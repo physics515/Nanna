@@ -9,7 +9,11 @@ use nanna_tools::{ToolCall, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    menu::{MenuBuilder, MenuItemBuilder},
+    AppHandle, Emitter, Manager, State,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -211,7 +215,9 @@ async fn run_agent_loop(
         let stream = llm.stream(&request);
         tokio::pin!(stream);
 
+        debug!("Starting to consume stream...");
         while let Some(event) = stream.next().await {
+            debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ContentBlockStart {
                     index,
@@ -260,9 +266,16 @@ async fn run_agent_loop(
                         current_tool_index = None;
                     }
                 }
-                StreamEvent::MessageStop { stop_reason: reason } => {
+                StreamEvent::MessageDelta { stop_reason: Some(reason), .. } => {
+                    debug!("MessageDelta with stop_reason: {}", reason);
                     stop_reason = reason;
-                    debug!("Message stopped: {}", stop_reason);
+                }
+                StreamEvent::MessageStop { stop_reason: reason } => {
+                    debug!("MessageStop: {}", reason);
+                    // Only use MessageStop's reason if we haven't got one from MessageDelta
+                    if stop_reason.is_empty() {
+                        stop_reason = reason;
+                    }
                 }
                 StreamEvent::Error { message } => {
                     error!("LLM stream error: {}", message);
@@ -566,6 +579,144 @@ async fn set_model(state: State<'_, Arc<RwLock<AppState>>>, model: String) -> Re
     Ok(())
 }
 
+/// Memory search result
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySearchResult {
+    pub session_id: String,
+    pub session_name: String,
+    pub message_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+    pub snippet: String,
+    pub relevance: f32,
+}
+
+/// Search across all sessions
+#[tauri::command]
+async fn search_memory(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<MemorySearchResult>, String> {
+    let state_guard = state.read().await;
+    let limit = limit.unwrap_or(50) as i64;
+    let query_lower = query.to_lowercase();
+
+    // Get all sessions
+    let sessions = state_guard
+        .storage
+        .list_gui_sessions(1000)
+        .await
+        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+
+    let mut results = Vec::new();
+
+    for session in &sessions {
+        let messages = state_guard
+            .storage
+            .get_session_messages(&session.session_id, 1000)
+            .await
+            .unwrap_or_default();
+
+        for msg in messages {
+            let content_lower = msg.content.to_lowercase();
+            if content_lower.contains(&query_lower) {
+                // Find match position and create snippet
+                let pos = content_lower.find(&query_lower).unwrap_or(0);
+                let start = pos.saturating_sub(50);
+                let end = (pos + query.len() + 50).min(msg.content.len());
+                let snippet = if start > 0 || end < msg.content.len() {
+                    let prefix = if start > 0 { "..." } else { "" };
+                    let suffix = if end < msg.content.len() { "..." } else { "" };
+                    format!("{}{}{}", prefix, &msg.content[start..end], suffix)
+                } else {
+                    msg.content.clone()
+                };
+
+                // Simple relevance scoring based on match frequency
+                let matches = content_lower.matches(&query_lower).count();
+                let relevance = (matches as f32 / msg.content.len().max(1) as f32).min(1.0);
+
+                results.push(MemorySearchResult {
+                    session_id: session.session_id.clone(),
+                    session_name: Storage::get_session_name(session),
+                    message_id: msg.id.to_string(),
+                    role: msg.role.clone(),
+                    content: msg.content.clone(),
+                    timestamp: msg.created_at.clone(),
+                    snippet,
+                    relevance,
+                });
+            }
+        }
+    }
+
+    // Sort by relevance and limit
+    results.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit as usize);
+
+    Ok(results)
+}
+
+/// Get statistics for memory browser
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryStats {
+    pub total_sessions: u32,
+    pub total_messages: u32,
+    pub oldest_session: Option<String>,
+    pub newest_session: Option<String>,
+}
+
+#[tauri::command]
+async fn get_memory_stats(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<MemoryStats, String> {
+    let state_guard = state.read().await;
+
+    let sessions = state_guard
+        .storage
+        .list_gui_sessions(10000)
+        .await
+        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+
+    let mut total_messages = 0u32;
+    for session in &sessions {
+        let count = state_guard
+            .storage
+            .count_session_messages(&session.session_id)
+            .await
+            .unwrap_or(0);
+        total_messages += count as u32;
+    }
+
+    Ok(MemoryStats {
+        total_sessions: sessions.len() as u32,
+        total_messages,
+        oldest_session: sessions.last().map(|s| s.created_at.clone()),
+        newest_session: sessions.first().map(|s| s.created_at.clone()),
+    })
+}
+
+/// Show the main window (called from system tray)
+#[tauri::command]
+async fn show_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Hide the main window to tray
+#[tauri::command]
+async fn hide_to_tray(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Set API key
 #[tauri::command]
 async fn set_api_key(
@@ -659,8 +810,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Set up system tray
+            setup_system_tray(app)?;
 
             // Initialize state asynchronously
             tauri::async_runtime::spawn(async move {
@@ -687,7 +842,71 @@ pub fn run() {
             get_config,
             set_model,
             set_api_key,
+            search_memory,
+            get_memory_stats,
+            show_window,
+            hide_to_tray,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Set up the system tray icon and menu
+fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let show_item = MenuItemBuilder::with_id("show", "Show Nanna").build(app)?;
+    let new_chat_item = MenuItemBuilder::with_id("new_chat", "New Chat").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&show_item)
+        .item(&new_chat_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    let _tray = TrayIconBuilder::with_id("main")
+        .tooltip("Nanna AI Assistant")
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&menu)
+        .menu_on_left_click(false)
+        .on_menu_event(move |app, event| {
+            match event.id().as_ref() {
+                "show" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                "new_chat" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        // Emit event to create new chat
+                        let _ = app.emit("tray-new-chat", ());
+                    }
+                }
+                "quit" => {
+                    app.exit(0);
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+
+    info!("System tray initialized");
+    Ok(())
 }

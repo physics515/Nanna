@@ -155,8 +155,12 @@ function formatDate(dateStr: string): string {
 }
 
 // Click outside directive
+interface ClickOutsideElement extends HTMLElement {
+  _clickOutside?: (event: MouseEvent) => void
+}
+
 const vClickOutside = {
-  mounted(el: HTMLElement, binding: any) {
+  mounted(el: ClickOutsideElement, binding: any) {
     el._clickOutside = (event: MouseEvent) => {
       if (!(el === event.target || el.contains(event.target as Node))) {
         binding.value()
@@ -164,8 +168,10 @@ const vClickOutside = {
     }
     document.addEventListener('click', el._clickOutside)
   },
-  unmounted(el: HTMLElement) {
-    document.removeEventListener('click', el._clickOutside)
+  unmounted(el: ClickOutsideElement) {
+    if (el._clickOutside) {
+      document.removeEventListener('click', el._clickOutside)
+    }
   }
 }
 </script>

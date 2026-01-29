@@ -49,14 +49,26 @@
         </nav>
         
         <!-- Footer -->
-        <div class="p-4 border-t border-nanna-primary/10 space-y-2">
+        <div class="p-4 border-t border-nanna-primary/10 space-y-1">
+          <NuxtLink 
+            to="/memory" 
+            class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            📚 Memory
+          </NuxtLink>
           <NuxtLink 
             to="/settings" 
             class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
             ⚙️ Settings
           </NuxtLink>
-          <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3">
+          <button 
+            @click="hideToTray"
+            class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            🔽 Hide to Tray
+          </button>
+          <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
             <span>v0.1.0</span>
             <span :class="apiKeySet ? 'text-nanna-success' : 'text-nanna-error'">
               {{ apiKeySet ? '● Connected' : '○ No API Key' }}
@@ -74,8 +86,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, provide } from 'vue'
+import { ref, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 interface SessionInfo {
   id: string
@@ -96,6 +109,8 @@ const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
 
+let unlistenTrayNewChat: UnlistenFn | null = null
+
 // Provide session switching to child components
 provide('currentSessionId', currentSessionId)
 provide('sessions', sessions)
@@ -103,13 +118,23 @@ provide('sessions', sessions)
 onMounted(async () => {
   await loadSessions()
   await loadConfig()
+  
+  // Listen for tray "new chat" event
+  unlistenTrayNewChat = await listen('tray-new-chat', () => {
+    createNewSession()
+  })
+})
+
+onUnmounted(() => {
+  if (unlistenTrayNewChat) unlistenTrayNewChat()
 })
 
 async function loadSessions() {
   try {
     sessions.value = await invoke<SessionInfo[]>('list_sessions')
-    if (sessions.value.length > 0 && !currentSessionId.value) {
-      currentSessionId.value = sessions.value[0].id
+    const firstSession = sessions.value[0]
+    if (firstSession && !currentSessionId.value) {
+      currentSessionId.value = firstSession.id
     }
   } catch (e) {
     console.error('Failed to load sessions:', e)
@@ -165,6 +190,14 @@ function onSessionRenamed(updated: SessionInfo) {
   const idx = sessions.value.findIndex(s => s.id === updated.id)
   if (idx !== -1) {
     sessions.value[idx] = updated
+  }
+}
+
+async function hideToTray() {
+  try {
+    await invoke('hide_to_tray')
+  } catch (e) {
+    console.error('Failed to hide to tray:', e)
   }
 }
 </script>

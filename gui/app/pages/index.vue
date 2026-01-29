@@ -114,19 +114,20 @@
       
       <!-- Loading indicator (before streaming starts) -->
       <div v-if="isLoading && !isStreaming && activeToolCalls.length === 0" class="max-w-4xl mx-auto">
-        <div class="message-assistant p-4 rounded-lg mr-12">
-          <div class="flex items-center gap-3">
-            <div class="w-8 h-8 rounded-full bg-nanna-accent text-nanna-bg-deep flex items-center justify-center">
-              N
-            </div>
-            <div class="flex items-center gap-2 text-nanna-text-muted">
-              <span class="animate-pulse">●</span>
-              <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
-              <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
-            </div>
-          </div>
-        </div>
+        <MessageSkeleton :lines="2" />
       </div>
+      
+      <!-- Error message -->
+      <ConnectionStatus
+        :status="connectionError ? 'error' : 'connected'"
+        :message="connectionError ?? undefined"
+        :visible="!!connectionError"
+        :can-retry="true"
+        :can-dismiss="true"
+        :is-retrying="isRetrying"
+        @retry="retryLastMessage"
+        @dismiss="dismissError"
+      />
     </div>
     
     <!-- Input area -->
@@ -232,6 +233,9 @@ const messagesContainer = ref<HTMLElement | null>(null)
 const currentSession = ref<SessionInfo | null>(null)
 const config = ref<AppConfig | null>(null)
 const activeToolCalls = ref<(ToolCallInfo & { status: 'started' | 'completed' | 'error' })[]>([])
+const connectionError = ref<string | null>(null)
+const isRetrying = ref(false)
+const lastUserMessage = ref<string>('')
 
 let unlistenChunk: UnlistenFn | null = null
 let unlistenTool: UnlistenFn | null = null
@@ -247,7 +251,7 @@ onMounted(async () => {
   // Try to get or create a session
   try {
     const sessions = await invoke<SessionInfo[]>('list_sessions')
-    if (sessions.length > 0) {
+    if (sessions.length > 0 && sessions[0]) {
       currentSession.value = sessions[0]
       // Load history
       messages.value = await invoke<Message[]>('get_session_history', { 
@@ -264,6 +268,7 @@ onMounted(async () => {
   
   // Listen for streaming chunks
   unlistenChunk = await listen<StreamChunk>('stream-chunk', (event) => {
+    console.log('stream-chunk event:', event.payload, 'current:', currentSession.value?.id)
     if (event.payload.session_id === currentSession.value?.id) {
       if (event.payload.done) {
         // Streaming complete
@@ -334,6 +339,8 @@ async function sendMessage() {
   
   const userMessage = input.value.trim()
   input.value = ''
+  lastUserMessage.value = userMessage
+  connectionError.value = null
   
   // Add user message immediately
   messages.value.push({
@@ -347,6 +354,10 @@ async function sendMessage() {
   await nextTick()
   scrollToBottom()
   
+  await sendMessageToBackend(userMessage)
+}
+
+async function sendMessageToBackend(message: string) {
   // Start loading
   isLoading.value = true
   isStreaming.value = false
@@ -356,24 +367,49 @@ async function sendMessage() {
   try {
     // Send message and wait for response (streaming happens via events)
     await invoke('send_message', { 
-      sessionId: currentSession.value.id,
-      message: userMessage 
+      sessionId: currentSession.value!.id,
+      message 
     })
   } catch (error: any) {
     console.error('Failed to send message:', error)
     isLoading.value = false
     isStreaming.value = false
     activeToolCalls.value = []
-    // Show error
-    messages.value.push({
-      id: Date.now().toString(),
-      role: 'assistant',
-      content: `Error: ${error.message || error}`,
-      timestamp: new Date().toISOString(),
-    })
+    
+    // Extract meaningful error message
+    const errorMsg = error.message || String(error)
+    if (errorMsg.includes('API key') || errorMsg.includes('authentication')) {
+      connectionError.value = 'Invalid or missing API key. Please check your settings.'
+    } else if (errorMsg.includes('rate limit')) {
+      connectionError.value = 'Rate limited. Please wait a moment and try again.'
+    } else if (errorMsg.includes('network') || errorMsg.includes('fetch')) {
+      connectionError.value = 'Network error. Please check your connection.'
+    } else {
+      connectionError.value = errorMsg
+    }
   }
   
   scrollToBottom()
+}
+
+async function retryLastMessage() {
+  if (!lastUserMessage.value || isLoading.value) return
+  
+  isRetrying.value = true
+  connectionError.value = null
+  
+  // Remove the last error message if present
+  const lastMsg = messages.value[messages.value.length - 1]
+  if (lastMsg && lastMsg.role === 'assistant' && lastMsg.content.startsWith('Error:')) {
+    messages.value.pop()
+  }
+  
+  await sendMessageToBackend(lastUserMessage.value)
+  isRetrying.value = false
+}
+
+function dismissError() {
+  connectionError.value = null
 }
 
 function scrollToBottom() {
