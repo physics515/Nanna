@@ -19,12 +19,12 @@
 - [x] Scheduling (remind, list, cancel)
 - [x] Browser tools (screenshot, extract, action, evaluate)
 - [x] Vision tools (analyze_image)
-- [ ] Audio tools (TTS, transcription)
+- [x] Audio tools (TTS, transcription)
 - [ ] Authoring tools (runtime tool creation)
 
 ### Channels
 - [x] Telegram (full API: send, react, edit, delete, pin, poll)
-- [ ] Discord (Gateway + REST API)
+- [x] Discord (REST API: send, react, edit, delete, pin, threads)
 - [ ] Slack (Bolt SDK)
 - [ ] Signal (signald integration)
 - [ ] WhatsApp (Baileys or Cloud API)
@@ -80,8 +80,8 @@
 | 1 | ~~Telegram E2E~~ | ✅ |
 | 2 | ~~Browser tools~~ | ✅ |
 | 3 | ~~Vision tools~~ | ✅ |
-| 4 | Discord channel | 🔜 |
-| 5 | Audio tools (TTS/Whisper) | 🔜 |
-| 6 | MCP client | 🔜 |
+| 4 | ~~Discord channel~~ | ✅ |
+| 5 | ~~Audio tools (TTS/Whisper)~~ | ✅ |
+| 6 | MCP client | 🔜 Next |
 | 7 | Tauri GUI (desktop) | 🔜 |
 | 8 | Tauri mobile (Android/iOS) | Later |
