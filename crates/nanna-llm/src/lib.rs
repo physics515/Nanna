@@ -68,8 +68,22 @@ impl Message {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text { text: String },
+    Image { source: ImageSource },
     ToolUse { id: String, name: String, input: serde_json::Value },
     ToolResult { tool_use_id: String, content: String, #[serde(skip_serializing_if = "Option::is_none")] is_error: Option<bool> },
+}
+
+/// Image source for vision API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Url {
+        url: String,
+    },
 }
 
 /// Anthropic message format
@@ -96,6 +110,33 @@ impl AnthropicMessage {
 
     pub fn assistant_text(text: impl Into<String>) -> Self {
         Self::assistant(vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    /// Create a user message with an image (base64)
+    pub fn user_image(media_type: impl Into<String>, base64_data: impl Into<String>, text: Option<String>) -> Self {
+        let mut content = vec![ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: media_type.into(),
+                data: base64_data.into(),
+            },
+        }];
+        if let Some(t) = text {
+            content.push(ContentBlock::Text { text: t });
+        }
+        Self::user(content)
+    }
+
+    /// Create a user message with text and image
+    pub fn user_with_image(text: impl Into<String>, media_type: impl Into<String>, base64_data: impl Into<String>) -> Self {
+        Self::user(vec![
+            ContentBlock::Text { text: text.into() },
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: media_type.into(),
+                    data: base64_data.into(),
+                },
+            },
+        ])
     }
 }
 

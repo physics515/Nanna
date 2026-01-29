@@ -8,6 +8,7 @@ mod file;
 mod memory;
 mod memory_storage;
 mod schedule;
+mod vision;
 mod web;
 
 pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
@@ -18,4 +19,5 @@ pub use file::{ReadFileTool, WriteFileTool, ListDirTool};
 pub use memory::{InMemoryStorage, MemoryStorage, MemoryResult, StorageHandle, RememberTool, RecallTool, ReflectTool};
 pub use memory_storage::{EmbedFn, TursoMemoryStorage};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
+pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};
 pub use web::{WebSearchTool, WebFetchTool};

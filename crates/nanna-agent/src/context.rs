@@ -66,6 +66,7 @@ impl AgentContext {
                             input.to_string().len() / 4 + 50
                         }
                         nanna_llm::ContentBlock::ToolResult { content, .. } => content.len() / 4 + 20,
+                        nanna_llm::ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
                     })
                     .sum::<usize>()
             })

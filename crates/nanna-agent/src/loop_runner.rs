@@ -318,7 +318,7 @@ impl Agent {
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_uses.push((id.clone(), name.clone(), input.clone()));
                 }
-                ContentBlock::ToolResult { .. } => {}
+                ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
             }
         }
 
