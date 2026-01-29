@@ -27,7 +27,7 @@
 ### Channels
 - [x] Telegram (full API: send, react, edit, delete, pin, poll)
 - [x] Discord (REST API: send, react, edit, delete, pin, threads)
-- [ ] Slack (Bolt SDK)
+- [x] Slack (Web API: send, react, edit, delete, pin, threads, files)
 - [ ] Signal (signald integration)
 - [ ] WhatsApp (Baileys or Cloud API)
 
@@ -111,6 +111,8 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 5 | ~~Audio tools (TTS/Whisper)~~ | ✅ |
 | 6 | ~~MCP client~~ | ✅ |
 | 7 | ~~Wire MCP into agent loop~~ | ✅ |
-| 8 | Slack channel | 🔜 Next |
-| 9 | Tauri GUI (desktop) | Later |
-| 10 | Tauri mobile (Android/iOS) | Later |
+| 8 | ~~Slack channel~~ | ✅ |
+| 9 | Signal channel | 🔜 Next |
+| 10 | WhatsApp channel | 🔜 |
+| 11 | Tauri GUI (desktop) | Later |
+| 12 | Tauri mobile (Android/iOS) | Later |
