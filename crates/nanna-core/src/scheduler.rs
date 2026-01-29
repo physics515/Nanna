@@ -1,7 +1,9 @@
 //! Task scheduler for autonomous behavior
 //!
 //! Provides heartbeats, cron jobs, and background task execution.
+//! Supports persistent storage of cron jobs via nanna-storage.
 
+use nanna_storage::{NewCronJob, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +76,7 @@ pub struct Scheduler {
     tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
     executor: Option<TaskExecutor>,
     shutdown_tx: Option<mpsc::Sender<()>>,
+    storage: Option<Arc<Storage>>,
 }
 
 impl Scheduler {
@@ -84,7 +87,98 @@ impl Scheduler {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             executor: None,
             shutdown_tx: None,
+            storage: None,
         }
+    }
+
+    /// Set persistent storage for cron jobs.
+    #[must_use]
+    pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Load persisted cron jobs from storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage query fails.
+    pub async fn load_jobs(&self) -> Result<usize, nanna_storage::StorageError> {
+        let storage = match &self.storage {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+
+        let jobs = storage.cron_jobs().list_enabled().await?;
+        let count = jobs.len();
+
+        let mut tasks = self.tasks.write().await;
+        for job in jobs {
+            let task_type = if job.schedule == "heartbeat" {
+                TaskType::Heartbeat
+            } else if let Some(interval_secs) = parse_interval(&job.schedule) {
+                TaskType::Recurring {
+                    interval: Duration::from_secs(interval_secs),
+                }
+            } else {
+                TaskType::Cron {
+                    schedule: job.schedule.clone(),
+                }
+            };
+
+            let payload = job.task.get("payload")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let task = ScheduledTask {
+                id: job.job_id.clone(),
+                name: job.task.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&job.job_id)
+                    .to_string(),
+                task_type,
+                payload,
+                enabled: job.enabled,
+                last_run: None,
+                run_count: 0,
+            };
+
+            tasks.insert(job.job_id, task);
+        }
+
+        info!("Loaded {} cron jobs from storage", count);
+        Ok(count)
+    }
+
+    /// Save a task to persistent storage.
+    async fn persist_task(&self, task: &ScheduledTask) -> Result<(), nanna_storage::StorageError> {
+        let storage = match &self.storage {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let schedule = match &task.task_type {
+            TaskType::Heartbeat => "heartbeat".to_string(),
+            TaskType::Cron { schedule } => schedule.clone(),
+            TaskType::Recurring { interval } => format!("every_{}s", interval.as_secs()),
+            TaskType::Delayed { delay } => format!("delay_{}s", delay.as_secs()),
+        };
+
+        let job = NewCronJob {
+            job_id: task.id.clone(),
+            schedule,
+            task: serde_json::json!({
+                "name": task.name,
+                "payload": task.payload,
+            }),
+            enabled: task.enabled,
+            next_run: None,
+            metadata: None,
+        };
+
+        storage.cron_jobs().create(job).await?;
+        Ok(())
     }
 
     /// Set the task executor callback.
@@ -94,21 +188,40 @@ impl Scheduler {
         self
     }
 
-    /// Add a task
+    /// Add a task (persisted if storage is configured)
     pub async fn add_task(&self, task: ScheduledTask) {
+        // Persist first if storage is available
+        if let Err(e) = self.persist_task(&task).await {
+            warn!("Failed to persist task {}: {}", task.id, e);
+        }
+
         let mut tasks = self.tasks.write().await;
         info!("Scheduled task: {} ({})", task.name, task.id);
         tasks.insert(task.id.clone(), task);
     }
 
-    /// Remove a task
+    /// Remove a task (from memory and storage)
     pub async fn remove_task(&self, task_id: &str) -> bool {
+        // Remove from storage
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.cron_jobs().delete(task_id).await {
+                warn!("Failed to delete task {} from storage: {}", task_id, e);
+            }
+        }
+
         let mut tasks = self.tasks.write().await;
         tasks.remove(task_id).is_some()
     }
 
-    /// Enable/disable a task
+    /// Enable/disable a task (persisted)
     pub async fn set_task_enabled(&self, task_id: &str, enabled: bool) {
+        // Update storage
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.cron_jobs().set_enabled(task_id, enabled).await {
+                warn!("Failed to update task {} enabled state: {}", task_id, e);
+            }
+        }
+
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(task_id) {
             task.enabled = enabled;
@@ -275,6 +388,16 @@ pub fn delayed_task(name: &str, delay: Duration, payload: &str) -> ScheduledTask
         enabled: true,
         last_run: None,
         run_count: 0,
+    }
+}
+
+/// Parse interval string like "every_300s" into seconds
+fn parse_interval(schedule: &str) -> Option<u64> {
+    if schedule.starts_with("every_") && schedule.ends_with('s') {
+        let num_str = &schedule[6..schedule.len() - 1];
+        num_str.parse().ok()
+    } else {
+        None
     }
 }
 

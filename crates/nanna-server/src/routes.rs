@@ -14,8 +14,9 @@ use uuid::Uuid;
 /// Create the main router
 pub fn create_router(state: AppState) -> Router {
     Router::new()
-        // Health check
+        // Health check and metrics
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics))
         // API routes
         .route("/api/v1/chat", post(chat))
         .route("/api/v1/sessions", post(create_session))
@@ -45,6 +46,39 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         gpu: state.bot.has_gpu(),
+    })
+}
+
+/// Metrics response
+#[derive(Serialize)]
+struct MetricsResponse {
+    uptime_secs: u64,
+    active_agents: usize,
+    total_sessions: i64,
+    total_messages: i64,
+    gpu_available: bool,
+    version: &'static str,
+}
+
+async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+    // Count active agents
+    let active_agents = state.agents.read().await.len();
+
+    // Get storage stats
+    let total_sessions = state
+        .storage
+        .sessions()
+        .list_recent(10000)
+        .await
+        .map_or(0, |s| s.len() as i64);
+
+    Json(MetricsResponse {
+        uptime_secs: 0, // Would need start time tracking
+        active_agents,
+        total_sessions,
+        total_messages: 0, // Would need aggregate query
+        gpu_available: state.bot.has_gpu(),
+        version: env!("CARGO_PKG_VERSION"),
     })
 }
 

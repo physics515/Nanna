@@ -21,7 +21,7 @@ use nanna_tools::{
 };
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
-use tracing::{error, info, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const BANNER: &str = r"
@@ -225,6 +225,9 @@ fn create_scheduler(
         max_concurrent: 4,
     };
 
+    // Clone storage for the scheduler's persistence
+    let scheduler_storage = storage.clone();
+
     // Create a task executor that runs tasks through an agent
     let model = config.llm.model.clone();
     let executor: nanna_core::TaskExecutor = Arc::new(move |task: ScheduledTask| {
@@ -301,7 +304,9 @@ fn create_scheduler(
         })
     });
 
-    Scheduler::new(scheduler_config).with_executor(executor)
+    Scheduler::new(scheduler_config)
+        .with_storage(scheduler_storage)
+        .with_executor(executor)
 }
 
 /// Initialize common components
@@ -478,6 +483,14 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
 
     // Start the scheduler for heartbeats and scheduled tasks
     let mut scheduler = create_scheduler(config, llm.clone(), tools.clone(), storage.clone());
+
+    // Load persisted cron jobs
+    match scheduler.load_jobs().await {
+        Ok(count) if count > 0 => info!("Loaded {} persisted cron jobs", count),
+        Ok(_) => debug!("No persisted cron jobs found"),
+        Err(e) => warn!("Failed to load cron jobs: {}", e),
+    }
+
     scheduler.start();
     info!("Scheduler started");
 

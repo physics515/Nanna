@@ -1,6 +1,6 @@
 //! Repository implementations using Turso
 
-use crate::{Memory, Message, NewMemory, NewMessage, Session, StorageError};
+use crate::{CronJob, Memory, Message, NewCronJob, NewMemory, NewMessage, Session, StorageError};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use turso::Connection;
@@ -413,5 +413,181 @@ impl ConfigRepository {
     pub async fn set_json<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), StorageError> {
         let json = serde_json::to_string(value)?;
         self.set(key, &json).await
+    }
+}
+
+/// Cron job repository
+pub struct CronJobRepository {
+    conn: Arc<RwLock<Connection>>,
+}
+
+impl CronJobRepository {
+    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    pub async fn create(&self, job: NewCronJob) -> Result<CronJob, StorageError> {
+        let conn = self.conn.write().await;
+
+        let task_json = job.task.to_string();
+        let metadata_json = job.metadata.as_ref().map(std::string::ToString::to_string);
+
+        conn.execute(
+            "INSERT INTO cron_jobs (job_id, schedule, task, enabled, next_run, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(job_id) DO UPDATE SET 
+                schedule = excluded.schedule,
+                task = excluded.task,
+                enabled = excluded.enabled,
+                next_run = excluded.next_run,
+                metadata = excluded.metadata",
+            turso::params![
+                job.job_id.as_str(),
+                job.schedule.as_str(),
+                task_json.as_str(),
+                job.enabled,
+                job.next_run.as_deref(),
+                metadata_json.as_deref(),
+            ],
+        )
+        .await?;
+
+        drop(conn);
+        self.get(&job.job_id).await
+    }
+
+    pub async fn get(&self, job_id: &str) -> Result<CronJob, StorageError> {
+        let conn = self.conn.read().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, schedule, task, enabled, last_run, next_run, created_at, metadata
+                 FROM cron_jobs WHERE job_id = ?1",
+                turso::params![job_id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let task_str: String = row.get(3)?;
+            let metadata_str: Option<String> = row.get(8)?;
+            let enabled: i64 = row.get(4)?;
+
+            Ok(CronJob {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                schedule: row.get(2)?,
+                task: serde_json::from_str(&task_str).unwrap_or_default(),
+                enabled: enabled != 0,
+                last_run: row.get(5)?,
+                next_run: row.get(6)?,
+                created_at: row.get(7)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+            })
+        } else {
+            Err(StorageError::NotFound(format!("CronJob: {job_id}")))
+        }
+    }
+
+    pub async fn list_enabled(&self) -> Result<Vec<CronJob>, StorageError> {
+        let conn = self.conn.read().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, schedule, task, enabled, last_run, next_run, created_at, metadata
+                 FROM cron_jobs WHERE enabled = 1 ORDER BY next_run ASC",
+                (),
+            )
+            .await?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let task_str: String = row.get(3)?;
+            let metadata_str: Option<String> = row.get(8)?;
+            let enabled: i64 = row.get(4)?;
+
+            jobs.push(CronJob {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                schedule: row.get(2)?,
+                task: serde_json::from_str(&task_str).unwrap_or_default(),
+                enabled: enabled != 0,
+                last_run: row.get(5)?,
+                next_run: row.get(6)?,
+                created_at: row.get(7)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+            });
+        }
+
+        Ok(jobs)
+    }
+
+    pub async fn list_all(&self) -> Result<Vec<CronJob>, StorageError> {
+        let conn = self.conn.read().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, schedule, task, enabled, last_run, next_run, created_at, metadata
+                 FROM cron_jobs ORDER BY created_at DESC",
+                (),
+            )
+            .await?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let task_str: String = row.get(3)?;
+            let metadata_str: Option<String> = row.get(8)?;
+            let enabled: i64 = row.get(4)?;
+
+            jobs.push(CronJob {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                schedule: row.get(2)?,
+                task: serde_json::from_str(&task_str).unwrap_or_default(),
+                enabled: enabled != 0,
+                last_run: row.get(5)?,
+                next_run: row.get(6)?,
+                created_at: row.get(7)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+            });
+        }
+
+        Ok(jobs)
+    }
+
+    pub async fn update_last_run(&self, job_id: &str, last_run: &str, next_run: Option<&str>) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+
+        conn.execute(
+            "UPDATE cron_jobs SET last_run = ?1, next_run = ?2 WHERE job_id = ?3",
+            turso::params![last_run, next_run, job_id],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+
+        conn.execute(
+            "UPDATE cron_jobs SET enabled = ?1 WHERE job_id = ?2",
+            turso::params![enabled, job_id],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
+        let conn = self.conn.write().await;
+
+        let result = conn
+            .execute(
+                "DELETE FROM cron_jobs WHERE job_id = ?1",
+                turso::params![job_id],
+            )
+            .await?;
+
+        Ok(result > 0)
     }
 }

@@ -18,3 +18,6 @@ nanna-gpu = { path = "../nanna-gpu" }
 nanna-llm = { path = "../nanna-llm" }
 nanna-channels = { path = "../nanna-channels" }
 nanna-memory = { path = "../nanna-memory" }
+nanna-storage = { path = "../nanna-storage" }
+
+chrono = { version = "0.4", features = ["serde"] }

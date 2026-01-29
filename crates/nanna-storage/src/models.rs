@@ -82,3 +82,14 @@ pub struct NewMemory {
     pub metadata: Option<serde_json::Value>,
     pub tags: Vec<String>,
 }
+
+/// New cron job input
+#[derive(Debug, Clone)]
+pub struct NewCronJob {
+    pub job_id: String,
+    pub schedule: String,
+    pub task: serde_json::Value,
+    pub enabled: bool,
+    pub next_run: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}

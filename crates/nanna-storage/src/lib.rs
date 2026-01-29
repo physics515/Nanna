@@ -141,6 +141,11 @@ impl Storage {
     pub fn config_store(&self) -> ConfigRepository {
         ConfigRepository::new(self.conn.clone())
     }
+
+    #[must_use] 
+    pub fn cron_jobs(&self) -> CronJobRepository {
+        CronJobRepository::new(self.conn.clone())
+    }
 }
 
 #[cfg(test)]
