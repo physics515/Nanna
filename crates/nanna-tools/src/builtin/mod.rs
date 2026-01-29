@@ -13,6 +13,9 @@ mod schedule;
 mod vision;
 mod web;
 
+#[cfg(feature = "browser")]
+mod browser_wiring;
+
 pub use audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
 pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
 pub use browser::{BrowserActionTool, BrowserEvaluateTool, BrowserExtractTool, BrowserFn, BrowserScreenshotTool};
@@ -25,3 +28,6 @@ pub use memory_storage::{EmbedFn, TursoMemoryStorage};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
 pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};
 pub use web::{WebSearchTool, WebFetchTool};
+
+#[cfg(feature = "browser")]
+pub use browser_wiring::{BrowserManager, create_browser_tools};

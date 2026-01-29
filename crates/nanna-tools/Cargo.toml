@@ -3,6 +3,10 @@ name = "nanna-tools"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+browser = ["nanna-browser"]
+
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
@@ -15,6 +19,7 @@ uuid.workspace = true
 
 nanna-storage = { path = "../nanna-storage" }
 nanna-simd = { path = "../nanna-simd" }
+nanna-browser = { path = "../nanna-browser", optional = true }
 
 # For file operations
 walkdir = "2"
