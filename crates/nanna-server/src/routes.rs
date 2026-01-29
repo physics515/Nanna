@@ -26,6 +26,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/webhooks/telegram", post(webhooks::telegram::handle))
         .route("/webhooks/discord", post(webhooks::discord::handle))
         .route("/webhooks/slack", post(webhooks::slack::handle))
+        .route("/webhooks/signal", post(webhooks::signal::handle))
+        .route("/webhooks/signal/health", get(webhooks::signal::health))
         .route("/webhooks/generic", post(webhooks::generic::handle))
         .with_state(state)
 }

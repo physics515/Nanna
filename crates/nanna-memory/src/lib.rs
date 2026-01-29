@@ -9,12 +9,14 @@ mod service;
 
 pub use service::{MemoryService, MemoryServiceConfig, RecallResult, EmbedFn};
 
+use nanna_gpu::{CosineSimilaritySearch, GpuContext};
 use nanna_simd::{cosine_similarity_f32, normalize_f32};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
 pub enum MemoryError {
@@ -54,10 +56,12 @@ impl Default for VectorStoreConfig {
     }
 }
 
-/// In-memory vector store with SIMD-accelerated search
+/// In-memory vector store with SIMD and GPU-accelerated search
 pub struct VectorStore {
     config: VectorStoreConfig,
     entries: RwLock<Vec<MemoryEntry>>,
+    gpu: Option<Arc<GpuContext>>,
+    gpu_pipeline: Option<CosineSimilaritySearch>,
 }
 
 impl VectorStore {
@@ -66,7 +70,45 @@ impl VectorStore {
         Self {
             config,
             entries: RwLock::new(Vec::new()),
+            gpu: None,
+            gpu_pipeline: None,
         }
+    }
+
+    /// Create a vector store with GPU acceleration.
+    ///
+    /// Falls back to SIMD if GPU initialization fails.
+    pub async fn with_gpu(config: VectorStoreConfig) -> Self {
+        match GpuContext::new().await {
+            Ok(ctx) => {
+                let ctx = Arc::new(ctx);
+                match CosineSimilaritySearch::new(&ctx) {
+                    Ok(pipeline) => {
+                        info!("VectorStore using GPU: {}", ctx.adapter_info.name);
+                        Self {
+                            config,
+                            entries: RwLock::new(Vec::new()),
+                            gpu: Some(ctx),
+                            gpu_pipeline: Some(pipeline),
+                        }
+                    }
+                    Err(e) => {
+                        warn!("GPU pipeline creation failed, using SIMD: {}", e);
+                        Self::new(config)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("GPU initialization failed, using SIMD: {}", e);
+                Self::new(config)
+            }
+        }
+    }
+
+    /// Check if GPU acceleration is available.
+    #[must_use]
+    pub fn has_gpu(&self) -> bool {
+        self.gpu.is_some() && self.gpu_pipeline.is_some()
     }
 
     /// Add a memory entry.
@@ -89,7 +131,9 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Search for similar memories using SIMD-accelerated cosine similarity.
+    /// Search for similar memories using GPU or SIMD-accelerated cosine similarity.
+    ///
+    /// Uses GPU for large vector counts (>1000), SIMD for smaller sets.
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(MemoryEntry, f32)> {
         if query_embedding.len() != self.config.dimension {
             return Vec::new();
@@ -99,14 +143,53 @@ impl VectorStore {
         let mut query = query_embedding.to_vec();
         normalize_f32(&mut query);
 
-        // Calculate similarities and collect results (scoped lock)
         let entries = self.entries.read().await;
+        let entry_count = entries.len();
+
+        if entry_count == 0 {
+            return Vec::new();
+        }
+
+        // Use GPU for large vector counts, SIMD for smaller sets
+        const GPU_THRESHOLD: usize = 1000;
+
+        let similarities: Vec<f32> = if entry_count >= GPU_THRESHOLD && self.has_gpu() {
+            // GPU path: batch all vectors together
+            debug!("Using GPU for {} vectors", entry_count);
+            let gpu = self.gpu.as_ref().unwrap();
+            let pipeline = self.gpu_pipeline.as_ref().unwrap();
+
+            // Flatten all embeddings into a single buffer
+            let vectors: Vec<f32> = entries
+                .iter()
+                .flat_map(|e| e.embedding.iter().copied())
+                .collect();
+
+            match pipeline.search(gpu, &query, &vectors).await {
+                Ok(sims) => sims,
+                Err(e) => {
+                    warn!("GPU search failed, falling back to SIMD: {}", e);
+                    // Fallback to SIMD
+                    entries
+                        .iter()
+                        .map(|entry| cosine_similarity_f32(&query, &entry.embedding))
+                        .collect()
+                }
+            }
+        } else {
+            // SIMD path
+            debug!("Using SIMD for {} vectors", entry_count);
+            entries
+                .iter()
+                .map(|entry| cosine_similarity_f32(&query, &entry.embedding))
+                .collect()
+        };
+
+        // Pair entries with similarities
         let mut scored: Vec<(MemoryEntry, f32)> = entries
             .iter()
-            .map(|entry| {
-                let sim = cosine_similarity_f32(&query, &entry.embedding);
-                (entry.clone(), sim)
-            })
+            .zip(similarities)
+            .map(|(entry, sim)| (entry.clone(), sim))
             .collect();
         drop(entries);
 

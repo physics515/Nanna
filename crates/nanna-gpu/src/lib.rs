@@ -203,6 +203,14 @@ pub struct CosineSimilaritySearch {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
+/// Parameters struct for the compute shader (must match WGSL layout)
+#[repr(C)]
+#[derive(Clone, Copy, Pod, bytemuck::Zeroable)]
+struct SimilarityParams {
+    query_len: u32,
+    num_vectors: u32,
+}
+
 impl CosineSimilaritySearch {
     /// Create a new cosine similarity search pipeline.
     ///
@@ -280,6 +288,138 @@ impl CosineSimilaritySearch {
             pipeline,
             bind_group_layout,
         })
+    }
+
+    /// Compute cosine similarity between a query vector and a batch of vectors.
+    ///
+    /// Returns a vector of similarity scores, one per input vector.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - GPU context
+    /// * `query` - Query vector (normalized)
+    /// * `vectors` - Batch of vectors to compare against (flattened, each same length as query)
+    ///
+    /// # Errors
+    ///
+    /// Returns `GpuError::BufferMapping` if the result buffer cannot be read.
+    pub async fn search(
+        &self,
+        ctx: &GpuContext,
+        query: &[f32],
+        vectors: &[f32],
+    ) -> Result<Vec<f32>, GpuError> {
+        let query_len = query.len() as u32;
+        let num_vectors = (vectors.len() / query.len()) as u32;
+
+        if num_vectors == 0 {
+            return Ok(vec![]);
+        }
+
+        // Create uniform buffer for parameters
+        let params = SimilarityParams {
+            query_len,
+            num_vectors,
+        };
+        let params_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params_buffer"),
+            contents: bytemuck::cast_slice(&[params]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        // Create storage buffers
+        let query_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("query_buffer"),
+            contents: bytemuck::cast_slice(query),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let vectors_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vectors_buffer"),
+            contents: bytemuck::cast_slice(vectors),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let output_size = (num_vectors as usize) * std::mem::size_of::<f32>();
+        let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("output_buffer"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_buffer"),
+            size: output_size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create bind group
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cosine_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: query_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: vectors_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Dispatch compute
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cosine_encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cosine_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            // Dispatch with ceiling division for workgroups
+            let workgroups = (num_vectors + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        // Copy output to staging buffer
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size as u64);
+
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read results
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        ctx.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::BufferMapping)?
+            .map_err(|_| GpuError::BufferMapping)?;
+
+        let data = buffer_slice.get_mapped_range();
+        let results: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging_buffer.unmap();
+
+        Ok(results)
     }
 }
 

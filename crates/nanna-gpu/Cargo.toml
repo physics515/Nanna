@@ -10,3 +10,4 @@ tracing.workspace = true
 thiserror.workspace = true
 half.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
+futures = "0.3"

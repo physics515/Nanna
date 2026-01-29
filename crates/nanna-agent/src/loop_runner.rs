@@ -41,6 +41,9 @@ impl Default for AgentConfig {
 /// Callback for streaming text chunks
 pub type StreamCallback = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Callback for storing extracted memories
+pub type MemoryCallback = Box<dyn Fn(ExtractedMemory) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Options for running the agent
 #[derive(Default)]
 pub struct RunOptions {
@@ -50,6 +53,10 @@ pub struct RunOptions {
     pub context_prefix: Option<String>,
     /// Callback for streaming text (called with each text chunk)
     pub on_text: Option<StreamCallback>,
+    /// Auto-extract memories after each run
+    pub auto_extract_memories: bool,
+    /// Callback for storing extracted memories (required if auto_extract_memories is true)
+    pub on_memory: Option<MemoryCallback>,
 }
 
 /// Response from an agent run
@@ -159,6 +166,16 @@ impl Agent {
 
             // If no tool calls, we're done
             if result.tool_uses.is_empty() {
+                // Auto-extract memories if enabled
+                if options.auto_extract_memories {
+                    if let Some(ref on_memory) = options.on_memory {
+                        if let Ok(memories) = self.extract_memories().await {
+                            for memory in memories {
+                                on_memory(memory).await;
+                            }
+                        }
+                    }
+                }
                 return Ok(state.into_response(false));
             }
 
@@ -398,6 +415,104 @@ impl Agent {
         let mut ctx = self.context.write().await;
         ctx.messages.clear();
     }
+
+    /// Extract memorable facts from the current conversation.
+    ///
+    /// Uses a quick LLM call to identify noteworthy information that should be
+    /// remembered long-term. Returns a list of extracted memory strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` if the extraction LLM call fails.
+    pub async fn extract_memories(&self) -> Result<Vec<ExtractedMemory>, AgentError> {
+        let ctx = self.context.read().await;
+
+        // Skip if no conversation yet
+        if ctx.messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build a summary of the conversation for extraction
+        let mut conversation_text = String::new();
+        for msg in &ctx.messages {
+            let role = &msg.role;
+            for block in &msg.content {
+                if let ContentBlock::Text { text } = block {
+                    conversation_text.push_str(&format!("{role}: {text}\n"));
+                }
+            }
+        }
+
+        // Skip if conversation is too short
+        if conversation_text.len() < 100 {
+            return Ok(Vec::new());
+        }
+
+        drop(ctx);
+
+        // Create extraction request
+        let extraction_prompt = format!(
+            r#"Analyze this conversation and extract noteworthy facts that should be remembered long-term.
+
+Focus on:
+- User preferences and personal information
+- Important decisions or conclusions
+- Facts about projects, people, or systems
+- Anything the user explicitly asked to remember
+
+Conversation:
+{conversation_text}
+
+Respond with a JSON array of objects, each with "content" (the fact to remember) and "category" (preference/fact/decision/reminder). 
+If nothing notable, respond with an empty array: []
+
+Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
+        );
+
+        let request = AnthropicRequest {
+            model: self.config.model.clone(),
+            messages: vec![AnthropicMessage::user_text(extraction_prompt)],
+            max_tokens: 1024,
+            temperature: Some(0.3), // Lower temperature for more consistent extraction
+            system: Some("You are a memory extraction system. Output only valid JSON.".to_string()),
+            tools: None,
+            stream: None,
+        };
+
+        let response = self.llm.complete_anthropic(&request).await?;
+
+        // Parse the response
+        let mut memories = Vec::new();
+        for block in &response.content {
+            if let ContentBlock::Text { text } = block {
+                // Try to parse as JSON array
+                if let Ok(parsed) = serde_json::from_str::<Vec<ExtractedMemoryRaw>>(text.trim()) {
+                    for raw in parsed {
+                        memories.push(ExtractedMemory {
+                            content: raw.content,
+                            category: raw.category,
+                        });
+                    }
+                }
+            }
+        }
+
+        debug!("Extracted {} memories from conversation", memories.len());
+        Ok(memories)
+    }
+}
+
+/// A memory extracted from conversation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMemory {
+    pub content: String,
+    pub category: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtractedMemoryRaw {
+    content: String,
+    category: String,
 }
 
 /// Internal state for a run

@@ -111,6 +111,7 @@ pub struct ChannelsConfig {
     pub telegram: Option<TelegramConfig>,
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
+    pub signal: Option<SignalConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +133,16 @@ pub struct SlackConfig {
     pub bot_token: String,
     pub app_token: Option<String>,
     pub signing_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalConfig {
+    /// Phone number registered with Signal (e.g., "+1234567890")
+    pub phone_number: String,
+    /// URL of signal-cli-rest-api instance
+    pub api_url: Option<String>,
+    /// Allowed phone numbers (None = allow all)
+    pub allowed_numbers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
