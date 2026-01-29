@@ -39,10 +39,13 @@
   - [x] Tool discovery and execution
   - [x] Resource and prompt support
   - [x] Adapter for nanna-tools integration
-- [ ] MCP server mode (expose Nanna tools)
-- [ ] Background task spawning
-- [ ] Agent-to-agent communication
-- [ ] Supervisor patterns
+- [x] MCP server mode (expose Nanna tools) — `server.rs`
+  - [x] Stdio transport
+  - [x] Tool/resource/prompt registration
+  - [x] nanna-tools bridge
+- [x] Background task spawning — `AgentCoordinator::spawn_task()`
+- [x] Agent-to-agent communication — `send_message()` / `check_mailbox()`
+- [ ] Supervisor patterns (restart policies, health checks)
 
 ## Phase 4: GUI Application 🆕
 **Stack:** Tauri v2 + Nuxt v4 + Tailwind v4
