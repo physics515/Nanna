@@ -90,7 +90,7 @@
 | 4 | ~~Discord channel~~ | ✅ |
 | 5 | ~~Audio tools (TTS/Whisper)~~ | ✅ |
 | 6 | ~~MCP client~~ | ✅ |
-| 7 | Wire MCP into agent loop | 🔜 Next |
-| 8 | Slack channel | 🔜 |
+| 7 | ~~Wire MCP into agent loop~~ | ✅ |
+| 8 | Slack channel | 🔜 Next |
 | 9 | Tauri GUI (desktop) | Later |
 | 10 | Tauri mobile (Android/iOS) | Later |
