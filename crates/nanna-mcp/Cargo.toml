@@ -5,9 +5,10 @@ edition.workspace = true
 description = "MCP (Model Context Protocol) client for Nanna"
 
 [features]
-default = ["stdio", "http"]
+default = ["stdio", "http", "tools-integration"]
 stdio = ["tokio/process"]
 http = ["reqwest", "tokio-tungstenite"]
+tools-integration = ["nanna-tools"]
 
 [dependencies]
 tokio.workspace = true
@@ -26,3 +27,6 @@ futures = "0.3"
 
 # JSON-RPC
 uuid.workspace = true
+
+# Tools integration (optional)
+nanna-tools = { path = "../nanna-tools", optional = true }

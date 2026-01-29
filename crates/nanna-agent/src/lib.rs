@@ -10,6 +10,9 @@ mod loop_runner;
 mod multi;
 mod prompts;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub use context::AgentContext;
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,

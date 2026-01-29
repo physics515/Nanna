@@ -11,7 +11,7 @@ mod schema;
 
 pub use builtin::*;
 pub use registry::ToolRegistry;
-pub use schema::{ToolDefinition, ToolParameter, ToolResult};
+pub use schema::{ParameterType, ToolDefinition, ToolParameter, ToolResult};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
