@@ -1,7 +1,7 @@
 //! Application state shared across handlers
 
 use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions};
-use nanna_channels::TelegramChannel;
+use nanna_channels::{DiscordChannel, TelegramChannel};
 use nanna_core::Nanna;
 use nanna_llm::LlmClient;
 use nanna_storage::Storage;
@@ -23,6 +23,8 @@ pub struct AppState {
     pub default_model: String,
     /// Telegram channel for proactive sends
     pub telegram: Option<Arc<TelegramChannel>>,
+    /// Discord channel for proactive sends
+    pub discord: Option<Arc<DiscordChannel>>,
 }
 
 /// Builder for `AppState`
@@ -35,6 +37,8 @@ pub struct AppStateBuilder {
     discord_public_key: Option<String>,
     default_model: String,
     telegram_token: Option<String>,
+    discord_bot_token: Option<String>,
+    discord_app_id: Option<String>,
 }
 
 impl Default for AppStateBuilder {
@@ -55,6 +59,8 @@ impl AppStateBuilder {
             discord_public_key: None,
             default_model: "claude-sonnet-4-20250514".to_string(),
             telegram_token: None,
+            discord_bot_token: None,
+            discord_app_id: None,
         }
     }
 
@@ -128,6 +134,14 @@ impl AppStateBuilder {
         self
     }
 
+    /// Set the Discord bot token and application ID.
+    #[must_use]
+    pub fn discord_config(mut self, bot_token: Option<String>, app_id: Option<String>) -> Self {
+        self.discord_bot_token = bot_token;
+        self.discord_app_id = app_id;
+        self
+    }
+
     /// Build the `AppState`.
     ///
     /// # Panics
@@ -139,6 +153,11 @@ impl AppStateBuilder {
             Arc::new(TelegramChannel::new(token))
         });
 
+        let discord = match (self.discord_bot_token, self.discord_app_id) {
+            (Some(token), Some(app_id)) => Some(Arc::new(DiscordChannel::new(token, app_id))),
+            _ => None,
+        };
+
         AppState {
             bot: Arc::new(self.bot.expect("bot required")),
             storage: self.storage.expect("storage required"),
@@ -149,6 +168,7 @@ impl AppStateBuilder {
             discord_public_key: self.discord_public_key,
             default_model: self.default_model,
             telegram,
+            discord,
         }
     }
 }

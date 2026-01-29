@@ -5,8 +5,10 @@
 //!
 //! Provides a unified interface for different messaging platforms.
 
+pub mod discord;
 pub mod telegram;
 
+pub use discord::DiscordChannel;
 pub use telegram::TelegramChannel;
 
 use async_trait::async_trait;

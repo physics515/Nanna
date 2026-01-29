@@ -483,6 +483,31 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
         info!("Telegram channel enabled");
     }
 
+    // Get Discord config
+    let discord_bot_token = config
+        .channels
+        .discord
+        .as_ref()
+        .map(|d| d.bot_token.clone())
+        .or_else(|| std::env::var("DISCORD_BOT_TOKEN").ok());
+
+    let discord_app_id = config
+        .channels
+        .discord
+        .as_ref()
+        .map(|d| d.application_id.clone())
+        .or_else(|| std::env::var("DISCORD_APP_ID").ok());
+
+    let discord_public_key = config
+        .channels
+        .discord
+        .as_ref()
+        .map(|d| d.public_key.clone());
+
+    if discord_bot_token.is_some() && discord_app_id.is_some() {
+        info!("Discord channel enabled");
+    }
+
     // Build app state - pass Arcs directly
     let state = AppStateBuilder::new()
         .bot(bot)
@@ -490,8 +515,10 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
         .llm_arc(llm.clone())
         .tools_arc(tools.clone())
         .webhook_secret(config.server.webhook_secret.clone())
+        .discord_public_key(discord_public_key)
         .default_model(config.llm.model.clone())
         .telegram_token(telegram_token)
+        .discord_config(discord_bot_token, discord_app_id)
         .build();
 
     // Start the scheduler for heartbeats and scheduled tasks
