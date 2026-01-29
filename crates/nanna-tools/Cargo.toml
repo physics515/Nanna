@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default = []
 browser = ["nanna-browser"]
+vision = ["nanna-llm"]
 
 [dependencies]
 tokio.workspace = true
@@ -20,6 +21,7 @@ uuid.workspace = true
 nanna-storage = { path = "../nanna-storage" }
 nanna-simd = { path = "../nanna-simd" }
 nanna-browser = { path = "../nanna-browser", optional = true }
+nanna-llm = { path = "../nanna-llm", optional = true }
 
 # For file operations
 walkdir = "2"

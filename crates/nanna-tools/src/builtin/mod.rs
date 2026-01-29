@@ -16,6 +16,9 @@ mod web;
 #[cfg(feature = "browser")]
 mod browser_wiring;
 
+#[cfg(feature = "vision")]
+mod vision_wiring;
+
 pub use audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
 pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
 pub use browser::{BrowserActionTool, BrowserEvaluateTool, BrowserExtractTool, BrowserFn, BrowserScreenshotTool};
@@ -31,3 +34,6 @@ pub use web::{WebSearchTool, WebFetchTool};
 
 #[cfg(feature = "browser")]
 pub use browser_wiring::{BrowserManager, create_browser_tools};
+
+#[cfg(feature = "vision")]
+pub use vision_wiring::create_vision_tool;
