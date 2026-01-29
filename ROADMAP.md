@@ -80,22 +80,25 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 3. **iOS** — via Tauri mobile
 
 ### Features
-- [ ] Chat interface with streaming
-- [ ] Session management
+- [x] Chat interface with streaming
+- [x] Markdown rendering for responses
+- [x] Session management (create, switch, rename, delete)
+- [x] Settings page (API key, model selection)
 - [ ] Tool call visualization
 - [ ] Memory browser
-- [ ] Settings/config UI
 - [ ] Channel status dashboard
 - [ ] System tray / menu bar presence
+- [ ] Native notifications
 
 ### Technical
 - [x] Tauri v2 setup with Rust backend
 - [x] Nuxt v4 frontend (SSG mode for Tauri)
 - [x] Tailwind v4 styling
+- [x] IPC bridge to nanna-core
+- [x] Streaming via Tauri events
+- [x] Session persistence (SQLite)
 - [ ] shadcn-vue component library
-- [ ] IPC bridge to nanna-core
 - [ ] Mobile-responsive layouts
-- [ ] Native notifications
 
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
@@ -131,6 +134,10 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 12 | ~~Background tasks~~ | ✅ |
 | 13 | ~~Supervisor patterns~~ | ✅ |
 | 14 | ~~Deno scripting~~ | ✅ |
-| 15 | Tauri GUI (desktop) | ✅ Builds |
-| 16 | GUI IPC + streaming | 🔜 Next |
-| 17 | Tauri mobile (Android/iOS) | Later |
+| 15 | ~~Tauri GUI scaffold~~ | ✅ |
+| 16 | ~~GUI IPC + streaming~~ | ✅ |
+| 17 | ~~Settings + session mgmt~~ | ✅ |
+| 18 | ~~Markdown rendering~~ | ✅ |
+| 19 | Tool call visualization | 🔜 Next |
+| 20 | System tray | Later |
+| 21 | Tauri mobile (Android/iOS) | Later |
