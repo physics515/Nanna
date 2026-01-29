@@ -6,10 +6,12 @@
 //! Provides a unified interface for different messaging platforms.
 
 pub mod discord;
+pub mod signal;
 pub mod slack;
 pub mod telegram;
 
 pub use discord::DiscordChannel;
+pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 
