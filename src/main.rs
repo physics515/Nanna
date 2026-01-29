@@ -471,6 +471,18 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
         info!("CPU-only mode (SIMD active)");
     }
 
+    // Get Telegram token from config or environment
+    let telegram_token = config
+        .channels
+        .telegram
+        .as_ref()
+        .map(|t| t.bot_token.clone())
+        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok());
+
+    if telegram_token.is_some() {
+        info!("Telegram channel enabled");
+    }
+
     // Build app state - pass Arcs directly
     let state = AppStateBuilder::new()
         .bot(bot)
@@ -479,6 +491,7 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
         .tools_arc(tools.clone())
         .webhook_secret(config.server.webhook_secret.clone())
         .default_model(config.llm.model.clone())
+        .telegram_token(telegram_token)
         .build();
 
     // Start the scheduler for heartbeats and scheduled tasks

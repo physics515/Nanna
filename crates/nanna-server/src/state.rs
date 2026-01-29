@@ -1,6 +1,7 @@
 //! Application state shared across handlers
 
 use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions};
+use nanna_channels::TelegramChannel;
 use nanna_core::Nanna;
 use nanna_llm::LlmClient;
 use nanna_storage::Storage;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub webhook_secret: Option<String>,
     pub discord_public_key: Option<String>,
     pub default_model: String,
+    /// Telegram channel for proactive sends
+    pub telegram: Option<Arc<TelegramChannel>>,
 }
 
 /// Builder for `AppState`
@@ -31,6 +34,7 @@ pub struct AppStateBuilder {
     webhook_secret: Option<String>,
     discord_public_key: Option<String>,
     default_model: String,
+    telegram_token: Option<String>,
 }
 
 impl Default for AppStateBuilder {
@@ -50,6 +54,7 @@ impl AppStateBuilder {
             webhook_secret: None,
             discord_public_key: None,
             default_model: "claude-sonnet-4-20250514".to_string(),
+            telegram_token: None,
         }
     }
 
@@ -116,6 +121,13 @@ impl AppStateBuilder {
         self
     }
 
+    /// Set the Telegram bot token.
+    #[must_use]
+    pub fn telegram_token(mut self, token: Option<String>) -> Self {
+        self.telegram_token = token;
+        self
+    }
+
     /// Build the `AppState`.
     ///
     /// # Panics
@@ -123,6 +135,10 @@ impl AppStateBuilder {
     /// Panics if bot, storage, llm, or tools are not set.
     #[must_use]
     pub fn build(self) -> AppState {
+        let telegram = self.telegram_token.map(|token| {
+            Arc::new(TelegramChannel::new(token))
+        });
+
         AppState {
             bot: Arc::new(self.bot.expect("bot required")),
             storage: self.storage.expect("storage required"),
@@ -132,6 +148,7 @@ impl AppStateBuilder {
             webhook_secret: self.webhook_secret,
             discord_public_key: self.discord_public_key,
             default_model: self.default_model,
+            telegram,
         }
     }
 }

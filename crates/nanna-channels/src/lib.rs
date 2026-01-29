@@ -5,6 +5,10 @@
 //!
 //! Provides a unified interface for different messaging platforms.
 
+pub mod telegram;
+
+pub use telegram::TelegramChannel;
+
 use async_trait::async_trait;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
