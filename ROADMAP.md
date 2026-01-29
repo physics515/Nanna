@@ -22,7 +22,9 @@
 - [x] Audio tools (TTS, transcription)
 - [x] Authoring tools (runtime tool creation) — `nanna-scripting` crate
   - [x] Boa engine (pure Rust, lightweight)
-  - [ ] Deno engine (V8 fallback for full TS support)
+  - [x] Deno engine (V8 fallback for full TS support)
+    - [x] TypeScript transpilation via deno_ast
+    - [x] V8 execution via deno_core 0.375
 
 ### Channels
 - [x] Telegram (full API: send, react, edit, delete, pin, poll)
@@ -45,9 +47,13 @@
   - [x] nanna-tools bridge
 - [x] Background task spawning — `AgentCoordinator::spawn_task()`
 - [x] Agent-to-agent communication — `send_message()` / `check_mailbox()`
-- [ ] Supervisor patterns (restart policies, health checks)
+- [x] Supervisor patterns — `nanna-agent/src/supervisor.rs`
+  - [x] RestartPolicy (Never, Always, OnFailure, ExponentialBackoff)
+  - [x] HealthCheckConfig (interval, timeout, thresholds, probe prompt)
+  - [x] SupervisionStrategy (OneForOne, OneForAll, RestForOne)
+  - [x] Supervisor with lifecycle management
 
-## Phase 4: GUI Application 🆕
+## Phase 4: GUI Application 🔜
 **Stack:** Tauri v2 + Nuxt v4 + Tailwind v4
 
 ### Design
@@ -83,13 +89,17 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [ ] System tray / menu bar presence
 
 ### Technical
-- [ ] Tauri v2 setup with Rust backend
-- [ ] Nuxt v4 frontend (SSG mode for Tauri)
-- [ ] Tailwind v4 styling
+- [x] Tauri v2 setup with Rust backend
+- [x] Nuxt v4 frontend (SSG mode for Tauri)
+- [x] Tailwind v4 styling
 - [ ] shadcn-vue component library
 - [ ] IPC bridge to nanna-core
 - [ ] Mobile-responsive layouts
 - [ ] Native notifications
+
+### Build Artifacts (Windows)
+- MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
+- NSIS: `D:\Development\Cargo Target\release\bundle\nsis\Nanna_0.1.0_x64-setup.exe`
 
 ## Phase 5: Production Hardening
 - [ ] Prometheus metrics
@@ -119,7 +129,8 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 10 | ~~WhatsApp channel~~ | ✅ |
 | 11 | ~~MCP server mode~~ | ✅ |
 | 12 | ~~Background tasks~~ | ✅ |
-| 13 | Supervisor patterns | 🔜 Next |
-| 14 | Tauri GUI (desktop) | 🔜 |
-| 15 | Deno scripting fallback | Later |
-| 16 | Tauri mobile (Android/iOS) | Later |
+| 13 | ~~Supervisor patterns~~ | ✅ |
+| 14 | ~~Deno scripting~~ | ✅ |
+| 15 | Tauri GUI (desktop) | ✅ Builds |
+| 16 | GUI IPC + streaming | 🔜 Next |
+| 17 | Tauri mobile (Android/iOS) | Later |

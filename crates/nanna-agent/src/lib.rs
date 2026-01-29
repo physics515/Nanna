@@ -9,6 +9,7 @@ mod context;
 mod loop_runner;
 mod multi;
 mod prompts;
+mod supervisor;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -19,6 +20,10 @@ pub use loop_runner::{
     RunOptions, StreamCallback, ToolCallRecord,
 };
 pub use multi::{AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, TaskStatus};
+pub use supervisor::{
+    AgentState, AgentStats, HealthCheckConfig, RestartPolicy, SupervisedAgentConfig,
+    SupervisionStrategy, Supervisor, SupervisorEvent, SupervisorEventType,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

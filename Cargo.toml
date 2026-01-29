@@ -46,6 +46,7 @@ members = [
     "crates/nanna-browser",
     "crates/nanna-mcp",
     "crates/nanna-scripting",
+    "gui/src-tauri",
 ]
 
 [workspace.package]
@@ -97,6 +98,11 @@ async-trait = "0.1"
 # Config
 toml = "0.8"
 directories = "6"
+
+# GUI (Tauri v2)
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-shell = "2"
 
 [profile.release]
 lto = "fat"

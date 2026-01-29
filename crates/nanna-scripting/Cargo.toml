@@ -7,7 +7,7 @@ description = "JavaScript/TypeScript scripting engine for Nanna tools"
 [features]
 default = ["boa"]
 boa = ["boa_engine", "boa_runtime"]
-deno = ["deno_core", "deno_ast"]
+deno = ["deno_core", "deno_ast", "deno_error"]
 full = ["boa", "deno"]
 
 [dependencies]
@@ -26,8 +26,10 @@ boa_engine = { version = "0.21", optional = true }
 boa_runtime = { version = "0.21", optional = true }
 
 # Deno - V8-based (full featured fallback)
-deno_core = { version = "0.340", optional = true }
-deno_ast = { version = "0.46", features = ["transpiling"], optional = true }
+# NOTE: deno_core and boa_engine have conflicting ICU versions at latest - use one or the other
+deno_core = { version = "0.375", optional = true }
+deno_ast = { version = "0.51", features = ["transpiling"], optional = true }
+deno_error = { version = "0.7", optional = true }
 
 # TypeScript transpilation for Boa
 swc_core = { version = "7", features = ["ecma_parser", "ecma_transforms", "ecma_codegen", "common"], optional = true }
