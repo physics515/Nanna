@@ -1,0 +1,33 @@
+[package]
+name = "nanna-scripting"
+version.workspace = true
+edition.workspace = true
+description = "JavaScript/TypeScript scripting engine for Nanna tools"
+
+[features]
+default = ["boa"]
+boa = ["boa_engine", "boa_runtime"]
+deno = ["deno_core", "deno_ast"]
+full = ["boa", "deno"]
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+url = "2"
+
+# Boa - Pure Rust JS engine (lightweight)
+boa_engine = { version = "0.21", optional = true }
+boa_runtime = { version = "0.21", optional = true }
+
+# Deno - V8-based (full featured fallback)
+deno_core = { version = "0.340", optional = true }
+deno_ast = { version = "0.46", features = ["transpiling"], optional = true }
+
+# TypeScript transpilation for Boa
+swc_core = { version = "7", features = ["ecma_parser", "ecma_transforms", "ecma_codegen", "common"], optional = true }

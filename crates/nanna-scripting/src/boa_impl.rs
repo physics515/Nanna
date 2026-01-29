@@ -1,0 +1,328 @@
+//! Boa JavaScript engine implementation
+//!
+//! Pure Rust JS engine - lightweight but limited ECMAScript support.
+
+use crate::{NannaBridge, Result, ScriptError, ScriptedTool};
+use boa_engine::{
+    js_string, property::Attribute, Context, JsArgs, JsResult,
+    JsValue, NativeFunction, Source,
+};
+use serde_json::Value;
+use std::sync::Arc;
+
+/// Execute a tool with Boa
+pub async fn execute(
+    tool: &ScriptedTool,
+    input: &Value,
+    bridge: &Arc<NannaBridge>,
+) -> Result<Value> {
+    // Transpile TypeScript if needed
+    let source = if tool.is_typescript {
+        transpile_typescript(&tool.source)?
+    } else {
+        tool.source.clone()
+    };
+
+    // Wrap execution in a blocking task (Boa is sync)
+    let source_clone = source.clone();
+    let input_clone = input.clone();
+    let bridge_clone = bridge.clone();
+    let timeout_ms = tool.timeout_ms;
+
+    let result = tokio::task::spawn_blocking(move || {
+        execute_sync(&source_clone, &input_clone, &bridge_clone)
+    });
+
+    // Apply timeout
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), result).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(ScriptError::Execution(format!("Task panicked: {e}"))),
+        Err(_) => Err(ScriptError::Timeout(timeout_ms)),
+    }
+}
+
+/// Synchronous execution (runs in blocking task)
+fn execute_sync(
+    source: &str,
+    input: &Value,
+    bridge: &Arc<NannaBridge>,
+) -> Result<Value> {
+    let mut context = Context::default();
+
+    // Register console.log
+    register_console(&mut context)?;
+
+    // Register Nanna bridge functions
+    register_nanna_bridge(&mut context, bridge)?;
+
+    // Inject INPUT as a global
+    let input_js = json_to_js(input, &mut context)?;
+    context
+        .register_global_property(js_string!("INPUT"), input_js, Attribute::READONLY)
+        .map_err(|e| ScriptError::Execution(format!("Failed to set INPUT: {e}")))?;
+
+    // Wrap source in an async IIFE that calls execute()
+    let wrapped = format!(
+        r#"
+        (function() {{
+            {source}
+            
+            // Get the default export
+            if (typeof module !== 'undefined' && module.exports && module.exports.default) {{
+                return module.exports.default;
+            }}
+            // Check for export default pattern by looking for execute
+            const tool = (function() {{
+                {source}
+                return typeof execute === 'function' ? {{ execute }} : null;
+            }})();
+            
+            if (tool && typeof tool.execute === 'function') {{
+                return tool.execute(INPUT);
+            }}
+            
+            // Try to find execute function in global scope
+            if (typeof execute === 'function') {{
+                return execute(INPUT);
+            }}
+            
+            throw new Error('No execute function found in tool');
+        }})()
+        "#
+    );
+
+    // Parse and execute
+    let result = context
+        .eval(Source::from_bytes(&wrapped))
+        .map_err(|e| ScriptError::Execution(format!("Execution failed: {e}")))?;
+
+    // Convert result back to JSON
+    js_to_json(&result, &mut context)
+}
+
+/// Register console.log/warn/error
+fn register_console(context: &mut Context) -> Result<()> {
+    // Create console object
+    let console = boa_engine::object::ObjectInitializer::new(context)
+        .function(
+            NativeFunction::from_fn_ptr(console_log),
+            js_string!("log"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(console_warn),
+            js_string!("warn"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(console_error),
+            js_string!("error"),
+            0,
+        )
+        .build();
+
+    context
+        .register_global_property(js_string!("console"), console, Attribute::all())
+        .map_err(|e| ScriptError::Execution(format!("Failed to register console: {e}")))?;
+
+    Ok(())
+}
+
+fn console_log(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let msg = format_console_args(args, context);
+    tracing::info!(target: "script", "{}", msg);
+    Ok(JsValue::undefined())
+}
+
+fn console_warn(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let msg = format_console_args(args, context);
+    tracing::warn!(target: "script", "{}", msg);
+    Ok(JsValue::undefined())
+}
+
+fn console_error(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let msg = format_console_args(args, context);
+    tracing::error!(target: "script", "{}", msg);
+    Ok(JsValue::undefined())
+}
+
+fn format_console_args(args: &[JsValue], context: &mut Context) -> String {
+    args.iter()
+        .map(|v| {
+            v.to_string(context)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|_| "[object]".to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Register Nanna bridge functions
+fn register_nanna_bridge(context: &mut Context, _bridge: &Arc<NannaBridge>) -> Result<()> {
+    // Create Nanna object with bridge functions
+    // Note: Boa doesn't support async natively in the same way, so we provide sync stubs
+    // Real async operations would need to use Boa's promise/job queue system
+    
+    let nanna = boa_engine::object::ObjectInitializer::new(context)
+        .function(
+            NativeFunction::from_fn_ptr(nanna_log),
+            js_string!("log"),
+            2,
+        )
+        .build();
+
+    context
+        .register_global_property(js_string!("Nanna"), nanna, Attribute::all())
+        .map_err(|e| ScriptError::Execution(format!("Failed to register Nanna: {e}")))?;
+
+    Ok(())
+}
+
+fn nanna_log(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let level = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let msg = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
+    
+    match level.as_str() {
+        "debug" => tracing::debug!(target: "script", "{}", msg),
+        "info" => tracing::info!(target: "script", "{}", msg),
+        "warn" => tracing::warn!(target: "script", "{}", msg),
+        "error" => tracing::error!(target: "script", "{}", msg),
+        _ => tracing::info!(target: "script", "{}", msg),
+    }
+    
+    Ok(JsValue::undefined())
+}
+
+/// Convert JSON Value to Boa JsValue
+fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
+    match value {
+        Value::Null => Ok(JsValue::null()),
+        Value::Bool(b) => Ok(JsValue::from(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(JsValue::from(i as f64))
+            } else if let Some(f) = n.as_f64() {
+                Ok(JsValue::from(f))
+            } else {
+                Ok(JsValue::from(0.0))
+            }
+        }
+        Value::String(s) => Ok(JsValue::from(js_string!(s.as_str()))),
+        Value::Array(arr) => {
+            let js_array = boa_engine::object::builtins::JsArray::new(context);
+            for item in arr {
+                let js_item = json_to_js(item, context)?;
+                js_array.push(js_item, context)
+                    .map_err(|e| ScriptError::Execution(format!("Array push failed: {e}")))?;
+            }
+            Ok(js_array.into())
+        }
+        Value::Object(obj) => {
+            let js_obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            for (key, val) in obj {
+                let js_val = json_to_js(val, context)?;
+                js_obj.set(js_string!(key.as_str()), js_val, false, context)
+                    .map_err(|e| ScriptError::Execution(format!("Object set failed: {e}")))?;
+            }
+            Ok(js_obj.into())
+        }
+    }
+}
+
+/// Convert Boa JsValue to JSON Value
+fn js_to_json(value: &JsValue, context: &mut Context) -> Result<Value> {
+    // Use Boa's variant enum for pattern matching
+    use boa_engine::value::JsVariant;
+    
+    match value.variant() {
+        JsVariant::Undefined | JsVariant::Null => Ok(Value::Null),
+        JsVariant::Boolean(b) => Ok(Value::Bool(b)),
+        JsVariant::Integer32(i) => Ok(Value::Number(i.into())),
+        JsVariant::Float64(f) => {
+            serde_json::Number::from_f64(f)
+                .map(Value::Number)
+                .ok_or_else(|| ScriptError::Execution("Invalid float".to_string()))
+        }
+        JsVariant::String(s) => Ok(Value::String(s.to_std_string_escaped())),
+        JsVariant::Object(obj) => {
+            // Check if it's an array
+            if obj.is_array() {
+                let length = obj
+                    .get(js_string!("length"), context)
+                    .map_err(|e| ScriptError::Execution(format!("Get length failed: {e}")))?
+                    .to_u32(context)
+                    .map_err(|e| ScriptError::Execution(format!("Length to u32 failed: {e}")))?;
+
+                let mut arr = Vec::with_capacity(length as usize);
+                for i in 0..length {
+                    let item = obj
+                        .get(i, context)
+                        .map_err(|e| ScriptError::Execution(format!("Array get failed: {e}")))?;
+                    arr.push(js_to_json(&item, context)?);
+                }
+                Ok(Value::Array(arr))
+            } else {
+                // Regular object
+                let keys = obj
+                    .own_property_keys(context)
+                    .map_err(|e| ScriptError::Execution(format!("Get keys failed: {e}")))?;
+
+                let mut map = serde_json::Map::new();
+                for key in keys {
+                    // Convert PropertyKey to string
+                    let key_str = match &key {
+                        boa_engine::property::PropertyKey::String(s) => s.to_std_string_escaped(),
+                        boa_engine::property::PropertyKey::Symbol(_) => continue, // Skip symbols
+                        boa_engine::property::PropertyKey::Index(i) => i.get().to_string(),
+                    };
+                    
+                    let val = obj
+                        .get(key, context)
+                        .map_err(|e| ScriptError::Execution(format!("Object get failed: {e}")))?;
+                    
+                    // Skip functions
+                    if !val.is_callable() {
+                        map.insert(key_str, js_to_json(&val, context)?);
+                    }
+                }
+                Ok(Value::Object(map))
+            }
+        }
+        JsVariant::BigInt(_) => Ok(Value::Null), // BigInt not directly representable in JSON
+        JsVariant::Symbol(_) => Ok(Value::Null), // Symbols not representable in JSON
+    }
+}
+
+/// Transpile TypeScript to JavaScript
+/// Note: Boa doesn't support TypeScript natively. If actual TS syntax is present,
+/// execution will fail and trigger Deno fallback (which has real TS support).
+fn transpile_typescript(source: &str) -> Result<String> {
+    // Just pass through - Boa handles plain JS, Deno handles TS
+    Ok(source.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_roundtrip() {
+        let mut context = Context::default();
+        
+        let input = serde_json::json!({
+            "name": "test",
+            "count": 42.0,  // Use float to match Boa's internal representation
+            "enabled": true,
+            "tags": ["a", "b", "c"]
+        });
+        
+        let js_val = json_to_js(&input, &mut context).unwrap();
+        let output = js_to_json(&js_val, &mut context).unwrap();
+        
+        // Compare structurally (Boa uses f64 internally, so integers become floats)
+        assert_eq!(output["name"], "test");
+        assert_eq!(output["count"].as_f64().unwrap() as i64, 42);
+        assert_eq!(output["enabled"], true);
+        assert_eq!(output["tags"].as_array().unwrap().len(), 3);
+    }
+}

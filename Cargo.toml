@@ -45,6 +45,7 @@ members = [
     "crates/nanna-storage",
     "crates/nanna-browser",
     "crates/nanna-mcp",
+    "crates/nanna-scripting",
 ]
 
 [workspace.package]
