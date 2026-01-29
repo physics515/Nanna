@@ -1,5 +1,6 @@
 //! Built-in tools
 
+mod audio;
 mod authoring;
 mod curiosity;
 mod echo;
@@ -11,6 +12,7 @@ mod schedule;
 mod vision;
 mod web;
 
+pub use audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
 pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
 pub use curiosity::{ExploreTool, WonderTool, StatusTool};
 pub use echo::EchoTool;
