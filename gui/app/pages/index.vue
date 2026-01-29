@@ -5,7 +5,12 @@
       <h2 class="text-lg font-semibold text-nanna-text">
         {{ currentSession?.name || 'New Chat' }}
       </h2>
-      <p class="text-sm text-nanna-text-muted">Model: {{ config?.model || 'Loading...' }}</p>
+      <p class="text-sm text-nanna-text-muted">
+        Model: {{ config?.model || 'Loading...' }}
+        <span v-if="config?.available_tools?.length" class="ml-2 text-nanna-secondary">
+          • {{ config.available_tools.length }} tools
+        </span>
+      </p>
     </header>
     
     <!-- Messages area -->
@@ -20,6 +25,9 @@
           <p class="text-nanna-text-muted">
             Your AI assistant is ready. Type a message to begin.
           </p>
+          <div v-if="config?.available_tools?.length" class="mt-4 text-sm text-nanna-text-dim">
+            Available tools: {{ config.available_tools.join(', ') }}
+          </div>
         </div>
       </div>
       
@@ -55,17 +63,29 @@
                 {{ msg.content }}
               </div>
               
-              <!-- Tool calls -->
+              <!-- Tool calls for this message -->
               <div v-if="msg.toolCalls?.length" class="mt-3 space-y-2">
-                <div v-for="(tool, tidx) in msg.toolCalls" :key="tidx" class="tool-call">
-                  <div class="text-nanna-secondary font-semibold">
-                    🔧 {{ tool.name }}
-                  </div>
-                  <pre class="text-xs text-nanna-text-muted mt-1 overflow-x-auto">{{ JSON.stringify(tool.input, null, 2) }}</pre>
-                </div>
+                <ToolCallCard 
+                  v-for="tool in msg.toolCalls" 
+                  :key="tool.id"
+                  :tool-call="tool"
+                  :status="tool.success ? 'completed' : 'error'"
+                />
               </div>
             </div>
           </div>
+        </div>
+      </div>
+      
+      <!-- Active tool calls during streaming -->
+      <div v-if="activeToolCalls.length > 0" class="max-w-4xl mx-auto mr-12">
+        <div class="space-y-2">
+          <ToolCallCard 
+            v-for="tool in activeToolCalls" 
+            :key="tool.id"
+            :tool-call="tool"
+            :status="tool.status"
+          />
         </div>
       </div>
       
@@ -78,9 +98,14 @@
             </div>
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">Nanna</div>
-              <div class="prose prose-invert prose-sm max-w-none">
+              <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
                 <span v-html="renderMarkdown(streamingContent)"></span>
                 <span class="cursor-blink">▋</span>
+              </div>
+              <div v-else class="text-nanna-text-muted flex items-center gap-2">
+                <span class="animate-pulse">●</span>
+                <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
+                <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
               </div>
             </div>
           </div>
@@ -88,7 +113,7 @@
       </div>
       
       <!-- Loading indicator (before streaming starts) -->
-      <div v-if="isLoading && !isStreaming" class="max-w-4xl mx-auto">
+      <div v-if="isLoading && !isStreaming && activeToolCalls.length === 0" class="max-w-4xl mx-auto">
         <div class="message-assistant p-4 rounded-lg mr-12">
           <div class="flex items-center gap-3">
             <div class="w-8 h-8 rounded-full bg-nanna-accent text-nanna-bg-deep flex items-center justify-center">
@@ -133,7 +158,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onUnmounted, computed } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { marked } from 'marked'
@@ -152,12 +177,14 @@ function renderMarkdown(content: string): string {
   }
 }
 
-interface ToolCall {
+interface ToolCallInfo {
   id: string
   name: string
   input: any
   output: string
   success: boolean
+  duration_ms: number
+  status?: 'started' | 'completed' | 'error'
 }
 
 interface Message {
@@ -165,7 +192,7 @@ interface Message {
   role: 'user' | 'assistant'
   content: string
   timestamp: string
-  toolCalls?: ToolCall[]
+  toolCalls?: ToolCallInfo[]
 }
 
 interface SessionInfo {
@@ -181,12 +208,19 @@ interface AppConfig {
   model: string
   api_key_set: boolean
   available_models: string[]
+  available_tools: string[]
 }
 
 interface StreamChunk {
   session_id: string
   chunk: string
   done: boolean
+}
+
+interface ToolCallEvent {
+  session_id: string
+  tool_call: ToolCallInfo
+  status: 'started' | 'completed' | 'error'
 }
 
 const messages = ref<Message[]>([])
@@ -197,8 +231,10 @@ const streamingContent = ref('')
 const messagesContainer = ref<HTMLElement | null>(null)
 const currentSession = ref<SessionInfo | null>(null)
 const config = ref<AppConfig | null>(null)
+const activeToolCalls = ref<(ToolCallInfo & { status: 'started' | 'completed' | 'error' })[]>([])
 
-let unlisten: UnlistenFn | null = null
+let unlistenChunk: UnlistenFn | null = null
+let unlistenTool: UnlistenFn | null = null
 
 onMounted(async () => {
   // Load config
@@ -227,37 +263,70 @@ onMounted(async () => {
   }
   
   // Listen for streaming chunks
-  unlisten = await listen<StreamChunk>('stream-chunk', (event) => {
+  unlistenChunk = await listen<StreamChunk>('stream-chunk', (event) => {
     if (event.payload.session_id === currentSession.value?.id) {
       if (event.payload.done) {
         // Streaming complete
         isStreaming.value = false
-        // Add the final message
-        if (streamingContent.value) {
+        // Add the final message with tool calls
+        if (streamingContent.value || activeToolCalls.value.length > 0) {
           messages.value.push({
             id: Date.now().toString(),
             role: 'assistant',
             content: streamingContent.value,
             timestamp: new Date().toISOString(),
-            toolCalls: [],
+            toolCalls: activeToolCalls.value.map(t => ({
+              id: t.id,
+              name: t.name,
+              input: t.input,
+              output: t.output,
+              success: t.success,
+              duration_ms: t.duration_ms,
+            })),
           })
           streamingContent.value = ''
+          activeToolCalls.value = []
         }
         isLoading.value = false
         scrollToBottom()
       } else {
         // Append chunk
+        isStreaming.value = true
         streamingContent.value += event.payload.chunk
         scrollToBottom()
       }
     }
   })
+  
+  // Listen for tool call events
+  unlistenTool = await listen<ToolCallEvent>('tool-call', (event) => {
+    if (event.payload.session_id === currentSession.value?.id) {
+      const { tool_call, status } = event.payload
+      
+      if (status === 'started') {
+        // Add new tool call
+        activeToolCalls.value.push({
+          ...tool_call,
+          status: 'started',
+        })
+      } else {
+        // Update existing tool call
+        const idx = activeToolCalls.value.findIndex(t => t.id === tool_call.id)
+        if (idx !== -1) {
+          activeToolCalls.value[idx] = {
+            ...tool_call,
+            status,
+          }
+        }
+      }
+      scrollToBottom()
+    }
+  })
 })
 
 onUnmounted(() => {
-  if (unlisten) {
-    unlisten()
-  }
+  if (unlistenChunk) unlistenChunk()
+  if (unlistenTool) unlistenTool()
 })
 
 async function sendMessage() {
@@ -280,8 +349,9 @@ async function sendMessage() {
   
   // Start loading
   isLoading.value = true
-  isStreaming.value = true
+  isStreaming.value = false
   streamingContent.value = ''
+  activeToolCalls.value = []
   
   try {
     // Send message and wait for response (streaming happens via events)
@@ -293,6 +363,7 @@ async function sendMessage() {
     console.error('Failed to send message:', error)
     isLoading.value = false
     isStreaming.value = false
+    activeToolCalls.value = []
     // Show error
     messages.value.push({
       id: Date.now().toString(),

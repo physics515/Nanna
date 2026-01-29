@@ -3,8 +3,9 @@
 //! IPC bridge between the frontend and nanna-core.
 
 use nanna_config::Config;
-use nanna_llm::{LlmClient, RequestBuilder};
+use nanna_llm::{LlmClient, RequestBuilder, StreamEvent};
 use nanna_storage::{Storage, StorageConfig};
+use nanna_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -15,6 +16,7 @@ use tracing::{error, info};
 pub struct AppState {
     storage: Arc<Storage>,
     llm: Arc<LlmClient>,
+    tools: Arc<ToolRegistry>,
     config: Config,
 }
 
@@ -29,7 +31,7 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCallInfo>,
 }
 
-/// Tool call info
+/// Tool call info for frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallInfo {
     pub id: String,
@@ -37,6 +39,7 @@ pub struct ToolCallInfo {
     pub input: serde_json::Value,
     pub output: String,
     pub success: bool,
+    pub duration_ms: u64,
 }
 
 /// Session info for frontend
@@ -57,6 +60,14 @@ pub struct StreamChunk {
     pub done: bool,
 }
 
+/// Tool call event for frontend visualization
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallEvent {
+    pub session_id: String,
+    pub tool_call: ToolCallInfo,
+    pub status: String, // "started" | "completed" | "error"
+}
+
 /// Application config for frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -64,6 +75,7 @@ pub struct AppConfig {
     pub model: String,
     pub api_key_set: bool,
     pub available_models: Vec<String>,
+    pub available_tools: Vec<String>,
 }
 
 // =============================================================================
@@ -117,7 +129,7 @@ async fn send_message(
     
     while let Some(event) = stream.next().await {
         match event {
-            nanna_llm::StreamEvent::TextDelta { text, .. } => {
+            StreamEvent::TextDelta { text, .. } => {
                 full_response.push_str(&text);
                 // Emit chunk to frontend
                 let _ = app_clone.emit("stream-chunk", StreamChunk {
@@ -126,14 +138,14 @@ async fn send_message(
                     done: false,
                 });
             }
-            nanna_llm::StreamEvent::MessageStop { .. } => {
+            StreamEvent::MessageStop { .. } => {
                 let _ = app_clone.emit("stream-chunk", StreamChunk {
                     session_id: session_id_clone.clone(),
                     chunk: String::new(),
                     done: true,
                 });
             }
-            nanna_llm::StreamEvent::Error { message } => {
+            StreamEvent::Error { message } => {
                 error!("LLM stream error: {}", message);
                 return Err(format!("LLM error: {}", message));
             }
@@ -264,6 +276,11 @@ async fn get_config(
 ) -> Result<AppConfig, String> {
     let state_guard = state.read().await;
     
+    let tool_names: Vec<String> = state_guard.tools.definitions().await
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    
     Ok(AppConfig {
         theme: "dark".to_string(),
         model: state_guard.config.llm.model.clone(),
@@ -276,6 +293,7 @@ async fn get_config(
             "gpt-4o".to_string(),
             "gpt-4o-mini".to_string(),
         ],
+        available_tools: tool_names,
     })
 }
 
@@ -308,7 +326,7 @@ async fn set_api_key(
     };
     state_guard.llm = Arc::new(llm);
     
-    // Also set env var for this process (safe since we're single-threaded at this point)
+    // Also set env var for this process
     // SAFETY: This is a single-threaded application context
     unsafe {
         std::env::set_var("ANTHROPIC_API_KEY", &api_key);
@@ -347,11 +365,25 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         _ => LlmClient::anthropic(&api_key),
     };
     
+    // Initialize tools
+    let tools = ToolRegistry::new();
+    
+    // Register built-in tools
+    tools.register(nanna_tools::ReadFileTool::new()).await;
+    tools.register(nanna_tools::WriteFileTool::new()).await;
+    tools.register(nanna_tools::ListDirTool::new()).await;
+    tools.register(nanna_tools::ExecTool::new()).await;
+    tools.register(nanna_tools::WebFetchTool::new()).await;
+    tools.register(nanna_tools::WebSearchTool::new()).await;
+    tools.register(nanna_tools::EchoTool).await;
+    
     info!("Nanna GUI initialized with model: {}", config.llm.model);
+    info!("Registered {} tools", tools.definitions().await.len());
     
     Ok(AppState {
         storage: Arc::new(storage),
         llm: Arc::new(llm),
+        tools: Arc::new(tools),
         config,
     })
 }

@@ -33,6 +33,7 @@ nanna-core = { path = "../../crates/nanna-core" }
 nanna-llm = { path = "../../crates/nanna-llm" }
 nanna-config = { path = "../../crates/nanna-config" }
 nanna-storage = { path = "../../crates/nanna-storage" }
+nanna-tools = { path = "../../crates/nanna-tools" }
 
 [features]
 default = ["custom-protocol"]
