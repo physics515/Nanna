@@ -2,20 +2,23 @@
 
 use crate::{Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
+use scraper::{Html, Selector};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Web search tool (stub - requires API key)
+/// Web search tool using Brave Search API
 pub struct WebSearchTool {
     pub api_key: Option<String>,
 }
 
 impl WebSearchTool {
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self { api_key: None }
     }
 
+    #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
@@ -28,10 +31,28 @@ impl Default for WebSearchTool {
     }
 }
 
+/// Brave Search API response types
+#[derive(Debug, Deserialize)]
+struct BraveSearchResponse {
+    web: Option<BraveWebResults>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveWebResults {
+    results: Vec<BraveWebResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveWebResult {
+    title: String,
+    url: String,
+    description: Option<String>,
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new("web_search", "Search the web using a search API")
+        ToolDefinition::new("web_search", "Search the web using Brave Search API")
             .string_param("query", "Search query string", true)
             .int_param("count", "Number of results to return (1-10)", false)
     }
@@ -42,34 +63,75 @@ impl Tool for WebSearchTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("Missing 'query' parameter".to_string()))?;
 
-        let _count = params
+        let count = params
             .get("count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(5)
-            .min(10);
+            .min(10) as usize;
 
-        // TODO: Implement actual search API (Brave, Serper, etc.)
-        if self.api_key.is_none() {
-            return Err(ToolError::ExecutionFailed(
-                "Web search API key not configured".to_string(),
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            ToolError::ExecutionFailed("Brave Search API key not configured".to_string())
+        })?;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get("https://api.search.brave.com/res/v1/web/search")
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", api_key)
+            .query(&[("q", query), ("count", &count.to_string())])
+            .send()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Search request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ToolError::ExecutionFailed(format!(
+                "Brave Search API error: {status} - {body}"
+            )));
+        }
+
+        let search_result: BraveSearchResponse = response
+            .json()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to parse response: {e}")))?;
+
+        let results = search_result
+            .web
+            .map(|w| w.results)
+            .unwrap_or_default();
+
+        if results.is_empty() {
+            return Ok(ToolResult::success("No results found."));
+        }
+
+        // Format results as readable text
+        let mut output = String::new();
+        for (i, result) in results.iter().take(count).enumerate() {
+            output.push_str(&format!(
+                "{}. {}\n   {}\n   {}\n\n",
+                i + 1,
+                result.title,
+                result.url,
+                result.description.as_deref().unwrap_or("No description")
             ));
         }
 
-        // Placeholder response
-        Ok(ToolResult::error(format!(
-            "Web search not yet implemented. Query: {query}"
-        )))
+        Ok(ToolResult::success(output).with_data(serde_json::json!({
+            "query": query,
+            "result_count": results.len(),
+        })))
     }
 }
 
-/// Fetch web page content
+/// Fetch web page content with readability extraction
 pub struct WebFetchTool {
     pub max_size: usize,
     pub timeout_secs: u64,
 }
 
 impl WebFetchTool {
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             max_size: 1024 * 1024, // 1MB
@@ -110,13 +172,12 @@ impl Tool for WebFetchTool {
             ));
         }
 
-        // TODO: Use reqwest to fetch, then readability/html2text to extract
-        // For now, just fetch raw HTML
-
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {e}")))?;
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to create HTTP client: {e}"))
+            })?;
 
         let response = client
             .get(url)
@@ -127,9 +188,7 @@ impl Tool for WebFetchTool {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "HTTP error: {status}"
-            )));
+            return Err(ToolError::ExecutionFailed(format!("HTTP error: {status}")));
         }
 
         let content = response
@@ -137,10 +196,14 @@ impl Tool for WebFetchTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response: {e}")))?;
 
-        // Basic HTML stripping (TODO: use proper readability extraction)
-        let text = strip_html_basic(&content);
+        // Extract readable content
+        let text = extract_readable_content(&content);
         let truncated = if text.len() > max_chars {
-            format!("{}...\n\n[Truncated at {} chars]", &text[..max_chars], max_chars)
+            format!(
+                "{}...\n\n[Truncated at {} chars]",
+                &text[..max_chars],
+                max_chars
+            )
         } else {
             text
         };
@@ -157,30 +220,165 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Basic HTML tag stripping (very naive, should use a proper library)
-fn strip_html_basic(html: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let in_script = false;
-    let in_style = false;
+/// Extract readable content from HTML using a readability-style algorithm.
+///
+/// This removes scripts, styles, navigation, ads, and other boilerplate,
+/// keeping the main content.
+fn extract_readable_content(html: &str) -> String {
+    let document = Html::parse_document(html);
 
-    for c in html.chars() {
-        match c {
-            '<' => {
-                in_tag = true;
+    // Try to find main content areas
+    let content_selectors = [
+        "article",
+        "main",
+        "[role=\"main\"]",
+        ".post-content",
+        ".article-content",
+        ".entry-content",
+        ".content",
+        "#content",
+        ".post",
+        ".article",
+    ];
+
+    // Try each content selector
+    for selector_str in &content_selectors {
+        if let Ok(selector) = Selector::parse(selector_str) {
+            if let Some(element) = document.select(&selector).next() {
+                let text = extract_text_from_element(&element);
+                if text.len() > 200 {
+                    // Likely main content
+                    return clean_extracted_text(&text);
+                }
             }
-            '>' => {
-                in_tag = false;
+        }
+    }
+
+    // Fallback: extract from body, excluding common noise elements
+    if let Ok(body_selector) = Selector::parse("body") {
+        if let Some(body) = document.select(&body_selector).next() {
+            let text = extract_text_from_element(&body);
+            return clean_extracted_text(&text);
+        }
+    }
+
+    // Last resort: strip all tags
+    strip_html_basic(html)
+}
+
+/// Extract text from an HTML element, skipping script/style/nav elements.
+fn extract_text_from_element(element: &scraper::ElementRef) -> String {
+    let skip_tags = ["script", "style", "nav", "header", "footer", "aside", "noscript", "iframe"];
+
+    let mut text = String::new();
+
+    for node in element.descendants() {
+        match node.value() {
+            scraper::node::Node::Text(t) => {
+                // Check if any ancestor is a skip tag
+                let should_skip = node.ancestors().any(|ancestor| {
+                    if let Some(el) = ancestor.value().as_element() {
+                        skip_tags.contains(&el.name())
+                    } else {
+                        false
+                    }
+                });
+
+                if !should_skip {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        if !text.is_empty() && !text.ends_with('\n') && !text.ends_with(' ') {
+                            text.push(' ');
+                        }
+                        text.push_str(trimmed);
+                    }
+                }
             }
-            _ if in_tag => {
-                // Check for script/style tags
-                // This is very naive
-            }
-            _ if !in_script && !in_style => {
-                result.push(c);
+            scraper::node::Node::Element(el) => {
+                // Add line breaks for block elements
+                let block_tags = ["p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"];
+                if block_tags.contains(&el.name()) && !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
             }
             _ => {}
         }
+    }
+
+    text
+}
+
+/// Clean up extracted text (normalize whitespace, remove excess blank lines).
+fn clean_extracted_text(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // Collapse multiple blank-ish lines
+    let mut result = String::new();
+    let mut prev_empty = false;
+
+    for line in lines {
+        let is_short = line.len() < 3;
+        if is_short && prev_empty {
+            continue; // Skip consecutive short lines
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+        prev_empty = is_short;
+    }
+
+    result
+}
+
+/// Basic HTML tag stripping (fallback).
+fn strip_html_basic(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut tag_name = String::new();
+
+    let chars: Vec<char> = html.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '<' {
+            in_tag = true;
+            tag_name.clear();
+            i += 1;
+            continue;
+        }
+
+        if c == '>' && in_tag {
+            in_tag = false;
+            let tag_lower = tag_name.to_lowercase();
+            if tag_lower.starts_with("script") {
+                in_script = true;
+            } else if tag_lower.starts_with("/script") {
+                in_script = false;
+            } else if tag_lower.starts_with("style") {
+                in_style = true;
+            } else if tag_lower.starts_with("/style") {
+                in_style = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_tag {
+            tag_name.push(c);
+        } else if !in_script && !in_style {
+            result.push(c);
+        }
+
+        i += 1;
     }
 
     // Clean up whitespace

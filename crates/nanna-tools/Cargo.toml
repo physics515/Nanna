@@ -22,3 +22,6 @@ glob = "0.3"
 
 # For parallel execution
 futures = "0.3"
+
+# For HTML extraction
+scraper = "0.22"

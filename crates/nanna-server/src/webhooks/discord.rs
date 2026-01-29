@@ -8,8 +8,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Discord interaction types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -108,15 +109,85 @@ pub struct InteractionResponseData {
     pub flags: Option<u32>,
 }
 
+/// Verify Discord request signature using Ed25519.
+///
+/// Discord signs requests with: signature = Ed25519(timestamp + body)
+fn verify_discord_signature(
+    public_key: &str,
+    signature_hex: &str,
+    timestamp: &str,
+    body: &[u8],
+) -> bool {
+    // Decode the public key from hex
+    let Ok(key_bytes) = hex::decode(public_key) else {
+        warn!("Failed to decode Discord public key from hex");
+        return false;
+    };
+
+    let Ok(key_bytes): Result<[u8; 32], _> = key_bytes.try_into() else {
+        warn!("Discord public key has invalid length");
+        return false;
+    };
+
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&key_bytes) else {
+        warn!("Invalid Discord public key");
+        return false;
+    };
+
+    // Decode the signature from hex
+    let Ok(sig_bytes) = hex::decode(signature_hex) else {
+        warn!("Failed to decode Discord signature from hex");
+        return false;
+    };
+
+    let Ok(sig_bytes): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        warn!("Discord signature has invalid length");
+        return false;
+    };
+
+    let signature = Signature::from_bytes(&sig_bytes);
+
+    // Build the message: timestamp + body
+    let mut message = timestamp.as_bytes().to_vec();
+    message.extend_from_slice(body);
+
+    // Verify
+    verifying_key.verify(&message, &signature).is_ok()
+}
+
 /// Handle Discord interaction webhook
 pub async fn handle(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<InteractionResponse>, StatusCode> {
-    // TODO: Verify Discord signature using Ed25519
-    // let signature = headers.get("X-Signature-Ed25519");
-    // let timestamp = headers.get("X-Signature-Timestamp");
+    // Verify Discord signature if public key is configured
+    if let Some(ref public_key) = state.discord_public_key {
+        let signature = headers
+            .get("X-Signature-Ed25519")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                warn!("Missing X-Signature-Ed25519 header");
+                StatusCode::UNAUTHORIZED
+            })?;
+
+        let timestamp = headers
+            .get("X-Signature-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                warn!("Missing X-Signature-Timestamp header");
+                StatusCode::UNAUTHORIZED
+            })?;
+
+        if !verify_discord_signature(public_key, signature, timestamp, &body) {
+            warn!("Discord signature verification failed");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+
+        debug!("Discord signature verified successfully");
+    } else {
+        warn!("Discord public key not configured - skipping signature verification");
+    }
 
     let interaction: Interaction =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;

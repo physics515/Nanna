@@ -18,6 +18,7 @@ pub struct AppState {
     pub tools: Arc<ToolRegistry>,
     pub agents: Arc<RwLock<HashMap<String, Arc<RwLock<Agent>>>>>,
     pub webhook_secret: Option<String>,
+    pub discord_public_key: Option<String>,
     pub default_model: String,
 }
 
@@ -28,6 +29,7 @@ pub struct AppStateBuilder {
     llm: Option<Arc<LlmClient>>,
     tools: Option<Arc<ToolRegistry>>,
     webhook_secret: Option<String>,
+    discord_public_key: Option<String>,
     default_model: String,
 }
 
@@ -46,6 +48,7 @@ impl AppStateBuilder {
             llm: None,
             tools: None,
             webhook_secret: None,
+            discord_public_key: None,
             default_model: "claude-sonnet-4-20250514".to_string(),
         }
     }
@@ -99,6 +102,13 @@ impl AppStateBuilder {
         self
     }
 
+    /// Set the Discord public key for signature verification.
+    #[must_use]
+    pub fn discord_public_key(mut self, key: Option<String>) -> Self {
+        self.discord_public_key = key;
+        self
+    }
+
     /// Set the default model.
     #[must_use]
     pub fn default_model(mut self, model: impl Into<String>) -> Self {
@@ -120,6 +130,7 @@ impl AppStateBuilder {
             tools: self.tools.expect("tools required"),
             agents: Arc::new(RwLock::new(HashMap::new())),
             webhook_secret: self.webhook_secret,
+            discord_public_key: self.discord_public_key,
             default_model: self.default_model,
         }
     }

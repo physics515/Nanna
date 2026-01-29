@@ -6,7 +6,7 @@
 //! Supports Anthropic Claude with proper tool calling and streaming.
 
 use async_stream::stream;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -641,20 +641,39 @@ impl LlmClient {
                 return;
             }
 
-            // Read full response as text (simpler approach for now)
-            // TODO: True SSE streaming with bytes_stream + tokio-stream
-            let text = match response.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    yield Err(LlmError::Http(e));
-                    return;
-                }
-            };
+            // True SSE streaming using bytes_stream
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer = String::new();
 
-            // Parse SSE events from the text
-            let mut buffer = text;
-            while let Some(event) = extract_sse_event(&mut buffer) {
-                if let Some(stream_event) = parse_sse_event(&event) {
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(LlmError::Http(e));
+                        return;
+                    }
+                };
+
+                // Append chunk to buffer (assuming UTF-8)
+                match std::str::from_utf8(&chunk) {
+                    Ok(s) => buffer.push_str(s),
+                    Err(e) => {
+                        yield Err(LlmError::Stream(format!("Invalid UTF-8 in stream: {e}")));
+                        return;
+                    }
+                }
+
+                // Parse complete SSE events from buffer
+                while let Some(event) = extract_sse_event(&mut buffer) {
+                    if let Some(stream_event) = parse_sse_event(&event) {
+                        yield Ok(stream_event);
+                    }
+                }
+            }
+
+            // Handle any remaining data in buffer
+            if !buffer.trim().is_empty() {
+                if let Some(stream_event) = parse_sse_event(&buffer) {
                     yield Ok(stream_event);
                 }
             }
