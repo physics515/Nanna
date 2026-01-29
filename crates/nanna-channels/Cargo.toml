@@ -12,5 +12,5 @@ thiserror.workspace = true
 flume.workspace = true
 async-trait = "0.1"
 bitflags = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 urlencoding = "2"
