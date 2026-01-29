@@ -29,12 +29,18 @@
 - [ ] Signal (signald integration)
 - [ ] WhatsApp (Baileys or Cloud API)
 
-## Phase 3: Multi-Agent & MCP
+## Phase 3: Multi-Agent & MCP 🚧
+- [x] MCP client (external tool servers) — `nanna-mcp` crate
+  - [x] JSON-RPC 2.0 protocol types
+  - [x] Stdio transport (spawn processes)
+  - [x] HTTP/SSE transport
+  - [x] Tool discovery and execution
+  - [x] Resource and prompt support
+  - [x] Adapter for nanna-tools integration
+- [ ] MCP server mode (expose Nanna tools)
 - [ ] Background task spawning
 - [ ] Agent-to-agent communication
 - [ ] Supervisor patterns
-- [ ] MCP client (external tool servers)
-- [ ] MCP server mode (expose Nanna tools)
 
 ## Phase 4: GUI Application 🆕
 **Stack:** Tauri v2 + Nuxt v4 + Tailwind v4
@@ -57,6 +63,7 @@
 - [ ] Tauri v2 setup with Rust backend
 - [ ] Nuxt v4 frontend (SSG mode for Tauri)
 - [ ] Tailwind v4 styling
+- [ ] shadcn-vue component library
 - [ ] IPC bridge to nanna-core
 - [ ] Mobile-responsive layouts
 - [ ] Native notifications
@@ -82,6 +89,8 @@
 | 3 | ~~Vision tools~~ | ✅ |
 | 4 | ~~Discord channel~~ | ✅ |
 | 5 | ~~Audio tools (TTS/Whisper)~~ | ✅ |
-| 6 | MCP client | 🔜 Next |
-| 7 | Tauri GUI (desktop) | 🔜 |
-| 8 | Tauri mobile (Android/iOS) | Later |
+| 6 | ~~MCP client~~ | ✅ |
+| 7 | Wire MCP into agent loop | 🔜 Next |
+| 8 | Slack channel | 🔜 |
+| 9 | Tauri GUI (desktop) | Later |
+| 10 | Tauri mobile (Android/iOS) | Later |

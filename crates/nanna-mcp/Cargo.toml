@@ -1,0 +1,28 @@
+[package]
+name = "nanna-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP (Model Context Protocol) client for Nanna"
+
+[features]
+default = ["stdio", "http"]
+stdio = ["tokio/process"]
+http = ["reqwest", "tokio-tungstenite"]
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+# HTTP transport (optional)
+reqwest = { workspace = true, optional = true }
+tokio-tungstenite = { version = "0.26", optional = true, features = ["native-tls"] }
+
+# For stdio line reading
+futures = "0.3"
+
+# JSON-RPC
+uuid.workspace = true
