@@ -63,6 +63,56 @@ impl Message {
     }
 }
 
+impl AnthropicMessage {
+    /// Create a tool result message
+    pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: content.into(),
+                is_error: if is_error { Some(true) } else { None },
+            }],
+        }
+    }
+    
+    /// Create an assistant message with tool use
+    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }],
+        }
+    }
+    
+    /// Create an assistant message with text and tool use
+    pub fn assistant_with_tool_use(
+        text: Option<String>,
+        tool_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        tool_input: serde_json::Value,
+    ) -> Self {
+        let mut content = Vec::new();
+        if let Some(t) = text {
+            if !t.is_empty() {
+                content.push(ContentBlock::Text { text: t });
+            }
+        }
+        content.push(ContentBlock::ToolUse {
+            id: tool_id.into(),
+            name: tool_name.into(),
+            input: tool_input,
+        });
+        Self {
+            role: "assistant".to_string(),
+            content,
+        }
+    }
+}
+
 /// Anthropic message content block
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -153,9 +203,11 @@ pub struct ToolDefinition {
 pub struct CompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    pub anthropic_messages: Vec<AnthropicMessage>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stream: bool,
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl Default for CompletionRequest {
@@ -163,10 +215,28 @@ impl Default for CompletionRequest {
         Self {
             model: "claude-sonnet-4-20250514".to_string(),
             messages: Vec::new(),
+            anthropic_messages: Vec::new(),
             max_tokens: Some(4096),
             temperature: Some(0.7),
             stream: false,
+            tools: Vec::new(),
         }
+    }
+}
+
+impl CompletionRequest {
+    /// Add tools to the request (Anthropic format)
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<serde_json::Value>) -> Self {
+        self.tools = tools;
+        self
+    }
+    
+    /// Add an Anthropic-format message (for tool use/results)
+    #[must_use]
+    pub fn with_anthropic_message(mut self, msg: AnthropicMessage) -> Self {
+        self.anthropic_messages.push(msg);
+        self
     }
 }
 
@@ -572,7 +642,14 @@ pub enum StreamEvent {
     /// Start of a new message
     MessageStart { id: String, model: String },
     /// Start of a content block
-    ContentBlockStart { index: usize, content_type: String },
+    ContentBlockStart { 
+        index: usize, 
+        content_type: String,
+        /// Tool use ID (only for tool_use blocks)
+        tool_id: Option<String>,
+        /// Tool name (only for tool_use blocks)
+        tool_name: Option<String>,
+    },
     /// Text delta within a content block
     TextDelta { index: usize, text: String },
     /// Tool use delta (JSON fragment)
@@ -748,13 +825,26 @@ impl LlmClient {
             })
             .collect();
 
+        // Merge simple messages with anthropic messages
+        let mut all_messages = messages;
+        all_messages.extend(request.anthropic_messages.clone());
+        
+        // Convert tool JSON values to ToolDefinition
+        let tools = if request.tools.is_empty() {
+            None
+        } else {
+            Some(request.tools.iter().filter_map(|v| {
+                serde_json::from_value::<ToolDefinition>(v.clone()).ok()
+            }).collect())
+        };
+        
         let anthropic_request = AnthropicRequest {
             model: request.model.clone(),
-            messages,
+            messages: all_messages,
             max_tokens: request.max_tokens.unwrap_or(4096),
             temperature: request.temperature,
             system: system_msg,
-            tools: None,
+            tools,
             stream: Some(true),
         };
 
@@ -805,6 +895,8 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
                 StreamEvent::ContentBlockStart {
                     index,
                     content_type: content_block.block_type,
+                    tool_id: content_block.id,
+                    tool_name: content_block.name,
                 }
             }
             AnthropicSSE::ContentBlockDelta { index, delta } => match delta {
