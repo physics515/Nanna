@@ -7,6 +7,7 @@
 
 mod context;
 mod loop_runner;
+mod multi;
 mod prompts;
 
 pub use context::AgentContext;
@@ -14,6 +15,7 @@ pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
     RunOptions, StreamCallback, ToolCallRecord,
 };
+pub use multi::{AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, TaskStatus};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
