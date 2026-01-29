@@ -15,9 +15,8 @@ use thiserror::Error;
 #[cfg(feature = "cdp")]
 pub mod cdp;
 
-// TODO: Playwright integration needs work - API differs significantly
-// #[cfg(feature = "playwright")]
-// pub mod playwright;
+#[cfg(feature = "playwright")]
+pub mod playwright;
 
 #[derive(Error, Debug)]
 pub enum BrowserError {
@@ -248,31 +247,34 @@ pub trait Browser: Send + Sync {
 
 /// Create a browser with the given configuration
 ///
+/// Uses Playwright for Firefox/WebKit, CDP for Chromium (if only CDP is enabled).
+///
 /// # Errors
 ///
 /// Returns `BrowserError::UnsupportedBrowser` if the requested backend is not compiled in.
 #[allow(unused_variables)]
 pub fn create_browser(config: BrowserConfig) -> Result<Arc<dyn Browser>, BrowserError> {
-    #[cfg(feature = "cdp")]
+    // Playwright supports all browsers
+    #[cfg(feature = "playwright")]
+    {
+        return Ok(Arc::new(playwright::PlaywrightBrowser::new(config)));
+    }
+
+    // CDP only supports Chromium
+    #[cfg(all(feature = "cdp", not(feature = "playwright")))]
     {
         if config.browser_type != BrowserType::Chromium {
             return Err(BrowserError::UnsupportedBrowser(
-                "CDP backend only supports Chromium. Use Playwright for Firefox/WebKit.".to_string(),
+                "CDP backend only supports Chromium. Enable 'playwright' feature for Firefox/WebKit.".to_string(),
             ));
         }
         return Ok(Arc::new(cdp::CdpBrowser::new(config)));
     }
 
-    // TODO: Playwright support for Firefox/WebKit
-    // #[cfg(feature = "playwright")]
-    // {
-    //     return Ok(Arc::new(playwright::PlaywrightBrowser::new(config)));
-    // }
-
-    #[cfg(not(feature = "cdp"))]
+    #[cfg(not(any(feature = "cdp", feature = "playwright")))]
     {
         Err(BrowserError::UnsupportedBrowser(
-            "No browser backend enabled. Enable 'cdp' feature.".to_string(),
+            "No browser backend enabled. Enable 'cdp' or 'playwright' feature.".to_string(),
         ))
     }
 }
