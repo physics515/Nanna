@@ -31,7 +31,7 @@
 - [x] Signal (signald: send, react, groups)
 - [x] WhatsApp (Cloud API: send, react, media, templates)
 
-## Phase 3: Multi-Agent & MCP 🚧
+## Phase 3: Multi-Agent & MCP ✅
 - [x] MCP client (external tool servers) — `nanna-mcp` crate
   - [x] JSON-RPC 2.0 protocol types
   - [x] Stdio transport (spawn processes)
@@ -117,7 +117,9 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 8 | ~~Slack channel~~ | ✅ |
 | 9 | ~~Signal channel~~ | ✅ |
 | 10 | ~~WhatsApp channel~~ | ✅ |
-| 11 | Deno scripting fallback | 🔜 Next |
-| 12 | MCP server mode | 🔜 |
-| 13 | Tauri GUI (desktop) | Later |
-| 14 | Tauri mobile (Android/iOS) | Later |
+| 11 | ~~MCP server mode~~ | ✅ |
+| 12 | ~~Background tasks~~ | ✅ |
+| 13 | Supervisor patterns | 🔜 Next |
+| 14 | Tauri GUI (desktop) | 🔜 |
+| 15 | Deno scripting fallback | Later |
+| 16 | Tauri mobile (Android/iOS) | Later |
