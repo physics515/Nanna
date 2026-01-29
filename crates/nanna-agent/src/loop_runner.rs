@@ -57,6 +57,10 @@ pub struct RunOptions {
     pub auto_extract_memories: bool,
     /// Callback for storing extracted memories (required if auto_extract_memories is true)
     pub on_memory: Option<MemoryCallback>,
+    /// Enable uncertainty/confidence tracking
+    pub track_uncertainty: bool,
+    /// Enable emotional context analysis
+    pub track_emotions: bool,
 }
 
 /// Response from an agent run
@@ -73,6 +77,21 @@ pub struct AgentResponse {
     /// Token usage
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Confidence level (0.0-1.0) if uncertainty tracking is enabled
+    pub confidence: Option<f32>,
+    /// Emotional context detected in the conversation
+    pub emotional_context: Option<EmotionalContext>,
+}
+
+/// Emotional context detected in the conversation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmotionalContext {
+    /// Primary emotion (e.g., "neutral", "frustrated", "excited", "confused")
+    pub primary_emotion: String,
+    /// Intensity (0.0-1.0)
+    pub intensity: f32,
+    /// Suggested response tone adjustment
+    pub suggested_tone: Option<String>,
 }
 
 /// Record of a tool call
@@ -166,6 +185,16 @@ impl Agent {
 
             // If no tool calls, we're done
             if result.tool_uses.is_empty() {
+                // Analyze uncertainty if enabled
+                if options.track_uncertainty {
+                    state.confidence = self.analyze_confidence(&state.final_text).await;
+                }
+
+                // Analyze emotional context if enabled
+                if options.track_emotions {
+                    state.emotional_context = self.analyze_emotions().await;
+                }
+
                 // Auto-extract memories if enabled
                 if options.auto_extract_memories {
                     if let Some(ref on_memory) = options.on_memory {
@@ -416,6 +445,138 @@ impl Agent {
         ctx.messages.clear();
     }
 
+    /// Analyze confidence level in a response.
+    ///
+    /// Uses heuristics and optional LLM analysis to estimate confidence.
+    async fn analyze_confidence(&self, response: &str) -> Option<f32> {
+        // Quick heuristic analysis (no LLM call needed for basic cases)
+        let lower = response.to_lowercase();
+
+        // High uncertainty indicators
+        let uncertain_phrases = [
+            "i'm not sure",
+            "i think",
+            "probably",
+            "maybe",
+            "might be",
+            "could be",
+            "i believe",
+            "it seems",
+            "possibly",
+            "not certain",
+            "uncertain",
+            "i don't know",
+            "hard to say",
+        ];
+
+        // High confidence indicators
+        let confident_phrases = [
+            "definitely",
+            "certainly",
+            "absolutely",
+            "i know",
+            "it is",
+            "clearly",
+            "obviously",
+            "without a doubt",
+        ];
+
+        let uncertain_count = uncertain_phrases
+            .iter()
+            .filter(|p| lower.contains(*p))
+            .count();
+        let confident_count = confident_phrases
+            .iter()
+            .filter(|p| lower.contains(*p))
+            .count();
+
+        // Calculate base confidence
+        let base_confidence = if uncertain_count > confident_count {
+            0.5 - (uncertain_count as f32 * 0.1)
+        } else if confident_count > uncertain_count {
+            0.8 + (confident_count as f32 * 0.05)
+        } else {
+            0.7 // Neutral
+        };
+
+        Some(base_confidence.clamp(0.1, 0.99))
+    }
+
+    /// Analyze emotional context of the conversation.
+    ///
+    /// Uses heuristics to detect user emotional state.
+    async fn analyze_emotions(&self) -> Option<EmotionalContext> {
+        let ctx = self.context.read().await;
+
+        // Get the last user message
+        let last_user_msg = ctx
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| {
+                m.content.iter().find_map(|b| {
+                    if let ContentBlock::Text { text } = b {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let user_text = last_user_msg?;
+        let lower = user_text.to_lowercase();
+
+        // Emotion detection heuristics
+        let emotions = [
+            ("frustrated", vec!["frustrated", "annoyed", "ugh", "why won't", "doesn't work", "broken", "useless", "terrible", "hate"]),
+            ("confused", vec!["confused", "don't understand", "what do you mean", "huh", "?", "lost", "unclear"]),
+            ("excited", vec!["excited", "amazing", "awesome", "love it", "fantastic", "great", "wonderful", "!", "can't wait"]),
+            ("grateful", vec!["thank", "thanks", "appreciate", "grateful", "helped"]),
+            ("anxious", vec!["worried", "anxious", "nervous", "scared", "urgent", "asap", "hurry"]),
+            ("neutral", vec![]),
+        ];
+
+        let mut detected_emotion = "neutral";
+        let mut max_matches = 0;
+
+        for (emotion, keywords) in &emotions {
+            let matches = keywords.iter().filter(|k| lower.contains(*k)).count();
+            if matches > max_matches {
+                max_matches = matches;
+                detected_emotion = emotion;
+            }
+        }
+
+        // Calculate intensity based on punctuation and caps
+        let exclamations = user_text.matches('!').count();
+        let _questions = user_text.matches('?').count(); // Reserved for future use
+        let caps_ratio = user_text
+            .chars()
+            .filter(|c| c.is_uppercase())
+            .count() as f32
+            / user_text.len().max(1) as f32;
+
+        let intensity = (0.3 + (exclamations as f32 * 0.1) + (caps_ratio * 0.3) + (max_matches as f32 * 0.1))
+            .clamp(0.0, 1.0);
+
+        // Suggest tone adjustment
+        let suggested_tone = match detected_emotion {
+            "frustrated" => Some("patient and helpful".to_string()),
+            "confused" => Some("clear and explanatory".to_string()),
+            "excited" => Some("enthusiastic and supportive".to_string()),
+            "anxious" => Some("calm and reassuring".to_string()),
+            "grateful" => Some("warm and appreciative".to_string()),
+            _ => None,
+        };
+
+        Some(EmotionalContext {
+            primary_emotion: detected_emotion.to_string(),
+            intensity,
+            suggested_tone,
+        })
+    }
+
     /// Extract memorable facts from the current conversation.
     ///
     /// Uses a quick LLM call to identify noteworthy information that should be
@@ -522,6 +683,8 @@ struct RunState {
     input_tokens: u32,
     output_tokens: u32,
     final_text: String,
+    confidence: Option<f32>,
+    emotional_context: Option<EmotionalContext>,
 }
 
 impl RunState {
@@ -532,6 +695,8 @@ impl RunState {
             input_tokens: 0,
             output_tokens: 0,
             final_text: String::new(),
+            confidence: None,
+            emotional_context: None,
         }
     }
 
@@ -543,6 +708,8 @@ impl RunState {
             truncated,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            confidence: self.confidence,
+            emotional_context: self.emotional_context,
         }
     }
 }

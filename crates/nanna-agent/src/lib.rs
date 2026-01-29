@@ -10,7 +10,10 @@ mod loop_runner;
 mod prompts;
 
 pub use context::AgentContext;
-pub use loop_runner::{Agent, AgentConfig, AgentResponse, ExtractedMemory, RunOptions, StreamCallback, ToolCallRecord};
+pub use loop_runner::{
+    Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
+    RunOptions, StreamCallback, ToolCallRecord,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

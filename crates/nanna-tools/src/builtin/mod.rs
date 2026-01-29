@@ -1,5 +1,6 @@
 //! Built-in tools
 
+mod authoring;
 mod curiosity;
 mod echo;
 mod exec;
@@ -9,6 +10,7 @@ mod memory_storage;
 mod schedule;
 mod web;
 
+pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
 pub use curiosity::{ExploreTool, WonderTool, StatusTool};
 pub use echo::EchoTool;
 pub use exec::ExecTool;
