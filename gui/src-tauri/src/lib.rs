@@ -290,6 +290,34 @@ async fn set_model(
     Ok(())
 }
 
+/// Set API key
+#[tauri::command]
+async fn set_api_key(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    api_key: String,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    
+    // Update config
+    state_guard.config.llm.api_key = Some(api_key.clone());
+    
+    // Recreate LLM client with new key
+    let llm = match state_guard.config.llm.provider.as_str() {
+        "openai" => LlmClient::openai(&api_key),
+        _ => LlmClient::anthropic(&api_key),
+    };
+    state_guard.llm = Arc::new(llm);
+    
+    // Also set env var for this process (safe since we're single-threaded at this point)
+    // SAFETY: This is a single-threaded application context
+    unsafe {
+        std::env::set_var("ANTHROPIC_API_KEY", &api_key);
+    }
+    
+    info!("API key updated");
+    Ok(())
+}
+
 // =============================================================================
 // App Setup
 // =============================================================================
@@ -368,6 +396,7 @@ pub fn run() {
             rename_session,
             get_config,
             set_model,
+            set_api_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

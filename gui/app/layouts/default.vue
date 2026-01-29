@@ -6,12 +6,14 @@
       <aside class="w-64 bg-nanna-bg-surface border-r border-nanna-primary/10 flex flex-col">
         <!-- Logo -->
         <div class="p-4 border-b border-nanna-primary/10">
-          <h1 class="text-2xl font-bold text-nanna-accent crt-glow">
-            NANNA
-          </h1>
-          <p class="text-xs text-nanna-text-muted mt-1">
-            AI Assistant
-          </p>
+          <NuxtLink to="/" class="block">
+            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">
+              NANNA
+            </h1>
+            <p class="text-xs text-nanna-text-muted mt-1">
+              AI Assistant
+            </p>
+          </NuxtLink>
         </div>
         
         <!-- New Chat button -->
@@ -31,22 +33,15 @@
             Recent Chats
           </div>
           
-          <button 
+          <SessionItem
             v-for="session in sessions" 
             :key="session.id"
-            @click="switchSession(session)"
-            :class="[
-              'w-full text-left px-3 py-2 rounded-lg transition-colors text-sm',
-              currentSessionId === session.id 
-                ? 'bg-nanna-primary/20 text-nanna-text border-l-2 border-nanna-primary' 
-                : 'text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated'
-            ]"
-          >
-            <div class="truncate">{{ session.name }}</div>
-            <div class="text-xs text-nanna-text-dim mt-0.5">
-              {{ formatDate(session.updated_at) }}
-            </div>
-          </button>
+            :session="session"
+            :is-active="currentSessionId === session.id"
+            @select="switchSession"
+            @deleted="onSessionDeleted"
+            @renamed="onSessionRenamed"
+          />
           
           <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
             No chats yet
@@ -54,8 +49,14 @@
         </nav>
         
         <!-- Footer -->
-        <div class="p-4 border-t border-nanna-primary/10">
-          <div class="flex items-center justify-between text-xs text-nanna-text-dim">
+        <div class="p-4 border-t border-nanna-primary/10 space-y-2">
+          <NuxtLink 
+            to="/settings" 
+            class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            ⚙️ Settings
+          </NuxtLink>
+          <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3">
             <span>v0.1.0</span>
             <span :class="apiKeySet ? 'text-nanna-success' : 'text-nanna-error'">
               {{ apiKeySet ? '● Connected' : '○ No API Key' }}
@@ -129,8 +130,12 @@ async function createNewSession() {
     const session = await invoke<SessionInfo>('create_session', { name: null })
     sessions.value.unshift(session)
     currentSessionId.value = session.id
-    // Reload page to switch to new session
-    window.location.reload()
+    // Navigate to chat
+    navigateTo('/')
+    // Force page reload to switch context
+    if (window.location.pathname === '/') {
+      window.location.reload()
+    }
   } catch (e) {
     console.error('Failed to create session:', e)
   }
@@ -138,20 +143,28 @@ async function createNewSession() {
 
 function switchSession(session: SessionInfo) {
   currentSessionId.value = session.id
-  // Reload to switch context
-  window.location.reload()
+  // Navigate and reload
+  if (window.location.pathname !== '/') {
+    navigateTo('/')
+  } else {
+    window.location.reload()
+  }
 }
 
-function formatDate(dateStr: string): string {
-  const date = new Date(dateStr)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  
-  if (diff < 60000) return 'Just now'
-  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
-  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
-  if (diff < 604800000) return `${Math.floor(diff / 86400000)}d ago`
-  
-  return date.toLocaleDateString()
+function onSessionDeleted(sessionId: string) {
+  sessions.value = sessions.value.filter(s => s.id !== sessionId)
+  if (currentSessionId.value === sessionId) {
+    currentSessionId.value = sessions.value[0]?.id || null
+    if (currentSessionId.value) {
+      window.location.reload()
+    }
+  }
+}
+
+function onSessionRenamed(updated: SessionInfo) {
+  const idx = sessions.value.findIndex(s => s.id === updated.id)
+  if (idx !== -1) {
+    sessions.value[idx] = updated
+  }
 }
 </script>
