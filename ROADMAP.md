@@ -47,6 +47,24 @@
 ## Phase 4: GUI Application 🆕
 **Stack:** Tauri v2 + Nuxt v4 + Tailwind v4
 
+### Design
+**Theme:** 80s hacker retro — Palenight-inspired using closest Tailwind defaults
+
+| Element | Tailwind Color |
+|---------|----------------|
+| Background | `slate-900` / `slate-950` |
+| Surface | `slate-800` |
+| Primary | `violet-500` |
+| Secondary | `indigo-400` |
+| Accent | `cyan-400` |
+| Text | `slate-200` |
+| Muted | `slate-400` |
+| Success | `emerald-400` |
+| Warning | `amber-400` |
+| Error | `rose-400` |
+
+CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Code)
+
 ### Platforms (priority order)
 1. **Desktop** (Windows, macOS, Linux) — primary target
 2. **Android** — via Tauri mobile
