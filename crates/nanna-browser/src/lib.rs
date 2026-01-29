@@ -1,19 +1,23 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
 
-//! Browser automation for Nanna using Chrome DevTools Protocol
+//! Browser automation for Nanna
 //!
-//! Provides headless browser control for web scraping, screenshots, and automation.
+//! Supports multiple backends:
+//! - **Playwright** (default): Multi-browser support (Chromium, Firefox, WebKit)
+//! - **CDP**: Direct Chrome DevTools Protocol via chromiumoxide
 
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, CaptureScreenshotParams};
-use chromiumoxide::page::ScreenshotParams;
-use chromiumoxide::Page;
-use futures::StreamExt;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+
+#[cfg(feature = "cdp")]
+pub mod cdp;
+
+// TODO: Playwright integration needs work - API differs significantly
+// #[cfg(feature = "playwright")]
+// pub mod playwright;
 
 #[derive(Error, Debug)]
 pub enum BrowserError {
@@ -31,254 +35,245 @@ pub enum BrowserError {
     ExecutionFailed(String),
     #[error("Timeout")]
     Timeout,
+    #[error("Unsupported browser: {0}")]
+    UnsupportedBrowser(String),
+}
+
+/// Supported browser types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserType {
+    Chromium,
+    Firefox,
+    Webkit,
+}
+
+impl Default for BrowserType {
+    fn default() -> Self {
+        Self::Chromium
+    }
+}
+
+impl std::fmt::Display for BrowserType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chromium => write!(f, "chromium"),
+            Self::Firefox => write!(f, "firefox"),
+            Self::Webkit => write!(f, "webkit"),
+        }
+    }
 }
 
 /// Browser configuration
 #[derive(Debug, Clone)]
-pub struct BrowserManagerConfig {
-    /// Path to Chrome/Chromium executable (None = auto-detect)
-    pub chrome_path: Option<String>,
+pub struct BrowserConfig {
+    /// Browser type (Chromium, Firefox, WebKit)
+    pub browser_type: BrowserType,
     /// Run in headless mode
     pub headless: bool,
     /// Default viewport width
     pub viewport_width: u32,
     /// Default viewport height
     pub viewport_height: u32,
-    /// Navigation timeout in seconds
-    pub timeout_secs: u64,
+    /// Navigation timeout in milliseconds
+    pub timeout_ms: u64,
+    /// Custom executable path (None = auto-detect)
+    pub executable_path: Option<String>,
+    /// Additional launch arguments
+    pub args: Vec<String>,
 }
 
-impl Default for BrowserManagerConfig {
+impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            chrome_path: None,
+            browser_type: BrowserType::Chromium,
             headless: true,
             viewport_width: 1920,
             viewport_height: 1080,
-            timeout_secs: 30,
+            timeout_ms: 30_000,
+            executable_path: None,
+            args: Vec::new(),
         }
     }
 }
 
-/// Manages browser instances
-pub struct BrowserManager {
-    config: BrowserManagerConfig,
-    browser: RwLock<Option<Browser>>,
-}
-
-impl BrowserManager {
-    /// Create a new browser manager.
+impl BrowserConfig {
     #[must_use]
-    pub fn new(config: BrowserManagerConfig) -> Self {
+    pub fn chromium() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn firefox() -> Self {
         Self {
-            config,
-            browser: RwLock::new(None),
+            browser_type: BrowserType::Firefox,
+            ..Self::default()
         }
     }
 
-    /// Launch the browser if not already running.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::LaunchFailed` if the browser cannot be started.
-    pub async fn launch(&self) -> Result<(), BrowserError> {
-        let mut browser_guard = self.browser.write().await;
-
-        if browser_guard.is_some() {
-            return Ok(());
+    #[must_use]
+    pub fn webkit() -> Self {
+        Self {
+            browser_type: BrowserType::Webkit,
+            ..Self::default()
         }
-
-        info!("Launching browser (headless: {})", self.config.headless);
-
-        let mut builder = BrowserConfig::builder();
-
-        if self.config.headless {
-            builder = builder.with_head();
-        }
-
-        if let Some(ref path) = self.config.chrome_path {
-            builder = builder.chrome_executable(path);
-        }
-
-        builder = builder
-            .viewport(chromiumoxide::handler::viewport::Viewport {
-                width: self.config.viewport_width,
-                height: self.config.viewport_height,
-                device_scale_factor: None,
-                emulating_mobile: false,
-                is_landscape: true,
-                has_touch: false,
-            })
-            .arg("--disable-gpu")
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage");
-
-        let config = builder.build().map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-
-        // Spawn handler task
-        tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                debug!("Browser event: {:?}", event);
-            }
-        });
-
-        *browser_guard = Some(browser);
-        info!("Browser launched successfully");
-        Ok(())
     }
 
-    /// Navigate to a URL and return the page.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::NavigationFailed` if navigation fails.
-    pub async fn navigate(&self, url: &str) -> Result<Arc<Page>, BrowserError> {
-        self.launch().await?;
-
-        let browser_guard = self.browser.read().await;
-        let browser = browser_guard
-            .as_ref()
-            .ok_or(BrowserError::NotInitialized)?;
-
-        let page = browser
-            .new_page(url)
-            .await
-            .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
-
-        // Wait for page to load
-        page.wait_for_navigation()
-            .await
-            .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
-
-        Ok(Arc::new(page))
+    #[must_use]
+    pub fn headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
+        self
     }
 
-    /// Take a screenshot of the current page.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::ScreenshotFailed` if the screenshot fails.
-    pub async fn screenshot(&self, url: &str, full_page: bool) -> Result<Vec<u8>, BrowserError> {
-        let page = self.navigate(url).await?;
-
-        let params = ScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
-            .full_page(full_page)
-            .build();
-
-        let screenshot = page
-            .screenshot(params)
-            .await
-            .map_err(|e| BrowserError::ScreenshotFailed(e.to_string()))?;
-
-        Ok(screenshot)
+    #[must_use]
+    pub fn viewport(mut self, width: u32, height: u32) -> Self {
+        self.viewport_width = width;
+        self.viewport_height = height;
+        self
     }
 
-    /// Extract text content from a page.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::ExecutionFailed` if extraction fails.
-    pub async fn extract_text(&self, url: &str) -> Result<String, BrowserError> {
-        let page = self.navigate(url).await?;
-
-        let text = page
-            .evaluate("document.body.innerText")
-            .await
-            .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?
-            .into_value::<String>()
-            .unwrap_or_default();
-
-        Ok(text)
-    }
-
-    /// Extract HTML content from a page.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::ExecutionFailed` if extraction fails.
-    pub async fn extract_html(&self, url: &str) -> Result<String, BrowserError> {
-        let page = self.navigate(url).await?;
-
-        let html = page
-            .evaluate("document.documentElement.outerHTML")
-            .await
-            .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?
-            .into_value::<String>()
-            .unwrap_or_default();
-
-        Ok(html)
-    }
-
-    /// Click an element by selector.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::ElementNotFound` if the element doesn't exist.
-    pub async fn click(&self, page: &Page, selector: &str) -> Result<(), BrowserError> {
-        let element = page
-            .find_element(selector)
-            .await
-            .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
-
-        element
-            .click()
-            .await
-            .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Type text into an element.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::ElementNotFound` if the element doesn't exist.
-    pub async fn type_text(&self, page: &Page, selector: &str, text: &str) -> Result<(), BrowserError> {
-        let element = page
-            .find_element(selector)
-            .await
-            .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
-
-        element
-            .type_str(text)
-            .await
-            .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Execute JavaScript on a page.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BrowserError::ExecutionFailed` if the script fails.
-    pub async fn evaluate(&self, page: &Page, script: &str) -> Result<serde_json::Value, BrowserError> {
-        let result = page
-            .evaluate(script)
-            .await
-            .map_err(|e| BrowserError::ExecutionFailed(e.to_string()))?;
-
-        Ok(result.into_value().unwrap_or(serde_json::Value::Null))
-    }
-
-    /// Close the browser.
-    pub async fn close(&self) {
-        let mut browser_guard = self.browser.write().await;
-        if browser_guard.is_some() {
-            *browser_guard = None;
-            info!("Browser closed");
-        }
+    #[must_use]
+    pub fn timeout_ms(mut self, ms: u64) -> Self {
+        self.timeout_ms = ms;
+        self
     }
 }
 
-impl Drop for BrowserManager {
-    fn drop(&mut self) {
-        // Browser will be dropped automatically
+/// Screenshot options
+#[derive(Debug, Clone, Default)]
+pub struct ScreenshotOptions {
+    /// Capture full page (not just viewport)
+    pub full_page: bool,
+    /// Image format
+    pub format: ImageFormat,
+    /// Quality (1-100, for JPEG)
+    pub quality: Option<u8>,
+    /// CSS selector to screenshot (None = full page)
+    pub selector: Option<String>,
+}
+
+/// Image format for screenshots
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ImageFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+/// Page handle returned by browser operations
+#[async_trait]
+pub trait BrowserPage: Send + Sync {
+    /// Get the page URL
+    fn url(&self) -> &str;
+
+    /// Navigate to a URL
+    async fn goto(&self, url: &str) -> Result<(), BrowserError>;
+
+    /// Take a screenshot
+    async fn screenshot(&self, options: ScreenshotOptions) -> Result<Vec<u8>, BrowserError>;
+
+    /// Get page content as text
+    async fn text_content(&self) -> Result<String, BrowserError>;
+
+    /// Get page HTML
+    async fn html(&self) -> Result<String, BrowserError>;
+
+    /// Click an element by selector
+    async fn click(&self, selector: &str) -> Result<(), BrowserError>;
+
+    /// Type text into an element
+    async fn type_text(&self, selector: &str, text: &str) -> Result<(), BrowserError>;
+
+    /// Fill an input (clears first)
+    async fn fill(&self, selector: &str, text: &str) -> Result<(), BrowserError>;
+
+    /// Press a key
+    async fn press(&self, selector: &str, key: &str) -> Result<(), BrowserError>;
+
+    /// Wait for a selector to appear
+    async fn wait_for_selector(&self, selector: &str) -> Result<(), BrowserError>;
+
+    /// Evaluate JavaScript and return result
+    async fn evaluate(&self, script: &str) -> Result<serde_json::Value, BrowserError>;
+
+    /// Get element attribute
+    async fn get_attribute(&self, selector: &str, attribute: &str) -> Result<Option<String>, BrowserError>;
+
+    /// Check if element exists
+    async fn exists(&self, selector: &str) -> Result<bool, BrowserError>;
+
+    /// Get all matching elements' text content
+    async fn query_all_text(&self, selector: &str) -> Result<Vec<String>, BrowserError>;
+
+    /// Close the page
+    async fn close(&self) -> Result<(), BrowserError>;
+}
+
+/// Browser manager trait
+#[async_trait]
+pub trait Browser: Send + Sync {
+    /// Launch the browser
+    async fn launch(&self) -> Result<(), BrowserError>;
+
+    /// Create a new page
+    async fn new_page(&self) -> Result<Arc<dyn BrowserPage>, BrowserError>;
+
+    /// Navigate to URL and return page
+    async fn navigate(&self, url: &str) -> Result<Arc<dyn BrowserPage>, BrowserError>;
+
+    /// Take a screenshot of a URL
+    async fn screenshot(&self, url: &str, options: ScreenshotOptions) -> Result<Vec<u8>, BrowserError> {
+        let page = self.navigate(url).await?;
+        page.screenshot(options).await
+    }
+
+    /// Extract text from a URL
+    async fn extract_text(&self, url: &str) -> Result<String, BrowserError> {
+        let page = self.navigate(url).await?;
+        page.text_content().await
+    }
+
+    /// Extract HTML from a URL
+    async fn extract_html(&self, url: &str) -> Result<String, BrowserError> {
+        let page = self.navigate(url).await?;
+        page.html().await
+    }
+
+    /// Close the browser
+    async fn close(&self) -> Result<(), BrowserError>;
+
+    /// Get browser configuration
+    fn config(&self) -> &BrowserConfig;
+}
+
+/// Create a browser with the given configuration
+///
+/// # Errors
+///
+/// Returns `BrowserError::UnsupportedBrowser` if the requested backend is not compiled in.
+#[allow(unused_variables)]
+pub fn create_browser(config: BrowserConfig) -> Result<Arc<dyn Browser>, BrowserError> {
+    #[cfg(feature = "cdp")]
+    {
+        if config.browser_type != BrowserType::Chromium {
+            return Err(BrowserError::UnsupportedBrowser(
+                "CDP backend only supports Chromium. Use Playwright for Firefox/WebKit.".to_string(),
+            ));
+        }
+        return Ok(Arc::new(cdp::CdpBrowser::new(config)));
+    }
+
+    // TODO: Playwright support for Firefox/WebKit
+    // #[cfg(feature = "playwright")]
+    // {
+    //     return Ok(Arc::new(playwright::PlaywrightBrowser::new(config)));
+    // }
+
+    #[cfg(not(feature = "cdp"))]
+    {
+        Err(BrowserError::UnsupportedBrowser(
+            "No browser backend enabled. Enable 'cdp' feature.".to_string(),
+        ))
     }
 }
 
@@ -286,18 +281,11 @@ impl Drop for BrowserManager {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires Chrome to be installed
-    async fn test_screenshot() {
-        let config = BrowserManagerConfig::default();
-        let manager = BrowserManager::new(config);
-
-        let screenshot = manager.screenshot("https://example.com", false).await;
-        assert!(screenshot.is_ok());
-
-        let data = screenshot.unwrap();
-        assert!(!data.is_empty());
-
-        manager.close().await;
+    #[test]
+    fn test_browser_config() {
+        let config = BrowserConfig::firefox().headless(true).viewport(1280, 720);
+        assert_eq!(config.browser_type, BrowserType::Firefox);
+        assert!(config.headless);
+        assert_eq!(config.viewport_width, 1280);
     }
 }

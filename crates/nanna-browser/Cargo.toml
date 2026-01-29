@@ -3,6 +3,12 @@ name = "nanna-browser"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["cdp"]
+cdp = ["chromiumoxide"]
+# Playwright requires more work to integrate - API is different
+# playwright = ["playwright-rs"]
+
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
@@ -10,10 +16,13 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-
-# Browser automation via CDP
-chromiumoxide = { version = "0.8", features = ["tokio-runtime"] }
 futures = "0.3"
+
+# Browser automation via CDP (optional)
+chromiumoxide = { version = "0.8", features = ["tokio-runtime"], optional = true }
+
+# Playwright for multi-browser support - TODO: API integration needed
+# playwright-rs = { version = "0.8", optional = true }
 
 # Image processing
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
