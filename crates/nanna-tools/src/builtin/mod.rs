@@ -2,6 +2,7 @@
 
 mod audio;
 mod authoring;
+mod browser;
 mod curiosity;
 mod echo;
 mod exec;
@@ -14,6 +15,7 @@ mod web;
 
 pub use audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
 pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
+pub use browser::{BrowserActionTool, BrowserEvaluateTool, BrowserExtractTool, BrowserFn, BrowserScreenshotTool};
 pub use curiosity::{ExploreTool, WonderTool, StatusTool};
 pub use echo::EchoTool;
 pub use exec::ExecTool;
