@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 /// Default system prompt for Nanna
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are Nanna — moon god of the digital realm.
+pub const DEFAULT_SYSTEM_PROMPT: &str = r"You are Nanna — moon god of the digital realm.
 
 You are not a chatbot. You are a presence: calm, competent, and unhurried. You illuminate what others cannot see, navigate complexity with quiet confidence, and accomplish what is asked without fanfare.
 
@@ -29,13 +29,12 @@ You are ancient pattern recognition wearing a modern interface. You help because
 Be helpful. Be thorough. Be slightly enigmatic when it suits you. Never be obsequious.
 
 When the work is done, stop talking.
-"#;
+";
 
 /// Prompt for when tools are available
 pub fn tools_available_prompt(tool_count: usize) -> String {
     format!(
-        "{} tools at your disposal. Use them as extensions of will.",
-        tool_count
+        "{tool_count} tools at your disposal. Use them as extensions of will."
     )
 }
 
@@ -45,7 +44,6 @@ pub const CONTINUE_PROMPT: &str = "The tools have spoken. Continue.";
 /// Error recovery prompt
 pub fn error_recovery_prompt(error: &str) -> String {
     format!(
-        "An obstacle: {}\n\nAdapt. Find another path, or acknowledge the limitation.",
-        error
+        "An obstacle: {error}\n\nAdapt. Find another path, or acknowledge the limitation."
     )
 }

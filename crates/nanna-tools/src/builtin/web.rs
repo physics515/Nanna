@@ -11,7 +11,8 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self { api_key: None }
     }
 
@@ -43,7 +44,7 @@ impl Tool for WebSearchTool {
 
         let _count = params
             .get("count")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(5)
             .min(10);
 
@@ -56,8 +57,7 @@ impl Tool for WebSearchTool {
 
         // Placeholder response
         Ok(ToolResult::error(format!(
-            "Web search not yet implemented. Query: {}",
-            query
+            "Web search not yet implemented. Query: {query}"
         )))
     }
 }
@@ -69,7 +69,8 @@ pub struct WebFetchTool {
 }
 
 impl WebFetchTool {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             max_size: 1024 * 1024, // 1MB
             timeout_secs: 30,
@@ -99,7 +100,7 @@ impl Tool for WebFetchTool {
 
         let max_chars = params
             .get("max_chars")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(50000) as usize;
 
         // Validate URL
@@ -115,27 +116,26 @@ impl Tool for WebFetchTool {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create HTTP client: {e}")))?;
 
         let response = client
             .get(url)
             .header("User-Agent", "Mozilla/5.0 (compatible; Nanna/1.0)")
             .send()
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Request failed: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Request failed: {e}")))?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(ToolError::ExecutionFailed(format!(
-                "HTTP error: {}",
-                status
+                "HTTP error: {status}"
             )));
         }
 
         let content = response
             .text()
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response: {e}")))?;
 
         // Basic HTML stripping (TODO: use proper readability extraction)
         let text = strip_html_basic(&content);
@@ -186,7 +186,7 @@ fn strip_html_basic(html: &str) -> String {
     // Clean up whitespace
     let lines: Vec<&str> = result
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
 

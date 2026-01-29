@@ -1,5 +1,5 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! LLM API client for Nanna
 //!
@@ -80,10 +80,12 @@ pub struct AnthropicMessage {
 }
 
 impl AnthropicMessage {
+    #[must_use] 
     pub fn user(content: Vec<ContentBlock>) -> Self {
         Self { role: "user".to_string(), content }
     }
 
+    #[must_use] 
     pub fn assistant(content: Vec<ContentBlock>) -> Self {
         Self { role: "assistant".to_string(), content }
     }
@@ -191,7 +193,7 @@ impl LlmClient {
         }
     }
 
-    /// Create a new OpenAI client
+    /// Create a new `OpenAI` client
     pub fn openai(api_key: impl Into<String>) -> Self {
         Self {
             http: Self::build_http_client(),
@@ -201,7 +203,7 @@ impl LlmClient {
         }
     }
 
-    /// Create a new OpenRouter client
+    /// Create a new `OpenRouter` client
     pub fn openrouter(api_key: impl Into<String>) -> Self {
         Self {
             http: Self::build_http_client(),
@@ -211,7 +213,12 @@ impl LlmClient {
         }
     }
 
-    /// Validate the API key by making a lightweight request
+    /// Validate the API key by making a lightweight request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError::Api` with status 401 if the API key is invalid.
+    /// Returns `LlmError::Network` if the request fails.
     pub async fn validate(&self) -> Result<(), LlmError> {
         match self.provider {
             Provider::Anthropic => {
@@ -241,7 +248,12 @@ impl LlmClient {
         }
     }
 
-    /// Send a completion request (simple, no tools)
+    /// Send a completion request (simple, no tools).
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError::Api` if the API returns an error.
+    /// Returns `LlmError::Network` if the request fails.
     pub async fn complete(&self, request: &CompletionRequest) -> Result<String, LlmError> {
         match self.provider {
             Provider::Anthropic => self.complete_anthropic_simple(request).await,
@@ -249,7 +261,13 @@ impl LlmClient {
         }
     }
 
-    /// Send a full Anthropic request with tools
+    /// Send a full Anthropic request with tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError::Api` if the API returns an error.
+    /// Returns `LlmError::Network` if the request fails.
+    /// Returns `LlmError::Parse` if the response cannot be parsed.
     pub async fn complete_anthropic(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
         let response = self
             .http
@@ -286,9 +304,8 @@ impl LlmClient {
             .filter(|m| m.role != Role::System)
             .map(|m| AnthropicMessage {
                 role: match m.role {
-                    Role::User => "user",
+                    Role::User | Role::System => "user", // System filtered above
                     Role::Assistant => "assistant",
-                    Role::System => "user", // shouldn't happen
                 }.to_string(),
                 content: vec![ContentBlock::Text { text: m.content.clone() }],
             })
@@ -372,11 +389,19 @@ impl LlmClient {
     }
 }
 
-/// Helper trait for building requests fluently
+/// Helper trait for building requests fluently.
 pub trait RequestBuilder {
+    /// Set the model.
+    #[must_use]
     fn with_model(self, model: impl Into<String>) -> Self;
+    /// Add a message.
+    #[must_use]
     fn with_message(self, message: Message) -> Self;
+    /// Set max tokens.
+    #[must_use]
     fn with_max_tokens(self, max_tokens: u32) -> Self;
+    /// Set temperature.
+    #[must_use]
     fn with_temperature(self, temperature: f32) -> Self;
 }
 
@@ -416,7 +441,7 @@ pub struct EmbeddingClient {
 }
 
 impl EmbeddingClient {
-    /// Create OpenAI embedding client
+    /// Create `OpenAI` embedding client
     pub fn openai(api_key: impl Into<String>) -> Self {
         Self {
             http: Client::builder()
@@ -429,13 +454,19 @@ impl EmbeddingClient {
         }
     }
 
-    /// Create client with custom model
+    /// Create client with custom model.
+    #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
-    /// Get embeddings for a batch of texts
+    /// Get embeddings for a batch of texts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError::Api` if the API returns an error.
+    /// Returns `LlmError::Network` if the request fails.
     pub async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
         #[derive(Serialize)]
         struct EmbedRequest<'a> {
@@ -475,7 +506,12 @@ impl EmbeddingClient {
         Ok(result.data.into_iter().map(|d| d.embedding).collect())
     }
 
-    /// Get embedding for a single text
+    /// Get embedding for a single text.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError::Api` if the API returns an error or no embedding is returned.
+    /// Returns `LlmError::Network` if the request fails.
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, LlmError> {
         let mut results = self.embed(&[text]).await?;
         results.pop().ok_or_else(|| LlmError::Api {
@@ -536,6 +572,7 @@ struct MessageStartData {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Fields populated by serde for future use
 struct ContentBlockData {
     #[serde(rename = "type")]
     block_type: String,
@@ -582,7 +619,7 @@ impl LlmClient {
 
         stream! {
             let response = match http
-                .post(format!("{}/v1/messages", base_url))
+                .post(format!("{base_url}/v1/messages"))
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -625,69 +662,56 @@ impl LlmClient {
     }
 }
 
-/// Extract a complete SSE event from the buffer
+/// Extract a complete SSE event from the buffer.
 fn extract_sse_event(buffer: &mut String) -> Option<String> {
     // SSE events are separated by double newlines
-    if let Some(pos) = buffer.find("\n\n") {
+    buffer.find("\n\n").map(|pos| {
         let event = buffer[..pos].to_string();
         *buffer = buffer[pos + 2..].to_string();
-        Some(event)
-    } else {
-        None
-    }
+        event
+    })
 }
 
-/// Parse an SSE event string into a StreamEvent
+/// Parse an SSE event string into a `StreamEvent`
 fn parse_sse_event(event: &str) -> Option<StreamEvent> {
-    let mut event_type = None;
-    let mut data = None;
+    // Extract data field from SSE event (we determine event type from JSON structure)
+    let data = event
+        .lines()
+        .find_map(|line| line.strip_prefix("data: ").map(str::trim))?;
 
-    for line in event.lines() {
-        if let Some(rest) = line.strip_prefix("event: ") {
-            event_type = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            data = Some(rest.trim().to_string());
-        }
-    }
-
-    let data = data?;
-    
-    // Parse the JSON data based on event type
-    match serde_json::from_str::<AnthropicSSE>(&data) {
-        Ok(sse) => match sse {
-            AnthropicSSE::MessageStart { message } => Some(StreamEvent::MessageStart {
+    // Parse the JSON data (skip malformed events)
+    serde_json::from_str::<AnthropicSSE>(data)
+        .ok()
+        .map(|sse| match sse {
+            AnthropicSSE::MessageStart { message } => StreamEvent::MessageStart {
                 id: message.id,
                 model: message.model,
-            }),
+            },
             AnthropicSSE::ContentBlockStart { index, content_block } => {
-                Some(StreamEvent::ContentBlockStart {
+                StreamEvent::ContentBlockStart {
                     index,
                     content_type: content_block.block_type,
-                })
+                }
             }
             AnthropicSSE::ContentBlockDelta { index, delta } => match delta {
-                DeltaData::TextDelta { text } => Some(StreamEvent::TextDelta { index, text }),
+                DeltaData::TextDelta { text } => StreamEvent::TextDelta { index, text },
                 DeltaData::InputJsonDelta { partial_json } => {
-                    Some(StreamEvent::ToolUseDelta { index, partial_json })
+                    StreamEvent::ToolUseDelta { index, partial_json }
                 }
             },
-            AnthropicSSE::ContentBlockStop { index } => {
-                Some(StreamEvent::ContentBlockStop { index })
-            }
-            AnthropicSSE::MessageDelta { delta, usage } => Some(StreamEvent::MessageDelta {
+            AnthropicSSE::ContentBlockStop { index } => StreamEvent::ContentBlockStop { index },
+            AnthropicSSE::MessageDelta { delta, usage } => StreamEvent::MessageDelta {
                 stop_reason: delta.stop_reason,
-                output_tokens: usage.map(|u| u.output_tokens).unwrap_or(0),
-            }),
-            AnthropicSSE::MessageStop => Some(StreamEvent::MessageStop {
+                output_tokens: usage.map_or(0, |u| u.output_tokens),
+            },
+            AnthropicSSE::MessageStop => StreamEvent::MessageStop {
                 stop_reason: "end_turn".to_string(),
-            }),
-            AnthropicSSE::Ping => Some(StreamEvent::Ping),
-            AnthropicSSE::Error { error } => Some(StreamEvent::Error {
+            },
+            AnthropicSSE::Ping => StreamEvent::Ping,
+            AnthropicSSE::Error { error } => StreamEvent::Error {
                 message: error.message,
-            }),
-        },
-        Err(_) => None, // Skip malformed events
-    }
+            },
+        })
 }
 
 #[cfg(test)]

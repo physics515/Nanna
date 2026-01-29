@@ -36,6 +36,7 @@ pub struct InMemoryStorage {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // tags stored for future filtering
 struct StoredMemory {
     id: String,
     content: String,
@@ -113,6 +114,7 @@ impl RememberTool {
         Self { storage }
     }
 
+    #[must_use] 
     pub fn with_default_storage() -> Self {
         Self {
             storage: Arc::new(InMemoryStorage::default()),
@@ -142,7 +144,7 @@ impl Tool for RememberTool {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                     .collect()
             })
             .unwrap_or_default();
@@ -151,7 +153,7 @@ impl Tool for RememberTool {
             .storage
             .store(content, &tags)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(e))?;
+            .map_err(ToolError::ExecutionFailed)?;
 
         info!("Remembered: {} (id: {})", truncate(content, 50), &id[..8]);
 
@@ -173,6 +175,7 @@ impl RecallTool {
         Self { storage }
     }
 
+    #[must_use] 
     pub fn with_default_storage() -> Self {
         Self {
             storage: Arc::new(InMemoryStorage::default()),
@@ -199,14 +202,14 @@ impl Tool for RecallTool {
 
         let limit = params
             .get("limit")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(5) as usize;
 
         let results = self
             .storage
             .search(query, limit)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(e))?;
+            .map_err(ToolError::ExecutionFailed)?;
 
         if results.is_empty() {
             Ok(ToolResult::success("No memories found matching query."))
@@ -214,7 +217,7 @@ impl Tool for RecallTool {
             let output = results
                 .iter()
                 .map(|r| {
-                    let score_str = r.score.map(|s| format!(" ({:.2})", s)).unwrap_or_default();
+                    let score_str = r.score.map(|s| format!(" ({s:.2})")).unwrap_or_default();
                     format!("[{}{}] {}", &r.id[..8], score_str, r.content)
                 })
                 .collect::<Vec<_>>()
@@ -234,6 +237,7 @@ impl ReflectTool {
         Self { storage }
     }
 
+    #[must_use] 
     pub fn with_default_storage() -> Self {
         Self {
             storage: Arc::new(InMemoryStorage::default()),
@@ -270,7 +274,7 @@ impl Tool for ReflectTool {
             .storage
             .store(&content, &tags)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(e))?;
+            .map_err(ToolError::ExecutionFailed)?;
 
         info!("Reflection: {} (id: {})", truncate(observation, 50), &id[..8]);
 

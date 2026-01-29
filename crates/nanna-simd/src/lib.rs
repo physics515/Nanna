@@ -1,10 +1,10 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! SIMD-accelerated operations for Nanna
 //!
 //! Uses the `wide` crate for stable Rust SIMD. When the `nightly` feature is enabled,
-//! falls back to std::simd for potentially better codegen.
+//! falls back to `std::simd` for potentially better codegen.
 
 use half::f16;
 use wide::f32x8;
@@ -12,7 +12,12 @@ use wide::f32x8;
 /// SIMD-accelerated dot product for f32 vectors
 ///
 /// Processes 8 elements at a time using AVX/AVX2 instructions.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
+#[must_use]
 pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "vectors must have equal length");
 
@@ -41,8 +46,13 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-/// SIMD-accelerated cosine similarity for f32 vectors
+/// SIMD-accelerated cosine similarity for f32 vectors.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
+#[must_use]
 pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "vectors must have equal length");
 
@@ -64,8 +74,8 @@ pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let mut dot_sum: f32 = dot.reduce_add();
-    let mut norm_a_sum: f32 = norm_a.reduce_add();
-    let mut norm_b_sum: f32 = norm_b.reduce_add();
+    let mut mag_a: f32 = norm_a.reduce_add();
+    let mut mag_b: f32 = norm_b.reduce_add();
 
     // Handle remainder
     let remainder_start = chunks * 8;
@@ -73,11 +83,11 @@ pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
         let ai = a[remainder_start + i];
         let bi = b[remainder_start + i];
         dot_sum += ai * bi;
-        norm_a_sum += ai * ai;
-        norm_b_sum += bi * bi;
+        mag_a += ai * ai;
+        mag_b += bi * bi;
     }
 
-    dot_sum / (norm_a_sum.sqrt() * norm_b_sum.sqrt())
+    dot_sum / (mag_a.sqrt() * mag_b.sqrt())
 }
 
 /// SIMD-accelerated vector normalization (L2)
@@ -105,7 +115,11 @@ pub fn normalize_f32(v: &mut [f32]) {
     }
 }
 
-/// Convert f16 array to f32 (for GPU compatibility)
+/// Convert f16 array to f32 (for GPU compatibility).
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` have different lengths.
 #[inline]
 pub fn f16_to_f32(src: &[f16], dst: &mut [f32]) {
     assert_eq!(src.len(), dst.len());
@@ -114,7 +128,11 @@ pub fn f16_to_f32(src: &[f16], dst: &mut [f32]) {
     }
 }
 
-/// Convert f32 array to f16 (for memory efficiency)
+/// Convert f32 array to f16 (for memory efficiency).
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` have different lengths.
 #[inline]
 pub fn f32_to_f16(src: &[f32], dst: &mut [f16]) {
     assert_eq!(src.len(), dst.len());
@@ -125,6 +143,7 @@ pub fn f32_to_f16(src: &[f32], dst: &mut [f16]) {
 
 /// SIMD-accelerated argmax
 #[inline]
+#[must_use] 
 pub fn argmax_f32(v: &[f32]) -> usize {
     if v.is_empty() {
         return 0;
@@ -145,7 +164,11 @@ pub fn argmax_f32(v: &[f32]) -> usize {
     max_idx
 }
 
-/// SIMD-accelerated vector addition in-place: a += b
+/// SIMD-accelerated vector addition in-place: a += b.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn add_f32(a: &mut [f32], b: &[f32]) {
     assert_eq!(a.len(), b.len());

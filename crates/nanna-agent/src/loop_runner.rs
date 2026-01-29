@@ -2,7 +2,7 @@
 
 use crate::{AgentContext, AgentError, prompts};
 use nanna_llm::{
-    AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient,
+    AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient, StreamEvent,
     ToolDefinition as LlmToolDef,
 };
 use nanna_tools::{ToolCall, ToolRegistry};
@@ -79,6 +79,15 @@ pub struct ToolCallRecord {
     pub duration_ms: u64,
 }
 
+/// Internal result from LLM call
+struct LlmResult {
+    text: String,
+    tool_uses: Vec<(String, String, Value)>,
+    content_blocks: Vec<ContentBlock>,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
 /// The main agent
 pub struct Agent {
     config: AgentConfig,
@@ -100,209 +109,255 @@ impl Agent {
         }
     }
 
+    /// Set the agent context.
+    #[must_use]
     pub fn with_context(mut self, context: AgentContext) -> Self {
         self.context = RwLock::new(context);
         self
     }
 
-    /// Run the agent with a user message
-    pub async fn run(&self, message: &str, options: RunOptions) -> Result<AgentResponse, AgentError> {
+    /// Run the agent with a user message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::Llm` if the LLM request fails.
+    /// Returns `AgentError::Tool` if a tool execution fails critically.
+    pub async fn run(
+        &self,
+        message: &str,
+        options: RunOptions,
+    ) -> Result<AgentResponse, AgentError> {
         let max_iterations = options.max_iterations.unwrap_or(self.config.max_iterations);
-        let mut iterations = 0;
-        let mut tool_records = Vec::new();
-        let mut total_input_tokens = 0u32;
-        let mut total_output_tokens = 0u32;
-        let mut final_text = String::new();
+        let mut state = RunState::new();
 
         // Add user message
-        {
-            let mut ctx = self.context.write().await;
-            let msg = if let Some(prefix) = &options.context_prefix {
-                format!("{}\n\n{}", prefix, message)
-            } else {
-                message.to_string()
-            };
-            ctx.messages.push(AnthropicMessage::user_text(msg));
-        }
+        self.add_user_message(message, &options).await;
 
         // Agent loop
         loop {
-            iterations += 1;
-            if iterations > max_iterations {
-                return Ok(AgentResponse {
-                    text: final_text,
-                    tool_calls: tool_records,
-                    iterations,
-                    truncated: true,
-                    input_tokens: total_input_tokens,
-                    output_tokens: total_output_tokens,
-                });
+            state.iterations += 1;
+            if state.iterations > max_iterations {
+                return Ok(state.into_response(true));
             }
 
-            debug!("Agent iteration {}/{}", iterations, max_iterations);
+            debug!("Agent iteration {}/{}", state.iterations, max_iterations);
 
-            // Build request
+            // Build and execute LLM request
             let request = self.build_request().await;
+            let result = self.call_llm(&request, &options).await?;
 
-            // Call LLM (with streaming if callback provided)
-            let mut tool_uses: Vec<(String, String, Value)> = Vec::new();
-            let mut response_text = String::new();
-            let mut content_blocks: Vec<ContentBlock> = Vec::new();
+            state.input_tokens += result.input_tokens;
+            state.output_tokens += result.output_tokens;
 
-            if let Some(ref on_text) = options.on_text {
-                // Streaming mode
-                use futures::StreamExt;
-                use nanna_llm::StreamEvent;
-                use std::pin::pin;
-
-                let mut stream = pin!(self.llm.stream_anthropic(&request));
-                let mut current_tool_id = String::new();
-                let mut current_tool_name = String::new();
-                let mut current_tool_json = String::new();
-                let mut current_block_type = String::new();
-
-                while let Some(event) = stream.next().await {
-                    match event? {
-                        StreamEvent::TextDelta { text, .. } => {
-                            on_text(&text);
-                            response_text.push_str(&text);
-                        }
-                        StreamEvent::ContentBlockStart { content_type, .. } => {
-                            current_block_type = content_type;
-                        }
-                        StreamEvent::ContentBlockStop { .. } => {
-                            if current_block_type == "tool_use" && !current_tool_id.is_empty() {
-                                if let Ok(input) = serde_json::from_str(&current_tool_json) {
-                                    tool_uses.push((
-                                        current_tool_id.clone(),
-                                        current_tool_name.clone(),
-                                        input,
-                                    ));
-                                    content_blocks.push(ContentBlock::ToolUse {
-                                        id: current_tool_id.clone(),
-                                        name: current_tool_name.clone(),
-                                        input: serde_json::from_str(&current_tool_json).unwrap_or_default(),
-                                    });
-                                }
-                                current_tool_id.clear();
-                                current_tool_name.clear();
-                                current_tool_json.clear();
-                            } else if !response_text.is_empty() {
-                                content_blocks.push(ContentBlock::Text { text: response_text.clone() });
-                            }
-                            current_block_type.clear();
-                        }
-                        StreamEvent::ToolUseDelta { partial_json, .. } => {
-                            current_tool_json.push_str(&partial_json);
-                        }
-                        StreamEvent::MessageDelta { output_tokens, .. } => {
-                            total_output_tokens += output_tokens;
-                        }
-                        _ => {}
-                    }
-                }
-                // Estimate input tokens (streaming doesn't give us this easily)
-                total_input_tokens += 100; // Placeholder
-            } else {
-                // Non-streaming mode
-                let response = self.llm.complete_anthropic(&request).await?;
-                total_input_tokens += response.usage.input_tokens;
-                total_output_tokens += response.usage.output_tokens;
-
-                for block in &response.content {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            response_text.push_str(text);
-                        }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            tool_uses.push((id.clone(), name.clone(), input.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-                content_blocks = response.content;
-            }
-
-            // Store assistant response in context
-            {
-                let mut ctx = self.context.write().await;
-                ctx.messages.push(AnthropicMessage::assistant(content_blocks.clone()));
-            }
+            // Store assistant response
+            self.store_assistant_response(&result.content_blocks).await;
 
             // Update final text
-            if !response_text.is_empty() {
-                final_text = response_text;
+            if !result.text.is_empty() {
+                state.final_text = result.text;
             }
 
             // If no tool calls, we're done
-            if tool_uses.is_empty() {
-                return Ok(AgentResponse {
-                    text: final_text,
-                    tool_calls: tool_records,
-                    iterations,
-                    truncated: false,
-                    input_tokens: total_input_tokens,
-                    output_tokens: total_output_tokens,
-                });
+            if result.tool_uses.is_empty() {
+                return Ok(state.into_response(false));
             }
 
-            // Execute tool calls and collect results
-            let mut tool_results: Vec<ContentBlock> = Vec::new();
+            // Execute tools and continue loop
+            let tool_results = self.execute_tools(&result.tool_uses, &mut state).await;
+            self.store_tool_results(tool_results).await;
+        }
+    }
 
-            for (id, name, input) in tool_uses {
-                let start = std::time::Instant::now();
-                
-                let params: HashMap<String, Value> = match input.as_object() {
-                    Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                    None => HashMap::new(),
-                };
+    async fn add_user_message(&self, message: &str, options: &RunOptions) {
+        let mut ctx = self.context.write().await;
+        let msg = options
+            .context_prefix
+            .as_ref()
+            .map_or_else(|| message.to_string(), |prefix| format!("{prefix}\n\n{message}"));
+        ctx.messages.push(AnthropicMessage::user_text(msg));
+    }
 
-                let tool_call = ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    parameters: params,
-                };
+    async fn call_llm(
+        &self,
+        request: &AnthropicRequest,
+        options: &RunOptions,
+    ) -> Result<LlmResult, AgentError> {
+        if let Some(ref on_text) = options.on_text {
+            self.call_llm_streaming(request, on_text).await
+        } else {
+            self.call_llm_sync(request).await
+        }
+    }
 
-                info!("Executing tool: {}", name);
-                let response = self.tools.execute(tool_call).await;
-                let duration_ms = start.elapsed().as_millis() as u64;
+    async fn call_llm_streaming(
+        &self,
+        request: &AnthropicRequest,
+        on_text: &StreamCallback,
+    ) -> Result<LlmResult, AgentError> {
+        use futures::StreamExt;
+        use std::pin::pin;
 
-                let record = ToolCallRecord {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    output: response.result.content.clone(),
-                    success: response.result.success,
-                    duration_ms,
-                };
-                tool_records.push(record);
+        let mut stream = pin!(self.llm.stream_anthropic(request));
+        let mut tool_uses = Vec::new();
+        let mut response_text = String::new();
+        let mut content_blocks = Vec::new();
+        let mut output_tokens = 0u32;
 
-                // Build tool result
-                let result_content = if response.result.success {
-                    response.result.content
-                } else {
-                    format!("Error: {}", response.result.error.unwrap_or_else(|| "Unknown error".to_string()))
-                };
+        let mut current_tool_id = String::new();
+        let mut current_tool_name = String::new();
+        let mut current_tool_json = String::new();
+        let mut current_block_type = String::new();
 
-                tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: result_content,
-                    is_error: if response.result.success { None } else { Some(true) },
-                });
-            }
-
-            // Add tool results to context
-            {
-                let mut ctx = self.context.write().await;
-                ctx.messages.push(AnthropicMessage::user(tool_results));
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta { text, .. } => {
+                    on_text(&text);
+                    response_text.push_str(&text);
+                }
+                StreamEvent::ContentBlockStart { content_type, .. } => {
+                    current_block_type = content_type;
+                }
+                StreamEvent::ContentBlockStop { .. } => {
+                    if current_block_type == "tool_use" && !current_tool_id.is_empty() {
+                        if let Ok(input) = serde_json::from_str(&current_tool_json) {
+                            tool_uses.push((
+                                current_tool_id.clone(),
+                                current_tool_name.clone(),
+                                input,
+                            ));
+                            content_blocks.push(ContentBlock::ToolUse {
+                                id: std::mem::take(&mut current_tool_id),
+                                name: std::mem::take(&mut current_tool_name),
+                                input: serde_json::from_str(&current_tool_json).unwrap_or_default(),
+                            });
+                        }
+                        current_tool_json.clear();
+                    } else if !response_text.is_empty() {
+                        content_blocks.push(ContentBlock::Text {
+                            text: response_text.clone(),
+                        });
+                    }
+                    current_block_type.clear();
+                }
+                StreamEvent::ToolUseDelta { partial_json, .. } => {
+                    current_tool_json.push_str(&partial_json);
+                }
+                StreamEvent::MessageDelta {
+                    output_tokens: tokens,
+                    ..
+                } => {
+                    output_tokens += tokens;
+                }
+                _ => {}
             }
         }
+
+        Ok(LlmResult {
+            text: response_text,
+            tool_uses,
+            content_blocks,
+            input_tokens: 100, // Placeholder for streaming
+            output_tokens,
+        })
+    }
+
+    async fn call_llm_sync(&self, request: &AnthropicRequest) -> Result<LlmResult, AgentError> {
+        let response = self.llm.complete_anthropic(request).await?;
+        let mut tool_uses = Vec::new();
+        let mut response_text = String::new();
+
+        for block in &response.content {
+            match block {
+                ContentBlock::Text { text } => response_text.push_str(text),
+                ContentBlock::ToolUse { id, name, input } => {
+                    tool_uses.push((id.clone(), name.clone(), input.clone()));
+                }
+                ContentBlock::ToolResult { .. } => {}
+            }
+        }
+
+        Ok(LlmResult {
+            text: response_text,
+            tool_uses,
+            content_blocks: response.content,
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+        })
+    }
+
+    async fn store_assistant_response(&self, content_blocks: &[ContentBlock]) {
+        let mut ctx = self.context.write().await;
+        ctx.messages
+            .push(AnthropicMessage::assistant(content_blocks.to_vec()));
+    }
+
+    async fn execute_tools(
+        &self,
+        tool_uses: &[(String, String, Value)],
+        state: &mut RunState,
+    ) -> Vec<ContentBlock> {
+        let mut tool_results = Vec::new();
+
+        for (id, name, input) in tool_uses {
+            let start = std::time::Instant::now();
+
+            let params: HashMap<String, Value> = input.as_object().map_or_else(HashMap::new, |obj| {
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            });
+
+            let tool_call = ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                parameters: params,
+            };
+
+            info!("Executing tool: {name}");
+            let response = self.tools.execute(tool_call).await;
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            state.tool_records.push(ToolCallRecord {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                output: response.result.content.clone(),
+                success: response.result.success,
+                duration_ms,
+            });
+
+            let result_content = if response.result.success {
+                response.result.content
+            } else {
+                format!(
+                    "Error: {}",
+                    response
+                        .result
+                        .error
+                        .unwrap_or_else(|| "Unknown error".to_string())
+                )
+            };
+
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: result_content,
+                is_error: if response.result.success {
+                    None
+                } else {
+                    Some(true)
+                },
+            });
+        }
+
+        tool_results
+    }
+
+    async fn store_tool_results(&self, tool_results: Vec<ContentBlock>) {
+        let mut ctx = self.context.write().await;
+        ctx.messages.push(AnthropicMessage::user(tool_results));
     }
 
     async fn build_request(&self) -> AnthropicRequest {
         let ctx = self.context.read().await;
-        
-        // Get tool definitions
+
         let tool_defs = self.tools.definitions().await;
         let tools: Vec<LlmToolDef> = tool_defs
             .iter()
@@ -342,5 +397,37 @@ impl Agent {
     pub async fn clear(&self) {
         let mut ctx = self.context.write().await;
         ctx.messages.clear();
+    }
+}
+
+/// Internal state for a run
+struct RunState {
+    iterations: usize,
+    tool_records: Vec<ToolCallRecord>,
+    input_tokens: u32,
+    output_tokens: u32,
+    final_text: String,
+}
+
+impl RunState {
+    const fn new() -> Self {
+        Self {
+            iterations: 0,
+            tool_records: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            final_text: String::new(),
+        }
+    }
+
+    fn into_response(self, truncated: bool) -> AgentResponse {
+        AgentResponse {
+            text: self.final_text,
+            tool_calls: self.tool_records,
+            iterations: self.iterations,
+            truncated,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        }
     }
 }

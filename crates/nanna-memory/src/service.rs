@@ -3,7 +3,7 @@
 use crate::{MemoryEntry, MemoryError, VectorStore, VectorStoreConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Memory service configuration
 #[derive(Debug, Clone)]
@@ -38,6 +38,7 @@ pub struct MemoryService {
 
 impl MemoryService {
     /// Create new memory service
+    #[must_use] 
     pub fn new(config: MemoryServiceConfig) -> Self {
         let store_config = VectorStoreConfig {
             dimension: config.dimension,
@@ -50,13 +51,18 @@ impl MemoryService {
         }
     }
 
-    /// Set the embedding function
+    /// Set the embedding function.
+    #[must_use]
     pub fn with_embed_fn(mut self, f: EmbedFn) -> Self {
         self.embed_fn = Some(f);
         self
     }
 
-    /// Remember something - store with embedding
+    /// Remember something - store with embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured or storage fails.
     pub async fn remember(
         &self,
         content: &str,
@@ -72,7 +78,7 @@ impl MemoryService {
         // Generate embedding
         let embedding = (embed_fn)(content)
             .await
-            .map_err(|e| MemoryError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let entry = MemoryEntry {
@@ -88,7 +94,11 @@ impl MemoryService {
         Ok(id)
     }
 
-    /// Recall memories similar to a query
+    /// Recall memories similar to a query.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured.
     pub async fn recall(&self, query: &str) -> Result<Vec<RecallResult>, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
             MemoryError::Io(std::io::Error::new(
@@ -100,7 +110,7 @@ impl MemoryService {
         // Generate query embedding
         let query_embedding = (embed_fn)(query)
             .await
-            .map_err(|e| MemoryError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
         // Search
         let results = self.store.search(&query_embedding, self.config.max_results).await;
@@ -121,7 +131,11 @@ impl MemoryService {
         Ok(filtered)
     }
 
-    /// Forget a memory by ID
+    /// Forget a memory by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if the memory cannot be removed.
     pub async fn forget(&self, id: &str) -> Result<(), MemoryError> {
         self.store.remove(id).await?;
         info!("Forgot memory: {}", id);
@@ -139,12 +153,20 @@ impl MemoryService {
         info!("Cleared all memories");
     }
 
-    /// Save memories to file
+    /// Save memories to file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if the file cannot be written.
     pub async fn save(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         self.store.save(path).await
     }
 
-    /// Load memories from file
+    /// Load memories from file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if the file cannot be read or parsed.
     pub async fn load(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         self.store.load(path).await
     }
@@ -162,8 +184,7 @@ pub struct RecallResult {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn truncate(s: &str, max_len: usize) -> String {

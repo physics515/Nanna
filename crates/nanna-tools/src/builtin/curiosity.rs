@@ -30,18 +30,18 @@ impl Tool for ExploreTool {
 
         let max_depth = params
             .get("depth")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(2) as usize;
 
         debug!("Exploring {} (depth: {})", path, max_depth);
 
         let root = std::path::Path::new(path);
         if !root.exists() {
-            return Ok(ToolResult::success(format!("Path does not exist: {}", path)));
+            return Ok(ToolResult::success(format!("Path does not exist: {path}")));
         }
 
         let mut output = String::new();
-        output.push_str(&format!("📂 {}\n", path));
+        output.push_str(&format!("📂 {path}\n"));
 
         explore_recursive(root, 0, max_depth, &mut output)?;
 
@@ -85,7 +85,7 @@ fn explore_recursive(
 
     // Show directories first
     for (name, path) in &dirs {
-        output.push_str(&format!("{}📁 {}/\n", indent, name));
+        output.push_str(&format!("{indent}📁 {name}/\n"));
         explore_recursive(path, depth + 1, max_depth, output)?;
     }
 
@@ -93,7 +93,7 @@ fn explore_recursive(
     let file_count = files.len();
     for name in files.iter().take(10) {
         let emoji = file_emoji(name);
-        output.push_str(&format!("{}{} {}\n", indent, emoji, name));
+        output.push_str(&format!("{indent}{emoji} {name}\n"));
     }
     if file_count > 10 {
         output.push_str(&format!("{}   ... and {} more files\n", indent, file_count - 10));
@@ -146,9 +146,9 @@ impl Tool for WonderTool {
         // This could be stored and acted upon during heartbeats
         // For now, just acknowledge
         let response = match urgency {
-            "now" => format!("🤔 I'm curious about: {} — I should look into this right away.", about),
-            "soon" => format!("🤔 I'm curious about: {} — I'll explore this when I have a moment.", about),
-            _ => format!("🤔 I'm curious about: {} — noted for idle time exploration.", about),
+            "now" => format!("🤔 I'm curious about: {about} — I should look into this right away."),
+            "soon" => format!("🤔 I'm curious about: {about} — I'll explore this when I have a moment."),
+            _ => format!("🤔 I'm curious about: {about} — noted for idle time exploration."),
         };
 
         Ok(ToolResult::success(response))
@@ -174,9 +174,7 @@ impl Tool for StatusTool {
 
         // System info
         status.push_str(&format!("📍 Working directory: {}\n", 
-            std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
+            std::env::current_dir().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string())
         ));
 
         // Time
@@ -184,7 +182,7 @@ impl Tool for StatusTool {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        status.push_str(&format!("🕐 Current time: {} (unix)\n", now));
+        status.push_str(&format!("🕐 Current time: {now} (unix)\n"));
 
         // Environment hints
         if std::env::var("OPENAI_API_KEY").is_ok() {

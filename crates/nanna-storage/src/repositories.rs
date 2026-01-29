@@ -11,7 +11,7 @@ pub struct SessionRepository {
 }
 
 impl SessionRepository {
-    pub fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
         Self { conn }
     }
 
@@ -57,7 +57,7 @@ impl SessionRepository {
                 metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
             })
         } else {
-            Err(StorageError::NotFound(format!("Session: {}", session_id)))
+            Err(StorageError::NotFound(format!("Session: {session_id}")))
         }
     }
 
@@ -96,14 +96,14 @@ pub struct MessageRepository {
 }
 
 impl MessageRepository {
-    pub fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
         Self { conn }
     }
 
     pub async fn create(&self, msg: NewMessage) -> Result<Message, StorageError> {
         let conn = self.conn.write().await;
 
-        let metadata_json = msg.metadata.as_ref().map(|m| m.to_string());
+        let metadata_json = msg.metadata.as_ref().map(std::string::ToString::to_string);
 
         conn.execute(
             "INSERT INTO messages (session_id, role, content, content_type, tool_use_id, tokens_in, tokens_out, metadata)
@@ -198,7 +198,7 @@ pub struct MemoryRepository {
 }
 
 impl MemoryRepository {
-    pub fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
         Self { conn }
     }
 
@@ -210,7 +210,7 @@ impl MemoryRepository {
             e.iter().flat_map(|f| f.to_le_bytes()).collect()
         });
 
-        let metadata_json = mem.metadata.as_ref().map(|m| m.to_string());
+        let metadata_json = mem.metadata.as_ref().map(std::string::ToString::to_string);
         let memory_id = mem.memory_id.clone();
 
         conn.execute(
@@ -289,7 +289,7 @@ impl MemoryRepository {
                 tags,
             })
         } else {
-            Err(StorageError::NotFound(format!("Memory: {}", memory_id)))
+            Err(StorageError::NotFound(format!("Memory: {memory_id}")))
         }
     }
 
@@ -361,7 +361,7 @@ pub struct ConfigRepository {
 }
 
 impl ConfigRepository {
-    pub fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
         Self { conn }
     }
 

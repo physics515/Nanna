@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -41,6 +40,7 @@ impl ReminderStore {
         id
     }
 
+    #[must_use] 
     pub fn list(&self) -> Vec<ScheduledReminder> {
         self.reminders.iter().filter(|r| !r.triggered).cloned().collect()
     }
@@ -85,7 +85,7 @@ pub struct RemindTool {
 }
 
 impl RemindTool {
-    pub fn new(state: SchedulerState) -> Self {
+    pub const fn new(state: SchedulerState) -> Self {
         Self { state }
     }
 }
@@ -109,7 +109,7 @@ impl Tool for RemindTool {
 
         let minutes = params
             .get("minutes")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(5);
 
         let delay_secs = minutes * 60;
@@ -120,8 +120,7 @@ impl Tool for RemindTool {
         info!("Reminder set: '{}' in {} minutes (id: {})", message, minutes, &id[..8]);
 
         Ok(ToolResult::success(format!(
-            "Reminder set for {} minutes from now: {}",
-            minutes, message
+            "Reminder set for {minutes} minutes from now: {message}"
         )))
     }
 }
@@ -132,7 +131,7 @@ pub struct ListRemindersTool {
 }
 
 impl ListRemindersTool {
-    pub fn new(state: SchedulerState) -> Self {
+    pub const fn new(state: SchedulerState) -> Self {
         Self { state }
     }
 }
@@ -174,7 +173,7 @@ pub struct CancelReminderTool {
 }
 
 impl CancelReminderTool {
-    pub fn new(state: SchedulerState) -> Self {
+    pub const fn new(state: SchedulerState) -> Self {
         Self { state }
     }
 }

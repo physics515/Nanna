@@ -21,7 +21,7 @@ pub struct AppState {
     pub default_model: String,
 }
 
-/// Builder for AppState
+/// Builder for `AppState`
 pub struct AppStateBuilder {
     bot: Option<Nanna>,
     storage: Option<Arc<Storage>>,
@@ -31,7 +31,14 @@ pub struct AppStateBuilder {
     default_model: String,
 }
 
+impl Default for AppStateBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppStateBuilder {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             bot: None,
@@ -43,26 +50,31 @@ impl AppStateBuilder {
         }
     }
 
+    #[must_use] 
     pub fn bot(mut self, bot: Nanna) -> Self {
         self.bot = Some(bot);
         self
     }
 
+    #[must_use] 
     pub fn storage(mut self, storage: Storage) -> Self {
         self.storage = Some(Arc::new(storage));
         self
     }
 
+    #[must_use] 
     pub fn storage_arc(mut self, storage: Arc<Storage>) -> Self {
         self.storage = Some(storage);
         self
     }
 
+    #[must_use] 
     pub fn llm(mut self, llm: LlmClient) -> Self {
         self.llm = Some(Arc::new(llm));
         self
     }
 
+    #[must_use] 
     pub fn llm_arc(mut self, llm: Arc<LlmClient>) -> Self {
         self.llm = Some(llm);
         self
@@ -73,21 +85,33 @@ impl AppStateBuilder {
         self
     }
 
+    /// Set the tools (Arc).
+    #[must_use]
     pub fn tools_arc(mut self, tools: Arc<ToolRegistry>) -> Self {
         self.tools = Some(tools);
         self
     }
 
+    /// Set the webhook secret.
+    #[must_use]
     pub fn webhook_secret(mut self, secret: Option<String>) -> Self {
         self.webhook_secret = secret;
         self
     }
 
+    /// Set the default model.
+    #[must_use]
     pub fn default_model(mut self, model: impl Into<String>) -> Self {
         self.default_model = model.into();
         self
     }
 
+    /// Build the `AppState`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if bot, storage, llm, or tools are not set.
+    #[must_use]
     pub fn build(self) -> AppState {
         AppState {
             bot: Arc::new(self.bot.expect("bot required")),
@@ -103,15 +127,21 @@ impl AppStateBuilder {
 
 impl AppState {
 
-    /// Get or create an agent for a session
-    pub async fn get_or_create_agent(&self, session_id: &str, system_prompt: Option<&str>) -> Arc<RwLock<Agent>> {
-        let mut agents = self.agents.write().await;
-        
-        if let Some(agent) = agents.get(session_id) {
-            return agent.clone();
+    /// Get or create an agent for a session.
+    pub async fn get_or_create_agent(
+        &self,
+        session_id: &str,
+        system_prompt: Option<&str>,
+    ) -> Arc<RwLock<Agent>> {
+        // Check if agent exists (read lock)
+        {
+            let agents = self.agents.read().await;
+            if let Some(agent) = agents.get(session_id) {
+                return agent.clone();
+            }
         }
 
-        // Create new agent
+        // Create new agent (outside lock)
         let config = AgentConfig {
             model: self.default_model.clone(),
             max_tokens: 8192,
@@ -122,63 +152,89 @@ impl AppState {
         let context = AgentContext::new(session_id)
             .with_system_prompt(system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT));
 
-        let agent = Agent::new(config, self.llm.clone(), self.tools.clone())
-            .with_context(context);
+        let agent = Agent::new(config, self.llm.clone(), self.tools.clone()).with_context(context);
 
         let agent = Arc::new(RwLock::new(agent));
-        agents.insert(session_id.to_string(), agent.clone());
 
-        // Persist session to storage
-        if let Err(e) = self.storage.sessions().create(session_id, "api", None).await {
-            tracing::warn!("Failed to persist session {}: {}", session_id, e);
+        // Insert with write lock
+        {
+            let mut agents = self.agents.write().await;
+            // Double-check in case another task created it
+            if let Some(existing) = agents.get(session_id) {
+                return existing.clone();
+            }
+            agents.insert(session_id.to_string(), agent.clone());
+        }
+
+        // Persist session to storage (outside lock)
+        if let Err(e) = self
+            .storage
+            .sessions()
+            .create(session_id, "api", None)
+            .await
+        {
+            tracing::warn!("Failed to persist session {session_id}: {e}");
         }
 
         agent
     }
 
-    /// Process a message through the agent and persist to storage
+    /// Process a message through the agent and persist to storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError` if the agent fails to process the message.
     pub async fn process_message(
         &self,
         session_id: &str,
         message: &str,
         system_prompt: Option<&str>,
     ) -> Result<String, nanna_agent::AgentError> {
-        let agent = self.get_or_create_agent(session_id, system_prompt).await;
-        let agent = agent.read().await;
+        // Store user message first
+        let _ = self
+            .storage
+            .messages()
+            .create(nanna_storage::NewMessage {
+                session_id: session_id.to_string(),
+                role: "user".to_string(),
+                content: message.to_string(),
+                content_type: "text".to_string(),
+                tool_use_id: None,
+                tokens_in: None,
+                tokens_out: None,
+                metadata: None,
+            })
+            .await;
 
-        // Store user message
-        let _ = self.storage.messages().create(nanna_storage::NewMessage {
-            session_id: session_id.to_string(),
-            role: "user".to_string(),
-            content: message.to_string(),
-            content_type: "text".to_string(),
-            tool_use_id: None,
-            tokens_in: None,
-            tokens_out: None,
-            metadata: None,
-        }).await;
-
-        // Run agent
-        let response = agent.run(message, RunOptions::default()).await?;
+        // Run agent (scoped lock)
+        let response = {
+            let agent_lock = self.get_or_create_agent(session_id, system_prompt).await;
+            let agent = agent_lock.read().await;
+            agent.run(message, RunOptions::default()).await?
+        };
 
         // Store assistant response
-        let _ = self.storage.messages().create(nanna_storage::NewMessage {
-            session_id: session_id.to_string(),
-            role: "assistant".to_string(),
-            content: response.text.clone(),
-            content_type: "text".to_string(),
-            tool_use_id: None,
-            tokens_in: Some(response.input_tokens as i64),
-            tokens_out: Some(response.output_tokens as i64),
-            metadata: None,
-        }).await;
+        let _ = self
+            .storage
+            .messages()
+            .create(nanna_storage::NewMessage {
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: response.text.clone(),
+                content_type: "text".to_string(),
+                tool_use_id: None,
+                tokens_in: Some(i64::from(response.input_tokens)),
+                tokens_out: Some(i64::from(response.output_tokens)),
+                metadata: None,
+            })
+            .await;
 
         Ok(response.text)
     }
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are Nanna — moon god of the digital realm.
+const DEFAULT_SYSTEM_PROMPT: &str = r"You are Nanna — moon god of the digital realm.
 
 You have tools at your disposal. Use them when needed.
 
-Be helpful. Be competent. Don't waste words."#;
+Be helpful. Be competent. Don't waste words.";

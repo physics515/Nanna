@@ -17,7 +17,8 @@ pub struct ReadFileTool {
 }
 
 impl ReadFileTool {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             base_dir: None,
             max_size: 10 * 1024 * 1024, // 10MB default
@@ -37,7 +38,7 @@ impl ReadFileTool {
             let resolved = if path.is_absolute() {
                 // Check if absolute path is within base
                 let canonical = path.canonicalize().map_err(|e| {
-                    ToolError::InvalidParams(format!("Invalid path: {}", e))
+                    ToolError::InvalidParams(format!("Invalid path: {e}"))
                 })?;
                 if !canonical.starts_with(base) {
                     return Err(ToolError::PermissionDenied(
@@ -81,7 +82,7 @@ impl Tool for ReadFileTool {
 
         // Check file size
         let metadata = fs::metadata(&path).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to read file metadata: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to read file metadata: {e}"))
         })?;
 
         if metadata.len() as usize > self.max_size {
@@ -93,19 +94,18 @@ impl Tool for ReadFileTool {
         }
 
         let content = fs::read_to_string(&path).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to read file: {e}"))
         })?;
 
         // Handle offset and limit
         let offset = params
             .get("offset")
-            .and_then(|v| v.as_u64())
-            .map(|v| v.saturating_sub(1) as usize)
-            .unwrap_or(0);
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |v| v.saturating_sub(1) as usize);
 
         let limit = params
             .get("limit")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|v| v as usize);
 
         let lines: Vec<&str> = content.lines().collect();
@@ -134,7 +134,8 @@ pub struct WriteFileTool {
 }
 
 impl WriteFileTool {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self { base_dir: None }
     }
 
@@ -191,12 +192,12 @@ impl Tool for WriteFileTool {
         // Create parent directories
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to create directories: {}", e))
+                ToolError::ExecutionFailed(format!("Failed to create directories: {e}"))
             })?;
         }
 
         fs::write(&path, content).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to write file: {}", e))
+            ToolError::ExecutionFailed(format!("Failed to write file: {e}"))
         })?;
 
         Ok(ToolResult::success(format!(
@@ -213,7 +214,8 @@ pub struct ListDirTool {
 }
 
 impl ListDirTool {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self { base_dir: None }
     }
 
@@ -245,7 +247,7 @@ impl Tool for ListDirTool {
 
         let recursive = params
             .get("recursive")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         let path = Path::new(path_str);
@@ -253,8 +255,7 @@ impl Tool for ListDirTool {
 
         if !path.exists() {
             return Err(ToolError::ExecutionFailed(format!(
-                "Directory does not exist: {}",
-                path_str
+                "Directory does not exist: {path_str}"
             )));
         }
 
@@ -275,17 +276,17 @@ impl Tool for ListDirTool {
                         entries.push(format!("[{}] {}", file_type, entry_path.display()));
                     }
                     Err(e) => {
-                        entries.push(format!("[error] {}", e));
+                        entries.push(format!("[error] {e}"));
                     }
                 }
             }
         } else {
             let mut dir = fs::read_dir(path).await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to read directory: {}", e))
+                ToolError::ExecutionFailed(format!("Failed to read directory: {e}"))
             })?;
 
             while let Some(entry) = dir.next_entry().await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to read entry: {}", e))
+                ToolError::ExecutionFailed(format!("Failed to read entry: {e}"))
             })? {
                 let file_type = entry.file_type().await.map_or("unknown", |ft| {
                     if ft.is_dir() {

@@ -56,6 +56,7 @@ impl ToolDefinition {
         }
     }
 
+    #[must_use] 
     pub fn param(mut self, param: ToolParameter) -> Self {
         self.parameters.push(param);
         self
@@ -134,7 +135,7 @@ impl ToolDefinition {
             param_type: ParameterType::String,
             required,
             default: None,
-            enum_values: Some(values.iter().map(|s| s.to_string()).collect()),
+            enum_values: Some(values.iter().map(std::string::ToString::to_string).collect()),
         });
         self
     }
@@ -157,6 +158,7 @@ impl ToolDefinition {
     }
 
     /// Convert to Anthropic tool format
+    #[must_use] 
     pub fn to_anthropic_format(&self) -> Value {
         let properties: serde_json::Map<String, Value> = self
             .parameters
@@ -203,7 +205,8 @@ impl ToolDefinition {
         })
     }
 
-    /// Convert to OpenAI tool format
+    /// Convert to `OpenAI` tool format
+    #[must_use] 
     pub fn to_openai_format(&self) -> Value {
         let properties: serde_json::Map<String, Value> = self
             .parameters

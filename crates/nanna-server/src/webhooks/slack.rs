@@ -71,19 +71,18 @@ pub async fn handle(
     debug!("Slack event type: {}", event.event_type);
 
     // Handle URL verification challenge
-    if event.event_type == "url_verification" {
-        if let Some(challenge) = event.challenge {
+    if event.event_type == "url_verification"
+        && let Some(challenge) = event.challenge {
             return Ok(Json(SlackResponse {
                 text: None,
                 response_type: None,
                 challenge: Some(challenge),
             }));
         }
-    }
 
     // Handle event callbacks
-    if event.event_type == "event_callback" {
-        if let Some(inner) = event.event {
+    if event.event_type == "event_callback"
+        && let Some(inner) = event.event {
             // Ignore bot messages
             if inner.bot_id.is_some() {
                 return Ok(Json(SlackResponse {
@@ -109,15 +108,14 @@ pub async fn handle(
                     }));
                 }
 
-                let session_id = format!("slack:{}:{}", channel_id, user_id);
+                let session_id = format!("slack:{channel_id}:{user_id}");
                 info!("Slack message from {}: {}", user_id, text.chars().take(50).collect::<String>());
 
                 // Get or create agent
                 let system_prompt = format!(
                     "You are Nanna — moon god of the digital realm.\n\
-                     You're chatting on Slack with user {}.\n\
-                     Be helpful and use Slack markdown (mrkdwn).",
-                    user_id
+                     You're chatting on Slack with user {user_id}.\n\
+                     Be helpful and use Slack markdown (mrkdwn)."
                 );
                 let agent = state.get_or_create_agent(&session_id, Some(&system_prompt)).await;
 
@@ -141,7 +139,6 @@ pub async fn handle(
                 }));
             }
         }
-    }
 
     // Default acknowledgment
     Ok(Json(SlackResponse {

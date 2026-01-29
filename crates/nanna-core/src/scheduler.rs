@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Scheduled task types
 #[derive(Debug, Clone)]
@@ -77,6 +77,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    #[must_use] 
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
             config,
@@ -86,7 +87,8 @@ impl Scheduler {
         }
     }
 
-    /// Set the task executor callback
+    /// Set the task executor callback.
+    #[must_use]
     pub fn with_executor(mut self, executor: TaskExecutor) -> Self {
         self.executor = Some(executor);
         self
@@ -119,14 +121,11 @@ impl Scheduler {
         tasks.values().cloned().collect()
     }
 
-    /// Start the scheduler
-    pub async fn start(&mut self) {
-        let executor = match &self.executor {
-            Some(e) => e.clone(),
-            None => {
-                warn!("No executor set, scheduler will not run tasks");
-                return;
-            }
+    /// Start the scheduler.
+    pub fn start(&mut self) {
+        let executor = if let Some(e) = &self.executor { e.clone() } else {
+            warn!("No executor set, scheduler will not run tasks");
+            return;
         };
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -181,10 +180,9 @@ impl Scheduler {
                             let should_run = match &task.task_type {
                                 TaskType::Recurring { interval: task_interval } => {
                                     task.last_run
-                                        .map(|lr| lr.elapsed() >= *task_interval)
-                                        .unwrap_or(true)
+                                        .is_none_or(|lr| lr.elapsed() >= *task_interval)
                                 }
-                                TaskType::Delayed { delay } => {
+                                TaskType::Delayed { delay: _ } => {
                                     task.last_run.is_none() && task.run_count == 0
                                 }
                                 _ => false,
@@ -197,16 +195,18 @@ impl Scheduler {
 
                                 tokio::spawn(async move {
                                     let result = executor(task).await;
-                                    
-                                    // Update task state
-                                    let mut tasks = tasks.write().await;
-                                    if let Some(t) = tasks.get_mut(&task_id) {
-                                        t.last_run = Some(Instant::now());
-                                        t.run_count += 1;
 
-                                        // Disable one-shot tasks after running
-                                        if matches!(t.task_type, TaskType::Delayed { .. }) {
-                                            t.enabled = false;
+                                    // Update task state (scope the lock)
+                                    {
+                                        let mut tasks_guard = tasks.write().await;
+                                        if let Some(t) = tasks_guard.get_mut(&task_id) {
+                                            t.last_run = Some(Instant::now());
+                                            t.run_count += 1;
+
+                                            // Disable one-shot tasks after running
+                                            if matches!(t.task_type, TaskType::Delayed { .. }) {
+                                                t.enabled = false;
+                                            }
                                         }
                                     }
 
@@ -233,11 +233,11 @@ impl Scheduler {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Helper to create a heartbeat task
+#[must_use] 
 pub fn heartbeat_task(prompt: &str) -> ScheduledTask {
     ScheduledTask {
         id: format!("heartbeat-{}", uuid::Uuid::new_v4()),
@@ -251,6 +251,7 @@ pub fn heartbeat_task(prompt: &str) -> ScheduledTask {
 }
 
 /// Helper to create a recurring task
+#[must_use] 
 pub fn recurring_task(name: &str, interval: Duration, payload: &str) -> ScheduledTask {
     ScheduledTask {
         id: format!("{}-{}", name, uuid::Uuid::new_v4()),
@@ -264,6 +265,7 @@ pub fn recurring_task(name: &str, interval: Duration, payload: &str) -> Schedule
 }
 
 /// Helper to create a delayed one-shot task
+#[must_use] 
 pub fn delayed_task(name: &str, delay: Duration, payload: &str) -> ScheduledTask {
     ScheduledTask {
         id: format!("{}-{}", name, uuid::Uuid::new_v4()),

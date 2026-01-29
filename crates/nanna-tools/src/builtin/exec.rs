@@ -19,6 +19,7 @@ pub struct ExecTool {
 }
 
 impl ExecTool {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             workdir: None,
@@ -66,8 +67,7 @@ impl Tool for ExecTool {
         for denied in &self.denylist {
             if command.contains(denied) {
                 return Err(ToolError::PermissionDenied(format!(
-                    "Command contains denied pattern: {}",
-                    denied
+                    "Command contains denied pattern: {denied}"
                 )));
             }
         }
@@ -85,12 +85,12 @@ impl Tool for ExecTool {
         let workdir = params
             .get("workdir")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .or_else(|| self.workdir.clone());
 
         let timeout_secs = params
             .get("timeout")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(30);
 
         debug!("Executing command: {}", command);
@@ -127,7 +127,7 @@ impl Tool for ExecTool {
             let content = if stderr.is_empty() {
                 stdout.to_string()
             } else {
-                format!("{}\n\nStderr:\n{}", stdout, stderr)
+                format!("{stdout}\n\nStderr:\n{stderr}")
             };
             ToolResult::success(content)
         } else {

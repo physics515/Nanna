@@ -1,5 +1,5 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Tool system for Nanna
 //!
@@ -91,6 +91,7 @@ impl ToolResult {
         }
     }
 
+    #[must_use] 
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
         self

@@ -13,6 +13,7 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
@@ -58,7 +59,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Get tool definitions in OpenAI format
+    /// Get tool definitions in `OpenAI` format
     pub async fn to_openai_format(&self) -> Vec<Value> {
         let tools = self.tools.read().await;
         tools

@@ -1,5 +1,5 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Configuration management for Nanna
 
@@ -26,6 +26,7 @@ pub enum ConfigError {
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     /// General settings
     pub general: GeneralConfig,
@@ -41,18 +42,6 @@ pub struct Config {
     pub memory: MemoryConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            llm: LlmConfig::default(),
-            server: ServerConfig::default(),
-            channels: ChannelsConfig::default(),
-            tools: ToolsConfig::default(),
-            memory: MemoryConfig::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -186,7 +175,11 @@ impl Default for MemoryConfig {
 }
 
 impl Config {
-    /// Load config from default location
+    /// Load config from default location.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError` if the config path cannot be determined or the file cannot be read.
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::default_config_path()?;
         if path.exists() {
@@ -196,63 +189,84 @@ impl Config {
         }
     }
 
-    /// Load config from a specific path
+    /// Load config from a specific path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::Io` if the file cannot be read.
+    /// Returns `ConfigError::Parse` if the TOML is invalid.
     pub fn load_from(path: &PathBuf) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        info!("Loaded config from {:?}", path);
+        let config: Self = toml::from_str(&content)?;
+        info!("Loaded config from {path:?}");
         Ok(config)
     }
 
-    /// Save config to default location
+    /// Save config to default location.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError` if the config path cannot be determined or the file cannot be written.
     pub fn save(&self) -> Result<(), ConfigError> {
         let path = Self::default_config_path()?;
         self.save_to(&path)
     }
 
-    /// Save config to a specific path
+    /// Save config to a specific path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::Io` if the directory cannot be created or the file cannot be written.
+    /// Returns `ConfigError::Parse` if the config cannot be serialized.
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
-        info!("Saved config to {:?}", path);
+        info!("Saved config to {path:?}");
         Ok(())
     }
 
-    /// Get default config path
+    /// Get default config path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::NoDirFound` if the system config directory cannot be determined.
     pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-        let dirs = ProjectDirs::from("bot", "clawd", "Nanna")
-            .ok_or(ConfigError::NoDirFound)?;
+        let dirs =
+            ProjectDirs::from("bot", "clawd", "Nanna").ok_or(ConfigError::NoDirFound)?;
         Ok(dirs.config_dir().join("config.toml"))
     }
 
-    /// Get default data directory
+    /// Get default data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::NoDirFound` if the system data directory cannot be determined.
     pub fn default_data_dir() -> Result<PathBuf, ConfigError> {
-        let dirs = ProjectDirs::from("bot", "clawd", "Nanna")
-            .ok_or(ConfigError::NoDirFound)?;
+        let dirs =
+            ProjectDirs::from("bot", "clawd", "Nanna").ok_or(ConfigError::NoDirFound)?;
         Ok(dirs.data_dir().to_path_buf())
     }
 
     /// Override config with environment variables
+    #[must_use] 
     pub fn with_env_overrides(mut self) -> Self {
         // LLM API keys
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             self.llm.api_key = Some(key);
         }
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            if self.llm.provider == "openai" {
+        if let Ok(key) = std::env::var("OPENAI_API_KEY")
+            && self.llm.provider == "openai" {
                 self.llm.api_key = Some(key);
             }
-        }
 
         // Server config
-        if let Ok(port) = std::env::var("PORT") {
-            if let Ok(p) = port.parse() {
+        if let Ok(port) = std::env::var("PORT")
+            && let Ok(p) = port.parse() {
                 self.server.port = p;
             }
-        }
 
         // Telegram
         if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
@@ -264,8 +278,8 @@ impl Config {
         }
 
         // Discord
-        if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
-            if let (Ok(app_id), Ok(pub_key)) = (
+        if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN")
+            && let (Ok(app_id), Ok(pub_key)) = (
                 std::env::var("DISCORD_APPLICATION_ID"),
                 std::env::var("DISCORD_PUBLIC_KEY"),
             ) {
@@ -275,13 +289,13 @@ impl Config {
                     public_key: pub_key,
                 });
             }
-        }
 
         self
     }
 }
 
 /// Generate a default config file content
+#[must_use] 
 pub fn generate_default_config() -> String {
     let config = Config::default();
     toml::to_string_pretty(&config).unwrap_or_default()

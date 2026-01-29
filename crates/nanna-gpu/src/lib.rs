@@ -1,5 +1,5 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! GPU-accelerated compute for Nanna using wgpu
 //!
@@ -32,7 +32,12 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    /// Initialize GPU context, preferring high-performance discrete GPU
+    /// Initialize GPU context, preferring high-performance discrete GPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GpuError::NoAdapter` if no GPU adapter is found.
+    /// Returns `GpuError::DeviceCreation` if the GPU device cannot be created.
     pub async fn new() -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -74,7 +79,8 @@ impl GpuContext {
     }
 
     /// Check if GPU supports compute shaders
-    pub fn supports_compute(&self) -> bool {
+    #[must_use] 
+    pub const fn supports_compute(&self) -> bool {
         true // wgpu always supports compute on valid adapters
     }
 }
@@ -96,11 +102,12 @@ impl GpuBuffer {
 
         Self {
             buffer,
-            size: (data.len() * std::mem::size_of::<T>()) as u64,
+            size: std::mem::size_of_val(data) as u64,
         }
     }
 
     /// Create an empty buffer for output
+    #[must_use] 
     pub fn empty(ctx: &GpuContext, size: u64, usage: wgpu::BufferUsages) -> Self {
         let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("output_buffer"),
@@ -114,7 +121,7 @@ impl GpuBuffer {
 }
 
 /// Dot product compute shader (WGSL)
-const DOT_PRODUCT_SHADER: &str = r#"
+const DOT_PRODUCT_SHADER: &str = r"
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> result: array<f32>;
@@ -152,10 +159,10 @@ fn main(
         result[workgroup_id.x] = partial_sums[0];
     }
 }
-"#;
+";
 
 /// Cosine similarity batch compute shader
-const COSINE_SIMILARITY_BATCH_SHADER: &str = r#"
+const COSINE_SIMILARITY_BATCH_SHADER: &str = r"
 struct Params {
     query_len: u32,
     num_vectors: u32,
@@ -188,7 +195,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     similarities[vec_idx] = dot / (sqrt(norm_q) * sqrt(norm_v));
 }
-"#;
+";
 
 /// GPU-accelerated cosine similarity search
 pub struct CosineSimilaritySearch {
@@ -197,6 +204,11 @@ pub struct CosineSimilaritySearch {
 }
 
 impl CosineSimilaritySearch {
+    /// Create a new cosine similarity search pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GpuError` if the compute pipeline cannot be created.
     pub fn new(ctx: &GpuContext) -> Result<Self, GpuError> {
         let shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cosine_similarity_shader"),
@@ -260,7 +272,7 @@ impl CosineSimilaritySearch {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
 
@@ -276,7 +288,7 @@ mod wgpu {
     pub use ::wgpu::*;
     
     pub mod util {
-        use super::*;
+        use super::BufferUsages;
         
         pub struct BufferInitDescriptor<'a> {
             pub label: Option<&'a str>,

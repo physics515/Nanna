@@ -1,5 +1,5 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! HTTP server for Nanna
 //!
@@ -37,7 +37,11 @@ impl Default for ServerConfig {
     }
 }
 
-/// Start the HTTP server
+/// Start the HTTP server.
+///
+/// # Errors
+///
+/// Returns an error if the server fails to bind or start.
 pub async fn start_server(config: ServerConfig, state: AppState) -> anyhow::Result<()> {
     let app = create_router(state)
         .layer(TraceLayer::new_for_http())

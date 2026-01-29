@@ -37,12 +37,12 @@ impl InteractionResponseType {
     pub const UPDATE_MESSAGE: Self = Self(7);
 }
 
-/// Discord interaction payload
+/// Discord interaction payload.
 #[derive(Debug, Deserialize)]
 pub struct Interaction {
     pub id: String,
     #[serde(rename = "type")]
-    pub interaction_type: InteractionType,
+    pub kind: InteractionType,
     pub token: String,
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,
@@ -65,7 +65,7 @@ pub struct InteractionData {
 pub struct CommandOption {
     pub name: String,
     pub value: Option<serde_json::Value>,
-    pub options: Option<Vec<CommandOption>>,
+    pub options: Option<Vec<Self>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,10 +121,10 @@ pub async fn handle(
     let interaction: Interaction =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    debug!("Discord interaction type: {:?}", interaction.interaction_type);
+    debug!("Discord interaction type: {:?}", interaction.kind);
 
     // Handle ping (required for Discord verification)
-    if interaction.interaction_type == InteractionType::PING {
+    if interaction.kind == InteractionType::PING {
         return Ok(Json(InteractionResponse {
             response_type: InteractionResponseType::PONG,
             data: None,
@@ -132,7 +132,7 @@ pub async fn handle(
     }
 
     // Handle slash commands
-    if interaction.interaction_type == InteractionType::APPLICATION_COMMAND {
+    if interaction.kind == InteractionType::APPLICATION_COMMAND {
         use nanna_agent::RunOptions;
 
         let user = interaction
@@ -141,10 +141,10 @@ pub async fn handle(
             .and_then(|m| m.user.as_ref())
             .or(interaction.user.as_ref());
 
-        let user_id = user.map(|u| u.id.as_str()).unwrap_or("unknown");
-        let username = user.map(|u| u.username.as_str()).unwrap_or("unknown");
+        let user_id = user.map_or("unknown", |u| u.id.as_str());
+        let username = user.map_or("unknown", |u| u.username.as_str());
         let channel_id = interaction.channel_id.as_deref().unwrap_or("unknown");
-        let session_id = format!("discord:{}:{}", channel_id, user_id);
+        let session_id = format!("discord:{channel_id}:{user_id}");
 
         // Get command input
         let input = interaction
@@ -161,9 +161,8 @@ pub async fn handle(
         // Get or create agent for this session
         let system_prompt = format!(
             "You are Nanna — moon god of the digital realm.\n\
-             You're chatting on Discord with user {} (ID: {}).\n\
-             Be helpful, concise, and conversational. Use Discord markdown.",
-            username, user_id
+             You're chatting on Discord with user {username} (ID: {user_id}).\n\
+             Be helpful, concise, and conversational. Use Discord markdown."
         );
         let agent = state.get_or_create_agent(&session_id, Some(&system_prompt)).await;
 

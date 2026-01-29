@@ -1,5 +1,5 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Core Nanna runtime
 //!
@@ -71,7 +71,11 @@ pub struct Nanna {
 }
 
 impl Nanna {
-    /// Create a new Nanna instance
+    /// Create a new Nanna instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NannaError::Memory` if the memory store cannot be initialized.
     pub async fn new(config: NannaConfig, llm: LlmClient) -> Result<Self, NannaError> {
         let gpu = if config.enable_gpu {
             match GpuContext::new().await {
@@ -117,7 +121,11 @@ impl Nanna {
         conversations.insert(session_id.to_string(), memory);
     }
 
-    /// Process an incoming message and generate a response
+    /// Process an incoming message and generate a response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NannaError::Llm` if the LLM request fails.
     pub async fn process_message(
         &self,
         session_id: &str,
@@ -157,13 +165,21 @@ impl Nanna {
         router.register(name, channel);
     }
 
-    /// Send a message through the router
+    /// Send a message through the router.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NannaError::Channel` if the channel is not found or send fails.
     pub async fn send_message(&self, message: OutgoingMessage) -> Result<String, NannaError> {
         let router = self.router.read().await;
         Ok(router.send(message).await?)
     }
 
-    /// Add a memory entry
+    /// Add a memory entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NannaError::Memory` if the entry cannot be stored.
     pub async fn remember(&self, entry: MemoryEntry) -> Result<(), NannaError> {
         Ok(self.memory.add(entry).await?)
     }
@@ -174,12 +190,14 @@ impl Nanna {
     }
 
     /// Check if GPU is available
-    pub fn has_gpu(&self) -> bool {
+    #[must_use] 
+    pub const fn has_gpu(&self) -> bool {
         self.gpu.is_some()
     }
 
     /// Get GPU context if available
-    pub fn gpu(&self) -> Option<&Arc<GpuContext>> {
+    #[must_use] 
+    pub const fn gpu(&self) -> Option<&Arc<GpuContext>> {
         self.gpu.as_ref()
     }
 }

@@ -6,8 +6,11 @@ use nanna_agent::RunOptions;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+// Telegram API types - fields are part of the API spec even if not all are currently used
+
 /// Telegram Update object (simplified)
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
@@ -16,16 +19,18 @@ pub struct TelegramUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TelegramMessage {
     pub message_id: i64,
     pub from: Option<TelegramUser>,
     pub chat: TelegramChat,
     pub date: i64,
     pub text: Option<String>,
-    pub reply_to_message: Option<Box<TelegramMessage>>,
+    pub reply_to_message: Option<Box<Self>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TelegramUser {
     pub id: i64,
     pub first_name: String,
@@ -34,6 +39,7 @@ pub struct TelegramUser {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TelegramChat {
     pub id: i64,
     #[serde(rename = "type")]
@@ -43,6 +49,7 @@ pub struct TelegramChat {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CallbackQuery {
     pub id: String,
     pub from: TelegramUser,
@@ -81,9 +88,9 @@ pub async fn handle(
     }
 
     let chat_id = message.chat.id;
-    let user_id = message.from.as_ref().map(|u| u.id).unwrap_or(0);
+    let user_id = message.from.as_ref().map_or(0, |u| u.id);
     let username = message.from.as_ref().and_then(|u| u.username.clone());
-    let session_id = format!("telegram:{}:{}", chat_id, user_id);
+    let session_id = format!("telegram:{chat_id}:{user_id}");
 
     info!(
         "Telegram message from {} (@{}) in {}: {}",

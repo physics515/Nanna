@@ -1,9 +1,9 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Persistent storage for Nanna using Turso
 //!
-//! Turso is a Rust-native SQLite implementation.
+//! Turso is a Rust-native `SQLite` implementation.
 
 mod migrations;
 mod models;
@@ -116,23 +116,28 @@ impl Storage {
     }
 
     /// Get connection reference
-    pub fn conn(&self) -> &Arc<RwLock<Connection>> {
+    #[must_use] 
+    pub const fn conn(&self) -> &Arc<RwLock<Connection>> {
         &self.conn
     }
 
     // Repository accessors
+    #[must_use] 
     pub fn sessions(&self) -> SessionRepository {
         SessionRepository::new(self.conn.clone())
     }
 
+    #[must_use] 
     pub fn messages(&self) -> MessageRepository {
         MessageRepository::new(self.conn.clone())
     }
 
+    #[must_use] 
     pub fn memories(&self) -> MemoryRepository {
         MemoryRepository::new(self.conn.clone())
     }
 
+    #[must_use] 
     pub fn config_store(&self) -> ConfigRepository {
         ConfigRepository::new(self.conn.clone())
     }

@@ -11,3 +11,4 @@ tracing.workspace = true
 thiserror.workspace = true
 flume.workspace = true
 async-trait = "0.1"
+bitflags = "2"

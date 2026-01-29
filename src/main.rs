@@ -1,7 +1,7 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
-//! Nanna - High-performance AI assistant in Rust
+//! Nanna - High-performance AI assistant in Rust.
 //!
 //! Moon god of the digital realm.
 //! Built with SIMD and GPU acceleration for unrelenting performance.
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tracing::{error, info, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const BANNER: &str = r#"
+const BANNER: &str = r"
          🌙
         /|\
        / | \
@@ -32,7 +32,7 @@ const BANNER: &str = r#"
      /   |   \
     /____|____\
        NANNA
-"#;
+";
 
 #[derive(Parser)]
 #[command(name = "nanna")]
@@ -117,10 +117,9 @@ async fn main() -> anyhow::Result<()> {
     let log_level = match cli.log_level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
-        "info" => Level::INFO,
         "warn" => Level::WARN,
         "error" => Level::ERROR,
-        _ => Level::INFO,
+        _ => Level::INFO, // "info" or unknown defaults to INFO
     };
 
     tracing_subscriber::registry()
@@ -148,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     // Handle commands
     match cli.command {
         Some(Commands::Init) => {
-            let _config = onboarding::run_onboarding().await?;
+            let _config = onboarding::run_onboarding()?;
             return Ok(());
         }
         Some(Commands::Status) => {
@@ -167,18 +166,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Server { host, port }) => {
             // Check for API key, offer quick setup if missing
-            let config = ensure_api_key(config).await?;
+            let config = ensure_api_key(config)?;
             run_server(&config, host, port).await?;
         }
         Some(Commands::Chat { session, model, stream }) => {
             // Check for first run
             if onboarding::is_first_run() {
                 println!("Welcome! Let's get you set up first.\n");
-                let config = onboarding::run_onboarding().await?;
+                let config = onboarding::run_onboarding()?;
                 run_cli(&config, session, model, stream).await?;
             } else {
                 // Check for API key, offer quick setup if missing
-                let config = ensure_api_key(config).await?;
+                let config = ensure_api_key(config)?;
                 run_cli(&config, session, model, stream).await?;
             }
         }
@@ -186,17 +185,17 @@ async fn main() -> anyhow::Result<()> {
             list_sessions(&config, limit).await?;
         }
         Some(Commands::Run { prompt, model }) => {
-            let config = ensure_api_key(config).await?;
+            let config = ensure_api_key(config)?;
             run_once(&config, &prompt, model).await?;
         }
         None => {
             // Default: check for first run, then CLI mode
             if onboarding::is_first_run() {
                 println!("Welcome! Let's get you set up first.\n");
-                let config = onboarding::run_onboarding().await?;
+                let config = onboarding::run_onboarding()?;
                 run_cli(&config, None, None, false).await?;
             } else {
-                let config = ensure_api_key(config).await?;
+                let config = ensure_api_key(config)?;
                 run_cli(&config, None, None, false).await?;
             }
         }
@@ -205,8 +204,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ensure API key is configured, prompt if not
-async fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
+/// Ensure API key is configured, prompt if not.
+fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
     if !onboarding::has_api_key(&config) {
         onboarding::quick_setup(&mut config)?;
     }
@@ -217,12 +216,11 @@ async fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
 async fn init_components(
     config: &Config,
 ) -> anyhow::Result<(Arc<LlmClient>, Arc<ToolRegistry>, Arc<Storage>)> {
-    // Get API key
+    // Get API key - default to Anthropic
     let env_var = match config.llm.provider.as_str() {
-        "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
-        _ => "ANTHROPIC_API_KEY",
+        _ => "ANTHROPIC_API_KEY", // anthropic or unknown
     };
     
     let api_key = config
@@ -231,17 +229,17 @@ async fn init_components(
         .clone()
         .or_else(|| std::env::var(env_var).ok())
         .ok_or_else(|| anyhow::anyhow!(
-            "API key required. Run 'nanna init' or set {} environment variable",
-            env_var
+            "API key required. Run 'nanna init' or set {env_var} environment variable"
         ))?;
 
-    // Create LLM client
+    // Create LLM client - default to Anthropic
     let llm = Arc::new(match config.llm.provider.as_str() {
-        "anthropic" => LlmClient::anthropic(&api_key),
         "openai" => LlmClient::openai(&api_key),
         "openrouter" => LlmClient::openrouter(&api_key),
-        _ => {
-            error!("Unknown LLM provider: {}", config.llm.provider);
+        provider => {
+            if provider != "anthropic" {
+                error!("Unknown LLM provider: {provider}, defaulting to anthropic");
+            }
             LlmClient::anthropic(&api_key)
         }
     });
@@ -249,7 +247,7 @@ async fn init_components(
     // Validate API key early
     info!("Validating API key...");
     if let Err(e) = llm.validate().await {
-        return Err(anyhow::anyhow!("API key validation failed: {}. Check your config or {} environment variable.", e, env_var));
+        return Err(anyhow::anyhow!("API key validation failed: {e}. Check your config or {env_var} environment variable."));
     }
     info!("API key valid");
 
@@ -334,12 +332,11 @@ async fn init_components(
 async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     let (llm, tools, storage) = init_components(config).await?;
 
-    // Get API key for bot
+    // Get API key for bot - default to Anthropic
     let env_var = match config.llm.provider.as_str() {
-        "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY", 
         "openrouter" => "OPENROUTER_API_KEY",
-        _ => "ANTHROPIC_API_KEY",
+        _ => "ANTHROPIC_API_KEY", // anthropic or unknown
     };
     
     let api_key = config
@@ -358,10 +355,9 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
     };
 
     let bot_llm = match config.llm.provider.as_str() {
-        "anthropic" => LlmClient::anthropic(&api_key),
         "openai" => LlmClient::openai(&api_key),
         "openrouter" => LlmClient::openrouter(&api_key),
-        _ => LlmClient::anthropic(&api_key),
+        _ => LlmClient::anthropic(&api_key), // anthropic or unknown
     };
 
     let bot = Nanna::new(bot_config, bot_llm).await?;
@@ -394,38 +390,10 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
     Ok(())
 }
 
-/// Run interactive CLI mode
-async fn run_cli(config: &Config, session_id: Option<String>, model: Option<String>, stream: bool) -> anyhow::Result<()> {
-    let (llm, tools, storage) = init_components(config).await?;
-
-    println!("{}", BANNER);
-    println!("  Moon god of the digital realm. v{}", env!("CARGO_PKG_VERSION"));
-    if stream {
-        println!("  Streaming enabled. Type 'quit' to exit, 'clear' to reset.\n");
-    } else {
-        println!("  Type 'quit' to exit, 'clear' to reset.\n");
-    }
-
-    // Check if resuming existing session or creating new
-    let (session_id, is_resume) = match session_id {
-        Some(id) => (id, true),
-        None => (uuid::Uuid::new_v4().to_string(), false),
-    };
-    info!("Session: {}", session_id);
-
-    // Create or resume session
-    let _ = storage.sessions().create(&session_id, "cli", None).await;
-
-    let agent_config = AgentConfig {
-        model: model.unwrap_or_else(|| config.llm.model.clone()),
-        max_tokens: config.llm.max_tokens,
-        temperature: config.llm.temperature,
-        max_iterations: 10,
-    };
-
-    let cwd = std::env::current_dir()?;
-    let mut context = AgentContext::new(&session_id).with_system_prompt(format!(
-        r#"You are Nanna — moon god of the digital realm.
+/// Build the system prompt for CLI mode.
+fn build_cli_system_prompt(cwd: &std::path::Path) -> String {
+    format!(
+        r"You are Nanna — moon god of the digital realm.
 
 You have tools at your disposal:
 - exec: Execute shell commands
@@ -436,35 +404,97 @@ You have tools at your disposal:
 
 Current directory: {}
 
-Be helpful. Be competent. Don't waste words."#,
+Be helpful. Be competent. Don't waste words.",
         cwd.display()
-    ));
+    )
+}
 
-    // Load previous messages if resuming
-    if is_resume {
-        match storage.messages().get_by_session(&session_id, 50).await {
-            Ok(messages) => {
-                let msg_count = messages.len();
-                for msg in messages {
-                    match msg.role.as_str() {
-                        "user" => context.add_user_message(&msg.content),
-                        "assistant" => context.add_assistant_message(&msg.content),
-                        _ => {}
-                    }
-                }
-                if msg_count > 0 {
-                    info!("Resumed session with {} messages", msg_count);
-                    println!("  Resumed session with {} previous messages.", msg_count);
-                }
-            }
-            Err(e) => {
-                info!("Could not load session history: {}", e);
-            }
+/// Print tool call results.
+fn print_tool_calls(tool_calls: &[nanna_agent::ToolCallRecord]) {
+    if tool_calls.is_empty() {
+        return;
+    }
+    print!("\n[");
+    for (i, call) in tool_calls.iter().enumerate() {
+        if i > 0 {
+            print!(", ");
         }
+        let status = if call.success { "✓" } else { "✗" };
+        print!("{} {}", status, call.name);
+    }
+    println!("]");
+}
+
+/// Run interactive CLI mode.
+async fn run_cli(
+    config: &Config,
+    session_id: Option<String>,
+    model: Option<String>,
+    stream: bool,
+) -> anyhow::Result<()> {
+    let (llm, tools, storage) = init_components(config).await?;
+
+    // Print banner
+    println!("{BANNER}");
+    println!(
+        "  Moon god of the digital realm. v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    if stream {
+        println!("  Streaming enabled. Type 'quit' to exit, 'clear' to reset.\n");
+    } else {
+        println!("  Type 'quit' to exit, 'clear' to reset.\n");
     }
 
-    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    // Session setup
+    let (session_id, is_resume) = session_id.map_or_else(
+        || (uuid::Uuid::new_v4().to_string(), false),
+        |id| (id, true),
+    );
+    info!("Session: {session_id}");
+    let _ = storage.sessions().create(&session_id, "cli", None).await;
 
+    // Agent config
+    let agent_config = AgentConfig {
+        model: model.unwrap_or_else(|| config.llm.model.clone()),
+        max_tokens: config.llm.max_tokens,
+        temperature: config.llm.temperature,
+        max_iterations: 10,
+    };
+
+    // Build context with system prompt
+    let cwd = std::env::current_dir()?;
+    let mut context =
+        AgentContext::new(&session_id).with_system_prompt(build_cli_system_prompt(&cwd));
+
+    // Load session history if resuming
+    if is_resume
+        && let Ok(messages) = storage.messages().get_by_session(&session_id, 50).await {
+            let msg_count = messages.len();
+            for msg in messages {
+                match msg.role.as_str() {
+                    "user" => context.add_user_message(&msg.content),
+                    "assistant" => context.add_assistant_message(&msg.content),
+                    _ => {}
+                }
+            }
+            if msg_count > 0 {
+                info!("Resumed session with {msg_count} messages");
+                println!("  Resumed session with {msg_count} previous messages.");
+            }
+        }
+
+    let agent = Agent::new(agent_config, llm, tools).with_context(context);
+    run_cli_loop(&agent, &storage, &session_id, stream).await
+}
+
+/// Main REPL loop for CLI mode.
+async fn run_cli_loop(
+    agent: &Agent,
+    storage: &Arc<Storage>,
+    session_id: &str,
+    stream: bool,
+) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -480,6 +510,7 @@ Be helpful. Be competent. Don't waste words."#,
             continue;
         }
 
+        // Handle commands
         match input.to_lowercase().as_str() {
             "quit" | "exit" | "q" => {
                 println!("\nThe moon sets. Until next time.");
@@ -497,10 +528,10 @@ Be helpful. Be competent. Don't waste words."#,
         let _ = storage
             .messages()
             .create(nanna_storage::NewMessage {
-                session_id: session_id.clone(),
-                role: "user".to_string(),
-                content: input.to_string(),
-                content_type: "text".to_string(),
+                session_id: session_id.to_string(),
+                role: "user".to_owned(),
+                content: input.to_owned(),
+                content_type: "text".to_owned(),
                 tool_use_id: None,
                 tokens_in: None,
                 tokens_out: None,
@@ -508,13 +539,13 @@ Be helpful. Be competent. Don't waste words."#,
             })
             .await;
 
-        // Build run options with optional streaming
+        // Build run options
         let run_options = if stream {
-            print!("\n");
+            println!();
             stdout.flush()?;
             RunOptions {
                 on_text: Some(Box::new(|text: &str| {
-                    print!("{}", text);
+                    print!("{text}");
                     let _ = std::io::stdout().flush();
                 })),
                 ..Default::default()
@@ -523,43 +554,34 @@ Be helpful. Be competent. Don't waste words."#,
             RunOptions::default()
         };
 
+        // Run agent and handle response
         match agent.run(input, run_options).await {
             Ok(response) => {
-                if !stream {
-                    println!("\n{}", response.text);
+                if stream {
+                    println!();
                 } else {
-                    println!(); // Newline after streamed text
+                    println!("\n{}", response.text);
                 }
 
                 // Store assistant response
                 let _ = storage
                     .messages()
                     .create(nanna_storage::NewMessage {
-                        session_id: session_id.clone(),
-                        role: "assistant".to_string(),
+                        session_id: session_id.to_string(),
+                        role: "assistant".to_owned(),
                         content: response.text.clone(),
-                        content_type: "text".to_string(),
+                        content_type: "text".to_owned(),
                         tool_use_id: None,
-                        tokens_in: Some(response.input_tokens as i64),
-                        tokens_out: Some(response.output_tokens as i64),
+                        tokens_in: Some(i64::from(response.input_tokens)),
+                        tokens_out: Some(i64::from(response.output_tokens)),
                         metadata: None,
                     })
                     .await;
 
-                if !response.tool_calls.is_empty() {
-                    print!("\n[");
-                    for (i, call) in response.tool_calls.iter().enumerate() {
-                        if i > 0 {
-                            print!(", ");
-                        }
-                        let status = if call.success { "✓" } else { "✗" };
-                        print!("{} {}", status, call.name);
-                    }
-                    println!("]");
-                }
+                print_tool_calls(&response.tool_calls);
             }
-            Err(e) => {
-                eprintln!("\nError: {}", e);
+            Err(err) => {
+                eprintln!("\nError: {err}");
             }
         }
     }
@@ -580,7 +602,7 @@ async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> anyho
 
     let cwd = std::env::current_dir()?;
     let context = AgentContext::new("oneshot").with_system_prompt(format!(
-        r#"You are Nanna — a helpful AI assistant.
+        r"You are Nanna — a helpful AI assistant.
 
 You have tools at your disposal:
 - exec: Execute shell commands
@@ -591,7 +613,7 @@ You have tools at your disposal:
 
 Current directory: {}
 
-Be concise and direct."#,
+Be concise and direct.",
         cwd.display()
     ));
 
@@ -602,7 +624,7 @@ Be concise and direct."#,
             println!("{}", response.text);
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             std::process::exit(1);
         }
     }

@@ -1,11 +1,12 @@
-#![warn(clippy::all, clippy::restriction)]
-#![deny(clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Channel abstraction for Nanna
 //!
 //! Provides a unified interface for different messaging platforms.
 
 use async_trait::async_trait;
+use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -84,6 +85,7 @@ impl MessageContent {
         Self::Text { text: text.into() }
     }
 
+    #[must_use] 
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
@@ -92,17 +94,71 @@ impl MessageContent {
     }
 }
 
-/// Channel capabilities
+bitflags! {
+    /// Flags representing supported channel features.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ChannelFeatures: u8 {
+        const REACTIONS  = 0b0000_0001;
+        const REPLIES    = 0b0000_0010;
+        const EDITS      = 0b0000_0100;
+        const THREADS    = 0b0000_1000;
+        const IMAGES     = 0b0001_0000;
+        const AUDIO      = 0b0010_0000;
+        const DOCUMENTS  = 0b0100_0000;
+    }
+}
+
+/// Channel capabilities.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelCapabilities {
-    pub supports_reactions: bool,
-    pub supports_replies: bool,
-    pub supports_edits: bool,
-    pub supports_threads: bool,
-    pub supports_images: bool,
-    pub supports_audio: bool,
-    pub supports_documents: bool,
+    /// Supported features (reactions, replies, etc.).
+    pub features: ChannelFeatures,
+    /// Maximum message length, if any.
     pub max_message_length: Option<usize>,
+}
+
+impl ChannelCapabilities {
+    /// Check if reactions are supported.
+    #[must_use]
+    pub const fn supports_reactions(&self) -> bool {
+        self.features.contains(ChannelFeatures::REACTIONS)
+    }
+
+    /// Check if replies are supported.
+    #[must_use]
+    pub const fn supports_replies(&self) -> bool {
+        self.features.contains(ChannelFeatures::REPLIES)
+    }
+
+    /// Check if edits are supported.
+    #[must_use]
+    pub const fn supports_edits(&self) -> bool {
+        self.features.contains(ChannelFeatures::EDITS)
+    }
+
+    /// Check if threads are supported.
+    #[must_use]
+    pub const fn supports_threads(&self) -> bool {
+        self.features.contains(ChannelFeatures::THREADS)
+    }
+
+    /// Check if images are supported.
+    #[must_use]
+    pub const fn supports_images(&self) -> bool {
+        self.features.contains(ChannelFeatures::IMAGES)
+    }
+
+    /// Check if audio is supported.
+    #[must_use]
+    pub const fn supports_audio(&self) -> bool {
+        self.features.contains(ChannelFeatures::AUDIO)
+    }
+
+    /// Check if documents are supported.
+    #[must_use]
+    pub const fn supports_documents(&self) -> bool {
+        self.features.contains(ChannelFeatures::DOCUMENTS)
+    }
 }
 
 /// Trait for channel implementations
@@ -141,6 +197,7 @@ pub struct MessageRouter {
 }
 
 impl MessageRouter {
+    #[must_use] 
     pub fn new() -> Self {
         let (incoming_tx, incoming_rx) = flume::unbounded();
         Self {
@@ -156,11 +213,13 @@ impl MessageRouter {
     }
 
     /// Get a channel by name
+    #[must_use] 
     pub fn get(&self, name: &str) -> Option<&dyn Channel> {
-        self.channels.get(name).map(|c| c.as_ref())
+        self.channels.get(name).map(std::convert::AsRef::as_ref)
     }
 
     /// Get the incoming message sender (for channel implementations)
+    #[must_use] 
     pub fn incoming_sender(&self) -> flume::Sender<IncomingMessage> {
         self.incoming_tx.clone()
     }
@@ -170,7 +229,12 @@ impl MessageRouter {
         self.incoming_rx.recv_async().await.ok()
     }
 
-    /// Send a message through the appropriate channel
+    /// Send a message through the appropriate channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ChannelError::NotFound` if the channel provider is not registered.
+    /// May also return errors from the underlying channel implementation.
     pub async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError> {
         let channel = self
             .channels

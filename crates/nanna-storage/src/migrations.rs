@@ -7,7 +7,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("003_config", MIGRATION_003),
 ];
 
-const MIGRATION_001: &str = r#"
+const MIGRATION_001: &str = r"
 -- Sessions table
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,9 +39,9 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
-"#;
+";
 
-const MIGRATION_002: &str = r#"
+const MIGRATION_002: &str = r"
 -- Vector memories table (for semantic search)
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,9 +66,9 @@ CREATE TABLE IF NOT EXISTS memory_tags (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
-"#;
+";
 
-const MIGRATION_003: &str = r#"
+const MIGRATION_003: &str = r"
 -- Key-value config storage
 CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
@@ -90,4 +90,4 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cron_next ON cron_jobs(next_run) WHERE enabled = 1;
-"#;
+";

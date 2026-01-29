@@ -31,6 +31,8 @@ impl AgentContext {
         }
     }
 
+    /// Set the system prompt.
+    #[must_use]
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
         self
@@ -49,6 +51,7 @@ impl AgentContext {
     }
 
     /// Estimate token count (rough heuristic: ~4 chars per token)
+    #[must_use] 
     pub fn estimate_tokens(&self) -> usize {
         let system_tokens = self.system_prompt.len() / 4;
         let message_tokens: usize = self

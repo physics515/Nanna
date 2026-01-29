@@ -25,6 +25,7 @@ pub struct TursoMemoryStorage {
 }
 
 impl TursoMemoryStorage {
+    #[must_use] 
     pub fn new(storage: Arc<Storage>) -> Self {
         Self {
             storage,
@@ -91,7 +92,7 @@ impl MemoryStorage for TursoMemoryStorage {
         if let Some(ref embed_fn) = self.embed_fn {
             let query_embedding = embed_fn(query.to_string())
                 .await
-                .map_err(|e| format!("Failed to embed query: {}", e))?;
+                .map_err(|e| format!("Failed to embed query: {e}"))?;
 
             // Score each memory by SIMD-accelerated cosine similarity
             let mut scored: Vec<(MemoryResult, f32)> = memories
