@@ -86,7 +86,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, provide } from 'vue'
+import { ref, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
@@ -105,6 +105,8 @@ interface AppConfig {
   available_models: string[]
 }
 
+const route = useRoute()
+
 const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
@@ -119,6 +121,12 @@ onMounted(async () => {
   await loadSessions()
   await loadConfig()
   
+  // Sync currentSessionId from URL query param
+  const urlSessionId = route.query.session as string | undefined
+  if (urlSessionId && sessions.value.some(s => s.id === urlSessionId)) {
+    currentSessionId.value = urlSessionId
+  }
+  
   // Listen for tray "new chat" event
   unlistenTrayNewChat = await listen('tray-new-chat', () => {
     createNewSession()
@@ -127,6 +135,13 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (unlistenTrayNewChat) unlistenTrayNewChat()
+})
+
+// Watch for route changes to sync currentSessionId
+watch(() => route.query.session, (newSessionId) => {
+  if (typeof newSessionId === 'string' && sessions.value.some(s => s.id === newSessionId)) {
+    currentSessionId.value = newSessionId
+  }
 })
 
 async function loadSessions() {
@@ -158,12 +173,8 @@ async function createNewSession() {
     // Reload sessions list from backend to avoid duplicates
     await loadSessions()
     
-    // Navigate to chat and reload to switch context
-    if (window.location.pathname === '/') {
-      window.location.reload()
-    } else {
-      navigateTo('/')
-    }
+    // Navigate with session ID in query
+    navigateTo(`/?session=${session.id}`)
   } catch (e) {
     console.error('Failed to create session:', e)
   }
@@ -171,12 +182,8 @@ async function createNewSession() {
 
 function switchSession(session: SessionInfo) {
   currentSessionId.value = session.id
-  // Navigate and reload
-  if (window.location.pathname !== '/') {
-    navigateTo('/')
-  } else {
-    window.location.reload()
-  }
+  // Navigate with session ID in query
+  navigateTo(`/?session=${session.id}`)
 }
 
 function onSessionDeleted(sessionId: string) {

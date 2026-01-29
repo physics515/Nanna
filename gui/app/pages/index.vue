@@ -159,7 +159,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, inject, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { marked } from 'marked'
@@ -224,8 +224,8 @@ interface ToolCallEvent {
   status: 'started' | 'completed' | 'error'
 }
 
-// Inject currentSessionId from layout
-const injectedSessionId = inject<Ref<string | null>>('currentSessionId')
+// Get session ID from URL query param
+const route = useRoute()
 
 const messages = ref<Message[]>([])
 const input = ref('')
@@ -254,10 +254,10 @@ onMounted(async () => {
   // Try to get or create a session
   try {
     const sessions = await invoke<SessionInfo[]>('list_sessions')
-    const targetSessionId = injectedSessionId?.value
+    const targetSessionId = route.query.session as string | undefined
     
     if (sessions.length > 0) {
-      // Find the session matching injectedSessionId, or fall back to first
+      // Find the session matching URL query, or fall back to first
       const targetSession = targetSessionId 
         ? sessions.find(s => s.id === targetSessionId) 
         : null
