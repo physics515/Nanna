@@ -20,7 +20,9 @@
 - [x] Browser tools (screenshot, extract, action, evaluate)
 - [x] Vision tools (analyze_image)
 - [x] Audio tools (TTS, transcription)
-- [ ] Authoring tools (runtime tool creation)
+- [x] Authoring tools (runtime tool creation) — `nanna-scripting` crate
+  - [x] Boa engine (pure Rust, lightweight)
+  - [ ] Deno engine (V8 fallback for full TS support)
 
 ### Channels
 - [x] Telegram (full API: send, react, edit, delete, pin, poll)
