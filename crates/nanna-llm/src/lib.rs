@@ -720,6 +720,60 @@ impl LlmClient {
             }
         }
     }
+
+    /// Convenience method to stream a CompletionRequest
+    /// Converts to provider-specific format automatically
+    pub fn stream(
+        &self,
+        request: &CompletionRequest,
+    ) -> impl Stream<Item = StreamEvent> + '_ {
+        // Extract system message
+        let system_msg = request
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.content.clone());
+
+        // Convert to Anthropic format
+        let messages: Vec<AnthropicMessage> = request
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .map(|m| AnthropicMessage {
+                role: match m.role {
+                    Role::User | Role::System => "user",
+                    Role::Assistant => "assistant",
+                }.to_string(),
+                content: vec![ContentBlock::Text { text: m.content.clone() }],
+            })
+            .collect();
+
+        let anthropic_request = AnthropicRequest {
+            model: request.model.clone(),
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(4096),
+            temperature: request.temperature,
+            system: system_msg,
+            tools: None,
+            stream: Some(true),
+        };
+
+        // Create an async stream that filters and maps the raw stream
+        stream! {
+            let raw_stream = self.stream_anthropic(&anthropic_request);
+            tokio::pin!(raw_stream);
+            
+            while let Some(result) = raw_stream.next().await {
+                match result {
+                    Ok(event) => yield event,
+                    Err(e) => {
+                        yield StreamEvent::Error { message: e.to_string() };
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Extract a complete SSE event from the buffer.

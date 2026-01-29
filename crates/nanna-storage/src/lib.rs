@@ -146,6 +146,114 @@ impl Storage {
     pub fn cron_jobs(&self) -> CronJobRepository {
         CronJobRepository::new(self.conn.clone())
     }
+
+    // =========================================================================
+    // Convenience methods for GUI
+    // =========================================================================
+
+    /// Create a new GUI session
+    pub async fn create_gui_session(&self, name: &str) -> Result<Session, StorageError> {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let conn = self.conn.write().await;
+
+        conn.execute(
+            "INSERT INTO sessions (session_id, channel, user_id, metadata) VALUES (?1, 'gui', NULL, ?2)",
+            turso::params![session_id.as_str(), format!("{{\"name\":\"{}\"}}", name).as_str()],
+        )
+        .await?;
+
+        drop(conn);
+        self.sessions().get(&session_id).await
+    }
+
+    /// List sessions for GUI (with names from metadata)
+    pub async fn list_gui_sessions(&self, limit: i64) -> Result<Vec<Session>, StorageError> {
+        self.sessions().list_recent(limit).await
+    }
+
+    /// Get messages for a session
+    pub async fn get_session_messages(&self, session_id: &str, limit: i64) -> Result<Vec<Message>, StorageError> {
+        self.messages().get_by_session(session_id, limit).await
+    }
+
+    /// Add a message to a session
+    pub async fn add_message(&self, session_id: &str, role: &str, content: &str) -> Result<Message, StorageError> {
+        self.messages().create(NewMessage {
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            content_type: "text".to_string(),
+            tool_use_id: None,
+            tokens_in: None,
+            tokens_out: None,
+            metadata: None,
+        }).await
+    }
+
+    /// Count messages in a session
+    pub async fn count_session_messages(&self, session_id: &str) -> Result<i64, StorageError> {
+        let conn = self.conn.read().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                turso::params![session_id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(row.get(0)?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Update session timestamp
+    pub async fn touch_session(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+        conn.execute(
+            "UPDATE sessions SET updated_at = datetime('now') WHERE session_id = ?1",
+            turso::params![session_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Rename a session
+    pub async fn rename_session(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+        conn.execute(
+            "UPDATE sessions SET metadata = json_set(COALESCE(metadata, '{}'), '$.name', ?1), updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![name, session_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a session and its messages
+    pub async fn delete_session(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            turso::params![session_id],
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            turso::params![session_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Get session name from metadata
+    pub fn get_session_name(session: &Session) -> String {
+        session.metadata
+            .as_ref()
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("Session {}", &session.session_id[..8]))
+    }
 }
 
 #[cfg(test)]

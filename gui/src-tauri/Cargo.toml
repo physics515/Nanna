@@ -19,14 +19,20 @@ tauri.workspace = true
 tauri-plugin-shell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+# Async utilities
+futures = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Link to nanna crates for IPC
 nanna-core = { path = "../../crates/nanna-core" }
 nanna-llm = { path = "../../crates/nanna-llm" }
 nanna-config = { path = "../../crates/nanna-config" }
 nanna-storage = { path = "../../crates/nanna-storage" }
-
-tokio.workspace = true
 
 [features]
 default = ["custom-protocol"]
