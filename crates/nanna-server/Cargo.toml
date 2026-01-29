@@ -1,0 +1,28 @@
+[package]
+name = "nanna-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+
+nanna-core = { path = "../nanna-core" }
+nanna-agent = { path = "../nanna-agent" }
+nanna-tools = { path = "../nanna-tools" }
+nanna-storage = { path = "../nanna-storage" }
+nanna-llm = { path = "../nanna-llm" }
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Utilities
+uuid = { version = "1.16", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }

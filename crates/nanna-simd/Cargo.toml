@@ -1,0 +1,12 @@
+[package]
+name = "nanna-simd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wide.workspace = true
+half.workspace = true
+
+[features]
+default = []
+nightly = []  # Enable std::simd when on nightly

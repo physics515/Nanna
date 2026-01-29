@@ -1,0 +1,84 @@
+//! Database models
+
+use serde::{Deserialize, Serialize};
+
+/// Session model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: i64,
+    pub session_id: String,
+    pub channel: String,
+    pub user_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Message model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub content_type: String,
+    pub tool_use_id: Option<String>,
+    pub created_at: String,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Memory model (for vector search)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Memory {
+    pub id: i64,
+    pub memory_id: String,
+    pub content: String,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: Option<serde_json::Value>,
+    pub tags: Vec<String>,
+}
+
+/// Cron job model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJob {
+    pub id: i64,
+    pub job_id: String,
+    pub schedule: String,
+    pub task: serde_json::Value,
+    pub enabled: bool,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+    pub created_at: String,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// New message input
+#[derive(Debug, Clone)]
+pub struct NewMessage {
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub content_type: String,
+    pub tool_use_id: Option<String>,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// New memory input
+#[derive(Debug, Clone)]
+pub struct NewMemory {
+    pub memory_id: String,
+    pub content: String,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub session_id: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub tags: Vec<String>,
+}

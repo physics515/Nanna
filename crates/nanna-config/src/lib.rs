@@ -1,0 +1,288 @@
+#![warn(clippy::all, clippy::restriction)]
+#![deny(clippy::pedantic, clippy::nursery)]
+
+//! Configuration management for Nanna
+
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use thiserror::Error;
+use tracing::info;
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("TOML parse error: {0}")]
+    TomlParse(#[from] toml::de::Error),
+    #[error("TOML serialize error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
+    #[error("Config directory not found")]
+    NoDirFound,
+    #[error("Missing required field: {0}")]
+    MissingField(String),
+}
+
+/// Main configuration structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// General settings
+    pub general: GeneralConfig,
+    /// LLM provider settings
+    pub llm: LlmConfig,
+    /// Server settings
+    pub server: ServerConfig,
+    /// Channel configurations
+    pub channels: ChannelsConfig,
+    /// Tool settings
+    pub tools: ToolsConfig,
+    /// Memory settings  
+    pub memory: MemoryConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            general: GeneralConfig::default(),
+            llm: LlmConfig::default(),
+            server: ServerConfig::default(),
+            channels: ChannelsConfig::default(),
+            tools: ToolsConfig::default(),
+            memory: MemoryConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeneralConfig {
+    pub name: String,
+    pub log_level: String,
+    pub workspace: Option<PathBuf>,
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            name: "Nanna".to_string(),
+            log_level: "info".to_string(),
+            workspace: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    pub provider: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub max_tokens: u32,
+    pub temperature: f32,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            api_key: None,
+            base_url: None,
+            max_tokens: 8192,
+            temperature: 0.7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub webhook_secret: Option<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: "0.0.0.0".to_string(),
+            port: 3000,
+            webhook_secret: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChannelsConfig {
+    pub telegram: Option<TelegramConfig>,
+    pub discord: Option<DiscordConfig>,
+    pub slack: Option<SlackConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub webhook_url: Option<String>,
+    pub allowed_users: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordConfig {
+    pub bot_token: String,
+    pub application_id: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackConfig {
+    pub bot_token: String,
+    pub app_token: Option<String>,
+    pub signing_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub enabled: Vec<String>,
+    pub disabled: Vec<String>,
+    pub exec_allowlist: Option<Vec<String>>,
+    pub file_sandbox: Option<PathBuf>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: vec!["*".to_string()], // All tools enabled by default
+            disabled: Vec::new(),
+            exec_allowlist: None,
+            file_sandbox: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    pub embedding_model: String,
+    pub vector_dimension: usize,
+    pub storage_path: Option<PathBuf>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            embedding_model: "text-embedding-3-small".to_string(),
+            vector_dimension: 1536,
+            storage_path: None,
+        }
+    }
+}
+
+impl Config {
+    /// Load config from default location
+    pub fn load() -> Result<Self, ConfigError> {
+        let path = Self::default_config_path()?;
+        if path.exists() {
+            Self::load_from(&path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Load config from a specific path
+    pub fn load_from(path: &PathBuf) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path)?;
+        let config: Config = toml::from_str(&content)?;
+        info!("Loaded config from {:?}", path);
+        Ok(config)
+    }
+
+    /// Save config to default location
+    pub fn save(&self) -> Result<(), ConfigError> {
+        let path = Self::default_config_path()?;
+        self.save_to(&path)
+    }
+
+    /// Save config to a specific path
+    pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        info!("Saved config to {:?}", path);
+        Ok(())
+    }
+
+    /// Get default config path
+    pub fn default_config_path() -> Result<PathBuf, ConfigError> {
+        let dirs = ProjectDirs::from("bot", "clawd", "Nanna")
+            .ok_or(ConfigError::NoDirFound)?;
+        Ok(dirs.config_dir().join("config.toml"))
+    }
+
+    /// Get default data directory
+    pub fn default_data_dir() -> Result<PathBuf, ConfigError> {
+        let dirs = ProjectDirs::from("bot", "clawd", "Nanna")
+            .ok_or(ConfigError::NoDirFound)?;
+        Ok(dirs.data_dir().to_path_buf())
+    }
+
+    /// Override config with environment variables
+    pub fn with_env_overrides(mut self) -> Self {
+        // LLM API keys
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            self.llm.api_key = Some(key);
+        }
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            if self.llm.provider == "openai" {
+                self.llm.api_key = Some(key);
+            }
+        }
+
+        // Server config
+        if let Ok(port) = std::env::var("PORT") {
+            if let Ok(p) = port.parse() {
+                self.server.port = p;
+            }
+        }
+
+        // Telegram
+        if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+            self.channels.telegram = Some(TelegramConfig {
+                bot_token: token,
+                webhook_url: std::env::var("TELEGRAM_WEBHOOK_URL").ok(),
+                allowed_users: None,
+            });
+        }
+
+        // Discord
+        if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
+            if let (Ok(app_id), Ok(pub_key)) = (
+                std::env::var("DISCORD_APPLICATION_ID"),
+                std::env::var("DISCORD_PUBLIC_KEY"),
+            ) {
+                self.channels.discord = Some(DiscordConfig {
+                    bot_token: token,
+                    application_id: app_id,
+                    public_key: pub_key,
+                });
+            }
+        }
+
+        self
+    }
+}
+
+/// Generate a default config file content
+pub fn generate_default_config() -> String {
+    let config = Config::default();
+    toml::to_string_pretty(&config).unwrap_or_default()
+}

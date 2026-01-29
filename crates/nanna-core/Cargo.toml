@@ -1,0 +1,20 @@
+[package]
+name = "nanna-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+flume.workspace = true
+uuid.workspace = true
+
+nanna-simd = { path = "../nanna-simd" }
+nanna-gpu = { path = "../nanna-gpu" }
+nanna-llm = { path = "../nanna-llm" }
+nanna-channels = { path = "../nanna-channels" }
+nanna-memory = { path = "../nanna-memory" }

@@ -1,0 +1,105 @@
+[package]
+name = "nanna"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance AI assistant - patron deity of your digital realm"
+repository = "https://github.com/clawdbot/nanna"
+license = "MIT"
+
+[[bin]]
+name = "nanna"
+path = "src/main.rs"
+
+[dependencies]
+nanna-core = { path = "crates/nanna-core" }
+nanna-server = { path = "crates/nanna-server" }
+nanna-agent = { path = "crates/nanna-agent" }
+nanna-tools = { path = "crates/nanna-tools" }
+nanna-config = { path = "crates/nanna-config" }
+nanna-storage = { path = "crates/nanna-storage" }
+nanna-llm = { path = "crates/nanna-llm" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+uuid.workspace = true
+toml.workspace = true
+dialoguer = { version = "0.11", features = ["password"] }
+console = "0.15"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/nanna-core",
+    "crates/nanna-simd",
+    "crates/nanna-gpu",
+    "crates/nanna-llm",
+    "crates/nanna-channels",
+    "crates/nanna-memory",
+    "crates/nanna-server",
+    "crates/nanna-tools",
+    "crates/nanna-agent",
+    "crates/nanna-config",
+    "crates/nanna-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/clawdbot/nanna"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# GPU compute
+wgpu = "24"
+
+# SIMD - using portable_simd (nightly) or wide for stable
+wide = "0.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1.0"
+
+# Async channels
+flume = "0.11"
+
+# Memory/embeddings
+half = "2.4"  # f16 support
+
+# Web server
+axum = { version = "0.8", features = ["macros"] }
+
+# Utilities
+uuid = { version = "1.16", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+# Config
+toml = "0.8"
+directories = "6"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
