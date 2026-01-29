@@ -29,11 +29,16 @@ mod protocol;
 mod transport;
 mod client;
 mod adapter;
+mod server;
 
 pub use protocol::*;
 pub use transport::*;
-pub use client::*;
+pub use client::{McpClient, McpClientBuilder};
 pub use adapter::*;
+pub use server::{McpServer, McpServerBuilder, McpServerConfig, ToolHandler, ResourceHandler};
+
+/// MCP protocol version
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 use thiserror::Error;
 
