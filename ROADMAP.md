@@ -10,7 +10,7 @@
 - [x] Agent loop with context management
 - [x] Scheduler (heartbeats, cron)
 
-## Phase 2: Tools & Channels 🚧
+## Phase 2: Tools & Channels ✅
 ### Tools
 - [x] File operations (read, write, list)
 - [x] Shell execution
@@ -28,8 +28,8 @@
 - [x] Telegram (full API: send, react, edit, delete, pin, poll)
 - [x] Discord (REST API: send, react, edit, delete, pin, threads)
 - [x] Slack (Web API: send, react, edit, delete, pin, threads, files)
-- [ ] Signal (signald integration)
-- [ ] WhatsApp (Baileys or Cloud API)
+- [x] Signal (signald: send, react, groups)
+- [x] WhatsApp (Cloud API: send, react, media, templates)
 
 ## Phase 3: Multi-Agent & MCP 🚧
 - [x] MCP client (external tool servers) — `nanna-mcp` crate
@@ -112,7 +112,9 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 6 | ~~MCP client~~ | ✅ |
 | 7 | ~~Wire MCP into agent loop~~ | ✅ |
 | 8 | ~~Slack channel~~ | ✅ |
-| 9 | Signal channel | 🔜 Next |
-| 10 | WhatsApp channel | 🔜 |
-| 11 | Tauri GUI (desktop) | Later |
-| 12 | Tauri mobile (Android/iOS) | Later |
+| 9 | ~~Signal channel~~ | ✅ |
+| 10 | ~~WhatsApp channel~~ | ✅ |
+| 11 | Deno scripting fallback | 🔜 Next |
+| 12 | MCP server mode | 🔜 |
+| 13 | Tauri GUI (desktop) | Later |
+| 14 | Tauri mobile (Android/iOS) | Later |
