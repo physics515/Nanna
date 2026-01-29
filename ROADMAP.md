@@ -84,11 +84,12 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] Markdown rendering for responses
 - [x] Session management (create, switch, rename, delete)
 - [x] Settings page (API key, model selection)
-- [ ] Tool call visualization
-- [ ] Memory browser
+- [x] Tool call visualization (type icons, progress bars, collapsible I/O)
+- [x] Memory browser (search across sessions, stats dashboard)
+- [x] System tray / menu bar presence (show/new chat/quit menu)
+- [x] Streaming UX polish (ConnectionStatus, MessageSkeleton, retry logic)
 - [ ] Channel status dashboard
-- [ ] System tray / menu bar presence
-- [ ] Native notifications
+- [ ] Native notifications (plugin added, not wired)
 
 ### Technical
 - [x] Tauri v2 setup with Rust backend
@@ -97,6 +98,8 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] IPC bridge to nanna-core
 - [x] Streaming via Tauri events
 - [x] Session persistence (SQLite)
+- [x] System tray with tauri tray-icon feature
+- [x] Notification plugin installed
 - [ ] shadcn-vue component library
 - [ ] Mobile-responsive layouts
 
@@ -138,6 +141,12 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 16 | ~~GUI IPC + streaming~~ | ✅ |
 | 17 | ~~Settings + session mgmt~~ | ✅ |
 | 18 | ~~Markdown rendering~~ | ✅ |
-| 19 | Tool call visualization | 🔜 Next |
-| 20 | System tray | Later |
-| 21 | Tauri mobile (Android/iOS) | Later |
+| 19 | ~~Tool call visualization~~ | ✅ |
+| 20 | ~~System tray~~ | ✅ |
+| 21 | ~~Memory browser~~ | ✅ |
+| 22 | ~~Streaming UX polish~~ | ✅ |
+| 23 | Channel status dashboard | 🔜 Next |
+| 24 | Native notifications wiring | 🔜 Next |
+| 25 | shadcn-vue components | Later |
+| 26 | Tauri mobile (Android/iOS) | Later |
+| 27 | Production hardening | Later |
