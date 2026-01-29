@@ -284,7 +284,7 @@ fn create_scheduler(
                         success: true,
                         output: Some(response.text),
                         error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                     }
                 }
                 Err(e) => {
@@ -294,7 +294,7 @@ fn create_scheduler(
                         success: false,
                         output: None,
                         error: Some(e.to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
+                        duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                     }
                 }
             }
