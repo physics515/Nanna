@@ -13,4 +13,4 @@ chrono.workspace = true
 uuid.workspace = true
 
 # Turso - Rust-native SQLite
-turso = "0.2"
+turso = "0.4"
