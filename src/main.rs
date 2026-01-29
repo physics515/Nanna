@@ -11,13 +11,13 @@ mod onboarding;
 use clap::{Parser, Subcommand};
 use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions};
 use nanna_config::Config;
-use nanna_core::{LlmClient, Nanna, NannaConfig};
+use nanna_core::{LlmClient, Nanna, NannaConfig, Scheduler, SchedulerConfig, ScheduledTask, TaskResult};
 use nanna_server::{start_server, AppStateBuilder, ServerConfig};
 use nanna_storage::{Storage, StorageConfig};
 use nanna_tools::{
     CancelReminderTool, EchoTool, ExecTool, ExploreTool, ListDirTool, ListRemindersTool,
     ReadFileTool, RecallTool, ReflectTool, ReminderStore, RememberTool, RemindTool, StatusTool,
-    ToolRegistry, TursoMemoryStorage, WebFetchTool, WonderTool, WriteFileTool,
+    ToolRegistry, TursoMemoryStorage, WebFetchTool, WebSearchTool, WonderTool, WriteFileTool,
 };
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -212,6 +212,98 @@ fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// Create the scheduler with a task executor that runs tasks through an agent.
+fn create_scheduler(
+    config: &Config,
+    llm: Arc<LlmClient>,
+    tools: Arc<ToolRegistry>,
+    storage: Arc<Storage>,
+) -> Scheduler {
+    let scheduler_config = SchedulerConfig {
+        heartbeat_interval: std::time::Duration::from_secs(300), // 5 minutes
+        heartbeat_enabled: true,
+        max_concurrent: 4,
+    };
+
+    // Create a task executor that runs tasks through an agent
+    let model = config.llm.model.clone();
+    let executor: nanna_core::TaskExecutor = Arc::new(move |task: ScheduledTask| {
+        let llm = llm.clone();
+        let tools = tools.clone();
+        let storage = storage.clone();
+        let model = model.clone();
+
+        Box::pin(async move {
+            let start = std::time::Instant::now();
+            let task_id = task.id.clone();
+
+            info!("Executing scheduled task: {} ({})", task.name, task_id);
+
+            // Create a dedicated agent for the task
+            let agent_config = AgentConfig {
+                model,
+                max_tokens: 4096,
+                temperature: 0.7,
+                max_iterations: 5,
+            };
+
+            let session_id = format!("scheduler:{}", task.name);
+            let system_prompt = match task.task_type {
+                nanna_core::TaskType::Heartbeat => {
+                    "You are Nanna in heartbeat mode. Check in, review your state, \
+                     and do any proactive work that needs attention. Be concise."
+                }
+                _ => {
+                    "You are Nanna executing a scheduled task. Complete the task efficiently."
+                }
+            };
+
+            let context = AgentContext::new(&session_id).with_system_prompt(system_prompt);
+            let agent = Agent::new(agent_config, llm, tools).with_context(context);
+
+            // Run the task
+            match agent.run(&task.payload, RunOptions::default()).await {
+                Ok(response) => {
+                    // Store the result
+                    let _ = storage
+                        .messages()
+                        .create(nanna_storage::NewMessage {
+                            session_id,
+                            role: "assistant".to_string(),
+                            content: response.text.clone(),
+                            content_type: "text".to_string(),
+                            tool_use_id: None,
+                            tokens_in: Some(i64::from(response.input_tokens)),
+                            tokens_out: Some(i64::from(response.output_tokens)),
+                            metadata: Some(serde_json::json!({"task_id": task_id})),
+                        })
+                        .await;
+
+                    TaskResult {
+                        task_id,
+                        success: true,
+                        output: Some(response.text),
+                        error: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Scheduled task {} failed: {}", task_id, e);
+                    TaskResult {
+                        task_id,
+                        success: false,
+                        output: None,
+                        error: Some(e.to_string()),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    }
+                }
+            }
+        })
+    });
+
+    Scheduler::new(scheduler_config).with_executor(executor)
+}
+
 /// Initialize common components
 async fn init_components(
     config: &Config,
@@ -286,6 +378,12 @@ async fn init_components(
     tools.register(WriteFileTool::new()).await;
     tools.register(ListDirTool::new()).await;
     tools.register(WebFetchTool::new()).await;
+
+    // Web search with Brave API (if configured)
+    if let Ok(brave_key) = std::env::var("BRAVE_API_KEY") {
+        tools.register(WebSearchTool::new().with_api_key(brave_key)).await;
+        info!("Web search enabled (Brave API)");
+    }
 
     // Memory tools backed by Turso with optional embeddings
     let memory_storage: Arc<dyn nanna_tools::MemoryStorage + Send + Sync> = {
@@ -371,12 +469,17 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
     // Build app state - pass Arcs directly
     let state = AppStateBuilder::new()
         .bot(bot)
-        .storage_arc(storage)
-        .llm_arc(llm)
-        .tools_arc(tools)
+        .storage_arc(storage.clone())
+        .llm_arc(llm.clone())
+        .tools_arc(tools.clone())
         .webhook_secret(config.server.webhook_secret.clone())
         .default_model(config.llm.model.clone())
         .build();
+
+    // Start the scheduler for heartbeats and scheduled tasks
+    let mut scheduler = create_scheduler(config, llm.clone(), tools.clone(), storage.clone());
+    scheduler.start();
+    info!("Scheduler started");
 
     let server_config = ServerConfig {
         host: host.clone(),
@@ -386,6 +489,9 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
 
     info!("Server listening on {}:{}", host, port);
     start_server(server_config, state).await?;
+
+    // Clean shutdown
+    scheduler.stop().await;
 
     Ok(())
 }
