@@ -159,7 +159,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, inject, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { marked } from 'marked'
@@ -224,6 +224,9 @@ interface ToolCallEvent {
   status: 'started' | 'completed' | 'error'
 }
 
+// Inject currentSessionId from layout
+const injectedSessionId = inject<Ref<string | null>>('currentSessionId')
+
 const messages = ref<Message[]>([])
 const input = ref('')
 const isLoading = ref(false)
@@ -251,15 +254,24 @@ onMounted(async () => {
   // Try to get or create a session
   try {
     const sessions = await invoke<SessionInfo[]>('list_sessions')
-    if (sessions.length > 0 && sessions[0]) {
-      currentSession.value = sessions[0]
-      // Load history
-      messages.value = await invoke<Message[]>('get_session_history', { 
-        sessionId: currentSession.value.id 
-      })
-      scrollToBottom()
+    const targetSessionId = injectedSessionId?.value
+    
+    if (sessions.length > 0) {
+      // Find the session matching injectedSessionId, or fall back to first
+      const targetSession = targetSessionId 
+        ? sessions.find(s => s.id === targetSessionId) 
+        : null
+      currentSession.value = targetSession || sessions[0] || null
+      
+      if (currentSession.value) {
+        // Load history
+        messages.value = await invoke<Message[]>('get_session_history', { 
+          sessionId: currentSession.value.id 
+        })
+        scrollToBottom()
+      }
     } else {
-      // Create new session
+      // No sessions exist, create one
       currentSession.value = await invoke<SessionInfo>('create_session', { name: null })
     }
   } catch (e) {

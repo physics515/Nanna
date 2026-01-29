@@ -153,13 +153,16 @@ async function loadConfig() {
 async function createNewSession() {
   try {
     const session = await invoke<SessionInfo>('create_session', { name: null })
-    sessions.value.unshift(session)
     currentSessionId.value = session.id
-    // Navigate to chat
-    navigateTo('/')
-    // Force page reload to switch context
+    
+    // Reload sessions list from backend to avoid duplicates
+    await loadSessions()
+    
+    // Navigate to chat and reload to switch context
     if (window.location.pathname === '/') {
       window.location.reload()
+    } else {
+      navigateTo('/')
     }
   } catch (e) {
     console.error('Failed to create session:', e)
