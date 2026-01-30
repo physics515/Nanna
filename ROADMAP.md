@@ -19,6 +19,7 @@
 - [x] Scheduling (remind, list, cancel)
 - [x] Browser tools (screenshot, extract, action, evaluate)
 - [x] Vision tools (analyze_image)
+- [ ] OCR tools (extract text from images, describe image contents)
 - [x] Audio tools (TTS, transcription)
 - [ ] PDF tools (read text, extract images, analyze embedded images)
 - [x] Authoring tools (runtime tool creation) — `nanna-scripting` crate
@@ -207,3 +208,4 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 38 | Visual debugging loop | Future |
 | 39 | Production hardening | Later |
 | 40 | PDF tools (read + extract images) | 🔜 |
+| 41 | OCR + image description | 🔜 |
