@@ -2075,7 +2075,7 @@ async fn check_notification_permission(app: AppHandle) -> Result<String, String>
     Ok(match permission {
         tauri_plugin_notification::PermissionState::Granted => "granted",
         tauri_plugin_notification::PermissionState::Denied => "denied",
-        tauri_plugin_notification::PermissionState::Unknown => "unknown",
+        _ => "unknown",
     }.to_string())
 }
 
