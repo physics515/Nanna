@@ -275,13 +275,17 @@ fn select_best_model(
     None
 }
 
-/// Check if an error message indicates a rate limit
+/// Check if an error message indicates a rate limit or recoverable error
 fn is_rate_limit_error(error_msg: &str) -> bool {
     let lower = error_msg.to_lowercase();
-    lower.contains("rate_limit") 
+    // Check for our RECOVERABLE: prefix (mid-stream errors)
+    error_msg.starts_with("RECOVERABLE:")
+        || lower.contains("rate_limit") 
         || lower.contains("rate limit")
         || lower.contains("429")
+        || lower.contains("529")  // Anthropic overloaded
         || lower.contains("too many requests")
+        || lower.contains("overloaded")
 }
 
 // =============================================================================
@@ -871,6 +875,27 @@ async fn run_agent_loop(
                 StreamEvent::Error { message } => {
                     error!("LLM stream error: {}", message);
                     return Err(format!("LLM error: {}", message));
+                }
+                StreamEvent::RecoverableError { error, partial_text, partial_tool_calls } => {
+                    // Mid-stream recoverable error (rate limit, network issue)
+                    // Return a special error that includes the partial content for recovery
+                    warn!("Recoverable stream error: {} (partial: {} chars, {} tool calls)", 
+                          error, partial_text.len(), partial_tool_calls.len());
+                    
+                    // If we have partial content, include it in the error for potential retry
+                    let error_msg = if !partial_text.is_empty() || !partial_tool_calls.is_empty() {
+                        format!("RECOVERABLE:{}: partial_text_len={}, partial_tools={}", 
+                                error, partial_text.len(), partial_tool_calls.len())
+                    } else {
+                        format!("RECOVERABLE:{}", error)
+                    };
+                    return Err(error_msg);
+                }
+                StreamEvent::RateLimitInfo { limit_tokens, remaining_tokens, reset_secs } => {
+                    // Log rate limit info for diagnostics
+                    info!("Rate limit info: limit={:?}, remaining={:?}, reset={:?}s",
+                          limit_tokens, remaining_tokens, reset_secs);
+                    // Could emit this to frontend for display, or update a limits cache
                 }
                 _ => {}
             }

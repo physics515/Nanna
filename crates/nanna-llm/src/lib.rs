@@ -91,7 +91,7 @@ impl LlmError {
     }
     
     /// Try to parse retry-after seconds from error message
-    fn parse_retry_after(message: &str) -> Option<u64> {
+    fn parse_retry_after(_message: &str) -> Option<u64> {
         // Anthropic includes "try again later" but not specific timing
         // Some APIs include "retry-after: X" in headers or body
         // For now, return None - we can enhance this later
@@ -721,50 +721,143 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
 }
 
 /// Model rate limit info (tokens per minute)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelLimits {
     pub input_tokens_per_minute: u32,
     pub output_tokens_per_minute: u32,
+    /// Requests per minute (if known)
+    pub requests_per_minute: Option<u32>,
+    /// Retry-after seconds from last 429 (if any)
+    pub retry_after_secs: Option<u64>,
+}
+
+impl Default for ModelLimits {
+    fn default() -> Self {
+        Self {
+            input_tokens_per_minute: 20_000,
+            output_tokens_per_minute: 8_000,
+            requests_per_minute: None,
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// Rate limit info parsed from API response headers
+#[derive(Debug, Clone)]
+pub struct RateLimitHeaders {
+    /// Tokens per minute limit
+    pub limit_tokens: Option<u32>,
+    /// Remaining tokens this minute
+    pub remaining_tokens: Option<u32>,
+    /// Requests per minute limit
+    pub limit_requests: Option<u32>,
+    /// Remaining requests this minute
+    pub remaining_requests: Option<u32>,
+    /// Seconds until limit resets
+    pub reset_tokens_secs: Option<u64>,
+    pub reset_requests_secs: Option<u64>,
+    /// Retry-after (from 429 response)
+    pub retry_after: Option<u64>,
+}
+
+impl RateLimitHeaders {
+    /// Parse rate limit headers from an HTTP response.
+    /// Handles both Anthropic and OpenAI header formats.
+    #[must_use]
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let get_u32 = |name: &str| -> Option<u32> {
+            headers.get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+        };
+        let get_u64 = |name: &str| -> Option<u64> {
+            headers.get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+        };
+        
+        Self {
+            // Anthropic uses x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens
+            // OpenAI uses x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens (same!)
+            limit_tokens: get_u32("x-ratelimit-limit-tokens"),
+            remaining_tokens: get_u32("x-ratelimit-remaining-tokens"),
+            limit_requests: get_u32("x-ratelimit-limit-requests"),
+            remaining_requests: get_u32("x-ratelimit-remaining-requests"),
+            reset_tokens_secs: get_u64("x-ratelimit-reset-tokens"),
+            reset_requests_secs: get_u64("x-ratelimit-reset-requests"),
+            retry_after: get_u64("retry-after"),
+        }
+    }
+    
+    /// Convert to ModelLimits, using defaults where headers are missing
+    #[must_use]
+    pub fn to_model_limits(&self, defaults: &ModelLimits) -> ModelLimits {
+        ModelLimits {
+            input_tokens_per_minute: self.limit_tokens.unwrap_or(defaults.input_tokens_per_minute),
+            output_tokens_per_minute: defaults.output_tokens_per_minute, // Usually not in headers
+            requests_per_minute: self.limit_requests.or(defaults.requests_per_minute),
+            retry_after_secs: self.retry_after.or(defaults.retry_after_secs),
+        }
+    }
 }
 
 impl ModelLimits {
-    /// Get known limits for common models
-    /// These are approximate/conservative - actual limits depend on tier
+    /// Get default limits for common models.
+    /// These are conservative fallbacks — actual limits come from API headers.
+    /// 
+    /// **Note:** These are baseline Tier 1 limits. Higher tiers get much more.
+    /// The system will update these from response headers at runtime.
     #[must_use]
     pub fn for_model(model: &str) -> Self {
         match model {
-            // Anthropic - very conservative estimates for default tiers
+            // Anthropic - Tier 1 baseline (very conservative)
+            // See https://docs.anthropic.com/en/api/rate-limits
             m if m.contains("opus") => Self {
-                input_tokens_per_minute: 10_000,  // Very restrictive!
+                input_tokens_per_minute: 20_000,   // Tier 1 baseline
                 output_tokens_per_minute: 4_000,
+                requests_per_minute: Some(50),
+                retry_after_secs: None,
             },
             m if m.contains("sonnet") => Self {
-                input_tokens_per_minute: 40_000,
+                input_tokens_per_minute: 40_000,   // Tier 1 baseline
                 output_tokens_per_minute: 8_000,
+                requests_per_minute: Some(50),
+                retry_after_secs: None,
             },
             m if m.contains("haiku") => Self {
-                input_tokens_per_minute: 50_000,
+                input_tokens_per_minute: 50_000,   // Tier 1 baseline
                 output_tokens_per_minute: 10_000,
+                requests_per_minute: Some(50),
+                retry_after_secs: None,
             },
-            // OpenAI - generally higher limits
+            // OpenAI - Tier 1 baseline
             m if m.contains("gpt-4o") => Self {
                 input_tokens_per_minute: 30_000,
                 output_tokens_per_minute: 10_000,
+                requests_per_minute: Some(500),
+                retry_after_secs: None,
             },
             m if m.contains("gpt-4") => Self {
                 input_tokens_per_minute: 10_000,
                 output_tokens_per_minute: 10_000,
+                requests_per_minute: Some(500),
+                retry_after_secs: None,
+            },
+            m if m.contains("gpt-3.5") => Self {
+                input_tokens_per_minute: 200_000,
+                output_tokens_per_minute: 50_000,
+                requests_per_minute: Some(3500),
+                retry_after_secs: None,
             },
             // Ollama - unlimited (local)
-            m if m.contains("ollama") || m.contains("llama") || m.contains("mistral") => Self {
+            m if m.contains("ollama") || m.contains("llama") || m.contains("mistral") || m.contains("qwen") => Self {
                 input_tokens_per_minute: u32::MAX,
                 output_tokens_per_minute: u32::MAX,
+                requests_per_minute: None,
+                retry_after_secs: None,
             },
             // Default conservative estimate
-            _ => Self {
-                input_tokens_per_minute: 20_000,
-                output_tokens_per_minute: 8_000,
-            },
+            _ => Self::default(),
         }
     }
     
@@ -772,6 +865,19 @@ impl ModelLimits {
     #[must_use]
     pub fn would_exceed(&self, estimated_input_tokens: usize) -> bool {
         estimated_input_tokens as u32 > self.input_tokens_per_minute
+    }
+    
+    /// Update limits from API response headers
+    pub fn update_from_headers(&mut self, headers: &RateLimitHeaders) {
+        if let Some(limit) = headers.limit_tokens {
+            self.input_tokens_per_minute = limit;
+        }
+        if let Some(requests) = headers.limit_requests {
+            self.requests_per_minute = Some(requests);
+        }
+        if let Some(retry) = headers.retry_after {
+            self.retry_after_secs = Some(retry);
+        }
     }
 }
 
@@ -1015,8 +1121,76 @@ pub enum StreamEvent {
     },
     /// Ping (keepalive)
     Ping,
-    /// Error event
+    /// Error event (non-recoverable)
     Error { message: String },
+    /// Recoverable error mid-stream (e.g., 429 rate limit).
+    /// Contains accumulated partial content that can be used to continue.
+    RecoverableError {
+        error: LlmError,
+        /// Text accumulated before the error
+        partial_text: String,
+        /// In-progress tool calls (id, name, partial_json)
+        partial_tool_calls: Vec<(String, String, String)>,
+    },
+    /// Rate limit headers received (allows updating limits cache)
+    RateLimitInfo {
+        limit_tokens: Option<u32>,
+        remaining_tokens: Option<u32>,
+        reset_secs: Option<u64>,
+    },
+}
+
+/// Accumulated state during streaming (for recovery)
+#[derive(Debug, Clone, Default)]
+pub struct StreamAccumulator {
+    /// Text content accumulated so far
+    pub text: String,
+    /// Tool calls in progress: (index, id, name, partial_json)
+    pub tool_calls: Vec<(usize, String, String, String)>,
+}
+
+impl StreamAccumulator {
+    /// Create a new empty accumulator
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Process an event and accumulate content
+    pub fn process(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::TextDelta { text, .. } => {
+                self.text.push_str(text);
+            }
+            StreamEvent::ContentBlockStart { index, content_type, tool_id, tool_name } => {
+                if content_type == "tool_use" {
+                    if let (Some(id), Some(name)) = (tool_id, tool_name) {
+                        self.tool_calls.push((*index, id.clone(), name.clone(), String::new()));
+                    }
+                }
+            }
+            StreamEvent::ToolUseDelta { index, partial_json } => {
+                if let Some((_, _, _, json)) = self.tool_calls.iter_mut().find(|(i, _, _, _)| i == index) {
+                    json.push_str(partial_json);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    /// Get partial tool calls as (id, name, json) tuples
+    #[must_use]
+    pub fn partial_tool_calls(&self) -> Vec<(String, String, String)> {
+        self.tool_calls.iter()
+            .map(|(_, id, name, json)| (id.clone(), name.clone(), json.clone()))
+            .collect()
+    }
+    
+    /// Check if there's any accumulated content
+    #[must_use]
+    pub fn has_content(&self) -> bool {
+        !self.text.is_empty() || !self.tool_calls.is_empty()
+    }
 }
 
 /// Anthropic SSE event types
@@ -1073,7 +1247,10 @@ struct ErrorData {
 }
 
 impl LlmClient {
-    /// Stream a completion request, yielding events as they arrive
+    /// Stream a completion request, yielding events as they arrive.
+    /// 
+    /// Emits `RateLimitInfo` from response headers and `RecoverableError` 
+    /// for mid-stream failures (with accumulated partial content).
     pub fn stream_anthropic(
         &self,
         request: &AnthropicRequest,
@@ -1102,6 +1279,16 @@ impl LlmClient {
                 }
             };
 
+            // Parse rate limit headers and emit info
+            let rate_headers = RateLimitHeaders::from_headers(response.headers());
+            if rate_headers.limit_tokens.is_some() || rate_headers.remaining_tokens.is_some() {
+                yield Ok(StreamEvent::RateLimitInfo {
+                    limit_tokens: rate_headers.limit_tokens,
+                    remaining_tokens: rate_headers.remaining_tokens,
+                    reset_secs: rate_headers.reset_tokens_secs,
+                });
+            }
+
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let message = response.text().await.unwrap_or_default();
@@ -1109,15 +1296,26 @@ impl LlmClient {
                 return;
             }
 
-            // True SSE streaming using bytes_stream
+            // True SSE streaming using bytes_stream with accumulator for recovery
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
+            let mut accumulator = StreamAccumulator::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        yield Err(LlmError::Http(e.to_string()));
+                        // Mid-stream error - emit recoverable error with accumulated content
+                        let error = LlmError::Http(e.to_string());
+                        if accumulator.has_content() {
+                            yield Ok(StreamEvent::RecoverableError {
+                                error,
+                                partial_text: accumulator.text.clone(),
+                                partial_tool_calls: accumulator.partial_tool_calls(),
+                            });
+                        } else {
+                            yield Err(error);
+                        }
                         return;
                     }
                 };
@@ -1126,14 +1324,25 @@ impl LlmClient {
                 match std::str::from_utf8(&chunk) {
                     Ok(s) => buffer.push_str(s),
                     Err(e) => {
-                        yield Err(LlmError::Stream(format!("Invalid UTF-8 in stream: {e}")));
+                        let error = LlmError::Stream(format!("Invalid UTF-8 in stream: {e}"));
+                        if accumulator.has_content() {
+                            yield Ok(StreamEvent::RecoverableError {
+                                error,
+                                partial_text: accumulator.text.clone(),
+                                partial_tool_calls: accumulator.partial_tool_calls(),
+                            });
+                        } else {
+                            yield Err(error);
+                        }
                         return;
                     }
                 }
 
                 // Parse complete SSE events from buffer
-                while let Some(event) = extract_sse_event(&mut buffer) {
-                    if let Some(stream_event) = parse_sse_event(&event) {
+                while let Some(event_str) = extract_sse_event(&mut buffer) {
+                    if let Some(stream_event) = parse_sse_event(&event_str) {
+                        // Accumulate content for recovery
+                        accumulator.process(&stream_event);
                         yield Ok(stream_event);
                     }
                 }
@@ -1142,14 +1351,17 @@ impl LlmClient {
             // Handle any remaining data in buffer
             if !buffer.trim().is_empty() {
                 if let Some(stream_event) = parse_sse_event(&buffer) {
+                    accumulator.process(&stream_event);
                     yield Ok(stream_event);
                 }
             }
         }
     }
 
-    /// Convenience method to stream a CompletionRequest
-    /// Converts to provider-specific format automatically
+    /// Convenience method to stream a CompletionRequest.
+    /// Converts to provider-specific format automatically.
+    /// 
+    /// Returns `StreamEvent` directly (errors converted to `Error` or `RecoverableError` events).
     pub fn stream(
         &self,
         request: &CompletionRequest,
@@ -1207,10 +1419,41 @@ impl LlmClient {
                 match result {
                     Ok(event) => yield event,
                     Err(e) => {
-                        yield StreamEvent::Error { message: e.to_string() };
+                        // Convert LlmError to appropriate StreamEvent
+                        if e.should_fallback() {
+                            // Recoverable errors (429, network issues) - these should have
+                            // been converted to RecoverableError upstream if there was content
+                            yield StreamEvent::RecoverableError {
+                                error: e,
+                                partial_text: String::new(),
+                                partial_tool_calls: Vec::new(),
+                            };
+                        } else {
+                            yield StreamEvent::Error { message: e.to_string() };
+                        }
                         return;
                     }
                 }
+            }
+        }
+    }
+    
+    /// Stream with explicit accumulator for advanced recovery scenarios.
+    /// 
+    /// Returns both events and the final accumulator state (even on error).
+    pub fn stream_with_recovery(
+        &self,
+        request: &CompletionRequest,
+    ) -> impl Stream<Item = (StreamEvent, StreamAccumulator)> + '_ {
+        let base_stream = self.stream(request);
+        
+        stream! {
+            let mut accumulator = StreamAccumulator::new();
+            tokio::pin!(base_stream);
+            
+            while let Some(event) = base_stream.next().await {
+                accumulator.process(&event);
+                yield (event, accumulator.clone());
             }
         }
     }
