@@ -12,6 +12,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+const PROVIDER: &str = "discord";
+
 /// Discord interaction types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
@@ -204,8 +206,6 @@ pub async fn handle(
 
     // Handle slash commands
     if interaction.kind == InteractionType::APPLICATION_COMMAND {
-        use nanna_agent::RunOptions;
-
         let user = interaction
             .member
             .as_ref()
@@ -229,26 +229,26 @@ pub async fn handle(
 
         info!("Discord command from {} ({}): {}", username, user_id, input);
 
-        // Get or create agent for this session
+        // Build system prompt for this user
         let system_prompt = format!(
             "You are Nanna — moon god of the digital realm.\n\
              You're chatting on Discord with user {username} (ID: {user_id}).\n\
              Be helpful, concise, and conversational. Use Discord markdown."
         );
-        let agent = state.get_or_create_agent(&session_id, Some(&system_prompt)).await;
 
-        let response = {
-            let agent_guard = agent.read().await;
-            agent_guard.run(input, RunOptions::default()).await
-        };
-
-        let response_text = match response {
-            Ok(r) => r.text,
+        // Process message (with memory extraction if enabled)
+        let response_text = match state.process_message(&session_id, input, Some(&system_prompt)).await {
+            Ok(text) => text,
             Err(e) => {
                 tracing::warn!("Error processing Discord command: {}", e);
                 "Sorry, I encountered an error.".to_string()
             }
         };
+
+        // Link interaction to session for potential reaction feedback
+        // Note: Discord reactions typically come via Gateway, not webhooks
+        let message_key = format!("{}:{}:{}", PROVIDER, channel_id, interaction.id);
+        state.link_message_to_session(&message_key, &session_id).await;
 
         return Ok(Json(InteractionResponse {
             response_type: InteractionResponseType::CHANNEL_MESSAGE,

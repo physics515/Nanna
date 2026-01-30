@@ -19,7 +19,10 @@ pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
     RunOptions, StreamCallback, ToolCallRecord,
 };
-pub use multi::{AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, TaskStatus};
+pub use multi::{
+    AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, TaskStatus,
+    SwarmConfig, SwarmResult, SwarmTaskResult,
+};
 pub use supervisor::{
     AgentState, AgentStats, HealthCheckConfig, RestartPolicy, SupervisedAgentConfig,
     SupervisionStrategy, Supervisor, SupervisorEvent, SupervisorEventType,

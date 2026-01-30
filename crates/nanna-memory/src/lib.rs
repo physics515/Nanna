@@ -4,10 +4,29 @@
 //! Memory and embedding system for Nanna
 //!
 //! Provides vector storage and semantic search with SIMD and GPU acceleration.
+//! Implements FSRS-6 for cognitive memory decay and the "dreaming" consolidation model.
 
+mod consolidation;
+mod dreaming;
+mod fsrs;
 mod service;
 
-pub use service::{MemoryService, MemoryServiceConfig, RecallResult, EmbedFn};
+pub use consolidation::{
+    ConsolidationConfig, ConsolidationResult, CompressionLevel,
+    WeightThresholds, MemoryCluster, cluster_memories, create_consolidated_entry,
+};
+pub use dreaming::{
+    DreamingConfig, DreamingService, DreamingStats, MemoryFeedback,
+    make_summarize_fn, LlmSummarizer,
+};
+pub use fsrs::{
+    FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
+    power_law_retrievability,
+};
+pub use service::{
+    MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
+    MemoryStats, MemoryListEntry, ConsolidationBands,
+};
 
 use nanna_gpu::{CosineSimilaritySearch, GpuContext};
 use nanna_simd::{cosine_similarity_f32, normalize_f32};
@@ -30,7 +49,7 @@ pub enum MemoryError {
     Serialization(#[from] serde_json::Error),
 }
 
-/// A memory entry with embedding and metadata
+/// A memory entry with embedding, metadata, and FSRS cognitive state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
@@ -38,6 +57,9 @@ pub struct MemoryEntry {
     pub embedding: Vec<f32>,
     pub metadata: HashMap<String, String>,
     pub timestamp: i64,
+    /// FSRS-6 cognitive state (stability, retrievability, etc.)
+    #[serde(default)]
+    pub fsrs: FsrsState,
 }
 
 /// Vector store configuration
@@ -220,6 +242,44 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Update FSRS state for an entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::NotFound` if no entry with the given ID exists.
+    pub async fn update_fsrs<F>(&self, id: &str, f: F) -> Result<(), MemoryError>
+    where
+        F: FnOnce(&mut FsrsState),
+    {
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        f(&mut entry.fsrs);
+        Ok(())
+    }
+
+    /// Update content for an entry (used during expansion).
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::NotFound` if no entry with the given ID exists.
+    pub async fn update_content(&self, id: &str, content: &str) -> Result<(), MemoryError> {
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        entry.content = content.to_string();
+        Ok(())
+    }
+
+    /// Get all entries (for consolidation)
+    pub async fn all_entries(&self) -> Vec<MemoryEntry> {
+        self.entries.read().await.clone()
+    }
+
     /// Get total number of entries
     pub async fn len(&self) -> usize {
         self.entries.read().await.len()
@@ -345,6 +405,7 @@ mod tests {
             embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             metadata: HashMap::new(),
             timestamp: 0,
+            fsrs: FsrsState::default(),
         };
 
         store.add(entry).await.unwrap();

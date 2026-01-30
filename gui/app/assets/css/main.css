@@ -1,5 +1,76 @@
 @import "tailwindcss";
 
+/* Animation utilities for shadcn-vue */
+@keyframes enter-from-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes enter-from-left {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes exit-to-right {
+  from { transform: translateX(0); }
+  to { transform: translateX(100%); }
+}
+
+@keyframes exit-to-left {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes zoom-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes zoom-out {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.95); }
+}
+
+@keyframes slide-in-from-bottom {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+@keyframes slide-in-from-top {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(0); }
+}
+
+/* Animation classes */
+.animate-in { animation-duration: 300ms; animation-timing-function: ease-out; }
+.animate-out { animation-duration: 200ms; animation-timing-function: ease-in; }
+.fade-in-0 { animation-name: fade-in; }
+.fade-out-0 { animation-name: fade-out; }
+.zoom-in-95 { animation-name: zoom-in; }
+.zoom-out-95 { animation-name: zoom-out; }
+.slide-in-from-left { animation-name: enter-from-left; }
+.slide-in-from-right { animation-name: enter-from-right; }
+.slide-out-to-left { animation-name: exit-to-left; }
+.slide-out-to-right { animation-name: exit-to-right; }
+.slide-in-from-top-2 { animation-name: slide-in-from-top; }
+.slide-in-from-bottom-2 { animation-name: slide-in-from-bottom; }
+.slide-in-from-left-2 { animation-name: enter-from-left; }
+.slide-in-from-right-2 { animation-name: enter-from-right; }
+
+/* Data state animations */
+[data-state="open"].animate-in { animation-fill-mode: forwards; }
+[data-state="closed"].animate-out { animation-fill-mode: forwards; }
+
 /* 80s Hacker Retro Theme - Custom Properties */
 @theme {
   /* Background colors */

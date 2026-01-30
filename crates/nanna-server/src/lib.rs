@@ -43,7 +43,10 @@ impl Default for ServerConfig {
 ///
 /// Returns an error if the server fails to bind or start.
 pub async fn start_server(config: ServerConfig, state: AppState) -> anyhow::Result<()> {
-    let app = create_router(state)
+    // Start the scheduler for periodic tasks (dreaming, heartbeats)
+    state.start_scheduler().await;
+
+    let app = create_router(state.clone())
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(
@@ -57,8 +60,12 @@ pub async fn start_server(config: ServerConfig, state: AppState) -> anyhow::Resu
     let listener = TcpListener::bind(addr).await?;
     
     info!("🚀 Server listening on {}", addr);
+    info!("🧠 Memory dreaming enabled");
     
     axum::serve(listener, app).await?;
+
+    // Stop scheduler on shutdown
+    state.stop_scheduler().await;
     
     Ok(())
 }

@@ -29,12 +29,16 @@ uuid.workspace = true
 futures = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP client for embeddings API
+reqwest = { version = "0.12", features = ["json"] }
+
 # Link to nanna crates for IPC
 nanna-core = { path = "../../crates/nanna-core" }
 nanna-llm = { path = "../../crates/nanna-llm" }
 nanna-config = { path = "../../crates/nanna-config" }
 nanna-storage = { path = "../../crates/nanna-storage" }
 nanna-tools = { path = "../../crates/nanna-tools" }
+nanna-memory = { path = "../../crates/nanna-memory" }
 
 [features]
 default = ["custom-protocol", "devtools"]

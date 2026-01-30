@@ -1,11 +1,11 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Chat header -->
-    <header class="px-6 py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
-      <h2 class="text-lg font-semibold text-nanna-text">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+      <h2 class="text-base sm:text-lg font-semibold text-nanna-text truncate">
         {{ currentSession?.name || 'New Chat' }}
       </h2>
-      <p class="text-sm text-nanna-text-muted">
+      <p class="text-xs sm:text-sm text-nanna-text-muted truncate">
         Model: {{ config?.model || 'Loading...' }}
         <span v-if="config?.available_tools?.length" class="ml-2 text-nanna-secondary">
           • {{ config.available_tools.length }} tools
@@ -14,18 +14,18 @@
     </header>
     
     <!-- Messages area -->
-    <div ref="messagesContainer" class="flex-1 overflow-y-auto p-6 space-y-4">
+    <div ref="messagesContainer" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
       <!-- Welcome message -->
       <div v-if="messages.length === 0" class="flex items-center justify-center h-full">
-        <div class="text-center max-w-md">
-          <div class="text-6xl mb-4">🌙</div>
-          <h3 class="text-2xl font-bold text-nanna-accent crt-glow mb-2">
+        <div class="text-center max-w-md px-4">
+          <div class="text-5xl sm:text-6xl mb-4">🌙</div>
+          <h3 class="text-xl sm:text-2xl font-bold text-nanna-accent crt-glow mb-2">
             Nanna
           </h3>
-          <p class="text-nanna-text-muted italic mb-2">
+          <p class="text-nanna-text-muted italic mb-2 text-sm sm:text-base">
             Patron deity of Ur
           </p>
-          <p class="text-nanna-text-dim text-sm">
+          <p class="text-nanna-text-dim text-xs sm:text-sm">
             The moon is here. What would you illuminate?
           </p>
           <div v-if="config?.available_tools?.length" class="mt-6 text-xs text-nanna-text-dim opacity-60">
@@ -38,31 +38,32 @@
       <div v-for="(msg, idx) in messages" :key="msg.id || idx" class="max-w-4xl mx-auto">
         <div 
           :class="[
-            'p-4 rounded-lg',
-            msg.role === 'user' ? 'message-user ml-12' : 'message-assistant mr-12'
+            'p-3 sm:p-4 rounded-lg',
+            msg.role === 'user' ? 'message-user ml-4 sm:ml-12' : 'message-assistant mr-4 sm:mr-12'
           ]"
         >
-          <div class="flex items-start gap-3">
-            <div 
-              :class="[
-                'w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold flex-shrink-0',
-                msg.role === 'user' 
-                  ? 'bg-nanna-primary text-white' 
-                  : 'bg-nanna-accent text-nanna-bg-deep'
-              ]"
-            >
-              {{ msg.role === 'user' ? 'U' : 'N' }}
-            </div>
+          <div class="flex items-start gap-2 sm:gap-3">
+            <UiAvatar 
+              :variant="msg.role === 'user' ? 'primary' : 'accent'"
+              :fallback="msg.role === 'user' ? 'U' : '☽'"
+              size="sm"
+              class="flex-shrink-0 sm:hidden"
+            />
+            <UiAvatar 
+              :variant="msg.role === 'user' ? 'primary' : 'accent'"
+              :fallback="msg.role === 'user' ? 'U' : '☽'"
+              class="flex-shrink-0 hidden sm:flex"
+            />
             <div class="flex-1 min-w-0">
               <div class="text-xs text-nanna-text-dim mb-1">
                 {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
               </div>
               <div 
                 v-if="msg.role === 'assistant'"
-                class="prose prose-invert prose-sm max-w-none"
+                class="prose prose-invert prose-sm max-w-none break-words"
                 v-html="renderMarkdown(msg.content)"
               />
-              <div v-else class="text-nanna-text whitespace-pre-wrap break-words">
+              <div v-else class="text-nanna-text text-sm sm:text-base whitespace-pre-wrap break-words">
                 {{ msg.content }}
               </div>
               
@@ -81,7 +82,7 @@
       </div>
       
       <!-- Active tool calls during streaming -->
-      <div v-if="activeToolCalls.length > 0" class="max-w-4xl mx-auto mr-12">
+      <div v-if="activeToolCalls.length > 0" class="max-w-4xl mx-auto mr-4 sm:mr-12">
         <div class="space-y-2">
           <ToolCallCard 
             v-for="tool in activeToolCalls" 
@@ -94,11 +95,10 @@
       
       <!-- Streaming indicator -->
       <div v-if="isStreaming" class="max-w-4xl mx-auto">
-        <div class="message-assistant p-4 rounded-lg mr-12">
-          <div class="flex items-start gap-3">
-            <div class="w-8 h-8 rounded-full bg-nanna-accent text-nanna-bg-deep flex items-center justify-center flex-shrink-0 text-lg">
-              ☽
-            </div>
+        <div class="message-assistant p-3 sm:p-4 rounded-lg mr-4 sm:mr-12">
+          <div class="flex items-start gap-2 sm:gap-3">
+            <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
+            <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
               <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
@@ -134,26 +134,27 @@
     </div>
     
     <!-- Input area -->
-    <div class="p-4 border-t border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <div class="p-3 sm:p-4 border-t border-nanna-primary/10 bg-nanna-bg-surface/50">
       <form @submit.prevent="sendMessage" class="max-w-4xl mx-auto">
-        <div class="flex gap-3">
-          <input
+        <div class="flex gap-2 sm:gap-3">
+          <UiInput
             v-model="input"
             type="text"
             placeholder="Type your message..."
-            class="input flex-1"
             :disabled="isLoading"
+            class="flex-1"
             @keydown.enter.exact.prevent="sendMessage"
           />
-          <button 
+          <UiButton 
             type="submit" 
-            class="btn-primary"
             :disabled="!input.trim() || isLoading"
+            class="shrink-0"
           >
-            Send
-          </button>
+            <Send class="w-4 h-4 sm:hidden" />
+            <span class="hidden sm:inline">Send</span>
+          </UiButton>
         </div>
-        <div class="mt-2 text-xs text-nanna-text-dim">
+        <div class="mt-2 text-xs text-nanna-text-dim hidden sm:block">
           Press Enter to send
         </div>
       </form>
@@ -166,6 +167,7 @@ import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { marked } from 'marked'
+import { Send } from 'lucide-vue-next'
 
 // Configure marked for safe rendering
 marked.setOptions({
@@ -180,6 +182,9 @@ function renderMarkdown(content: string): string {
     return content
   }
 }
+
+// Notifications
+const { notifyToolComplete, notifyError, notifyMessage } = useNotifications()
 
 interface ToolCallInfo {
   id: string
@@ -310,6 +315,12 @@ onMounted(async () => {
               duration_ms: t.duration_ms,
             })),
           })
+          
+          // Notify if window is not focused
+          if (document.hidden && streamingContent.value) {
+            notifyMessage(streamingContent.value)
+          }
+          
           streamingContent.value = ''
           activeToolCalls.value = []
         }
@@ -343,6 +354,11 @@ onMounted(async () => {
             ...tool_call,
             status,
           }
+        }
+        
+        // Notify on tool completion if window not focused
+        if (document.hidden) {
+          notifyToolComplete(tool_call.name, tool_call.success)
         }
       }
       scrollToBottom()
@@ -423,6 +439,11 @@ async function sendMessageToBackend(message: string) {
       connectionError.value = 'Network error. Please check your connection.'
     } else {
       connectionError.value = errorMsg
+    }
+    
+    // Notify on error if window not focused
+    if (document.hidden) {
+      notifyError('Message Failed', connectionError.value)
     }
   }
   

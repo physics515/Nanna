@@ -32,7 +32,7 @@ pub use memory::{InMemoryStorage, MemoryStorage, MemoryResult, StorageHandle, Re
 pub use memory_storage::{EmbedFn, TursoMemoryStorage};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
 pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};
-pub use web::{WebSearchTool, WebFetchTool};
+pub use web::{WebSearchTool, WebSearchBatchTool, WebFetchTool};
 
 #[cfg(feature = "browser")]
 pub use browser_wiring::{BrowserManager, create_browser_tools};

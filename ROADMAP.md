@@ -88,7 +88,7 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] Memory browser (search across sessions, stats dashboard)
 - [x] System tray / menu bar presence (show/new chat/quit menu)
 - [x] Streaming UX polish (ConnectionStatus, MessageSkeleton, retry logic)
-- [ ] Channel status dashboard
+- [x] Channel status dashboard
 - [ ] Native notifications (plugin added, not wired)
 
 ### Technical
@@ -100,26 +100,41 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] Session persistence (SQLite)
 - [x] System tray with tauri tray-icon feature
 - [x] Notification plugin installed
-- [ ] shadcn-vue component library
-- [ ] Mobile-responsive layouts
+- [x] UI component library (Button, Card, Input, Select, Switch, Badge, etc.)
+- [x] Mobile-responsive layouts
+
+### Memory Recall & Extraction ✅
+- [x] **Separate embedding provider/model** - configure embeddings independently from chat (e.g., Opus for chat + Ollama for embeddings)
+- [x] **Configurable extraction model** - GUI setting to select extraction model (empty = use chat model)
+- [x] **Skip extraction without embeddings** - don't extract facts if recall won't work anyway
+- [x] **FSRS feedback loop** - when memory is recalled, apply testing effect (update retrievability)
+- [x] **Importance scoring** - LLM rates extracted fact importance (1-5) for FSRS weight
+- [x] **Duplicate detection** - `smart_ingest()` checks similarity before storing (>0.92 = reinforce, >0.75 = update, <0.75 = create)
+- [x] **Memory persistence** - load on startup, save on exit, auto-save after extraction
+- [x] **Fact source tagging** - distinguish STATED (user said) vs OBSERVED (model inferred) facts
+- [x] **Anti-confabulation prompting** - explicit instructions to not fabricate memories
+- [x] **Similarity threshold tuning** - lowered min_score from 0.70 to 0.40 for semantic matching
+- [x] **Memory management UI** - view, edit, delete individual memories in GUI ✅
+- [ ] **Configurable similarity threshold** - expose min_score in GUI settings
 
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
 - NSIS: `D:\Development\Cargo Target\release\bundle\nsis\Nanna_0.1.0_x64-setup.exe`
 
-## Phase 5: Agent Swarm & Parallel Execution 🆕
+## Phase 5: Agent Swarm & Parallel Execution 🔜
 *Inspired by Kimi K2.5's agent swarm architecture*
 
 ### Parallel Agent Orchestration
 - [ ] **Swarm Coordinator** - orchestrator that decomposes tasks into parallel subtasks
 - [ ] **Dynamic sub-agent spawning** - instantiate domain-specific agents on-the-fly
-- [ ] **Parallel tool execution** - execute independent tool calls concurrently
+- [x] **Parallel tool execution** - execute independent tool calls concurrently ✅
 - [ ] **Critical Path metrics** - measure efficiency by longest parallel branch, not total steps
 - [ ] **Sub-agent communication** - message passing between parallel agents
 - [ ] **Result aggregation** - collect and synthesize outputs from parallel branches
 
 ### Context Management
-- [ ] **Sliding window truncation** - retain only latest N tool rounds when context grows
+- [x] **Sliding window truncation** - retain only latest N messages when context grows ✅
+- [x] **Message truncation** - truncate individual long messages (50KB limit) ✅
 - [ ] **Selective context compression** - summarize old context instead of dropping
 - [ ] **Per-agent context isolation** - sub-agents don't inherit full parent context
 - [ ] **Context budget allocation** - distribute context tokens across parallel agents
@@ -173,14 +188,20 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 20 | ~~System tray~~ | ✅ |
 | 21 | ~~Memory browser~~ | ✅ |
 | 22 | ~~Streaming UX polish~~ | ✅ |
-| 23 | Channel status dashboard | 🔜 Next |
+| 23 | ~~Channel status dashboard~~ | ✅ Done |
 | 24 | Native notifications wiring | 🔜 Next |
-| 25 | **Parallel tool execution** | 🔜 High Priority |
-| 26 | **Swarm Coordinator** | 🔜 High Priority |
-| 27 | **Context management/truncation** | 🔜 High Priority |
-| 28 | Critical Path metrics | Later |
-| 29 | Thinking mode toggle | Later |
-| 30 | shadcn-vue components | Later |
-| 31 | Tauri mobile (Android/iOS) | Later |
-| 32 | Visual debugging loop | Future |
-| 33 | Production hardening | Later |
+| 25 | ~~Dreaming trigger + auto feedback~~ | ✅ Done |
+| 26 | ~~Ollama integration~~ | ✅ Done |
+| 27 | ~~Memory extraction: configurable model~~ | ✅ Done |
+| 28 | ~~Memory extraction: FSRS feedback loop~~ | ✅ Done |
+| 29 | ~~Memory duplicate detection~~ | ✅ Done |
+| 30 | ~~Parallel tool execution~~ | ✅ Done |
+| 31 | **Swarm Coordinator** | 🔜 High Priority |
+| 32 | ~~Context management/truncation~~ | ✅ Done |
+| 33 | ~~Memory management UI~~ | ✅ Done |
+| 34 | Critical Path metrics | Later |
+| 35 | Thinking mode toggle | Later |
+| 36 | ~~UI component library~~ | ✅ Done |
+| 37 | Tauri mobile (Android/iOS) | Later |
+| 38 | Visual debugging loop | Future |
+| 39 | Production hardening | Later |

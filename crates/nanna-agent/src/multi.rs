@@ -1,7 +1,7 @@
 //! Multi-agent coordination and background tasks
 
 use crate::{Agent, AgentConfig, AgentContext, AgentError, AgentResponse, RunOptions};
-use nanna_llm::LlmClient;
+use nanna_llm::{LlmClient, RequestBuilder};
 use nanna_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -246,6 +246,242 @@ fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+// =============================================================================
+// Swarm Operations
+// =============================================================================
+
+/// Result from a swarm task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmTaskResult {
+    pub task_id: String,
+    pub prompt: String,
+    pub success: bool,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+/// Aggregated results from a swarm run
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmResult {
+    pub swarm_id: String,
+    pub total_tasks: usize,
+    pub successful: usize,
+    pub failed: usize,
+    pub results: Vec<SwarmTaskResult>,
+    pub aggregated: Option<String>,
+    pub duration_ms: u64,
+}
+
+/// Swarm configuration
+#[derive(Debug, Clone)]
+pub struct SwarmConfig {
+    /// Maximum parallel tasks
+    pub max_parallel: usize,
+    /// Timeout per task (seconds)
+    pub task_timeout_secs: u64,
+    /// Whether to aggregate results with LLM
+    pub aggregate_results: bool,
+    /// Aggregation prompt template (use {results} placeholder)
+    pub aggregation_prompt: Option<String>,
+}
+
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel: 10,
+            task_timeout_secs: 60,
+            aggregate_results: true,
+            aggregation_prompt: None,
+        }
+    }
+}
+
+impl AgentCoordinator {
+    /// Spawn a swarm of parallel tasks and wait for completion.
+    ///
+    /// All tasks run in parallel (up to max_parallel), then results are
+    /// optionally aggregated using the LLM.
+    ///
+    /// # Arguments
+    /// * `agent_id` - Agent configuration to use for all tasks
+    /// * `prompts` - List of prompts to execute in parallel
+    /// * `config` - Swarm configuration
+    ///
+    /// # Returns
+    /// Aggregated results from all tasks.
+    pub async fn spawn_swarm(
+        &self,
+        agent_id: &str,
+        prompts: Vec<String>,
+        config: SwarmConfig,
+    ) -> Result<SwarmResult, AgentError> {
+        let start = std::time::Instant::now();
+        let swarm_id = Uuid::new_v4().to_string();
+        let total_tasks = prompts.len();
+        
+        info!("Starting swarm {} with {} tasks (max parallel: {})", 
+              swarm_id, total_tasks, config.max_parallel);
+
+        // Get agent configuration
+        let agents = self.agents.read().await;
+        let entry = agents
+            .get(agent_id)
+            .ok_or_else(|| AgentError::Llm(nanna_llm::LlmError::MissingApiKey(
+                format!("Agent not found: {}", agent_id)
+            )))?;
+        let agent_config = entry.config.clone();
+        let system_prompt = entry.system_prompt.clone();
+        drop(agents);
+
+        // Spawn tasks in batches
+        let mut all_results = Vec::with_capacity(total_tasks);
+        let task_timeout = config.task_timeout_secs;
+        
+        for chunk in prompts.chunks(config.max_parallel) {
+            let mut handles = Vec::with_capacity(chunk.len());
+            
+            for prompt in chunk {
+                let llm = self.llm.clone();
+                let tools = self.tools.clone();
+                let agent_cfg = agent_config.clone();
+                let system = system_prompt.clone();
+                let prompt = prompt.clone();
+                let timeout = task_timeout;
+                let task_id = Uuid::new_v4().to_string();
+                
+                let handle = tokio::spawn(async move {
+                    let task_start = std::time::Instant::now();
+                    
+                    let context = AgentContext::new(&task_id).with_system_prompt(system);
+                    let agent = Agent::new(agent_cfg, llm, tools).with_context(context);
+                    
+                    // Run with timeout
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout),
+                        agent.run(&prompt, RunOptions::default())
+                    ).await;
+                    
+                    let duration_ms = task_start.elapsed().as_millis() as u64;
+                    
+                    match result {
+                        Ok(Ok(response)) => SwarmTaskResult {
+                            task_id,
+                            prompt,
+                            success: true,
+                            result: Some(response.text),
+                            error: None,
+                            duration_ms,
+                        },
+                        Ok(Err(e)) => SwarmTaskResult {
+                            task_id,
+                            prompt,
+                            success: false,
+                            result: None,
+                            error: Some(e.to_string()),
+                            duration_ms,
+                        },
+                        Err(_) => SwarmTaskResult {
+                            task_id,
+                            prompt,
+                            success: false,
+                            result: None,
+                            error: Some("Task timed out".to_string()),
+                            duration_ms,
+                        },
+                    }
+                });
+                
+                handles.push(handle);
+            }
+            
+            // Wait for this batch
+            for handle in handles {
+                if let Ok(result) = handle.await {
+                    all_results.push(result);
+                }
+            }
+        }
+
+        let successful = all_results.iter().filter(|r| r.success).count();
+        let failed = all_results.iter().filter(|r| !r.success).count();
+        
+        info!("Swarm {} completed: {}/{} successful", swarm_id, successful, total_tasks);
+
+        // Optionally aggregate results
+        let aggregated = if config.aggregate_results && successful > 0 {
+            let results_text = all_results
+                .iter()
+                .filter_map(|r| r.result.as_ref())
+                .enumerate()
+                .map(|(i, text)| format!("--- Result {} ---\n{}", i + 1, text))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            
+            let agg_prompt = config.aggregation_prompt.unwrap_or_else(|| {
+                format!(
+                    "You are aggregating results from {} parallel research tasks.\n\n\
+                    Synthesize these results into a coherent summary. \
+                    Identify key themes, resolve contradictions, and highlight the most important findings.\n\n\
+                    {}\n\n\
+                    Synthesized summary:",
+                    successful, results_text
+                )
+            });
+            
+            match self.llm.complete(
+                &nanna_llm::CompletionRequest::default()
+                    .with_model(&agent_config.model)
+                    .with_message(nanna_llm::Message::user(&agg_prompt))
+            ).await {
+                Ok(summary) => Some(summary),
+                Err(e) => {
+                    debug!("Aggregation failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        Ok(SwarmResult {
+            swarm_id,
+            total_tasks,
+            successful,
+            failed,
+            results: all_results,
+            aggregated,
+            duration_ms,
+        })
+    }
+
+    /// Quick helper to run parallel research queries and aggregate results.
+    pub async fn parallel_research(
+        &self,
+        agent_id: &str,
+        queries: Vec<String>,
+    ) -> Result<String, AgentError> {
+        let result = self.spawn_swarm(
+            agent_id,
+            queries,
+            SwarmConfig {
+                max_parallel: 5,
+                task_timeout_secs: 30,
+                aggregate_results: true,
+                aggregation_prompt: None,
+            },
+        ).await?;
+
+        result.aggregated.ok_or_else(|| {
+            AgentError::Llm(nanna_llm::LlmError::MissingApiKey(
+                "No results to aggregate".to_string()
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

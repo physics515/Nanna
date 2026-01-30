@@ -31,6 +31,7 @@ pub enum Provider {
     Anthropic,
     OpenAI,
     OpenRouter,
+    Ollama,
 }
 
 /// Message role
@@ -324,6 +325,21 @@ impl LlmClient {
         }
     }
 
+    /// Create a new `Ollama` client (local, no API key needed)
+    pub fn ollama(base_url: impl Into<String>) -> Self {
+        Self {
+            http: Self::build_http_client(),
+            provider: Provider::Ollama,
+            api_key: String::new(), // Ollama doesn't need auth
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Create an Ollama client with default localhost URL
+    pub fn ollama_default() -> Self {
+        Self::ollama("http://localhost:11434")
+    }
+
     /// Validate the API key by making a lightweight request.
     ///
     /// # Errors
@@ -369,6 +385,7 @@ impl LlmClient {
         match self.provider {
             Provider::Anthropic => self.complete_anthropic_simple(request).await,
             Provider::OpenAI | Provider::OpenRouter => self.complete_openai(request).await,
+            Provider::Ollama => self.complete_ollama(request).await,
         }
     }
 
@@ -498,6 +515,88 @@ impl LlmClient {
             .map(|c| c.message.content.clone())
             .unwrap_or_default())
     }
+
+    async fn complete_ollama(&self, request: &CompletionRequest) -> Result<String, LlmError> {
+        // Ollama uses a slightly different format from OpenAI
+        #[derive(Serialize)]
+        struct OllamaMessage<'a> {
+            role: &'a str,
+            content: &'a str,
+        }
+
+        #[derive(Serialize)]
+        struct OllamaRequest<'a> {
+            model: &'a str,
+            messages: Vec<OllamaMessage<'a>>,
+            stream: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            options: Option<OllamaOptions>,
+        }
+
+        #[derive(Serialize)]
+        struct OllamaOptions {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            temperature: Option<f32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            num_predict: Option<u32>,
+        }
+
+        #[derive(Deserialize)]
+        struct OllamaResponse {
+            message: OllamaResponseMessage,
+        }
+
+        #[derive(Deserialize)]
+        struct OllamaResponseMessage {
+            content: String,
+        }
+
+        let messages: Vec<OllamaMessage> = request
+            .messages
+            .iter()
+            .map(|m| OllamaMessage {
+                role: match m.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                },
+                content: &m.content,
+            })
+            .collect();
+
+        let options = if request.temperature.is_some() || request.max_tokens.is_some() {
+            Some(OllamaOptions {
+                temperature: request.temperature,
+                num_predict: request.max_tokens,
+            })
+        } else {
+            None
+        };
+
+        let body = OllamaRequest {
+            model: &request.model,
+            messages,
+            stream: false,
+            options,
+        };
+
+        let response = self
+            .http
+            .post(format!("{}/api/chat", self.base_url))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, message });
+        }
+
+        let result: OllamaResponse = response.json().await?;
+        Ok(result.message.content)
+    }
 }
 
 /// Helper trait for building requests fluently.
@@ -542,10 +641,18 @@ impl RequestBuilder for CompletionRequest {
 // Embeddings Support
 // ============================================================================
 
+/// Embedding provider type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingProvider {
+    OpenAI,
+    Ollama,
+}
+
 /// Embedding client for generating vector embeddings
 #[derive(Clone)]
 pub struct EmbeddingClient {
     http: Client,
+    provider: EmbeddingProvider,
     api_key: String,
     base_url: String,
     model: String,
@@ -559,10 +666,30 @@ impl EmbeddingClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            provider: EmbeddingProvider::OpenAI,
             api_key: api_key.into(),
             base_url: "https://api.openai.com".to_string(),
             model: "text-embedding-3-small".to_string(),
         }
+    }
+
+    /// Create `Ollama` embedding client (local, no API key needed)
+    pub fn ollama(base_url: impl Into<String>) -> Self {
+        Self {
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(60)) // Ollama can be slower
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            provider: EmbeddingProvider::Ollama,
+            api_key: String::new(),
+            base_url: base_url.into(),
+            model: "nomic-embed-text".to_string(), // Good default for Ollama
+        }
+    }
+
+    /// Create Ollama embedding client with default localhost URL
+    pub fn ollama_default() -> Self {
+        Self::ollama("http://localhost:11434")
     }
 
     /// Create client with custom model.
@@ -579,6 +706,13 @@ impl EmbeddingClient {
     /// Returns `LlmError::Api` if the API returns an error.
     /// Returns `LlmError::Network` if the request fails.
     pub async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
+        match self.provider {
+            EmbeddingProvider::OpenAI => self.embed_openai(texts).await,
+            EmbeddingProvider::Ollama => self.embed_ollama(texts).await,
+        }
+    }
+
+    async fn embed_openai(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
         #[derive(Serialize)]
         struct EmbedRequest<'a> {
             model: &'a str,
@@ -615,6 +749,46 @@ impl EmbeddingClient {
 
         let result: EmbedResponse = response.json().await?;
         Ok(result.data.into_iter().map(|d| d.embedding).collect())
+    }
+
+    async fn embed_ollama(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
+        // Ollama embedding API only supports one text at a time
+        #[derive(Serialize)]
+        struct OllamaEmbedRequest<'a> {
+            model: &'a str,
+            prompt: &'a str,
+        }
+
+        #[derive(Deserialize)]
+        struct OllamaEmbedResponse {
+            embedding: Vec<f32>,
+        }
+
+        let mut results = Vec::with_capacity(texts.len());
+
+        for text in texts {
+            let response = self
+                .http
+                .post(format!("{}/api/embeddings", self.base_url))
+                .header("Content-Type", "application/json")
+                .json(&OllamaEmbedRequest {
+                    model: &self.model,
+                    prompt: text,
+                })
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let message = response.text().await.unwrap_or_default();
+                return Err(LlmError::Api { status, message });
+            }
+
+            let result: OllamaEmbedResponse = response.json().await?;
+            results.push(result.embedding);
+        }
+
+        Ok(results)
     }
 
     /// Get embedding for a single text.

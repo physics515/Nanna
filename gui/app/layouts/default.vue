@@ -1,9 +1,127 @@
 <template>
   <div class="min-h-screen bg-nanna-bg-deep bg-grid relative">
+    <!-- Mobile Header -->
+    <header class="lg:hidden fixed top-0 left-0 right-0 z-40 flex items-center justify-between px-4 py-3 bg-nanna-bg-surface/95 backdrop-blur border-b border-nanna-primary/10">
+      <button 
+        @click="sidebarOpen = true"
+        class="p-2 rounded-lg text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+        aria-label="Open menu"
+      >
+        <Menu class="w-5 h-5" />
+      </button>
+      
+      <NuxtLink to="/" class="flex items-center gap-2">
+        <span class="text-lg font-bold text-nanna-accent crt-glow">NANNA</span>
+      </NuxtLink>
+      
+      <button 
+        @click="createNewSession"
+        class="p-2 rounded-lg text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+        aria-label="New chat"
+      >
+        <Plus class="w-5 h-5" />
+      </button>
+    </header>
+    
+    <!-- Mobile Sidebar (Sheet) -->
+    <UiSheet v-model:open="sidebarOpen" side="left">
+      <template #trigger>
+        <!-- Empty - we use the header button -->
+        <span></span>
+      </template>
+      
+      <div class="flex flex-col h-full -m-6">
+        <!-- Logo -->
+        <div class="p-4 border-b border-nanna-primary/10">
+          <NuxtLink to="/" @click="sidebarOpen = false" class="block">
+            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">
+              NANNA
+            </h1>
+            <p class="text-xs text-nanna-text-muted mt-1">
+              AI Assistant
+            </p>
+          </NuxtLink>
+        </div>
+        
+        <!-- New Chat button -->
+        <div class="p-4">
+          <UiButton 
+            @click="createNewSession(); sidebarOpen = false"
+            class="w-full justify-start"
+          >
+            <Plus class="w-4 h-4" />
+            <span>New Chat</span>
+          </UiButton>
+        </div>
+        
+        <!-- Sessions list -->
+        <nav class="flex-1 px-4 space-y-1 overflow-y-auto">
+          <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
+            Recent Chats
+          </div>
+          
+          <SessionItem
+            v-for="session in sessions" 
+            :key="session.id"
+            :session="session"
+            :is-active="currentSessionId === session.id"
+            @select="(s) => { switchSession(s); sidebarOpen = false }"
+            @deleted="onSessionDeleted"
+            @renamed="onSessionRenamed"
+          />
+          
+          <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
+            No chats yet
+          </div>
+        </nav>
+        
+        <!-- Footer -->
+        <div class="p-4 border-t border-nanna-primary/10 space-y-1">
+          <NuxtLink 
+            to="/memory" 
+            @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Brain class="w-4 h-4" />
+            <span>Memory</span>
+          </NuxtLink>
+          <NuxtLink 
+            to="/channels" 
+            @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Radio class="w-4 h-4" />
+            <span>Channels</span>
+          </NuxtLink>
+          <NuxtLink 
+            to="/settings" 
+            @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Settings class="w-4 h-4" />
+            <span>Settings</span>
+          </NuxtLink>
+          <button 
+            @click="hideToTray(); sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <ChevronDown class="w-4 h-4" />
+            <span>Hide to Tray</span>
+          </button>
+          <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
+            <span>v0.1.0</span>
+            <span :class="apiKeySet ? 'text-nanna-success' : 'text-nanna-error'">
+              {{ apiKeySet ? '● Connected' : '○ No API Key' }}
+            </span>
+          </div>
+        </div>
+      </div>
+    </UiSheet>
+    
     <!-- Main content -->
     <div class="flex h-screen">
-      <!-- Sidebar -->
-      <aside class="w-64 bg-nanna-bg-surface border-r border-nanna-primary/10 flex flex-col">
+      <!-- Desktop Sidebar -->
+      <aside class="hidden lg:flex w-64 bg-nanna-bg-surface border-r border-nanna-primary/10 flex-col">
         <!-- Logo -->
         <div class="p-4 border-b border-nanna-primary/10">
           <NuxtLink to="/" class="block">
@@ -18,13 +136,13 @@
         
         <!-- New Chat button -->
         <div class="p-4">
-          <button 
+          <UiButton 
             @click="createNewSession"
-            class="w-full btn-primary text-left flex items-center gap-2"
+            class="w-full justify-start"
           >
-            <span>+</span>
+            <Plus class="w-4 h-4" />
             <span>New Chat</span>
-          </button>
+          </UiButton>
         </div>
         
         <!-- Sessions list -->
@@ -52,21 +170,31 @@
         <div class="p-4 border-t border-nanna-primary/10 space-y-1">
           <NuxtLink 
             to="/memory" 
-            class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
-            📚 Memory
+            <Brain class="w-4 h-4" />
+            <span>Memory</span>
+          </NuxtLink>
+          <NuxtLink 
+            to="/channels" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Radio class="w-4 h-4" />
+            <span>Channels</span>
           </NuxtLink>
           <NuxtLink 
             to="/settings" 
-            class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
-            ⚙️ Settings
+            <Settings class="w-4 h-4" />
+            <span>Settings</span>
           </NuxtLink>
           <button 
             @click="hideToTray"
-            class="block w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
-            🔽 Hide to Tray
+            <ChevronDown class="w-4 h-4" />
+            <span>Hide to Tray</span>
           </button>
           <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
             <span>v0.1.0</span>
@@ -78,7 +206,7 @@
       </aside>
       
       <!-- Main area -->
-      <main class="flex-1 flex flex-col">
+      <main class="flex-1 flex flex-col pt-14 lg:pt-0">
         <slot />
       </main>
     </div>
@@ -89,6 +217,7 @@
 import { ref, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { Menu, Plus, Brain, Radio, Settings, ChevronDown } from 'lucide-vue-next'
 
 interface SessionInfo {
   id: string
@@ -110,12 +239,16 @@ const route = useRoute()
 const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
+const sidebarOpen = ref(false)
 
 let unlistenTrayNewChat: UnlistenFn | null = null
 
 // Provide session switching to child components
 provide('currentSessionId', currentSessionId)
 provide('sessions', sessions)
+
+// Initialize notifications
+const { checkPermission } = useNotifications()
 
 onMounted(async () => {
   await loadSessions()
@@ -131,6 +264,9 @@ onMounted(async () => {
   unlistenTrayNewChat = await listen('tray-new-chat', () => {
     createNewSession()
   })
+  
+  // Check notification permissions on mount
+  await checkPermission()
 })
 
 onUnmounted(() => {
@@ -142,6 +278,11 @@ watch(() => route.query.session, (newSessionId) => {
   if (typeof newSessionId === 'string' && sessions.value.some(s => s.id === newSessionId)) {
     currentSessionId.value = newSessionId
   }
+})
+
+// Close sidebar on route change (mobile)
+watch(() => route.fullPath, () => {
+  sidebarOpen.value = false
 })
 
 async function loadSessions() {

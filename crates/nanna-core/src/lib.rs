@@ -5,11 +5,16 @@
 //!
 //! Ties together all subsystems: LLM, channels, memory, SIMD, and GPU.
 
+mod dreaming;
 mod scheduler;
 
+pub use dreaming::{
+    DreamingRuntime, DreamingRuntimeConfig, create_dreaming_executor,
+};
 pub use scheduler::{
     Scheduler, SchedulerConfig, ScheduledTask, TaskType, TaskResult, TaskExecutor,
-    heartbeat_task, recurring_task, delayed_task,
+    heartbeat_task, recurring_task, delayed_task, consolidation_task,
+    DREAMING_TASK_NAME, is_dreaming_task,
 };
 
 pub use nanna_channels::{
@@ -17,8 +22,17 @@ pub use nanna_channels::{
     MessageRouter, OutgoingMessage, Sender,
 };
 pub use nanna_gpu::{GpuContext, GpuError};
-pub use nanna_llm::{CompletionRequest, LlmClient, LlmError, Message, Provider, RequestBuilder, Role};
-pub use nanna_memory::{ConversationMemory, MemoryEntry, MemoryError, VectorStore, VectorStoreConfig};
+pub use nanna_llm::{CompletionRequest, EmbeddingClient, LlmClient, LlmError, Message, Provider, RequestBuilder, Role};
+pub use nanna_memory::{
+    ConversationMemory, MemoryEntry, MemoryError, VectorStore, VectorStoreConfig,
+    // FSRS-6 cognitive memory
+    FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,
+    // Consolidation (dreaming)
+    ConsolidationConfig, ConsolidationResult, CompressionLevel,
+    MemoryService, MemoryServiceConfig, MemoryStats,
+    // Dreaming service
+    DreamingConfig, DreamingService, DreamingStats, MemoryFeedback,
+};
 pub use nanna_simd::{cosine_similarity_f32, dot_product_f32, normalize_f32};
 
 use std::sync::Arc;

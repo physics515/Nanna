@@ -181,11 +181,16 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Set the task executor callback.
+    /// Set the task executor callback (builder pattern).
     #[must_use]
     pub fn with_executor(mut self, executor: TaskExecutor) -> Self {
         self.executor = Some(executor);
         self
+    }
+
+    /// Set the task executor callback (mutable reference).
+    pub fn set_executor(&mut self, executor: TaskExecutor) {
+        self.executor = Some(executor);
     }
 
     /// Add a task (persisted if storage is configured)
@@ -389,6 +394,33 @@ pub fn delayed_task(name: &str, delay: Duration, payload: &str) -> ScheduledTask
         last_run: None,
         run_count: 0,
     }
+}
+
+/// Helper to create a memory consolidation ("dreaming") task
+/// 
+/// Runs periodically to consolidate memories based on weight/importance.
+/// Default interval is 1 hour.
+#[must_use]
+pub fn consolidation_task(interval: Option<Duration>) -> ScheduledTask {
+    let interval = interval.unwrap_or(Duration::from_secs(3600)); // 1 hour default
+    ScheduledTask {
+        id: format!("consolidation-{}", uuid::Uuid::new_v4()),
+        name: "memory_consolidation".to_string(),
+        task_type: TaskType::Recurring { interval },
+        payload: "Run memory consolidation (dreaming): compress fading memories, expand important ones.".to_string(),
+        enabled: true,
+        last_run: None,
+        run_count: 0,
+    }
+}
+
+/// Task type marker for the dreaming task
+pub const DREAMING_TASK_NAME: &str = "memory_consolidation";
+
+/// Check if a task is the dreaming/consolidation task
+#[must_use]
+pub fn is_dreaming_task(task: &ScheduledTask) -> bool {
+    task.name == DREAMING_TASK_NAME
 }
 
 /// Parse interval string like "every_300s" into seconds

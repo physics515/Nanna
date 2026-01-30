@@ -70,6 +70,8 @@ pub struct LlmConfig {
     pub base_url: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// OpenAI API key for embeddings (semantic memory)
+    pub openai_api_key: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -81,6 +83,7 @@ impl Default for LlmConfig {
             base_url: None,
             max_tokens: 8192,
             temperature: 0.7,
+            openai_api_key: None,
         }
     }
 }
@@ -152,6 +155,8 @@ pub struct ToolsConfig {
     pub disabled: Vec<String>,
     pub exec_allowlist: Option<Vec<String>>,
     pub file_sandbox: Option<PathBuf>,
+    /// Brave Search API key for web_search tool
+    pub brave_api_key: Option<String>,
 }
 
 impl Default for ToolsConfig {
@@ -161,6 +166,7 @@ impl Default for ToolsConfig {
             disabled: Vec::new(),
             exec_allowlist: None,
             file_sandbox: None,
+            brave_api_key: None,
         }
     }
 }
@@ -169,18 +175,28 @@ impl Default for ToolsConfig {
 #[serde(default)]
 pub struct MemoryConfig {
     pub enabled: bool,
+    /// Embedding provider: "openai", "ollama", or "disabled"
+    pub embedding_provider: String,
+    /// Embedding model name
     pub embedding_model: String,
     pub vector_dimension: usize,
     pub storage_path: Option<PathBuf>,
+    /// Ollama server URL (used for both chat and embeddings)
+    pub ollama_host: String,
+    /// Model to use for memory extraction (empty = use chat model)
+    pub extraction_model: String,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            embedding_provider: "openai".to_string(),
             embedding_model: "text-embedding-3-small".to_string(),
             vector_dimension: 1536,
             storage_path: None,
+            ollama_host: "http://localhost:11434".to_string(),
+            extraction_model: String::new(), // Empty = use chat model
         }
     }
 }
