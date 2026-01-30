@@ -82,6 +82,19 @@
                 @update:model-value="saveChatModelPriority"
               />
               
+              <!-- No Models Warning -->
+              <div v-if="allChatModels.length === 0" class="mt-4 p-4 rounded-lg bg-nanna-warning/10 border border-nanna-warning/30">
+                <div class="flex items-start gap-3">
+                  <AlertTriangle class="w-5 h-5 text-nanna-warning shrink-0 mt-0.5" />
+                  <div>
+                    <div class="font-medium text-nanna-warning">No models available</div>
+                    <p class="text-sm text-nanna-text-muted mt-1">
+                      Set up an API key below, or configure Ollama for local models.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              
               <!-- Ollama Host -->
               <div class="mt-4 pt-4 border-t border-nanna-primary/10">
                 <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
@@ -200,10 +213,23 @@
                 @update:model-value="saveEmbeddingModelPriority"
               />
               
+              <!-- No Embedding Models Warning -->
+              <div v-if="allEmbeddingModels.length === 0" class="mt-4 p-4 rounded-lg bg-nanna-warning/10 border border-nanna-warning/30">
+                <div class="flex items-start gap-3">
+                  <AlertTriangle class="w-5 h-5 text-nanna-warning shrink-0 mt-0.5" />
+                  <div>
+                    <div class="font-medium text-nanna-warning">No embedding models available</div>
+                    <p class="text-sm text-nanna-text-muted mt-1">
+                      Set up an OpenAI API key or install Ollama embedding models (e.g., <code class="text-nanna-accent">ollama pull bge-m3</code>).
+                    </p>
+                  </div>
+                </div>
+              </div>
+              
               <!-- Status -->
-              <div class="flex items-center gap-2 mt-4 pt-4 border-t border-nanna-primary/10">
+              <div v-else class="flex items-center gap-2 mt-4 pt-4 border-t border-nanna-primary/10">
                 <UiBadge v-if="embeddingModelPriority.length > 0" variant="success">✓ Memory recall enabled</UiBadge>
-                <UiBadge v-else variant="warning">⚠ No embedding models — memory recall disabled</UiBadge>
+                <UiBadge v-else variant="warning">⚠ No embedding models selected — memory recall disabled</UiBadge>
               </div>
             </UiCard>
             
@@ -478,7 +504,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { 
   ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon, 
   RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp,
-  Bot, MessageSquare
+  Bot, MessageSquare, AlertTriangle
 } from 'lucide-vue-next'
 
 interface ToolInfo {
@@ -569,31 +595,37 @@ import type { ModelOption } from '~/components/ModelPriorityList.vue'
 const allChatModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
   
-  // Anthropic models
-  models.push(
-    { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
-    { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
-    { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
-    { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
-  )
+  // Anthropic models (only if API key set)
+  if (settings.value?.anthropic_key_set) {
+    models.push(
+      { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', provider: 'anthropic', available: true },
+      { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: true },
+      { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: true },
+      { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: true },
+    )
+  }
   
-  // OpenAI models
-  models.push(
-    { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-    { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-    { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-    { id: 'o1', name: 'o1', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-    { id: 'o1-mini', name: 'o1 Mini', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-  )
+  // OpenAI models (only if API key set)
+  if (settings.value?.openai_key_set) {
+    models.push(
+      { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', available: true },
+      { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', available: true },
+      { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openai', available: true },
+      { id: 'o1', name: 'o1', provider: 'openai', available: true },
+      { id: 'o1-mini', name: 'o1 Mini', provider: 'openai', available: true },
+    )
+  }
   
-  // OpenRouter models
-  models.push(
-    { id: 'anthropic/claude-sonnet-4-20250514', name: 'Claude Sonnet 4 (OR)', provider: 'openrouter', available: settings.value?.openrouter_key_set ?? false },
-    { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'openrouter', available: settings.value?.openrouter_key_set ?? false },
-    { id: 'google/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash', provider: 'openrouter', available: settings.value?.openrouter_key_set ?? false },
-  )
+  // OpenRouter models (only if API key set)
+  if (settings.value?.openrouter_key_set) {
+    models.push(
+      { id: 'anthropic/claude-sonnet-4-20250514', name: 'Claude Sonnet 4 (OR)', provider: 'openrouter', available: true },
+      { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'openrouter', available: true },
+      { id: 'google/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash', provider: 'openrouter', available: true },
+    )
+  }
   
-  // Ollama models (always "available" since local)
+  // Ollama models (always available if Ollama is running)
   for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
     models.push({ id: `ollama/${m.name}`, name: m.name, provider: 'ollama', available: true })
   }
@@ -604,23 +636,17 @@ const allChatModels = computed<ModelOption[]>(() => {
 const allEmbeddingModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
   
-  // OpenAI embedding models
-  models.push(
-    { id: 'openai/text-embedding-3-small', name: 'text-embedding-3-small (1536d)', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-    { id: 'openai/text-embedding-3-large', name: 'text-embedding-3-large (3072d)', provider: 'openai', available: settings.value?.openai_key_set ?? false },
-  )
-  
-  // Ollama embedding models
-  for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
-    models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB)`, provider: 'ollama', available: true })
+  // OpenAI embedding models (only if API key set)
+  if (settings.value?.openai_key_set) {
+    models.push(
+      { id: 'openai/text-embedding-3-small', name: 'text-embedding-3-small (1536d)', provider: 'openai', available: true },
+      { id: 'openai/text-embedding-3-large', name: 'text-embedding-3-large (3072d)', provider: 'openai', available: true },
+    )
   }
   
-  // Common Ollama embedding models that might not be installed yet
-  const commonOllamaEmbeddings = ['nomic-embed-text', 'mxbai-embed-large', 'all-minilm', 'bge-m3']
-  for (const name of commonOllamaEmbeddings) {
-    if (!ollamaModels.value.some(m => m.name === name)) {
-      models.push({ id: `ollama/${name}`, name: `${name} (not installed)`, provider: 'ollama', available: false })
-    }
+  // Ollama embedding models (only installed ones)
+  for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
+    models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB)`, provider: 'ollama', available: true })
   }
   
   return models
