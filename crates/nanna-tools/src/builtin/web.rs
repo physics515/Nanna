@@ -70,7 +70,10 @@ impl Tool for WebSearchTool {
             .min(10) as usize;
 
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            ToolError::ExecutionFailed("Brave Search API key not configured".to_string())
+            ToolError::ExecutionFailed(
+                "Brave Search API key not configured (BRAVE_API_KEY env var). \
+                Use web_fetch to fetch content from specific URLs instead.".to_string()
+            )
         })?;
 
         let client = reqwest::Client::new();

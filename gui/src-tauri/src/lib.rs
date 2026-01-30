@@ -791,7 +791,15 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     tools.register(nanna_tools::ListDirTool::new()).await;
     tools.register(nanna_tools::ExecTool::new()).await;
     tools.register(nanna_tools::WebFetchTool::new()).await;
-    tools.register(nanna_tools::WebSearchTool::new()).await;
+    
+    // WebSearchTool requires BRAVE_API_KEY environment variable
+    let web_search = if let Ok(brave_key) = std::env::var("BRAVE_API_KEY") {
+        nanna_tools::WebSearchTool::new().with_api_key(brave_key)
+    } else {
+        info!("BRAVE_API_KEY not set - web_search will be unavailable, use web_fetch instead");
+        nanna_tools::WebSearchTool::new()
+    };
+    tools.register(web_search).await;
     tools.register(nanna_tools::EchoTool).await;
 
     info!("Nanna GUI initialized with model: {}", config.llm.model);
