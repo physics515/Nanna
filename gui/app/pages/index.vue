@@ -159,7 +159,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { marked } from 'marked'
@@ -243,15 +243,8 @@ const lastUserMessage = ref<string>('')
 let unlistenChunk: UnlistenFn | null = null
 let unlistenTool: UnlistenFn | null = null
 
-onMounted(async () => {
-  // Load config
-  try {
-    config.value = await invoke<AppConfig>('get_config')
-  } catch (e) {
-    console.error('Failed to load config:', e)
-  }
-  
-  // Try to get or create a session
+// Load session data based on current route
+async function loadSession() {
   try {
     const sessions = await invoke<SessionInfo[]>('list_sessions')
     const targetSessionId = route.query.session as string | undefined
@@ -273,10 +266,23 @@ onMounted(async () => {
     } else {
       // No sessions exist, create one
       currentSession.value = await invoke<SessionInfo>('create_session', { name: null })
+      messages.value = []
     }
   } catch (e) {
     console.error('Failed to load sessions:', e)
   }
+}
+
+onMounted(async () => {
+  // Load config
+  try {
+    config.value = await invoke<AppConfig>('get_config')
+  } catch (e) {
+    console.error('Failed to load config:', e)
+  }
+  
+  // Load initial session
+  await loadSession()
   
   // Listen for streaming chunks
   unlistenChunk = await listen<StreamChunk>('stream-chunk', (event) => {
@@ -344,6 +350,22 @@ onMounted(async () => {
 onUnmounted(() => {
   if (unlistenChunk) unlistenChunk()
   if (unlistenTool) unlistenTool()
+})
+
+// Watch for session changes in URL
+watch(() => route.query.session, async (newSessionId) => {
+  if (newSessionId && newSessionId !== currentSession.value?.id) {
+    // Reset state for new session
+    messages.value = []
+    streamingContent.value = ''
+    activeToolCalls.value = []
+    isLoading.value = false
+    isStreaming.value = false
+    connectionError.value = null
+    
+    // Load new session
+    await loadSession()
+  }
 })
 
 async function sendMessage() {
