@@ -113,10 +113,12 @@ html {
   background-color: var(--color-nanna-bg-deep);
   color: var(--color-nanna-text);
   font-family: var(--font-mono);
+  font-size: 14px; /* Reduced from 16px default */
 }
 
 body {
   min-height: 100vh;
+  font-size: 0.875rem; /* 14px at base, scales down slightly */
 }
 
 /* Scrollbar styling */
