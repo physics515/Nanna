@@ -11,18 +11,92 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum LlmError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("API error: {status} - {message}")]
     Api { status: u16, message: String },
     #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(String),
     #[error("Stream error: {0}")]
     Stream(String),
     #[error("Missing API key for provider: {0}")]
     MissingApiKey(String),
+    #[error("Rate limit exceeded: {message}")]
+    RateLimit { 
+        message: String,
+        /// Seconds until rate limit resets (if available)
+        retry_after: Option<u64>,
+    },
+    #[error("All fallback models exhausted")]
+    AllModelsExhausted,
+}
+
+impl From<reqwest::Error> for LlmError {
+    fn from(e: reqwest::Error) -> Self {
+        LlmError::Http(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for LlmError {
+    fn from(e: serde_json::Error) -> Self {
+        LlmError::Json(e.to_string())
+    }
+}
+
+impl LlmError {
+    /// Check if this error is a rate limit error (429)
+    #[must_use]
+    pub fn is_rate_limit(&self) -> bool {
+        matches!(self, LlmError::RateLimit { .. }) 
+            || matches!(self, LlmError::Api { status: 429, .. })
+    }
+    
+    /// Check if this error should trigger a fallback to another model
+    #[must_use]
+    pub fn should_fallback(&self) -> bool {
+        match self {
+            // Rate limits - definitely fallback
+            LlmError::RateLimit { .. } => true,
+            LlmError::Api { status, message } => {
+                // 429 = rate limit
+                // 529 = overloaded (Anthropic)
+                // 503 = service unavailable
+                // 502 = bad gateway
+                if *status == 429 || *status == 529 || *status == 503 || *status == 502 {
+                    return true;
+                }
+                // Check for rate limit in error message (some APIs return 400 with rate limit message)
+                let msg_lower = message.to_lowercase();
+                msg_lower.contains("rate limit") || msg_lower.contains("rate_limit")
+            }
+            // Network errors - might be transient
+            LlmError::Http(_) => true,
+            // Don't fallback on auth errors, JSON errors, etc.
+            _ => false,
+        }
+    }
+    
+    /// Parse an API error response to extract rate limit info
+    pub fn from_api_response(status: u16, message: String) -> Self {
+        // Check if it's a rate limit error
+        if status == 429 || message.to_lowercase().contains("rate_limit") {
+            // Try to extract retry-after from the message
+            let retry_after = Self::parse_retry_after(&message);
+            return LlmError::RateLimit { message, retry_after };
+        }
+        
+        LlmError::Api { status, message }
+    }
+    
+    /// Try to parse retry-after seconds from error message
+    fn parse_retry_after(message: &str) -> Option<u64> {
+        // Anthropic includes "try again later" but not specific timing
+        // Some APIs include "retry-after: X" in headers or body
+        // For now, return None - we can enhance this later
+        None
+    }
 }
 
 /// LLM Provider
@@ -410,7 +484,7 @@ impl LlmClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api { status, message });
+            return Err(LlmError::from_api_response(status, message));
         }
 
         let result: AnthropicResponse = response.json().await?;
@@ -505,7 +579,7 @@ impl LlmClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api { status, message });
+            return Err(LlmError::from_api_response(status, message));
         }
 
         let result: OpenAIResponse = response.json().await?;
@@ -591,11 +665,113 @@ impl LlmClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api { status, message });
+            return Err(LlmError::from_api_response(status, message));
         }
 
         let result: OllamaResponse = response.json().await?;
         Ok(result.message.content)
+    }
+}
+
+// ============================================================================
+// Token Estimation
+// ============================================================================
+
+/// Estimate token count for a string (rough heuristic: ~4 chars per token)
+#[must_use]
+pub fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+/// Estimate total tokens for a completion request
+#[must_use]
+pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
+    let mut total = 0;
+    
+    // Simple messages
+    for msg in &request.messages {
+        total += estimate_tokens(&msg.content);
+    }
+    
+    // Anthropic messages (can have multiple content blocks)
+    for msg in &request.anthropic_messages {
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => total += estimate_tokens(text),
+                ContentBlock::ToolUse { input, .. } => {
+                    total += estimate_tokens(&input.to_string());
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    total += estimate_tokens(content);
+                }
+                ContentBlock::Image { .. } => {
+                    // Images are ~1000 tokens for small, more for large
+                    total += 1000;
+                }
+            }
+        }
+    }
+    
+    // Tools definitions
+    for tool in &request.tools {
+        total += estimate_tokens(&tool.to_string());
+    }
+    
+    total
+}
+
+/// Model rate limit info (tokens per minute)
+#[derive(Debug, Clone, Copy)]
+pub struct ModelLimits {
+    pub input_tokens_per_minute: u32,
+    pub output_tokens_per_minute: u32,
+}
+
+impl ModelLimits {
+    /// Get known limits for common models
+    /// These are approximate/conservative - actual limits depend on tier
+    #[must_use]
+    pub fn for_model(model: &str) -> Self {
+        match model {
+            // Anthropic - very conservative estimates for default tiers
+            m if m.contains("opus") => Self {
+                input_tokens_per_minute: 10_000,  // Very restrictive!
+                output_tokens_per_minute: 4_000,
+            },
+            m if m.contains("sonnet") => Self {
+                input_tokens_per_minute: 40_000,
+                output_tokens_per_minute: 8_000,
+            },
+            m if m.contains("haiku") => Self {
+                input_tokens_per_minute: 50_000,
+                output_tokens_per_minute: 10_000,
+            },
+            // OpenAI - generally higher limits
+            m if m.contains("gpt-4o") => Self {
+                input_tokens_per_minute: 30_000,
+                output_tokens_per_minute: 10_000,
+            },
+            m if m.contains("gpt-4") => Self {
+                input_tokens_per_minute: 10_000,
+                output_tokens_per_minute: 10_000,
+            },
+            // Ollama - unlimited (local)
+            m if m.contains("ollama") || m.contains("llama") || m.contains("mistral") => Self {
+                input_tokens_per_minute: u32::MAX,
+                output_tokens_per_minute: u32::MAX,
+            },
+            // Default conservative estimate
+            _ => Self {
+                input_tokens_per_minute: 20_000,
+                output_tokens_per_minute: 8_000,
+            },
+        }
+    }
+    
+    /// Check if a request would likely exceed rate limits
+    #[must_use]
+    pub fn would_exceed(&self, estimated_input_tokens: usize) -> bool {
+        estimated_input_tokens as u32 > self.input_tokens_per_minute
     }
 }
 
@@ -744,7 +920,7 @@ impl EmbeddingClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api { status, message });
+            return Err(LlmError::from_api_response(status, message));
         }
 
         let result: EmbedResponse = response.json().await?;
@@ -781,7 +957,7 @@ impl EmbeddingClient {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let message = response.text().await.unwrap_or_default();
-                return Err(LlmError::Api { status, message });
+                return Err(LlmError::from_api_response(status, message));
             }
 
             let result: OllamaEmbedResponse = response.json().await?;
@@ -921,7 +1097,7 @@ impl LlmClient {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    yield Err(LlmError::Http(e));
+                    yield Err(LlmError::Http(e.to_string()));
                     return;
                 }
             };
@@ -929,7 +1105,7 @@ impl LlmClient {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let message = response.text().await.unwrap_or_default();
-                yield Err(LlmError::Api { status, message });
+                yield Err(LlmError::from_api_response(status, message));
                 return;
             }
 
@@ -941,7 +1117,7 @@ impl LlmClient {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        yield Err(LlmError::Http(e));
+                        yield Err(LlmError::Http(e.to_string()));
                         return;
                     }
                 };

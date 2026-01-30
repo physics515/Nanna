@@ -109,6 +109,18 @@ pub struct AppState {
     ollama_host: Arc<RwLock<String>>,
     /// Model for memory extraction (empty = use chat model)
     extraction_model: Arc<RwLock<String>>,
+    /// Currently active model (the one that will be used for the next request)
+    active_model: Arc<RwLock<String>>,
+    /// Models currently on cooldown due to rate limits (model_id -> cooldown_until timestamp)
+    rate_limited_models: Arc<RwLock<HashMap<String, i64>>>,
+}
+
+/// Model status event for frontend
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelStatusEvent {
+    pub active_model: String,
+    pub fallback_reason: Option<String>,
+    pub rate_limited_models: Vec<String>,
 }
 
 /// Chat message for frontend
@@ -176,6 +188,100 @@ struct PendingToolCall {
     id: String,
     name: String,
     input_json: String,
+}
+
+// =============================================================================
+// Model Selection & Fallback
+// =============================================================================
+
+/// Parse a model ID to extract provider and model name
+/// Format: "provider/model" or just "model" (defaults to anthropic)
+fn parse_model_id(model_id: &str) -> (String, String) {
+    if let Some((provider, model)) = model_id.split_once('/') {
+        (provider.to_string(), model.to_string())
+    } else {
+        // Guess provider from model name
+        let provider = if model_id.contains("claude") || model_id.contains("opus") || model_id.contains("sonnet") || model_id.contains("haiku") {
+            "anthropic"
+        } else if model_id.contains("gpt") || model_id.contains("o1") {
+            "openai"
+        } else if model_id.contains("llama") || model_id.contains("mistral") || model_id.contains("qwen") {
+            "ollama"
+        } else {
+            "anthropic" // default
+        };
+        (provider.to_string(), model_id.to_string())
+    }
+}
+
+/// Create an LLM client for a specific model
+fn create_llm_client_for_model(model_id: &str, config: &Config, ollama_host: &str) -> Option<(LlmClient, String)> {
+    let (provider, model_name) = parse_model_id(model_id);
+    
+    match provider.as_str() {
+        "anthropic" => {
+            let api_key = config.llm.api_key.clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())?;
+            Some((LlmClient::anthropic(&api_key), model_name))
+        }
+        "openai" => {
+            let api_key = config.llm.openai_api_key.clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())?;
+            Some((LlmClient::openai(&api_key), model_name))
+        }
+        "openrouter" => {
+            let api_key = std::env::var("OPENROUTER_API_KEY").ok()?;
+            Some((LlmClient::openrouter(&api_key), model_name))
+        }
+        "ollama" => {
+            Some((LlmClient::ollama(ollama_host), model_name))
+        }
+        _ => None,
+    }
+}
+
+/// Select the best available model from priority list, skipping rate-limited ones
+fn select_best_model(
+    priority: &[String],
+    rate_limited: &HashMap<String, i64>,
+    config: &Config,
+) -> Option<String> {
+    let now = chrono::Utc::now().timestamp();
+    
+    for model_id in priority {
+        // Check if rate limited and cooldown hasn't expired
+        if let Some(&cooldown_until) = rate_limited.get(model_id) {
+            if now < cooldown_until {
+                debug!("Skipping rate-limited model: {} (cooldown until {})", model_id, cooldown_until);
+                continue;
+            }
+        }
+        
+        // Check if we have credentials for this model
+        let (provider, _) = parse_model_id(model_id);
+        let has_credentials = match provider.as_str() {
+            "anthropic" => config.llm.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok(),
+            "openai" => config.llm.openai_api_key.is_some() || std::env::var("OPENAI_API_KEY").is_ok(),
+            "openrouter" => std::env::var("OPENROUTER_API_KEY").is_ok(),
+            "ollama" => true, // Always available (local)
+            _ => false,
+        };
+        
+        if has_credentials {
+            return Some(model_id.clone());
+        }
+    }
+    
+    None
+}
+
+/// Check if an error message indicates a rate limit
+fn is_rate_limit_error(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("rate_limit") 
+        || lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
 }
 
 // =============================================================================
@@ -328,16 +434,31 @@ Be concise. Be useful. Be present.{}"#,
     let session_id_clone = session_id.clone();
     let app_clone = app.clone();
     let tools = state_guard.tools.clone();
-    let llm = state_guard.llm.clone();
     let memory = state_guard.memory.clone();
     let user_message = message.clone();
+    
+    // Get model priority list and config for fallback
+    let model_priority = state_guard.config.llm.model_priority.clone();
+    let config = state_guard.config.clone();
+    let ollama_host = state_guard.ollama_host.read().await.clone();
+    let rate_limited = state_guard.rate_limited_models.clone();
+    let active_model = state_guard.active_model.clone();
 
     // Drop the state guard so we can do tool execution without holding the lock
     drop(state_guard);
 
-    // Run the agentic loop with tool calls
-    let (full_response, tool_calls) =
-        run_agent_loop(&app_clone, &session_id_clone, &llm, tools, request).await?;
+    // Run the agentic loop with fallback support
+    let (full_response, tool_calls) = run_agent_loop_with_fallback(
+        &app_clone,
+        &session_id_clone,
+        tools,
+        request,
+        &model_priority,
+        &config,
+        &ollama_host,
+        rate_limited,
+        active_model,
+    ).await?;
 
     // Re-acquire state to store the response
     let state_guard = state.read().await;
@@ -545,6 +666,116 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
             debug!("Memory extraction failed: {}", e);
         }
     }
+}
+
+/// Run the agent loop with automatic fallback on rate limit errors
+async fn run_agent_loop_with_fallback(
+    app: &AppHandle,
+    session_id: &str,
+    tools: Arc<ToolRegistry>,
+    request: nanna_llm::CompletionRequest,
+    model_priority: &[String],
+    config: &Config,
+    ollama_host: &str,
+    rate_limited: Arc<RwLock<HashMap<String, i64>>>,
+    active_model: Arc<RwLock<String>>,
+) -> Result<(String, Vec<ToolCallInfo>), String> {
+    use nanna_llm::{estimate_request_tokens, ModelLimits};
+    
+    // Estimate tokens for pre-flight check
+    let estimated_tokens = estimate_request_tokens(&request);
+    info!("Estimated request tokens: {}", estimated_tokens);
+    
+    // Get rate-limited models
+    let rate_limited_map = rate_limited.read().await.clone();
+    
+    // Try each model in priority order
+    let mut last_error = String::from("No models available");
+    let mut tried_models = Vec::new();
+    
+    for model_id in model_priority {
+        // Check if we have credentials for this model
+        let (_provider, _model_name) = parse_model_id(model_id);
+        
+        // Skip if rate limited and cooldown hasn't expired
+        let now = chrono::Utc::now().timestamp();
+        if let Some(&cooldown_until) = rate_limited_map.get(model_id) {
+            if now < cooldown_until {
+                info!("Skipping rate-limited model: {} (cooldown until {})", model_id, cooldown_until);
+                continue;
+            }
+        }
+        
+        // Pre-flight check: skip models that would likely exceed limits
+        let limits = ModelLimits::for_model(model_id);
+        if limits.would_exceed(estimated_tokens) {
+            info!("Skipping model {} - estimated {} tokens exceeds limit of {}", 
+                  model_id, estimated_tokens, limits.input_tokens_per_minute);
+            continue;
+        }
+        
+        // Try to create client for this model
+        let Some((llm, actual_model)) = create_llm_client_for_model(model_id, config, ollama_host) else {
+            debug!("No credentials for model: {}", model_id);
+            continue;
+        };
+        
+        tried_models.push(model_id.clone());
+        
+        // Update active model
+        {
+            let mut active = active_model.write().await;
+            *active = model_id.clone();
+        }
+        
+        // Emit model status event
+        let _ = app.emit("model-status", ModelStatusEvent {
+            active_model: model_id.clone(),
+            fallback_reason: if tried_models.len() > 1 {
+                Some(last_error.clone())
+            } else {
+                None
+            },
+            rate_limited_models: rate_limited_map.keys().cloned().collect(),
+        });
+        
+        info!("Trying model: {} (attempt {})", model_id, tried_models.len());
+        
+        // Create request with the actual model name
+        let mut model_request = request.clone();
+        model_request.model = actual_model;
+        
+        // Run the agent loop
+        match run_agent_loop(app, session_id, &llm, tools.clone(), model_request).await {
+            Ok(result) => {
+                info!("Success with model: {}", model_id);
+                return Ok(result);
+            }
+            Err(e) => {
+                warn!("Model {} failed: {}", model_id, e);
+                last_error = e.clone();
+                
+                // Check if it's a rate limit error
+                if is_rate_limit_error(&e) {
+                    // Add to rate-limited models with 60 second cooldown
+                    let cooldown_until = chrono::Utc::now().timestamp() + 60;
+                    rate_limited.write().await.insert(model_id.clone(), cooldown_until);
+                    info!("Rate limited model {} until {}", model_id, cooldown_until);
+                    
+                    // Continue to next model
+                    continue;
+                }
+                
+                // For non-rate-limit errors, also try fallback
+                // (network errors, 5xx errors, etc.)
+                continue;
+            }
+        }
+    }
+    
+    // All models exhausted
+    error!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error);
+    Err(format!("All models exhausted (tried {}). Last error: {}", tried_models.len(), last_error))
 }
 
 /// Run the agent loop with tool execution (parallel tool calls)
@@ -2310,6 +2541,54 @@ async fn set_embedding_model_priority(
 }
 
 // =============================================================================
+// Model Status Commands
+// =============================================================================
+
+/// Get current model status (active model, rate-limited models)
+#[tauri::command]
+async fn get_model_status(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<ModelStatusEvent, String> {
+    let state_guard = state.read().await;
+    let active = state_guard.active_model.read().await.clone();
+    let rate_limited = state_guard.rate_limited_models.read().await;
+    
+    // Filter to only models that are still rate limited
+    let now = chrono::Utc::now().timestamp();
+    let still_limited: Vec<String> = rate_limited
+        .iter()
+        .filter(|(_, until)| now < **until)
+        .map(|(model, _)| model.clone())
+        .collect();
+    
+    Ok(ModelStatusEvent {
+        active_model: active,
+        fallback_reason: None,
+        rate_limited_models: still_limited,
+    })
+}
+
+/// Clear rate limit for a specific model (or all if model is None)
+#[tauri::command]
+async fn clear_rate_limit(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    model: Option<String>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let mut rate_limited = state_guard.rate_limited_models.write().await;
+    
+    if let Some(model_id) = model {
+        rate_limited.remove(&model_id);
+        info!("Cleared rate limit for model: {}", model_id);
+    } else {
+        rate_limited.clear();
+        info!("Cleared all rate limits");
+    }
+    
+    Ok(())
+}
+
+// =============================================================================
 // Config Persistence Commands
 // =============================================================================
 
@@ -2941,6 +3220,11 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
 
     // Get extraction model from config (empty = use chat model)
     let saved_extraction_model = config.memory.extraction_model.clone();
+    
+    // Get initial active model from priority list or default
+    let initial_active_model = config.llm.model_priority.first()
+        .cloned()
+        .unwrap_or_else(|| config.llm.model.clone());
 
     Ok(AppState {
         storage: Arc::new(storage),
@@ -2964,6 +3248,10 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         ollama_host: Arc::new(RwLock::new(saved_ollama_host)),
         // Extraction model (from config, empty = use chat model)
         extraction_model: Arc::new(RwLock::new(saved_extraction_model)),
+        // Active model tracking (start with first in priority or default model)
+        active_model: Arc::new(RwLock::new(initial_active_model)),
+        // Rate limited models (empty at startup)
+        rate_limited_models: Arc::new(RwLock::new(HashMap::new())),
     })
 }
 
@@ -3073,6 +3361,9 @@ pub fn run() {
             set_chat_model_priority,
             get_embedding_model_priority,
             set_embedding_model_priority,
+            // Model status
+            get_model_status,
+            clear_rate_limit,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

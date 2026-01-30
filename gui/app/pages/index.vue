@@ -2,13 +2,15 @@
   <div class="flex flex-col h-full">
     <!-- Chat header -->
     <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
-      <h2 class="text-base sm:text-lg font-semibold text-nanna-text truncate">
-        {{ currentSession?.name || 'New Chat' }}
-      </h2>
-      <p class="text-xs sm:text-sm text-nanna-text-muted truncate">
-        Model: {{ config?.model || 'Loading...' }}
-        <span v-if="config?.available_tools?.length" class="ml-2 text-nanna-secondary">
-          • {{ config.available_tools.length }} tools
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="text-base sm:text-lg font-semibold text-nanna-text truncate">
+          {{ currentSession?.name || 'New Chat' }}
+        </h2>
+        <ModelStatusBadge />
+      </div>
+      <p class="text-xs text-nanna-text-dim mt-1">
+        <span v-if="config?.available_tools?.length">
+          {{ config.available_tools.length }} tools available
         </span>
       </p>
     </header>
