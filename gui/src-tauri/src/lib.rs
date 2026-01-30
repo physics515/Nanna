@@ -1160,6 +1160,7 @@ pub struct ExtendedSettings {
     // API Keys (masked for display)
     pub anthropic_key_set: bool,
     pub openai_key_set: bool,
+    pub openrouter_key_set: bool,
     pub brave_key_set: bool,
     
     // Chat Provider
@@ -1239,6 +1240,7 @@ async fn get_extended_settings(
         anthropic_key_set: state_guard.config.llm.api_key.is_some() 
             || std::env::var("ANTHROPIC_API_KEY").is_ok(),
         openai_key_set: std::env::var("OPENAI_API_KEY").is_ok(),
+        openrouter_key_set: std::env::var("OPENROUTER_API_KEY").is_ok(),
         brave_key_set: std::env::var("BRAVE_API_KEY").is_ok(),
         
         provider: state_guard.config.llm.provider.clone(),
@@ -2110,6 +2112,23 @@ async fn set_similarity_threshold(
 }
 
 // =============================================================================
+// Config Persistence Commands
+// =============================================================================
+
+/// Save config to disk
+#[tauri::command]
+async fn save_config(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    
+    info!("Config saved to disk");
+    Ok(())
+}
+
+// =============================================================================
 // Channel Status Commands
 // =============================================================================
 
@@ -2635,6 +2654,8 @@ pub fn run() {
             clear_all_memories,
             // Channel status
             get_channel_status,
+            // Config persistence
+            save_config,
             // Notifications
             send_notification,
             request_notification_permission,
