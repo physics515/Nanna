@@ -35,3 +35,6 @@ scraper = "0.22"
 
 # For audio encoding
 base64-simd = "0.8"
+
+# For PDF parsing
+lopdf = "0.34"

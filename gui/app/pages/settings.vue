@@ -356,6 +356,30 @@
                 {{ consolidating ? 'Dreaming...' : 'Dream Now' }}
               </UiButton>
             </div>
+            
+            <!-- Similarity Threshold -->
+            <div class="p-3 rounded-lg bg-nanna-bg-elevated/50">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-sm font-medium text-nanna-text">Recall Similarity Threshold</span>
+                <span class="text-sm text-nanna-accent font-mono">{{ (similarityThreshold * 100).toFixed(0) }}%</span>
+              </div>
+              <input 
+                type="range" 
+                min="0" 
+                max="100" 
+                step="5"
+                :value="similarityThreshold * 100"
+                @change="setSimilarityThreshold(Number(($event.target as HTMLInputElement).value) / 100)"
+                class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+              >
+              <div class="flex justify-between text-xs text-nanna-text-dim mt-1">
+                <span>0% (more results)</span>
+                <span>100% (exact match)</span>
+              </div>
+              <p class="text-xs text-nanna-text-dim mt-2">
+                Lower = more memories recalled but less relevant. Higher = fewer but more accurate matches.
+              </p>
+            </div>
           </div>
         </UiCard>
         
@@ -510,6 +534,7 @@ const loadingModels = ref(false)
 const memoryStats = ref<CognitiveMemoryStats | null>(null)
 const consolidating = ref(false)
 const toast = ref<{ message: string; type: 'success' | 'error' } | null>(null)
+const similarityThreshold = ref(0.4)
 
 const ollamaModelOptions = computed(() => {
   const options: { value: string; label: string }[] = []
@@ -533,7 +558,26 @@ onMounted(async () => {
   await loadSettings()
   await loadSessions()
   await loadMemoryStats()
+  await loadSimilarityThreshold()
 })
+
+async function loadSimilarityThreshold() {
+  try {
+    similarityThreshold.value = await invoke<number>('get_similarity_threshold')
+  } catch (e) {
+    console.error('Failed to load similarity threshold:', e)
+  }
+}
+
+async function setSimilarityThreshold(value: number) {
+  try {
+    const result = await invoke<string>('set_similarity_threshold', { threshold: value })
+    similarityThreshold.value = value
+    showToast(result, 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
 
 async function loadSettings() {
   try {

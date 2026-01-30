@@ -22,6 +22,8 @@ pub use loop_runner::{
 pub use multi::{
     AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, TaskStatus,
     SwarmConfig, SwarmResult, SwarmTaskResult,
+    // Swarm Coordinator
+    SwarmCoordinator, DecomposedTask, DomainAgent, Subtask,
 };
 pub use supervisor::{
     AgentState, AgentStats, HealthCheckConfig, RestartPolicy, SupervisedAgentConfig,

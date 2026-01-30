@@ -51,6 +51,8 @@ pub struct MemoryService {
     embed_fn: Option<EmbedFn>,
     /// Track memory IDs that need FSRS updates (for async batch updates)
     pending_updates: RwLock<Vec<(String, Rating)>>,
+    /// Runtime-adjustable minimum score (overrides config)
+    min_score_override: RwLock<Option<f32>>,
 }
 
 impl MemoryService {
@@ -66,6 +68,7 @@ impl MemoryService {
             store: VectorStore::new(store_config),
             embed_fn: None,
             pending_updates: RwLock::new(Vec::new()),
+            min_score_override: RwLock::new(None),
         }
     }
 
@@ -80,6 +83,24 @@ impl MemoryService {
     #[must_use]
     pub fn fsrs_params(&self) -> &FsrsParameters {
         &self.config.fsrs
+    }
+
+    /// Get the minimum similarity score threshold for recall
+    pub fn get_min_score(&self) -> f32 {
+        // Check for runtime override first
+        if let Ok(guard) = self.min_score_override.try_read() {
+            if let Some(score) = *guard {
+                return score;
+            }
+        }
+        self.config.min_score
+    }
+
+    /// Set the minimum similarity score threshold for recall (runtime override)
+    pub fn set_min_score(&self, score: f32) {
+        if let Ok(mut guard) = self.min_score_override.try_write() {
+            *guard = Some(score.clamp(0.0, 1.0));
+        }
     }
 
     /// Smart ingest - handles duplicates via prediction error gating.
@@ -269,8 +290,9 @@ impl MemoryService {
 
         // Search
         let results = self.store.search(&query_embedding, self.config.max_results * 2).await;
+        let min_score = self.get_min_score();
         info!("Recall: raw search returned {} results (min_score: {:.2}, min_weight: {:.2})", 
-               results.len(), self.config.min_score, self.config.min_weight);
+               results.len(), min_score, self.config.min_weight);
         
         // Log top results before filtering
         for (i, (entry, score)) in results.iter().take(3).enumerate() {
@@ -282,7 +304,7 @@ impl MemoryService {
         let mut updates = Vec::new();
         
         for (entry, score) in results {
-            if score < self.config.min_score {
+            if score < min_score {
                 continue;
             }
             

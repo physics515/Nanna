@@ -2028,6 +2028,88 @@ async fn clear_all_memories(
 }
 
 // =============================================================================
+// Notification Commands
+// =============================================================================
+
+/// Send a native notification
+#[tauri::command]
+async fn send_notification(
+    app: AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    
+    app.notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+        .map_err(|e| format!("Failed to send notification: {}", e))?;
+    
+    info!("Sent notification: {} - {}", title, body);
+    Ok(())
+}
+
+/// Request notification permission (needed on some platforms)
+#[tauri::command]
+async fn request_notification_permission(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_notification::NotificationExt;
+    
+    let permission = app.notification()
+        .request_permission()
+        .map_err(|e| format!("Failed to request permission: {}", e))?;
+    
+    Ok(matches!(permission, tauri_plugin_notification::PermissionState::Granted))
+}
+
+/// Check if notifications are permitted
+#[tauri::command]
+async fn check_notification_permission(app: AppHandle) -> Result<String, String> {
+    use tauri_plugin_notification::NotificationExt;
+    
+    let permission = app.notification()
+        .permission_state()
+        .map_err(|e| format!("Failed to check permission: {}", e))?;
+    
+    Ok(match permission {
+        tauri_plugin_notification::PermissionState::Granted => "granted",
+        tauri_plugin_notification::PermissionState::Denied => "denied",
+        tauri_plugin_notification::PermissionState::Unknown => "unknown",
+    }.to_string())
+}
+
+// =============================================================================
+// Similarity Threshold Configuration
+// =============================================================================
+
+/// Get the current similarity threshold
+#[tauri::command]
+async fn get_similarity_threshold(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<f32, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.memory.get_min_score())
+}
+
+/// Set the similarity threshold for memory recall
+#[tauri::command]
+async fn set_similarity_threshold(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    threshold: f32,
+) -> Result<String, String> {
+    if !(0.0..=1.0).contains(&threshold) {
+        return Err("Threshold must be between 0.0 and 1.0".to_string());
+    }
+    
+    let state_guard = state.read().await;
+    state_guard.memory.set_min_score(threshold);
+    
+    info!("Set similarity threshold to {}", threshold);
+    Ok(format!("Similarity threshold set to {:.2}", threshold))
+}
+
+// =============================================================================
 // Channel Status Commands
 // =============================================================================
 
@@ -2553,6 +2635,13 @@ pub fn run() {
             clear_all_memories,
             // Channel status
             get_channel_status,
+            // Notifications
+            send_notification,
+            request_notification_permission,
+            check_notification_permission,
+            // Similarity threshold
+            get_similarity_threshold,
+            set_similarity_threshold,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

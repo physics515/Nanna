@@ -19,9 +19,9 @@
 - [x] Scheduling (remind, list, cancel)
 - [x] Browser tools (screenshot, extract, action, evaluate)
 - [x] Vision tools (analyze_image)
-- [ ] OCR tools (extract text from images, describe image contents)
+- [x] OCR tools (extract text from images, describe image contents)
 - [x] Audio tools (TTS, transcription)
-- [ ] PDF tools (read text, extract images, analyze embedded images)
+- [x] PDF tools (read text, extract images, analyze embedded images)
 - [x] Authoring tools (runtime tool creation) — `nanna-scripting` crate
   - [x] Boa engine (pure Rust, lightweight)
   - [x] Deno engine (V8 fallback for full TS support)
@@ -91,7 +91,7 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] System tray / menu bar presence (show/new chat/quit menu)
 - [x] Streaming UX polish (ConnectionStatus, MessageSkeleton, retry logic)
 - [x] Channel status dashboard
-- [ ] Native notifications (plugin added, not wired)
+- [x] Native notifications (wired up with permission handling)
 
 ### Technical
 - [x] Tauri v2 setup with Rust backend
@@ -117,7 +117,7 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Anti-confabulation prompting** - explicit instructions to not fabricate memories
 - [x] **Similarity threshold tuning** - lowered min_score from 0.70 to 0.40 for semantic matching
 - [x] **Memory management UI** - view, edit, delete individual memories in GUI ✅
-- [ ] **Configurable similarity threshold** - expose min_score in GUI settings
+- [x] **Configurable similarity threshold** - expose min_score in GUI settings
 
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
@@ -127,12 +127,12 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 *Inspired by Kimi K2.5's agent swarm architecture*
 
 ### Parallel Agent Orchestration
-- [ ] **Swarm Coordinator** - orchestrator that decomposes tasks into parallel subtasks
-- [ ] **Dynamic sub-agent spawning** - instantiate domain-specific agents on-the-fly
+- [x] **Swarm Coordinator** - orchestrator that decomposes tasks into parallel subtasks ✅
+- [x] **Dynamic sub-agent spawning** - instantiate domain-specific agents on-the-fly ✅
 - [x] **Parallel tool execution** - execute independent tool calls concurrently ✅
 - [ ] **Critical Path metrics** - measure efficiency by longest parallel branch, not total steps
-- [ ] **Sub-agent communication** - message passing between parallel agents
-- [ ] **Result aggregation** - collect and synthesize outputs from parallel branches
+- [x] **Sub-agent communication** - message passing between parallel agents ✅
+- [x] **Result aggregation** - collect and synthesize outputs from parallel branches ✅
 
 ### Context Management
 - [x] **Sliding window truncation** - retain only latest N messages when context grows ✅
@@ -191,14 +191,14 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 21 | ~~Memory browser~~ | ✅ |
 | 22 | ~~Streaming UX polish~~ | ✅ |
 | 23 | ~~Channel status dashboard~~ | ✅ Done |
-| 24 | Native notifications wiring | 🔜 Next |
+| 24 | ~~Native notifications wiring~~ | ✅ Done |
 | 25 | ~~Dreaming trigger + auto feedback~~ | ✅ Done |
 | 26 | ~~Ollama integration~~ | ✅ Done |
 | 27 | ~~Memory extraction: configurable model~~ | ✅ Done |
 | 28 | ~~Memory extraction: FSRS feedback loop~~ | ✅ Done |
 | 29 | ~~Memory duplicate detection~~ | ✅ Done |
 | 30 | ~~Parallel tool execution~~ | ✅ Done |
-| 31 | **Swarm Coordinator** | 🔜 High Priority |
+| 31 | ~~Swarm Coordinator~~ | ✅ Done |
 | 32 | ~~Context management/truncation~~ | ✅ Done |
 | 33 | ~~Memory management UI~~ | ✅ Done |
 | 34 | Critical Path metrics | Later |
@@ -207,5 +207,5 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 37 | Tauri mobile (Android/iOS) | Later |
 | 38 | Visual debugging loop | Future |
 | 39 | Production hardening | Later |
-| 40 | PDF tools (read + extract images) | 🔜 |
-| 41 | OCR + image description | 🔜 |
+| 40 | ~~PDF tools (read + extract images)~~ | ✅ Done |
+| 41 | ~~OCR + image description~~ | ✅ Done |
