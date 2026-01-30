@@ -772,6 +772,169 @@ async fn set_api_key(
     Ok(())
 }
 
+/// Extended settings for the settings page
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendedSettings {
+    // API Keys (masked for display)
+    pub anthropic_key_set: bool,
+    pub openai_key_set: bool,
+    pub brave_key_set: bool,
+    
+    // Provider
+    pub provider: String,
+    pub available_providers: Vec<String>,
+    
+    // Model
+    pub model: String,
+    pub available_models: Vec<String>,
+    
+    // Generation params
+    pub temperature: f32,
+    pub top_p: f32,
+    pub max_tokens: u32,
+    
+    // Tools
+    pub tools: Vec<ToolInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+}
+
+/// Get extended settings
+#[tauri::command]
+async fn get_extended_settings(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<ExtendedSettings, String> {
+    let state_guard = state.read().await;
+    
+    let tool_defs = state_guard.tools.definitions().await;
+    let tools: Vec<ToolInfo> = tool_defs
+        .into_iter()
+        .map(|t| ToolInfo {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            enabled: true, // TODO: implement per-tool enable/disable
+        })
+        .collect();
+    
+    Ok(ExtendedSettings {
+        anthropic_key_set: state_guard.config.llm.api_key.is_some() 
+            || std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        openai_key_set: std::env::var("OPENAI_API_KEY").is_ok(),
+        brave_key_set: std::env::var("BRAVE_API_KEY").is_ok(),
+        
+        provider: state_guard.config.llm.provider.clone(),
+        available_providers: vec![
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "openrouter".to_string(),
+        ],
+        
+        model: state_guard.config.llm.model.clone(),
+        available_models: vec![
+            "claude-sonnet-4-20250514".to_string(),
+            "claude-opus-4-20250514".to_string(),
+            "claude-3-5-sonnet-20241022".to_string(),
+            "claude-3-5-haiku-20241022".to_string(),
+            "gpt-4o".to_string(),
+            "gpt-4o-mini".to_string(),
+            "gpt-4-turbo".to_string(),
+            "deepseek/deepseek-chat".to_string(),
+            "google/gemini-2.0-flash-exp".to_string(),
+        ],
+        
+        temperature: 1.0,
+        top_p: 0.95,
+        max_tokens: 8192,
+        
+        tools,
+    })
+}
+
+/// Set a specific API key
+#[tauri::command]
+async fn set_provider_api_key(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    provider: String,
+    api_key: String,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    
+    match provider.as_str() {
+        "anthropic" => {
+            state_guard.config.llm.api_key = Some(api_key.clone());
+            unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
+            
+            // Recreate LLM client if this is the active provider
+            if state_guard.config.llm.provider == "anthropic" {
+                state_guard.llm = Arc::new(LlmClient::anthropic(&api_key));
+            }
+        }
+        "openai" => {
+            unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
+            
+            if state_guard.config.llm.provider == "openai" {
+                state_guard.llm = Arc::new(LlmClient::openai(&api_key));
+            }
+        }
+        "brave" => {
+            unsafe { std::env::set_var("BRAVE_API_KEY", &api_key); }
+            // Note: WebSearchTool would need to be re-registered to pick this up
+        }
+        "openrouter" => {
+            unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
+        }
+        _ => return Err(format!("Unknown provider: {}", provider)),
+    }
+    
+    info!("API key set for provider: {}", provider);
+    Ok(())
+}
+
+/// Set the active LLM provider
+#[tauri::command]
+async fn set_provider(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    provider: String,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    
+    // Get appropriate API key
+    let api_key = match provider.as_str() {
+        "anthropic" => state_guard.config.llm.api_key.clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
+        "openai" => std::env::var("OPENAI_API_KEY").ok(),
+        "openrouter" => std::env::var("OPENROUTER_API_KEY").ok(),
+        _ => return Err(format!("Unknown provider: {}", provider)),
+    };
+    
+    let api_key = api_key.ok_or_else(|| format!("No API key set for {}", provider))?;
+    
+    // Create new LLM client
+    let llm = match provider.as_str() {
+        "anthropic" => LlmClient::anthropic(&api_key),
+        "openai" => LlmClient::openai(&api_key),
+        "openrouter" => LlmClient::openrouter(&api_key),
+        _ => return Err(format!("Unknown provider: {}", provider)),
+    };
+    
+    state_guard.config.llm.provider = provider.clone();
+    state_guard.llm = Arc::new(llm);
+    
+    info!("Provider changed to: {}", provider);
+    Ok(())
+}
+
+/// Get env var status (for checking if keys are set)
+#[tauri::command]
+async fn check_env_var(name: String) -> Result<bool, String> {
+    Ok(std::env::var(&name).is_ok())
+}
+
 // =============================================================================
 // App Setup
 // =============================================================================
@@ -881,6 +1044,10 @@ pub fn run() {
             get_memory_stats,
             show_window,
             hide_to_tray,
+            get_extended_settings,
+            set_provider_api_key,
+            set_provider,
+            check_env_var,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
