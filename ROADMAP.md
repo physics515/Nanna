@@ -119,23 +119,23 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Memory management UI** - view, edit, delete individual memories in GUI ✅
 - [x] **Configurable similarity threshold** - expose min_score in GUI settings
 
-### Settings Overhaul 🔜
-- [ ] **Tabbed settings UI** - organize settings into logical tabs (General, Models, Memory, Tools, Advanced)
-- [ ] **Full config migration** - move ALL config.toml/env settings into GUI
-- [ ] **Persistent settings** - save to config file on change, load on startup
-- [ ] **Tool configuration** - enable/disable tools, set tool-specific options (Brave API key, etc.)
+### Settings Overhaul ✅
+- [x] **Tabbed settings UI** - organize settings into logical tabs (Models, Memory, Tools, Scheduler, Data)
+- [x] **Full config migration** - settings saved to config.toml via GUI
+- [x] **Persistent settings** - save to config file on change, load on startup
+- [x] **Tool configuration** - tool API keys (Brave), tool list display
 - [ ] **System prompt editor** - edit default system prompt in GUI
 - [ ] **Import/Export config** - backup and restore settings
 
-### Channels Page Overhaul 🔜
-- [ ] **Channel onboarding wizards** - step-by-step setup for each channel
-  - [ ] Telegram: BotFather walkthrough, token input, webhook setup
-  - [ ] Discord: App creation guide, bot token, permissions setup
+### Channels Page Overhaul 🔶
+- [x] **Channel onboarding wizards** - step-by-step setup for each channel
+  - [x] Telegram: BotFather walkthrough, token input, webhook setup
+  - [x] Discord: App creation guide, bot token, permissions setup
   - [ ] Slack: App manifest, OAuth flow, socket mode setup
   - [ ] Signal: signald setup, phone verification
   - [ ] WhatsApp: Business API setup, access token
-- [ ] **Credential management** - secure input/storage for tokens and keys
-- [ ] **Connection testing** - verify credentials work before saving
+- [x] **Credential management** - secure input/storage for tokens and keys
+- [x] **Connection testing** - verify credentials work before saving
 - [ ] **Channel status live updates** - real-time connection health
 
 ### Build Artifacts (Windows)
@@ -228,5 +228,8 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 39 | Production hardening | Later |
 | 40 | ~~PDF tools (read + extract images)~~ | ✅ Done |
 | 41 | ~~OCR + image description~~ | ✅ Done |
-| 42 | **Settings overhaul (tabs + full config)** | 🔜 High Priority |
-| 43 | **Channels page overhaul (onboarding wizards)** | 🔜 High Priority |
+| 42 | ~~Settings overhaul (tabs + full config)~~ | ✅ Done |
+| 43 | ~~Channels page (Telegram/Discord wizards)~~ | ✅ Done |
+| 44 | Channels: Slack/Signal/WhatsApp wizards | 🔜 |
+| 45 | System prompt editor | 🔜 |
+| 46 | Config import/export | Later |
