@@ -119,6 +119,15 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Memory management UI** - view, edit, delete individual memories in GUI ✅
 - [x] **Configurable similarity threshold** - expose min_score in GUI settings
 
+### Settings Overhaul 🔜
+- [ ] **Tabbed settings UI** - organize settings into logical tabs (General, Models, Memory, Channels, Tools, Advanced)
+- [ ] **Full config migration** - move ALL config.toml/env settings into GUI
+- [ ] **Persistent settings** - save to config file on change, load on startup
+- [ ] **Channel credentials in GUI** - Telegram token, Discord app ID, Slack tokens, etc.
+- [ ] **Tool configuration** - enable/disable tools, set tool-specific options (Brave API key, etc.)
+- [ ] **System prompt editor** - edit default system prompt in GUI
+- [ ] **Import/Export config** - backup and restore settings
+
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
 - NSIS: `D:\Development\Cargo Target\release\bundle\nsis\Nanna_0.1.0_x64-setup.exe`
@@ -209,3 +218,4 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 39 | Production hardening | Later |
 | 40 | ~~PDF tools (read + extract images)~~ | ✅ Done |
 | 41 | ~~OCR + image description~~ | ✅ Done |
+| 42 | **Settings overhaul (tabs + full config)** | 🔜 High Priority |
