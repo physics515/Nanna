@@ -288,6 +288,29 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
         || lower.contains("overloaded")
 }
 
+/// Parse retry-after seconds from error message (if available)
+fn parse_retry_after_from_error(error_msg: &str) -> Option<u64> {
+    // Try to find "retry after X" or "retry-after: X" patterns
+    let lower = error_msg.to_lowercase();
+    
+    // Pattern: "retry after 30 seconds" or "retry-after: 30"
+    for pattern in ["retry after ", "retry-after: ", "retry-after:", "wait "] {
+        if let Some(pos) = lower.find(pattern) {
+            let after_pattern = &error_msg[pos + pattern.len()..];
+            // Extract the number
+            let num_str: String = after_pattern
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(secs) = num_str.parse::<u64>() {
+                return Some(secs);
+            }
+        }
+    }
+    
+    None
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -749,30 +772,60 @@ async fn run_agent_loop_with_fallback(
         let mut model_request = request.clone();
         model_request.model = actual_model;
         
-        // Run the agent loop
-        match run_agent_loop(app, session_id, &llm, tools.clone(), model_request).await {
-            Ok(result) => {
-                info!("Success with model: {}", model_id);
-                return Ok(result);
-            }
-            Err(e) => {
-                warn!("Model {} failed: {}", model_id, e);
-                last_error = e.clone();
-                
-                // Check if it's a rate limit error
-                if is_rate_limit_error(&e) {
-                    // Add to rate-limited models with 60 second cooldown
-                    let cooldown_until = chrono::Utc::now().timestamp() + 60;
-                    rate_limited.write().await.insert(model_id.clone(), cooldown_until);
-                    info!("Rate limited model {} until {}", model_id, cooldown_until);
-                    
-                    // Continue to next model
-                    continue;
+        // Run the agent loop with retry logic for preferred models
+        let is_preferred = tried_models.len() == 1; // First model is preferred
+        let max_retries = if is_preferred { 3 } else { 1 };
+        let mut retry_count = 0;
+        
+        loop {
+            let model_request_clone = model_request.clone();
+            match run_agent_loop(app, session_id, &llm, tools.clone(), model_request_clone).await {
+                Ok(result) => {
+                    info!("Success with model: {}", model_id);
+                    return Ok(result);
                 }
-                
-                // For non-rate-limit errors, also try fallback
-                // (network errors, 5xx errors, etc.)
-                continue;
+                Err(e) => {
+                    warn!("Model {} failed (attempt {}/{}): {}", model_id, retry_count + 1, max_retries, e);
+                    last_error = e.clone();
+                    
+                    // Check if it's a rate limit error
+                    if is_rate_limit_error(&e) {
+                        retry_count += 1;
+                        
+                        // For preferred model, wait and retry instead of immediately falling back
+                        if is_preferred && retry_count < max_retries {
+                            // Parse retry-after from error if available, default to progressive backoff
+                            let wait_secs = parse_retry_after_from_error(&e)
+                                .unwrap_or(15 * retry_count as u64); // 15s, 30s, 45s...
+                            
+                            // Cap wait time at 60 seconds
+                            let wait_secs = wait_secs.min(60);
+                            
+                            info!("Rate limited on preferred model {}, waiting {}s before retry {}/{}", 
+                                  model_id, wait_secs, retry_count + 1, max_retries);
+                            
+                            // Emit waiting status to UI
+                            let _ = app.emit("model-status", ModelStatusEvent {
+                                active_model: format!("{} (waiting {}s...)", model_id, wait_secs),
+                                fallback_reason: Some(format!("Rate limited, retry {}/{}", retry_count, max_retries)),
+                                rate_limited_models: vec![model_id.clone()],
+                            });
+                            
+                            // Wait before retry
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                            continue; // Retry same model
+                        }
+                        
+                        // Max retries exceeded or not preferred - add cooldown and fall back
+                        let cooldown_until = chrono::Utc::now().timestamp() + 60;
+                        rate_limited.write().await.insert(model_id.clone(), cooldown_until);
+                        info!("Rate limited model {} until {} (tried {} times)", model_id, cooldown_until, retry_count);
+                        break; // Fall back to next model
+                    }
+                    
+                    // For non-rate-limit errors, fall back immediately
+                    break;
+                }
             }
         }
     }
@@ -1209,8 +1262,8 @@ async fn get_config(state: State<'_, Arc<RwLock<AppState>>>) -> Result<AppConfig
             || std::env::var("ANTHROPIC_API_KEY").is_ok(),
         available_models: vec![
             // Anthropic
+            "claude-opus-4-20250514".to_string(),
             "claude-sonnet-4-20250514".to_string(),
-            "claude-opus-4-5-20250514".to_string(),
             "claude-3-5-sonnet-20241022".to_string(),
             "claude-3-5-haiku-20241022".to_string(),
             // OpenAI
@@ -1510,8 +1563,8 @@ async fn get_extended_settings(
         model: state_guard.config.llm.model.clone(),
         available_models: vec![
             // Anthropic
+            "claude-opus-4-20250514".to_string(),
             "claude-sonnet-4-20250514".to_string(),
-            "claude-opus-4-5-20250514".to_string(),
             "claude-3-5-sonnet-20241022".to_string(),
             "claude-3-5-haiku-20241022".to_string(),
             // OpenAI

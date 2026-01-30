@@ -82,7 +82,7 @@ const statusTitle = computed(() => {
 function formatModelName(model: string): string {
   // Shorten common model names
   const replacements: Record<string, string> = {
-    'claude-opus-4-5-20250514': 'Opus 4.5',
+    'claude-opus-4-20250514': 'Opus 4',
     'claude-sonnet-4-20250514': 'Sonnet 4',
     'claude-3-5-sonnet-20241022': 'Sonnet 3.5',
     'claude-3-5-haiku-20241022': 'Haiku 3.5',

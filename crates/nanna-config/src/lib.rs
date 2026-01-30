@@ -75,7 +75,7 @@ pub struct LlmConfig {
     /// OpenAI API key for embeddings (semantic memory)
     pub openai_api_key: Option<String>,
     /// Model priority list for fallback (first working model is used)
-    /// Format: ["claude-opus-4-5-20250514", "claude-sonnet-4-20250514", "ollama/llama3.2"]
+    /// Format: ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "ollama/llama3.2"]
     pub model_priority: Vec<String>,
 }
 

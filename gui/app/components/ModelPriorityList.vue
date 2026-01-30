@@ -21,19 +21,21 @@
       <div
         v-for="(model, index) in activeModels"
         :key="model.id"
-        draggable="true"
+        :draggable="true"
         @dragstart="onDragStart($event, model, index, 'active')"
         @dragend="onDragEnd"
         @dragover.prevent="onDragOver($event, index)"
+        @drop.prevent="onDropOnItem($event, index)"
         :class="[
-          'flex items-center gap-2 p-2 rounded-lg cursor-grab active:cursor-grabbing transition-all',
+          'flex items-center gap-2 p-2 rounded-lg cursor-grab active:cursor-grabbing transition-all select-none',
           'bg-nanna-bg-surface border border-nanna-primary/20',
-          dragOverIndex === index && 'border-nanna-primary border-dashed',
+          dragOverIndex === index && 'border-nanna-primary border-dashed bg-nanna-primary/10',
+          draggingModel?.id === model.id && 'opacity-50',
           index === 0 && 'ring-1 ring-nanna-accent/50'
         ]"
       >
         <!-- Drag Handle -->
-        <GripVertical class="w-4 h-4 text-nanna-text-dim shrink-0" />
+        <GripVertical class="w-4 h-4 text-nanna-text-dim shrink-0 cursor-grab" />
         
         <!-- Priority Badge -->
         <span :class="[
@@ -165,8 +167,10 @@ const emit = defineEmits<{
 
 const showAddModel = ref(false)
 const draggedModel = ref<ModelOption | null>(null)
+const draggingModel = ref<ModelOption | null>(null)
 const dragSource = ref<'active' | 'excluded'>('active')
 const dragOverIndex = ref<number | null>(null)
+const draggedFromIndex = ref<number>(-1)
 
 // Active models in priority order
 const activeModels = computed(() => {
@@ -196,22 +200,53 @@ function getProviderIcon(provider: string): string {
 
 function onDragStart(event: DragEvent, model: ModelOption, index: number, source: 'active' | 'excluded') {
   draggedModel.value = model
+  draggingModel.value = model
   dragSource.value = source
+  draggedFromIndex.value = index
   event.dataTransfer!.effectAllowed = 'move'
   event.dataTransfer!.setData('text/plain', model.id)
+  // Set drag image
+  if (event.dataTransfer) {
+    event.dataTransfer.setDragImage(event.target as HTMLElement, 10, 10)
+  }
 }
 
 function onDragEnd() {
   draggedModel.value = null
+  draggingModel.value = null
   dragOverIndex.value = null
+  draggedFromIndex.value = -1
 }
 
 function onDragOver(event: DragEvent, index: number) {
-  dragOverIndex.value = index
+  event.preventDefault()
+  if (draggedModel.value && draggedFromIndex.value !== index) {
+    dragOverIndex.value = index
+  }
+}
+
+function onDropOnItem(event: DragEvent, targetIndex: number) {
+  event.preventDefault()
+  if (!draggedModel.value || dragSource.value !== 'active') return
+  
+  const newList = [...props.modelValue]
+  const currentIndex = newList.indexOf(draggedModel.value.id)
+  
+  if (currentIndex !== -1 && currentIndex !== targetIndex) {
+    // Remove from current position
+    newList.splice(currentIndex, 1)
+    // Insert at target position (adjust if we removed before target)
+    const adjustedTarget = currentIndex < targetIndex ? targetIndex - 1 : targetIndex
+    newList.splice(adjustedTarget, 0, draggedModel.value.id)
+    emit('update:modelValue', newList)
+  }
+  
+  dragOverIndex.value = null
 }
 
 function onDrop(event: DragEvent, target: 'active' | 'excluded') {
   event.preventDefault()
+  event.stopPropagation()
   
   if (!draggedModel.value) return
   
@@ -224,9 +259,8 @@ function onDrop(event: DragEvent, target: 'active' | 'excluded') {
       newList.splice(currentIndex, 1)
     }
     
-    // Insert at drop position
-    const insertIndex = dragOverIndex.value !== null ? dragOverIndex.value : newList.length
-    newList.splice(insertIndex, 0, draggedModel.value.id)
+    // Insert at end (dropped on container, not specific item)
+    newList.push(draggedModel.value.id)
   } else {
     // Remove from active list (exclude)
     const index = newList.indexOf(draggedModel.value.id)
@@ -237,6 +271,7 @@ function onDrop(event: DragEvent, target: 'active' | 'excluded') {
   
   emit('update:modelValue', newList)
   dragOverIndex.value = null
+  draggingModel.value = null
 }
 
 function removeModel(index: number) {

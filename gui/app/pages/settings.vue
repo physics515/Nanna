@@ -571,7 +571,7 @@ const allChatModels = computed<ModelOption[]>(() => {
   
   // Anthropic models
   models.push(
-    { id: 'claude-opus-4-5-20250514', name: 'Claude Opus 4.5', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
+    { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
     { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
     { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
     { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
