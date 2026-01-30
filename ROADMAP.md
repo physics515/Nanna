@@ -20,6 +20,7 @@
 - [x] Browser tools (screenshot, extract, action, evaluate)
 - [x] Vision tools (analyze_image)
 - [x] Audio tools (TTS, transcription)
+- [ ] PDF tools (read text, extract images, analyze embedded images)
 - [x] Authoring tools (runtime tool creation) — `nanna-scripting` crate
   - [x] Boa engine (pure Rust, lightweight)
   - [x] Deno engine (V8 fallback for full TS support)
@@ -205,3 +206,4 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 37 | Tauri mobile (Android/iOS) | Later |
 | 38 | Visual debugging loop | Future |
 | 39 | Production hardening | Later |
+| 40 | PDF tools (read + extract images) | 🔜 |
