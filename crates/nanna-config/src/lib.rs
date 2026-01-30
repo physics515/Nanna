@@ -74,6 +74,9 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// OpenAI API key for embeddings (semantic memory)
     pub openai_api_key: Option<String>,
+    /// Model priority list for fallback (first working model is used)
+    /// Format: ["claude-opus-4-5-20250514", "claude-sonnet-4-20250514", "ollama/llama3.2"]
+    pub model_priority: Vec<String>,
 }
 
 impl Default for LlmConfig {
@@ -86,6 +89,10 @@ impl Default for LlmConfig {
             max_tokens: 8192,
             temperature: 0.7,
             openai_api_key: None,
+            model_priority: vec![
+                "claude-sonnet-4-20250514".to_string(),
+                "claude-3-5-sonnet-20241022".to_string(),
+            ],
         }
     }
 }
@@ -231,6 +238,9 @@ pub struct MemoryConfig {
     pub ollama_host: String,
     /// Model to use for memory extraction (empty = use chat model)
     pub extraction_model: String,
+    /// Embedding model priority list for fallback
+    /// Format: ["openai/text-embedding-3-small", "ollama/nomic-embed-text"]
+    pub embedding_priority: Vec<String>,
 }
 
 impl Default for MemoryConfig {
@@ -243,6 +253,9 @@ impl Default for MemoryConfig {
             storage_path: None,
             ollama_host: "http://localhost:11434".to_string(),
             extraction_model: String::new(), // Empty = use chat model
+            embedding_priority: vec![
+                "openai/text-embedding-3-small".to_string(),
+            ],
         }
     }
 }

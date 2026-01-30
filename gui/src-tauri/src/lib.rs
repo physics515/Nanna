@@ -2240,6 +2240,76 @@ async fn import_config(
 }
 
 // =============================================================================
+// Model Priority (Fallback Chains)
+// =============================================================================
+
+/// Get chat model priority list
+#[tauri::command]
+async fn get_chat_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.llm.model_priority.clone())
+}
+
+/// Set chat model priority list
+#[tauri::command]
+async fn set_chat_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    priority: Vec<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.model_priority = priority.clone();
+    
+    // Also set the primary model to the first in the list for backwards compatibility
+    if let Some(first) = priority.first() {
+        // Strip provider prefix if present (e.g., "ollama/llama3.2" -> "llama3.2" for ollama)
+        state_guard.config.llm.model = first.clone();
+    }
+    
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    
+    info!("Chat model priority set: {:?}", priority);
+    Ok(())
+}
+
+/// Get embedding model priority list
+#[tauri::command]
+async fn get_embedding_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.memory.embedding_priority.clone())
+}
+
+/// Set embedding model priority list
+#[tauri::command]
+async fn set_embedding_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    priority: Vec<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.memory.embedding_priority = priority.clone();
+    
+    // Update the primary embedding config for backwards compatibility
+    if let Some(first) = priority.first() {
+        if let Some((provider, model)) = first.split_once('/') {
+            state_guard.config.memory.embedding_provider = provider.to_string();
+            state_guard.config.memory.embedding_model = model.to_string();
+        }
+    } else {
+        state_guard.config.memory.embedding_provider = "disabled".to_string();
+    }
+    
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    
+    info!("Embedding model priority set: {:?}", priority);
+    Ok(())
+}
+
+// =============================================================================
 // Config Persistence Commands
 // =============================================================================
 
@@ -2998,6 +3068,11 @@ pub fn run() {
             // Config import/export
             export_config,
             import_config,
+            // Model priority (fallback chains)
+            get_chat_model_priority,
+            set_chat_model_priority,
+            get_embedding_model_priority,
+            set_embedding_model_priority,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

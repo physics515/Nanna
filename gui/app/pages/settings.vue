@@ -62,53 +62,34 @@
               </div>
             </UiCard>
             
-            <!-- Provider & Model Selection -->
+            <!-- Model Priority (Fallback Chain) -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
-                <Brain class="w-4 h-4" />
-                Model Configuration
-              </h3>
-              <div class="space-y-4">
-                <!-- Provider -->
-                <div>
-                  <label class="block text-sm font-medium text-nanna-text-muted mb-2">Provider</label>
-                  <div class="flex flex-wrap gap-2">
-                    <UiButton
-                      v-for="p in ['anthropic', 'openai', 'openrouter', 'ollama']"
-                      :key="p"
-                      @click="setProvider(p)"
-                      :variant="settings?.provider === p ? 'default' : 'secondary'"
-                      size="sm"
-                    >
-                      {{ formatProvider(p) }}
-                    </UiButton>
-                  </div>
+              <div class="flex items-center justify-between mb-4">
+                <h3 class="text-base font-semibold text-nanna-accent flex items-center gap-2">
+                  <Brain class="w-4 h-4" />
+                  Chat Models
+                </h3>
+                <UiButton @click="refreshAllModels" :disabled="loadingModels" variant="ghost" size="sm">
+                  <RefreshCw :class="['w-3 h-3', loadingModels && 'animate-spin']" />
+                </UiButton>
+              </div>
+              
+              <ModelPriorityList
+                label="Model Priority"
+                hint="First working model is used. Drag to reorder fallback priority."
+                :models="allChatModels"
+                v-model="chatModelPriority"
+                @update:model-value="saveChatModelPriority"
+              />
+              
+              <!-- Ollama Host -->
+              <div class="mt-4 pt-4 border-t border-nanna-primary/10">
+                <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
+                <div class="flex gap-2">
+                  <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
+                  <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
                 </div>
-                
-                <!-- Model -->
-                <div>
-                  <div class="flex items-center justify-between mb-2">
-                    <label class="text-sm font-medium text-nanna-text-muted">Model</label>
-                    <UiButton @click="refreshModels" :disabled="loadingModels" variant="ghost" size="sm">
-                      <RefreshCw :class="['w-3 h-3', loadingModels && 'animate-spin']" />
-                    </UiButton>
-                  </div>
-                  <UiSelect 
-                    v-model="selectedModel" 
-                    @update:model-value="updateModel"
-                    :options="availableModels.map(m => ({ value: m.id, label: m.name }))"
-                    :placeholder="loadingModels ? 'Loading...' : 'Select model'"
-                  />
-                </div>
-                
-                <!-- Ollama Host (if ollama selected) -->
-                <div v-if="settings?.provider === 'ollama'">
-                  <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
-                  <div class="flex gap-2">
-                    <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
-                    <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
-                  </div>
-                </div>
+                <p class="text-xs text-nanna-text-dim mt-1">Local Ollama instance for fallback models</p>
               </div>
             </UiCard>
           </div>
@@ -208,51 +189,21 @@
             <UiCard>
               <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
                 <Link class="w-4 h-4" />
-                Embedding Configuration
+                Embedding Models
               </h3>
-              <div class="space-y-4">
-                <!-- Provider -->
-                <div>
-                  <label class="block text-sm font-medium text-nanna-text-muted mb-2">Embedding Provider</label>
-                  <div class="flex flex-wrap gap-2">
-                    <UiButton
-                      v-for="p in ['openai', 'ollama', 'disabled']"
-                      :key="p"
-                      @click="setEmbeddingProvider(p)"
-                      :variant="settings?.embedding_provider === p ? 'accent' : 'secondary'"
-                      size="sm"
-                    >
-                      {{ formatEmbeddingProvider(p) }}
-                    </UiButton>
-                  </div>
-                </div>
-                
-                <!-- Model -->
-                <div v-if="settings?.embedding_provider !== 'disabled'">
-                  <label class="block text-sm font-medium text-nanna-text-muted mb-2">Embedding Model</label>
-                  <UiSelect 
-                    v-if="settings?.embedding_provider === 'openai'"
-                    v-model="selectedEmbeddingModel" 
-                    @update:model-value="updateEmbeddingModel"
-                    :options="[
-                      { value: 'text-embedding-3-small', label: 'text-embedding-3-small (1536 dims)' },
-                      { value: 'text-embedding-3-large', label: 'text-embedding-3-large (3072 dims)' },
-                    ]"
-                  />
-                  <UiSelect 
-                    v-else-if="settings?.embedding_provider === 'ollama'"
-                    v-model="selectedEmbeddingModel" 
-                    @update:model-value="updateEmbeddingModel"
-                    :options="ollamaModelOptions"
-                    placeholder="Select embedding model"
-                  />
-                </div>
-                
-                <!-- Status -->
-                <div class="flex items-center gap-2">
-                  <UiBadge v-if="settings?.embedding_enabled" variant="success">✓ Memory recall enabled</UiBadge>
-                  <UiBadge v-else variant="warning">⚠ Memory recall disabled</UiBadge>
-                </div>
+              
+              <ModelPriorityList
+                label="Embedding Priority"
+                hint="Used for memory recall. First working model is used."
+                :models="allEmbeddingModels"
+                v-model="embeddingModelPriority"
+                @update:model-value="saveEmbeddingModelPriority"
+              />
+              
+              <!-- Status -->
+              <div class="flex items-center gap-2 mt-4 pt-4 border-t border-nanna-primary/10">
+                <UiBadge v-if="embeddingModelPriority.length > 0" variant="success">✓ Memory recall enabled</UiBadge>
+                <UiBadge v-else variant="warning">⚠ No embedding models — memory recall disabled</UiBadge>
               </div>
             </UiCard>
             
@@ -608,6 +559,73 @@ const agentName = ref('Nanna')
 const personalityMode = ref('balanced')
 const maxTokens = ref(4096)
 
+// Model priority lists (fallback chains)
+const chatModelPriority = ref<string[]>([])
+const embeddingModelPriority = ref<string[]>([])
+
+// All available models with provider info
+import type { ModelOption } from '~/components/ModelPriorityList.vue'
+
+const allChatModels = computed<ModelOption[]>(() => {
+  const models: ModelOption[] = []
+  
+  // Anthropic models
+  models.push(
+    { id: 'claude-opus-4-5-20250514', name: 'Claude Opus 4.5', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
+    { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
+    { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
+    { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: settings.value?.anthropic_key_set ?? false },
+  )
+  
+  // OpenAI models
+  models.push(
+    { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+    { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+    { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+    { id: 'o1', name: 'o1', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+    { id: 'o1-mini', name: 'o1 Mini', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+  )
+  
+  // OpenRouter models
+  models.push(
+    { id: 'anthropic/claude-sonnet-4-20250514', name: 'Claude Sonnet 4 (OR)', provider: 'openrouter', available: settings.value?.openrouter_key_set ?? false },
+    { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'openrouter', available: settings.value?.openrouter_key_set ?? false },
+    { id: 'google/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash', provider: 'openrouter', available: settings.value?.openrouter_key_set ?? false },
+  )
+  
+  // Ollama models (always "available" since local)
+  for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
+    models.push({ id: `ollama/${m.name}`, name: m.name, provider: 'ollama', available: true })
+  }
+  
+  return models
+})
+
+const allEmbeddingModels = computed<ModelOption[]>(() => {
+  const models: ModelOption[] = []
+  
+  // OpenAI embedding models
+  models.push(
+    { id: 'openai/text-embedding-3-small', name: 'text-embedding-3-small (1536d)', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+    { id: 'openai/text-embedding-3-large', name: 'text-embedding-3-large (3072d)', provider: 'openai', available: settings.value?.openai_key_set ?? false },
+  )
+  
+  // Ollama embedding models
+  for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
+    models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB)`, provider: 'ollama', available: true })
+  }
+  
+  // Common Ollama embedding models that might not be installed yet
+  const commonOllamaEmbeddings = ['nomic-embed-text', 'mxbai-embed-large', 'all-minilm', 'bge-m3']
+  for (const name of commonOllamaEmbeddings) {
+    if (!ollamaModels.value.some(m => m.name === name)) {
+      models.push({ id: `ollama/${name}`, name: `${name} (not installed)`, provider: 'ollama', available: false })
+    }
+  }
+  
+  return models
+})
+
 const configPath = computed(() => {
   if (navigator.platform.includes('Win')) {
     return '%APPDATA%\\clawd\\Nanna\\config\\config.toml'
@@ -642,10 +660,28 @@ async function loadSettings() {
     agentName.value = settings.value.agent_name || 'Nanna'
     personalityMode.value = settings.value.personality_mode || 'balanced'
     maxTokens.value = settings.value.max_tokens || 4096
-    await refreshModels()
-    if (settings.value.embedding_provider === 'ollama') {
-      await refreshOllamaModels()
+    
+    // Load model priority lists
+    try {
+      chatModelPriority.value = await invoke<string[]>('get_chat_model_priority')
+    } catch {
+      // Default to current model if priority not set
+      chatModelPriority.value = settings.value.model ? [settings.value.model] : []
     }
+    try {
+      embeddingModelPriority.value = await invoke<string[]>('get_embedding_model_priority')
+    } catch {
+      // Default based on current embedding config
+      if (settings.value.embedding_provider !== 'disabled' && settings.value.embedding_model) {
+        embeddingModelPriority.value = [`${settings.value.embedding_provider}/${settings.value.embedding_model}`]
+      } else {
+        embeddingModelPriority.value = []
+      }
+    }
+    
+    // Always refresh Ollama models to populate the lists
+    await refreshOllamaModels()
+    await refreshModels()
   } catch (e) {
     console.error('Failed to load settings:', e)
     showToast('Failed to load settings', 'error')
@@ -693,6 +729,35 @@ async function refreshOllamaModels() {
     ollamaModels.value = []
   } finally {
     loadingOllamaModels.value = false
+  }
+}
+
+async function refreshAllModels() {
+  loadingModels.value = true
+  try {
+    // Refresh Ollama models first
+    await refreshOllamaModels()
+    // The computed properties will automatically update
+  } finally {
+    loadingModels.value = false
+  }
+}
+
+async function saveChatModelPriority(priority: string[]) {
+  try {
+    await invoke('set_chat_model_priority', { priority })
+    showToast('Chat model priority saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveEmbeddingModelPriority(priority: string[]) {
+  try {
+    await invoke('set_embedding_model_priority', { priority })
+    showToast('Embedding model priority saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
   }
 }
 
