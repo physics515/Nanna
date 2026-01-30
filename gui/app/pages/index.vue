@@ -443,7 +443,7 @@ async function sendMessageToBackend(message: string) {
     
     // Notify on error if window not focused
     if (document.hidden) {
-      notifyError('Message Failed', connectionError.value)
+      notifyError('Message Failed', connectionError.value ?? undefined)
     }
   }
   

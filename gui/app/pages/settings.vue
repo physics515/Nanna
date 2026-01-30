@@ -114,6 +114,93 @@
           </div>
         </UiTabPanel>
         
+        <!-- Agent Tab -->
+        <UiTabPanel :active="activeTab === 'agent'">
+          <div class="space-y-6">
+            <!-- System Prompt -->
+            <SystemPromptEditor 
+              @saved="showToast('System prompt saved', 'success')"
+              @error="(msg) => showToast(msg, 'error')"
+            />
+            
+            <!-- Agent Identity -->
+            <UiCard>
+              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+                <Bot class="w-4 h-4" />
+                Agent Identity
+              </h3>
+              <div class="space-y-4">
+                <div>
+                  <label class="block text-sm font-medium text-nanna-text-muted mb-1">Name</label>
+                  <UiInput v-model="agentName" placeholder="Nanna" @change="saveAgentName" />
+                  <p class="text-xs text-nanna-text-dim mt-1">The name the agent uses to refer to itself</p>
+                </div>
+                
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="text-sm font-medium text-nanna-text">Personality Mode</div>
+                    <div class="text-xs text-nanna-text-dim">How the agent responds</div>
+                  </div>
+                  <UiSelect 
+                    v-model="personalityMode" 
+                    @update:model-value="savePersonalityMode"
+                    :options="[
+                      { value: 'balanced', label: 'Balanced' },
+                      { value: 'professional', label: 'Professional' },
+                      { value: 'casual', label: 'Casual' },
+                      { value: 'minimal', label: 'Minimal' },
+                    ]"
+                    class="w-40"
+                  />
+                </div>
+              </div>
+            </UiCard>
+            
+            <!-- Response Preferences -->
+            <UiCard>
+              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+                <MessageSquare class="w-4 h-4" />
+                Response Preferences
+              </h3>
+              <div class="space-y-4">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="text-sm font-medium text-nanna-text">Thinking Mode</div>
+                    <div class="text-xs text-nanna-text-dim">Show reasoning process</div>
+                  </div>
+                  <UiSwitch :model-value="settings?.thinking_enabled" @update:model-value="setThinkingEnabled" />
+                </div>
+                
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="text-sm font-medium text-nanna-text">Streaming</div>
+                    <div class="text-xs text-nanna-text-dim">Stream responses token by token</div>
+                  </div>
+                  <UiSwitch :model-value="settings?.streaming_enabled ?? true" @update:model-value="setStreamingEnabled" />
+                </div>
+                
+                <!-- Max Tokens -->
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/50">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm font-medium text-nanna-text">Max Response Length</span>
+                    <span class="text-sm text-nanna-accent font-mono">{{ maxTokens.toLocaleString() }}</span>
+                  </div>
+                  <input 
+                    type="range" min="256" max="8192" step="256"
+                    :value="maxTokens"
+                    @change="setMaxTokens(Number(($event.target as HTMLInputElement).value))"
+                    class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+                  >
+                  <div class="flex justify-between text-xs text-nanna-text-dim mt-1">
+                    <span>256</span>
+                    <span>8192 tokens</span>
+                  </div>
+                </div>
+              </div>
+            </UiCard>
+          </div>
+        </UiTabPanel>
+        
         <!-- Memory Tab -->
         <UiTabPanel :active="activeTab === 'memory'">
           <div class="space-y-6">
@@ -439,7 +526,8 @@ import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { 
   ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon, 
-  RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp
+  RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp,
+  Bot, MessageSquare
 } from 'lucide-vue-next'
 
 interface ToolInfo {
@@ -465,6 +553,11 @@ interface ExtendedSettings {
   scheduler_enabled: boolean
   heartbeat_enabled: boolean
   heartbeat_interval_seconds: number
+  thinking_enabled?: boolean
+  streaming_enabled?: boolean
+  max_tokens?: number
+  agent_name?: string
+  personality_mode?: string
 }
 
 interface CognitiveMemoryStats {
@@ -488,6 +581,7 @@ interface OllamaModelInfo {
 
 const tabs = [
   { id: 'models', label: 'Models', icon: Brain },
+  { id: 'agent', label: 'Agent', icon: Bot },
   { id: 'memory', label: 'Memory', icon: BrainCircuit },
   { id: 'tools', label: 'Tools', icon: Wrench },
   { id: 'scheduler', label: 'Scheduler', icon: Clock },
@@ -510,6 +604,9 @@ const toast = ref<{ message: string; type: 'success' | 'error' } | null>(null)
 const similarityThreshold = ref(0.4)
 const hasChanges = ref(false)
 const saving = ref(false)
+const agentName = ref('Nanna')
+const personalityMode = ref('balanced')
+const maxTokens = ref(4096)
 
 const configPath = computed(() => {
   if (navigator.platform.includes('Win')) {
@@ -541,6 +638,10 @@ async function loadSettings() {
     selectedModel.value = settings.value.model
     selectedEmbeddingModel.value = settings.value.embedding_model
     ollamaHostInput.value = settings.value.ollama_host
+    // Load agent settings
+    agentName.value = settings.value.agent_name || 'Nanna'
+    personalityMode.value = settings.value.personality_mode || 'balanced'
+    maxTokens.value = settings.value.max_tokens || 4096
     await refreshModels()
     if (settings.value.embedding_provider === 'ollama') {
       await refreshOllamaModels()
@@ -735,6 +836,51 @@ async function setHeartbeatInterval(seconds: number) {
   }
 }
 
+async function saveAgentName() {
+  try {
+    await invoke('set_agent_name', { name: agentName.value })
+    showToast('Agent name saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function savePersonalityMode() {
+  try {
+    await invoke('set_personality_mode', { mode: personalityMode.value })
+    showToast('Personality mode saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function setThinkingEnabled(enabled: boolean) {
+  try {
+    await invoke('set_thinking_enabled', { enabled })
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function setStreamingEnabled(enabled: boolean) {
+  try {
+    await invoke('set_streaming_enabled', { enabled })
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function setMaxTokens(tokens: number) {
+  try {
+    await invoke('set_max_tokens', { tokens })
+    maxTokens.value = tokens
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
 async function triggerConsolidation() {
   consolidating.value = true
   try {
@@ -786,12 +932,50 @@ async function saveAllSettings() {
   }
 }
 
-function exportConfig() {
-  showToast('Export coming soon', 'success')
+async function exportConfig() {
+  try {
+    const config = await invoke<string>('export_config')
+    
+    // Create a downloadable blob
+    const blob = new Blob([config], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'nanna-config.toml'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    
+    showToast('Configuration exported', 'success')
+  } catch (e: any) {
+    showToast(`Export failed: ${e.message || e}`, 'error')
+  }
 }
 
-function importConfig() {
-  showToast('Import coming soon', 'success')
+async function importConfig() {
+  try {
+    // Create file input and trigger it
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.toml'
+    
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0]
+      if (!file) return
+      
+      if (!confirm('This will replace your current configuration. Continue?')) return
+      
+      const content = await file.text()
+      await invoke('import_config', { config: content })
+      showToast('Configuration imported', 'success')
+      await loadSettings()
+    }
+    
+    input.click()
+  } catch (e: any) {
+    showToast(`Import failed: ${e.message || e}`, 'error')
+  }
 }
 
 function formatInterval(seconds: number): string {

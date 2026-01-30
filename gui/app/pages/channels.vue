@@ -23,12 +23,9 @@
         <UiCard
           v-for="channel in channelConfigs"
           :key="channel.id"
-          :class="[
-            'border-2 transition-all',
-            getChannelStatus(channel.id)?.configured 
+          :class="'border-2 transition-all ' + (getChannelStatus(channel.id)?.configured 
               ? 'border-nanna-success/30' 
-              : 'border-nanna-text-dim/10'
-          ]"
+              : 'border-nanna-text-dim/10')"
         >
           <!-- Channel Header -->
           <div 
@@ -79,16 +76,29 @@
                 @test="testConnection"
               />
               
-              <!-- Other Channels - Coming Soon -->
-              <div v-if="['slack', 'signal', 'whatsapp'].includes(channel.id)" class="text-center py-8">
-                <span class="text-4xl mb-3 block">🚧</span>
-                <p class="text-nanna-text-muted">
-                  {{ channel.name }} setup wizard coming soon.
-                </p>
-                <p class="text-xs text-nanna-text-dim mt-2">
-                  For now, configure in config.toml
-                </p>
-              </div>
+              <!-- Slack Setup -->
+              <SlackSetup 
+                v-if="channel.id === 'slack'"
+                :status="getChannelStatus('slack')"
+                @save="saveChannelConfig"
+                @test="testConnection"
+              />
+              
+              <!-- Signal Setup -->
+              <SignalSetup 
+                v-if="channel.id === 'signal'"
+                :status="getChannelStatus('signal')"
+                @save="saveChannelConfig"
+                @test="testConnection"
+              />
+              
+              <!-- WhatsApp Setup -->
+              <WhatsAppSetup 
+                v-if="channel.id === 'whatsapp'"
+                :status="getChannelStatus('whatsapp')"
+                @save="saveChannelConfig"
+                @test="testConnection"
+              />
               
             </div>
           </Transition>

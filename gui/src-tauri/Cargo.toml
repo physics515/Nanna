@@ -32,6 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client for embeddings API
 reqwest = { version = "0.12", features = ["json"] }
 
+# TOML for config export/import
+toml = "0.8"
+
 # Link to nanna crates for IPC
 nanna-core = { path = "../../crates/nanna-core" }
 nanna-llm = { path = "../../crates/nanna-llm" }

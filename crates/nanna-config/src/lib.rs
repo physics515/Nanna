@@ -32,6 +32,8 @@ pub struct Config {
     pub general: GeneralConfig,
     /// LLM provider settings
     pub llm: LlmConfig,
+    /// Agent personality settings
+    pub agent: AgentConfig,
     /// Server settings
     pub server: ServerConfig,
     /// Channel configurations
@@ -90,6 +92,33 @@ impl Default for LlmConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct AgentConfig {
+    /// Agent name (displayed in responses)
+    pub name: String,
+    /// Custom system prompt (None = use default)
+    pub system_prompt: Option<String>,
+    /// Personality mode: balanced, professional, casual, minimal
+    pub personality_mode: String,
+    /// Enable thinking/reasoning mode
+    pub thinking_enabled: bool,
+    /// Enable streaming responses
+    pub streaming_enabled: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            name: "Nanna".to_string(),
+            system_prompt: None,
+            personality_mode: "balanced".to_string(),
+            thinking_enabled: false,
+            streaming_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub enabled: bool,
     pub host: String,
@@ -115,6 +144,7 @@ pub struct ChannelsConfig {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub signal: Option<SignalConfig>,
+    pub whatsapp: Option<WhatsAppConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +176,22 @@ pub struct SignalConfig {
     pub api_url: Option<String>,
     /// Allowed phone numbers (None = allow all)
     pub allowed_numbers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsAppConfig {
+    /// Connection method: "cloud-api" or "web"
+    pub connection_method: String,
+    /// Phone Number ID (for Cloud API)
+    pub phone_number_id: Option<String>,
+    /// Access token (for Cloud API)
+    pub access_token: Option<String>,
+    /// Webhook verify token (for Cloud API)
+    pub verify_token: Option<String>,
+    /// Session name (for Web bridge)
+    pub session_name: Option<String>,
+    /// Allowed phone numbers (None = allow all)
+    pub allowed_contacts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

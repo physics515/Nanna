@@ -2112,6 +2112,134 @@ async fn set_similarity_threshold(
 }
 
 // =============================================================================
+// System Prompt & Agent Settings
+// =============================================================================
+
+/// Get the custom system prompt (returns None if using default)
+#[tauri::command]
+async fn get_system_prompt(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Option<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.agent.system_prompt.clone())
+}
+
+/// Set a custom system prompt (pass null to reset to default)
+#[tauri::command]
+async fn set_system_prompt(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    prompt: Option<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.agent.system_prompt = prompt.clone();
+    
+    // Save to disk
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    
+    info!("System prompt {}", if prompt.is_some() { "updated" } else { "reset to default" });
+    Ok(())
+}
+
+/// Set agent name
+#[tauri::command]
+async fn set_agent_name(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.agent.name = name.clone();
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Agent name set to: {}", name);
+    Ok(())
+}
+
+/// Set personality mode
+#[tauri::command]
+async fn set_personality_mode(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    mode: String,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.agent.personality_mode = mode.clone();
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Personality mode set to: {}", mode);
+    Ok(())
+}
+
+/// Set thinking mode enabled
+#[tauri::command]
+async fn set_thinking_enabled(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.agent.thinking_enabled = enabled;
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Thinking mode: {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+/// Set streaming enabled
+#[tauri::command]
+async fn set_streaming_enabled(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.agent.streaming_enabled = enabled;
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Streaming: {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+/// Set max tokens for responses
+#[tauri::command]
+async fn set_max_tokens(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    tokens: u32,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.max_tokens = tokens;
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Max tokens set to: {}", tokens);
+    Ok(())
+}
+
+/// Export config as TOML string
+#[tauri::command]
+async fn export_config(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<String, String> {
+    let state_guard = state.read().await;
+    toml::to_string_pretty(&state_guard.config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))
+}
+
+/// Import config from TOML string
+#[tauri::command]
+async fn import_config(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    config: String,
+) -> Result<(), String> {
+    let new_config: nanna_config::Config = toml::from_str(&config)
+        .map_err(|e| format!("Failed to parse config: {}", e))?;
+    
+    let mut state_guard = state.write().await;
+    state_guard.config = new_config;
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    
+    info!("Config imported from TOML");
+    Ok(())
+}
+
+// =============================================================================
 // Config Persistence Commands
 // =============================================================================
 
@@ -2203,6 +2331,23 @@ async fn save_channel_config(
                 phone_number,
                 api_url,
                 allowed_numbers,
+            });
+        }
+        "whatsapp" => {
+            let connection_method = config.get("connection_method")
+                .ok_or("Missing connection_method")?
+                .clone();
+            
+            let allowed_contacts = config.get("allowed_contacts")
+                .map(|s| s.split(',').map(|n| n.trim().to_string()).collect());
+            
+            state_guard.config.channels.whatsapp = Some(nanna_config::WhatsAppConfig {
+                connection_method,
+                phone_number_id: config.get("phone_number_id").cloned(),
+                access_token: config.get("access_token").cloned(),
+                verify_token: config.get("verify_token").cloned(),
+                session_name: config.get("session_name").cloned(),
+                allowed_contacts,
             });
         }
         _ => return Err(format!("Unknown channel: {}", channel)),
@@ -2378,14 +2523,15 @@ async fn get_channel_status(
         }),
     });
     
-    // WhatsApp (check env var or config)
-    let whatsapp_configured = std::env::var("WHATSAPP_ACCESS_TOKEN").is_ok();
+    // WhatsApp
     channels.push(ChannelStatus {
         name: "WhatsApp".to_string(),
-        configured: whatsapp_configured,
-        enabled: whatsapp_configured,
-        status: if whatsapp_configured { "ready" } else { "not_configured" }.to_string(),
-        details: if whatsapp_configured { Some("Cloud API".to_string()) } else { None },
+        configured: config.channels.whatsapp.is_some(),
+        enabled: config.channels.whatsapp.is_some(),
+        status: if config.channels.whatsapp.is_some() { "ready" } else { "not_configured" }.to_string(),
+        details: config.channels.whatsapp.as_ref().map(|w| {
+            format!("Method: {}", w.connection_method)
+        }),
     });
     
     Ok(channels)
@@ -2841,6 +2987,17 @@ pub fn run() {
             // Similarity threshold
             get_similarity_threshold,
             set_similarity_threshold,
+            // System prompt & agent settings
+            get_system_prompt,
+            set_system_prompt,
+            set_agent_name,
+            set_personality_mode,
+            set_thinking_enabled,
+            set_streaming_enabled,
+            set_max_tokens,
+            // Config import/export
+            export_config,
+            import_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
