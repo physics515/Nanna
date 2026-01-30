@@ -6,96 +6,134 @@
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Channels</h2>
           <p class="text-xs sm:text-sm text-nanna-text-muted">
-            Messaging channel integrations
+            Connect Nanna to messaging platforms
           </p>
         </div>
         <UiButton @click="refreshStatus" variant="secondary" size="sm" :disabled="isLoading">
-          {{ isLoading ? '⏳ Loading...' : '🔄 Refresh' }}
+          <RefreshCw :class="['w-4 h-4', isLoading && 'animate-spin']" />
         </UiButton>
       </div>
     </header>
 
     <!-- Content -->
     <div class="flex-1 overflow-y-auto p-4 sm:p-6">
-      <!-- Info banner -->
-      <UiCard class="mb-4 sm:mb-6 bg-nanna-accent/10 border-nanna-accent/20">
-        <div class="flex gap-3">
-          <span class="text-xl sm:text-2xl">💡</span>
-          <div>
-            <h3 class="font-medium text-nanna-accent text-sm sm:text-base mb-1">About Channels</h3>
-            <p class="text-xs sm:text-sm text-nanna-text-muted">
-              Channels allow Nanna to communicate via messaging platforms like Telegram, Discord, and Slack.
-              The desktop app shows chat locally, but you can configure channels for remote access via the server.
-            </p>
-          </div>
-        </div>
-      </UiCard>
-
-      <!-- Channel grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 sm:gap-4">
+      <div class="max-w-3xl mx-auto space-y-4">
+        
+        <!-- Channel Cards -->
         <UiCard
-          v-for="channel in channels"
-          :key="channel.name"
+          v-for="channel in channelConfigs"
+          :key="channel.id"
           :class="[
-            'border-2 transition-colors',
-            channel.configured 
-              ? 'border-nanna-success/30 hover:border-nanna-success/50' 
-              : 'border-nanna-text-dim/10 hover:border-nanna-text-dim/20'
+            'border-2 transition-all',
+            getChannelStatus(channel.id)?.configured 
+              ? 'border-nanna-success/30' 
+              : 'border-nanna-text-dim/10'
           ]"
         >
-          <!-- Header -->
-          <div class="flex items-center justify-between mb-3">
-            <div class="flex items-center gap-2 sm:gap-3">
-              <span class="text-2xl sm:text-3xl">{{ getChannelIcon(channel.name) }}</span>
+          <!-- Channel Header -->
+          <div 
+            class="flex items-center justify-between cursor-pointer"
+            @click="toggleChannel(channel.id)"
+          >
+            <div class="flex items-center gap-3">
+              <span class="text-2xl">{{ channel.icon }}</span>
               <div>
-                <h3 class="font-semibold text-nanna-text text-sm sm:text-base">{{ channel.name }}</h3>
-                <UiBadge :variant="channel.status === 'ready' ? 'success' : 'secondary'" class="text-xs">
-                  {{ channel.status === 'ready' ? '✓ Configured' : 'Not configured' }}
-                </UiBadge>
+                <h3 class="font-semibold text-nanna-text">{{ channel.name }}</h3>
+                <p class="text-xs text-nanna-text-dim">{{ channel.description }}</p>
               </div>
             </div>
+            <div class="flex items-center gap-2">
+              <UiBadge 
+                v-if="getChannelStatus(channel.id)?.configured" 
+                variant="success"
+              >
+                ✓ Connected
+              </UiBadge>
+              <UiBadge v-else variant="secondary">Not configured</UiBadge>
+              <ChevronDown 
+                :class="[
+                  'w-5 h-5 text-nanna-text-muted transition-transform',
+                  expandedChannel === channel.id && 'rotate-180'
+                ]" 
+              />
+            </div>
           </div>
-
-          <!-- Details -->
-          <div v-if="channel.details" class="text-xs sm:text-sm text-nanna-text-muted mb-3">
-            {{ channel.details }}
-          </div>
-
-          <!-- Status indicator -->
-          <div class="flex items-center gap-2 text-xs sm:text-sm">
-            <span :class="[
-              'w-2 h-2 rounded-full shrink-0',
-              channel.configured ? 'bg-nanna-success' : 'bg-nanna-text-dim'
-            ]"></span>
-            <span class="text-nanna-text-dim">
-              {{ channel.configured ? 'Ready for server mode' : 'Configure in config.toml' }}
-            </span>
+          
+          <!-- Expanded Setup Wizard -->
+          <Transition name="expand">
+            <div v-if="expandedChannel === channel.id" class="mt-4 pt-4 border-t border-nanna-primary/10">
+              
+              <!-- Telegram Setup -->
+              <TelegramSetup 
+                v-if="channel.id === 'telegram'"
+                :status="getChannelStatus('telegram')"
+                @save="saveChannelConfig"
+                @test="testConnection"
+              />
+              
+              <!-- Discord Setup -->
+              <DiscordSetup 
+                v-if="channel.id === 'discord'"
+                :status="getChannelStatus('discord')"
+                @save="saveChannelConfig"
+                @test="testConnection"
+              />
+              
+              <!-- Other Channels - Coming Soon -->
+              <div v-if="['slack', 'signal', 'whatsapp'].includes(channel.id)" class="text-center py-8">
+                <span class="text-4xl mb-3 block">🚧</span>
+                <p class="text-nanna-text-muted">
+                  {{ channel.name }} setup wizard coming soon.
+                </p>
+                <p class="text-xs text-nanna-text-dim mt-2">
+                  For now, configure in config.toml
+                </p>
+              </div>
+              
+            </div>
+          </Transition>
+        </UiCard>
+        
+        <!-- Config File Info -->
+        <UiCard class="bg-nanna-bg-elevated/30">
+          <div class="flex items-start gap-3">
+            <FileCode class="w-5 h-5 text-nanna-accent shrink-0 mt-0.5" />
+            <div>
+              <h3 class="font-medium text-nanna-text text-sm mb-1">Configuration File</h3>
+              <p class="text-xs text-nanna-text-dim mb-2">
+                Channel credentials are saved to your config file:
+              </p>
+              <code class="block bg-nanna-bg-deep text-nanna-accent text-xs p-2 rounded font-mono break-all">
+                {{ configPath }}
+              </code>
+            </div>
           </div>
         </UiCard>
+        
       </div>
-
-      <!-- Configuration help -->
-      <UiCard class="mt-6 sm:mt-8">
-        <h3 class="font-semibold text-nanna-text text-sm sm:text-base mb-3">Configuration</h3>
-        <p class="text-xs sm:text-sm text-nanna-text-muted mb-3">
-          Channel credentials are stored in your config file:
-        </p>
-        <code class="block bg-nanna-bg-deep text-nanna-accent text-xs sm:text-sm p-3 rounded font-mono break-all">
-          {{ configPath }}
-        </code>
-        <p class="text-xs sm:text-sm text-nanna-text-muted mt-3">
-          Edit this file to add channel tokens and credentials. See the 
-          <a href="https://docs.clawd.bot" class="text-nanna-accent hover:underline" target="_blank">documentation</a>
-          for setup guides.
-        </p>
-      </UiCard>
     </div>
+    
+    <!-- Toast -->
+    <Transition name="toast">
+      <div 
+        v-if="toast" 
+        :class="[
+          'fixed bottom-4 right-4 left-4 sm:left-auto px-4 py-3 rounded-lg shadow-lg flex items-center gap-2 max-w-sm mx-auto sm:mx-0 z-50',
+          toast.type === 'success' ? 'bg-nanna-success text-nanna-bg-deep' : 'bg-nanna-error text-white'
+        ]"
+      >
+        <CheckCircle v-if="toast.type === 'success'" class="w-4 h-4 shrink-0" />
+        <XCircle v-else class="w-4 h-4 shrink-0" />
+        <span class="text-sm">{{ toast.message }}</span>
+      </div>
+    </Transition>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle } from 'lucide-vue-next'
 
 interface ChannelStatus {
   name: string
@@ -105,11 +143,27 @@ interface ChannelStatus {
   details: string | null
 }
 
+interface ChannelConfig {
+  id: string
+  name: string
+  icon: string
+  description: string
+}
+
+const channelConfigs: ChannelConfig[] = [
+  { id: 'telegram', name: 'Telegram', icon: '✈️', description: 'Bot messaging via Telegram' },
+  { id: 'discord', name: 'Discord', icon: '🎮', description: 'Server and DM messaging' },
+  { id: 'slack', name: 'Slack', icon: '💼', description: 'Workspace messaging' },
+  { id: 'signal', name: 'Signal', icon: '🔒', description: 'Secure private messaging' },
+  { id: 'whatsapp', name: 'WhatsApp', icon: '💬', description: 'WhatsApp Business API' },
+]
+
 const channels = ref<ChannelStatus[]>([])
 const isLoading = ref(false)
+const expandedChannel = ref<string | null>(null)
+const toast = ref<{ message: string; type: 'success' | 'error' } | null>(null)
 
 const configPath = computed(() => {
-  // Approximate path - actual path depends on OS
   if (navigator.platform.includes('Win')) {
     return '%APPDATA%\\clawd\\Nanna\\config\\config.toml'
   } else if (navigator.platform.includes('Mac')) {
@@ -134,14 +188,74 @@ async function refreshStatus() {
   }
 }
 
-function getChannelIcon(name: string): string {
-  const icons: Record<string, string> = {
-    'Telegram': '✈️',
-    'Discord': '🎮',
-    'Slack': '💼',
-    'Signal': '🔒',
-    'WhatsApp': '💬',
+function getChannelStatus(id: string): ChannelStatus | undefined {
+  const nameMap: Record<string, string> = {
+    telegram: 'Telegram',
+    discord: 'Discord',
+    slack: 'Slack',
+    signal: 'Signal',
+    whatsapp: 'WhatsApp',
   }
-  return icons[name] || '📱'
+  return channels.value.find(c => c.name === nameMap[id])
+}
+
+function toggleChannel(id: string) {
+  expandedChannel.value = expandedChannel.value === id ? null : id
+}
+
+async function saveChannelConfig(channel: string, config: Record<string, string>) {
+  try {
+    await invoke('save_channel_config', { channel, config })
+    showToast(`${channel} configuration saved`, 'success')
+    await refreshStatus()
+  } catch (e: any) {
+    showToast(`Failed to save: ${e.message || e}`, 'error')
+  }
+}
+
+async function testConnection(channel: string) {
+  try {
+    const result = await invoke<{ success: boolean; message: string }>('test_channel_connection', { channel })
+    if (result.success) {
+      showToast(`${channel}: ${result.message}`, 'success')
+    } else {
+      showToast(`${channel}: ${result.message}`, 'error')
+    }
+  } catch (e: any) {
+    showToast(`Test failed: ${e.message || e}`, 'error')
+  }
+}
+
+function showToast(message: string, type: 'success' | 'error') {
+  toast.value = { message, type }
+  setTimeout(() => { toast.value = null }, 4000)
 }
 </script>
+
+<style scoped>
+.expand-enter-active,
+.expand-leave-active {
+  transition: all 0.3s ease;
+  overflow: hidden;
+}
+.expand-enter-from,
+.expand-leave-to {
+  opacity: 0;
+  max-height: 0;
+}
+.expand-enter-to,
+.expand-leave-from {
+  opacity: 1;
+  max-height: 500px;
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: all 0.3s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateY(10px);
+}
+</style>

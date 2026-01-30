@@ -2128,6 +2128,182 @@ async fn save_config(
     Ok(())
 }
 
+/// Save channel configuration
+#[tauri::command]
+async fn save_channel_config(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    channel: String,
+    config: HashMap<String, String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    
+    match channel.as_str() {
+        "telegram" => {
+            let bot_token = config.get("bot_token")
+                .ok_or("Missing bot_token")?
+                .clone();
+            
+            let webhook_url = config.get("webhook_url").cloned();
+            
+            let allowed_users: Option<Vec<i64>> = config.get("allowed_users")
+                .and_then(|s| {
+                    let ids: Vec<i64> = s.split(',')
+                        .filter_map(|id| id.trim().parse().ok())
+                        .collect();
+                    if ids.is_empty() { None } else { Some(ids) }
+                });
+            
+            state_guard.config.channels.telegram = Some(nanna_config::TelegramConfig {
+                bot_token,
+                webhook_url,
+                allowed_users,
+            });
+        }
+        "discord" => {
+            let bot_token = config.get("bot_token")
+                .ok_or("Missing bot_token")?
+                .clone();
+            let application_id = config.get("application_id")
+                .ok_or("Missing application_id")?
+                .clone();
+            let public_key = config.get("public_key")
+                .ok_or("Missing public_key")?
+                .clone();
+            
+            state_guard.config.channels.discord = Some(nanna_config::DiscordConfig {
+                bot_token,
+                application_id,
+                public_key,
+            });
+        }
+        "slack" => {
+            let bot_token = config.get("bot_token")
+                .ok_or("Missing bot_token")?
+                .clone();
+            let signing_secret = config.get("signing_secret")
+                .ok_or("Missing signing_secret")?
+                .clone();
+            let app_token = config.get("app_token").cloned();
+            
+            state_guard.config.channels.slack = Some(nanna_config::SlackConfig {
+                bot_token,
+                app_token,
+                signing_secret,
+            });
+        }
+        "signal" => {
+            let phone_number = config.get("phone_number")
+                .ok_or("Missing phone_number")?
+                .clone();
+            let api_url = config.get("api_url").cloned();
+            let allowed_numbers = config.get("allowed_numbers")
+                .map(|s| s.split(',').map(|n| n.trim().to_string()).collect());
+            
+            state_guard.config.channels.signal = Some(nanna_config::SignalConfig {
+                phone_number,
+                api_url,
+                allowed_numbers,
+            });
+        }
+        _ => return Err(format!("Unknown channel: {}", channel)),
+    }
+    
+    // Save to disk
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    
+    info!("Saved {} channel configuration", channel);
+    Ok(())
+}
+
+/// Test channel connection
+#[tauri::command]
+async fn test_channel_connection(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    channel: String,
+) -> Result<TestConnectionResult, String> {
+    let state_guard = state.read().await;
+    
+    match channel.to_lowercase().as_str() {
+        "telegram" => {
+            let config = state_guard.config.channels.telegram.as_ref()
+                .ok_or("Telegram not configured")?;
+            
+            // Test by calling getMe
+            let client = reqwest::Client::new();
+            let url = format!("https://api.telegram.org/bot{}/getMe", config.bot_token);
+            
+            match client.get(&url).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let data: serde_json::Value = response.json().await
+                            .map_err(|e| e.to_string())?;
+                        let username = data["result"]["username"].as_str().unwrap_or("unknown");
+                        Ok(TestConnectionResult {
+                            success: true,
+                            message: format!("Connected to @{}", username),
+                        })
+                    } else {
+                        Ok(TestConnectionResult {
+                            success: false,
+                            message: format!("API error: {}", response.status()),
+                        })
+                    }
+                }
+                Err(e) => Ok(TestConnectionResult {
+                    success: false,
+                    message: format!("Connection failed: {}", e),
+                }),
+            }
+        }
+        "discord" => {
+            let config = state_guard.config.channels.discord.as_ref()
+                .ok_or("Discord not configured")?;
+            
+            // Test by calling /users/@me
+            let client = reqwest::Client::new();
+            
+            match client
+                .get("https://discord.com/api/v10/users/@me")
+                .header("Authorization", format!("Bot {}", config.bot_token))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let data: serde_json::Value = response.json().await
+                            .map_err(|e| e.to_string())?;
+                        let username = data["username"].as_str().unwrap_or("unknown");
+                        Ok(TestConnectionResult {
+                            success: true,
+                            message: format!("Connected as {}", username),
+                        })
+                    } else {
+                        Ok(TestConnectionResult {
+                            success: false,
+                            message: format!("API error: {}", response.status()),
+                        })
+                    }
+                }
+                Err(e) => Ok(TestConnectionResult {
+                    success: false,
+                    message: format!("Connection failed: {}", e),
+                }),
+            }
+        }
+        _ => Ok(TestConnectionResult {
+            success: false,
+            message: format!("Testing not implemented for {}", channel),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TestConnectionResult {
+    success: bool,
+    message: String,
+}
+
 // =============================================================================
 // Channel Status Commands
 // =============================================================================
@@ -2656,6 +2832,8 @@ pub fn run() {
             get_channel_status,
             // Config persistence
             save_config,
+            save_channel_config,
+            test_channel_connection,
             // Notifications
             send_notification,
             request_notification_permission,
