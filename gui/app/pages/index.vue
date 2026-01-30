@@ -20,13 +20,16 @@
         <div class="text-center max-w-md">
           <div class="text-6xl mb-4">🌙</div>
           <h3 class="text-2xl font-bold text-nanna-accent crt-glow mb-2">
-            Welcome to Nanna
+            Nanna
           </h3>
-          <p class="text-nanna-text-muted">
-            Your AI assistant is ready. Type a message to begin.
+          <p class="text-nanna-text-muted italic mb-2">
+            Patron deity of Ur
           </p>
-          <div v-if="config?.available_tools?.length" class="mt-4 text-sm text-nanna-text-dim">
-            Available tools: {{ config.available_tools.join(', ') }}
+          <p class="text-nanna-text-dim text-sm">
+            The moon is here. What would you illuminate?
+          </p>
+          <div v-if="config?.available_tools?.length" class="mt-6 text-xs text-nanna-text-dim opacity-60">
+            {{ config.available_tools.length }} tools await
           </div>
         </div>
       </div>
@@ -52,7 +55,7 @@
             </div>
             <div class="flex-1 min-w-0">
               <div class="text-xs text-nanna-text-dim mb-1">
-                {{ msg.role === 'user' ? 'You' : 'Nanna' }}
+                {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
               </div>
               <div 
                 v-if="msg.role === 'assistant'"
@@ -93,11 +96,11 @@
       <div v-if="isStreaming" class="max-w-4xl mx-auto">
         <div class="message-assistant p-4 rounded-lg mr-12">
           <div class="flex items-start gap-3">
-            <div class="w-8 h-8 rounded-full bg-nanna-accent text-nanna-bg-deep flex items-center justify-center flex-shrink-0">
-              N
+            <div class="w-8 h-8 rounded-full bg-nanna-accent text-nanna-bg-deep flex items-center justify-center flex-shrink-0 text-lg">
+              ☽
             </div>
             <div class="flex-1">
-              <div class="text-xs text-nanna-text-dim mb-1">Nanna</div>
+              <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
               <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
                 <span v-html="renderMarkdown(streamingContent)"></span>
                 <span class="cursor-blink">▋</span>
