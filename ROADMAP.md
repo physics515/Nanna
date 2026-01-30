@@ -107,7 +107,35 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
 - NSIS: `D:\Development\Cargo Target\release\bundle\nsis\Nanna_0.1.0_x64-setup.exe`
 
-## Phase 5: Production Hardening
+## Phase 5: Agent Swarm & Parallel Execution 🆕
+*Inspired by Kimi K2.5's agent swarm architecture*
+
+### Parallel Agent Orchestration
+- [ ] **Swarm Coordinator** - orchestrator that decomposes tasks into parallel subtasks
+- [ ] **Dynamic sub-agent spawning** - instantiate domain-specific agents on-the-fly
+- [ ] **Parallel tool execution** - execute independent tool calls concurrently
+- [ ] **Critical Path metrics** - measure efficiency by longest parallel branch, not total steps
+- [ ] **Sub-agent communication** - message passing between parallel agents
+- [ ] **Result aggregation** - collect and synthesize outputs from parallel branches
+
+### Context Management
+- [ ] **Sliding window truncation** - retain only latest N tool rounds when context grows
+- [ ] **Selective context compression** - summarize old context instead of dropping
+- [ ] **Per-agent context isolation** - sub-agents don't inherit full parent context
+- [ ] **Context budget allocation** - distribute context tokens across parallel agents
+
+### Thinking Mode Enhancements
+- [ ] **Explicit thinking toggle** - instant vs thinking mode per request
+- [ ] **Interleaved reasoning** - thinking blocks between tool calls (like Claude)
+- [ ] **Reasoning content field** - expose chain-of-thought separately from response
+- [ ] **Thinking budget** - configurable max tokens for reasoning phase
+
+### Visual Agent Capabilities (Future)
+- [ ] **Screenshot-to-code** - generate UI code from images
+- [ ] **Visual debugging loop** - agent inspects its own output visually
+- [ ] **Video understanding** - process video inputs for multi-step workflows
+
+## Phase 6: Production Hardening
 - [ ] Prometheus metrics
 - [ ] Tracing spans for tool calls
 - [ ] Cost tracking per session
@@ -147,6 +175,12 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 22 | ~~Streaming UX polish~~ | ✅ |
 | 23 | Channel status dashboard | 🔜 Next |
 | 24 | Native notifications wiring | 🔜 Next |
-| 25 | shadcn-vue components | Later |
-| 26 | Tauri mobile (Android/iOS) | Later |
-| 27 | Production hardening | Later |
+| 25 | **Parallel tool execution** | 🔜 High Priority |
+| 26 | **Swarm Coordinator** | 🔜 High Priority |
+| 27 | **Context management/truncation** | 🔜 High Priority |
+| 28 | Critical Path metrics | Later |
+| 29 | Thinking mode toggle | Later |
+| 30 | shadcn-vue components | Later |
+| 31 | Tauri mobile (Android/iOS) | Later |
+| 32 | Visual debugging loop | Future |
+| 33 | Production hardening | Later |
