@@ -120,13 +120,23 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Configurable similarity threshold** - expose min_score in GUI settings
 
 ### Settings Overhaul 🔜
-- [ ] **Tabbed settings UI** - organize settings into logical tabs (General, Models, Memory, Channels, Tools, Advanced)
+- [ ] **Tabbed settings UI** - organize settings into logical tabs (General, Models, Memory, Tools, Advanced)
 - [ ] **Full config migration** - move ALL config.toml/env settings into GUI
 - [ ] **Persistent settings** - save to config file on change, load on startup
-- [ ] **Channel credentials in GUI** - Telegram token, Discord app ID, Slack tokens, etc.
 - [ ] **Tool configuration** - enable/disable tools, set tool-specific options (Brave API key, etc.)
 - [ ] **System prompt editor** - edit default system prompt in GUI
 - [ ] **Import/Export config** - backup and restore settings
+
+### Channels Page Overhaul 🔜
+- [ ] **Channel onboarding wizards** - step-by-step setup for each channel
+  - [ ] Telegram: BotFather walkthrough, token input, webhook setup
+  - [ ] Discord: App creation guide, bot token, permissions setup
+  - [ ] Slack: App manifest, OAuth flow, socket mode setup
+  - [ ] Signal: signald setup, phone verification
+  - [ ] WhatsApp: Business API setup, access token
+- [ ] **Credential management** - secure input/storage for tokens and keys
+- [ ] **Connection testing** - verify credentials work before saving
+- [ ] **Channel status live updates** - real-time connection health
 
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
@@ -219,3 +229,4 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 40 | ~~PDF tools (read + extract images)~~ | ✅ Done |
 | 41 | ~~OCR + image description~~ | ✅ Done |
 | 42 | **Settings overhaul (tabs + full config)** | 🔜 High Priority |
+| 43 | **Channels page overhaul (onboarding wizards)** | 🔜 High Priority |
