@@ -373,9 +373,16 @@ async fn run_agent_loop(
             all_tool_calls.push(tool_call_info);
 
             // Build tool result for next request
+            // Anthropic requires non-empty content when is_error is true
+            let result_content = if response.result.content.is_empty() && !response.result.success {
+                "Tool execution failed".to_string()
+            } else {
+                response.result.content
+            };
+            
             tool_results.push((
                 pending.id.clone(),
-                response.result.content,
+                result_content,
                 !response.result.success,
             ));
         }
