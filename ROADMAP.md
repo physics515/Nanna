@@ -178,8 +178,10 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [ ] Runtime config reload
 - [ ] Per-channel config
 - [ ] Tool allowlists/blocklists
-- [ ] Rate limiting
+- [ ] Rate limiting (outbound)
 - [ ] Error recovery / retry logic
+- [ ] **Message queuing** - queue outbound messages to handle bursts and offline periods
+- [ ] **Graceful rate limit handling** - detect 429s, backoff, queue, and retry with exponential delay
 
 ---
 
@@ -233,3 +235,5 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 44 | Channels: Slack/Signal/WhatsApp wizards | 🔜 |
 | 45 | System prompt editor | 🔜 |
 | 46 | Config import/export | Later |
+| 47 | Message queuing | 🔜 |
+| 48 | Graceful rate limit handling | 🔜 |
