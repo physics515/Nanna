@@ -159,6 +159,7 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [ ] **Selective context compression** - summarize old context instead of dropping
 - [ ] **Per-agent context isolation** - sub-agents don't inherit full parent context
 - [ ] **Context budget allocation** - distribute context tokens across parallel agents
+- [ ] **Intelligent tool output truncation** - proportional budget allocation across tool results based on total context budget, with minimum floor per tool and recency bias
 
 ### Thinking Mode Enhancements
 - [ ] **Explicit thinking toggle** - instant vs thinking mode per request
@@ -237,3 +238,4 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 46 | Config import/export | Later |
 | 47 | Message queuing | 🔜 |
 | 48 | Graceful rate limit handling | 🔜 |
+| 49 | Intelligent tool output truncation | 🔜 |
