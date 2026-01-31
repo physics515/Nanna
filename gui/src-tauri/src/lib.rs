@@ -2400,14 +2400,42 @@ async fn get_ollama_models(
         .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
     
     // Convert to our info struct, marking known embedding models
-    let embedding_models = ["nomic-embed-text", "mxbai-embed-large", "all-minilm", 
-                           "snowflake-arctic-embed", "bge-m3", "bge-large"];
+    // Comprehensive list of known embedding model name patterns
+    let embedding_patterns = [
+        // BGE family
+        "bge-m3", "bge-large", "bge-small", "bge-base",
+        // Nomic
+        "nomic-embed",
+        // MixedBread
+        "mxbai-embed",
+        // Sentence transformers / all-minilm
+        "all-minilm", "minilm",
+        // Snowflake
+        "snowflake-arctic-embed",
+        // E5 family
+        "e5-small", "e5-base", "e5-large", "e5-mistral",
+        // GTE family  
+        "gte-small", "gte-base", "gte-large", "gte-qwen",
+        // Jina
+        "jina-embed",
+        // Voyage
+        "voyage",
+        // Cohere
+        "embed-english", "embed-multilingual",
+        // Generic patterns (catch-all)
+        "-embed-", "-embed:",
+    ];
     
     let models: Vec<OllamaModelInfo> = tags.models
         .into_iter()
         .map(|m| {
-            let base_name = m.name.split(':').next().unwrap_or(&m.name);
-            let is_embedding = embedding_models.iter().any(|e| base_name.contains(e));
+            let name_lower = m.name.to_lowercase();
+            let base_name = m.name.split(':').next().unwrap_or(&m.name).to_lowercase();
+            
+            // Check if model name contains "embed" or matches known embedding patterns
+            let is_embedding = name_lower.contains("embed") 
+                || embedding_patterns.iter().any(|p| base_name.contains(p));
+            
             OllamaModelInfo {
                 name: m.name,
                 size_mb: m.size / 1_000_000,
