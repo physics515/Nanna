@@ -11,10 +11,11 @@
     <!-- Active Models (Drag & Drop) -->
     <div 
       ref="dropZone"
-      class="space-y-1 min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-nanna-primary/20"
-      @dragover.prevent="onContainerDragOver"
-      @dragenter.prevent="onContainerDragOver"
-      @drop.prevent="onDropOnContainer"
+      class="space-y-1 min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-nanna-primary/20 transition-colors"
+      :class="isDragging && !draggingFromExcluded && 'border-nanna-primary/40'"
+      @dragover="handleContainerDragOver"
+      @dragenter="handleContainerDragOver"
+      @drop="handleContainerDrop"
     >
       <div v-if="activeModels.length === 0" class="text-center py-4 text-sm text-nanna-text-dim">
         Drag models here to enable
@@ -24,18 +25,16 @@
         v-for="(model, index) in activeModels"
         :key="model.id"
         draggable="true"
-        @dragstart="onDragStart($event, model, index)"
-        @dragend="onDragEnd"
-        @dragenter.prevent="onDragEnter($event, index)"
-        @dragover.prevent="onDragOver($event, index)"
-        @dragleave.prevent="onDragLeave($event, index)"
-        @drop.prevent.stop="onDropOnItem($event, index)"
+        @dragstart="handleDragStart($event, model, index)"
+        @dragend="handleDragEnd"
+        @dragenter="handleItemDragEnter($event, index)"
+        @dragover="handleItemDragOver($event, index)"
+        @dragleave="handleItemDragLeave($event, index)"
+        @drop="handleItemDrop($event, index)"
         :class="[
           'flex items-center gap-2 p-2 rounded-lg cursor-grab active:cursor-grabbing transition-all select-none',
-          'bg-nanna-bg-surface border border-nanna-primary/20',
-          dropTargetIndex === index && draggingId !== model.id && 'border-nanna-primary border-2 bg-nanna-primary/10',
-          draggingId === model.id && 'opacity-40 scale-95',
-          index === 0 && draggingId !== model.id && 'ring-1 ring-nanna-accent/50'
+          'bg-nanna-bg-surface border-2',
+          getItemClasses(model, index)
         ]"
       >
         <!-- Drag Handle -->
@@ -86,16 +85,16 @@
       </summary>
       <div 
         class="mt-2 space-y-1 p-2 rounded-lg bg-nanna-bg-deep/50"
-        @dragover.prevent="onContainerDragOver"
-        @dragenter.prevent="onContainerDragOver"
-        @drop.prevent="onDropOnExcluded"
+        @dragover="handleContainerDragOver"
+        @dragenter="handleContainerDragOver"
+        @drop="handleExcludedDrop"
       >
         <div
           v-for="model in excludedModels"
           :key="model.id"
           draggable="true"
-          @dragstart="onDragStartExcluded($event, model)"
-          @dragend="onDragEnd"
+          @dragstart="handleExcludedDragStart($event, model)"
+          @dragend="handleDragEnd"
           class="flex items-center gap-2 p-2 rounded bg-nanna-bg-elevated/50 opacity-60 cursor-grab"
         >
           <GripVertical class="w-3 h-3 text-nanna-text-dim" />
@@ -156,14 +155,14 @@ export interface ModelOption {
   id: string
   name: string
   provider: string
-  available: boolean // Has API key configured
+  available: boolean
 }
 
 const props = defineProps<{
   label: string
   hint?: string
   models: ModelOption[]
-  modelValue: string[] // Ordered list of model IDs
+  modelValue: string[]
 }>()
 
 const emit = defineEmits<{
@@ -172,11 +171,13 @@ const emit = defineEmits<{
 
 const showAddModel = ref(false)
 
-// Drag state - simplified
+// Drag state
 const draggingId = ref<string | null>(null)
 const draggingFromExcluded = ref(false)
 const dropTargetIndex = ref<number | null>(null)
 const dragStartIndex = ref<number>(-1)
+
+const isDragging = computed(() => draggingId.value !== null)
 
 // Active models in priority order
 const activeModels = computed(() => {
@@ -190,7 +191,6 @@ const excludedModels = computed(() => {
   return props.models.filter(m => !props.modelValue.includes(m.id))
 })
 
-// Models available to add (excluded ones)
 const availableToAdd = computed(() => excludedModels.value)
 
 function getProviderIcon(provider: string): string {
@@ -204,55 +204,66 @@ function getProviderIcon(provider: string): string {
   return icons[provider.toLowerCase()] || '⚪'
 }
 
-// Drag from active list
-function onDragStart(event: DragEvent, model: ModelOption, index: number) {
+function getItemClasses(model: ModelOption, index: number): string {
+  const classes: string[] = []
+  
+  if (draggingId.value === model.id) {
+    classes.push('opacity-40', 'scale-95', 'border-nanna-primary/20')
+  } else if (dropTargetIndex.value === index) {
+    classes.push('border-nanna-accent', 'bg-nanna-accent/10')
+  } else if (index === 0) {
+    classes.push('border-nanna-primary/30', 'ring-1', 'ring-nanna-accent/50')
+  } else {
+    classes.push('border-nanna-primary/20')
+  }
+  
+  return classes.join(' ')
+}
+
+// === DRAG HANDLERS ===
+
+function handleDragStart(event: DragEvent, model: ModelOption, index: number) {
   draggingId.value = model.id
   draggingFromExcluded.value = false
   dragStartIndex.value = index
   
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.dropEffect = 'move'
     event.dataTransfer.setData('text/plain', model.id)
   }
 }
 
-// Drag from excluded list
-function onDragStartExcluded(event: DragEvent, model: ModelOption) {
+function handleExcludedDragStart(event: DragEvent, model: ModelOption) {
   draggingId.value = model.id
   draggingFromExcluded.value = true
   dragStartIndex.value = -1
   
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.dropEffect = 'move'
     event.dataTransfer.setData('text/plain', model.id)
   }
 }
 
-function onDragEnd() {
+function handleDragEnd() {
   draggingId.value = null
   draggingFromExcluded.value = false
   dropTargetIndex.value = null
   dragStartIndex.value = -1
 }
 
-// Container dragover - must set dropEffect to allow drops
-function onContainerDragOver(event: DragEvent) {
+function handleContainerDragOver(event: DragEvent) {
+  event.preventDefault()
+  event.stopPropagation()
   if (event.dataTransfer) {
     event.dataTransfer.dropEffect = 'move'
   }
 }
 
-function onDragEnter(event: DragEvent, index: number) {
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = 'move'
-  }
-  if (draggingId.value && dragStartIndex.value !== index) {
-    dropTargetIndex.value = index
-  }
-}
-
-function onDragOver(event: DragEvent, index: number) {
-  // CRITICAL: Must set dropEffect to allow drop (prevents 🚫 cursor)
+function handleItemDragEnter(event: DragEvent, index: number) {
+  event.preventDefault()
+  event.stopPropagation()
   if (event.dataTransfer) {
     event.dataTransfer.dropEffect = 'move'
   }
@@ -261,14 +272,33 @@ function onDragOver(event: DragEvent, index: number) {
   }
 }
 
-function onDragLeave(event: DragEvent, index: number) {
+function handleItemDragOver(event: DragEvent, index: number) {
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move'
+  }
+  if (draggingId.value && dragStartIndex.value !== index) {
+    dropTargetIndex.value = index
+  }
+}
+
+function handleItemDragLeave(event: DragEvent, index: number) {
+  // Only clear if we're actually leaving this item (not entering a child)
+  const relatedTarget = event.relatedTarget as HTMLElement | null
+  const currentTarget = event.currentTarget as HTMLElement
+  if (relatedTarget && currentTarget.contains(relatedTarget)) {
+    return
+  }
   if (dropTargetIndex.value === index) {
     dropTargetIndex.value = null
   }
 }
 
-// Drop on a specific item - reorder
-function onDropOnItem(event: DragEvent, targetIndex: number) {
+function handleItemDrop(event: DragEvent, targetIndex: number) {
+  event.preventDefault()
+  event.stopPropagation()
+  
   if (!draggingId.value) return
   
   const newList = [...props.modelValue]
@@ -280,49 +310,50 @@ function onDropOnItem(event: DragEvent, targetIndex: number) {
     // Reordering within active list
     const currentIndex = newList.indexOf(draggingId.value)
     if (currentIndex === -1 || currentIndex === targetIndex) {
-      onDragEnd()
+      handleDragEnd()
       return
     }
     
-    // Remove from current position
+    // Remove and reinsert
     newList.splice(currentIndex, 1)
-    
-    // Calculate insertion point
-    // If we removed an item before the target, the target shifts down by 1
     const insertAt = currentIndex < targetIndex ? targetIndex - 1 : targetIndex
     newList.splice(insertAt, 0, draggingId.value)
   }
   
   emit('update:modelValue', newList)
-  onDragEnd()
+  handleDragEnd()
 }
 
-// Drop on container (not on an item) - add to end
-function onDropOnContainer(event: DragEvent) {
+function handleContainerDrop(event: DragEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  
   if (!draggingId.value) return
   
   const newList = [...props.modelValue]
   
   if (draggingFromExcluded.value) {
-    // Adding from excluded to end
     if (!newList.includes(draggingId.value)) {
       newList.push(draggingId.value)
     }
+    emit('update:modelValue', newList)
   }
-  // If dragging within active and dropped on container, do nothing (keep position)
   
-  emit('update:modelValue', newList)
-  onDragEnd()
+  handleDragEnd()
 }
 
-// Drop on excluded area - remove from active
-function onDropOnExcluded(event: DragEvent) {
+function handleExcludedDrop(event: DragEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  
   if (!draggingId.value || draggingFromExcluded.value) return
   
   const newList = props.modelValue.filter(id => id !== draggingId.value)
   emit('update:modelValue', newList)
-  onDragEnd()
+  handleDragEnd()
 }
+
+// === NON-DRAG ACTIONS ===
 
 function removeModel(index: number) {
   const newList = [...props.modelValue]
