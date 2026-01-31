@@ -6,14 +6,18 @@
 //! Provides a unified interface for different messaging platforms.
 
 pub mod discord;
+pub mod queue;
 pub mod signal;
 pub mod slack;
+pub mod status;
 pub mod telegram;
 pub mod whatsapp;
 
 pub use discord::DiscordChannel;
+pub use queue::{MessageQueue, MessagePriority, QueueConfig, QueueEvent, QueueStats, QueuedMessage, SendResult};
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
+pub use status::{ChannelStatus, ConnectionState, HealthChecker, HealthCheckResult, HealthMetrics, StatusEvent, StatusManager, StatusSummary};
 pub use telegram::TelegramChannel;
 pub use whatsapp::WhatsAppChannel;
 

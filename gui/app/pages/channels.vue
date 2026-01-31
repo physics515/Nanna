@@ -104,6 +104,17 @@
           </Transition>
         </UiCard>
         
+        <!-- Live Status Dashboard -->
+        <UiCard>
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-semibold text-nanna-accent flex items-center gap-2">
+              <Activity class="w-4 h-4" />
+              Live Status
+            </h3>
+          </div>
+          <ChannelStatusLive />
+        </UiCard>
+        
         <!-- Config File Info -->
         <UiCard class="bg-nanna-bg-elevated/30">
           <div class="flex items-start gap-3">
@@ -143,7 +154,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle } from 'lucide-vue-next'
+import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle, Activity } from 'lucide-vue-next'
 
 interface ChannelStatus {
   name: string

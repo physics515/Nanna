@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -14,3 +14,5 @@ async-trait = "0.1"
 bitflags = "2"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 urlencoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
