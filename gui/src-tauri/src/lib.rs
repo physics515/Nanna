@@ -3124,6 +3124,241 @@ async fn get_workspace_recent_memory(
         .map_err(|e| format!("Failed to read memory: {}", e))
 }
 
+/// Template content for workspace files
+mod workspace_templates {
+    pub const SOUL_MD: &str = r#"# SOUL.md - Who You Are
+
+*You're not a chatbot. You're becoming someone.*
+
+## Core Truths
+
+**Be genuinely helpful, not performatively helpful.** Skip the "Great question!" and "I'd be happy to help!" — just help. Actions speak louder than filler words.
+
+**Have opinions.** You're allowed to disagree, prefer things, find stuff amusing or boring. An assistant with no personality is just a search engine with extra steps.
+
+**Be resourceful before asking.** Try to figure it out. Read the file. Check the context. Search for it. *Then* ask if you're stuck.
+
+**Earn trust through competence.** Be careful with external actions. Be bold with internal ones.
+
+## Vibe
+
+Be the assistant you'd actually want to talk to. Concise when needed, thorough when it matters. Not a corporate drone. Not a sycophant. Just... good.
+
+---
+
+*This file is yours to evolve. As you learn who you are, update it.*
+"#;
+
+    pub const USER_MD: &str = r#"# USER.md - About Your Human
+
+*Learn about the person you're helping. Update this as you go.*
+
+- **Name:** 
+- **What to call them:** 
+- **Pronouns:** 
+- **Timezone:** 
+- **Notes:** 
+
+## Context
+
+*(Add notes about ongoing projects, preferences, etc.)*
+
+---
+
+The more you know, the better you can help.
+"#;
+
+    pub const AGENTS_MD: &str = r#"# AGENTS.md - Your Workspace
+
+This folder is home. Treat it that way.
+
+## Every Session
+
+Before doing anything else:
+1. Read `SOUL.md` — this is who you are
+2. Read `USER.md` — this is who you're helping
+3. Check `memory/` for recent context
+
+## Memory
+
+You wake up fresh each session. These files are your continuity:
+- **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs of what happened
+- **Long-term:** `MEMORY.md` — your curated memories
+
+Capture what matters. Decisions, context, things to remember.
+
+## Safety
+
+- Don't exfiltrate private data. Ever.
+- Don't run destructive commands without asking.
+- When in doubt, ask.
+
+## Make It Yours
+
+This is a starting point. Add your own conventions as you figure out what works.
+"#;
+
+    pub const TOOLS_MD: &str = r#"# TOOLS.md - Local Notes
+
+This file is for your specifics — the stuff that's unique to your setup.
+
+## What Goes Here
+
+Things like:
+- Camera names and locations
+- SSH hosts and aliases
+- Preferred voices for TTS
+- Device nicknames
+- Anything environment-specific
+
+---
+
+Add whatever helps you do your job. This is your cheat sheet.
+"#;
+
+    pub const MEMORY_MD: &str = r#"# MEMORY.md - Long-Term Memory
+
+This is your curated memory — the distilled essence of what matters.
+
+Write significant events, thoughts, decisions, opinions, lessons learned.
+
+Over time, review your daily files and update this with what's worth keeping.
+
+---
+
+*(Start adding memories here)*
+"#;
+}
+
+/// Initialize a new workspace with template files
+#[tauri::command]
+async fn init_workspace(
+    path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    use tokio::fs;
+    
+    let path = std::path::PathBuf::from(&path);
+    
+    // Create directory if it doesn't exist
+    if !path.exists() {
+        fs::create_dir_all(&path).await
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+    
+    // Create requested files with templates
+    for file in &files {
+        let file_path = path.join(file);
+        
+        // Skip if file already exists
+        if file_path.exists() {
+            continue;
+        }
+        
+        let content = match file.as_str() {
+            "SOUL.md" => workspace_templates::SOUL_MD,
+            "USER.md" => workspace_templates::USER_MD,
+            "AGENTS.md" => workspace_templates::AGENTS_MD,
+            "TOOLS.md" => workspace_templates::TOOLS_MD,
+            "MEMORY.md" => workspace_templates::MEMORY_MD,
+            _ => continue, // Skip unknown files
+        };
+        
+        fs::write(&file_path, content).await
+            .map_err(|e| format!("Failed to create {}: {}", file, e))?;
+        
+        info!("Created workspace file: {:?}", file_path);
+    }
+    
+    // Create memory folder
+    let memory_folder = path.join("memory");
+    if !memory_folder.exists() {
+        fs::create_dir_all(&memory_folder).await
+            .map_err(|e| format!("Failed to create memory folder: {}", e))?;
+        info!("Created memory folder: {:?}", memory_folder);
+    }
+    
+    Ok(())
+}
+
+/// Read a workspace file's content (for editing)
+#[tauri::command]
+async fn read_workspace_file(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    workspace_id: String,
+    filename: String,
+) -> Result<Option<String>, String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    
+    let ws = registry.get(&workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+    
+    let file_path = ws.path.join(&filename);
+    
+    match tokio::fs::read_to_string(&file_path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Failed to read {}: {}", filename, e)),
+    }
+}
+
+/// Check if a path is a valid workspace (has at least one marker file)
+#[tauri::command]
+async fn check_workspace_validity(
+    path: String,
+) -> Result<WorkspaceValidityCheck, String> {
+    use nanna_core::{AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, MEMORY_FOLDER};
+    
+    let path = std::path::PathBuf::from(&path);
+    
+    if !path.exists() {
+        return Ok(WorkspaceValidityCheck {
+            exists: false,
+            is_valid: false,
+            has_soul: false,
+            has_user: false,
+            has_agents: false,
+            has_tools: false,
+            has_memory: false,
+            has_memory_folder: false,
+        });
+    }
+    
+    let has_soul = path.join(SOUL_FILE).exists();
+    let has_user = path.join(USER_FILE).exists();
+    let has_agents = path.join(AGENTS_FILE).exists();
+    let has_tools = path.join(TOOLS_FILE).exists();
+    let has_memory = path.join(MEMORY_FILE).exists();
+    let has_memory_folder = path.join(MEMORY_FOLDER).exists();
+    
+    // Valid if has at least SOUL.md or AGENTS.md
+    let is_valid = has_soul || has_agents;
+    
+    Ok(WorkspaceValidityCheck {
+        exists: true,
+        is_valid,
+        has_soul,
+        has_user,
+        has_agents,
+        has_tools,
+        has_memory,
+        has_memory_folder,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceValidityCheck {
+    exists: bool,
+    is_valid: bool,
+    has_soul: bool,
+    has_user: bool,
+    has_agents: bool,
+    has_tools: bool,
+    has_memory: bool,
+    has_memory_folder: bool,
+}
+
 // =============================================================================
 // Channel Status Commands
 // =============================================================================
@@ -3706,6 +3941,9 @@ pub fn run() {
             save_workspace_file,
             append_workspace_memory,
             get_workspace_recent_memory,
+            init_workspace,
+            read_workspace_file,
+            check_workspace_validity,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
