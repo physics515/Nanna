@@ -172,6 +172,93 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [ ] **Visual debugging loop** - agent inspects its own output visually
 - [ ] **Video understanding** - process video inputs for multi-step workflows
 
+## Phase 7: Rich Input & Editor Experience
+
+### Tiptap Markdown Editor
+**Goal:** Replace plain textarea with a rich Tiptap-based editor for markdown input with Monaco code blocks.
+
+**Stack:**
+- [tiptap-shadcn-vue](https://tiptap-shadcn-vue.pages.dev/tiptap) - Vue/Nuxt Tiptap integration with shadcn-vue
+- Monaco Editor (via `@monaco-editor/react` port or `monaco-editor-vue3`)
+- Tailwind v4 + Nanna Palenight theme
+
+**Core Features:**
+- [ ] **Basic formatting** - Bold, italic, strikethrough, underline
+- [ ] **Headings** - H1-H3 with keyboard shortcuts
+- [ ] **Lists** - Bullet, numbered, and task lists
+- [ ] **Blockquotes** - Styled quote blocks
+- [ ] **Links** - Inline link insertion with URL preview
+- [ ] **Images** - Paste/drag-drop with inline preview
+- [ ] **Tables** - Basic table support
+- [ ] **Horizontal rules** - Dividers
+- [ ] **Markdown shortcuts** - Type `**bold**` and it auto-converts
+
+**Code Block Integration:**
+- [ ] **Monaco-powered code blocks** - Full syntax highlighting + autocomplete
+- [ ] **Language selector** - Dropdown for language (auto-detect default)
+- [ ] **Inline code** - Backtick styling with monospace font
+- [ ] **Copy button** - One-click copy for code blocks
+- [ ] **Line numbers** - Toggleable in settings
+- [ ] **Theme sync** - Monaco uses Nanna Palenight colors
+
+**Nanna Theming:**
+- [ ] **Palenight toolbar** - Violet/cyan accents on slate background
+- [ ] **CRT glow effects** - Subtle glow on focused elements
+- [ ] **Monospace fonts** - JetBrains Mono / Fira Code for code
+- [ ] **Dark mode only** - Matches Nanna aesthetic
+- [ ] **Custom selection colors** - Violet-tinted text selection
+
+**UX Enhancements:**
+- [ ] **Floating toolbar** - Appears on text selection
+- [ ] **Slash commands** - Type `/` for quick formatting menu
+- [ ] **Drag-and-drop blocks** - Reorder content blocks
+- [ ] **Keyboard shortcuts** - Full vim-style navigation optional
+- [ ] **Mobile toolbar** - Responsive bottom toolbar on mobile
+- [ ] **Placeholder text** - "Ask Nanna anything..." with tips
+
+**Technical:**
+- [ ] **Output format** - Markdown (for LLM context) + HTML (for rendering)
+- [ ] **Content persistence** - Draft saved to localStorage
+- [ ] **Streaming input** - Editor remains editable while response streams
+- [ ] **History/Undo** - Full undo/redo stack
+- [ ] **Accessibility** - ARIA labels, keyboard navigation
+
+**Integration Points:**
+- [ ] **Chat input replacement** - Replace `<textarea>` in chat
+- [ ] **System prompt editor** - Use in settings for prompt editing
+- [ ] **Memory editor** - Rich editing for memory content
+- [ ] **Workspace files** - Edit SOUL.md, USER.md with rich preview
+
+**Dependencies:**
+```
+# Vue Tiptap ecosystem
+@tiptap/vue-3
+@tiptap/starter-kit
+@tiptap/extension-code-block-lowlight
+@tiptap/extension-image
+@tiptap/extension-link
+@tiptap/extension-table
+@tiptap/extension-placeholder
+@tiptap/extension-typography
+
+# Monaco (for code blocks)
+monaco-editor
+@vueuse/core  # for Monaco resize handling
+
+# Syntax highlighting
+lowlight
+highlight.js
+```
+
+**Implementation Order:**
+1. Basic Tiptap editor component with formatting toolbar
+2. Theme integration (Palenight colors, fonts)
+3. Code block extension with syntax highlighting (lowlight)
+4. Monaco integration for full code editing
+5. Slash commands and floating toolbar
+6. Chat integration (replace textarea)
+7. Settings/memory editor integration
+
 ## Phase 6: Production Hardening
 - [ ] Prometheus metrics
 - [ ] Tracing spans for tool calls
@@ -242,3 +329,8 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 50 | ~~Channel status live updates~~ | ✅ Done |
 | 51 | Prometheus metrics | 🔜 |
 | 52 | Cost tracking per session | Later |
+| 53 | Tiptap markdown editor | 🔜 |
+| 54 | Monaco code blocks | 🔜 |
+| 55 | Nanna-themed editor | 🔜 |
+| 56 | Slash commands | Later |
+| 57 | Chat input replacement | 🔜 |
