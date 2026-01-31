@@ -55,7 +55,7 @@
   - [x] SupervisionStrategy (OneForOne, OneForAll, RestForOne)
   - [x] Supervisor with lifecycle management
 
-## Phase 4: GUI Application 🔜
+## Phase 4: GUI Application ✅
 **Stack:** Tauri v2 + Nuxt v4 + Tailwind v4
 
 ### Design
@@ -120,23 +120,23 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Configurable similarity threshold** - expose min_score in GUI settings
 
 ### Settings Overhaul ✅
-- [x] **Tabbed settings UI** - organize settings into logical tabs (Models, Memory, Tools, Scheduler, Data)
+- [x] **Tabbed settings UI** - organize settings into logical tabs (Models, Agent, Memory, Tools, Scheduler, Data)
 - [x] **Full config migration** - settings saved to config.toml via GUI
 - [x] **Persistent settings** - save to config file on change, load on startup
 - [x] **Tool configuration** - tool API keys (Brave), tool list display
-- [ ] **System prompt editor** - edit default system prompt in GUI
-- [ ] **Import/Export config** - backup and restore settings
+- [x] **System prompt editor** - edit default system prompt in GUI with templates
+- [x] **Import/Export config** - backup and restore settings (download TOML / upload TOML)
 
-### Channels Page Overhaul 🔶
+### Channels Page Overhaul ✅
 - [x] **Channel onboarding wizards** - step-by-step setup for each channel
   - [x] Telegram: BotFather walkthrough, token input, webhook setup
   - [x] Discord: App creation guide, bot token, permissions setup
-  - [ ] Slack: App manifest, OAuth flow, socket mode setup
-  - [ ] Signal: signald setup, phone verification
-  - [ ] WhatsApp: Business API setup, access token
+  - [x] Slack: App manifest, OAuth flow, socket mode setup (4-step wizard)
+  - [x] Signal: signald setup, phone verification, REST API options
+  - [x] WhatsApp: Cloud API + Web bridge modes, full setup flow
 - [x] **Credential management** - secure input/storage for tokens and keys
 - [x] **Connection testing** - verify credentials work before saving
-- [ ] **Channel status live updates** - real-time connection health
+- [ ] **Channel status live updates** - real-time connection health (WebSocket)
 
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
@@ -233,9 +233,10 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 41 | ~~OCR + image description~~ | ✅ Done |
 | 42 | ~~Settings overhaul (tabs + full config)~~ | ✅ Done |
 | 43 | ~~Channels page (Telegram/Discord wizards)~~ | ✅ Done |
-| 44 | Channels: Slack/Signal/WhatsApp wizards | 🔜 |
-| 45 | System prompt editor | 🔜 |
-| 46 | Config import/export | Later |
+| 44 | ~~Channels: Slack/Signal/WhatsApp wizards~~ | ✅ Done |
+| 45 | ~~System prompt editor~~ | ✅ Done |
+| 46 | ~~Config import/export~~ | ✅ Done |
 | 47 | Message queuing | 🔜 |
 | 48 | Graceful rate limit handling | 🔜 |
 | 49 | ~~Intelligent tool output truncation~~ | ✅ Done |
+| 50 | Channel status live updates (WebSocket) | Later |
