@@ -20,7 +20,7 @@ pub use scheduler::{
 pub use workspace::{
     Workspace, WorkspaceContext, WorkspaceError, WorkspaceRegistry,
     find_workspace_root, discover_workspaces, is_workspace_root,
-    AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, 
+    NANNA_FOLDER, AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, 
     IDENTITY_FILE, HEARTBEAT_FILE, MEMORY_FOLDER, WORKSPACE_MARKERS,
 };
 

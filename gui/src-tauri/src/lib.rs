@@ -3705,24 +3705,34 @@ Over time, review your daily files and update this with what's worth keeping.
 }
 
 /// Initialize a new workspace with template files
+/// Files are created inside a hidden .nanna folder
 #[tauri::command]
 async fn init_workspace(
     path: String,
     files: Vec<String>,
 ) -> Result<(), String> {
     use tokio::fs;
+    use nanna_core::NANNA_FOLDER;
     
     let path = std::path::PathBuf::from(&path);
+    let nanna_folder = path.join(NANNA_FOLDER);
     
-    // Create directory if it doesn't exist
+    // Create workspace directory if it doesn't exist
     if !path.exists() {
         fs::create_dir_all(&path).await
             .map_err(|e| format!("Failed to create directory: {}", e))?;
     }
     
-    // Create requested files with templates
+    // Create .nanna folder
+    if !nanna_folder.exists() {
+        fs::create_dir_all(&nanna_folder).await
+            .map_err(|e| format!("Failed to create .nanna folder: {}", e))?;
+        info!("Created .nanna folder: {:?}", nanna_folder);
+    }
+    
+    // Create requested files with templates (inside .nanna)
     for file in &files {
-        let file_path = path.join(file);
+        let file_path = nanna_folder.join(file);
         
         // Skip if file already exists
         if file_path.exists() {
@@ -3744,8 +3754,8 @@ async fn init_workspace(
         info!("Created workspace file: {:?}", file_path);
     }
     
-    // Create memory folder
-    let memory_folder = path.join("memory");
+    // Create memory folder (inside .nanna)
+    let memory_folder = nanna_folder.join("memory");
     if !memory_folder.exists() {
         fs::create_dir_all(&memory_folder).await
             .map_err(|e| format!("Failed to create memory folder: {}", e))?;
@@ -3756,6 +3766,7 @@ async fn init_workspace(
 }
 
 /// Read a workspace file's content (for editing)
+/// Files are stored in the .nanna folder
 #[tauri::command]
 async fn read_workspace_file(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -3768,7 +3779,8 @@ async fn read_workspace_file(
     let ws = registry.get(&workspace_id)
         .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
     
-    let file_path = ws.path.join(&filename);
+    // Files are inside the .nanna folder
+    let file_path = ws.nanna_folder().join(&filename);
     
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => Ok(Some(content)),
@@ -3777,12 +3789,12 @@ async fn read_workspace_file(
     }
 }
 
-/// Check if a path is a valid workspace (has at least one marker file)
+/// Check if a path is a valid workspace (has .nanna folder with files)
 #[tauri::command]
 async fn check_workspace_validity(
     path: String,
 ) -> Result<WorkspaceValidityCheck, String> {
-    use nanna_core::{AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, MEMORY_FOLDER};
+    use nanna_core::{NANNA_FOLDER, AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, MEMORY_FOLDER};
     
     let path = std::path::PathBuf::from(&path);
     
@@ -3799,15 +3811,20 @@ async fn check_workspace_validity(
         });
     }
     
-    let has_soul = path.join(SOUL_FILE).exists();
-    let has_user = path.join(USER_FILE).exists();
-    let has_agents = path.join(AGENTS_FILE).exists();
-    let has_tools = path.join(TOOLS_FILE).exists();
-    let has_memory = path.join(MEMORY_FILE).exists();
-    let has_memory_folder = path.join(MEMORY_FOLDER).exists();
+    // Check for .nanna folder
+    let nanna_folder = path.join(NANNA_FOLDER);
+    let has_nanna_folder = nanna_folder.exists();
     
-    // Valid if has at least SOUL.md or AGENTS.md
-    let is_valid = has_soul || has_agents;
+    // Check for files inside .nanna folder
+    let has_soul = nanna_folder.join(SOUL_FILE).exists();
+    let has_user = nanna_folder.join(USER_FILE).exists();
+    let has_agents = nanna_folder.join(AGENTS_FILE).exists();
+    let has_tools = nanna_folder.join(TOOLS_FILE).exists();
+    let has_memory = nanna_folder.join(MEMORY_FILE).exists();
+    let has_memory_folder = nanna_folder.join(MEMORY_FOLDER).exists();
+    
+    // Valid if has .nanna folder with at least SOUL.md or AGENTS.md
+    let is_valid = has_nanna_folder && (has_soul || has_agents);
     
     Ok(WorkspaceValidityCheck {
         exists: true,

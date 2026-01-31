@@ -25,7 +25,10 @@ pub enum WorkspaceError {
     Invalid(String),
 }
 
-/// Standard workspace files
+/// Hidden folder containing all Nanna workspace files
+pub const NANNA_FOLDER: &str = ".nanna";
+
+/// Standard workspace files (relative to NANNA_FOLDER)
 pub const AGENTS_FILE: &str = "AGENTS.md";
 pub const SOUL_FILE: &str = "SOUL.md";
 pub const USER_FILE: &str = "USER.md";
@@ -34,15 +37,13 @@ pub const MEMORY_FILE: &str = "MEMORY.md";
 pub const IDENTITY_FILE: &str = "IDENTITY.md";
 pub const HEARTBEAT_FILE: &str = "HEARTBEAT.md";
 
-/// Memory folder for daily notes
+/// Memory folder for daily notes (inside NANNA_FOLDER)
 pub const MEMORY_FOLDER: &str = "memory";
 
-/// Files that indicate a workspace root
+/// Files/folders that indicate a workspace root
 pub const WORKSPACE_MARKERS: &[&str] = &[
-    AGENTS_FILE,
-    SOUL_FILE,
-    ".nanna",        // Explicit marker file
-    "nanna.toml",    // Config file
+    NANNA_FOLDER,    // .nanna folder (primary marker)
+    "nanna.toml",    // Legacy: Config file at root
 ];
 
 /// Workspace context files loaded from disk
@@ -167,19 +168,40 @@ impl Workspace {
         self
     }
 
+    /// Get path to the .nanna folder
+    #[must_use]
+    pub fn nanna_folder(&self) -> PathBuf {
+        self.path.join(NANNA_FOLDER)
+    }
+
+    /// Ensure .nanna folder exists
+    ///
+    /// # Errors
+    /// Returns `WorkspaceError::Io` if folder cannot be created.
+    pub async fn ensure_nanna_folder(&self) -> Result<PathBuf, WorkspaceError> {
+        let folder = self.nanna_folder();
+        if !folder.exists() {
+            fs::create_dir_all(&folder).await?;
+            info!("Created .nanna folder: {:?}", folder);
+        }
+        Ok(folder)
+    }
+
     /// Load context files from disk
     ///
     /// # Errors
     /// Returns `WorkspaceError::Io` if files cannot be read.
     pub async fn load_context(&mut self) -> Result<(), WorkspaceError> {
+        let nanna = self.nanna_folder();
+        
         self.context = WorkspaceContext {
-            agents: read_optional_file(&self.path.join(AGENTS_FILE)).await?,
-            soul: read_optional_file(&self.path.join(SOUL_FILE)).await?,
-            user: read_optional_file(&self.path.join(USER_FILE)).await?,
-            tools: read_optional_file(&self.path.join(TOOLS_FILE)).await?,
-            memory: read_optional_file(&self.path.join(MEMORY_FILE)).await?,
-            identity: read_optional_file(&self.path.join(IDENTITY_FILE)).await?,
-            heartbeat: read_optional_file(&self.path.join(HEARTBEAT_FILE)).await?,
+            agents: read_optional_file(&nanna.join(AGENTS_FILE)).await?,
+            soul: read_optional_file(&nanna.join(SOUL_FILE)).await?,
+            user: read_optional_file(&nanna.join(USER_FILE)).await?,
+            tools: read_optional_file(&nanna.join(TOOLS_FILE)).await?,
+            memory: read_optional_file(&nanna.join(MEMORY_FILE)).await?,
+            identity: read_optional_file(&nanna.join(IDENTITY_FILE)).await?,
+            heartbeat: read_optional_file(&nanna.join(HEARTBEAT_FILE)).await?,
         };
         
         self.last_accessed = chrono_timestamp();
@@ -198,16 +220,17 @@ impl Workspace {
     /// # Errors
     /// Returns `WorkspaceError::Io` if file cannot be written.
     pub async fn save_context_file(&self, filename: &str, content: &str) -> Result<(), WorkspaceError> {
-        let path = self.path.join(filename);
+        self.ensure_nanna_folder().await?;
+        let path = self.nanna_folder().join(filename);
         fs::write(&path, content).await?;
         info!("Saved workspace file: {:?}", path);
         Ok(())
     }
 
-    /// Get path to memory folder
+    /// Get path to memory folder (inside .nanna)
     #[must_use]
     pub fn memory_folder(&self) -> PathBuf {
-        self.path.join(MEMORY_FOLDER)
+        self.nanna_folder().join(MEMORY_FOLDER)
     }
 
     /// Get path to today's memory file
@@ -488,7 +511,10 @@ mod tests {
     #[tokio::test]
     async fn test_workspace_load_context() {
         let dir = tempdir().unwrap();
-        let soul_path = dir.path().join(SOUL_FILE);
+        // Create .nanna folder and files inside it
+        let nanna_folder = dir.path().join(NANNA_FOLDER);
+        std::fs::create_dir(&nanna_folder).unwrap();
+        let soul_path = nanna_folder.join(SOUL_FILE);
         std::fs::write(&soul_path, "Test soul content").unwrap();
         
         let mut ws = Workspace::new(dir.path());
@@ -501,8 +527,9 @@ mod tests {
     #[tokio::test]
     async fn test_find_workspace_root() {
         let dir = tempdir().unwrap();
-        let agents_path = dir.path().join(AGENTS_FILE);
-        std::fs::write(&agents_path, "# AGENTS").unwrap();
+        // Create .nanna folder as workspace marker
+        let nanna_folder = dir.path().join(NANNA_FOLDER);
+        std::fs::create_dir(&nanna_folder).unwrap();
         
         // Create a subdirectory
         let subdir = dir.path().join("subdir");
