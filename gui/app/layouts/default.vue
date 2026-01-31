@@ -86,6 +86,14 @@
             <span>Memory</span>
           </NuxtLink>
           <NuxtLink 
+            to="/workspaces" 
+            @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <FolderKanban class="w-4 h-4" />
+            <span>Workspaces</span>
+          </NuxtLink>
+          <NuxtLink 
             to="/channels" 
             @click="sidebarOpen = false"
             class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
@@ -176,6 +184,13 @@
             <span>Memory</span>
           </NuxtLink>
           <NuxtLink 
+            to="/workspaces" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <FolderKanban class="w-4 h-4" />
+            <span>Workspaces</span>
+          </NuxtLink>
+          <NuxtLink 
             to="/channels" 
             class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
@@ -217,7 +232,7 @@
 import { ref, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Menu, Plus, Brain, Radio, Settings, ChevronDown } from 'lucide-vue-next'
+import { Menu, Plus, Brain, Radio, Settings, ChevronDown, FolderKanban } from 'lucide-vue-next'
 
 interface SessionInfo {
   id: string
