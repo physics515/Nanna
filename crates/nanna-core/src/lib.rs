@@ -7,6 +7,7 @@
 
 mod dreaming;
 mod scheduler;
+mod workspace;
 
 pub use dreaming::{
     DreamingRuntime, DreamingRuntimeConfig, create_dreaming_executor,
@@ -15,6 +16,12 @@ pub use scheduler::{
     Scheduler, SchedulerConfig, ScheduledTask, TaskType, TaskResult, TaskExecutor,
     heartbeat_task, recurring_task, delayed_task, consolidation_task,
     DREAMING_TASK_NAME, is_dreaming_task,
+};
+pub use workspace::{
+    Workspace, WorkspaceContext, WorkspaceError, WorkspaceRegistry,
+    find_workspace_root, discover_workspaces, is_workspace_root,
+    AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, 
+    IDENTITY_FILE, HEARTBEAT_FILE, MEMORY_FOLDER, WORKSPACE_MARKERS,
 };
 
 pub use nanna_channels::{

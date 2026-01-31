@@ -7,6 +7,9 @@ use nanna_config::Config;
 use nanna_core::{
     Scheduler, SchedulerConfig, consolidation_task,
     MemoryService, MemoryServiceConfig, ConsolidationConfig,
+    // Workspaces
+    Workspace, WorkspaceRegistry, 
+    find_workspace_root, discover_workspaces,
 };
 use nanna_llm::{AnthropicMessage, LlmClient, RequestBuilder, StreamEvent};
 use nanna_storage::{Storage, StorageConfig};
@@ -113,6 +116,8 @@ pub struct AppState {
     active_model: Arc<RwLock<String>>,
     /// Models currently on cooldown due to rate limits (model_id -> cooldown_until timestamp)
     rate_limited_models: Arc<RwLock<HashMap<String, i64>>>,
+    /// Workspace registry for multi-workspace support
+    workspaces: Arc<RwLock<WorkspaceRegistry>>,
 }
 
 /// Model status event for frontend
@@ -2877,6 +2882,231 @@ struct TestConnectionResult {
 }
 
 // =============================================================================
+// Workspace Commands
+// =============================================================================
+
+/// Workspace info for frontend
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub active: bool,
+    pub has_agents: bool,
+    pub has_soul: bool,
+    pub has_user: bool,
+    pub has_memory: bool,
+    pub context_chars: usize,
+}
+
+impl From<&Workspace> for WorkspaceInfo {
+    fn from(ws: &Workspace) -> Self {
+        Self {
+            id: ws.id.clone(),
+            name: ws.name.clone(),
+            path: ws.path.to_string_lossy().to_string(),
+            active: ws.active,
+            has_agents: ws.context.agents.is_some(),
+            has_soul: ws.context.soul.is_some(),
+            has_user: ws.context.user.is_some(),
+            has_memory: ws.context.memory.is_some(),
+            context_chars: ws.context.total_chars(),
+        }
+    }
+}
+
+/// List all registered workspaces
+#[tauri::command]
+async fn list_workspaces(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<WorkspaceInfo>, String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    Ok(registry.list().iter().map(|ws| WorkspaceInfo::from(*ws)).collect())
+}
+
+/// Open a workspace by path
+#[tauri::command]
+async fn open_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    path: String,
+) -> Result<WorkspaceInfo, String> {
+    let state_guard = state.read().await;
+    let mut registry = state_guard.workspaces.write().await;
+    
+    let path = std::path::PathBuf::from(&path);
+    
+    // Check if already registered
+    if let Some(ws) = registry.get_by_path(&path) {
+        return Ok(WorkspaceInfo::from(ws));
+    }
+    
+    // Create and load new workspace
+    let mut workspace = Workspace::new(&path);
+    workspace.load_context().await
+        .map_err(|e| format!("Failed to load workspace: {}", e))?;
+    
+    let id = registry.register(workspace);
+    registry.set_active(&id);
+    
+    let ws = registry.get(&id).unwrap();
+    info!("Opened workspace: {} at {:?}", ws.name, path);
+    
+    Ok(WorkspaceInfo::from(ws))
+}
+
+/// Set active workspace
+#[tauri::command]
+async fn set_active_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    id: String,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let mut registry = state_guard.workspaces.write().await;
+    
+    if registry.set_active(&id) {
+        info!("Activated workspace: {}", id);
+        Ok(())
+    } else {
+        Err(format!("Workspace not found: {}", id))
+    }
+}
+
+/// Get active workspace info
+#[tauri::command]
+async fn get_active_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Option<WorkspaceInfo>, String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    Ok(registry.active().map(WorkspaceInfo::from))
+}
+
+/// Get workspace context (for system prompt injection)
+#[tauri::command]
+async fn get_workspace_context(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    id: String,
+) -> Result<String, String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    
+    let ws = registry.get(&id)
+        .ok_or_else(|| format!("Workspace not found: {}", id))?;
+    
+    Ok(ws.context.build_system_prompt_injection())
+}
+
+/// Reload workspace context from disk
+#[tauri::command]
+async fn reload_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    id: String,
+) -> Result<WorkspaceInfo, String> {
+    let state_guard = state.read().await;
+    let mut registry = state_guard.workspaces.write().await;
+    
+    let ws = registry.get_mut(&id)
+        .ok_or_else(|| format!("Workspace not found: {}", id))?;
+    
+    ws.load_context().await
+        .map_err(|e| format!("Failed to reload workspace: {}", e))?;
+    
+    info!("Reloaded workspace: {}", ws.name);
+    Ok(WorkspaceInfo::from(&*ws))
+}
+
+/// Close a workspace
+#[tauri::command]
+async fn close_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    id: String,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let mut registry = state_guard.workspaces.write().await;
+    
+    if registry.remove(&id).is_some() {
+        info!("Closed workspace: {}", id);
+        Ok(())
+    } else {
+        Err(format!("Workspace not found: {}", id))
+    }
+}
+
+/// Discover workspaces in a directory
+#[tauri::command]
+async fn discover_workspaces_in_path(
+    path: String,
+) -> Result<Vec<String>, String> {
+    let paths = discover_workspaces(&path).await;
+    Ok(paths.iter().map(|p| p.to_string_lossy().to_string()).collect())
+}
+
+/// Find workspace root from a path (walks up)
+#[tauri::command]
+async fn find_workspace_root_from_path(
+    path: String,
+) -> Result<Option<String>, String> {
+    let root = find_workspace_root(&path).await;
+    Ok(root.map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Save content to a workspace file
+#[tauri::command]
+async fn save_workspace_file(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    workspace_id: String,
+    filename: String,
+    content: String,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    
+    let ws = registry.get(&workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+    
+    ws.save_context_file(&filename, &content).await
+        .map_err(|e| format!("Failed to save file: {}", e))?;
+    
+    Ok(())
+}
+
+/// Append to today's memory file
+#[tauri::command]
+async fn append_workspace_memory(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    workspace_id: String,
+    content: String,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    
+    let ws = registry.get(&workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+    
+    ws.append_to_daily_memory(&content).await
+        .map_err(|e| format!("Failed to append memory: {}", e))?;
+    
+    Ok(())
+}
+
+/// Get recent memory (today + yesterday)
+#[tauri::command]
+async fn get_workspace_recent_memory(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    workspace_id: String,
+) -> Result<String, String> {
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    
+    let ws = registry.get(&workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+    
+    ws.read_recent_memory().await
+        .map_err(|e| format!("Failed to read memory: {}", e))
+}
+
+// =============================================================================
 // Channel Status Commands
 // =============================================================================
 
@@ -3330,6 +3560,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         active_model: Arc::new(RwLock::new(initial_active_model)),
         // Rate limited models (empty at startup)
         rate_limited_models: Arc::new(RwLock::new(HashMap::new())),
+        // Workspace registry (empty at startup, populated as workspaces are opened)
+        workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
     })
 }
 
@@ -3442,6 +3674,19 @@ pub fn run() {
             // Model status
             get_model_status,
             clear_rate_limit,
+            // Workspaces
+            list_workspaces,
+            open_workspace,
+            set_active_workspace,
+            get_active_workspace,
+            get_workspace_context,
+            reload_workspace,
+            close_workspace,
+            discover_workspaces_in_path,
+            find_workspace_root_from_path,
+            save_workspace_file,
+            append_workspace_memory,
+            get_workspace_recent_memory,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
