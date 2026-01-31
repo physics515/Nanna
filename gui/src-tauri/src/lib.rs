@@ -30,35 +30,189 @@ use tracing::{debug, error, info, warn};
 // Context Management Constants
 // =============================================================================
 
-/// Maximum tokens for conversation context (leaves room for response)
-const MAX_CONTEXT_TOKENS: usize = 100_000;
+/// Target context budget (leaves room for system prompt + response)
+/// Most models have 200k context, but we aim lower for safety
+const TARGET_CONTEXT_TOKENS: usize = 150_000;
+
+/// Reserved tokens for system prompt, memory context, workspace context
+const SYSTEM_RESERVED_TOKENS: usize = 10_000;
+
+/// Reserved tokens for model response
+const RESPONSE_RESERVED_TOKENS: usize = 8_000;
+
+/// Maximum tokens available for conversation (history + tool results)
+const MAX_CONVERSATION_TOKENS: usize = TARGET_CONTEXT_TOKENS - SYSTEM_RESERVED_TOKENS - RESPONSE_RESERVED_TOKENS;
 
 /// Maximum characters per individual message before truncation
 const MAX_MESSAGE_CHARS: usize = 50_000;
 
-/// Maximum characters per tool result before truncation
-/// Tool results can be large (file contents, web pages) so limit aggressively
-const MAX_TOOL_RESULT_CHARS: usize = 100_000;
+/// Initial budget for each tool result (can be reduced if over total budget)
+const INITIAL_TOOL_RESULT_CHARS: usize = 80_000;
+
+/// Minimum tool result chars (never truncate below this)
+const MIN_TOOL_RESULT_CHARS: usize = 4_000;
 
 /// Rough estimate: ~4 characters per token
 fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
+/// Smart truncation for tool results based on content type
+fn smart_truncate_tool_result(content: &str, tool_name: &str, budget_chars: usize) -> String {
+    if content.len() <= budget_chars {
+        return content.to_string();
+    }
+    
+    // Apply tool-specific truncation strategies
+    match tool_name {
+        "read_file" => truncate_code_content(content, budget_chars),
+        "exec" => truncate_command_output(content, budget_chars),
+        "web_fetch" => truncate_web_content(content, budget_chars),
+        "web_search" | "web_search_batch" => truncate_search_results(content, budget_chars),
+        _ => truncate_generic(content, budget_chars),
+    }
+}
+
+/// Truncate code/file content: keep head + tail with middle omitted
+fn truncate_code_content(content: &str, budget_chars: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    
+    // For small files, just do generic truncation
+    if total_lines <= 200 || content.len() <= budget_chars * 2 {
+        return truncate_generic(content, budget_chars);
+    }
+    
+    // Calculate how many lines we can show (rough estimate)
+    let avg_line_len = content.len() / total_lines;
+    let target_lines = budget_chars / avg_line_len.max(1);
+    let head_lines = target_lines * 2 / 3; // 2/3 for head
+    let tail_lines = target_lines / 3;      // 1/3 for tail
+    
+    let head_lines = head_lines.min(total_lines / 2).max(20);
+    let tail_lines = tail_lines.min(total_lines / 2).max(10);
+    
+    if head_lines + tail_lines >= total_lines {
+        return truncate_generic(content, budget_chars);
+    }
+    
+    let head = lines[..head_lines].join("\n");
+    let tail = lines[total_lines - tail_lines..].join("\n");
+    let omitted = total_lines - head_lines - tail_lines;
+    
+    format!(
+        "{}\n\n... [{} lines omitted - showing first {} and last {} of {} total lines] ...\n\n{}",
+        head, omitted, head_lines, tail_lines, total_lines, tail
+    )
+}
+
+/// Truncate command output: keep recent output (tail) which is usually most relevant
+fn truncate_command_output(content: &str, budget_chars: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    
+    if content.len() <= budget_chars {
+        return content.to_string();
+    }
+    
+    // For command output, tail is usually more important
+    let avg_line_len = content.len() / total_lines.max(1);
+    let target_lines = budget_chars / avg_line_len.max(1);
+    let head_lines = target_lines / 4;      // 1/4 for head (context)
+    let tail_lines = target_lines * 3 / 4;  // 3/4 for tail (results)
+    
+    let head_lines = head_lines.min(50).max(5);
+    let tail_lines = tail_lines.min(total_lines - head_lines).max(20);
+    
+    if head_lines + tail_lines >= total_lines {
+        return truncate_generic(content, budget_chars);
+    }
+    
+    let head = lines[..head_lines].join("\n");
+    let tail = lines[total_lines - tail_lines..].join("\n");
+    let omitted = total_lines - head_lines - tail_lines;
+    
+    format!(
+        "{}\n\n... [{} lines of output omitted] ...\n\n{}",
+        head, omitted, tail
+    )
+}
+
+/// Truncate web content: extract key sections
+fn truncate_web_content(content: &str, budget_chars: usize) -> String {
+    if content.len() <= budget_chars {
+        return content.to_string();
+    }
+    
+    // Web content: prioritize beginning (usually has summary/intro)
+    // and a bit of the end (conclusions)
+    let head_budget = budget_chars * 4 / 5;
+    let tail_budget = budget_chars / 5;
+    
+    let head = if content.len() > head_budget {
+        &content[..head_budget]
+    } else {
+        content
+    };
+    
+    let tail = if content.len() > budget_chars {
+        let tail_start = content.len().saturating_sub(tail_budget);
+        &content[tail_start..]
+    } else {
+        ""
+    };
+    
+    let omitted = content.len().saturating_sub(head_budget + tail_budget);
+    
+    if omitted > 0 && !tail.is_empty() {
+        format!(
+            "{}\n\n... [{} chars omitted] ...\n\n{}",
+            head, omitted, tail
+        )
+    } else {
+        format!("{}...\n\n[Content truncated - {} chars removed]", head, content.len() - head.len())
+    }
+}
+
+/// Truncate search results: keep all results but shorten snippets
+fn truncate_search_results(content: &str, budget_chars: usize) -> String {
+    // For search results, try to keep the structure but shorten each result
+    if content.len() <= budget_chars {
+        return content.to_string();
+    }
+    
+    // Simple approach: truncate from the end but try to keep structure
+    truncate_generic(content, budget_chars)
+}
+
+/// Generic truncation: head with truncation notice
+fn truncate_generic(content: &str, budget_chars: usize) -> String {
+    if content.len() <= budget_chars {
+        return content.to_string();
+    }
+    
+    // Find a good break point (newline or space) near the budget
+    let break_point = content[..budget_chars]
+        .rfind('\n')
+        .or_else(|| content[..budget_chars].rfind(' '))
+        .unwrap_or(budget_chars);
+    
+    let truncated = &content[..break_point];
+    let removed = content.len() - break_point;
+    
+    format!(
+        "{}\n\n[... {} chars truncated ...]",
+        truncated, removed
+    )
+}
+
 /// Truncate a single message if too long
 fn truncate_message(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
-        content.to_string()
-    } else {
-        let truncated = &content[..max_chars];
-        format!("{}...\n\n[Message truncated - {} chars removed]", 
-                truncated, content.len() - max_chars)
-    }
+    truncate_generic(content, max_chars)
 }
 
 /// Truncate conversation history to fit within token budget.
 /// Keeps most recent messages, drops oldest when over budget.
-/// Returns (truncated messages, was truncated)
 fn truncate_context(
     messages: &[nanna_storage::Message],
     max_tokens: usize,
@@ -87,6 +241,51 @@ fn truncate_context(
     // Reverse back to chronological order
     result.reverse();
     result
+}
+
+/// Calculate total token budget used by tool results
+fn calculate_tool_results_tokens(tool_results: &[(String, String, bool)]) -> usize {
+    tool_results.iter()
+        .map(|(_, content, _)| estimate_tokens(content))
+        .sum()
+}
+
+/// Fit tool results within a token budget by progressively truncating
+fn fit_tool_results_to_budget(
+    tool_results: Vec<(String, String, String, bool)>, // (id, name, content, is_error)
+    budget_tokens: usize,
+) -> Vec<(String, String, bool)> { // (id, content, is_error)
+    let mut results: Vec<(String, String, String, bool)> = tool_results;
+    
+    // First pass: calculate total
+    let total_tokens: usize = results.iter()
+        .map(|(_, _, content, _)| estimate_tokens(content))
+        .sum();
+    
+    if total_tokens <= budget_tokens {
+        // Within budget, return as-is
+        return results.into_iter()
+            .map(|(id, _, content, is_error)| (id, content, is_error))
+            .collect();
+    }
+    
+    // Need to truncate - calculate per-result budget
+    let num_results = results.len();
+    let per_result_budget_tokens = budget_tokens / num_results.max(1);
+    let per_result_budget_chars = (per_result_budget_tokens * 4).max(MIN_TOOL_RESULT_CHARS);
+    
+    info!(
+        "Tool results over budget ({} > {} tokens). Truncating {} results to ~{} chars each",
+        total_tokens, budget_tokens, num_results, per_result_budget_chars
+    );
+    
+    // Truncate each result
+    results.into_iter()
+        .map(|(id, name, content, is_error)| {
+            let truncated = smart_truncate_tool_result(&content, &name, per_result_budget_chars);
+            (id, truncated, is_error)
+        })
+        .collect()
 }
 
 /// Application state shared across commands
@@ -465,7 +664,7 @@ Be concise. Be useful. Be present.{}
     request = request.with_message(nanna_llm::Message::system(&system_prompt));
 
     // Add history with context truncation
-    let truncated_history = truncate_context(&history, MAX_CONTEXT_TOKENS);
+    let truncated_history = truncate_context(&history, MAX_CONVERSATION_TOKENS);
     for msg in &truncated_history {
         let llm_msg = match msg.role.as_str() {
             "user" => nanna_llm::Message::user(&msg.content),
@@ -1001,7 +1200,8 @@ async fn run_agent_loop(
         }
 
         // Execute tool calls in PARALLEL and build messages for next turn
-        let mut tool_results: Vec<(String, String, bool)> = Vec::new(); // (id, content, is_error)
+        // Collect with tool name for smart truncation: (id, name, content, is_error)
+        let mut tool_results_raw: Vec<(String, String, String, bool)> = Vec::new();
 
         // Emit "started" events for all tools
         for pending in &pending_tool_calls {
@@ -1090,24 +1290,29 @@ async fn run_agent_loop(
                 },
             );
 
-            all_tool_calls.push(tool_call_info);
+            all_tool_calls.push(tool_call_info.clone());
 
-            // Build tool result for next request
-            // Anthropic requires non-empty content when is_error is true
+            // Collect raw tool result (will be intelligently truncated below)
             let result_content = if response.result.content.is_empty() && !response.result.success {
                 "Tool execution failed".to_string()
             } else {
-                // CRITICAL: Truncate large tool results to prevent context overflow
-                // This prevents "prompt too long" errors when tools return huge outputs
-                truncate_message(&response.result.content, MAX_TOOL_RESULT_CHARS)
+                response.result.content
             };
             
-            tool_results.push((
-                id, // Use id from the tuple, not pending
+            tool_results_raw.push((
+                id,
+                tool_call_info.name,
                 result_content,
                 !response.result.success,
             ));
         }
+
+        // INTELLIGENT TRUNCATION: Fit all tool results within context budget
+        // Use a conservative budget for tool results (50k tokens = ~200k chars)
+        // This ensures we never exceed model context limits even with history
+        const TOOL_RESULTS_BUDGET_TOKENS: usize = 50_000;
+        
+        let tool_results = fit_tool_results_to_budget(tool_results_raw, TOOL_RESULTS_BUDGET_TOKENS);
 
         // Add assistant message with tool use blocks
         let mut assistant_content = Vec::new();
