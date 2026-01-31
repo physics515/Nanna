@@ -36,6 +36,10 @@ const MAX_CONTEXT_TOKENS: usize = 100_000;
 /// Maximum characters per individual message before truncation
 const MAX_MESSAGE_CHARS: usize = 50_000;
 
+/// Maximum characters per tool result before truncation
+/// Tool results can be large (file contents, web pages) so limit aggressively
+const MAX_TOOL_RESULT_CHARS: usize = 100_000;
+
 /// Rough estimate: ~4 characters per token
 fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
@@ -1093,7 +1097,9 @@ async fn run_agent_loop(
             let result_content = if response.result.content.is_empty() && !response.result.success {
                 "Tool execution failed".to_string()
             } else {
-                response.result.content
+                // CRITICAL: Truncate large tool results to prevent context overflow
+                // This prevents "prompt too long" errors when tools return huge outputs
+                truncate_message(&response.result.content, MAX_TOOL_RESULT_CHARS)
             };
             
             tool_results.push((
