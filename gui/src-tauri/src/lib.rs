@@ -46,11 +46,41 @@ const MAX_CONVERSATION_TOKENS: usize = TARGET_CONTEXT_TOKENS - SYSTEM_RESERVED_T
 /// Maximum characters per individual message before truncation
 const MAX_MESSAGE_CHARS: usize = 50_000;
 
-/// Initial budget for each tool result (can be reduced if over total budget)
-const INITIAL_TOOL_RESULT_CHARS: usize = 80_000;
-
 /// Minimum tool result chars (never truncate below this)
-const MIN_TOOL_RESULT_CHARS: usize = 4_000;
+const MIN_TOOL_RESULT_CHARS: usize = 2_000;
+
+// =============================================================================
+// Intelligent Context Budget Allocation
+// =============================================================================
+
+/// Model-specific context limits (in tokens)
+fn model_context_limit(model: &str) -> usize {
+    match model {
+        // Anthropic Claude 4 models
+        m if m.contains("claude-opus-4") => 200_000,
+        m if m.contains("claude-sonnet-4") => 200_000,
+        // Anthropic Claude 3.5 models
+        m if m.contains("claude-3-5") => 200_000,
+        m if m.contains("claude-3-opus") => 200_000,
+        m if m.contains("claude-3-sonnet") => 200_000,
+        m if m.contains("claude-3-haiku") => 200_000,
+        // OpenAI models
+        m if m.contains("gpt-4o") => 128_000,
+        m if m.contains("gpt-4-turbo") => 128_000,
+        m if m.contains("gpt-4") => 128_000,
+        m if m.contains("o1") || m.contains("o3") => 200_000,
+        // Google Gemini
+        m if m.contains("gemini-2") => 1_000_000,
+        m if m.contains("gemini-1.5") => 1_000_000,
+        m if m.contains("gemini") => 128_000,
+        // Ollama / local models - conservative default
+        m if m.contains("llama") => 32_000,
+        m if m.contains("mistral") => 32_000,
+        m if m.contains("qwen") => 32_000,
+        // Default conservative estimate
+        _ => 100_000,
+    }
+}
 
 /// Rough estimate: ~4 characters per token
 fn estimate_tokens(text: &str) -> usize {
@@ -243,49 +273,215 @@ fn truncate_context(
     result
 }
 
-/// Calculate total token budget used by tool results
-fn calculate_tool_results_tokens(tool_results: &[(String, String, bool)]) -> usize {
-    tool_results.iter()
-        .map(|(_, content, _)| estimate_tokens(content))
-        .sum()
+/// Tool result with metadata for intelligent allocation
+#[derive(Debug)]
+struct ToolResultEntry {
+    id: String,
+    name: String,
+    content: String,
+    is_error: bool,
+    raw_tokens: usize,
+    /// Index in original order (for recency bias - higher = more recent)
+    recency_index: usize,
 }
 
-/// Fit tool results within a token budget by progressively truncating
+/// Intelligent budget allocation across tool results.
+///
+/// Instead of equal division, allocates proportionally based on:
+/// 1. Original content size (larger results get proportionally more)
+/// 2. Recency bias (recent tool calls get slight priority)
+/// 3. Minimum floor (never truncate below MIN_TOOL_RESULT_CHARS)
+fn allocate_tool_budgets(entries: &[ToolResultEntry], total_budget_tokens: usize) -> Vec<usize> {
+    let n = entries.len();
+    if n == 0 {
+        return vec![];
+    }
+    
+    let total_budget_chars = total_budget_tokens * 4;
+    let total_raw: usize = entries.iter().map(|e| e.raw_tokens).sum();
+    let total_raw_chars = total_raw * 4;
+    
+    // If everything fits, no truncation needed
+    if total_raw_chars <= total_budget_chars {
+        return entries.iter().map(|e| e.content.len()).collect();
+    }
+    
+    // Calculate minimum floor per tool
+    let floor_per_tool = MIN_TOOL_RESULT_CHARS;
+    let total_floor = floor_per_tool * n;
+    
+    // If we can't even give minimums, distribute equally
+    if total_budget_chars <= total_floor {
+        let per_tool = total_budget_chars / n;
+        return vec![per_tool.max(500); n]; // Absolute minimum 500 chars
+    }
+    
+    // Distributable budget after floors
+    let distributable = total_budget_chars - total_floor;
+    
+    // Calculate weights: base weight from size + recency bonus
+    let max_recency = entries.iter().map(|e| e.recency_index).max().unwrap_or(0) as f64;
+    
+    let weights: Vec<f64> = entries.iter().map(|e| {
+        // Base weight from original size (proportional)
+        let size_weight = (e.raw_tokens as f64) / (total_raw as f64).max(1.0);
+        
+        // Recency bonus: most recent gets up to 20% boost
+        let recency_factor = if max_recency > 0.0 {
+            1.0 + 0.2 * (e.recency_index as f64 / max_recency)
+        } else {
+            1.0
+        };
+        
+        size_weight * recency_factor
+    }).collect();
+    
+    // Normalize weights
+    let weight_sum: f64 = weights.iter().sum();
+    let normalized: Vec<f64> = weights.iter().map(|w| w / weight_sum.max(0.001)).collect();
+    
+    // Allocate: floor + proportional share
+    let mut allocations: Vec<usize> = normalized.iter().map(|w| {
+        let extra = (distributable as f64 * w) as usize;
+        floor_per_tool + extra
+    }).collect();
+    
+    // Cap allocations at actual content size (don't allocate more than needed)
+    for (i, entry) in entries.iter().enumerate() {
+        allocations[i] = allocations[i].min(entry.content.len());
+    }
+    
+    allocations
+}
+
+/// Fit tool results within a token budget using intelligent proportional allocation.
+///
+/// Key improvements over naive equal division:
+/// - Proportional: larger results get proportionally more budget
+/// - Recency bias: recent tool calls get priority (20% boost for most recent)
+/// - Minimum floor: every result gets at least MIN_TOOL_RESULT_CHARS
+/// - Smart truncation: tool-specific strategies (code head/tail, command tail-biased, etc.)
 fn fit_tool_results_to_budget(
     tool_results: Vec<(String, String, String, bool)>, // (id, name, content, is_error)
     budget_tokens: usize,
 ) -> Vec<(String, String, bool)> { // (id, content, is_error)
-    let mut results: Vec<(String, String, String, bool)> = tool_results;
+    if tool_results.is_empty() {
+        return vec![];
+    }
     
-    // First pass: calculate total
-    let total_tokens: usize = results.iter()
-        .map(|(_, _, content, _)| estimate_tokens(content))
-        .sum();
+    // Build entries with metadata
+    let entries: Vec<ToolResultEntry> = tool_results
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (id, name, content, is_error))| {
+            let raw_tokens = estimate_tokens(&content);
+            ToolResultEntry {
+                id,
+                name,
+                content,
+                is_error,
+                raw_tokens,
+                recency_index: idx,
+            }
+        })
+        .collect();
     
-    if total_tokens <= budget_tokens {
-        // Within budget, return as-is
-        return results.into_iter()
-            .map(|(id, _, content, is_error)| (id, content, is_error))
+    // Calculate total raw tokens
+    let total_raw_tokens: usize = entries.iter().map(|e| e.raw_tokens).sum();
+    
+    // If within budget, return as-is
+    if total_raw_tokens <= budget_tokens {
+        return entries.into_iter()
+            .map(|e| (e.id, e.content, e.is_error))
             .collect();
     }
     
-    // Need to truncate - calculate per-result budget
-    let num_results = results.len();
-    let per_result_budget_tokens = budget_tokens / num_results.max(1);
-    let per_result_budget_chars = (per_result_budget_tokens * 4).max(MIN_TOOL_RESULT_CHARS);
+    // Allocate budgets intelligently
+    let allocations = allocate_tool_budgets(&entries, budget_tokens);
     
+    // Log the allocation strategy
     info!(
-        "Tool results over budget ({} > {} tokens). Truncating {} results to ~{} chars each",
-        total_tokens, budget_tokens, num_results, per_result_budget_chars
+        "Tool results over budget ({} > {} tokens, {} results). Allocating proportionally with recency bias.",
+        total_raw_tokens, budget_tokens, entries.len()
     );
     
-    // Truncate each result
-    results.into_iter()
-        .map(|(id, name, content, is_error)| {
-            let truncated = smart_truncate_tool_result(&content, &name, per_result_budget_chars);
-            (id, truncated, is_error)
+    for (entry, alloc) in entries.iter().zip(allocations.iter()) {
+        if entry.content.len() > *alloc {
+            debug!(
+                "  {} ({}): {} -> {} chars ({:.0}% of original)",
+                entry.name,
+                entry.id.chars().take(8).collect::<String>(),
+                entry.content.len(),
+                alloc,
+                (*alloc as f64 / entry.content.len() as f64) * 100.0
+            );
+        }
+    }
+    
+    // Apply truncation with allocated budgets
+    entries.into_iter()
+        .zip(allocations)
+        .map(|(entry, budget_chars)| {
+            let truncated = if entry.content.len() <= budget_chars {
+                entry.content
+            } else {
+                smart_truncate_tool_result(&entry.content, &entry.name, budget_chars)
+            };
+            (entry.id, truncated, entry.is_error)
         })
         .collect()
+}
+
+/// Estimate tokens used by a CompletionRequest (for dynamic budget calculation)
+fn estimate_request_tokens(request: &nanna_llm::CompletionRequest) -> usize {
+    let mut total = 0;
+    
+    // Message tokens (includes system message with Role::System)
+    for msg in &request.messages {
+        total += estimate_tokens(&msg.content);
+    }
+    
+    // Anthropic message tokens (tool use blocks are larger)
+    for msg in &request.anthropic_messages {
+        for block in &msg.content {
+            total += match block {
+                nanna_llm::ContentBlock::Text { text } => estimate_tokens(text),
+                nanna_llm::ContentBlock::ToolUse { input, .. } => {
+                    // Tool use: id + name + JSON input
+                    50 + estimate_tokens(&input.to_string())
+                }
+                nanna_llm::ContentBlock::ToolResult { content, .. } => {
+                    // Tool result: id + content
+                    20 + estimate_tokens(content)
+                }
+                nanna_llm::ContentBlock::Image { .. } => 1000, // Images ~1k tokens
+            };
+        }
+    }
+    
+    // Tool definitions overhead (~100 tokens per tool)
+    total += request.tools.len() * 100;
+    
+    total
+}
+
+/// Calculate dynamic tool budget from a CompletionRequest
+fn calculate_dynamic_tool_budget(request: &nanna_llm::CompletionRequest) -> usize {
+    let model = &request.model;
+    let total_limit = model_context_limit(model);
+    let used = estimate_request_tokens(request);
+    let response_reserve = RESPONSE_RESERVED_TOKENS;
+    
+    let available = total_limit.saturating_sub(used).saturating_sub(response_reserve);
+    
+    // Log the calculation
+    debug!(
+        "Dynamic tool budget: model={}, limit={}, used={}, reserve={}, available={}",
+        model, total_limit, used, response_reserve, available
+    );
+    
+    // Return at least a minimum budget to avoid degenerate cases
+    available.max(10_000) // At least 10k tokens for tools
 }
 
 /// Application state shared across commands
@@ -1311,12 +1507,12 @@ async fn run_agent_loop(
             ));
         }
 
-        // INTELLIGENT TRUNCATION: Fit all tool results within context budget
-        // Use a conservative budget for tool results (50k tokens = ~200k chars)
-        // This ensures we never exceed model context limits even with history
-        const TOOL_RESULTS_BUDGET_TOKENS: usize = 50_000;
+        // INTELLIGENT TRUNCATION: Fit all tool results within dynamically calculated budget
+        // Budget is based on: model context limit - (system + history + response reserve)
+        // This replaces the old hardcoded 50k constant with actual remaining context space
+        let tool_budget = calculate_dynamic_tool_budget(&request);
         
-        let tool_results = fit_tool_results_to_budget(tool_results_raw, TOOL_RESULTS_BUDGET_TOKENS);
+        let tool_results = fit_tool_results_to_budget(tool_results_raw, tool_budget);
 
         // Add assistant message with tool use blocks
         let mut assistant_content = Vec::new();
