@@ -136,7 +136,7 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
   - [x] WhatsApp: Cloud API + Web bridge modes, full setup flow
 - [x] **Credential management** - secure input/storage for tokens and keys
 - [x] **Connection testing** - verify credentials work before saving
-- [ ] **Channel status live updates** - real-time connection health (WebSocket)
+- [x] **Channel status live updates** - real-time connection health via Tauri events
 
 ### Build Artifacts (Windows)
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
@@ -179,10 +179,10 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [ ] Runtime config reload
 - [ ] Per-channel config
 - [ ] Tool allowlists/blocklists
-- [ ] Rate limiting (outbound)
-- [ ] Error recovery / retry logic
-- [ ] **Message queuing** - queue outbound messages to handle bursts and offline periods
-- [ ] **Graceful rate limit handling** - detect 429s, backoff, queue, and retry with exponential delay
+- [x] **Rate limiting (outbound)** - token bucket per channel with provider-specific defaults
+- [x] **Error recovery / retry logic** - exponential backoff with jitter
+- [x] **Message queuing** - priority queue with burst handling and offline resilience
+- [x] **Graceful rate limit handling** - detect 429s, backoff, queue, and retry with exponential delay
 
 ---
 
@@ -236,7 +236,9 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 44 | ~~Channels: Slack/Signal/WhatsApp wizards~~ | ✅ Done |
 | 45 | ~~System prompt editor~~ | ✅ Done |
 | 46 | ~~Config import/export~~ | ✅ Done |
-| 47 | Message queuing | 🔜 |
-| 48 | Graceful rate limit handling | 🔜 |
+| 47 | ~~Message queuing~~ | ✅ Done |
+| 48 | ~~Graceful rate limit handling~~ | ✅ Done |
 | 49 | ~~Intelligent tool output truncation~~ | ✅ Done |
-| 50 | Channel status live updates (WebSocket) | Later |
+| 50 | ~~Channel status live updates~~ | ✅ Done |
+| 51 | Prometheus metrics | 🔜 |
+| 52 | Cost tracking per session | Later |
