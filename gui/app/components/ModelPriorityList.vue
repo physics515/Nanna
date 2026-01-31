@@ -12,8 +12,8 @@
     <div 
       ref="dropZone"
       class="space-y-1 min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-nanna-primary/20"
-      @dragover.prevent
-      @dragenter.prevent
+      @dragover.prevent="onContainerDragOver"
+      @dragenter.prevent="onContainerDragOver"
       @drop.prevent="onDropOnContainer"
     >
       <div v-if="activeModels.length === 0" class="text-center py-4 text-sm text-nanna-text-dim">
@@ -26,9 +26,9 @@
         draggable="true"
         @dragstart="onDragStart($event, model, index)"
         @dragend="onDragEnd"
-        @dragenter.prevent="onDragEnter(index)"
-        @dragover.prevent="onDragOver(index)"
-        @dragleave="onDragLeave(index)"
+        @dragenter.prevent="onDragEnter($event, index)"
+        @dragover.prevent="onDragOver($event, index)"
+        @dragleave.prevent="onDragLeave($event, index)"
         @drop.prevent.stop="onDropOnItem($event, index)"
         :class="[
           'flex items-center gap-2 p-2 rounded-lg cursor-grab active:cursor-grabbing transition-all select-none',
@@ -86,8 +86,8 @@
       </summary>
       <div 
         class="mt-2 space-y-1 p-2 rounded-lg bg-nanna-bg-deep/50"
-        @dragover.prevent
-        @dragenter.prevent
+        @dragover.prevent="onContainerDragOver"
+        @dragenter.prevent="onContainerDragOver"
         @drop.prevent="onDropOnExcluded"
       >
         <div
@@ -235,19 +235,33 @@ function onDragEnd() {
   dragStartIndex.value = -1
 }
 
-function onDragEnter(index: number) {
+// Container dragover - must set dropEffect to allow drops
+function onContainerDragOver(event: DragEvent) {
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move'
+  }
+}
+
+function onDragEnter(event: DragEvent, index: number) {
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move'
+  }
   if (draggingId.value && dragStartIndex.value !== index) {
     dropTargetIndex.value = index
   }
 }
 
-function onDragOver(index: number) {
+function onDragOver(event: DragEvent, index: number) {
+  // CRITICAL: Must set dropEffect to allow drop (prevents 🚫 cursor)
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move'
+  }
   if (draggingId.value && dragStartIndex.value !== index) {
     dropTargetIndex.value = index
   }
 }
 
-function onDragLeave(index: number) {
+function onDragLeave(event: DragEvent, index: number) {
   if (dropTargetIndex.value === index) {
     dropTargetIndex.value = null
   }
