@@ -1402,9 +1402,9 @@ async fn create_session(
 /// - workspace_id = Some(id): Show sessions belonging to that workspace
 /// - workspace_id = None: Show only GLOBAL sessions (workspace_id IS NULL)
 /// 
-/// This enforces memory isolation:
-/// - Global sessions see only global memory
-/// - Workspace sessions see global + their workspace memory (not other workspaces)
+/// Memory access model:
+/// - Global sessions: Access ALL memory (global + all workspaces) - omniscient
+/// - Workspace sessions: Access global + their workspace's memory only - scoped
 #[tauri::command]
 async fn list_sessions(
     state: State<'_, Arc<RwLock<AppState>>>,

@@ -54,10 +54,24 @@
           </UiButton>
         </div>
         
+        <!-- Workspace indicator (mobile) -->
+        <div v-if="activeWorkspace" class="px-4 py-2 bg-nanna-accent/10 border-b border-nanna-accent/20">
+          <div class="flex items-center gap-2 text-xs">
+            <FolderKanban class="w-3 h-3 text-nanna-accent" />
+            <span class="text-nanna-accent font-medium truncate">{{ activeWorkspace.name }}</span>
+          </div>
+        </div>
+        <div v-else class="px-4 py-2 bg-nanna-bg-elevated/50 border-b border-nanna-primary/10">
+          <div class="flex items-center gap-2 text-xs text-nanna-text-dim">
+            <span>Global</span>
+            <span class="text-[10px] opacity-60">(all memory)</span>
+          </div>
+        </div>
+        
         <!-- Sessions list -->
-        <nav class="flex-1 px-4 space-y-1 overflow-y-auto">
+        <nav class="flex-1 px-4 space-y-1 overflow-y-auto pt-2">
           <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
-            Recent Chats
+            {{ activeWorkspace ? 'Workspace Chats' : 'Global Chats' }}
           </div>
           
           <SessionItem
@@ -71,7 +85,7 @@
           />
           
           <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
-            No chats yet
+            {{ activeWorkspace ? 'No workspace chats yet' : 'No global chats yet' }}
           </div>
         </nav>
         
@@ -153,10 +167,24 @@
           </UiButton>
         </div>
         
+        <!-- Workspace indicator -->
+        <div v-if="activeWorkspace" class="px-4 py-2 bg-nanna-accent/10 border-b border-nanna-accent/20">
+          <div class="flex items-center gap-2 text-xs">
+            <FolderKanban class="w-3 h-3 text-nanna-accent" />
+            <span class="text-nanna-accent font-medium truncate">{{ activeWorkspace.name }}</span>
+          </div>
+        </div>
+        <div v-else class="px-4 py-2 bg-nanna-bg-elevated/50 border-b border-nanna-primary/10">
+          <div class="flex items-center gap-2 text-xs text-nanna-text-dim">
+            <span>Global</span>
+            <span class="text-[10px] opacity-60">(all memory)</span>
+          </div>
+        </div>
+        
         <!-- Sessions list -->
-        <nav class="flex-1 px-4 space-y-1 overflow-y-auto">
+        <nav class="flex-1 px-4 space-y-1 overflow-y-auto pt-2">
           <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
-            Recent Chats
+            {{ activeWorkspace ? 'Workspace Chats' : 'Global Chats' }}
           </div>
           
           <SessionItem
@@ -170,7 +198,7 @@
           />
           
           <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
-            No chats yet
+            {{ activeWorkspace ? 'No workspace chats yet' : 'No global chats yet' }}
           </div>
         </nav>
         
@@ -240,6 +268,15 @@ interface SessionInfo {
   created_at: string
   updated_at: string
   message_count: number
+  workspace_id: string | null
+  workspace_name: string | null
+}
+
+interface WorkspaceInfo {
+  id: string
+  name: string
+  path: string
+  active: boolean
 }
 
 interface AppConfig {
@@ -255,17 +292,21 @@ const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
 const sidebarOpen = ref(false)
+const activeWorkspace = ref<WorkspaceInfo | null>(null)
 
 let unlistenTrayNewChat: UnlistenFn | null = null
 
 // Provide session switching to child components
 provide('currentSessionId', currentSessionId)
 provide('sessions', sessions)
+provide('activeWorkspace', activeWorkspace)
 
 // Initialize notifications
 const { checkPermission } = useNotifications()
 
 onMounted(async () => {
+  // Load active workspace first, then sessions (sessions filtered by workspace)
+  await loadActiveWorkspace()
   await loadSessions()
   await loadConfig()
   
@@ -300,9 +341,21 @@ watch(() => route.fullPath, () => {
   sidebarOpen.value = false
 })
 
+async function loadActiveWorkspace() {
+  try {
+    activeWorkspace.value = await invoke<WorkspaceInfo | null>('get_active_workspace')
+  } catch (e) {
+    console.error('Failed to load active workspace:', e)
+    activeWorkspace.value = null
+  }
+}
+
 async function loadSessions() {
   try {
-    sessions.value = await invoke<SessionInfo[]>('list_sessions')
+    // Pass workspace_id to filter sessions
+    // null = show only global sessions, Some(id) = show that workspace's sessions
+    const workspaceId = activeWorkspace.value?.id ?? null
+    sessions.value = await invoke<SessionInfo[]>('list_sessions', { workspaceId })
     const firstSession = sessions.value[0]
     if (firstSession && !currentSessionId.value) {
       currentSessionId.value = firstSession.id
@@ -323,7 +376,12 @@ async function loadConfig() {
 
 async function createNewSession() {
   try {
-    const session = await invoke<SessionInfo>('create_session', { name: null })
+    // Create session in the active workspace (or global if no workspace)
+    const workspaceId = activeWorkspace.value?.id ?? null
+    const session = await invoke<SessionInfo>('create_session', { 
+      name: null, 
+      workspaceId 
+    })
     currentSessionId.value = session.id
     
     // Reload sessions list from backend to avoid duplicates
