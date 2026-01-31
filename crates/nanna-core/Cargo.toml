@@ -21,3 +21,6 @@ nanna-memory = { path = "../nanna-memory" }
 nanna-storage = { path = "../nanna-storage" }
 
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
