@@ -361,6 +361,10 @@ pub struct SessionInfo {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: u32,
+    /// Workspace this session belongs to (None = global)
+    pub workspace_id: Option<String>,
+    /// Workspace name for display
+    pub workspace_name: Option<String>,
 }
 
 /// Streaming chunk event
@@ -1360,6 +1364,7 @@ async fn run_agent_loop(
 async fn create_session(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<SessionInfo, String> {
     let state_guard = state.read().await;
 
@@ -1367,9 +1372,17 @@ async fn create_session(
         format!("Chat {}", chrono::Utc::now().format("%Y-%m-%d %H:%M"))
     });
 
+    // Get workspace name if workspace_id provided
+    let workspace_name = if let Some(ref ws_id) = workspace_id {
+        let registry = state_guard.workspaces.read().await;
+        registry.get(ws_id).map(|ws| ws.name.clone())
+    } else {
+        None
+    };
+
     let session = state_guard
         .storage
-        .create_gui_session(&session_name)
+        .create_gui_session_with_workspace(&session_name, workspace_id.as_deref())
         .await
         .map_err(|e| format!("Failed to create session: {}", e))?;
 
@@ -1380,22 +1393,42 @@ async fn create_session(
         created_at: session.created_at,
         updated_at: session.updated_at,
         message_count: 0,
+        workspace_id: session.workspace_id,
+        workspace_name,
     })
 }
 
-/// List all sessions
+/// List all sessions (optionally filtered by workspace)
 #[tauri::command]
 async fn list_sessions(
     state: State<'_, Arc<RwLock<AppState>>>,
+    workspace_id: Option<String>,
 ) -> Result<Vec<SessionInfo>, String> {
     let state_guard = state.read().await;
 
-    let sessions = state_guard
-        .storage
-        .list_gui_sessions(100)
-        .await
-        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+    // Get sessions - if workspace_id is Some, filter by workspace
+    // If workspace_id is None, show ALL sessions (global view)
+    let sessions = match &workspace_id {
+        Some(ws_id) => {
+            state_guard
+                .storage
+                .list_gui_sessions_by_workspace(Some(ws_id), 100)
+                .await
+                .map_err(|e| format!("Failed to list sessions: {}", e))?
+        }
+        None => {
+            // Show all sessions when no workspace filter
+            state_guard
+                .storage
+                .list_gui_sessions(100)
+                .await
+                .map_err(|e| format!("Failed to list sessions: {}", e))?
+        }
+    };
 
+    // Build workspace name lookup
+    let registry = state_guard.workspaces.read().await;
+    
     let mut result = Vec::with_capacity(sessions.len());
     for s in sessions {
         let count = state_guard
@@ -1403,12 +1436,20 @@ async fn list_sessions(
             .count_session_messages(&s.session_id)
             .await
             .unwrap_or(0);
+        
+        // Get workspace name if session has workspace_id
+        let workspace_name = s.workspace_id.as_ref()
+            .and_then(|ws_id| registry.get(ws_id))
+            .map(|ws| ws.name.clone());
+        
         result.push(SessionInfo {
             id: s.session_id.clone(),
             name: Storage::get_session_name(&s),
             created_at: s.created_at,
             updated_at: s.updated_at,
             message_count: count as u32,
+            workspace_id: s.workspace_id.clone(),
+            workspace_name,
         });
     }
 

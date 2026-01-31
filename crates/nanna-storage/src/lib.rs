@@ -153,12 +153,23 @@ impl Storage {
 
     /// Create a new GUI session
     pub async fn create_gui_session(&self, name: &str) -> Result<Session, StorageError> {
+        self.create_gui_session_with_workspace(name, None).await
+    }
+
+    /// Create a new GUI session with optional workspace
+    pub async fn create_gui_session_with_workspace(&self, name: &str, workspace_id: Option<&str>) -> Result<Session, StorageError> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let conn = self.conn.write().await;
 
         conn.execute(
-            "INSERT INTO sessions (session_id, channel, user_id, metadata) VALUES (?1, 'gui', NULL, ?2)",
-            turso::params![session_id.as_str(), format!("{{\"name\":\"{}\"}}", name).as_str()],
+            "INSERT INTO sessions (session_id, channel, user_id, workspace_id, name, metadata) 
+             VALUES (?1, 'gui', NULL, ?2, ?3, ?4)",
+            turso::params![
+                session_id.as_str(), 
+                workspace_id,
+                name,
+                format!("{{\"name\":\"{}\"}}", name).as_str()
+            ],
         )
         .await?;
 
@@ -169,6 +180,11 @@ impl Storage {
     /// List sessions for GUI (with names from metadata)
     pub async fn list_gui_sessions(&self, limit: i64) -> Result<Vec<Session>, StorageError> {
         self.sessions().list_recent(limit).await
+    }
+
+    /// List sessions for GUI filtered by workspace
+    pub async fn list_gui_sessions_by_workspace(&self, workspace_id: Option<&str>, limit: i64) -> Result<Vec<Session>, StorageError> {
+        self.sessions().list_by_workspace(workspace_id, limit).await
     }
 
     /// Get messages for a session
@@ -245,14 +261,26 @@ impl Storage {
         Ok(())
     }
 
-    /// Get session name from metadata
+    /// Get session name - prefers name field, falls back to metadata, then generates one
     pub fn get_session_name(session: &Session) -> String {
+        // First try the name column
+        if let Some(name) = &session.name {
+            if !name.is_empty() {
+                return name.clone();
+            }
+        }
+        // Fall back to metadata
         session.metadata
             .as_ref()
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .map(String::from)
             .unwrap_or_else(|| format!("Session {}", &session.session_id[..8]))
+    }
+
+    /// Update session's workspace
+    pub async fn set_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
+        self.sessions().update_workspace(session_id, workspace_id).await
     }
 }
 
