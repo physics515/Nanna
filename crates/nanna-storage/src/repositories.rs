@@ -2,16 +2,16 @@
 
 use crate::{CronJob, Memory, Message, NewCronJob, NewMemory, NewMessage, Session, StorageError};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use turso::Connection;
 
 /// Session repository
 pub struct SessionRepository {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SessionRepository {
-    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
@@ -32,7 +32,7 @@ impl SessionRepository {
         workspace_id: Option<&str>,
         name: Option<&str>,
     ) -> Result<Session, StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         conn.execute(
             "INSERT INTO sessions (session_id, channel, user_id, workspace_id, name) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -46,7 +46,7 @@ impl SessionRepository {
     }
 
     pub async fn get(&self, session_id: &str) -> Result<Session, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -75,7 +75,7 @@ impl SessionRepository {
     }
 
     pub async fn list_recent(&self, limit: i64) -> Result<Vec<Session>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -106,7 +106,7 @@ impl SessionRepository {
 
     /// List sessions for a specific workspace (or global if workspace_id is None)
     pub async fn list_by_workspace(&self, workspace_id: Option<&str>, limit: i64) -> Result<Vec<Session>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = match workspace_id {
             Some(ws_id) => {
@@ -146,7 +146,7 @@ impl SessionRepository {
 
     /// Update session name
     pub async fn update_name(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE session_id = ?2",
             turso::params![name, session_id],
@@ -156,7 +156,7 @@ impl SessionRepository {
 
     /// Update session workspace
     pub async fn update_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sessions SET workspace_id = ?1, updated_at = datetime('now') WHERE session_id = ?2",
             turso::params![workspace_id, session_id],
@@ -167,16 +167,16 @@ impl SessionRepository {
 
 /// Message repository
 pub struct MessageRepository {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl MessageRepository {
-    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     pub async fn create(&self, msg: NewMessage) -> Result<Message, StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         let metadata_json = msg.metadata.as_ref().map(std::string::ToString::to_string);
 
@@ -236,7 +236,7 @@ impl MessageRepository {
         session_id: &str,
         limit: i64,
     ) -> Result<Vec<Message>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -269,16 +269,16 @@ impl MessageRepository {
 
 /// Memory repository (for vector search)
 pub struct MemoryRepository {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl MemoryRepository {
-    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     pub async fn create(&self, mem: NewMemory) -> Result<Memory, StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         // Serialize embedding as bytes
         let embedding_bytes: Option<Vec<u8>> = mem.embedding.as_ref().map(|e| {
@@ -316,7 +316,7 @@ impl MemoryRepository {
     }
 
     pub async fn get(&self, memory_id: &str) -> Result<Memory, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -369,7 +369,7 @@ impl MemoryRepository {
     }
 
     pub async fn list_all(&self, limit: i64) -> Result<Vec<Memory>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -409,7 +409,7 @@ impl MemoryRepository {
     }
 
     pub async fn delete(&self, memory_id: &str) -> Result<bool, StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         // Delete tags first
         conn.execute(
@@ -432,16 +432,16 @@ impl MemoryRepository {
 
 /// Config repository (key-value store)
 pub struct ConfigRepository {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl ConfigRepository {
-    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query("SELECT value FROM config WHERE key = ?1", turso::params![key])
@@ -455,7 +455,7 @@ impl ConfigRepository {
     }
 
     pub async fn set(&self, key: &str, value: &str) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         conn.execute(
             "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
@@ -468,7 +468,7 @@ impl ConfigRepository {
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
         conn.execute("DELETE FROM config WHERE key = ?1", turso::params![key])
             .await?;
         Ok(())
@@ -493,16 +493,16 @@ impl ConfigRepository {
 
 /// Cron job repository
 pub struct CronJobRepository {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl CronJobRepository {
-    pub const fn new(conn: Arc<RwLock<Connection>>) -> Self {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
 
     pub async fn create(&self, job: NewCronJob) -> Result<CronJob, StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         let task_json = job.task.to_string();
         let metadata_json = job.metadata.as_ref().map(std::string::ToString::to_string);
@@ -532,7 +532,7 @@ impl CronJobRepository {
     }
 
     pub async fn get(&self, job_id: &str) -> Result<CronJob, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -564,7 +564,7 @@ impl CronJobRepository {
     }
 
     pub async fn list_enabled(&self) -> Result<Vec<CronJob>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -597,7 +597,7 @@ impl CronJobRepository {
     }
 
     pub async fn list_all(&self) -> Result<Vec<CronJob>, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
 
         let mut rows = conn
             .query(
@@ -630,7 +630,7 @@ impl CronJobRepository {
     }
 
     pub async fn update_last_run(&self, job_id: &str, last_run: &str, next_run: Option<&str>) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         conn.execute(
             "UPDATE cron_jobs SET last_run = ?1, next_run = ?2 WHERE job_id = ?3",
@@ -642,7 +642,7 @@ impl CronJobRepository {
     }
 
     pub async fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         conn.execute(
             "UPDATE cron_jobs SET enabled = ?1 WHERE job_id = ?2",
@@ -654,7 +654,7 @@ impl CronJobRepository {
     }
 
     pub async fn delete(&self, job_id: &str) -> Result<bool, StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         let result = conn
             .execute(

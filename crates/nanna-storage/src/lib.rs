@@ -14,7 +14,7 @@ pub use repositories::*;
 
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::info;
 use turso::{Builder, Connection};
 
@@ -47,7 +47,7 @@ impl Default for StorageConfig {
 
 /// Main storage interface
 pub struct Storage {
-    conn: Arc<RwLock<Connection>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Storage {
@@ -57,7 +57,7 @@ impl Storage {
         let db = Builder::new_local(&config.path).build().await?;
         let conn = db.connect()?;
         let storage = Self {
-            conn: Arc::new(RwLock::new(conn)),
+            conn: Arc::new(Mutex::new(conn)),
         };
 
         storage.migrate().await?;
@@ -69,7 +69,7 @@ impl Storage {
         let db = Builder::new_local(":memory:").build().await?;
         let conn = db.connect()?;
         let storage = Self {
-            conn: Arc::new(RwLock::new(conn)),
+            conn: Arc::new(Mutex::new(conn)),
         };
         storage.migrate().await?;
         Ok(storage)
@@ -77,7 +77,7 @@ impl Storage {
 
     /// Run database migrations
     async fn migrate(&self) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         // Create migrations table
         conn.execute(
@@ -117,7 +117,7 @@ impl Storage {
 
     /// Get connection reference
     #[must_use] 
-    pub const fn conn(&self) -> &Arc<RwLock<Connection>> {
+    pub const fn conn(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
 
@@ -159,7 +159,7 @@ impl Storage {
     /// Create a new GUI session with optional workspace
     pub async fn create_gui_session_with_workspace(&self, name: &str, workspace_id: Option<&str>) -> Result<Session, StorageError> {
         let session_id = uuid::Uuid::new_v4().to_string();
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
 
         conn.execute(
             "INSERT INTO sessions (session_id, channel, user_id, workspace_id, name, metadata) 
@@ -208,7 +208,7 @@ impl Storage {
 
     /// Count messages in a session
     pub async fn count_session_messages(&self, session_id: &str) -> Result<i64, StorageError> {
-        let conn = self.conn.read().await;
+        let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
@@ -225,7 +225,7 @@ impl Storage {
 
     /// Update session timestamp
     pub async fn touch_session(&self, session_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sessions SET updated_at = datetime('now') WHERE session_id = ?1",
             turso::params![session_id],
@@ -236,7 +236,7 @@ impl Storage {
 
     /// Rename a session
     pub async fn rename_session(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sessions SET metadata = json_set(COALESCE(metadata, '{}'), '$.name', ?1), updated_at = datetime('now') WHERE session_id = ?2",
             turso::params![name, session_id],
@@ -247,7 +247,7 @@ impl Storage {
 
     /// Delete a session and its messages
     pub async fn delete_session(&self, session_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.write().await;
+        let conn = self.conn.lock().await;
         conn.execute(
             "DELETE FROM messages WHERE session_id = ?1",
             turso::params![session_id],
