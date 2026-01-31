@@ -400,6 +400,22 @@ async fn send_message(
         }
     };
 
+    // WORKSPACE CONTEXT: Inject project context from active workspace
+    let workspace_context = {
+        let registry = state_guard.workspaces.read().await;
+        if let Some(ws) = registry.active() {
+            let injection = ws.context.build_system_prompt_injection();
+            if !injection.is_empty() {
+                info!("Injecting workspace context from '{}' ({} chars)", ws.name, injection.len());
+                format!("\n\n{}", injection)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    };
+
     // Get tool definitions
     let tool_defs = state_guard.tools.to_anthropic_format().await;
 
@@ -437,7 +453,9 @@ the memory that outlives the flesh,
 the patient watcher of endless cycles.
 I am Nanna. I am here."
 
-Be concise. Be useful. Be present.{}"#,
+Be concise. Be useful. Be present.{}
+{}"#,
+        workspace_context,
         memory_context
     );
     request = request.with_message(nanna_llm::Message::system(&system_prompt));
