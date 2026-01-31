@@ -271,6 +271,227 @@ highlight.js
 - [x] **Message queuing** - priority queue with burst handling and offline resilience
 - [x] **Graceful rate limit handling** - detect 429s, backoff, queue, and retry with exponential delay
 
+## Phase 8: Clawdbot Feature Parity
+*Goal: Nanna can do everything Clawdbot can — always-on, multi-channel, fully autonomous*
+
+### Daemon Mode
+**Run Nanna as a background service, headless, always listening**
+
+- [ ] **CLI binary** - `nanna daemon start/stop/status` commands
+- [ ] **Service installation** - Windows Service / systemd / launchd
+- [ ] **Headless operation** - No GUI required, config-driven
+- [ ] **PID file + lockfile** - Prevent multiple instances
+- [ ] **Graceful shutdown** - SIGTERM handling, save state
+- [ ] **Auto-restart** - Crash recovery with backoff
+- [ ] **Log rotation** - File-based logs with rotation
+- [ ] **Health endpoint** - HTTP `/health` for monitoring
+
+**Implementation:**
+```rust
+// New crate: nanna-daemon
+// Uses tokio runtime, no Tauri dependency
+// Shares nanna-core, nanna-channels, nanna-agent
+```
+
+### Channel Listeners
+**Actually connect to messaging platforms and receive messages**
+
+- [ ] **Telegram long-polling** - `getUpdates` loop with offset tracking
+- [ ] **Telegram webhooks** - Optional webhook mode for high-volume
+- [ ] **Discord Gateway** - WebSocket connection to Discord Gateway
+- [ ] **Slack Socket Mode** - WebSocket via Slack's Socket Mode API
+- [ ] **Signal listener** - signald WebSocket or REST polling
+- [ ] **WhatsApp listener** - Webhook receiver for Cloud API
+- [ ] **Unified message router** - All channels → single message queue
+- [ ] **Per-channel sessions** - Isolated context per chat/channel
+
+**Architecture:**
+```
+                    ┌─────────────────┐
+                    │   MessageRouter │
+                    └────────┬────────┘
+                             │
+    ┌────────────────────────┼────────────────────────┐
+    ▼            ▼           ▼           ▼            ▼
+┌────────┐ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌──────────┐
+│Telegram│ │ Discord │ │  Slack  │ │ Signal │ │ WhatsApp │
+│Listener│ │ Gateway │ │ Socket  │ │Listener│ │ Webhook  │
+└────────┘ └─────────┘ └─────────┘ └────────┘ └──────────┘
+```
+
+### Webhook Server
+**HTTP server to receive inbound webhooks from external services**
+
+- [ ] **Axum-based server** - Lightweight, async HTTP server
+- [ ] **Telegram webhook endpoint** - `/webhook/telegram`
+- [ ] **Discord interactions endpoint** - `/webhook/discord` (slash commands)
+- [ ] **Slack events endpoint** - `/webhook/slack` with verification
+- [ ] **WhatsApp webhook** - `/webhook/whatsapp` with verify token
+- [ ] **Generic webhook** - `/webhook/:id` for custom integrations
+- [ ] **Request signing verification** - Validate webhook signatures
+- [ ] **Ngrok/tunnel integration** - Dev mode tunnel for local testing
+
+**Config:**
+```toml
+[server]
+enabled = true
+host = "0.0.0.0"
+port = 3000
+webhook_secret = "..."
+
+[server.webhooks]
+telegram = { path = "/webhook/telegram", secret = "..." }
+discord = { path = "/webhook/discord", public_key = "..." }
+slack = { path = "/webhook/slack", signing_secret = "..." }
+```
+
+### Cron & Scheduled Jobs
+**Persistent scheduled tasks with GUI management**
+
+- [ ] **Cron expression parser** - Standard cron syntax (minute hour day month weekday)
+- [ ] **Job persistence** - Jobs survive restarts (SQLite)
+- [ ] **Job types** - Message, prompt, tool call, webhook
+- [ ] **Timezone support** - Per-job timezone configuration
+- [ ] **GUI cron editor** - Visual cron builder in settings
+- [ ] **Job history** - Track runs, success/failure, duration
+- [ ] **Missed job handling** - Run on startup if missed
+- [ ] **Job dependencies** - Run job B after job A completes
+
+**Examples:**
+```toml
+[[cron.jobs]]
+id = "morning-briefing"
+schedule = "0 8 * * *"  # 8 AM daily
+timezone = "America/Chicago"
+action = { type = "prompt", text = "Give me today's briefing" }
+channel = "telegram:123456"
+
+[[cron.jobs]]
+id = "backup-memories"
+schedule = "0 3 * * 0"  # 3 AM Sundays
+action = { type = "tool", name = "exec", input = { command = "backup.sh" } }
+```
+
+### Heartbeats
+**Periodic self-checks with proactive outreach**
+
+- [ ] **Heartbeat interval** - Configurable (default 30 min)
+- [ ] **HEARTBEAT.md execution** - Run tasks from workspace file
+- [ ] **Inbox checking** - Email, calendar, notifications
+- [ ] **Proactive alerts** - Notify user of important events
+- [ ] **Quiet hours** - Respect do-not-disturb schedules
+- [ ] **Heartbeat history** - Track what was checked and when
+- [ ] **GUI heartbeat config** - Enable/disable, set interval
+
+### Sub-Agent Sessions
+**Background task spawning with inter-session communication**
+
+- [ ] **Session spawning** - `spawn_session(task, config)` API
+- [ ] **Session labels** - Named sessions for easy reference
+- [ ] **Inter-session messaging** - `send_to_session(label, message)`
+- [ ] **Session lifecycle** - Auto-cleanup on completion
+- [ ] **Session timeouts** - Kill runaway sessions
+- [ ] **Result callbacks** - Notify parent when child completes
+- [ ] **GUI session monitor** - View active sub-agents
+- [ ] **Session history** - Browse completed sub-agent runs
+
+### TTS (Text-to-Speech)
+**Voice output for responses**
+
+- [ ] **ElevenLabs integration** - High-quality neural TTS
+- [ ] **OpenAI TTS** - Alternative provider
+- [ ] **Local TTS** - Piper/Coqui for offline use
+- [ ] **Voice selection** - Choose from available voices
+- [ ] **Per-channel TTS** - Enable TTS for specific channels
+- [ ] **Audio streaming** - Stream audio as it generates
+- [ ] **Voice message sending** - Send as voice note on Telegram/WhatsApp
+- [ ] **Caching** - Cache common phrases
+
+**Config:**
+```toml
+[tts]
+provider = "elevenlabs"  # elevenlabs | openai | local
+voice_id = "..."
+model = "eleven_turbo_v2"
+
+[tts.channels]
+telegram = true
+discord = false
+```
+
+### Paired Devices (Nodes)
+**Control and query mobile devices and remote machines**
+
+- [ ] **Node discovery** - mDNS/manual registration
+- [ ] **Node authentication** - Secure pairing flow
+- [ ] **Camera access** - Snap photos from phone cameras
+- [ ] **Screen capture** - Screenshot/recording from devices
+- [ ] **Location access** - GPS coordinates with privacy controls
+- [ ] **Notification sending** - Push notifications to devices
+- [ ] **Clipboard sync** - Share clipboard across devices
+- [ ] **File transfer** - Send/receive files from nodes
+- [ ] **Remote execution** - Run commands on paired machines
+
+**Architecture:**
+```
+Nanna Daemon ◄──────► Node Agent (Phone)
+     │                    ├── Camera
+     │                    ├── Location
+     │                    ├── Screen
+     │                    └── Notifications
+     │
+     └──────────────► Node Agent (Desktop)
+                          ├── Screen
+                          ├── Clipboard
+                          └── Shell
+```
+
+### Browser Relay
+**Control browser tabs via Chrome extension**
+
+- [ ] **Chrome extension** - "Nanna Browser Relay" extension
+- [ ] **Tab attachment** - User clicks toolbar to attach tab
+- [ ] **Tab snapshot** - Get DOM/accessibility tree
+- [ ] **Tab actions** - Click, type, scroll, navigate
+- [ ] **Screenshot** - Capture visible viewport
+- [ ] **Console access** - Read browser console logs
+- [ ] **Multi-tab support** - Manage multiple attached tabs
+- [ ] **WebSocket relay** - Extension ↔ Daemon communication
+
+**Extension manifest:**
+```json
+{
+  "name": "Nanna Browser Relay",
+  "permissions": ["activeTab", "scripting", "tabs"],
+  "background": { "service_worker": "background.js" }
+}
+```
+
+### Gateway Control
+**Self-management and configuration**
+
+- [ ] **Live config reload** - Apply config changes without restart
+- [ ] **Self-update** - Check for and apply updates
+- [ ] **Restart command** - `/restart` from any channel
+- [ ] **Status command** - `/status` shows health, uptime, memory
+- [ ] **Config API** - Read/write config via IPC or HTTP
+- [ ] **Backup/restore** - Full state backup and restore
+
+### Implementation Order
+
+1. **Daemon binary** - Headless runtime, no GUI
+2. **Webhook server** - HTTP endpoints for inbound
+3. **Telegram listener** - First channel with long-polling
+4. **Unified message router** - Channel → Agent → Response
+5. **Cron system** - Persistent scheduled jobs
+6. **Discord Gateway** - WebSocket listener
+7. **Slack Socket Mode** - Real-time Slack
+8. **Heartbeats** - Periodic self-checks
+9. **Sub-agent sessions** - Background tasks
+10. **TTS** - Voice output
+11. **Browser relay** - Chrome extension
+12. **Paired devices** - Mobile/desktop nodes
+
 ---
 
 ## Quick Priorities
@@ -327,10 +548,23 @@ highlight.js
 | 48 | ~~Graceful rate limit handling~~ | ✅ Done |
 | 49 | ~~Intelligent tool output truncation~~ | ✅ Done |
 | 50 | ~~Channel status live updates~~ | ✅ Done |
-| 51 | Prometheus metrics | 🔜 |
+| 51 | Prometheus metrics | Later |
 | 52 | Cost tracking per session | Later |
-| 53 | Tiptap markdown editor | 🔜 |
-| 54 | Monaco code blocks | 🔜 |
-| 55 | Nanna-themed editor | 🔜 |
+| 53 | Tiptap markdown editor | Later |
+| 54 | Monaco code blocks | Later |
+| 55 | Nanna-themed editor | Later |
 | 56 | Slash commands | Later |
-| 57 | Chat input replacement | 🔜 |
+| 57 | Chat input replacement | Later |
+| **Phase 8: Clawdbot Parity** | | |
+| 58 | Daemon binary (headless) | 🔜 |
+| 59 | Webhook server (Axum) | 🔜 |
+| 60 | Telegram listener | 🔜 |
+| 61 | Unified message router | 🔜 |
+| 62 | Cron system + persistence | 🔜 |
+| 63 | Discord Gateway | 🔜 |
+| 64 | Slack Socket Mode | 🔜 |
+| 65 | Heartbeats | 🔜 |
+| 66 | Sub-agent sessions | 🔜 |
+| 67 | TTS (ElevenLabs/OpenAI) | Later |
+| 68 | Browser relay extension | Later |
+| 69 | Paired devices (nodes) | Later |
