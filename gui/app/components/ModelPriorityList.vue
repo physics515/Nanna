@@ -7,70 +7,62 @@
         Add
       </UiButton>
     </div>
-    
+
     <!-- Active Models (Drag & Drop) -->
-    <div 
-      ref="dropZone"
-      class="space-y-1 min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-nanna-primary/20 transition-colors"
-      :class="isDragging && !draggingFromExcluded && 'border-nanna-primary/40'"
-      @dragover="handleContainerDragOver"
-      @dragenter="handleContainerDragOver"
-      @drop="handleContainerDrop"
+    <div
+      class="min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-nanna-primary/20"
     >
-      <div v-if="activeModels.length === 0" class="text-center py-4 text-sm text-nanna-text-dim">
-        Drag models here to enable
+      <div v-if="localModels.length === 0" class="text-center py-4 text-sm text-nanna-text-dim">
+        No models selected. Click "Add" to enable models.
       </div>
-      
-      <div
-        v-for="(model, index) in activeModels"
-        :key="model.id"
-        draggable="true"
-        @dragstart="handleDragStart($event, model, index)"
-        @dragend="handleDragEnd"
-        @dragenter="handleItemDragEnter($event, index)"
-        @dragover="handleItemDragOver($event, index)"
-        @dragleave="handleItemDragLeave($event, index)"
-        @drop="handleItemDrop($event, index)"
-        :class="[
-          'flex items-center gap-2 p-2 rounded-lg cursor-grab active:cursor-grabbing transition-all select-none',
-          'bg-nanna-bg-surface border-2',
-          getItemClasses(model, index)
-        ]"
+
+      <draggable
+        v-model="localModels"
+        :item-key="(item: string) => item"
+        handle=".drag-handle"
+        ghost-class="opacity-50"
+        :animation="150"
+        :force-fallback="true"
+        fallback-class="dragging"
+        class="space-y-1"
+        @end="onDragEnd"
       >
-        <!-- Drag Handle -->
-        <GripVertical class="w-4 h-4 text-nanna-text-dim shrink-0" />
-        
-        <!-- Priority Badge -->
-        <span :class="[
-          'w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold shrink-0',
-          index === 0 ? 'bg-nanna-accent text-white' : 'bg-nanna-bg-elevated text-nanna-text-muted'
-        ]">
-          {{ index + 1 }}
-        </span>
-        
-        <!-- Provider Icon -->
-        <span class="text-base">{{ getProviderIcon(model.provider) }}</span>
-        
-        <!-- Model Info -->
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-medium text-nanna-text truncate">{{ model.name }}</div>
-          <div class="text-xs text-nanna-text-dim">{{ model.provider }}</div>
-        </div>
-        
-        <!-- Status Indicators -->
-        <div class="flex items-center gap-1 shrink-0">
-          <span v-if="!model.available" class="text-xs text-nanna-warning" title="No API key">⚠️</span>
-          <span v-if="index === 0" class="text-xs text-nanna-accent">Primary</span>
-        </div>
-        
-        <!-- Remove Button -->
-        <button 
-          @click="removeModel(index)"
-          class="p-1 rounded hover:bg-nanna-error/20 text-nanna-text-dim hover:text-nanna-error transition-colors"
-        >
-          <X class="w-3 h-3" />
-        </button>
-      </div>
+        <template #item="{ element: modelId, index }">
+          <div
+            class="flex items-center gap-2 p-2 rounded-lg transition-all select-none bg-nanna-bg-surface border-2 border-nanna-primary/20"
+          >
+            <!-- Drag Handle -->
+            <GripVertical class="drag-handle w-4 h-4 text-nanna-text-dim shrink-0 cursor-grab active:cursor-grabbing" />
+
+            <!-- Priority Badge -->
+            <span class="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold shrink-0 bg-nanna-bg-elevated text-nanna-text-muted">
+              {{ index + 1 }}
+            </span>
+
+            <!-- Provider Icon -->
+            <span class="text-base">{{ getProviderIcon(getModel(modelId)?.provider) }}</span>
+
+            <!-- Model Info -->
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-medium text-nanna-text truncate">{{ getModel(modelId)?.name || modelId }}</div>
+              <div class="text-xs text-nanna-text-dim">{{ getModel(modelId)?.provider }}</div>
+            </div>
+
+            <!-- Status Indicators -->
+            <div class="flex items-center gap-1 shrink-0">
+              <span v-if="!getModel(modelId)?.available" class="text-xs text-nanna-warning" title="No API key">⚠️</span>
+            </div>
+
+            <!-- Remove Button -->
+            <button
+              @click.stop="removeModel(index)"
+              class="p-1 rounded hover:bg-nanna-error/20 text-nanna-text-dim hover:text-nanna-error transition-colors"
+            >
+              <X class="w-3 h-3" />
+            </button>
+          </div>
+        </template>
+      </draggable>
     </div>
     
     <!-- Hint -->
@@ -83,21 +75,12 @@
       <summary class="cursor-pointer text-nanna-text-muted hover:text-nanna-text">
         {{ excludedModels.length }} excluded model{{ excludedModels.length > 1 ? 's' : '' }}
       </summary>
-      <div 
-        class="mt-2 space-y-1 p-2 rounded-lg bg-nanna-bg-deep/50"
-        @dragover="handleContainerDragOver"
-        @dragenter="handleContainerDragOver"
-        @drop="handleExcludedDrop"
-      >
+      <div class="mt-2 space-y-1 p-2 rounded-lg bg-nanna-bg-deep/50">
         <div
           v-for="model in excludedModels"
           :key="model.id"
-          draggable="true"
-          @dragstart="handleExcludedDragStart($event, model)"
-          @dragend="handleDragEnd"
-          class="flex items-center gap-2 p-2 rounded bg-nanna-bg-elevated/50 opacity-60 cursor-grab"
+          class="flex items-center gap-2 p-2 rounded bg-nanna-bg-elevated/50 opacity-60"
         >
-          <GripVertical class="w-3 h-3 text-nanna-text-dim" />
           <span class="text-sm">{{ getProviderIcon(model.provider) }}</span>
           <span class="text-sm text-nanna-text-muted flex-1 truncate">{{ model.name }}</span>
           <button 
@@ -148,7 +131,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
+import draggable from 'vuedraggable'
 import { GripVertical, X, Plus } from 'lucide-vue-next'
 
 export interface ModelOption {
@@ -161,7 +145,7 @@ export interface ModelOption {
 const props = defineProps<{
   label: string
   hint?: string
-  models: ModelOption[]
+  allModels: ModelOption[]
   modelValue: string[]
 }>()
 
@@ -171,29 +155,35 @@ const emit = defineEmits<{
 
 const showAddModel = ref(false)
 
-// Drag state
-const draggingId = ref<string | null>(null)
-const draggingFromExcluded = ref(false)
-const dropTargetIndex = ref<number | null>(null)
-const dragStartIndex = ref<number>(-1)
+// Local copy of models for vuedraggable
+const localModels = ref<string[]>([...props.modelValue])
 
-const isDragging = computed(() => draggingId.value !== null)
+// Watch for external changes to modelValue
+watch(() => props.modelValue, (newVal) => {
+  if (JSON.stringify(newVal) !== JSON.stringify(localModels.value)) {
+    localModels.value = [...newVal]
+  }
+}, { deep: true })
 
-// Active models in priority order
-const activeModels = computed(() => {
-  return props.modelValue
-    .map(id => props.models.find(m => m.id === id))
-    .filter((m): m is ModelOption => m !== undefined)
-})
+// Emit changes after drag ends
+function onDragEnd() {
+  emit('update:modelValue', [...localModels.value])
+}
+
+// Helper to get model info by ID
+function getModel(id: string): ModelOption | undefined {
+  return props.allModels.find(m => m.id === id)
+}
 
 // Models not in the active list
 const excludedModels = computed(() => {
-  return props.models.filter(m => !props.modelValue.includes(m.id))
+  return props.allModels.filter(m => !localModels.value.includes(m.id))
 })
 
 const availableToAdd = computed(() => excludedModels.value)
 
-function getProviderIcon(provider: string): string {
+function getProviderIcon(provider: string | undefined): string {
+  if (!provider) return '⚪'
   const icons: Record<string, string> = {
     anthropic: '🟣',
     openai: '🟢',
@@ -204,169 +194,29 @@ function getProviderIcon(provider: string): string {
   return icons[provider.toLowerCase()] || '⚪'
 }
 
-function getItemClasses(model: ModelOption, index: number): string {
-  const classes: string[] = []
-  
-  if (draggingId.value === model.id) {
-    classes.push('opacity-40', 'scale-95', 'border-nanna-primary/20')
-  } else if (dropTargetIndex.value === index) {
-    classes.push('border-nanna-accent', 'bg-nanna-accent/10')
-  } else if (index === 0) {
-    classes.push('border-nanna-primary/30', 'ring-1', 'ring-nanna-accent/50')
-  } else {
-    classes.push('border-nanna-primary/20')
-  }
-  
-  return classes.join(' ')
-}
-
-// === DRAG HANDLERS ===
-
-function handleDragStart(event: DragEvent, model: ModelOption, index: number) {
-  draggingId.value = model.id
-  draggingFromExcluded.value = false
-  dragStartIndex.value = index
-  
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.dropEffect = 'move'
-    event.dataTransfer.setData('text/plain', model.id)
-  }
-}
-
-function handleExcludedDragStart(event: DragEvent, model: ModelOption) {
-  draggingId.value = model.id
-  draggingFromExcluded.value = true
-  dragStartIndex.value = -1
-  
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.dropEffect = 'move'
-    event.dataTransfer.setData('text/plain', model.id)
-  }
-}
-
-function handleDragEnd() {
-  draggingId.value = null
-  draggingFromExcluded.value = false
-  dropTargetIndex.value = null
-  dragStartIndex.value = -1
-}
-
-function handleContainerDragOver(event: DragEvent) {
-  event.preventDefault()
-  event.stopPropagation()
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = 'move'
-  }
-}
-
-function handleItemDragEnter(event: DragEvent, index: number) {
-  event.preventDefault()
-  event.stopPropagation()
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = 'move'
-  }
-  if (draggingId.value && dragStartIndex.value !== index) {
-    dropTargetIndex.value = index
-  }
-}
-
-function handleItemDragOver(event: DragEvent, index: number) {
-  event.preventDefault()
-  event.stopPropagation()
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = 'move'
-  }
-  if (draggingId.value && dragStartIndex.value !== index) {
-    dropTargetIndex.value = index
-  }
-}
-
-function handleItemDragLeave(event: DragEvent, index: number) {
-  // Only clear if we're actually leaving this item (not entering a child)
-  const relatedTarget = event.relatedTarget as HTMLElement | null
-  const currentTarget = event.currentTarget as HTMLElement
-  if (relatedTarget && currentTarget.contains(relatedTarget)) {
-    return
-  }
-  if (dropTargetIndex.value === index) {
-    dropTargetIndex.value = null
-  }
-}
-
-function handleItemDrop(event: DragEvent, targetIndex: number) {
-  event.preventDefault()
-  event.stopPropagation()
-  
-  if (!draggingId.value) return
-  
-  const newList = [...props.modelValue]
-  
-  if (draggingFromExcluded.value) {
-    // Adding from excluded - insert at target position
-    newList.splice(targetIndex, 0, draggingId.value)
-  } else {
-    // Reordering within active list
-    const currentIndex = newList.indexOf(draggingId.value)
-    if (currentIndex === -1 || currentIndex === targetIndex) {
-      handleDragEnd()
-      return
-    }
-    
-    // Remove and reinsert
-    newList.splice(currentIndex, 1)
-    const insertAt = currentIndex < targetIndex ? targetIndex - 1 : targetIndex
-    newList.splice(insertAt, 0, draggingId.value)
-  }
-  
-  emit('update:modelValue', newList)
-  handleDragEnd()
-}
-
-function handleContainerDrop(event: DragEvent) {
-  event.preventDefault()
-  event.stopPropagation()
-  
-  if (!draggingId.value) return
-  
-  const newList = [...props.modelValue]
-  
-  if (draggingFromExcluded.value) {
-    if (!newList.includes(draggingId.value)) {
-      newList.push(draggingId.value)
-    }
-    emit('update:modelValue', newList)
-  }
-  
-  handleDragEnd()
-}
-
-function handleExcludedDrop(event: DragEvent) {
-  event.preventDefault()
-  event.stopPropagation()
-  
-  if (!draggingId.value || draggingFromExcluded.value) return
-  
-  const newList = props.modelValue.filter(id => id !== draggingId.value)
-  emit('update:modelValue', newList)
-  handleDragEnd()
-}
-
-// === NON-DRAG ACTIONS ===
-
 function removeModel(index: number) {
-  const newList = [...props.modelValue]
+  const newList = [...localModels.value]
   newList.splice(index, 1)
-  emit('update:modelValue', newList)
+  localModels.value = newList
+  emit('update:modelValue', [...localModels.value])
 }
 
 function restoreModel(model: ModelOption) {
-  emit('update:modelValue', [...props.modelValue, model.id])
+  localModels.value = [...localModels.value, model.id]
+  emit('update:modelValue', [...localModels.value])
 }
 
 function addModel(model: ModelOption) {
-  emit('update:modelValue', [...props.modelValue, model.id])
+  localModels.value = [...localModels.value, model.id]
+  emit('update:modelValue', [...localModels.value])
   showAddModel.value = false
 }
 </script>
+
+<style scoped>
+.dragging {
+  opacity: 0.8;
+  background: var(--nanna-bg-surface);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+</style>

@@ -142,14 +142,14 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - MSI: `D:\Development\Cargo Target\release\bundle\msi\Nanna_0.1.0_x64_en-US.msi`
 - NSIS: `D:\Development\Cargo Target\release\bundle\nsis\Nanna_0.1.0_x64-setup.exe`
 
-## Phase 5: Agent Swarm & Parallel Execution 🔜
+## Phase 5: Agent Swarm & Parallel Execution ✅
 *Inspired by Kimi K2.5's agent swarm architecture*
 
 ### Parallel Agent Orchestration
 - [x] **Swarm Coordinator** - orchestrator that decomposes tasks into parallel subtasks ✅
 - [x] **Dynamic sub-agent spawning** - instantiate domain-specific agents on-the-fly ✅
 - [x] **Parallel tool execution** - execute independent tool calls concurrently ✅
-- [ ] **Critical Path metrics** - measure efficiency by longest parallel branch, not total steps
+- [x] **Critical Path metrics** - `CriticalPathMetrics` struct with `calculate()` method ✅
 - [x] **Sub-agent communication** - message passing between parallel agents ✅
 - [x] **Result aggregation** - collect and synthesize outputs from parallel branches ✅
 
@@ -157,15 +157,15 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Sliding window truncation** - retain only latest N messages when context grows ✅
 - [x] **Message truncation** - truncate individual long messages (50KB limit) ✅
 - [x] **Intelligent tool output truncation** - proportional budget allocation across tool results based on total context budget, with minimum floor per tool and recency bias ✅
-- [ ] **Selective context compression** - summarize old context instead of dropping
-- [ ] **Per-agent context isolation** - sub-agents don't inherit full parent context
-- [ ] **Context budget allocation** - distribute context tokens across parallel agents
+- [x] **Selective context compression** - `compress()` method summarizes old context via LLM ✅
+- [x] **Per-agent context isolation** - `ContextIsolation` enum (Full/SystemOnly/Summary/Isolated) ✅
+- [x] **Context budget allocation** - `allocate_budget()` distributes tokens across parallel agents ✅
 
 ### Thinking Mode Enhancements
-- [ ] **Explicit thinking toggle** - instant vs thinking mode per request
-- [ ] **Interleaved reasoning** - thinking blocks between tool calls (like Claude)
-- [ ] **Reasoning content field** - expose chain-of-thought separately from response
-- [ ] **Thinking budget** - configurable max tokens for reasoning phase
+- [x] **Explicit thinking toggle** - `ThinkingMode` enum (Instant/Low/Medium/High/Maximum) per request ✅
+- [x] **Interleaved reasoning** - `ReasoningBlock` captures thinking before tool calls ✅
+- [x] **Reasoning content field** - `AgentResponse.reasoning: Option<ReasoningContent>` ✅
+- [x] **Thinking budget** - `ThinkingMode::budget_tokens()` returns configurable max tokens ✅
 
 ### Visual Agent Capabilities (Future)
 - [ ] **Screenshot-to-code** - generate UI code from images
@@ -223,8 +223,8 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 | 31 | ~~Swarm Coordinator~~ | ✅ Done |
 | 32 | ~~Context management/truncation~~ | ✅ Done |
 | 33 | ~~Memory management UI~~ | ✅ Done |
-| 34 | Critical Path metrics | Later |
-| 35 | Thinking mode toggle | Later |
+| 34 | ~~Critical Path metrics~~ | ✅ Done |
+| 35 | ~~Thinking mode toggle~~ | ✅ Done |
 | 36 | ~~UI component library~~ | ✅ Done |
 | 37 | Tauri mobile (Android/iOS) | Later |
 | 38 | Visual debugging loop | Future |

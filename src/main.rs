@@ -248,6 +248,7 @@ fn create_scheduler(
                 max_tokens: 4096,
                 temperature: 0.7,
                 max_iterations: 5,
+                thinking_mode: nanna_agent::ThinkingMode::Instant,
             };
 
             let session_id = format!("scheduler:{}", task.name);
@@ -619,6 +620,7 @@ async fn run_cli(
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: 10,
+        thinking_mode: nanna_agent::ThinkingMode::Instant,
     };
 
     // Build context with system prompt
@@ -757,6 +759,7 @@ async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> anyho
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: 10,
+        thinking_mode: nanna_agent::ThinkingMode::Instant,
     };
 
     let cwd = std::env::current_dir()?;

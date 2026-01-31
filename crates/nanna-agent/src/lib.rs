@@ -14,14 +14,15 @@ mod supervisor;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
-pub use context::AgentContext;
+pub use context::{AgentContext, ContextIsolation, ContextSummary};
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
-    RunOptions, StreamCallback, ToolCallRecord,
+    ReasoningBlock, ReasoningContent, RunOptions, StreamCallback, ThinkingCallback,
+    ThinkingMode, ToolCallRecord,
 };
 pub use multi::{
-    AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, TaskStatus,
-    SwarmConfig, SwarmResult, SwarmTaskResult,
+    AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,
+    TaskStatus, SwarmConfig, SwarmResult, SwarmTaskResult,
     // Swarm Coordinator
     SwarmCoordinator, DecomposedTask, DomainAgent, Subtask,
 };

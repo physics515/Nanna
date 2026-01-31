@@ -308,6 +308,7 @@ impl AppState {
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: 10,
+            thinking_mode: nanna_agent::ThinkingMode::Instant,
         };
 
         let context = AgentContext::new(session_id)

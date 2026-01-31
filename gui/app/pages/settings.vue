@@ -77,7 +77,7 @@
               <ModelPriorityList
                 label="Model Priority"
                 hint="First working model is used. Drag to reorder fallback priority."
-                :models="allChatModels"
+                :all-models="allChatModels"
                 v-model="chatModelPriority"
                 @update:model-value="saveChatModelPriority"
               />
@@ -208,7 +208,7 @@
               <ModelPriorityList
                 label="Embedding Priority"
                 hint="Used for memory recall. First working model is used."
-                :models="allEmbeddingModels"
+                :all-models="allEmbeddingModels"
                 v-model="embeddingModelPriority"
                 @update:model-value="saveEmbeddingModelPriority"
               />
@@ -589,43 +589,70 @@ const maxTokens = ref(4096)
 const chatModelPriority = ref<string[]>([])
 const embeddingModelPriority = ref<string[]>([])
 
+// Dynamically fetched models from APIs
+const anthropicModels = ref<ModelInfo[]>([])
+const openaiModels = ref<ModelInfo[]>([])
+
 // All available models with provider info
 import type { ModelOption } from '~/components/ModelPriorityList.vue'
 
 const allChatModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
   
-  // Anthropic models (only if API key set)
+  // Anthropic models (dynamically fetched, or fallback)
   if (settings.value?.anthropic_key_set) {
-    models.push(
-      { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', provider: 'anthropic', available: true },
-      { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: true },
-      { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: true },
-      { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: true },
-    )
+    if (anthropicModels.value.length > 0) {
+      // Use dynamically fetched models
+      for (const m of anthropicModels.value) {
+        models.push({ id: m.id, name: m.name, provider: 'anthropic', available: true })
+      }
+    } else {
+      // Fallback to known models if API call failed
+      models.push(
+        { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', provider: 'anthropic', available: true },
+        { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: true },
+        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: true },
+        { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: true },
+      )
+    }
   }
   
-  // OpenAI models (only if API key set)
+  // OpenAI models (dynamically fetched, or fallback)
   if (settings.value?.openai_key_set) {
-    models.push(
-      { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', available: true },
-      { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', available: true },
-      { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openai', available: true },
-      { id: 'o1', name: 'o1', provider: 'openai', available: true },
-      { id: 'o1-mini', name: 'o1 Mini', provider: 'openai', available: true },
+    const chatModels = openaiModels.value.filter(m => 
+      m.id.startsWith('gpt-') || m.id.startsWith('o1') || m.id.startsWith('o3') || m.id.startsWith('chatgpt')
     )
+    if (chatModels.length > 0) {
+      // Use dynamically fetched models
+      for (const m of chatModels) {
+        models.push({ id: m.id, name: m.name, provider: 'openai', available: true })
+      }
+    } else {
+      // Fallback to known models if API call failed
+      models.push(
+        { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', available: true },
+        { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', available: true },
+        { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openai', available: true },
+        { id: 'o1', name: 'o1', provider: 'openai', available: true },
+        { id: 'o1-mini', name: 'o1 Mini', provider: 'openai', available: true },
+      )
+    }
   }
   
-  // OpenRouter models (only if API key set)
+  // OpenRouter models (hardcoded popular models - OpenRouter has thousands)
   if (settings.value?.openrouter_key_set) {
     models.push(
       { id: 'anthropic/claude-sonnet-4-20250514', name: 'Claude Sonnet 4 (OR)', provider: 'openrouter', available: true },
+      { id: 'anthropic/claude-opus-4-20250514', name: 'Claude Opus 4 (OR)', provider: 'openrouter', available: true },
       { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'openrouter', available: true },
       { id: 'google/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash', provider: 'openrouter', available: true },
+      { id: 'google/gemini-2.5-pro-preview', name: 'Gemini 2.5 Pro', provider: 'openrouter', available: true },
+      { id: 'openai/gpt-4o', name: 'GPT-4o (OR)', provider: 'openrouter', available: true },
+      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'Llama 3.3 70B', provider: 'openrouter', available: true },
     )
   }
   
-  // Ollama models (always available if Ollama is running)
+  // Ollama models (dynamically fetched - always dynamic)
   for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
     models.push({ id: `ollama/${m.name}`, name: m.name, provider: 'ollama', available: true })
   }
@@ -636,15 +663,23 @@ const allChatModels = computed<ModelOption[]>(() => {
 const allEmbeddingModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
   
-  // OpenAI embedding models (only if API key set)
+  // OpenAI embedding models (dynamically fetched, or fallback)
   if (settings.value?.openai_key_set) {
-    models.push(
-      { id: 'openai/text-embedding-3-small', name: 'text-embedding-3-small (1536d)', provider: 'openai', available: true },
-      { id: 'openai/text-embedding-3-large', name: 'text-embedding-3-large (3072d)', provider: 'openai', available: true },
-    )
+    const embeddingModels = openaiModels.value.filter(m => m.id.startsWith('text-embedding'))
+    if (embeddingModels.length > 0) {
+      for (const m of embeddingModels) {
+        models.push({ id: `openai/${m.id}`, name: m.name, provider: 'openai', available: true })
+      }
+    } else {
+      // Fallback
+      models.push(
+        { id: 'openai/text-embedding-3-small', name: 'text-embedding-3-small (1536d)', provider: 'openai', available: true },
+        { id: 'openai/text-embedding-3-large', name: 'text-embedding-3-large (3072d)', provider: 'openai', available: true },
+      )
+    }
   }
   
-  // Ollama embedding models (only installed ones)
+  // Ollama embedding models (dynamically fetched)
   for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
     models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB)`, provider: 'ollama', available: true })
   }
@@ -717,33 +752,37 @@ async function loadSettings() {
 async function refreshModels() {
   if (!settings.value) return
   loadingModels.value = true
-  try {
-    const provider = settings.value.provider
-    let models: ModelInfo[] = []
-    
-    if (provider === 'anthropic') {
-      models = await invoke<ModelInfo[]>('get_anthropic_models')
-    } else if (provider === 'openai') {
-      models = await invoke<ModelInfo[]>('get_openai_models')
-    } else if (provider === 'ollama') {
-      const ollamaList = await invoke<OllamaModelInfo[]>('get_ollama_models')
-      models = ollamaList.filter(m => !m.is_embedding_model).map(m => ({ id: m.name, name: `${m.name} (${m.size_mb}MB)` }))
-    } else if (provider === 'openrouter') {
-      models = [
-        { id: 'anthropic/claude-sonnet-4-20250514', name: 'Claude Sonnet 4' },
-        { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat' },
-        { id: 'google/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash' },
-      ]
-    }
-    availableModels.value = models
-    if (models.length > 0 && !models.find(m => m.id === selectedModel.value)) {
-      availableModels.value.unshift({ id: selectedModel.value, name: `${selectedModel.value} (current)` })
-    }
-  } catch (e: any) {
-    availableModels.value = [{ id: settings.value.model, name: `${settings.value.model} (current)` }]
-  } finally {
-    loadingModels.value = false
+  
+  // Fetch models from all available providers in parallel
+  const promises: Promise<void>[] = []
+  
+  // Anthropic models
+  if (settings.value.anthropic_key_set) {
+    promises.push(
+      invoke<ModelInfo[]>('get_anthropic_models')
+        .then(models => { anthropicModels.value = models })
+        .catch(e => { 
+          console.warn('Failed to fetch Anthropic models:', e)
+          anthropicModels.value = [] // Will use fallback in computed
+        })
+    )
   }
+  
+  // OpenAI models
+  if (settings.value.openai_key_set) {
+    promises.push(
+      invoke<ModelInfo[]>('get_openai_models')
+        .then(models => { openaiModels.value = models })
+        .catch(e => { 
+          console.warn('Failed to fetch OpenAI models:', e)
+          openaiModels.value = [] // Will use fallback in computed
+        })
+    )
+  }
+  
+  // Wait for all fetches to complete
+  await Promise.all(promises)
+  loadingModels.value = false
 }
 
 async function refreshOllamaModels() {
@@ -761,9 +800,11 @@ async function refreshOllamaModels() {
 async function refreshAllModels() {
   loadingModels.value = true
   try {
-    // Refresh Ollama models first
-    await refreshOllamaModels()
-    // The computed properties will automatically update
+    // Refresh all model sources in parallel
+    await Promise.all([
+      refreshOllamaModels(),
+      refreshModels(), // Fetches Anthropic and OpenAI
+    ])
   } finally {
     loadingModels.value = false
   }

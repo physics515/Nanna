@@ -14,6 +14,42 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+/// Thinking mode for extended reasoning
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingMode {
+    /// No explicit thinking - fast responses
+    #[default]
+    Instant,
+    /// Low thinking budget (1024 tokens)
+    Low,
+    /// Medium thinking budget (4096 tokens)
+    Medium,
+    /// High thinking budget (8192 tokens)
+    High,
+    /// Maximum thinking budget (16384 tokens)
+    Maximum,
+}
+
+impl ThinkingMode {
+    /// Get the thinking budget in tokens for this mode
+    #[must_use]
+    pub const fn budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Instant => None,
+            Self::Low => Some(1024),
+            Self::Medium => Some(4096),
+            Self::High => Some(8192),
+            Self::Maximum => Some(16384),
+        }
+    }
+
+    /// Check if thinking is enabled
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Instant)
+    }
+}
+
 /// Agent configuration
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -25,6 +61,8 @@ pub struct AgentConfig {
     pub temperature: f32,
     /// Maximum iterations (tool call rounds)
     pub max_iterations: usize,
+    /// Thinking mode for extended reasoning
+    pub thinking_mode: ThinkingMode,
 }
 
 impl Default for AgentConfig {
@@ -34,6 +72,7 @@ impl Default for AgentConfig {
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: 10,
+            thinking_mode: ThinkingMode::Instant,
         }
     }
 }
@@ -44,6 +83,9 @@ pub type StreamCallback = Box<dyn Fn(&str) + Send + Sync>;
 /// Callback for storing extracted memories
 pub type MemoryCallback = Box<dyn Fn(ExtractedMemory) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Callback for streaming thinking chunks
+pub type ThinkingCallback = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Options for running the agent
 #[derive(Default)]
 pub struct RunOptions {
@@ -53,6 +95,8 @@ pub struct RunOptions {
     pub context_prefix: Option<String>,
     /// Callback for streaming text (called with each text chunk)
     pub on_text: Option<StreamCallback>,
+    /// Callback for streaming thinking/reasoning (called with each thinking chunk)
+    pub on_thinking: Option<ThinkingCallback>,
     /// Auto-extract memories after each run
     pub auto_extract_memories: bool,
     /// Callback for storing extracted memories (required if auto_extract_memories is true)
@@ -61,6 +105,12 @@ pub struct RunOptions {
     pub track_uncertainty: bool,
     /// Enable emotional context analysis
     pub track_emotions: bool,
+    /// Override thinking mode for this run
+    pub thinking_mode: Option<ThinkingMode>,
+    /// Enable context compression for long conversations
+    pub enable_context_compression: bool,
+    /// Maximum context tokens before compression kicks in
+    pub context_compression_threshold: Option<usize>,
 }
 
 /// Response from an agent run
@@ -81,6 +131,30 @@ pub struct AgentResponse {
     pub confidence: Option<f32>,
     /// Emotional context detected in the conversation
     pub emotional_context: Option<EmotionalContext>,
+    /// Reasoning/thinking content (if thinking mode was enabled)
+    pub reasoning: Option<ReasoningContent>,
+}
+
+/// Reasoning content from thinking mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningContent {
+    /// The full reasoning/thinking text
+    pub content: String,
+    /// Reasoning tokens used
+    pub tokens: u32,
+    /// Interleaved reasoning blocks (between tool calls)
+    pub blocks: Vec<ReasoningBlock>,
+}
+
+/// A single reasoning block (interleaved between actions)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningBlock {
+    /// The reasoning text for this block
+    pub content: String,
+    /// Which iteration this occurred in
+    pub iteration: usize,
+    /// Whether this was before a tool call
+    pub before_tool: Option<String>,
 }
 
 /// Emotional context detected in the conversation
@@ -169,8 +243,8 @@ impl Agent {
             debug!("Agent iteration {}/{}", state.iterations, max_iterations);
 
             // Build and execute LLM request
-            let request = self.build_request().await;
-            let result = self.call_llm(&request, &options).await?;
+            let request = self.build_request_with_thinking(options.thinking_mode).await;
+            let result = self.call_llm(&request, &options, &mut state).await?;
 
             state.input_tokens += result.input_tokens;
             state.output_tokens += result.output_tokens;
@@ -208,6 +282,12 @@ impl Agent {
                 return Ok(state.into_response(false));
             }
 
+            // Finalize any reasoning that occurred before tool calls (interleaved reasoning)
+            if !result.tool_uses.is_empty() {
+                let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
+                state.finalize_reasoning_block(first_tool);
+            }
+
             // Execute tools and continue loop
             let tool_results = self.execute_tools(&result.tool_uses, &mut state).await;
             self.store_tool_results(tool_results).await;
@@ -227,11 +307,12 @@ impl Agent {
         &self,
         request: &AnthropicRequest,
         options: &RunOptions,
+        state: &mut RunState,
     ) -> Result<LlmResult, AgentError> {
         if let Some(ref on_text) = options.on_text {
-            self.call_llm_streaming(request, on_text).await
+            self.call_llm_streaming(request, on_text, options.on_thinking.as_ref(), state).await
         } else {
-            self.call_llm_sync(request).await
+            self.call_llm_sync(request, state).await
         }
     }
 
@@ -239,6 +320,8 @@ impl Agent {
         &self,
         request: &AnthropicRequest,
         on_text: &StreamCallback,
+        on_thinking: Option<&ThinkingCallback>,
+        state: &mut RunState,
     ) -> Result<LlmResult, AgentError> {
         use futures::StreamExt;
         use std::pin::pin;
@@ -260,8 +343,24 @@ impl Agent {
                     on_text(&text);
                     response_text.push_str(&text);
                 }
-                StreamEvent::ContentBlockStart { content_type, .. } => {
+                StreamEvent::ThinkingDelta { thinking, .. } => {
+                    // Capture thinking/reasoning content
+                    if let Some(callback) = on_thinking {
+                        callback(&thinking);
+                    }
+                    state.reasoning_content.push_str(&thinking);
+                    state.current_reasoning.push_str(&thinking);
+                    // Estimate tokens (~4 chars per token)
+                    state.reasoning_tokens += (thinking.len() / 4) as u32;
+                }
+                StreamEvent::ContentBlockStart { content_type, tool_id, tool_name, .. } => {
                     current_block_type = content_type;
+                    if let Some(id) = tool_id {
+                        current_tool_id = id;
+                    }
+                    if let Some(name) = tool_name {
+                        current_tool_name = name;
+                    }
                 }
                 StreamEvent::ContentBlockStop { .. } => {
                     if current_block_type == "tool_use" && !current_tool_id.is_empty() {
@@ -278,6 +377,8 @@ impl Agent {
                             });
                         }
                         current_tool_json.clear();
+                    } else if current_block_type == "thinking" {
+                        // Thinking block finished - reasoning already accumulated
                     } else if !response_text.is_empty() {
                         content_blocks.push(ContentBlock::Text {
                             text: response_text.clone(),
@@ -307,7 +408,7 @@ impl Agent {
         })
     }
 
-    async fn call_llm_sync(&self, request: &AnthropicRequest) -> Result<LlmResult, AgentError> {
+    async fn call_llm_sync(&self, request: &AnthropicRequest, state: &mut RunState) -> Result<LlmResult, AgentError> {
         let response = self.llm.complete_anthropic(request).await?;
         let mut tool_uses = Vec::new();
         let mut response_text = String::new();
@@ -317,6 +418,13 @@ impl Agent {
                 ContentBlock::Text { text } => response_text.push_str(text),
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_uses.push((id.clone(), name.clone(), input.clone()));
+                }
+                ContentBlock::Thinking { thinking } => {
+                    // Capture thinking/reasoning content
+                    state.reasoning_content.push_str(thinking);
+                    state.current_reasoning.push_str(thinking);
+                    // Estimate tokens (~4 chars per token)
+                    state.reasoning_tokens += (thinking.len() / 4) as u32;
                 }
                 ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
             }
@@ -356,6 +464,9 @@ impl Agent {
                 name: name.clone(),
                 parameters: params,
             };
+
+            // Finalize any pending reasoning block before tool execution (interleaved reasoning)
+            state.finalize_reasoning_block(Some(name.clone()));
 
             info!("Executing tool: {name}");
             let response = self.tools.execute(tool_call).await;
@@ -401,7 +512,7 @@ impl Agent {
         ctx.messages.push(AnthropicMessage::user(tool_results));
     }
 
-    async fn build_request(&self) -> AnthropicRequest {
+    async fn build_request_with_thinking(&self, thinking_override: Option<ThinkingMode>) -> AnthropicRequest {
         let ctx = self.context.read().await;
 
         let tool_defs = self.tools.definitions().await;
@@ -413,6 +524,10 @@ impl Agent {
                 input_schema: t.to_anthropic_format()["input_schema"].clone(),
             })
             .collect();
+
+        // Determine thinking mode (override takes precedence)
+        let thinking_mode = thinking_override.unwrap_or(self.config.thinking_mode);
+        let thinking = thinking_mode.budget_tokens().map(nanna_llm::ThinkingConfig::new);
 
         AnthropicRequest {
             model: self.config.model.clone(),
@@ -426,6 +541,7 @@ impl Agent {
             },
             tools: if tools.is_empty() { None } else { Some(tools) },
             stream: None,
+            thinking,
         }
     }
 
@@ -638,6 +754,7 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
             system: Some("You are a memory extraction system. Output only valid JSON.".to_string()),
             tools: None,
             stream: None,
+            thinking: None,
         };
 
         let response = self.llm.complete_anthropic(&request).await?;
@@ -685,6 +802,14 @@ struct RunState {
     final_text: String,
     confidence: Option<f32>,
     emotional_context: Option<EmotionalContext>,
+    /// Accumulated reasoning content
+    reasoning_content: String,
+    /// Reasoning tokens used
+    reasoning_tokens: u32,
+    /// Interleaved reasoning blocks
+    reasoning_blocks: Vec<ReasoningBlock>,
+    /// Current reasoning block being built
+    current_reasoning: String,
 }
 
 impl RunState {
@@ -697,10 +822,35 @@ impl RunState {
             final_text: String::new(),
             confidence: None,
             emotional_context: None,
+            reasoning_content: String::new(),
+            reasoning_tokens: 0,
+            reasoning_blocks: Vec::new(),
+            current_reasoning: String::new(),
+        }
+    }
+
+    /// Finalize any pending reasoning block before a tool call
+    fn finalize_reasoning_block(&mut self, before_tool: Option<String>) {
+        if !self.current_reasoning.is_empty() {
+            self.reasoning_blocks.push(ReasoningBlock {
+                content: std::mem::take(&mut self.current_reasoning),
+                iteration: self.iterations,
+                before_tool,
+            });
         }
     }
 
     fn into_response(self, truncated: bool) -> AgentResponse {
+        let reasoning = if self.reasoning_content.is_empty() && self.reasoning_blocks.is_empty() {
+            None
+        } else {
+            Some(ReasoningContent {
+                content: self.reasoning_content,
+                tokens: self.reasoning_tokens,
+                blocks: self.reasoning_blocks,
+            })
+        };
+
         AgentResponse {
             text: self.final_text,
             tool_calls: self.tool_records,
@@ -710,6 +860,7 @@ impl RunState {
             output_tokens: self.output_tokens,
             confidence: self.confidence,
             emotional_context: self.emotional_context,
+            reasoning,
         }
     }
 }

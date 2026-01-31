@@ -1,6 +1,6 @@
 //! Multi-agent coordination and background tasks
 
-use crate::{Agent, AgentConfig, AgentContext, AgentError, AgentResponse, RunOptions};
+use crate::{Agent, AgentConfig, AgentContext, AgentError, AgentResponse, RunOptions, ThinkingMode};
 use nanna_llm::{LlmClient, RequestBuilder};
 use nanna_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
@@ -263,6 +263,78 @@ pub struct SwarmTaskResult {
     pub duration_ms: u64,
 }
 
+/// Critical path metrics for parallel execution analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticalPathMetrics {
+    /// Total wall-clock time (actual elapsed)
+    pub wall_clock_ms: u64,
+    /// Sum of all task durations (if sequential)
+    pub sequential_ms: u64,
+    /// Duration of the longest parallel branch (critical path)
+    pub critical_path_ms: u64,
+    /// Parallelism efficiency (sequential / wall_clock)
+    pub parallelism_ratio: f32,
+    /// Number of execution levels (dependency depth)
+    pub execution_levels: usize,
+    /// Tasks per level
+    pub tasks_per_level: Vec<usize>,
+    /// Critical path task IDs (the longest chain)
+    pub critical_path_tasks: Vec<String>,
+}
+
+impl CriticalPathMetrics {
+    /// Calculate metrics from task results and execution levels
+    pub fn calculate(
+        results: &[SwarmTaskResult],
+        levels: &[Vec<String>],
+        wall_clock_ms: u64,
+    ) -> Self {
+        let sequential_ms: u64 = results.iter().map(|r| r.duration_ms).sum();
+        
+        // Calculate critical path: max duration at each level, then sum
+        let mut level_max_durations: Vec<u64> = Vec::new();
+        let mut critical_path_tasks: Vec<String> = Vec::new();
+        
+        for level in levels {
+            let mut max_duration = 0u64;
+            let mut max_task_id = String::new();
+            
+            for task_id in level {
+                if let Some(result) = results.iter().find(|r| &r.task_id == task_id) {
+                    if result.duration_ms > max_duration {
+                        max_duration = result.duration_ms;
+                        max_task_id = task_id.clone();
+                    }
+                }
+            }
+            
+            if max_duration > 0 {
+                level_max_durations.push(max_duration);
+                critical_path_tasks.push(max_task_id);
+            }
+        }
+        
+        let critical_path_ms: u64 = level_max_durations.iter().sum();
+        let parallelism_ratio = if wall_clock_ms > 0 {
+            sequential_ms as f32 / wall_clock_ms as f32
+        } else {
+            1.0
+        };
+        
+        let tasks_per_level: Vec<usize> = levels.iter().map(Vec::len).collect();
+        
+        Self {
+            wall_clock_ms,
+            sequential_ms,
+            critical_path_ms,
+            parallelism_ratio,
+            execution_levels: levels.len(),
+            tasks_per_level,
+            critical_path_tasks,
+        }
+    }
+}
+
 /// Aggregated results from a swarm run
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmResult {
@@ -273,6 +345,8 @@ pub struct SwarmResult {
     pub results: Vec<SwarmTaskResult>,
     pub aggregated: Option<String>,
     pub duration_ms: u64,
+    /// Critical path analysis metrics
+    pub critical_path: Option<CriticalPathMetrics>,
 }
 
 /// Swarm configuration
@@ -286,6 +360,14 @@ pub struct SwarmConfig {
     pub aggregate_results: bool,
     /// Aggregation prompt template (use {results} placeholder)
     pub aggregation_prompt: Option<String>,
+    /// Context isolation mode for sub-agents
+    pub context_isolation: crate::context::ContextIsolation,
+    /// Enable critical path metrics calculation
+    pub calculate_critical_path: bool,
+    /// Thinking mode for sub-agents (extended reasoning)
+    pub thinking_mode: ThinkingMode,
+    /// Total context budget to distribute across sub-agents (in tokens)
+    pub context_budget: Option<usize>,
 }
 
 impl Default for SwarmConfig {
@@ -295,6 +377,10 @@ impl Default for SwarmConfig {
             task_timeout_secs: 60,
             aggregate_results: true,
             aggregation_prompt: None,
+            context_isolation: crate::context::ContextIsolation::SystemOnly,
+            calculate_critical_path: true,
+            thinking_mode: ThinkingMode::Instant,
+            context_budget: None,
         }
     }
 }
@@ -339,6 +425,7 @@ impl AgentCoordinator {
         // Spawn tasks in batches
         let mut all_results = Vec::with_capacity(total_tasks);
         let task_timeout = config.task_timeout_secs;
+        let swarm_thinking_mode = config.thinking_mode;
         
         for chunk in prompts.chunks(config.max_parallel) {
             let mut handles = Vec::with_capacity(chunk.len());
@@ -351,6 +438,7 @@ impl AgentCoordinator {
                 let prompt = prompt.clone();
                 let timeout = task_timeout;
                 let task_id = Uuid::new_v4().to_string();
+                let thinking_mode = swarm_thinking_mode;
                 
                 let handle = tokio::spawn(async move {
                     let task_start = std::time::Instant::now();
@@ -358,10 +446,14 @@ impl AgentCoordinator {
                     let context = AgentContext::new(&task_id).with_system_prompt(system);
                     let agent = Agent::new(agent_cfg, llm, tools).with_context(context);
                     
-                    // Run with timeout
+                    // Run with timeout, passing thinking mode from swarm config
+                    let run_options = RunOptions {
+                        thinking_mode: Some(thinking_mode),
+                        ..RunOptions::default()
+                    };
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(timeout),
-                        agent.run(&prompt, RunOptions::default())
+                        agent.run(&prompt, run_options)
                     ).await;
                     
                     let duration_ms = task_start.elapsed().as_millis() as u64;
@@ -448,6 +540,14 @@ impl AgentCoordinator {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // For simple swarm (no dependency levels), create single-level metrics
+        let critical_path = if config.calculate_critical_path {
+            let single_level = vec![all_results.iter().map(|r| r.task_id.clone()).collect()];
+            Some(CriticalPathMetrics::calculate(&all_results, &single_level, duration_ms))
+        } else {
+            None
+        };
+
         Ok(SwarmResult {
             swarm_id,
             total_tasks,
@@ -456,6 +556,7 @@ impl AgentCoordinator {
             results: all_results,
             aggregated,
             duration_ms,
+            critical_path,
         })
     }
 
@@ -473,6 +574,10 @@ impl AgentCoordinator {
                 task_timeout_secs: 30,
                 aggregate_results: true,
                 aggregation_prompt: None,
+                context_isolation: crate::context::ContextIsolation::SystemOnly,
+                calculate_critical_path: false,
+                thinking_mode: ThinkingMode::Instant,
+                context_budget: None,
             },
         ).await?;
 
@@ -770,8 +875,17 @@ Be comprehensive but concise. Highlight key findings and conclusions."#,
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        info!("Swarm {} completed: {}/{} successful in {}ms", 
-              swarm_id, successful, all_results.len(), duration_ms);
+        // Calculate critical path metrics using actual execution levels
+        let critical_path = if config.calculate_critical_path {
+            Some(CriticalPathMetrics::calculate(&all_results, &execution_levels, duration_ms))
+        } else {
+            None
+        };
+
+        info!("Swarm {} completed: {}/{} successful in {}ms (critical path: {}ms, parallelism: {:.2}x)", 
+              swarm_id, successful, all_results.len(), duration_ms,
+              critical_path.as_ref().map_or(0, |cp| cp.critical_path_ms),
+              critical_path.as_ref().map_or(1.0, |cp| cp.parallelism_ratio));
 
         Ok(SwarmResult {
             swarm_id,
@@ -781,6 +895,7 @@ Be comprehensive but concise. Highlight key findings and conclusions."#,
             results: all_results,
             aggregated,
             duration_ms,
+            critical_path,
         })
     }
 

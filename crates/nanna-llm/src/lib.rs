@@ -196,6 +196,8 @@ pub enum ContentBlock {
     Image { source: ImageSource },
     ToolUse { id: String, name: String, input: serde_json::Value },
     ToolResult { tool_use_id: String, content: String, #[serde(skip_serializing_if = "Option::is_none")] is_error: Option<bool> },
+    /// Extended thinking content (reasoning)
+    Thinking { thinking: String },
 }
 
 /// Image source for vision API
@@ -315,6 +317,27 @@ impl CompletionRequest {
     }
 }
 
+/// Extended thinking configuration
+#[derive(Debug, Clone, Serialize)]
+pub struct ThinkingConfig {
+    /// Type of thinking (always "enabled" when present)
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    /// Budget in tokens for thinking
+    pub budget_tokens: u32,
+}
+
+impl ThinkingConfig {
+    /// Create a new thinking config with the given budget
+    #[must_use]
+    pub fn new(budget_tokens: u32) -> Self {
+        Self {
+            thinking_type: "enabled".to_string(),
+            budget_tokens,
+        }
+    }
+}
+
 /// Full Anthropic request with tools
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicRequest {
@@ -329,6 +352,9 @@ pub struct AnthropicRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Extended thinking configuration (Claude 3.5+ models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 /// Anthropic API response
@@ -521,6 +547,7 @@ impl LlmClient {
             system: system_msg,
             tools: None,
             stream: None,
+            thinking: None,
         };
 
         let result = self.complete_anthropic(&anthropic_request).await?;
@@ -707,6 +734,9 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
                 ContentBlock::Image { .. } => {
                     // Images are ~1000 tokens for small, more for large
                     total += 1000;
+                }
+                ContentBlock::Thinking { thinking } => {
+                    total += estimate_tokens(thinking);
                 }
             }
         }
@@ -1108,6 +1138,8 @@ pub enum StreamEvent {
     },
     /// Text delta within a content block
     TextDelta { index: usize, text: String },
+    /// Thinking/reasoning delta (extended thinking mode)
+    ThinkingDelta { index: usize, thinking: String },
     /// Tool use delta (JSON fragment)
     ToolUseDelta { index: usize, partial_json: String },
     /// Content block finished
@@ -1145,6 +1177,8 @@ pub enum StreamEvent {
 pub struct StreamAccumulator {
     /// Text content accumulated so far
     pub text: String,
+    /// Thinking/reasoning content accumulated so far
+    pub thinking: String,
     /// Tool calls in progress: (index, id, name, partial_json)
     pub tool_calls: Vec<(usize, String, String, String)>,
 }
@@ -1161,6 +1195,9 @@ impl StreamAccumulator {
         match event {
             StreamEvent::TextDelta { text, .. } => {
                 self.text.push_str(text);
+            }
+            StreamEvent::ThinkingDelta { thinking, .. } => {
+                self.thinking.push_str(thinking);
             }
             StreamEvent::ContentBlockStart { index, content_type, tool_id, tool_name } => {
                 if content_type == "tool_use" {
@@ -1189,7 +1226,7 @@ impl StreamAccumulator {
     /// Check if there's any accumulated content
     #[must_use]
     pub fn has_content(&self) -> bool {
-        !self.text.is_empty() || !self.tool_calls.is_empty()
+        !self.text.is_empty() || !self.thinking.is_empty() || !self.tool_calls.is_empty()
     }
 }
 
@@ -1228,6 +1265,7 @@ struct ContentBlockData {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DeltaData {
     TextDelta { text: String },
+    ThinkingDelta { thinking: String },
     InputJsonDelta { partial_json: String },
 }
 
@@ -1408,6 +1446,7 @@ impl LlmClient {
             system: system_msg,
             tools,
             stream: Some(true),
+            thinking: None, // TODO: Add thinking support
         };
 
         // Create an async stream that filters and maps the raw stream
@@ -1494,6 +1533,7 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
             }
             AnthropicSSE::ContentBlockDelta { index, delta } => match delta {
                 DeltaData::TextDelta { text } => StreamEvent::TextDelta { index, text },
+                DeltaData::ThinkingDelta { thinking } => StreamEvent::ThinkingDelta { index, thinking },
                 DeltaData::InputJsonDelta { partial_json } => {
                     StreamEvent::ToolUseDelta { index, partial_json }
                 }
