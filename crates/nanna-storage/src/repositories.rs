@@ -21,12 +21,23 @@ impl SessionRepository {
         channel: &str,
         user_id: Option<&str>,
     ) -> Result<Session, StorageError> {
+        self.create_with_workspace(session_id, channel, user_id, None, None).await
+    }
+
+    pub async fn create_with_workspace(
+        &self,
+        session_id: &str,
+        channel: &str,
+        user_id: Option<&str>,
+        workspace_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Session, StorageError> {
         let conn = self.conn.write().await;
 
         conn.execute(
-            "INSERT INTO sessions (session_id, channel, user_id) VALUES (?1, ?2, ?3)
+            "INSERT INTO sessions (session_id, channel, user_id, workspace_id, name) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id) DO UPDATE SET updated_at = datetime('now')",
-            turso::params![session_id, channel, user_id],
+            turso::params![session_id, channel, user_id, workspace_id, name],
         )
         .await?;
 
@@ -39,7 +50,7 @@ impl SessionRepository {
 
         let mut rows = conn
             .query(
-                "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata 
+                "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
                  FROM sessions WHERE session_id = ?1",
                 turso::params![session_id],
             )
@@ -55,6 +66,8 @@ impl SessionRepository {
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
                 metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+                workspace_id: row.get(7)?,
+                name: row.get(8)?,
             })
         } else {
             Err(StorageError::NotFound(format!("Session: {session_id}")))
@@ -66,7 +79,7 @@ impl SessionRepository {
 
         let mut rows = conn
             .query(
-                "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata 
+                "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
                  FROM sessions ORDER BY updated_at DESC LIMIT ?1",
                 turso::params![limit],
             )
@@ -83,10 +96,72 @@ impl SessionRepository {
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
                 metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+                workspace_id: row.get(7)?,
+                name: row.get(8)?,
             });
         }
 
         Ok(sessions)
+    }
+
+    /// List sessions for a specific workspace (or global if workspace_id is None)
+    pub async fn list_by_workspace(&self, workspace_id: Option<&str>, limit: i64) -> Result<Vec<Session>, StorageError> {
+        let conn = self.conn.read().await;
+
+        let mut rows = match workspace_id {
+            Some(ws_id) => {
+                conn.query(
+                    "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
+                     FROM sessions WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                    turso::params![ws_id, limit],
+                ).await?
+            }
+            None => {
+                conn.query(
+                    "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name 
+                     FROM sessions WHERE workspace_id IS NULL ORDER BY updated_at DESC LIMIT ?1",
+                    turso::params![limit],
+                ).await?
+            }
+        };
+
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let metadata_str: Option<String> = row.get(6)?;
+            sessions.push(Session {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                channel: row.get(2)?,
+                user_id: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+                workspace_id: row.get(7)?,
+                name: row.get(8)?,
+            });
+        }
+
+        Ok(sessions)
+    }
+
+    /// Update session name
+    pub async fn update_name(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+        conn.execute(
+            "UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![name, session_id],
+        ).await?;
+        Ok(())
+    }
+
+    /// Update session workspace
+    pub async fn update_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
+        let conn = self.conn.write().await;
+        conn.execute(
+            "UPDATE sessions SET workspace_id = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![workspace_id, session_id],
+        ).await?;
+        Ok(())
     }
 }
 

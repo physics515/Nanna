@@ -5,6 +5,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", MIGRATION_001),
     ("002_memories", MIGRATION_002),
     ("003_config", MIGRATION_003),
+    ("004_workspaces", MIGRATION_004),
 ];
 
 const MIGRATION_001: &str = r"
@@ -90,4 +91,23 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cron_next ON cron_jobs(next_run) WHERE enabled = 1;
+";
+
+const MIGRATION_004: &str = r"
+-- Add workspace support to sessions
+-- workspace_id is optional (NULL = global/no workspace)
+ALTER TABLE sessions ADD COLUMN workspace_id TEXT;
+ALTER TABLE sessions ADD COLUMN name TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id);
+
+-- Workspace memory links (memory can belong to multiple workspaces)
+CREATE TABLE IF NOT EXISTS workspace_memories (
+    workspace_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, memory_id),
+    FOREIGN KEY (memory_id) REFERENCES memories(memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_memories_workspace ON workspace_memories(workspace_id);
 ";

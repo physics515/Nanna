@@ -12,6 +12,10 @@ pub struct Session {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
+    /// Optional workspace this session belongs to (None = global)
+    pub workspace_id: Option<String>,
+    /// Human-readable session name
+    pub name: Option<String>,
 }
 
 /// Message model
