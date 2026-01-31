@@ -4816,15 +4816,30 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                // Save memories before exiting
+                // Save memories before exiting (only if we have some)
                 if let Some(state) = app.try_state::<Arc<RwLock<AppState>>>() {
                     let state = state.inner().clone();
                     tauri::async_runtime::block_on(async {
                         let state_guard = state.read().await;
-                        if let Err(e) = state_guard.memory.save(&state_guard.memory_path).await {
-                            error!("Failed to save memories on exit: {}", e);
+                        let count = state_guard.memory.count().await;
+                        
+                        // Only save if we have memories (prevents wiping on failed load)
+                        if count > 0 {
+                            // Create backup before saving
+                            let backup_path = state_guard.memory_path.with_extension("json.bak");
+                            if state_guard.memory_path.exists() {
+                                if let Err(e) = std::fs::copy(&state_guard.memory_path, &backup_path) {
+                                    warn!("Failed to create memory backup: {}", e);
+                                }
+                            }
+                            
+                            if let Err(e) = state_guard.memory.save(&state_guard.memory_path).await {
+                                error!("Failed to save memories on exit: {}", e);
+                            } else {
+                                info!("Saved {} memories to {:?}", count, state_guard.memory_path);
+                            }
                         } else {
-                            info!("Saved memories to {:?}", state_guard.memory_path);
+                            info!("No memories to save (count=0), skipping to preserve existing file");
                         }
                     });
                 }
