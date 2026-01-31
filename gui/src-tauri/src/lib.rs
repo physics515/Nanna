@@ -1398,7 +1398,13 @@ async fn create_session(
     })
 }
 
-/// List all sessions (optionally filtered by workspace)
+/// List sessions for the current context
+/// - workspace_id = Some(id): Show sessions belonging to that workspace
+/// - workspace_id = None: Show only GLOBAL sessions (workspace_id IS NULL)
+/// 
+/// This enforces memory isolation:
+/// - Global sessions see only global memory
+/// - Workspace sessions see global + their workspace memory (not other workspaces)
 #[tauri::command]
 async fn list_sessions(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -1406,25 +1412,13 @@ async fn list_sessions(
 ) -> Result<Vec<SessionInfo>, String> {
     let state_guard = state.read().await;
 
-    // Get sessions - if workspace_id is Some, filter by workspace
-    // If workspace_id is None, show ALL sessions (global view)
-    let sessions = match &workspace_id {
-        Some(ws_id) => {
-            state_guard
-                .storage
-                .list_gui_sessions_by_workspace(Some(ws_id), 100)
-                .await
-                .map_err(|e| format!("Failed to list sessions: {}", e))?
-        }
-        None => {
-            // Show all sessions when no workspace filter
-            state_guard
-                .storage
-                .list_gui_sessions(100)
-                .await
-                .map_err(|e| format!("Failed to list sessions: {}", e))?
-        }
-    };
+    // Filter sessions by workspace context
+    // Both cases use list_by_workspace - None means "workspace_id IS NULL" (global only)
+    let sessions = state_guard
+        .storage
+        .list_gui_sessions_by_workspace(workspace_id.as_deref(), 100)
+        .await
+        .map_err(|e| format!("Failed to list sessions: {}", e))?;
 
     // Build workspace name lookup
     let registry = state_guard.workspaces.read().await;
