@@ -19,3 +19,5 @@ config.toml
 *.db
 *.db-shm
 *.db-wal
+
+rustc-ice-*.txt
