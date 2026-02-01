@@ -9,16 +9,19 @@
 //! - `DiscordListener` - WebSocket via Discord Gateway
 //! - `SlackListener` - WebSocket via Slack Socket Mode
 //! - `SignalListener` - signal-cli-rest-api (SSE or polling)
+//! - `WhatsAppWebListener` - WhatsApp Web bridge (WebSocket, SSE, or polling)
 
 pub mod discord;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
+pub mod whatsapp;
 
 pub use discord::DiscordListener;
 pub use signal::{SignalListener, ReceiveMode as SignalReceiveMode};
 pub use slack::SlackListener;
 pub use telegram::TelegramListener;
+pub use whatsapp::{WhatsAppWebListener, ReceiveMode as WhatsAppReceiveMode};
 
 use crate::IncomingMessage;
 use async_trait::async_trait;
