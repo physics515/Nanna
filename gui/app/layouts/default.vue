@@ -304,6 +304,9 @@
         <slot />
       </main>
     </div>
+    
+    <!-- Close confirmation dialog -->
+    <CloseDialog />
   </div>
 </template>
 
@@ -346,6 +349,7 @@ const sidebarOpen = ref(false)
 const activeWorkspace = ref<WorkspaceInfo | null>(null)
 
 let unlistenTrayNewChat: UnlistenFn | null = null
+let unlistenCloseRequested: UnlistenFn | null = null
 
 // Provide session switching to child components
 provide('currentSessionId', currentSessionId)
@@ -357,6 +361,9 @@ const { checkPermission } = useNotifications()
 
 // Initialize backend (daemon or embedded mode)
 const { init: initBackend, status: backendStatus, isDaemon } = useBackend()
+
+// Close handler
+const { handleClose, loadCloseMode } = useCloseHandler()
 
 onMounted(async () => {
   // Initialize backend first (tries daemon, falls back to embedded)
@@ -379,12 +386,26 @@ onMounted(async () => {
     createNewSession()
   })
   
+  // Listen for window close request
+  const { getCurrentWindow } = await import('@tauri-apps/api/window')
+  const window = getCurrentWindow()
+  unlistenCloseRequested = await window.onCloseRequested(async (event) => {
+    // Prevent default close
+    event.preventDefault()
+    // Handle via our close handler
+    await handleClose()
+  })
+  
+  // Load close mode preference
+  await loadCloseMode()
+  
   // Check notification permissions on mount
   await checkPermission()
 })
 
 onUnmounted(() => {
   if (unlistenTrayNewChat) unlistenTrayNewChat()
+  if (unlistenCloseRequested) unlistenCloseRequested()
 })
 
 // Watch for route changes to sync currentSessionId
