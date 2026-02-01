@@ -2,9 +2,17 @@
 //!
 //! IPC bridge between the frontend and nanna-core with agentic tool loop.
 //! Includes FSRS-6 cognitive memory and dreaming/consolidation.
+//!
+//! Supports two modes:
+//! - **Daemon mode**: Connects to nanna-daemon via WebSocket
+//! - **Embedded mode**: Runs agent directly (fallback when daemon unavailable)
 
 pub mod agents;
+pub mod backend;
+pub mod daemon_client;
 pub mod tool_authoring;
+
+use backend::{Backend, BackendMode};
 
 use nanna_config::Config;
 use nanna_core::{
@@ -590,6 +598,8 @@ pub struct AppState {
     workspaces: Arc<RwLock<WorkspaceRegistry>>,
     /// User tool authoring manager
     user_tools: Arc<tool_authoring::UserToolManager>,
+    /// Backend abstraction (daemon or embedded mode)
+    backend: Arc<Backend>,
 }
 
 /// Model status event for frontend
@@ -4498,6 +4508,32 @@ async fn test_user_tool(
 }
 
 // =============================================================================
+// Backend Mode Commands
+// =============================================================================
+
+/// Get current backend status (daemon or embedded mode)
+#[tauri::command]
+async fn get_backend_status(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<backend::BackendStatus, String> {
+    let state = state.read().await;
+    Ok(state.backend.status().await)
+}
+
+/// Initialize the backend - attempts daemon connection, falls back to embedded
+#[tauri::command]
+async fn init_backend(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<String, String> {
+    let state = state.read().await;
+    let mode = state.backend.init().await;
+    Ok(match mode {
+        BackendMode::Daemon => "daemon".to_string(),
+        BackendMode::Embedded => "embedded".to_string(),
+    })
+}
+
+// =============================================================================
 // App Setup
 // =============================================================================
 
@@ -4896,6 +4932,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
         // User tool authoring manager
         user_tools: user_tool_manager,
+        // Backend (will be initialized on setup)
+        backend: Arc::new(Backend::new()),
     })
 }
 
@@ -5054,6 +5092,9 @@ pub fn run() {
             update_user_tool,
             delete_user_tool,
             test_user_tool,
+            // Backend mode
+            get_backend_status,
+            init_backend,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
