@@ -805,10 +805,10 @@ tools = ["*"]  # Full access
 | 65 | Webhook server (Axum) | 🔜 |
 | 66 | Telegram listener | ✅ Done |
 | 67 | Unified message router | ✅ Done |
-| 68 | Cron system + persistence | 🔜 |
+| 68 | Cron system + persistence | ✅ Done |
 | 69 | Discord Gateway | ✅ Done |
 | 70 | Slack Socket Mode | ✅ Done |
-| 71 | Heartbeats | 🔜 |
+| 71 | Heartbeats | ✅ Done |
 | 72 | Sub-agent sessions | 🔜 |
 | 73 | TTS (ElevenLabs/OpenAI) | Later |
 | 74 | Browser relay extension | Later |
@@ -845,11 +845,11 @@ tools = ["*"]  # Full access
 12. **Discord Interactions** - `/webhook/discord` with signature verification
 13. **Slack Events** - `/webhook/slack` with challenge handling
 
-### Cron & Scheduling (Low Priority)
-14. **Cron Parser** - Parse standard cron expressions
-15. **Job Persistence** - Store jobs in SQLite
-16. **Job Execution** - Run prompts/tools on schedule
-17. **GUI Cron Editor** - Visual cron builder
+### Cron & Scheduling ✅ DONE
+14. ~~**Cron Parser**~~ - Parse standard cron expressions ✅
+15. ~~**Job Persistence**~~ - Store jobs in SQLite ✅
+16. ~~**Job Execution**~~ - Run prompts/tools on schedule ✅
+17. ~~**GUI Cron Editor**~~ - Visual cron builder ✅
 
 ### Multi-Device Swarm (Phase 9 - Foundation)
 18. **nanna-identity** - Ed25519 keypair + onion address derivation
