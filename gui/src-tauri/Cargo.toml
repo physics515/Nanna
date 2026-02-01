@@ -51,6 +51,7 @@ nanna-memory = { path = "../../crates/nanna-memory" }
 nanna-agent = { path = "../../crates/nanna-agent" }
 nanna-workspace = { path = "../../crates/nanna-workspace" }
 nanna-scripting = { path = "../../crates/nanna-scripting", features = ["boa"] }
+nanna-channels = { path = "../../crates/nanna-channels" }
 
 [features]
 default = ["custom-protocol", "devtools"]

@@ -39,6 +39,126 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 // =============================================================================
+// Channel Routing for Scheduled Tasks
+// =============================================================================
+
+use nanna_channels::{Channel, ChannelId, MessageContent, OutgoingMessage};
+
+/// Route a message to a channel by ID (format: "provider:chat_id" e.g. "telegram:12345")
+async fn route_to_channel(
+    channels: &nanna_config::ChannelsConfig,
+    channel_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    // Parse channel_id format: "provider:chat_id"
+    let parts: Vec<&str> = channel_id.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(format!("Invalid channel_id format '{}', expected 'provider:chat_id'", channel_id));
+    }
+    
+    let (provider, chat_id) = (parts[0], parts[1]);
+    
+    match provider.to_lowercase().as_str() {
+        "telegram" => {
+            let config = channels.telegram.as_ref()
+                .ok_or("Telegram not configured")?;
+            
+            let channel = nanna_channels::TelegramChannel::new(&config.bot_token);
+            let outgoing = OutgoingMessage {
+                channel: ChannelId::new("telegram", chat_id),
+                content: MessageContent::text(message),
+                reply_to: None,
+            };
+            
+            channel.send(outgoing).await
+                .map_err(|e| format!("Telegram send failed: {}", e))?;
+            
+            info!("Routed message to Telegram chat {}", chat_id);
+            Ok(())
+        }
+        "discord" => {
+            let config = channels.discord.as_ref()
+                .ok_or("Discord not configured")?;
+            
+            let channel = nanna_channels::DiscordChannel::new(
+                &config.bot_token,
+                &config.application_id,
+            );
+            let outgoing = OutgoingMessage {
+                channel: ChannelId::new("discord", chat_id),
+                content: MessageContent::text(message),
+                reply_to: None,
+            };
+            
+            channel.send(outgoing).await
+                .map_err(|e| format!("Discord send failed: {}", e))?;
+            
+            info!("Routed message to Discord channel {}", chat_id);
+            Ok(())
+        }
+        "slack" => {
+            let config = channels.slack.as_ref()
+                .ok_or("Slack not configured")?;
+            
+            let channel = nanna_channels::SlackChannel::new(&config.bot_token);
+            let outgoing = OutgoingMessage {
+                channel: ChannelId::new("slack", chat_id),
+                content: MessageContent::text(message),
+                reply_to: None,
+            };
+            
+            channel.send(outgoing).await
+                .map_err(|e| format!("Slack send failed: {}", e))?;
+            
+            info!("Routed message to Slack channel {}", chat_id);
+            Ok(())
+        }
+        "signal" => {
+            let config = channels.signal.as_ref()
+                .ok_or("Signal not configured")?;
+            
+            // SignalChannel::new takes the phone number (account)
+            let channel = nanna_channels::SignalChannel::new(&config.phone_number);
+            let outgoing = OutgoingMessage {
+                channel: ChannelId::new("signal", chat_id),
+                content: MessageContent::text(message),
+                reply_to: None,
+            };
+            
+            channel.send(outgoing).await
+                .map_err(|e| format!("Signal send failed: {}", e))?;
+            
+            info!("Routed message to Signal {}", chat_id);
+            Ok(())
+        }
+        "whatsapp" => {
+            let config = channels.whatsapp.as_ref()
+                .ok_or("WhatsApp not configured")?;
+            
+            // Only Cloud API is supported for outbound
+            let access_token = config.access_token.as_ref()
+                .ok_or("WhatsApp access_token not configured")?;
+            let phone_number_id = config.phone_number_id.as_ref()
+                .ok_or("WhatsApp phone_number_id not configured")?;
+            
+            let channel = nanna_channels::WhatsAppChannel::new(access_token, phone_number_id);
+            let outgoing = OutgoingMessage {
+                channel: ChannelId::new("whatsapp", chat_id),
+                content: MessageContent::text(message),
+                reply_to: None,
+            };
+            
+            channel.send(outgoing).await
+                .map_err(|e| format!("WhatsApp send failed: {}", e))?;
+            
+            info!("Routed message to WhatsApp {}", chat_id);
+            Ok(())
+        }
+        _ => Err(format!("Unknown channel provider: {}", provider)),
+    }
+}
+
+// =============================================================================
 // Context Management Constants
 // =============================================================================
 
@@ -5188,12 +5308,14 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     let llm_for_executor = llm.clone();
     let tools_for_executor = tools.clone();
     let model_for_executor = config.llm.model.clone();
+    let channels_for_executor = config.channels.clone();
     
     let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
         let memory = memory_for_executor.clone();
         let llm = llm_for_executor.clone();
         let tools = tools_for_executor.clone();
         let model = model_for_executor.clone();
+        let channels = channels_for_executor.clone();
         
         Box::pin(async move {
             let start = std::time::Instant::now();
@@ -5236,6 +5358,13 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                                 debug!("Heartbeat: OK (nothing to do)");
                             } else {
                                 info!("Heartbeat response: {}", output.chars().take(200).collect::<String>());
+                                
+                                // Route to channel if specified
+                                if let Some(ref channel_id) = task.target_channel {
+                                    if let Err(e) = route_to_channel(&channels, channel_id, &output).await {
+                                        warn!("Failed to route heartbeat to channel {}: {}", channel_id, e);
+                                    }
+                                }
                             }
                             
                             nanna_core::TaskResult {
@@ -5338,12 +5467,21 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                         match agent.run(&task.payload, run_options).await {
                             Ok(response) => {
                                 let finished_at = chrono::Utc::now();
+                                let output = response.text;
                                 info!("Cron job '{}' completed", task.name);
+                                
+                                // Route to channel if specified
+                                if let Some(ref channel_id) = task.target_channel {
+                                    if let Err(e) = route_to_channel(&channels, channel_id, &output).await {
+                                        warn!("Failed to route cron job to channel {}: {}", channel_id, e);
+                                    }
+                                }
+                                
                                 nanna_core::TaskResult {
                                     task_id: task.id.clone(),
                                     task_name: task.name.clone(),
                                     success: true,
-                                    output: Some(response.text),
+                                    output: Some(output),
                                     error: None,
                                     duration_ms: start.elapsed().as_millis() as u64,
                                     started_at,
