@@ -317,7 +317,7 @@ highlight.js
 - All see messages in real-time (like multiple Telegram clients)
 - Cross-channel sessions possible (Slack + Discord + GUI on same conversation)
 
-### Daemon Mode
+### Daemon Mode ✅ (Core Complete)
 **Run Nanna as a background service, headless, with attachable GUI**
 
 **Architecture:** Daemon runs independently; GUI connects as a channel client.
@@ -332,16 +332,20 @@ highlight.js
 └─────────────────────┘     └─────────────────────┘
 ```
 
-- [ ] **CLI binary** - `nanna daemon start/stop/status` commands
-- [ ] **Service installation** - Windows Service / systemd / launchd
-- [ ] **Headless operation** - No GUI required, config-driven
+- [x] **CLI binary** - `nanna-daemon run/start/stop/status/install/uninstall` commands
+- [x] **Service installation** - Windows Service / systemd / launchd
+- [x] **Headless operation** - No GUI required, config-driven
+- [x] **Graceful shutdown** - SIGTERM/Ctrl+C handling, save state
+- [x] **IPC server** - WebSocket server on port 5149
+- [x] **GUI client library** - `nanna-client` crate for connecting
+- [x] **Session persistence** - JSON persistence with auto-save
+- [x] **Protocol definition** - Complete IPC protocol for all actions
 - [ ] **PID file + lockfile** - Prevent multiple instances
-- [ ] **Graceful shutdown** - SIGTERM handling, save state
 - [ ] **Auto-restart** - Crash recovery with backoff
 - [ ] **Log rotation** - File-based logs with rotation
 - [ ] **Health endpoint** - HTTP `/health` for monitoring
-- [ ] **IPC server** - WebSocket + Unix socket for channel clients
-- [ ] **GUI attach/detach** - GUI connects as channel, survives restarts
+- [ ] **GUI integration** - Wire GUI to use daemon client
+- [ ] **Agent integration** - Connect control plane to actual agent
 
 **Platform Support:**
 | Platform | Daemon | GUI Mode | IPC |
@@ -622,15 +626,50 @@ Nanna Daemon ◄──────► Node Agent (Phone)
 | 56 | Slash commands | Later |
 | 57 | Chat input replacement | Later |
 | **Phase 8: Clawdbot Parity** | | |
-| 58 | Daemon binary (headless) | 🔜 |
-| 59 | Webhook server (Axum) | 🔜 |
-| 60 | Telegram listener | 🔜 |
-| 61 | Unified message router | 🔜 |
-| 62 | Cron system + persistence | 🔜 |
-| 63 | Discord Gateway | 🔜 |
-| 64 | Slack Socket Mode | 🔜 |
-| 65 | Heartbeats | 🔜 |
-| 66 | Sub-agent sessions | 🔜 |
-| 67 | TTS (ElevenLabs/OpenAI) | Later |
-| 68 | Browser relay extension | Later |
-| 69 | Paired devices (nodes) | Later |
+| 58 | ~~Daemon binary (headless)~~ | ✅ Done |
+| 59 | ~~IPC Protocol definition~~ | ✅ Done |
+| 60 | ~~Windows Service~~ | ✅ Done |
+| 61 | ~~Session persistence~~ | ✅ Done |
+| 62 | ~~Client library (nanna-client)~~ | ✅ Done |
+| 63 | Wire GUI to daemon client | 🔜 |
+| 64 | Agent integration in daemon | 🔜 |
+| 65 | Webhook server (Axum) | 🔜 |
+| 66 | Telegram listener | 🔜 |
+| 67 | Unified message router | 🔜 |
+| 68 | Cron system + persistence | 🔜 |
+| 69 | Discord Gateway | 🔜 |
+| 70 | Slack Socket Mode | 🔜 |
+| 71 | Heartbeats | 🔜 |
+| 72 | Sub-agent sessions | 🔜 |
+| 73 | TTS (ElevenLabs/OpenAI) | Later |
+| 74 | Browser relay extension | Later |
+| 75 | Paired devices (nodes) | Later |
+
+---
+
+## Open TODOs (Next Sprint)
+
+### Daemon Completion (High Priority)
+1. **Agent Integration** - Connect `ControlPlane` to `nanna-agent` for actual LLM calls
+2. **GUI Wiring** - Update Tauri backend to use `nanna-client` in daemon mode
+3. **Memory Integration** - Connect daemon to `nanna-memory` for persistence
+4. **Tool Registry** - Wire up `nanna-tools` in daemon
+5. **Fallback Mode** - GUI runs embedded agent when daemon unavailable
+
+### Channel Listeners (Medium Priority)
+6. **Telegram Listener** - Long-polling `getUpdates` loop
+7. **Discord Gateway** - WebSocket connection
+8. **Slack Socket Mode** - Real-time Slack events
+9. **Unified Router** - All channels → single message queue
+
+### Webhook Server (Medium Priority)
+10. **Axum HTTP Server** - Base server with routing
+11. **Telegram Webhook** - `/webhook/telegram` endpoint
+12. **Discord Interactions** - `/webhook/discord` with signature verification
+13. **Slack Events** - `/webhook/slack` with challenge handling
+
+### Cron & Scheduling (Low Priority)
+14. **Cron Parser** - Parse standard cron expressions
+15. **Job Persistence** - Store jobs in SQLite
+16. **Job Execution** - Run prompts/tools on schedule
+17. **GUI Cron Editor** - Visual cron builder
