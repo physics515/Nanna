@@ -5163,8 +5163,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     // Initialize scheduler with consolidation task
     let scheduler_config = SchedulerConfig {
         heartbeat_interval: Duration::from_secs(1800), // 30 minutes
-        heartbeat_enabled: false, // Heartbeats disabled for GUI (no HEARTBEAT.md)
-        heartbeat_prompt: "GUI heartbeat".to_string(),
+        heartbeat_enabled: true, // Enable heartbeats for autonomous operation
+        heartbeat_prompt: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
         max_concurrent: 4,
         check_interval: Duration::from_secs(30),
         default_timezone: "UTC".to_string(),
@@ -5186,15 +5186,89 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     // Create executor for scheduled tasks
     let memory_for_executor = memory.clone();
     let llm_for_executor = llm.clone();
+    let tools_for_executor = tools.clone();
+    let model_for_executor = config.llm.model.clone();
     
     let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
         let memory = memory_for_executor.clone();
         let llm = llm_for_executor.clone();
+        let tools = tools_for_executor.clone();
+        let model = model_for_executor.clone();
         
         Box::pin(async move {
             let start = std::time::Instant::now();
+            let started_at = chrono::Utc::now();
             
             match task.name.as_str() {
+                "heartbeat" => {
+                    info!("Running heartbeat...");
+                    
+                    // Build the heartbeat prompt with context
+                    let prompt = task.payload.clone();
+                    
+                    // Create agent config
+                    let agent_config = nanna_agent::AgentConfig {
+                        model: model.clone(),
+                        max_iterations: 5, // Limit turns for heartbeat
+                        ..Default::default()
+                    };
+                    
+                    // Create agent and run
+                    let agent = nanna_agent::Agent::new(
+                        agent_config,
+                        llm.clone(),
+                        tools.clone(),
+                    );
+                    
+                    // Run the agent with the heartbeat prompt
+                    let run_options = nanna_agent::RunOptions::default();
+                    match agent.run(&prompt, run_options).await {
+                        Ok(response) => {
+                            let finished_at = chrono::Utc::now();
+                            let output = response.text.clone();
+                            
+                            // Check if agent responded with HEARTBEAT_OK
+                            let is_heartbeat_ok = output.trim().starts_with("HEARTBEAT_OK") 
+                                || output.trim().ends_with("HEARTBEAT_OK")
+                                || output.trim() == "HEARTBEAT_OK";
+                            
+                            if is_heartbeat_ok {
+                                debug!("Heartbeat: OK (nothing to do)");
+                            } else {
+                                info!("Heartbeat response: {}", output.chars().take(200).collect::<String>());
+                            }
+                            
+                            nanna_core::TaskResult {
+                                task_id: task.id.clone(),
+                                task_name: task.name.clone(),
+                                success: true,
+                                output: Some(if is_heartbeat_ok { 
+                                    "HEARTBEAT_OK".to_string() 
+                                } else { 
+                                    output 
+                                }),
+                                error: None,
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                started_at,
+                                finished_at,
+                            }
+                        }
+                        Err(e) => {
+                            let finished_at = chrono::Utc::now();
+                            error!("Heartbeat failed: {}", e);
+                            nanna_core::TaskResult {
+                                task_id: task.id.clone(),
+                                task_name: task.name.clone(),
+                                success: false,
+                                output: None,
+                                error: Some(e.to_string()),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                started_at,
+                                finished_at,
+                            }
+                        }
+                    }
+                }
                 "memory_consolidation" => {
                     info!("Running scheduled memory consolidation...");
                     
@@ -5209,7 +5283,6 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                         }
                     };
                     
-                    let started_at = chrono::Utc::now();
                     match memory.consolidate(&config, summarize).await {
                         Ok(result) => {
                             let finished_at = chrono::Utc::now();
@@ -5245,17 +5318,66 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                     }
                 }
                 _ => {
-                    let now = chrono::Utc::now();
-                    debug!("Unknown task: {}", task.name);
-                    nanna_core::TaskResult {
-                        task_id: task.id.clone(),
-                        task_name: task.name.clone(),
-                        success: true,
-                        output: Some("Skipped unknown task".to_string()),
-                        error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        started_at: now,
-                        finished_at: now,
+                    // Generic cron job - run as agent prompt
+                    if !task.payload.is_empty() {
+                        info!("Running cron job '{}': {}", task.name, task.payload.chars().take(50).collect::<String>());
+                        
+                        let agent_config = nanna_agent::AgentConfig {
+                            model: model.clone(),
+                            max_iterations: 10,
+                            ..Default::default()
+                        };
+                        
+                        let agent = nanna_agent::Agent::new(
+                            agent_config,
+                            llm.clone(),
+                            tools.clone(),
+                        );
+                        
+                        let run_options = nanna_agent::RunOptions::default();
+                        match agent.run(&task.payload, run_options).await {
+                            Ok(response) => {
+                                let finished_at = chrono::Utc::now();
+                                info!("Cron job '{}' completed", task.name);
+                                nanna_core::TaskResult {
+                                    task_id: task.id.clone(),
+                                    task_name: task.name.clone(),
+                                    success: true,
+                                    output: Some(response.text),
+                                    error: None,
+                                    duration_ms: start.elapsed().as_millis() as u64,
+                                    started_at,
+                                    finished_at,
+                                }
+                            }
+                            Err(e) => {
+                                let finished_at = chrono::Utc::now();
+                                error!("Cron job '{}' failed: {}", task.name, e);
+                                nanna_core::TaskResult {
+                                    task_id: task.id.clone(),
+                                    task_name: task.name.clone(),
+                                    success: false,
+                                    output: None,
+                                    error: Some(e.to_string()),
+                                    duration_ms: start.elapsed().as_millis() as u64,
+                                    started_at,
+                                    finished_at,
+                                }
+                            }
+                        }
+                    } else {
+                        let finished_at = chrono::Utc::now();
+                        debug!("Skipping task with empty payload: {}", task.name);
+                        nanna_core::TaskResult {
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
+                            success: true,
+                            output: Some("Skipped (empty payload)".to_string()),
+                            error: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            started_at,
+                            finished_at,
+                        }
                     }
                 }
             }
