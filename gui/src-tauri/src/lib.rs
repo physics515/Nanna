@@ -4785,9 +4785,9 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         .map(|d| d.join("nanna.db").to_string_lossy().to_string())
         .unwrap_or_else(|_| "nanna.db".to_string());
 
-    // Initialize storage
+    // Initialize storage (Arc-wrapped for sharing with scheduler)
     let storage_config = StorageConfig { path: db_path };
-    let storage = Storage::new(&storage_config).await?;
+    let storage = Arc::new(Storage::new(&storage_config).await?);
 
     // Initialize LLM client
     let api_key = config
@@ -5052,7 +5052,14 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         check_interval: Duration::from_secs(30),
         default_timezone: "UTC".to_string(),
     };
-    let mut scheduler = Scheduler::new(scheduler_config);
+    let mut scheduler = Scheduler::new(scheduler_config)
+        .with_storage(Arc::clone(&storage));
+    
+    // Load persisted cron jobs from storage
+    match scheduler.load_jobs().await {
+        Ok(count) => info!("Loaded {} cron jobs from database", count),
+        Err(e) => warn!("Failed to load cron jobs: {}", e),
+    }
     
     // Add memory consolidation task (runs every hour)
     let consolidation = consolidation_task(Some(Duration::from_secs(3600)));
@@ -5158,7 +5165,7 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         .unwrap_or_else(|| config.llm.model.clone());
 
     Ok(AppState {
-        storage: Arc::new(storage),
+        storage,
         llm,
         tools,
         config,
