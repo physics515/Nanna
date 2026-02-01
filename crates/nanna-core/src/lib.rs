@@ -5,15 +5,17 @@
 //!
 //! Ties together all subsystems: LLM, channels, memory, SIMD, and GPU.
 
+pub mod cron;
 mod dreaming;
 mod scheduler;
 mod workspace;
 
+pub use cron::{CronError, CronExpr};
 pub use dreaming::{
     DreamingRuntime, DreamingRuntimeConfig, create_dreaming_executor,
 };
 pub use scheduler::{
-    Scheduler, SchedulerConfig, ScheduledTask, TaskType, TaskResult, TaskExecutor,
+    Scheduler, SchedulerConfig, ScheduledTask, TaskType, TaskResult, TaskExecutor, JobRun,
     heartbeat_task, recurring_task, delayed_task, consolidation_task,
     DREAMING_TASK_NAME, is_dreaming_task,
 };

@@ -97,3 +97,28 @@ pub struct NewCronJob {
     pub next_run: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
+
+/// Job run history entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRun {
+    pub id: i64,
+    pub job_id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub success: bool,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+/// New job run input
+#[derive(Debug, Clone)]
+pub struct NewJobRun {
+    pub job_id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub success: bool,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+}

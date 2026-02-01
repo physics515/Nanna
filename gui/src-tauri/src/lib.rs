@@ -4534,6 +4534,245 @@ async fn init_backend(
 }
 
 // =============================================================================
+// Scheduler / Cron Job Commands
+// =============================================================================
+
+/// Cron job info for the GUI
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CronJobInfo {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    pub schedule_description: String,
+    pub payload: String,
+    pub enabled: bool,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+    pub run_count: u64,
+    pub timezone: String,
+}
+
+/// Job run info for the GUI
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobRunInfo {
+    pub id: i64,
+    pub job_id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub success: bool,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
+/// Get all scheduled jobs
+#[tauri::command]
+async fn list_cron_jobs(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<CronJobInfo>, String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    let tasks = scheduler.list_tasks().await;
+    
+    let jobs: Vec<CronJobInfo> = tasks.into_iter().map(|t| {
+        let (schedule, next_run, schedule_description) = match &t.task_type {
+            nanna_core::TaskType::Heartbeat => {
+                ("heartbeat".to_string(), None, "Periodic heartbeat".to_string())
+            }
+            nanna_core::TaskType::Cron { schedule, next_run, parsed } => {
+                let desc = parsed.as_ref()
+                    .map(|p| p.describe())
+                    .unwrap_or_else(|| schedule.clone());
+                (schedule.clone(), next_run.map(|dt| dt.to_rfc3339()), desc)
+            }
+            nanna_core::TaskType::Recurring { interval } => {
+                let secs = interval.as_secs();
+                let desc = if secs >= 3600 {
+                    format!("Every {} hours", secs / 3600)
+                } else if secs >= 60 {
+                    format!("Every {} minutes", secs / 60)
+                } else {
+                    format!("Every {} seconds", secs)
+                };
+                (format!("every_{}s", secs), None, desc)
+            }
+            nanna_core::TaskType::Delayed { delay, .. } => {
+                (format!("delay_{}s", delay.as_secs()), None, "One-shot delayed".to_string())
+            }
+        };
+        
+        CronJobInfo {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            schedule,
+            schedule_description,
+            payload: t.payload.clone(),
+            enabled: t.enabled,
+            last_run: t.last_run.map(|dt| dt.to_rfc3339()),
+            next_run,
+            run_count: t.run_count,
+            timezone: t.timezone.clone(),
+        }
+    }).collect();
+    
+    Ok(jobs)
+}
+
+/// Create a new cron job
+#[tauri::command]
+async fn create_cron_job(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    schedule: String,
+    payload: String,
+    timezone: Option<String>,
+) -> Result<CronJobInfo, String> {
+    use nanna_core::CronExpr;
+    
+    // Validate the cron expression
+    let parsed = CronExpr::parse(&schedule).map_err(|e| e.to_string())?;
+    let next_run = parsed.next_from_now();
+    
+    let task = nanna_core::ScheduledTask {
+        id: format!("{}-{}", name, uuid::Uuid::new_v4()),
+        name: name.clone(),
+        task_type: nanna_core::TaskType::Cron {
+            schedule: schedule.clone(),
+            parsed: Some(parsed.clone()),
+            next_run,
+        },
+        payload: payload.clone(),
+        enabled: true,
+        last_run: None,
+        run_count: 0,
+        timezone: timezone.clone().unwrap_or_else(|| "UTC".to_string()),
+        target_channel: None,
+        target_session: None,
+    };
+    
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    scheduler.add_task(task.clone()).await;
+    
+    Ok(CronJobInfo {
+        id: task.id.clone(),
+        name: task.name,
+        schedule: schedule.clone(),
+        schedule_description: parsed.describe(),
+        payload,
+        enabled: true,
+        last_run: None,
+        next_run: next_run.map(|dt| dt.to_rfc3339()),
+        run_count: 0,
+        timezone: timezone.unwrap_or_else(|| "UTC".to_string()),
+    })
+}
+
+/// Update a cron job's schedule
+#[tauri::command]
+async fn update_cron_job(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    job_id: String,
+    schedule: String,
+) -> Result<bool, String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    scheduler.update_schedule(&job_id, &schedule).await.map_err(|e| e.to_string())
+}
+
+/// Enable or disable a cron job
+#[tauri::command]
+async fn set_cron_job_enabled(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    job_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    scheduler.set_task_enabled(&job_id, enabled).await;
+    Ok(())
+}
+
+/// Delete a cron job
+#[tauri::command]
+async fn delete_cron_job(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    job_id: String,
+) -> Result<bool, String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    Ok(scheduler.remove_task(&job_id).await)
+}
+
+/// Run a cron job immediately
+#[tauri::command]
+async fn run_cron_job_now(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    job_id: String,
+) -> Result<Option<JobRunInfo>, String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    
+    if let Some(result) = scheduler.run_now(&job_id).await {
+        Ok(Some(JobRunInfo {
+            id: 0,
+            job_id: result.task_id,
+            started_at: result.started_at.to_rfc3339(),
+            finished_at: Some(result.finished_at.to_rfc3339()),
+            success: result.success,
+            output: result.output,
+            error: result.error,
+            duration_ms: Some(result.duration_ms as i64),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Get job run history
+#[tauri::command]
+async fn get_cron_job_history(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    job_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<JobRunInfo>, String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    
+    let runs = scheduler.get_history(&job_id, limit.unwrap_or(20)).await;
+    
+    Ok(runs.into_iter().map(|r| JobRunInfo {
+        id: r.id,
+        job_id: r.job_id,
+        started_at: r.started_at.to_rfc3339(),
+        finished_at: r.finished_at.map(|dt| dt.to_rfc3339()),
+        success: r.success,
+        output: r.output,
+        error: r.error,
+        duration_ms: None, // JobRun from scheduler doesn't track this yet
+    }).collect())
+}
+
+/// Validate a cron expression
+#[tauri::command]
+async fn validate_cron_expression(
+    expression: String,
+) -> Result<(bool, String), String> {
+    use nanna_core::CronExpr;
+    
+    match CronExpr::parse(&expression) {
+        Ok(parsed) => {
+            let description = parsed.describe();
+            let next = parsed.next_from_now()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "N/A".to_string());
+            Ok((true, format!("{} (next: {})", description, next)))
+        }
+        Err(e) => Ok((false, e.to_string())),
+    }
+}
+
+// =============================================================================
 // App Setup
 // =============================================================================
 
@@ -4806,9 +5045,12 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
 
     // Initialize scheduler with consolidation task
     let scheduler_config = SchedulerConfig {
-        heartbeat_interval: Duration::from_secs(300), // 5 minutes
-        heartbeat_enabled: false, // Heartbeats disabled for GUI
+        heartbeat_interval: Duration::from_secs(1800), // 30 minutes
+        heartbeat_enabled: false, // Heartbeats disabled for GUI (no HEARTBEAT.md)
+        heartbeat_prompt: "GUI heartbeat".to_string(),
         max_concurrent: 4,
+        check_interval: Duration::from_secs(30),
+        default_timezone: "UTC".to_string(),
     };
     let mut scheduler = Scheduler::new(scheduler_config);
     
@@ -4843,40 +5085,53 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                         }
                     };
                     
+                    let started_at = chrono::Utc::now();
                     match memory.consolidate(&config, summarize).await {
                         Ok(result) => {
+                            let finished_at = chrono::Utc::now();
                             info!(
                                 "Scheduled consolidation: {} processed, {} merged",
                                 result.memories_processed, result.memories_merged
                             );
                             nanna_core::TaskResult {
-                                task_id: task.id,
+                                task_id: task.id.clone(),
+                                task_name: task.name.clone(),
                                 success: true,
                                 output: Some(format!("Processed {} memories", result.memories_processed)),
                                 error: None,
                                 duration_ms: start.elapsed().as_millis() as u64,
+                                started_at,
+                                finished_at,
                             }
                         }
                         Err(e) => {
+                            let finished_at = chrono::Utc::now();
                             error!("Scheduled consolidation failed: {}", e);
                             nanna_core::TaskResult {
-                                task_id: task.id,
+                                task_id: task.id.clone(),
+                                task_name: task.name.clone(),
                                 success: false,
                                 output: None,
                                 error: Some(e.to_string()),
                                 duration_ms: start.elapsed().as_millis() as u64,
+                                started_at,
+                                finished_at,
                             }
                         }
                     }
                 }
                 _ => {
+                    let now = chrono::Utc::now();
                     debug!("Unknown task: {}", task.name);
                     nanna_core::TaskResult {
-                        task_id: task.id,
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
                         success: true,
                         output: Some("Skipped unknown task".to_string()),
                         error: None,
                         duration_ms: start.elapsed().as_millis() as u64,
+                        started_at: now,
+                        finished_at: now,
                     }
                 }
             }
@@ -5095,6 +5350,15 @@ pub fn run() {
             // Backend mode
             get_backend_status,
             init_backend,
+            // Scheduler / Cron jobs
+            list_cron_jobs,
+            create_cron_job,
+            update_cron_job,
+            set_cron_job_enabled,
+            delete_cron_job,
+            run_cron_job_now,
+            get_cron_job_history,
+            validate_cron_expression,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

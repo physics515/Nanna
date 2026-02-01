@@ -147,6 +147,11 @@ impl Storage {
         CronJobRepository::new(self.conn.clone())
     }
 
+    #[must_use] 
+    pub fn job_runs(&self) -> JobRunRepository {
+        JobRunRepository::new(self.conn.clone())
+    }
+
     // =========================================================================
     // Convenience methods for GUI
     // =========================================================================

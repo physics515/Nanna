@@ -192,19 +192,25 @@ pub fn create_dreaming_executor(
 
             // Check if this is a dreaming task
             if !crate::is_dreaming_task(&task) {
+                let now = chrono::Utc::now();
                 return crate::TaskResult {
-                    task_id: task.id,
+                    task_id: task.id.clone(),
+                    task_name: task.name.clone(),
                     success: false,
                     output: None,
                     error: Some("Not a dreaming task".to_string()),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    started_at: now,
+                    finished_at: now,
                 };
             }
 
             info!("Starting memory consolidation (dreaming)...");
 
+            let started_at = chrono::Utc::now();
             match runtime.dream().await {
                 Ok(stats) => {
+                    let finished_at = chrono::Utc::now();
                     let output = format!(
                         "Dreaming complete: {} processed, {} merged, {} expanded",
                         stats.consolidation.memories_processed,
@@ -214,21 +220,28 @@ pub fn create_dreaming_executor(
                     info!("{}", output);
 
                     crate::TaskResult {
-                        task_id: task.id,
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
                         success: true,
                         output: Some(output),
                         error: None,
                         duration_ms: start.elapsed().as_millis() as u64,
+                        started_at,
+                        finished_at,
                     }
                 }
                 Err(e) => {
+                    let finished_at = chrono::Utc::now();
                     warn!("Dreaming failed: {}", e);
                     crate::TaskResult {
-                        task_id: task.id,
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
                         success: false,
                         output: None,
                         error: Some(e.to_string()),
                         duration_ms: start.elapsed().as_millis() as u64,
+                        started_at,
+                        finished_at,
                     }
                 }
             }

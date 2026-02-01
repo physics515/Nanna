@@ -6,6 +6,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("002_memories", MIGRATION_002),
     ("003_config", MIGRATION_003),
     ("004_workspaces", MIGRATION_004),
+    ("005_job_runs", MIGRATION_005),
 ];
 
 const MIGRATION_001: &str = r"
@@ -110,4 +111,29 @@ CREATE TABLE IF NOT EXISTS workspace_memories (
 );
 
 CREATE INDEX IF NOT EXISTS idx_workspace_memories_workspace ON workspace_memories(workspace_id);
+";
+
+const MIGRATION_005: &str = r"
+-- Job run history for tracking cron executions
+CREATE TABLE IF NOT EXISTS job_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    success INTEGER NOT NULL DEFAULT 0,
+    output TEXT,
+    error TEXT,
+    duration_ms INTEGER,
+    FOREIGN KEY (job_id) REFERENCES cron_jobs(job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_runs_job ON job_runs(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at);
+
+-- Add timezone support to cron jobs
+ALTER TABLE cron_jobs ADD COLUMN timezone TEXT DEFAULT 'UTC';
+
+-- Add target channel/session for cron results
+ALTER TABLE cron_jobs ADD COLUMN target_channel TEXT;
+ALTER TABLE cron_jobs ADD COLUMN target_session TEXT;
 ";

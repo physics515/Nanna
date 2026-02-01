@@ -1,6 +1,6 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, Memory, Message, NewCronJob, NewMemory, NewMessage, Session, StorageError};
+use crate::{CronJob, JobRun, Memory, Message, NewCronJob, NewJobRun, NewMemory, NewMessage, Session, StorageError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -664,5 +664,151 @@ impl CronJobRepository {
             .await?;
 
         Ok(result > 0)
+    }
+}
+
+/// Job run history repository
+pub struct JobRunRepository {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl JobRunRepository {
+    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// Record a new job run
+    pub async fn create(&self, run: NewJobRun) -> Result<JobRun, StorageError> {
+        let conn = self.conn.lock().await;
+
+        conn.execute(
+            "INSERT INTO job_runs (job_id, started_at, finished_at, success, output, error, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            turso::params![
+                run.job_id.as_str(),
+                run.started_at.as_str(),
+                run.finished_at.as_deref(),
+                run.success,
+                run.output.as_deref(),
+                run.error.as_deref(),
+                run.duration_ms,
+            ],
+        )
+        .await?;
+
+        // Get the inserted run
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, started_at, finished_at, success, output, error, duration_ms
+                 FROM job_runs ORDER BY id DESC LIMIT 1",
+                (),
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let success: i64 = row.get(4)?;
+            Ok(JobRun {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: row.get(2)?,
+                finished_at: row.get(3)?,
+                success: success != 0,
+                output: row.get(5)?,
+                error: row.get(6)?,
+                duration_ms: row.get(7)?,
+            })
+        } else {
+            Err(StorageError::NotFound("JobRun just created".to_string()))
+        }
+    }
+
+    /// Get runs for a specific job
+    pub async fn list_by_job(&self, job_id: &str, limit: i64) -> Result<Vec<JobRun>, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, started_at, finished_at, success, output, error, duration_ms
+                 FROM job_runs WHERE job_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+                turso::params![job_id, limit],
+            )
+            .await?;
+
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let success: i64 = row.get(4)?;
+            runs.push(JobRun {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: row.get(2)?,
+                finished_at: row.get(3)?,
+                success: success != 0,
+                output: row.get(5)?,
+                error: row.get(6)?,
+                duration_ms: row.get(7)?,
+            });
+        }
+
+        Ok(runs)
+    }
+
+    /// Get recent runs across all jobs
+    pub async fn list_recent(&self, limit: i64) -> Result<Vec<JobRun>, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, started_at, finished_at, success, output, error, duration_ms
+                 FROM job_runs ORDER BY started_at DESC LIMIT ?1",
+                turso::params![limit],
+            )
+            .await?;
+
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let success: i64 = row.get(4)?;
+            runs.push(JobRun {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: row.get(2)?,
+                finished_at: row.get(3)?,
+                success: success != 0,
+                output: row.get(5)?,
+                error: row.get(6)?,
+                duration_ms: row.get(7)?,
+            });
+        }
+
+        Ok(runs)
+    }
+
+    /// Delete old runs for a job (keep only the most recent N)
+    pub async fn cleanup(&self, job_id: &str, keep: i64) -> Result<i64, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let result = conn
+            .execute(
+                "DELETE FROM job_runs WHERE job_id = ?1 AND id NOT IN (
+                    SELECT id FROM job_runs WHERE job_id = ?1 ORDER BY started_at DESC LIMIT ?2
+                )",
+                turso::params![job_id, keep],
+            )
+            .await?;
+
+        Ok(result as i64)
+    }
+
+    /// Delete all runs for a job
+    pub async fn delete_by_job(&self, job_id: &str) -> Result<i64, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let result = conn
+            .execute(
+                "DELETE FROM job_runs WHERE job_id = ?1",
+                turso::params![job_id],
+            )
+            .await?;
+
+        Ok(result as i64)
     }
 }
