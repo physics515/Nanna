@@ -564,12 +564,27 @@ fn calculate_dynamic_tool_budget(request: &nanna_llm::CompletionRequest) -> usiz
     available.max(10_000) // At least 10k tokens for tools
 }
 
+/// What happens when user closes the main window
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseMode {
+    /// Ask the user every time
+    #[default]
+    Ask,
+    /// Minimize to system tray (daemon keeps running)
+    MinimizeToTray,
+    /// Quit completely (stop daemon)
+    QuitCompletely,
+}
+
 /// Application state shared across commands
 pub struct AppState {
     storage: Arc<Storage>,
     llm: Arc<LlmClient>,
     tools: Arc<ToolRegistry>,
     config: Config,
+    /// What to do when window is closed
+    close_mode: Arc<RwLock<CloseMode>>,
     /// FSRS-6 cognitive memory service
     memory: Arc<MemoryService>,
     /// Path to persist memories (JSON file)
@@ -4536,6 +4551,106 @@ async fn init_backend(
 }
 
 // =============================================================================
+// Window Close Behavior
+// =============================================================================
+
+/// Get current close mode preference
+#[tauri::command]
+async fn get_close_mode(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<String, String> {
+    let state = state.read().await;
+    let mode = *state.close_mode.read().await;
+    Ok(match mode {
+        CloseMode::Ask => "ask".to_string(),
+        CloseMode::MinimizeToTray => "minimize_to_tray".to_string(),
+        CloseMode::QuitCompletely => "quit_completely".to_string(),
+    })
+}
+
+/// Set close mode preference
+#[tauri::command]
+async fn set_close_mode(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    mode: String,
+) -> Result<(), String> {
+    let close_mode = match mode.as_str() {
+        "ask" => CloseMode::Ask,
+        "minimize_to_tray" => CloseMode::MinimizeToTray,
+        "quit_completely" => CloseMode::QuitCompletely,
+        _ => return Err(format!("Unknown close mode: {}", mode)),
+    };
+    
+    let state = state.read().await;
+    *state.close_mode.write().await = close_mode;
+    info!("Close mode set to: {:?}", close_mode);
+    Ok(())
+}
+
+/// Handle window close - returns what action to take
+/// Called from frontend before actual close
+#[tauri::command]
+async fn handle_window_close(
+    app: AppHandle,
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<String, String> {
+    let state_guard = state.read().await;
+    let mode = *state_guard.close_mode.read().await;
+    
+    match mode {
+        CloseMode::Ask => {
+            // Frontend should show dialog
+            Ok("ask".to_string())
+        }
+        CloseMode::MinimizeToTray => {
+            // Hide window to tray
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+            Ok("minimized".to_string())
+        }
+        CloseMode::QuitCompletely => {
+            // Will trigger actual exit
+            Ok("quit".to_string())
+        }
+    }
+}
+
+/// Perform actual quit (called after user confirms or preference is quit)
+#[tauri::command]
+async fn perform_quit(
+    app: AppHandle,
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    
+    // Shutdown backend (stop daemon)
+    info!("Performing quit - shutting down backend...");
+    state_guard.backend.shutdown().await;
+    
+    // Save memories
+    let count = state_guard.memory.count().await;
+    if count > 0 {
+        let backup_path = state_guard.memory_path.with_extension("json.bak");
+        if state_guard.memory_path.exists() {
+            if let Err(e) = std::fs::copy(&state_guard.memory_path, &backup_path) {
+                warn!("Failed to create memory backup: {}", e);
+            }
+        }
+        
+        if let Err(e) = state_guard.memory.save(&state_guard.memory_path).await {
+            error!("Failed to save memories on exit: {}", e);
+        } else {
+            info!("Saved {} memories", count);
+        }
+    }
+    
+    // Exit the app
+    app.exit(0);
+    Ok(())
+}
+
+// =============================================================================
 // Scheduler / Cron Job Commands
 // =============================================================================
 
@@ -5198,6 +5313,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         user_tools: user_tool_manager,
         // Backend (will be initialized on setup)
         backend: Arc::new(Backend::new()),
+        // Close behavior (default: ask user)
+        close_mode: Arc::new(RwLock::new(CloseMode::default())),
     })
 }
 
@@ -5359,6 +5476,11 @@ pub fn run() {
             // Backend mode
             get_backend_status,
             init_backend,
+            // Window close behavior
+            get_close_mode,
+            set_close_mode,
+            handle_window_close,
+            perform_quit,
             // Scheduler / Cron jobs
             list_cron_jobs,
             create_cron_job,
