@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 /// Bridge providing Nanna capabilities to scripts
 #[derive(Clone)]
 pub struct NannaBridge {
-    permissions: ToolPermissions,
+    pub permissions: ToolPermissions,
     http_client: reqwest::Client,
     logs: Arc<RwLock<Vec<LogEntry>>>,
 }
@@ -25,6 +25,65 @@ impl NannaBridge {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             logs: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Execute a shell command (if permitted)
+    pub async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecResponse> {
+        tracing::debug!(target: "bridge", "exec called: command={}, run_permission={}", command, self.permissions.run);
+        
+        if !self.permissions.run {
+            tracing::warn!(target: "bridge", "Shell execution denied - run permission is false");
+            return Err(ScriptError::Permission(
+                "Shell execution not permitted. Tool needs 'run' permission.".to_string(),
+            ));
+        }
+
+        // Determine shell based on OS
+        let (shell, shell_arg) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.arg(shell_arg).arg(command);
+
+        if let Some(wd) = workdir {
+            cmd.current_dir(wd);
+        }
+
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cmd.output(),
+        )
+        .await
+        .map_err(|_| ScriptError::Timeout(30_000))?
+        .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        Ok(ExecResponse {
+            success: output.status.success(),
+            code: output.status.code(),
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Get the current platform (windows, darwin, linux)
+    #[must_use]
+    pub fn platform() -> &'static str {
+        if cfg!(windows) {
+            "win32"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
         }
     }
 
@@ -159,6 +218,15 @@ impl NannaBridge {
     pub async fn clear_logs(&self) {
         self.logs.write().await.clear();
     }
+}
+
+/// Exec response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecResponse {
+    pub success: bool,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 /// Fetch request options

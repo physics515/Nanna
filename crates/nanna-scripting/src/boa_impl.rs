@@ -8,7 +8,13 @@ use boa_engine::{
     JsValue, NativeFunction, Source,
 };
 use serde_json::Value;
+use std::cell::RefCell;
 use std::sync::Arc;
+
+// Thread-local bridge for native function access
+thread_local! {
+    static BRIDGE: RefCell<Option<Arc<NannaBridge>>> = const { RefCell::new(None) };
+}
 
 /// Execute a tool with Boa
 pub async fn execute(
@@ -47,13 +53,16 @@ fn execute_sync(
     input: &Value,
     bridge: &Arc<NannaBridge>,
 ) -> Result<Value> {
+    // Store bridge in thread-local for native function access
+    BRIDGE.with(|b| *b.borrow_mut() = Some(bridge.clone()));
+    
     let mut context = Context::default();
 
     // Register console.log
     register_console(&mut context)?;
 
     // Register Nanna bridge functions
-    register_nanna_bridge(&mut context, bridge)?;
+    register_nanna_bridge(&mut context)?;
 
     // Inject INPUT as a global
     let input_js = json_to_js(input, &mut context)?;
@@ -61,24 +70,29 @@ fn execute_sync(
         .register_global_property(js_string!("INPUT"), input_js, Attribute::READONLY)
         .map_err(|e| ScriptError::Execution(format!("Failed to set INPUT: {e}")))?;
 
-    // Wrap source in an async IIFE that calls execute()
+    // Transform ES6 "export default" to a variable assignment that Boa can handle
+    // Boa doesn't support ES modules, so we convert to CommonJS-style
+    let transformed_source = source.replace("export default", "var __exported__ =");
+    
+    tracing::debug!(target: "script", "Transformed source for Boa execution");
+
+    // Wrap source in an IIFE that calls execute()
     let wrapped = format!(
         r#"
         (function() {{
-            {source}
+            {transformed_source}
             
-            // Get the default export
-            if (typeof module !== 'undefined' && module.exports && module.exports.default) {{
-                return module.exports.default;
+            // Find the exported tool object
+            if (typeof __exported__ !== 'undefined' && __exported__ && typeof __exported__.execute === 'function') {{
+                return __exported__.execute(INPUT);
             }}
-            // Check for export default pattern by looking for execute
-            const tool = (function() {{
-                {source}
-                return typeof execute === 'function' ? {{ execute }} : null;
-            }})();
             
-            if (tool && typeof tool.execute === 'function') {{
-                return tool.execute(INPUT);
+            // Get the default export (CommonJS style)
+            if (typeof module !== 'undefined' && module.exports && module.exports.default) {{
+                var tool = module.exports.default;
+                if (typeof tool.execute === 'function') {{
+                    return tool.execute(INPUT);
+                }}
             }}
             
             // Try to find execute function in global scope
@@ -86,7 +100,7 @@ fn execute_sync(
                 return execute(INPUT);
             }}
             
-            throw new Error('No execute function found in tool');
+            throw new Error('No execute function found in tool. Make sure your tool exports an object with an execute function.');
         }})()
         "#
     );
@@ -94,7 +108,12 @@ fn execute_sync(
     // Parse and execute
     let result = context
         .eval(Source::from_bytes(&wrapped))
-        .map_err(|e| ScriptError::Execution(format!("Execution failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(target: "script", "JS execution failed: {}", e);
+            ScriptError::Execution(format!("Execution failed: {e}"))
+        })?;
+    
+    tracing::debug!(target: "script", "JS execution completed successfully");
 
     // Convert result back to JSON
     js_to_json(&result, &mut context)
@@ -158,16 +177,25 @@ fn format_console_args(args: &[JsValue], context: &mut Context) -> String {
 }
 
 /// Register Nanna bridge functions
-fn register_nanna_bridge(context: &mut Context, _bridge: &Arc<NannaBridge>) -> Result<()> {
+fn register_nanna_bridge(context: &mut Context) -> Result<()> {
     // Create Nanna object with bridge functions
-    // Note: Boa doesn't support async natively in the same way, so we provide sync stubs
-    // Real async operations would need to use Boa's promise/job queue system
+    // Note: exec() is blocking here - real async would need Boa's promise/job queue
     
     let nanna = boa_engine::object::ObjectInitializer::new(context)
         .function(
             NativeFunction::from_fn_ptr(nanna_log),
             js_string!("log"),
             2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_exec),
+            js_string!("exec"),
+            2,
+        )
+        .property(
+            js_string!("platform"),
+            js_string!(NannaBridge::platform()),
+            Attribute::READONLY,
         )
         .build();
 
@@ -191,6 +219,58 @@ fn nanna_log(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<J
     }
     
     Ok(JsValue::undefined())
+}
+
+fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let command = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let workdir = args.get(1)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .map(|v| v.to_string(context).map(|s| s.to_std_string_escaped()))
+        .transpose()?;
+    
+    tracing::info!(target: "script", "Nanna.exec called with command: {}", command);
+    
+    // Get bridge from thread-local storage
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            tracing::error!(target: "script", "Bridge not initialized in thread-local storage");
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+    
+    tracing::info!(target: "script", "Bridge found, run permission: {}", bridge.permissions.run);
+    
+    // Execute synchronously using a new thread with its own runtime
+    // (we're in a blocking task but need async for the bridge)
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.exec(&command, workdir.as_deref()))
+    })
+    .join()
+    .map_err(|e| {
+        tracing::error!(target: "script", "Thread panicked: {:?}", e);
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+    
+    match result {
+        Ok(response) => {
+            tracing::info!(target: "script", "Exec success: {}, code: {:?}, stdout: {}, stderr: {}", 
+                response.success, response.code, response.stdout, response.stderr);
+            // Build result object
+            let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("success"), JsValue::from(response.success), false, context)?;
+            obj.set(js_string!("code"), response.code.map_or(JsValue::null(), |c| JsValue::from(c)), false, context)?;
+            obj.set(js_string!("stdout"), JsValue::from(js_string!(response.stdout.as_str())), false, context)?;
+            obj.set(js_string!("stderr"), JsValue::from(js_string!(response.stderr.as_str())), false, context)?;
+            Ok(obj.into())
+        }
+        Err(e) => {
+            tracing::error!(target: "script", "Exec failed: {}", e);
+            Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str()))))
+        }
+    }
 }
 
 /// Convert JSON Value to Boa JsValue

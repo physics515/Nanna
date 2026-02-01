@@ -1,0 +1,27 @@
+[package]
+name = "nanna-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Nanna daemon client library - connect GUIs, CLIs, and APIs to the daemon"
+
+[dependencies]
+# Shared protocol
+nanna-daemon = { path = "../nanna-daemon" }
+
+# Workspace deps
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+
+# WebSocket client
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+# Reconnection
+backoff = { version = "0.4", features = ["tokio"] }

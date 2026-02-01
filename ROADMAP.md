@@ -274,8 +274,63 @@ highlight.js
 ## Phase 8: Clawdbot Feature Parity
 *Goal: Nanna can do everything Clawdbot can — always-on, multi-channel, fully autonomous*
 
+### Core Architecture: Channels as Control Plane Clients
+
+**Key Insight:** The GUI is not a privileged controller — it's just another channel. ALL channels should have full access to the control plane, with rendering adapted to their capabilities.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Control Plane                        │
+│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐  │
+│  │ Sessions │ Memory   │ Config   │ Tools    │ Scheduler│  │
+│  │ Manager  │ Browser  │ Manager  │ Registry │ /Cron    │  │
+│  └──────────┴──────────┴──────────┴──────────┴──────────┘  │
+│                            ▲                                │
+│                            │ Full Access (all channels)     │
+│  ┌─────────────────────────┴───────────────────────────┐   │
+│  │                  Channel Router                      │   │
+│  └──┬────────┬────────┬────────┬────────┬────────┬─────┘   │
+└─────┼────────┼────────┼────────┼────────┼────────┼─────────┘
+      ▼        ▼        ▼        ▼        ▼        ▼
+  Telegram  Discord   GUI    CLI     API    Slack
+```
+
+**Principles:**
+- Every channel can: manage sessions, browse/edit memory, configure settings, control tools, manage scheduler
+- Capabilities determine HOW things render, not WHAT you can access
+- GUI is "just the channel with richest rendering" — not special
+- Multiple channels (including multiple GUIs) can attach to same session
+- Daemon owns state; channels are interchangeable views/controllers
+
+**Channel Capabilities (rendering hints, not access control):**
+| Channel | Markdown | Tables | Embeds | Buttons | Modals | Streaming |
+|---------|----------|--------|--------|---------|--------|-----------|
+| GUI     | ✓        | ✓      | ✓      | ✓       | ✓      | ✓         |
+| Telegram| ✓        | -      | -      | ✓       | -      | -         |
+| Discord | ✓        | -      | ✓      | ✓       | ✓      | -         |
+| Slack   | ✓        | -      | ✓      | ✓       | ✓      | -         |
+| CLI     | ✓        | ✓      | -      | -       | -      | ✓         |
+| API     | -        | ✓      | -      | -       | -      | ✓         |
+
+**Multi-GUI / Multi-Device:**
+- Multiple GUIs can subscribe to same session (phone + desktop)
+- All see messages in real-time (like multiple Telegram clients)
+- Cross-channel sessions possible (Slack + Discord + GUI on same conversation)
+
 ### Daemon Mode
-**Run Nanna as a background service, headless, always listening**
+**Run Nanna as a background service, headless, with attachable GUI**
+
+**Architecture:** Daemon runs independently; GUI connects as a channel client.
+```
+┌─────────────────────┐     ┌─────────────────────┐
+│   nanna-daemon      │     │    nanna-gui        │
+│  (always running)   │◄───►│  (attach/detach)    │
+│                     │ WS  │                     │
+│  • Agent core       │     │  • Rich UI channel  │
+│  • All channels     │     │  • Can run embedded │
+│  • Control plane    │     │    (iOS) or remote  │
+└─────────────────────┘     └─────────────────────┘
+```
 
 - [ ] **CLI binary** - `nanna daemon start/stop/status` commands
 - [ ] **Service installation** - Windows Service / systemd / launchd
@@ -285,12 +340,23 @@ highlight.js
 - [ ] **Auto-restart** - Crash recovery with backoff
 - [ ] **Log rotation** - File-based logs with rotation
 - [ ] **Health endpoint** - HTTP `/health` for monitoring
+- [ ] **IPC server** - WebSocket + Unix socket for channel clients
+- [ ] **GUI attach/detach** - GUI connects as channel, survives restarts
 
-**Implementation:**
+**Platform Support:**
+| Platform | Daemon | GUI Mode | IPC |
+|----------|--------|----------|-----|
+| Windows | Background process / Service | Remote (attach to daemon) | Named pipe / localhost WS |
+| macOS | launchd agent | Remote | Unix socket / localhost WS |
+| Linux | systemd user service | Remote | Unix socket / localhost WS |
+| Android | Foreground Service | Remote (same app) | Binder / localhost WS |
+| iOS | ❌ Not allowed | Embedded only | In-process |
+
+**Crate Structure:**
 ```rust
-// New crate: nanna-daemon
-// Uses tokio runtime, no Tauri dependency
-// Shares nanna-core, nanna-channels, nanna-agent
+// nanna-daemon: Headless binary, owns all state
+// nanna-client: Library for connecting to daemon  
+// nanna-gui: Uses nanna-client OR embeds nanna-core (iOS)
 ```
 
 ### Channel Listeners

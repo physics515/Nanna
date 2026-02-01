@@ -33,14 +33,19 @@ pub struct UserToolPermissions {
     pub read: Vec<String>,
     pub write: Vec<String>,
     pub env: bool,
+    #[serde(default)]
+    pub run: bool,
 }
 
 impl From<UserToolPermissions> for ToolPermissions {
     fn from(p: UserToolPermissions) -> Self {
-        ToolPermissions::none()
+        let mut perms = ToolPermissions::none()
             .with_net(p.net)
             .with_read(p.read.into_iter().map(PathBuf::from))
-            .with_write(p.write.into_iter().map(PathBuf::from))
+            .with_write(p.write.into_iter().map(PathBuf::from));
+        perms.env = p.env;
+        perms.run = p.run;
+        perms
     }
 }
 
@@ -380,7 +385,7 @@ impl Tool for CreateToolTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "create_tool".to_string(),
-            description: "Create a new tool that can be used in future conversations. Write JavaScript code that exports a default object with name, description, and execute function. The tool will be immediately available.".to_string(),
+            description: "Create a new tool that can be used in future conversations. Write JavaScript code that exports a default object with name, description, and execute function. Use Nanna.exec(command) for shell commands, Nanna.platform for OS detection ('win32'/'darwin'/'linux'). The tool will be immediately available.".to_string(),
             parameters: vec![
                 ToolParameter {
                     name: "name".to_string(),
@@ -400,7 +405,7 @@ impl Tool for CreateToolTool {
                 },
                 ToolParameter {
                     name: "code".to_string(),
-                    description: "JavaScript code. Must export default { name, description, execute(params) { ... } }".to_string(),
+                    description: "JavaScript code. Must export default { name, description, execute(params) { ... } }. Use Nanna.exec(cmd) for shell commands.".to_string(),
                     param_type: ParameterType::String,
                     required: true,
                     default: None,
@@ -412,6 +417,14 @@ impl Tool for CreateToolTool {
                     param_type: ParameterType::Object,
                     required: false,
                     default: None,
+                    enum_values: None,
+                },
+                ToolParameter {
+                    name: "needs_shell".to_string(),
+                    description: "Set to true if the tool needs to execute shell commands via Nanna.exec()".to_string(),
+                    param_type: ParameterType::Boolean,
+                    required: false,
+                    default: Some(Value::Bool(false)),
                     enum_values: None,
                 },
             ],
@@ -435,6 +448,20 @@ impl Tool for CreateToolTool {
             .to_string();
         
         let parameters_schema = params.get("parameters_schema").cloned();
+        
+        let needs_shell = params.get("needs_shell")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Build permissions based on needs
+        let permissions = if needs_shell {
+            Some(UserToolPermissions {
+                run: true,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         // Create the tool
         let meta = self.manager.create_tool(
@@ -443,7 +470,7 @@ impl Tool for CreateToolTool {
             code,
             Some("javascript".to_string()),
             parameters_schema,
-            None,
+            permissions,
         ).await.map_err(|e| ToolError::ExecutionFailed(e))?;
 
         // Register it immediately

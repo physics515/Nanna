@@ -47,6 +47,8 @@ members = [
     "crates/nanna-mcp",
     "crates/nanna-scripting",
     "crates/nanna-workspace",
+    "crates/nanna-daemon",
+    "crates/nanna-client",
     "gui/src-tauri",
 ]
 
