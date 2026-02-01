@@ -1,6 +1,0 @@
-thread 'rustc' panicked at /rustc-dev/842bd5be253e17831e318fdbd9d01d716557cc75/compiler\rustc_mir_transform\src\lib.rs:552:25:
-stealing value which is locked: ()
-stack backtrace:
-   0:     0x7ff8331033de - std::backtrace_rs::backtrace::win64::trace
-                               at /rustc/842bd5be253e17831e318fdbd9d01d716557cc75/library\std\src\..\..\backtrace\src\backtrace\win64.rs:85
-   1:     0x7ff8331033de - std::backtrace_rs::backtrace::trace_unsynchronized

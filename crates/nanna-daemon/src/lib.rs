@@ -12,12 +12,16 @@
 //! - Tool management
 //! - Scheduler/cron
 
+pub mod control;
 pub mod ipc;
+pub mod persistence;
 pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod session;
-pub mod control;
+
+#[cfg(windows)]
+pub mod windows_service;
 
 pub use ipc::{IpcServer, IpcServerConfig, ConnectionId};
 pub use protocol::{Request, Response, Event, Action, SessionAction, MemoryAction, ConfigAction};

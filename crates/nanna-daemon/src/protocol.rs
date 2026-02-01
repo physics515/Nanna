@@ -322,6 +322,27 @@ impl Response {
             },
         }
     }
+    
+    /// Check if this response is an error
+    pub fn is_error(&self) -> bool {
+        matches!(self.result, ResponseResult::Error { .. })
+    }
+    
+    /// Get the data if successful
+    pub fn data(&self) -> Option<&Value> {
+        match &self.result {
+            ResponseResult::Success { data } => Some(data),
+            ResponseResult::Error { .. } => None,
+        }
+    }
+    
+    /// Get the error message if failed
+    pub fn error_message(&self) -> Option<&str> {
+        match &self.result {
+            ResponseResult::Error { message, .. } => Some(message),
+            ResponseResult::Success { .. } => None,
+        }
+    }
 }
 
 // =============================================================================

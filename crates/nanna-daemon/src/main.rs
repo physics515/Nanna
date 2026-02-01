@@ -7,13 +7,17 @@
 //!   nanna-daemon status           Show daemon status
 //!   nanna-daemon install          Install as system service
 //!   nanna-daemon uninstall        Uninstall system service
+//!   nanna-daemon service          (Windows only) Run as Windows Service
 
 use clap::{Parser, Subcommand};
-use nanna_daemon::server::{DaemonBuilder, DaemonConfig};
+use nanna_daemon::server::DaemonBuilder;
 use nanna_daemon::service::{ServiceConfig, ServiceManager, ServiceStatus};
 use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[cfg(windows)]
+use nanna_daemon::windows_service;
 
 #[derive(Parser)]
 #[command(name = "nanna-daemon")]
@@ -56,13 +60,31 @@ enum Commands {
     Install,
     /// Uninstall system service
     Uninstall,
+    /// Run as Windows Service (called by SCM)
+    #[cfg(windows)]
+    Service,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
     
-    // Setup logging
+    // Special case: Windows Service mode doesn't parse args normally
+    #[cfg(windows)]
+    if let Commands::Service = cli.command {
+        // Minimal logging for service mode
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        
+        if let Err(e) = windows_service::run_as_service() {
+            error!("Service failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+    
+    // Setup logging for non-service modes
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
     
@@ -72,13 +94,15 @@ async fn main() {
         .init();
     
     let result = match cli.command {
-        Commands::Run => run_daemon(&cli).await,
+        Commands::Run => run_daemon(&cli),
         Commands::Start => start_service(&cli),
         Commands::Stop => stop_service(&cli),
         Commands::Restart => restart_service(&cli),
         Commands::Status => show_status(&cli),
         Commands::Install => install_service(&cli),
         Commands::Uninstall => uninstall_service(&cli),
+        #[cfg(windows)]
+        Commands::Service => unreachable!(), // Handled above
     };
     
     if let Err(e) = result {
@@ -87,63 +111,81 @@ async fn main() {
     }
 }
 
-async fn run_daemon(cli: &Cli) -> Result<(), String> {
+fn run_daemon(cli: &Cli) -> Result<(), String> {
     info!("Starting Nanna daemon...");
     
-    let mut builder = DaemonBuilder::new()
-        .with_port(cli.port)
-        .with_host(&cli.host)
-        .with_log_level(&cli.log_level);
+    // Create tokio runtime
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create runtime: {}", e))?;
     
-    if let Some(ref data_dir) = cli.data_dir {
-        builder = builder.with_data_dir(data_dir);
-    }
-    
-    let mut daemon = builder.build();
-    
-    // Setup signal handlers
-    let shutdown_tx = daemon.shutdown_handle();
-    
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
-        let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let mut builder = DaemonBuilder::new()
+            .with_port(cli.port)
+            .with_host(&cli.host)
+            .with_log_level(&cli.log_level);
         
-        let shutdown = shutdown_tx.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM");
+        if let Some(ref data_dir) = cli.data_dir {
+            builder = builder.with_data_dir(data_dir);
+        }
+        
+        let mut daemon = builder.build();
+        
+        // Setup signal handlers
+        let shutdown_tx = daemon.shutdown_handle();
+        
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
+            let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
+            
+            let shutdown = shutdown_tx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM");
+                    }
+                    _ = sigint.recv() => {
+                        info!("Received SIGINT");
+                    }
                 }
-                _ = sigint.recv() => {
-                    info!("Received SIGINT");
-                }
-            }
-            let _ = shutdown.send(());
-        });
-    }
-    
-    #[cfg(windows)]
-    {
-        let shutdown = shutdown_tx.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Received Ctrl+C");
-            let _ = shutdown.send(());
-        });
-    }
-    
-    daemon.run().await.map_err(|e| e.to_string())
+                let _ = shutdown.send(());
+            });
+        }
+        
+        #[cfg(windows)]
+        {
+            let shutdown = shutdown_tx.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Received Ctrl+C");
+                let _ = shutdown.send(());
+            });
+        }
+        
+        daemon.run().await.map_err(|e| e.to_string())
+    })
 }
 
-fn get_service_manager(_cli: &Cli) -> ServiceManager {
-    ServiceManager::new(ServiceConfig::default())
+#[cfg(windows)]
+fn start_service(_cli: &Cli) -> Result<(), String> {
+    match windows_service::query_service_status() {
+        ServiceStatus::Running => {
+            println!("Daemon is already running");
+            Ok(())
+        }
+        _ => {
+            println!("Starting daemon...");
+            windows_service::start_service()?;
+            println!("Daemon started");
+            Ok(())
+        }
+    }
 }
 
+#[cfg(not(windows))]
 fn start_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
-    
     match manager.status() {
         ServiceStatus::Running => {
             println!("Daemon is already running");
@@ -158,9 +200,25 @@ fn start_service(cli: &Cli) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+fn stop_service(_cli: &Cli) -> Result<(), String> {
+    match windows_service::query_service_status() {
+        ServiceStatus::Stopped => {
+            println!("Daemon is not running");
+            Ok(())
+        }
+        _ => {
+            println!("Stopping daemon...");
+            windows_service::stop_service()?;
+            println!("Daemon stopped");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
 fn stop_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
-    
     match manager.status() {
         ServiceStatus::Stopped => {
             println!("Daemon is not running");
@@ -176,22 +234,40 @@ fn stop_service(cli: &Cli) -> Result<(), String> {
 }
 
 fn restart_service(cli: &Cli) -> Result<(), String> {
-    let manager = get_service_manager(cli);
-    
-    if manager.status() == ServiceStatus::Running {
-        println!("Stopping daemon...");
-        manager.stop()?;
+    #[cfg(windows)]
+    {
+        if windows_service::query_service_status() == ServiceStatus::Running {
+            println!("Stopping daemon...");
+            windows_service::stop_service()?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        println!("Starting daemon...");
+        windows_service::start_service()?;
+        println!("Daemon restarted");
+        Ok(())
     }
     
-    println!("Starting daemon...");
-    manager.start()?;
-    println!("Daemon restarted");
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let manager = get_service_manager(cli);
+        if manager.status() == ServiceStatus::Running {
+            println!("Stopping daemon...");
+            manager.stop()?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        println!("Starting daemon...");
+        manager.start()?;
+        println!("Daemon restarted");
+        Ok(())
+    }
 }
 
 fn show_status(cli: &Cli) -> Result<(), String> {
-    let manager = get_service_manager(cli);
-    let status = manager.status();
+    #[cfg(windows)]
+    let status = windows_service::query_service_status();
+    
+    #[cfg(not(windows))]
+    let status = get_service_manager(cli).status();
     
     println!("Nanna Daemon Status");
     println!("==================");
@@ -208,24 +284,50 @@ fn show_status(cli: &Cli) -> Result<(), String> {
     // Try to connect to running daemon
     if status == ServiceStatus::Running {
         println!("\nTrying to connect to ws://{}:{}...", cli.host, cli.port);
-        // TODO: Actually test connection
+        // TODO: Actually test WebSocket connection
+        println!("(Connection test not implemented yet)");
     }
     
     Ok(())
 }
 
+#[cfg(windows)]
+fn install_service(_cli: &Cli) -> Result<(), String> {
+    println!("Installing Nanna daemon as Windows Service...");
+    windows_service::install_service()?;
+    println!("Service installed successfully");
+    println!("\nTo start the daemon, run:");
+    println!("  nanna-daemon start");
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn install_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
-    
     println!("Installing Nanna daemon as system service...");
     manager.install()?;
     println!("Service installed successfully");
     println!("\nTo start the daemon, run:");
     println!("  nanna-daemon start");
-    
     Ok(())
 }
 
+#[cfg(windows)]
+fn uninstall_service(_cli: &Cli) -> Result<(), String> {
+    // Stop if running
+    if windows_service::query_service_status() == ServiceStatus::Running {
+        println!("Stopping running daemon...");
+        windows_service::stop_service()?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    
+    println!("Uninstalling Nanna daemon service...");
+    windows_service::uninstall_service()?;
+    println!("Service uninstalled successfully");
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn uninstall_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     
@@ -233,11 +335,16 @@ fn uninstall_service(cli: &Cli) -> Result<(), String> {
     if manager.status() == ServiceStatus::Running {
         println!("Stopping running daemon...");
         manager.stop()?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     
     println!("Uninstalling Nanna daemon service...");
     manager.uninstall()?;
     println!("Service uninstalled successfully");
-    
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn get_service_manager(_cli: &Cli) -> ServiceManager {
+    ServiceManager::new(ServiceConfig::default())
 }

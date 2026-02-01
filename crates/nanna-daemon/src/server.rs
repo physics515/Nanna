@@ -1,14 +1,16 @@
 //! Daemon Server - Main daemon orchestrator
 //!
-//! Combines IPC server, control plane, sessions, and all subsystems.
+//! Combines IPC server, control plane, sessions, persistence, and all subsystems.
 
 use crate::control::ControlPlane;
 use crate::ipc::{IpcServer, IpcServerConfig};
-use crate::protocol::{Request, Response};
+use crate::persistence::PersistenceManager;
+use crate::protocol::Response;
 use crate::session::SessionManager;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Configuration for the daemon server
 #[derive(Debug, Clone)]
@@ -19,6 +21,8 @@ pub struct DaemonConfig {
     pub data_dir: std::path::PathBuf,
     /// Log level
     pub log_level: String,
+    /// Auto-save interval in seconds
+    pub auto_save_interval_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -31,6 +35,7 @@ impl Default for DaemonConfig {
             ipc: IpcServerConfig::default(),
             data_dir,
             log_level: "info".to_string(),
+            auto_save_interval_secs: 60, // Save every minute
         }
     }
 }
@@ -41,6 +46,7 @@ pub struct DaemonServer {
     sessions: Arc<SessionManager>,
     control: Arc<ControlPlane>,
     ipc: IpcServer,
+    persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -50,6 +56,7 @@ impl DaemonServer {
         let sessions = Arc::new(SessionManager::new());
         let control = Arc::new(ControlPlane::new(sessions.clone()));
         let ipc = IpcServer::new(config.ipc.clone());
+        let persistence = Arc::new(PersistenceManager::new(&config.data_dir));
         let (shutdown_tx, _) = broadcast::channel(1);
         
         Self {
@@ -57,6 +64,7 @@ impl DaemonServer {
             sessions,
             control,
             ipc,
+            persistence,
             shutdown_tx,
         }
     }
@@ -79,31 +87,57 @@ impl DaemonServer {
         // Ensure data directory exists
         std::fs::create_dir_all(&self.config.data_dir)?;
         
-        // Create default session
-        let default_session = self.sessions.create(Some("Main".to_string())).await;
-        info!("Created default session: {}", default_session.id);
+        // Load persisted sessions
+        match self.persistence.load_sessions_with_fallback().await {
+            Ok((sessions, default_id)) => {
+                info!("Loaded {} persisted sessions", sessions.len());
+                for session in sessions {
+                    self.sessions.restore(session).await;
+                }
+                if let Some(id) = default_id {
+                    self.sessions.set_default(&id).await;
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load persisted sessions: {}", e);
+            }
+        }
+        
+        // Create default session if none exist
+        if self.sessions.count().await == 0 {
+            let default_session = self.sessions.create(Some("Main".to_string())).await;
+            info!("Created default session: {}", default_session.id);
+        }
         
         // Take the request receiver from IPC server
         let mut request_rx = self.ipc.take_request_receiver();
         
         // Clone what we need for the request handler
         let control = self.control.clone();
-        let ipc_for_response = Arc::new(tokio::sync::RwLock::new(None::<Arc<IpcServer>>));
-        
-        // We can't easily share IpcServer, so we'll use channels for responses
-        // For now, we'll handle responses inline
+        let ipc_clone = Arc::new(tokio::sync::RwLock::new(IpcServer::new(self.config.ipc.clone())));
         
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         
         // Spawn IPC server
-        let ipc_handle = {
-            let ipc_server = IpcServer::new(self.config.ipc.clone());
-            tokio::spawn(async move {
-                if let Err(e) = ipc_server.run().await {
-                    error!("IPC server error: {}", e);
-                }
-            })
-        };
+        let ipc_config = self.config.ipc.clone();
+        let ipc_handle = tokio::spawn(async move {
+            let ipc_server = IpcServer::new(ipc_config);
+            if let Err(e) = ipc_server.run().await {
+                error!("IPC server error: {}", e);
+            }
+        });
+        
+        // Spawn auto-save task
+        let persistence = self.persistence.clone();
+        let sessions_for_save = self.sessions.clone();
+        let save_interval = Duration::from_secs(self.config.auto_save_interval_secs);
+        let save_shutdown = self.shutdown_tx.subscribe();
+        
+        let save_handle = tokio::spawn(async move {
+            let sessions_map = sessions_for_save.sessions_map();
+            let default_session = sessions_for_save.default_session_id();
+            persistence.auto_save_loop(sessions_map, default_session, save_interval, save_shutdown).await;
+        });
         
         info!("Daemon ready. IPC server listening on ws://{}", self.ipc.address());
         
@@ -115,9 +149,9 @@ impl DaemonServer {
                     let result = control.handle(&client_id, request.action).await;
                     let response = Response::success(request.id, result);
                     
-                    // TODO: Send response back to client
+                    // TODO: Send response back to client via IPC
                     // For now we just log it
-                    info!("Response for {}: {:?}", client_id, response.result);
+                    info!("Response for {}: success={}", client_id, !response.is_error());
                 }
                 
                 // Handle shutdown signal
@@ -129,7 +163,12 @@ impl DaemonServer {
         }
         
         // Cleanup
+        info!("Shutting down daemon...");
         self.ipc.shutdown();
+        
+        // Wait for auto-save to complete final save
+        let _ = tokio::time::timeout(Duration::from_secs(5), save_handle).await;
+        
         ipc_handle.abort();
         
         info!("Daemon stopped");
@@ -166,6 +205,11 @@ impl DaemonBuilder {
     
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.config.log_level = level.into();
+        self
+    }
+    
+    pub fn with_auto_save_interval(mut self, secs: u64) -> Self {
+        self.config.auto_save_interval_secs = secs;
         self
     }
     

@@ -356,6 +356,40 @@ impl Default for SessionManager {
     }
 }
 
+impl SessionManager {
+    /// Restore a session from persistence (used during startup)
+    pub async fn restore(&self, session: Session) {
+        let id = session.id.clone();
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(id.clone(), session);
+        
+        // Set as default if it's the first session
+        let mut default = self.default_session.write().await;
+        if default.is_none() {
+            *default = Some(id);
+        }
+    }
+    
+    /// Set the default session ID
+    pub async fn set_default(&self, id: &str) {
+        let sessions = self.sessions.read().await;
+        if sessions.contains_key(id) {
+            let mut default = self.default_session.write().await;
+            *default = Some(id.to_string());
+        }
+    }
+    
+    /// Get the internal sessions map (for persistence)
+    pub fn sessions_map(&self) -> Arc<RwLock<HashMap<SessionId, Session>>> {
+        self.sessions.clone()
+    }
+    
+    /// Get the default session ID holder (for persistence)
+    pub fn default_session_id(&self) -> Arc<RwLock<Option<SessionId>>> {
+        self.default_session.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
