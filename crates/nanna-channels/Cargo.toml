@@ -16,3 +16,6 @@ reqwest = { version = "0.12", features = ["json", "multipart"] }
 urlencoding = "2"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
+# WebSocket listeners
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }

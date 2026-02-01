@@ -4,8 +4,18 @@
 //! Channel abstraction for Nanna
 //!
 //! Provides a unified interface for different messaging platforms.
+//!
+//! # Architecture
+//!
+//! Channels have two parts:
+//! - **Outbound** (`Channel` trait): Send messages, reactions, edits, etc.
+//! - **Inbound** (`Listener` trait): Receive messages via polling or webhooks
+//!
+//! The `MessageRouter` coordinates outbound sends.
+//! The `ListenerManager` coordinates inbound listeners.
 
 pub mod discord;
+pub mod listeners;
 pub mod queue;
 pub mod signal;
 pub mod slack;
@@ -14,6 +24,10 @@ pub mod telegram;
 pub mod whatsapp;
 
 pub use discord::DiscordChannel;
+pub use listeners::{
+    DiscordListener, Listener, ListenerError, ListenerHandle, ListenerManager, SlackListener,
+    TelegramListener,
+};
 pub use queue::{MessageQueue, MessagePriority, QueueConfig, QueueEvent, QueueStats, QueuedMessage, SendResult};
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
