@@ -1,26 +1,27 @@
 //! Backend abstraction layer
 //!
 //! Provides a unified interface that can use either:
-//! - Daemon mode: Connect to nanna-daemon via WebSocket
-//! - Embedded mode: Run agent directly in the GUI process
+//! - Daemon mode: Starts and connects to nanna-daemon sidecar
+//! - Embedded mode: Run agent directly in the GUI process (fallback)
 //!
 //! The GUI commands use this layer, which automatically selects the right backend.
 
 use crate::daemon_client::{ConnectionMode, DaemonClient, DaemonClientConfig, DaemonEvent};
-use serde::{Deserialize, Serialize};
+use crate::daemon_manager::{DaemonManager, DaemonManagerConfig, DaemonState};
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Backend mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendMode {
-    /// Connected to external daemon
+    /// Connected to daemon sidecar
     Daemon,
-    /// Running embedded agent
+    /// Running embedded agent (fallback)
     Embedded,
 }
 
@@ -30,59 +31,100 @@ pub struct BackendStatus {
     pub mode: BackendMode,
     pub connected: bool,
     pub daemon_url: Option<String>,
+    pub daemon_state: String,
     pub version: String,
 }
 
 /// The unified backend interface
 pub struct Backend {
     mode: Arc<RwLock<BackendMode>>,
+    daemon_manager: Arc<DaemonManager>,
     daemon_client: Arc<DaemonClient>,
-    app: Option<AppHandle>,
+    app: Arc<RwLock<Option<AppHandle>>>,
 }
 
 impl Backend {
     /// Create a new backend (starts in embedded mode)
     pub fn new() -> Self {
-        let config = DaemonClientConfig::default();
-        Self {
-            mode: Arc::new(RwLock::new(BackendMode::Embedded)),
-            daemon_client: Arc::new(DaemonClient::new(config)),
-            app: None,
-        }
-    }
-    
-    /// Set the app handle for event emission
-    pub fn with_app(mut self, app: AppHandle) -> Self {
-        self.app = Some(app);
-        self
-    }
-    
-    /// Initialize the backend - try daemon, fall back to embedded
-    pub async fn init(&self) -> BackendMode {
-        info!("Initializing backend...");
-        
-        // Try to connect to daemon
-        let mode = self.daemon_client.connect_or_embed().await;
-        
-        let backend_mode = match mode {
-            ConnectionMode::Daemon => {
-                info!("Backend: daemon mode");
-                BackendMode::Daemon
-            }
-            ConnectionMode::Embedded => {
-                info!("Backend: embedded mode");
-                BackendMode::Embedded
-            }
+        let manager_config = DaemonManagerConfig::default();
+        let client_config = DaemonClientConfig {
+            url: format!("ws://{}:{}", manager_config.host, manager_config.port),
+            ..Default::default()
         };
         
-        *self.mode.write().await = backend_mode;
+        Self {
+            mode: Arc::new(RwLock::new(BackendMode::Embedded)),
+            daemon_manager: Arc::new(DaemonManager::new(manager_config)),
+            daemon_client: Arc::new(DaemonClient::new(client_config)),
+            app: Arc::new(RwLock::new(None)),
+        }
+    }
+    
+    /// Set the app handle (required for sidecar and event emission)
+    pub async fn set_app(&self, app: AppHandle) {
+        *self.app.write().await = Some(app);
+    }
+    
+    /// Initialize the backend:
+    /// 1. Start the daemon sidecar
+    /// 2. Connect the client
+    /// 3. Fall back to embedded if daemon fails
+    pub async fn init(&self, app: &AppHandle) -> BackendMode {
+        info!("Initializing backend...");
         
-        // Start event forwarding if in daemon mode
-        if backend_mode == BackendMode::Daemon {
-            self.start_event_forwarding();
+        // Store app handle
+        *self.app.write().await = Some(app.clone());
+        
+        // Step 1: Start the daemon sidecar
+        match self.daemon_manager.start(app).await {
+            Ok(()) => {
+                info!("Daemon sidecar started");
+                
+                // Step 2: Connect the client
+                let mode = self.daemon_client.connect_or_embed().await;
+                
+                match mode {
+                    ConnectionMode::Daemon => {
+                        info!("Backend: daemon mode (sidecar)");
+                        *self.mode.write().await = BackendMode::Daemon;
+                        
+                        // Start event forwarding
+                        self.start_event_forwarding(app.clone());
+                        
+                        // Start health monitoring
+                        self.daemon_manager.clone().start_health_monitor(app.clone());
+                        
+                        BackendMode::Daemon
+                    }
+                    ConnectionMode::Embedded => {
+                        warn!("Daemon started but client connection failed, falling back to embedded");
+                        *self.mode.write().await = BackendMode::Embedded;
+                        BackendMode::Embedded
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to start daemon sidecar: {}", e);
+                info!("Backend: embedded mode (fallback)");
+                *self.mode.write().await = BackendMode::Embedded;
+                BackendMode::Embedded
+            }
+        }
+    }
+    
+    /// Shutdown the backend (stop daemon if running)
+    pub async fn shutdown(&self) {
+        info!("Shutting down backend...");
+        
+        // Disconnect client
+        self.daemon_client.disconnect();
+        
+        // Stop daemon
+        if let Err(e) = self.daemon_manager.stop().await {
+            warn!("Error stopping daemon: {}", e);
         }
         
-        backend_mode
+        *self.mode.write().await = BackendMode::Embedded;
     }
     
     /// Get current mode
@@ -93,16 +135,18 @@ impl Backend {
     /// Get backend status
     pub async fn status(&self) -> BackendStatus {
         let mode = *self.mode.read().await;
+        let daemon_state = self.daemon_manager.state().await;
         let client_status = self.daemon_client.status().await;
         
         BackendStatus {
             mode,
-            connected: mode == BackendMode::Daemon,
+            connected: mode == BackendMode::Daemon && daemon_state == DaemonState::Running,
             daemon_url: if mode == BackendMode::Daemon {
-                Some(client_status.daemon_url)
+                Some(self.daemon_manager.ws_url())
             } else {
                 None
             },
+            daemon_state: format!("{:?}", daemon_state).to_lowercase(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -121,14 +165,8 @@ impl Backend {
     }
     
     /// Start forwarding daemon events to Tauri
-    fn start_event_forwarding(&self) {
-        let Some(ref app) = self.app else {
-            warn!("No app handle for event forwarding");
-            return;
-        };
-        
+    fn start_event_forwarding(&self, app: AppHandle) {
         let mut events = self.daemon_client.subscribe_events();
-        let app = app.clone();
         
         tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
@@ -140,7 +178,7 @@ impl Backend {
                             "done": false,
                         }));
                     }
-                    DaemonEvent::MessageEnd { session_id, content, .. } => {
+                    DaemonEvent::MessageEnd { session_id, .. } => {
                         let _ = app.emit("stream-chunk", serde_json::json!({
                             "session_id": session_id,
                             "chunk": "",
@@ -191,7 +229,6 @@ impl Backend {
         if self.is_daemon_mode().await {
             self.daemon_client.chat_send(session_id, content).await
         } else {
-            // In embedded mode, return an indicator that caller should use embedded path
             Err("EMBEDDED_MODE".to_string())
         }
     }
