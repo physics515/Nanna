@@ -366,13 +366,13 @@ highlight.js
 ### Channel Listeners
 **Actually connect to messaging platforms and receive messages**
 
-- [ ] **Telegram long-polling** - `getUpdates` loop with offset tracking
+- [x] **Telegram long-polling** - `getUpdates` loop with offset tracking ✅
 - [ ] **Telegram webhooks** - Optional webhook mode for high-volume
-- [ ] **Discord Gateway** - WebSocket connection to Discord Gateway
-- [ ] **Slack Socket Mode** - WebSocket via Slack's Socket Mode API
+- [x] **Discord Gateway** - WebSocket connection to Discord Gateway ✅
+- [x] **Slack Socket Mode** - WebSocket via Slack's Socket Mode API ✅
 - [ ] **Signal listener** - signald WebSocket or REST polling
 - [ ] **WhatsApp listener** - Webhook receiver for Cloud API
-- [ ] **Unified message router** - All channels → single message queue
+- [x] **Unified message router** - All channels → single message queue ✅
 - [ ] **Per-channel sessions** - Isolated context per chat/channel
 
 **Architecture:**
@@ -803,11 +803,11 @@ tools = ["*"]  # Full access
 | 63 | Wire GUI to daemon client | 🔜 |
 | 64 | Agent integration in daemon | 🔜 |
 | 65 | Webhook server (Axum) | 🔜 |
-| 66 | Telegram listener | 🔜 |
-| 67 | Unified message router | 🔜 |
+| 66 | Telegram listener | ✅ Done |
+| 67 | Unified message router | ✅ Done |
 | 68 | Cron system + persistence | 🔜 |
-| 69 | Discord Gateway | 🔜 |
-| 70 | Slack Socket Mode | 🔜 |
+| 69 | Discord Gateway | ✅ Done |
+| 70 | Slack Socket Mode | ✅ Done |
 | 71 | Heartbeats | 🔜 |
 | 72 | Sub-agent sessions | 🔜 |
 | 73 | TTS (ElevenLabs/OpenAI) | Later |

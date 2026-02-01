@@ -13,6 +13,7 @@
 //! - Scheduler/cron
 
 pub mod agent_service;
+pub mod channels;
 pub mod control;
 pub mod ipc;
 pub mod persistence;
