@@ -25,8 +25,8 @@ pub mod whatsapp;
 
 pub use discord::DiscordChannel;
 pub use listeners::{
-    DiscordListener, Listener, ListenerError, ListenerHandle, ListenerManager, SlackListener,
-    TelegramListener,
+    DiscordListener, Listener, ListenerError, ListenerHandle, ListenerManager, SignalListener,
+    SignalReceiveMode, SlackListener, TelegramListener,
 };
 pub use queue::{MessageQueue, MessagePriority, QueueConfig, QueueEvent, QueueStats, QueuedMessage, SendResult};
 pub use signal::SignalChannel;
