@@ -285,7 +285,13 @@
             <span>Hide to Tray</span>
           </button>
           <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
-            <span>v0.1.0</span>
+            <div class="flex items-center gap-2">
+              <span>v0.1.0</span>
+              <span v-if="backendStatus" class="px-1.5 py-0.5 rounded text-[10px]" 
+                    :class="isDaemon ? 'bg-nanna-accent/20 text-nanna-accent' : 'bg-nanna-bg-elevated text-nanna-text-dim'">
+                {{ isDaemon ? 'daemon' : 'embedded' }}
+              </span>
+            </div>
             <span :class="apiKeySet ? 'text-nanna-success' : 'text-nanna-error'">
               {{ apiKeySet ? '● Connected' : '○ No API Key' }}
             </span>
@@ -349,7 +355,14 @@ provide('activeWorkspace', activeWorkspace)
 // Initialize notifications
 const { checkPermission } = useNotifications()
 
+// Initialize backend (daemon or embedded mode)
+const { init: initBackend, status: backendStatus, isDaemon } = useBackend()
+
 onMounted(async () => {
+  // Initialize backend first (tries daemon, falls back to embedded)
+  const mode = await initBackend()
+  console.log(`Nanna running in ${mode} mode`)
+  
   // Load active workspace first, then sessions (sessions filtered by workspace)
   await loadActiveWorkspace()
   await loadSessions()
