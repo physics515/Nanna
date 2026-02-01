@@ -10,6 +10,7 @@
 pub mod agents;
 pub mod backend;
 pub mod daemon_client;
+pub mod daemon_manager;
 pub mod tool_authoring;
 
 use backend::{Backend, BackendMode};
@@ -4520,13 +4521,14 @@ async fn get_backend_status(
     Ok(state.backend.status().await)
 }
 
-/// Initialize the backend - attempts daemon connection, falls back to embedded
+/// Initialize the backend - starts daemon sidecar and connects
 #[tauri::command]
 async fn init_backend(
+    app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
     let state = state.read().await;
-    let mode = state.backend.init().await;
+    let mode = state.backend.init(&app).await;
     Ok(match mode {
         BackendMode::Daemon => "daemon".to_string(),
         BackendMode::Embedded => "embedded".to_string(),
@@ -5371,11 +5373,16 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                // Save memories before exiting (only if we have some)
+                // Shutdown backend (stop daemon sidecar) and save memories
                 if let Some(state) = app.try_state::<Arc<RwLock<AppState>>>() {
                     let state = state.inner().clone();
                     tauri::async_runtime::block_on(async {
                         let state_guard = state.read().await;
+                        
+                        // Stop the daemon sidecar
+                        info!("Shutting down backend...");
+                        state_guard.backend.shutdown().await;
+                        
                         let count = state_guard.memory.count().await;
                         
                         // Only save if we have memories (prevents wiping on failed load)

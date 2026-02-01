@@ -14,6 +14,18 @@
     "core:window:allow-close",
     "core:window:allow-set-focus",
     "shell:allow-open",
+    "shell:allow-spawn",
+    "shell:allow-kill",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "nanna-daemon",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
     "notification:default",
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
