@@ -3,10 +3,17 @@
 
 $target = $env:CARGO_TARGET_DIR
 if (-not $target) {
-    $target = "..\..\target"
+    # Check for custom target dir first (Justin's setup)
+    $customTarget = "D:\Development\Cargo Target"
+    if (Test-Path $customTarget) {
+        $target = $customTarget
+    } else {
+        $target = "..\..\target"
+    }
 }
 
-$source = "$target\debug\nanna-daemon.exe"
+# Handle path with spaces
+$source = Join-Path $target "debug\nanna-daemon.exe"
 $destDir = "src-tauri\binaries"
 $dest = "$destDir\nanna-daemon-x86_64-pc-windows-msvc.exe"
 
