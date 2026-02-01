@@ -564,6 +564,175 @@ Nanna Daemon ◄──────► Node Agent (Phone)
 
 ---
 
+## Phase 9: Multi-Device Swarm (Tor P2P)
+*Peer-to-peer daemon communication over Tor hidden services*
+
+**Vision:** Every Nanna daemon becomes a node with its own `.onion` address. Nodes can invoke tools on each other — phone camera from desktop, GPU compute from phone, sensors from anywhere.
+
+### Architecture
+```
+┌─────────────────────┐  Tor Hidden Service  ┌─────────────────────┐
+│    Phone Daemon     │◄════════════════════►│   Desktop Daemon    │
+│     (Android)       │   .onion ↔ .onion    │   (Windows/Linux)   │
+│                     │                      │                     │
+│  Tools:             │  "Run camera_snap    │  Tools:             │
+│  - Camera           │   on your phone"     │  - File system      │
+│  - GPS              │◄─────────────────────│  - Browser          │
+│  - Notifications    │                      │  - GPU compute      │
+│  - Sensors          │                      │  - exec             │
+└─────────────────────┘                      └─────────────────────┘
+          │                                            │
+          └────────────────────┬───────────────────────┘
+                               ▼
+                 ┌─────────────────────────┐
+                 │    Gateway / Registry   │
+                 │  (Optional central or   │
+                 │     DHT-based)          │
+                 └─────────────────────────┘
+```
+
+### nanna-identity Crate
+**Persistent cryptographic identity for each daemon**
+
+- [ ] **Ed25519 keypair generation** - `ed25519-dalek` for signing
+- [ ] **Onion address derivation** - Derive `.onion` from public key via `onyums`
+- [ ] **Identity persistence** - Store in `~/.nanna/identity.json`
+- [ ] **Identity rotation** - Generate new identity on demand
+- [ ] **Export/import** - Backup and restore identity
+- [ ] **Fingerprint display** - Human-readable identity verification
+
+**Identity format:**
+```json
+{
+  "version": 1,
+  "created_at": "2026-02-01T12:00:00Z",
+  "public_key": "base64...",
+  "secret_key_encrypted": "base64...",
+  "onion_address": "abc123xyz789.onion",
+  "fingerprint": "A1B2-C3D4-E5F6-G7H8"
+}
+```
+
+### nanna-tor Crate
+**Tor integration for hidden service publishing and outbound requests**
+
+- [ ] **Embedded Tor** - Bundle `arti` (pure Rust Tor) for zero-config
+- [ ] **System Tor fallback** - Connect to existing Tor daemon if available
+- [ ] **Hidden service publishing** - Expose daemon IPC over `.onion`
+- [ ] **Outbound requests** - `artiqwest` for HTTP requests to other `.onion` addresses
+- [ ] **Circuit management** - Connection pooling and circuit reuse
+- [ ] **Bootstrap progress** - Report Tor bootstrap status to GUI
+
+**Dependencies:**
+```toml
+arti-client = "0.x"        # Embedded Tor
+artiqwest = "0.x"          # Tor HTTP client
+onyums = "0.x"             # Onion address generation for axum
+```
+
+### Peer Discovery
+**How nodes find each other**
+
+- [ ] **Manual pairing** - Exchange onion addresses via QR code or link
+- [ ] **Pairing flow** - Device A shows QR, Device B scans, mutual approval
+- [ ] **Gateway registry** - Optional central rendezvous server
+- [ ] **DHT discovery** - Fully decentralized (Kademlia-style, future)
+- [ ] **Peer persistence** - Remember paired devices across restarts
+
+**Pairing protocol:**
+```
+Device A                          Device B
+   │                                  │
+   │──── Display QR (onion + nonce) ──►
+   │                                  │
+   │◄─── Scan + send pairing request ─│
+   │     (signed with B's key)        │
+   │                                  │
+   │──── Approve + send confirmation ─►
+   │     (signed with A's key)        │
+   │                                  │
+   └──── Mutual trust established ────┘
+```
+
+### Remote Tool Protocol
+**Cross-node tool invocation**
+
+- [ ] **Tool request message** - Request tool execution on remote node
+- [ ] **Tool response message** - Return result or error
+- [ ] **Streaming results** - Long-running tools stream output
+- [ ] **Request signing** - Ed25519 signatures on all requests
+- [ ] **Request encryption** - End-to-end encryption (Tor provides transport)
+- [ ] **Timeout handling** - Request timeouts with retry logic
+
+**Protocol messages:**
+```json
+{
+  "type": "tool_request",
+  "id": "uuid",
+  "from": "abc123.onion",
+  "to": "xyz789.onion",
+  "tool": "camera_snap",
+  "input": { "facing": "front" },
+  "signature": "base64..."
+}
+
+{
+  "type": "tool_response",
+  "id": "uuid",
+  "from": "xyz789.onion",
+  "to": "abc123.onion",
+  "result": { "image": "base64...", "timestamp": "..." },
+  "signature": "base64..."
+}
+```
+
+### Trust & Permissions
+**Fine-grained control over what peers can do**
+
+- [ ] **Peer allowlist** - Only approved peers can connect
+- [ ] **Per-peer tool allowlist** - Limit which tools each peer can invoke
+- [ ] **Request approval** - Optional user confirmation for sensitive tools
+- [ ] **Audit log** - Track all remote tool invocations
+- [ ] **Rate limiting** - Per-peer request limits
+- [ ] **Revocation** - Remove peer trust instantly
+
+**Trust config:**
+```toml
+[[peers]]
+name = "My Phone"
+onion = "abc123.onion"
+fingerprint = "A1B2-C3D4-E5F6-G7H8"
+tools = ["camera_snap", "location_get", "notify"]
+require_approval = ["location_get"]
+
+[[peers]]
+name = "Work Laptop"
+onion = "xyz789.onion"
+fingerprint = "I9J0-K1L2-M3N4-O5P6"
+tools = ["*"]  # Full access
+```
+
+### Claude Code / External Agent Attachment
+**Connect external AI agents to Nanna**
+
+- [ ] **API key mode** - User provides Anthropic key, Nanna proxies requests
+- [ ] **Claude Code bridge** - Connect to running Claude Code session via socket
+- [ ] **Tool exposure** - Expose Nanna tools to external agent
+- [ ] **Session handoff** - External agent takes over conversation
+- [ ] **Capability negotiation** - Advertise available tools to external agent
+
+### Implementation Order
+
+1. **nanna-identity** - Keypair generation, onion derivation, persistence
+2. **nanna-tor** - Embedded Tor, hidden service publishing
+3. **Peer discovery** - Manual pairing via QR/link
+4. **Remote tool protocol** - Request/response over Tor
+5. **Trust model** - Peer allowlists, tool permissions
+6. **GUI integration** - Pair devices, manage peers, view remote tools
+7. **Claude Code bridge** - External agent attachment
+
+---
+
 ## Quick Priorities
 
 | Priority | Item | Status |
@@ -644,6 +813,14 @@ Nanna Daemon ◄──────► Node Agent (Phone)
 | 73 | TTS (ElevenLabs/OpenAI) | Later |
 | 74 | Browser relay extension | Later |
 | 75 | Paired devices (nodes) | Later |
+| **Phase 9: Multi-Device Swarm** | | |
+| 76 | nanna-identity (keypair + onion) | 🔜 |
+| 77 | nanna-tor (embedded Tor + hidden service) | 🔜 |
+| 78 | Peer discovery (QR pairing) | Later |
+| 79 | Remote tool protocol | Later |
+| 80 | Trust model (per-peer permissions) | Later |
+| 81 | GUI peer management | Later |
+| 82 | Claude Code bridge | Later |
 
 ---
 
@@ -673,3 +850,8 @@ Nanna Daemon ◄──────► Node Agent (Phone)
 15. **Job Persistence** - Store jobs in SQLite
 16. **Job Execution** - Run prompts/tools on schedule
 17. **GUI Cron Editor** - Visual cron builder
+
+### Multi-Device Swarm (Phase 9 - Foundation)
+18. **nanna-identity** - Ed25519 keypair + onion address derivation
+19. **nanna-tor** - Embedded arti + hidden service publishing
+20. **Peer pairing** - QR code exchange + mutual approval flow
