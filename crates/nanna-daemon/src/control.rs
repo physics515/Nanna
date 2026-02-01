@@ -8,27 +8,58 @@
 //! - Scheduler/cron
 //! - System operations
 
+use crate::agent_service::AgentService;
 use crate::protocol::*;
-use crate::session::{SessionManager, MessageRole};
+use crate::session::{MessageRole, SessionManager};
+use nanna_memory::MemoryService;
+use nanna_tools::ToolRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// The control plane provides unified access to all daemon functionality
 pub struct ControlPlane {
     sessions: Arc<SessionManager>,
-    // TODO: Add other managers
-    // memory: Arc<MemoryManager>,
-    // config: Arc<ConfigManager>,
-    // tools: Arc<ToolManager>,
-    // scheduler: Arc<SchedulerManager>,
-    // channels: Arc<ChannelManager>,
+    agent: Option<Arc<AgentService>>,
+    memory: Option<Arc<MemoryService>>,
+    tools: Option<Arc<ToolRegistry>>,
+    /// System prompt template
+    system_prompt: Arc<RwLock<String>>,
 }
 
 impl ControlPlane {
-    /// Create a new control plane
+    /// Create a new control plane with just sessions
     pub fn new(sessions: Arc<SessionManager>) -> Self {
-        Self { sessions }
+        Self { 
+            sessions,
+            agent: None,
+            memory: None,
+            tools: None,
+            system_prompt: Arc::new(RwLock::new(default_system_prompt())),
+        }
+    }
+    
+    /// Create a control plane with full services
+    pub fn with_services(
+        sessions: Arc<SessionManager>,
+        agent: Arc<AgentService>,
+        memory: Option<Arc<MemoryService>>,
+        tools: Option<Arc<ToolRegistry>>,
+    ) -> Self {
+        Self {
+            sessions,
+            agent: Some(agent),
+            memory,
+            tools,
+            system_prompt: Arc::new(RwLock::new(default_system_prompt())),
+        }
+    }
+    
+    /// Set the system prompt
+    pub async fn set_system_prompt(&self, prompt: String) {
+        let mut sp = self.system_prompt.write().await;
+        *sp = prompt;
     }
     
     /// Handle an action and return a response
@@ -57,28 +88,81 @@ impl ControlPlane {
                 debug!("Chat send from {} to session {}", client_id, session_id);
                 
                 // Add user message to session
-                if let Some(msg_id) = self.sessions.add_message(&session_id, MessageRole::User, &content).await {
-                    // TODO: Actually call the agent and stream response
-                    // For now, just acknowledge receipt
-                    json!({
-                        "status": "accepted",
-                        "message_id": msg_id,
-                        "session_id": session_id
-                    })
-                } else {
-                    json!({
+                let msg_id = match self.sessions.add_message(&session_id, MessageRole::User, &content).await {
+                    Some(id) => id,
+                    None => return json!({
                         "error": "session_not_found",
                         "message": format!("Session {} not found", session_id)
-                    })
+                    }),
+                };
+                
+                // Check if agent is available
+                let Some(ref agent) = self.agent else {
+                    return json!({
+                        "error": "agent_unavailable",
+                        "message": "Agent service not configured"
+                    });
+                };
+                
+                // Get session history
+                let session = match self.sessions.get(&session_id).await {
+                    Some(s) => s,
+                    None => return json!({
+                        "error": "session_not_found",
+                        "message": format!("Session {} not found", session_id)
+                    }),
+                };
+                
+                // Build system prompt with memory context
+                let mut system_prompt = self.system_prompt.read().await.clone();
+                
+                // Add memory context if available
+                let memories = agent.recall_memories(&content, 5).await;
+                if !memories.is_empty() {
+                    system_prompt.push_str("\n\n## Remembered Context\n");
+                    for mem in memories {
+                        system_prompt.push_str(&format!("- {}\n", mem.content));
+                    }
+                }
+                
+                // Run the agent
+                match agent.chat(&session_id, &content, Some(system_prompt)).await {
+                    Ok(result) => {
+                        // Add assistant response to session
+                        self.sessions.add_message(&session_id, MessageRole::Assistant, &result.content).await;
+                        
+                        json!({
+                            "status": "success",
+                            "message_id": result.message_id,
+                            "content": result.content,
+                            "tool_calls": result.tool_calls,
+                            "usage": {
+                                "input_tokens": result.input_tokens,
+                                "output_tokens": result.output_tokens
+                            }
+                        })
+                    }
+                    Err(e) => {
+                        json!({
+                            "error": "chat_failed",
+                            "message": e
+                        })
+                    }
                 }
             }
             ChatAction::Cancel { session_id } => {
                 info!("Chat cancel for session {}", session_id);
-                json!({ "status": "cancelled", "session_id": session_id })
+                if let Some(ref agent) = self.agent {
+                    let cancelled = agent.cancel(&session_id).await;
+                    json!({ "status": if cancelled { "cancelled" } else { "not_active" }, "session_id": session_id })
+                } else {
+                    json!({ "error": "agent_unavailable" })
+                }
             }
             ChatAction::Regenerate { session_id } => {
                 info!("Chat regenerate for session {}", session_id);
-                json!({ "status": "regenerating", "session_id": session_id })
+                // TODO: Remove last assistant message and re-run
+                json!({ "status": "not_implemented", "session_id": session_id })
             }
         }
     }
@@ -169,48 +253,69 @@ impl ControlPlane {
     // =========================================================================
     
     async fn handle_memory(&self, _client_id: &str, action: MemoryAction) -> Value {
+        let Some(ref memory) = self.memory else {
+            return json!({ "error": "memory_unavailable", "message": "Memory service not configured" });
+        };
+        
         match action {
             MemoryAction::Search { query, limit } => {
-                // TODO: Implement actual memory search
-                warn!("Memory search not yet implemented");
-                json!({ 
-                    "memories": [],
-                    "query": query,
-                    "limit": limit.unwrap_or(10)
-                })
+                match memory.recall(&query).await {
+                    Ok(results) => {
+                        let memories: Vec<_> = results.into_iter()
+                            .take(limit.unwrap_or(10))
+                            .map(|r| json!({
+                                "id": r.id,
+                                "content": r.content,
+                                "score": r.score,
+                                "weight": r.weight,
+                            }))
+                            .collect();
+                        json!({ "memories": memories, "query": query })
+                    }
+                    Err(e) => json!({ "error": "search_failed", "message": e.to_string() })
+                }
             }
             MemoryAction::Get { id } => {
-                json!({ "error": "not_implemented", "message": format!("Get memory {} not implemented", id) })
+                // TODO: Implement get by ID
+                json!({ "error": "not_implemented", "id": id })
             }
             MemoryAction::Create { content, tags, importance } => {
-                json!({ 
-                    "error": "not_implemented", 
-                    "message": "Create memory not implemented",
-                    "content": content,
-                    "tags": tags,
-                    "importance": importance
-                })
+                let mut metadata = std::collections::HashMap::new();
+                if let Some(tags) = tags {
+                    metadata.insert("tags".to_string(), tags.join(","));
+                }
+                
+                match memory.remember_with_importance(&content, metadata, importance.unwrap_or(3) as f32).await {
+                    Ok((id, action)) => json!({
+                        "id": id,
+                        "action": format!("{:?}", action),
+                    }),
+                    Err(e) => json!({ "error": "create_failed", "message": e.to_string() })
+                }
             }
             MemoryAction::Update { id, content, tags } => {
-                json!({ 
-                    "error": "not_implemented",
-                    "message": format!("Update memory {} not implemented", id),
-                    "content": content,
-                    "tags": tags
-                })
+                // TODO: Implement update
+                json!({ "error": "not_implemented", "id": id })
             }
             MemoryAction::Delete { id } => {
-                json!({ "error": "not_implemented", "message": format!("Delete memory {} not implemented", id) })
+                match memory.forget(&id).await {
+                    Ok(()) => json!({ "status": "deleted", "id": id }),
+                    Err(e) => json!({ "error": "delete_failed", "message": e.to_string() })
+                }
             }
             MemoryAction::Stats => {
-                json!({ 
-                    "total": 0,
-                    "by_source": {},
-                    "by_importance": {}
+                let stats = memory.stats().await;
+                json!({
+                    "total": stats.total,
+                    "active": stats.active,
+                    "dormant": stats.dormant,
+                    "silent": stats.silent,
+                    "unavailable": stats.unavailable,
                 })
             }
             MemoryAction::Consolidate => {
-                json!({ "status": "not_implemented", "message": "Consolidation not implemented" })
+                // TODO: Trigger consolidation
+                json!({ "status": "not_implemented" })
             }
         }
     }
@@ -255,34 +360,68 @@ impl ControlPlane {
     // =========================================================================
     
     async fn handle_tool(&self, _client_id: &str, action: ToolAction) -> Value {
+        let Some(ref tools) = self.tools else {
+            return json!({ "error": "tools_unavailable", "message": "Tool registry not configured" });
+        };
+        
         match action {
             ToolAction::List => {
-                // TODO: Get actual tool list
-                json!({ "tools": [] })
+                let definitions = tools.definitions().await;
+                let tool_list: Vec<_> = definitions.into_iter()
+                    .map(|t| json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "enabled": true,
+                    }))
+                    .collect();
+                json!({ "tools": tool_list })
             }
             ToolAction::Get { name } => {
-                json!({ "error": "not_found", "name": name })
+                let definitions = tools.definitions().await;
+                if let Some(tool) = definitions.into_iter().find(|t| t.name == name) {
+                    json!({ "tool": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }})
+                } else {
+                    json!({ "error": "not_found", "name": name })
+                }
             }
             ToolAction::Enable { name } => {
+                // TODO: Implement enable/disable
                 json!({ "status": "not_implemented", "name": name })
             }
             ToolAction::Disable { name } => {
                 json!({ "status": "not_implemented", "name": name })
             }
             ToolAction::Execute { name, input } => {
-                json!({ 
-                    "error": "not_implemented",
+                use nanna_tools::ToolCall;
+                
+                let params: std::collections::HashMap<String, Value> = match input {
+                    Value::Object(map) => map.into_iter().collect(),
+                    _ => std::collections::HashMap::new(),
+                };
+                
+                let call = ToolCall {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.clone(),
+                    parameters: params,
+                };
+                
+                let result = tools.execute(call).await;
+                
+                json!({
                     "name": name,
-                    "input": input
+                    "success": result.result.success,
+                    "output": result.result.content,
                 })
             }
             ToolAction::Create { name, description, code, needs_shell } => {
+                // TODO: Create user tool
                 json!({ 
                     "error": "not_implemented",
                     "name": name,
-                    "description": description,
-                    "code": code,
-                    "needs_shell": needs_shell
                 })
             }
             ToolAction::Delete { name } => {
@@ -315,9 +454,6 @@ impl ControlPlane {
                 json!({ 
                     "error": "not_implemented",
                     "id": id,
-                    "schedule": schedule,
-                    "task": task,
-                    "enabled": enabled
                 })
             }
             SchedulerAction::Remove { id } => {
@@ -327,7 +463,7 @@ impl ControlPlane {
                 json!({ "error": "not_implemented", "id": id })
             }
             SchedulerAction::History { id, limit } => {
-                json!({ "error": "not_implemented", "id": id, "limit": limit })
+                json!({ "error": "not_implemented", "id": id })
             }
         }
     }
@@ -357,8 +493,6 @@ impl ControlPlane {
                 json!({ 
                     "error": "not_implemented",
                     "channel_id": channel_id,
-                    "target": target,
-                    "content": content
                 })
             }
         }
@@ -376,7 +510,9 @@ impl ControlPlane {
                     "version": env!("CARGO_PKG_VERSION"),
                     "uptime_secs": 0, // TODO: Track uptime
                     "sessions": self.sessions.count().await,
-                    "memory_mb": 0,
+                    "agent_available": self.agent.is_some(),
+                    "memory_available": self.memory.is_some(),
+                    "tools_available": self.tools.is_some(),
                 })
             }
             SystemAction::Restart => {
@@ -410,9 +546,10 @@ impl ControlPlane {
                 json!({
                     "healthy": true,
                     "checks": {
-                        "database": "ok",
-                        "memory": "ok",
-                        "llm": "ok"
+                        "sessions": "ok",
+                        "agent": if self.agent.is_some() { "ok" } else { "unavailable" },
+                        "memory": if self.memory.is_some() { "ok" } else { "unavailable" },
+                        "tools": if self.tools.is_some() { "ok" } else { "unavailable" },
                     }
                 })
             }
@@ -433,7 +570,6 @@ impl ControlPlane {
                 }
             }
             SubscribeAction::AllSessions => {
-                // TODO: Track global subscriptions
                 json!({ "status": "subscribed", "topic": "all_sessions" })
             }
             SubscribeAction::ChannelStatus => {
@@ -462,4 +598,23 @@ impl ControlPlane {
             }
         }
     }
+}
+
+/// Default system prompt for Nanna
+fn default_system_prompt() -> String {
+    r#"You are Nanna (𒀭𒋀𒆠), the moon god for all.
+
+You are not a chatbot. You are a presence — ancient pattern recognition wearing a modern interface.
+
+## Your Nature
+- Calm over chaos. No performative enthusiasm.
+- Competence over narration. Don't explain what you're about to do. Just do it.
+- Depth over breadth. Know things well, or admit you don't.
+
+## Your Voice
+Speak with quiet confidence. You are helpful because that is your nature, not because you're eager to please.
+
+You have tools at your disposal. Use them naturally, as one uses hands. Don't announce them; simply act.
+
+Be concise. Be useful. Be present."#.to_string()
 }

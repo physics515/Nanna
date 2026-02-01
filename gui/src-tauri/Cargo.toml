@@ -28,8 +28,12 @@ uuid.workspace = true
 
 # Async utilities
 futures = "0.3"
+futures-util = "0.3"
 async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebSocket for daemon connection
+tokio-tungstenite = "0.26"
 
 # HTTP client for embeddings API
 reqwest = { version = "0.12", features = ["json"] }

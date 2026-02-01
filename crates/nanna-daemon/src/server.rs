@@ -2,11 +2,19 @@
 //!
 //! Combines IPC server, control plane, sessions, persistence, and all subsystems.
 
+use crate::agent_service::{AgentService, AgentServiceConfig};
 use crate::control::ControlPlane;
 use crate::ipc::{IpcServer, IpcServerConfig};
 use crate::persistence::PersistenceManager;
 use crate::protocol::Response;
 use crate::session::SessionManager;
+use nanna_llm::LlmClient;
+use nanna_memory::MemoryService;
+use nanna_tools::{
+    ToolRegistry, EchoTool, ExecTool, ReadFileTool, WriteFileTool, ListDirTool,
+    WebSearchTool, WebFetchTool,
+};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -18,24 +26,54 @@ pub struct DaemonConfig {
     /// IPC server configuration
     pub ipc: IpcServerConfig,
     /// Data directory
-    pub data_dir: std::path::PathBuf,
+    pub data_dir: PathBuf,
     /// Log level
     pub log_level: String,
     /// Auto-save interval in seconds
     pub auto_save_interval_secs: u64,
+    /// LLM configuration
+    pub llm: LlmConfig,
+    /// Agent configuration
+    pub agent: AgentServiceConfig,
+    /// Enable memory service
+    pub enable_memory: bool,
+}
+
+/// LLM provider configuration
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    /// Provider (anthropic, openai, ollama)
+    pub provider: String,
+    /// API key (for Anthropic/OpenAI)
+    pub api_key: Option<String>,
+    /// Ollama host (for Ollama provider)
+    pub ollama_host: String,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: "anthropic".to_string(),
+            api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+            ollama_host: "http://localhost:11434".to_string(),
+        }
+    }
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         let data_dir = directories::ProjectDirs::from("com", "nanna", "nanna-daemon")
             .map(|d| d.data_dir().to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            .unwrap_or_else(|| PathBuf::from("./data"));
         
         Self {
             ipc: IpcServerConfig::default(),
             data_dir,
             log_level: "info".to_string(),
-            auto_save_interval_secs: 60, // Save every minute
+            auto_save_interval_secs: 60,
+            llm: LlmConfig::default(),
+            agent: AgentServiceConfig::default(),
+            enable_memory: false, // Disabled by default until embeddings are wired
         }
     }
 }
@@ -109,12 +147,19 @@ impl DaemonServer {
             info!("Created default session: {}", default_session.id);
         }
         
+        // Initialize services
+        let (tools, memory, agent) = self.init_services().await?;
+        
+        // Create control plane with all services
+        let control = Arc::new(ControlPlane::with_services(
+            self.sessions.clone(),
+            agent,
+            memory,
+            Some(tools),
+        ));
+        
         // Take the request receiver from IPC server
         let mut request_rx = self.ipc.take_request_receiver();
-        
-        // Clone what we need for the request handler
-        let control = self.control.clone();
-        let ipc_clone = Arc::new(tokio::sync::RwLock::new(IpcServer::new(self.config.ipc.clone())));
         
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         
@@ -150,7 +195,6 @@ impl DaemonServer {
                     let response = Response::success(request.id, result);
                     
                     // TODO: Send response back to client via IPC
-                    // For now we just log it
                     info!("Response for {}: success={}", client_id, !response.is_error());
                 }
                 
@@ -173,6 +217,73 @@ impl DaemonServer {
         
         info!("Daemon stopped");
         Ok(())
+    }
+    
+    /// Initialize all services
+    async fn init_services(&self) -> Result<(
+        Arc<ToolRegistry>,
+        Option<Arc<MemoryService>>,
+        Arc<AgentService>,
+    ), crate::DaemonError> {
+        // Create LLM client
+        let llm = match self.config.llm.provider.as_str() {
+            "anthropic" => {
+                let api_key = self.config.llm.api_key.clone()
+                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                    .ok_or_else(|| crate::DaemonError::Config("ANTHROPIC_API_KEY not set".to_string()))?;
+                Arc::new(LlmClient::anthropic(&api_key))
+            }
+            "openai" => {
+                let api_key = self.config.llm.api_key.clone()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                    .ok_or_else(|| crate::DaemonError::Config("OPENAI_API_KEY not set".to_string()))?;
+                Arc::new(LlmClient::openai(&api_key))
+            }
+            "ollama" => {
+                Arc::new(LlmClient::ollama(&self.config.llm.ollama_host))
+            }
+            provider => {
+                return Err(crate::DaemonError::Config(format!("Unknown LLM provider: {}", provider)));
+            }
+        };
+        
+        info!("LLM client initialized: {}", self.config.llm.provider);
+        
+        // Create tool registry with built-in tools
+        let tools = Arc::new(ToolRegistry::new());
+        
+        // Register built-in tools
+        tools.register(EchoTool).await;
+        tools.register(ExecTool::new()).await;
+        tools.register(ReadFileTool::new()).await;
+        tools.register(WriteFileTool::new()).await;
+        tools.register(ListDirTool::new()).await;
+        tools.register(WebFetchTool::new()).await;
+        
+        // Register web search if API key available
+        if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
+            tools.register(WebSearchTool::new().with_api_key(&api_key)).await;
+        }
+        
+        let tool_count = tools.definitions().await.len();
+        info!("Tool registry initialized with {} tools", tool_count);
+        
+        // Memory service is disabled for now (needs embedding setup)
+        let memory: Option<Arc<MemoryService>> = None;
+        
+        // Create agent service
+        let event_tx = self.ipc.event_sender();
+        let agent = Arc::new(AgentService::new(
+            self.config.agent.clone(),
+            llm,
+            tools.clone(),
+            memory.clone(),
+            event_tx,
+        ));
+        
+        info!("Agent service initialized");
+        
+        Ok((tools, memory, agent))
     }
 }
 
@@ -198,7 +309,7 @@ impl DaemonBuilder {
         self
     }
     
-    pub fn with_data_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+    pub fn with_data_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.data_dir = path.into();
         self
     }
@@ -210,6 +321,26 @@ impl DaemonBuilder {
     
     pub fn with_auto_save_interval(mut self, secs: u64) -> Self {
         self.config.auto_save_interval_secs = secs;
+        self
+    }
+    
+    pub fn with_llm_provider(mut self, provider: impl Into<String>) -> Self {
+        self.config.llm.provider = provider.into();
+        self
+    }
+    
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        self.config.llm.api_key = Some(key.into());
+        self
+    }
+    
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.config.agent.model = model.into();
+        self
+    }
+    
+    pub fn with_memory(mut self, enable: bool) -> Self {
+        self.config.enable_memory = enable;
         self
     }
     

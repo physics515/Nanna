@@ -16,7 +16,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tracing::{debug, error, info, warn};
 
 /// Connection mode
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionMode {
     /// Connected to daemon via WebSocket
     Daemon,
@@ -25,7 +26,8 @@ pub enum ConnectionMode {
 }
 
 /// Connection state
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionState {
     Disconnected,
     Connecting,
@@ -40,17 +42,15 @@ pub struct DaemonClientConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub auto_reconnect: bool,
-    pub max_reconnect_attempts: u32,
 }
 
 impl Default for DaemonClientConfig {
     fn default() -> Self {
         Self {
             url: "ws://127.0.0.1:5149".to_string(),
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(3),
             request_timeout: Duration::from_secs(30),
             auto_reconnect: true,
-            max_reconnect_attempts: 10,
         }
     }
 }
@@ -70,7 +70,7 @@ pub struct Response {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum ResponseResult {
     Success { data: Value },
     Error { code: String, message: String },
@@ -88,34 +88,26 @@ impl Response {
         }
     }
     
-    pub fn error_message(&self) -> Option<String> {
-        match &self.result {
-            ResponseResult::Error { message, .. } => Some(message.clone()),
-            ResponseResult::Success { .. } => None,
+    pub fn into_data(self) -> Result<Value, String> {
+        match self.result {
+            ResponseResult::Success { data } => Ok(data),
+            ResponseResult::Error { message, .. } => Err(message),
         }
     }
 }
 
 /// IPC Event (from daemon)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub enum DaemonEvent {
-    #[serde(rename = "connected")]
+    MessageStart { session_id: String, message_id: String },
+    MessageDelta { session_id: String, message_id: String, delta: String },
+    MessageEnd { session_id: String, message_id: String, content: String },
+    ToolStart { session_id: String, call_id: String, name: String },
+    ToolEnd { session_id: String, call_id: String, output: String, success: bool },
+    Error { code: String, message: String },
     Connected { client_id: String },
-    #[serde(rename = "disconnected")]
     Disconnected { client_id: String },
-    #[serde(rename = "session.updated")]
-    SessionUpdated { session_id: String },
-    #[serde(rename = "chat.token")]
-    ChatToken { session_id: String, token: String },
-    #[serde(rename = "chat.done")]
-    ChatDone { session_id: String, message_id: String },
-    #[serde(rename = "tool.started")]
-    ToolStarted { session_id: String, tool_id: String, tool_name: String },
-    #[serde(rename = "tool.completed")]
-    ToolCompleted { session_id: String, tool_id: String, success: bool, output: String },
-    #[serde(rename = "error")]
-    Error { session_id: Option<String>, code: String, message: String },
 }
 
 /// Pending request waiting for response
@@ -128,7 +120,7 @@ pub struct DaemonClient {
     config: DaemonClientConfig,
     state: Arc<RwLock<ConnectionState>>,
     mode: Arc<RwLock<ConnectionMode>>,
-    msg_tx: Option<mpsc::Sender<Message>>,
+    msg_tx: Arc<RwLock<Option<mpsc::Sender<Message>>>>,
     pending: Arc<RwLock<HashMap<String, PendingRequest>>>,
     event_tx: broadcast::Sender<DaemonEvent>,
     shutdown_tx: broadcast::Sender<()>,
@@ -144,7 +136,7 @@ impl DaemonClient {
             config,
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             mode: Arc::new(RwLock::new(ConnectionMode::Embedded)),
-            msg_tx: None,
+            msg_tx: Arc::new(RwLock::new(None)),
             pending: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             shutdown_tx,
@@ -152,7 +144,7 @@ impl DaemonClient {
     }
     
     /// Try to connect to the daemon
-    pub async fn connect(&mut self) -> Result<(), String> {
+    pub async fn connect(&self) -> Result<(), String> {
         *self.state.write().await = ConnectionState::Connecting;
         
         info!("Attempting to connect to daemon at {}", self.config.url);
@@ -167,7 +159,7 @@ impl DaemonClient {
                 info!("Connected to daemon");
                 
                 // Start message handler
-                self.spawn_handler(ws);
+                self.spawn_handler(ws).await;
                 
                 Ok(())
             }
@@ -185,7 +177,7 @@ impl DaemonClient {
     }
     
     /// Try to connect, fall back to embedded mode if daemon not available
-    pub async fn connect_or_embed(&mut self) -> ConnectionMode {
+    pub async fn connect_or_embed(&self) -> ConnectionMode {
         match self.connect().await {
             Ok(()) => {
                 info!("Running in daemon mode");
@@ -199,11 +191,11 @@ impl DaemonClient {
         }
     }
     
-    fn spawn_handler(&mut self, ws: WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    async fn spawn_handler(&self, ws: WebSocketStream<MaybeTlsStream<TcpStream>>) {
         let (mut ws_tx, mut ws_rx) = ws.split();
         let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(100);
         
-        self.msg_tx = Some(msg_tx);
+        *self.msg_tx.write().await = Some(msg_tx);
         
         let pending = self.pending.clone();
         let event_tx = self.event_tx.clone();
@@ -225,7 +217,7 @@ impl DaemonClient {
                     Some(msg) = ws_rx.next() => {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                Self::handle_message(&text, &pending, &event_tx).await;
+                                Self::handle_message_static(&text, &pending, &event_tx).await;
                             }
                             Ok(Message::Ping(data)) => {
                                 let _ = ws_tx.send(Message::Pong(data)).await;
@@ -263,7 +255,7 @@ impl DaemonClient {
         });
     }
     
-    async fn handle_message(
+    async fn handle_message_static(
         text: &str,
         pending: &Arc<RwLock<HashMap<String, PendingRequest>>>,
         event_tx: &broadcast::Sender<DaemonEvent>,
@@ -272,10 +264,7 @@ impl DaemonClient {
         if let Ok(response) = serde_json::from_str::<Response>(text) {
             let mut pending = pending.write().await;
             if let Some(req) = pending.remove(&response.id) {
-                let result = match response.result {
-                    ResponseResult::Success { data } => Ok(data),
-                    ResponseResult::Error { message, .. } => Err(message),
-                };
+                let result = response.into_data();
                 let _ = req.tx.send(result);
             } else {
                 warn!("Received response for unknown request: {}", response.id);
@@ -294,17 +283,22 @@ impl DaemonClient {
     
     /// Get current connection mode
     pub async fn mode(&self) -> ConnectionMode {
-        self.mode.read().await.clone()
+        *self.mode.read().await
     }
     
     /// Get current connection state
     pub async fn state(&self) -> ConnectionState {
-        self.state.read().await.clone()
+        *self.state.read().await
     }
     
     /// Check if connected to daemon
     pub async fn is_connected(&self) -> bool {
         *self.state.read().await == ConnectionState::Connected
+    }
+    
+    /// Check if in embedded mode
+    pub async fn is_embedded(&self) -> bool {
+        *self.mode.read().await == ConnectionMode::Embedded
     }
     
     /// Subscribe to daemon events
@@ -318,8 +312,10 @@ impl DaemonClient {
             return Err("Not connected to daemon".to_string());
         }
         
-        let msg_tx = self.msg_tx.as_ref()
-            .ok_or_else(|| "No message sender".to_string())?;
+        let msg_tx = {
+            let guard = self.msg_tx.read().await;
+            guard.clone().ok_or_else(|| "No message sender".to_string())?
+        };
         
         let id = uuid::Uuid::new_v4().to_string();
         let request = Request { id: id.clone(), action };
@@ -360,13 +356,63 @@ impl DaemonClient {
     pub fn disconnect(&self) {
         let _ = self.shutdown_tx.send(());
     }
+    
+    // =========================================================================
+    // Convenience methods
+    // =========================================================================
+    
+    /// Send a chat message
+    pub async fn chat_send(&self, session_id: &str, content: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "chat",
+            "action": "send",
+            "session_id": session_id,
+            "content": content,
+            "attachments": []
+        })).await
+    }
+    
+    /// List sessions
+    pub async fn sessions_list(&self) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "list"
+        })).await
+    }
+    
+    /// Create a session
+    pub async fn session_create(&self, name: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "create",
+            "name": name
+        })).await
+    }
+    
+    /// Get session history
+    pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "history",
+            "id": session_id,
+            "limit": limit
+        })).await
+    }
+    
+    /// Get system status
+    pub async fn system_status(&self) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "system",
+            "action": "status"
+        })).await
+    }
 }
 
 /// Connection status for frontend
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionStatus {
-    pub mode: String,
-    pub state: String,
+    pub mode: ConnectionMode,
+    pub state: ConnectionState,
     pub daemon_url: String,
 }
 
@@ -374,16 +420,8 @@ impl DaemonClient {
     /// Get connection status for frontend
     pub async fn status(&self) -> ConnectionStatus {
         ConnectionStatus {
-            mode: match *self.mode.read().await {
-                ConnectionMode::Daemon => "daemon".to_string(),
-                ConnectionMode::Embedded => "embedded".to_string(),
-            },
-            state: match *self.state.read().await {
-                ConnectionState::Disconnected => "disconnected".to_string(),
-                ConnectionState::Connecting => "connecting".to_string(),
-                ConnectionState::Connected => "connected".to_string(),
-                ConnectionState::Reconnecting => "reconnecting".to_string(),
-            },
+            mode: *self.mode.read().await,
+            state: *self.state.read().await,
             daemon_url: self.config.url.clone(),
         }
     }

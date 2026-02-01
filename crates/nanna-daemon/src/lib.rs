@@ -12,6 +12,7 @@
 //! - Tool management
 //! - Scheduler/cron
 
+pub mod agent_service;
 pub mod control;
 pub mod ipc;
 pub mod persistence;
