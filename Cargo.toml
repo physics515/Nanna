@@ -46,6 +46,7 @@ members = [
     "crates/nanna-browser",
     "crates/nanna-mcp",
     "crates/nanna-scripting",
+    "crates/nanna-workspace",
     "gui/src-tauri",
 ]
 

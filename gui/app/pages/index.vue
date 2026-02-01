@@ -60,14 +60,7 @@
               <div class="text-xs text-nanna-text-dim mb-1">
                 {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
               </div>
-              <div 
-                v-if="msg.role === 'assistant'"
-                class="prose prose-invert prose-sm max-w-none break-words"
-                v-html="renderMarkdown(msg.content)"
-              />
-              <div v-else class="text-nanna-text text-sm sm:text-base whitespace-pre-wrap break-words">
-                {{ msg.content }}
-              </div>
+              <MarkdownContent :content="msg.content" />
               
               <!-- Tool calls for this message -->
               <div v-if="msg.toolCalls?.length" class="mt-3 space-y-2">
@@ -104,8 +97,8 @@
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
               <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
-                <span v-html="renderMarkdown(streamingContent)"></span>
-                <span class="cursor-blink">▋</span>
+                <MarkdownContent :content="streamingContent" />
+                <span class="cursor-blink inline-block ml-0.5">▋</span>
               </div>
               <div v-else class="text-nanna-text-muted flex items-center gap-2">
                 <span class="animate-pulse">●</span>
@@ -137,29 +130,14 @@
     
     <!-- Input area -->
     <div class="p-3 sm:p-4 border-t border-nanna-primary/10 bg-nanna-bg-surface/50">
-      <form @submit.prevent="sendMessage" class="max-w-4xl mx-auto">
-        <div class="flex gap-2 sm:gap-3">
-          <UiInput
-            v-model="input"
-            type="text"
-            placeholder="Type your message..."
-            :disabled="isLoading"
-            class="flex-1"
-            @keydown.enter.exact.prevent="sendMessage"
-          />
-          <UiButton 
-            type="submit" 
-            :disabled="!input.trim() || isLoading"
-            class="shrink-0"
-          >
-            <Send class="w-4 h-4 sm:hidden" />
-            <span class="hidden sm:inline">Send</span>
-          </UiButton>
-        </div>
-        <div class="mt-2 text-xs text-nanna-text-dim hidden sm:block">
-          Press Enter to send
-        </div>
-      </form>
+      <div class="max-w-4xl mx-auto">
+        <ChatInput
+          v-model="input"
+          placeholder="Type your message..."
+          :disabled="isLoading"
+          @submit="sendMessage"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -168,23 +146,6 @@
 import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { marked } from 'marked'
-import { Send } from 'lucide-vue-next'
-
-// Configure marked for safe rendering
-marked.setOptions({
-  breaks: true,
-  gfm: true,
-})
-
-function renderMarkdown(content: string): string {
-  try {
-    return marked.parse(content) as string
-  } catch {
-    return content
-  }
-}
-
 // Notifications
 const { notifyToolComplete, notifyError, notifyMessage } = useNotifications()
 

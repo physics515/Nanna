@@ -9,12 +9,21 @@ mod context;
 mod loop_runner;
 mod multi;
 mod prompts;
+mod registry;
 mod supervisor;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+// Re-export workspace crate for convenience
+pub use nanna_workspace;
+pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, WorkspaceTemplate};
+
 pub use context::{AgentContext, ContextIsolation, ContextSummary};
+pub use registry::{
+    AgentMetadata, AgentRegistry, AgentRole, AgentState as RegistryAgentState, LifecycleEvent, 
+    RegisteredAgent,
+};
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
     ReasoningBlock, ReasoningContent, RunOptions, StreamCallback, ThinkingCallback,

@@ -1,8 +1,10 @@
 //! Agent context management
 
 use nanna_llm::{AnthropicMessage, ContentBlock, LlmClient, RequestBuilder};
+use nanna_workspace::{Workspace, WorkspaceFiles};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Compressed context summary
@@ -60,6 +62,19 @@ pub struct AgentContext {
     /// Context budget in tokens for sub-agents (limits how much context can be used)
     #[serde(default)]
     pub context_budget: Option<usize>,
+    /// Workspace root path (if workspace is active)
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+    /// Workspace context (injected into system prompt)
+    #[serde(default)]
+    pub workspace_context: Option<String>,
+    /// Whether to include MEMORY.md in workspace context (false for group chats)
+    #[serde(default = "default_include_memory")]
+    pub include_workspace_memory: bool,
+}
+
+fn default_include_memory() -> bool {
+    true
 }
 
 fn default_compression_threshold() -> usize {
@@ -79,6 +94,9 @@ impl AgentContext {
             parent_context_id: None,
             isolation_mode: None,
             context_budget: None,
+            workspace_root: None,
+            workspace_context: None,
+            include_workspace_memory: true,
         }
     }
 
@@ -101,6 +119,58 @@ impl AgentContext {
     pub fn with_context_budget(mut self, budget: usize) -> Self {
         self.context_budget = Some(budget);
         self
+    }
+
+    /// Set workspace root and load workspace context
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: &Workspace) -> Self {
+        self.workspace_root = Some(workspace.root.clone());
+        self.workspace_context = Some(workspace.system_context());
+        self.include_workspace_memory = workspace.config.include_memory;
+        self
+    }
+
+    /// Set workspace from files directly
+    #[must_use]
+    pub fn with_workspace_files(mut self, root: PathBuf, files: &WorkspaceFiles, include_memory: bool) -> Self {
+        self.workspace_root = Some(root);
+        self.workspace_context = Some(files.to_system_context(include_memory));
+        self.include_workspace_memory = include_memory;
+        self
+    }
+
+    /// Set whether to include MEMORY.md in workspace context
+    #[must_use]
+    pub fn with_workspace_memory(mut self, include: bool) -> Self {
+        self.include_workspace_memory = include;
+        self
+    }
+
+    /// Get the effective system prompt (base + workspace context)
+    #[must_use]
+    pub fn effective_system_prompt(&self) -> String {
+        match &self.workspace_context {
+            Some(ws_ctx) if !ws_ctx.is_empty() => {
+                if self.system_prompt.is_empty() {
+                    ws_ctx.clone()
+                } else {
+                    format!("{}\n\n{}", self.system_prompt, ws_ctx)
+                }
+            }
+            _ => self.system_prompt.clone(),
+        }
+    }
+
+    /// Reload workspace context from disk
+    /// 
+    /// # Errors
+    /// Returns error if workspace cannot be loaded
+    pub async fn reload_workspace(&mut self) -> Result<(), nanna_workspace::WorkspaceError> {
+        if let Some(ref root) = self.workspace_root {
+            let files = WorkspaceFiles::load(root).await;
+            self.workspace_context = Some(files.to_system_context(self.include_workspace_memory));
+        }
+        Ok(())
     }
 
     /// Allocate a portion of context budget to a sub-agent.

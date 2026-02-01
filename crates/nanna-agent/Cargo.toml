@@ -22,4 +22,5 @@ futures = "0.3"
 nanna-llm = { path = "../nanna-llm" }
 nanna-tools = { path = "../nanna-tools" }
 nanna-memory = { path = "../nanna-memory" }
+nanna-workspace = { path = "../nanna-workspace" }
 nanna-mcp = { path = "../nanna-mcp", optional = true }

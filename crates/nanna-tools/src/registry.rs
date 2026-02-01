@@ -1,11 +1,13 @@
 //! Tool registry for managing available tools
 
 use crate::{Tool, ToolCall, ToolDefinition, ToolResponse, ToolResult};
+use crate::skills::{load_skill, discover_skills};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Registry of available tools
 pub struct ToolRegistry {
@@ -113,6 +115,57 @@ impl ToolRegistry {
     pub async fn execute_parallel(&self, calls: Vec<ToolCall>) -> Vec<ToolResponse> {
         let futures: Vec<_> = calls.into_iter().map(|call| self.execute(call)).collect();
         futures::future::join_all(futures).await
+    }
+
+    /// Load user-authored skills from a directory
+    ///
+    /// Discovers and loads all skills from the given directory (e.g., `workspace/skills/`).
+    /// Returns the number of skills successfully loaded.
+    pub async fn load_skills(&self, skills_dir: &Path) -> usize {
+        let discovered = discover_skills(skills_dir);
+        let total = discovered.len();
+        let mut loaded = 0;
+        
+        for skill in discovered {
+            match load_skill(&skill.path).await {
+                Ok(tool) => {
+                    let name = tool.definition().name.clone();
+                    self.register_boxed(tool).await;
+                    info!(name = %name, path = ?skill.path, "Loaded skill");
+                    loaded += 1;
+                }
+                Err(e) => {
+                    warn!(name = %skill.name, error = %e, "Failed to load skill");
+                }
+            }
+        }
+        
+        info!(loaded, total, "Skills loaded from {:?}", skills_dir);
+        loaded
+    }
+
+    /// Unregister a tool by name
+    pub async fn unregister(&self, name: &str) -> bool {
+        let mut tools = self.tools.write().await;
+        tools.remove(name).is_some()
+    }
+
+    /// Check if a tool is registered
+    pub async fn has(&self, name: &str) -> bool {
+        let tools = self.tools.read().await;
+        tools.contains_key(name)
+    }
+
+    /// Get the number of registered tools
+    pub async fn len(&self) -> usize {
+        let tools = self.tools.read().await;
+        tools.len()
+    }
+
+    /// Check if the registry is empty
+    pub async fn is_empty(&self) -> bool {
+        let tools = self.tools.read().await;
+        tools.is_empty()
     }
 }
 

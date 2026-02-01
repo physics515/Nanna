@@ -4,14 +4,24 @@
 //! Tool system for Nanna
 //!
 //! Provides a framework for defining and executing tools that the LLM can invoke.
+//!
+//! # User-Authored Skills
+//!
+//! The `skills` module supports two tiers of tool authoring:
+//! - **Scripted (Boa/Deno)**: JS/TS tools with sandboxing (requires `scripting` feature)
+//! - **Executable (Manifest)**: Python/shell/binary via `tool.yaml`
+//!
+//! See [`skills`] module for details.
 
 mod builtin;
 mod registry;
 mod schema;
+pub mod skills;
 
 pub use builtin::*;
 pub use registry::ToolRegistry;
 pub use schema::{ParameterType, ToolDefinition, ToolParameter, ToolResult};
+pub use skills::{discover_skills, load_skill, load_skills_from_dir, DiscoveredSkill, SkillSource};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

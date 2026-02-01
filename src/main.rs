@@ -9,7 +9,7 @@
 mod onboarding;
 
 use clap::{Parser, Subcommand};
-use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions};
+use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions, Workspace};
 use nanna_config::Config;
 use nanna_core::{LlmClient, Nanna, NannaConfig, Scheduler, SchedulerConfig, ScheduledTask, TaskResult};
 use nanna_server::{start_server, AppStateBuilder, ServerConfig};
@@ -107,6 +107,34 @@ enum Commands {
         #[arg(long)]
         generate: bool,
     },
+
+    /// Workspace management
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Initialize a new workspace in the current directory
+    Init {
+        /// Template to use (minimal, standard, project, assistant, research)
+        #[arg(short, long, default_value = "standard")]
+        template: String,
+
+        /// Path to initialize (defaults to current directory)
+        path: Option<String>,
+    },
+
+    /// Show current workspace status
+    Status,
+
+    /// List available templates
+    Templates,
+
+    /// Reload workspace files
+    Reload,
 }
 
 #[tokio::main]
@@ -162,6 +190,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("Config path: {}", path.display());
                 println!("\n{}", toml::to_string_pretty(&config)?);
             }
+            return Ok(());
+        }
+        Some(Commands::Workspace { action }) => {
+            handle_workspace_command(action).await?;
             return Ok(());
         }
         Some(Commands::Server { host, port }) => {
@@ -551,8 +583,8 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
 }
 
 /// Build the system prompt for CLI mode.
-fn build_cli_system_prompt(cwd: &std::path::Path) -> String {
-    format!(
+fn build_cli_system_prompt(cwd: &std::path::Path, workspace: Option<&Workspace>) -> String {
+    let base = format!(
         r"You are Nanna — moon god of the digital realm.
 
 You have tools at your disposal:
@@ -566,7 +598,17 @@ Current directory: {}
 
 Be helpful. Be competent. Don't waste words.",
         cwd.display()
-    )
+    );
+
+    // Append workspace context if available
+    if let Some(ws) = workspace {
+        let ws_context = ws.system_context();
+        if !ws_context.is_empty() {
+            return format!("{base}\n\n{ws_context}");
+        }
+    }
+
+    base
 }
 
 /// Print tool call results.
@@ -592,6 +634,8 @@ async fn run_cli(
     model: Option<String>,
     stream: bool,
 ) -> anyhow::Result<()> {
+    use nanna_agent::nanna_workspace::discover_workspace;
+
     let (llm, tools, storage) = init_components(config).await?;
 
     // Print banner
@@ -605,6 +649,28 @@ async fn run_cli(
     } else {
         println!("  Type 'quit' to exit, 'clear' to reset.\n");
     }
+
+    // Try to detect workspace
+    let cwd = std::env::current_dir()?;
+    let workspace = match discover_workspace(Some(&cwd)) {
+        Ok(root) => {
+            match Workspace::load(root.clone()).await {
+                Ok(ws) => {
+                    info!("Workspace detected: {} at {}", ws.name(), root.display());
+                    println!("  📂 Workspace: {}\n", ws.name());
+                    Some(ws)
+                }
+                Err(e) => {
+                    warn!("Failed to load workspace: {}", e);
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            debug!("No workspace detected in {}", cwd.display());
+            None
+        }
+    };
 
     // Session setup
     let (session_id, is_resume) = session_id.map_or_else(
@@ -623,10 +689,14 @@ async fn run_cli(
         thinking_mode: nanna_agent::ThinkingMode::Instant,
     };
 
-    // Build context with system prompt
-    let cwd = std::env::current_dir()?;
-    let mut context =
-        AgentContext::new(&session_id).with_system_prompt(build_cli_system_prompt(&cwd));
+    // Build context with system prompt (includes workspace context if available)
+    let mut context = AgentContext::new(&session_id)
+        .with_system_prompt(build_cli_system_prompt(&cwd, workspace.as_ref()));
+
+    // Set workspace on context if detected
+    if let Some(ref ws) = workspace {
+        context = context.with_workspace(ws);
+    }
 
     // Load session history if resuming
     if is_resume
@@ -833,6 +903,134 @@ async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
     }
 
     println!("\nResume with: nanna chat --session <ID>");
+
+    Ok(())
+}
+
+/// Handle workspace subcommands
+async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()> {
+    use nanna_agent::nanna_workspace::{
+        create_from_template, discover_workspace, list_templates,
+    };
+
+    match action {
+        WorkspaceAction::Init { template, path } => {
+            let target = path
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+            println!("🌙 Initializing workspace at {}", target.display());
+
+            // Check if workspace already exists
+            if discover_workspace(Some(&target)).is_ok() {
+                println!("⚠️  Workspace already exists at {}", target.display());
+                println!("   Use 'nanna workspace status' to see details.");
+                return Ok(());
+            }
+
+            // Create from template
+            create_from_template(&target, &template).await?;
+
+            println!("✅ Created workspace with '{}' template", template);
+            println!("\n📁 Files created:");
+            for entry in std::fs::read_dir(&target)? {
+                if let Ok(e) = entry {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".md") || name.starts_with('.') {
+                        println!("   - {}", name);
+                    }
+                }
+            }
+            println!("\n🚀 Run 'nanna chat' to start chatting in this workspace!");
+        }
+
+        WorkspaceAction::Status => {
+            let cwd = std::env::current_dir()?;
+            
+            match discover_workspace(Some(&cwd)) {
+                Ok(root) => {
+                    let workspace = Workspace::load(root.clone()).await?;
+                    
+                    println!("🌙 Workspace Status\n");
+                    println!("   Root: {}", root.display());
+                    println!("   Name: {}", workspace.name());
+                    println!("   Marker: {:?}", workspace.marker);
+                    println!("\n📁 Context Files:");
+                    
+                    let files = &workspace.files;
+                    if files.agents.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ AGENTS.md");
+                    }
+                    if files.soul.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ SOUL.md");
+                    }
+                    if files.user.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ USER.md");
+                    }
+                    if files.tools.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ TOOLS.md");
+                    }
+                    if files.memory.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ MEMORY.md");
+                    }
+                    if files.identity.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ IDENTITY.md");
+                    }
+                    if files.heartbeat.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ✓ HEARTBEAT.md");
+                    }
+                    if files.bootstrap.as_ref().is_some_and(|f| f.exists) {
+                        println!("   ⚡ BOOTSTRAP.md (fresh workspace)");
+                    }
+                    
+                    if !files.daily_memories.is_empty() {
+                        println!("\n📅 Recent Daily Notes:");
+                        for daily in &files.daily_memories {
+                            println!("   - {}", daily.name);
+                        }
+                    }
+                    
+                    println!("\n📊 Context Size:");
+                    println!("   {} bytes (~{} tokens)", 
+                        files.total_size(), 
+                        files.estimated_tokens()
+                    );
+                }
+                Err(_) => {
+                    println!("❌ No workspace found in current directory.");
+                    println!("   Run 'nanna workspace init' to create one.");
+                }
+            }
+        }
+
+        WorkspaceAction::Templates => {
+            let templates = list_templates();
+            
+            println!("🌙 Available Workspace Templates\n");
+            for t in templates {
+                println!("   {} - {}", t.id, t.name);
+                println!("      {}", t.description);
+                println!();
+            }
+            println!("Use: nanna workspace init --template <id>");
+        }
+
+        WorkspaceAction::Reload => {
+            let cwd = std::env::current_dir()?;
+            
+            match discover_workspace(Some(&cwd)) {
+                Ok(root) => {
+                    let workspace = Workspace::load(root).await?;
+                    println!("✅ Reloaded workspace: {}", workspace.name());
+                    println!("   {} files loaded", workspace.files.existing_files().len());
+                }
+                Err(_) => {
+                    println!("❌ No workspace found in current directory.");
+                }
+            }
+        }
+    }
 
     Ok(())
 }

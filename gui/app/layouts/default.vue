@@ -108,12 +108,28 @@
             <span>Workspaces</span>
           </NuxtLink>
           <NuxtLink 
+            to="/agents" 
+            @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Bot class="w-4 h-4" />
+            <span>Agents</span>
+          </NuxtLink>
+          <NuxtLink 
             to="/channels" 
             @click="sidebarOpen = false"
             class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
             <Radio class="w-4 h-4" />
             <span>Channels</span>
+          </NuxtLink>
+          <NuxtLink 
+            to="/tools" 
+            @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Wrench class="w-4 h-4" />
+            <span>Tools</span>
           </NuxtLink>
           <NuxtLink 
             to="/settings" 
@@ -219,11 +235,25 @@
             <span>Workspaces</span>
           </NuxtLink>
           <NuxtLink 
+            to="/agents" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Bot class="w-4 h-4" />
+            <span>Agents</span>
+          </NuxtLink>
+          <NuxtLink 
             to="/channels" 
             class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
           >
             <Radio class="w-4 h-4" />
             <span>Channels</span>
+          </NuxtLink>
+          <NuxtLink 
+            to="/tools" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
+          >
+            <Wrench class="w-4 h-4" />
+            <span>Tools</span>
           </NuxtLink>
           <NuxtLink 
             to="/settings" 
@@ -260,7 +290,7 @@
 import { ref, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Menu, Plus, Brain, Radio, Settings, ChevronDown, FolderKanban } from 'lucide-vue-next'
+import { Menu, Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench } from 'lucide-vue-next'
 
 interface SessionInfo {
   id: string

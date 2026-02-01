@@ -35,5 +35,8 @@ export default defineNuxtConfig({
     server: {
       strictPort: true,
     },
+    optimizeDeps: {
+      include: ['monaco-editor'],
+    },
   },
 })

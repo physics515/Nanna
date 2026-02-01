@@ -309,9 +309,16 @@ impl VectorStore {
         let json = tokio::fs::read_to_string(path).await?;
         let loaded: Vec<MemoryEntry> = serde_json::from_str(&json)?;
         
+        info!("Parsing {} entries from {:?}, expecting {} dimensions", 
+              loaded.len(), path, self.config.dimension);
+        
         // Validate dimensions
         for entry in &loaded {
             if entry.embedding.len() != self.config.dimension {
+                warn!(
+                    "Dimension mismatch for entry {}: expected {}, got {} - skipping load",
+                    entry.id, self.config.dimension, entry.embedding.len()
+                );
                 return Err(MemoryError::DimensionMismatch {
                     expected: self.config.dimension,
                     got: entry.embedding.len(),

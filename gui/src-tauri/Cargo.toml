@@ -28,6 +28,7 @@ uuid.workspace = true
 
 # Async utilities
 futures = "0.3"
+async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client for embeddings API
@@ -43,6 +44,9 @@ nanna-config = { path = "../../crates/nanna-config" }
 nanna-storage = { path = "../../crates/nanna-storage" }
 nanna-tools = { path = "../../crates/nanna-tools" }
 nanna-memory = { path = "../../crates/nanna-memory" }
+nanna-agent = { path = "../../crates/nanna-agent" }
+nanna-workspace = { path = "../../crates/nanna-workspace" }
+nanna-scripting = { path = "../../crates/nanna-scripting", features = ["boa"] }
 
 [features]
 default = ["custom-protocol", "devtools"]

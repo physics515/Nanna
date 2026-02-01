@@ -529,15 +529,18 @@ impl Agent {
         let thinking_mode = thinking_override.unwrap_or(self.config.thinking_mode);
         let thinking = thinking_mode.budget_tokens().map(nanna_llm::ThinkingConfig::new);
 
+        // Get effective system prompt (includes workspace context if set)
+        let system_prompt = ctx.effective_system_prompt();
+
         AnthropicRequest {
             model: self.config.model.clone(),
             messages: ctx.messages.clone(),
             max_tokens: self.config.max_tokens,
             temperature: Some(self.config.temperature),
-            system: if ctx.system_prompt.is_empty() {
+            system: if system_prompt.is_empty() {
                 None
             } else {
-                Some(ctx.system_prompt.clone())
+                Some(system_prompt)
             },
             tools: if tools.is_empty() { None } else { Some(tools) },
             stream: None,
@@ -559,6 +562,25 @@ impl Agent {
     pub async fn clear(&self) {
         let mut ctx = self.context.write().await;
         ctx.messages.clear();
+    }
+
+    /// Set the workspace for this agent
+    pub async fn set_workspace(&self, workspace: &nanna_workspace::Workspace) {
+        let mut ctx = self.context.write().await;
+        ctx.workspace_root = Some(workspace.root.clone());
+        ctx.workspace_context = Some(workspace.system_context());
+        ctx.include_workspace_memory = workspace.config.include_memory;
+    }
+
+    /// Reload workspace context from disk
+    pub async fn reload_workspace(&self) -> Result<(), nanna_workspace::WorkspaceError> {
+        let mut ctx = self.context.write().await;
+        ctx.reload_workspace().await
+    }
+
+    /// Get the current workspace root (if set)
+    pub async fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.context.read().await.workspace_root.clone()
     }
 
     /// Analyze confidence level in a response.

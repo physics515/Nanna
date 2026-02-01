@@ -7,6 +7,7 @@ edition.workspace = true
 default = []
 browser = ["nanna-browser"]
 vision = ["nanna-llm"]
+scripting = ["nanna-scripting"]
 
 [dependencies]
 tokio.workspace = true
@@ -38,3 +39,12 @@ base64-simd = "0.8"
 
 # For PDF parsing
 lopdf = "0.34"
+
+# For skill manifests (tool.yaml)
+serde_yaml = "0.9"
+
+# For parameter substitution in commands
+regex = "1"
+
+# For scripted tools (optional)
+nanna-scripting = { path = "../nanna-scripting", optional = true }

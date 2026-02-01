@@ -44,7 +44,7 @@ mod boa_impl;
 mod deno_impl;
 
 pub use engine::{ScriptEngine, EngineKind, ExecutionResult};
-pub use tool::{ScriptedTool, ToolManifest};
+pub use tool::{ScriptedTool, ToolManifest, ToolPermissions, extract_manifest};
 pub use bridge::NannaBridge;
 
 use thiserror::Error;

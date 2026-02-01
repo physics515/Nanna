@@ -3,6 +3,9 @@
 //! IPC bridge between the frontend and nanna-core with agentic tool loop.
 //! Includes FSRS-6 cognitive memory and dreaming/consolidation.
 
+pub mod agents;
+pub mod tool_authoring;
+
 use nanna_config::Config;
 use nanna_core::{
     Scheduler, SchedulerConfig, consolidation_task,
@@ -48,6 +51,70 @@ const MAX_MESSAGE_CHARS: usize = 50_000;
 
 /// Minimum tool result chars (never truncate below this)
 const MIN_TOOL_RESULT_CHARS: usize = 2_000;
+
+// =============================================================================
+// Memory Service Adapter for Tool System
+// =============================================================================
+
+/// Adapter to make MemoryService work with the MemoryStorage trait used by tools
+struct MemoryServiceAdapter {
+    service: Arc<MemoryService>,
+}
+
+impl MemoryServiceAdapter {
+    fn new(service: Arc<MemoryService>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait::async_trait]
+impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
+    async fn store(&self, content: &str, tags: &[String]) -> Result<String, String> {
+        let mut metadata = std::collections::HashMap::new();
+        if !tags.is_empty() {
+            metadata.insert("tags".to_string(), tags.join(","));
+        }
+        metadata.insert("source".to_string(), "tool".to_string());
+        
+        self.service
+            .remember_with_importance(content, metadata, 3.0) // Medium importance for explicit remembers
+            .await
+            .map(|(id, _action)| id)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<nanna_tools::MemoryResult>, String> {
+        self.service
+            .recall(query)
+            .await
+            .map(|memories| {
+                memories
+                    .into_iter()
+                    .take(limit)
+                    .map(|m| nanna_tools::MemoryResult {
+                        id: m.id,
+                        content: m.content,
+                        score: Some(m.score),
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, String> {
+        self.service
+            .forget(id)
+            .await
+            .map(|()| true)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list(&self, _limit: usize) -> Result<Vec<nanna_tools::MemoryResult>, String> {
+        // MemoryService doesn't have a direct list method, use search with empty query
+        // or return empty - tools shouldn't need this often
+        Ok(Vec::new())
+    }
+}
 
 // =============================================================================
 // Intelligent Context Budget Allocation
@@ -521,6 +588,8 @@ pub struct AppState {
     rate_limited_models: Arc<RwLock<HashMap<String, i64>>>,
     /// Workspace registry for multi-workspace support
     workspaces: Arc<RwLock<WorkspaceRegistry>>,
+    /// User tool authoring manager
+    user_tools: Arc<tool_authoring::UserToolManager>,
 }
 
 /// Model status event for frontend
@@ -4328,6 +4397,107 @@ async fn unsubscribe_channel_status() -> Result<(), String> {
 }
 
 // =============================================================================
+// User Tool Authoring Commands
+// =============================================================================
+
+#[tauri::command]
+async fn list_user_tools_cmd(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<tool_authoring::UserToolMeta>, String> {
+    let state = state.read().await;
+    Ok(state.user_tools.list_tools().await)
+}
+
+#[tauri::command]
+async fn get_user_tool(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<Option<tool_authoring::UserToolMeta>, String> {
+    let state = state.read().await;
+    Ok(state.user_tools.get_tool(&name).await)
+}
+
+#[tauri::command]
+async fn create_user_tool(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    description: String,
+    source: String,
+    language: Option<String>,
+    parameters: Option<serde_json::Value>,
+) -> Result<tool_authoring::UserToolMeta, String> {
+    let state = state.read().await;
+    
+    // Create the tool
+    let meta = state.user_tools.create_tool(
+        name.clone(),
+        description,
+        source,
+        language,
+        parameters,
+        None,
+    ).await?;
+    
+    // Register it with the tool registry
+    if let Ok(tool_impl) = state.user_tools.create_tool_impl(&meta) {
+        state.tools.register_boxed(tool_impl).await;
+        info!("Registered new user tool: {}", name);
+    }
+    
+    Ok(meta)
+}
+
+#[tauri::command]
+async fn update_user_tool(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    description: Option<String>,
+    source: Option<String>,
+    parameters: Option<serde_json::Value>,
+    enabled: Option<bool>,
+) -> Result<tool_authoring::UserToolMeta, String> {
+    let state = state.read().await;
+    
+    let meta = state.user_tools.update_tool(
+        &name,
+        description,
+        source,
+        parameters,
+        None,
+        enabled,
+    ).await?;
+    
+    // Re-register if enabled
+    if meta.enabled {
+        if let Ok(tool_impl) = state.user_tools.create_tool_impl(&meta) {
+            state.tools.register_boxed(tool_impl).await;
+            info!("Re-registered updated user tool: {}", name);
+        }
+    }
+    
+    Ok(meta)
+}
+
+#[tauri::command]
+async fn delete_user_tool(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<(), String> {
+    let state = state.read().await;
+    state.user_tools.delete_tool(&name).await
+}
+
+#[tauri::command]
+async fn test_user_tool(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    source: String,
+    input: std::collections::HashMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    let state = state.read().await;
+    state.user_tools.test_tool(&source, input).await
+}
+
+// =============================================================================
 // App Setup
 // =============================================================================
 
@@ -4569,6 +4739,35 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         info!("No saved memories found at {:?} (starting fresh)", memory_path);
     }
 
+    // Register memory tools (remember, recall, reflect) with the FSRS memory service
+    let memory_storage: nanna_tools::StorageHandle = Arc::new(MemoryServiceAdapter::new(memory.clone()));
+    tools.register(nanna_tools::RememberTool::new(memory_storage.clone())).await;
+    tools.register(nanna_tools::RecallTool::new(memory_storage.clone())).await;
+    tools.register(nanna_tools::ReflectTool::new(memory_storage)).await;
+    info!("Registered memory tools (remember, recall, reflect)");
+
+    // Initialize user tool authoring system
+    let user_tools_dir = Config::default_data_dir()
+        .map(|d| d.join("user_tools"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("user_tools"));
+    let user_tool_manager = Arc::new(tool_authoring::UserToolManager::new(user_tools_dir));
+    
+    // Load existing user tools
+    match user_tool_manager.load_all().await {
+        Ok(count) => info!("Loaded {} user-created tools", count),
+        Err(e) => warn!("Failed to load user tools: {}", e),
+    }
+    
+    // Register user tools with the registry
+    let tools = Arc::new(tools);
+    let registered = user_tool_manager.register_with_registry(&tools).await;
+    info!("Registered {} user tools with the tool registry", registered);
+    
+    // Register create_tool and list_user_tools tools (so Nanna can create tools at runtime)
+    tools.register(tool_authoring::CreateToolTool::new(user_tool_manager.clone(), tools.clone())).await;
+    tools.register(tool_authoring::ListUserToolsTool::new(user_tool_manager.clone())).await;
+    info!("Registered tool authoring tools (create_tool, list_user_tools)");
+
     // Initialize scheduler with consolidation task
     let scheduler_config = SchedulerConfig {
         heartbeat_interval: Duration::from_secs(300), // 5 minutes
@@ -4670,7 +4869,7 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     Ok(AppState {
         storage: Arc::new(storage),
         llm,
-        tools: Arc::new(tools),
+        tools,
         config,
         memory,
         memory_path,
@@ -4695,6 +4894,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         rate_limited_models: Arc::new(RwLock::new(HashMap::new())),
         // Workspace registry (empty at startup, populated as workspaces are opened)
         workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
+        // User tool authoring manager
+        user_tools: user_tool_manager,
     })
 }
 
@@ -4722,7 +4923,15 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 match setup_state().await {
                     Ok(state) => {
+                        // Create agent registry with shared LLM and tools
+                        let agent_registry = agents::AgentRegistryState::new(
+                            state.llm.clone(),
+                            state.tools.clone(),
+                        );
+                        
+                        // Manage both states
                         handle.manage(Arc::new(RwLock::new(state)));
+                        handle.manage(Arc::new(RwLock::new(agent_registry)));
                         info!("App state initialized successfully");
                     }
                     Err(e) => {
@@ -4828,6 +5037,23 @@ pub fn run() {
             init_workspace,
             read_workspace_file,
             check_workspace_validity,
+            // Agent visualization
+            agents::get_agent_clusters,
+            agents::get_all_agents,
+            agents::get_agent,
+            agents::get_agent_children,
+            agents::get_agent_stats,
+            agents::cancel_agent,
+            agents::subscribe_agent_events,
+            agents::cleanup_completed_agents,
+            agents::get_workspace_agents,
+            // User tool authoring
+            list_user_tools_cmd,
+            get_user_tool,
+            create_user_tool,
+            update_user_tool,
+            delete_user_tool,
+            test_user_tool,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
