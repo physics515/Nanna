@@ -8,12 +8,15 @@
 //! - `TelegramListener` - Long-polling via getUpdates API
 //! - `DiscordListener` - WebSocket via Discord Gateway
 //! - `SlackListener` - WebSocket via Slack Socket Mode
+//! - `SignalListener` - signal-cli-rest-api (SSE or polling)
 
 pub mod discord;
+pub mod signal;
 pub mod slack;
 pub mod telegram;
 
 pub use discord::DiscordListener;
+pub use signal::{SignalListener, ReceiveMode as SignalReceiveMode};
 pub use slack::SlackListener;
 pub use telegram::TelegramListener;
 
