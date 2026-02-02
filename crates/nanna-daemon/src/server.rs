@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the daemon server
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ pub struct DaemonConfig {
     pub llm: LlmConfig,
     /// Agent configuration
     pub agent: AgentServiceConfig,
-    /// Enable memory service
+    /// Enable memory service (requires embedding provider)
     pub enable_memory: bool,
 }
 
@@ -73,7 +73,7 @@ impl Default for DaemonConfig {
             auto_save_interval_secs: 60,
             llm: LlmConfig::default(),
             agent: AgentServiceConfig::default(),
-            enable_memory: false, // Disabled by default until embeddings are wired
+            enable_memory: true, // Enabled by default (requires embedding provider)
         }
     }
 }
@@ -83,7 +83,7 @@ pub struct DaemonServer {
     config: DaemonConfig,
     sessions: Arc<SessionManager>,
     control: Arc<ControlPlane>,
-    ipc: IpcServer,
+    ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -93,7 +93,7 @@ impl DaemonServer {
     pub fn new(config: DaemonConfig) -> Self {
         let sessions = Arc::new(SessionManager::new());
         let control = Arc::new(ControlPlane::new(sessions.clone()));
-        let ipc = IpcServer::new(config.ipc.clone());
+        let ipc = Arc::new(IpcServer::new(config.ipc.clone()));
         let persistence = Arc::new(PersistenceManager::new(&config.data_dir));
         let (shutdown_tx, _) = broadcast::channel(1);
         
@@ -159,14 +159,14 @@ impl DaemonServer {
         ));
         
         // Take the request receiver from IPC server
-        let mut request_rx = self.ipc.take_request_receiver();
+        let mut request_rx = self.ipc.take_request_receiver().await
+            .ok_or_else(|| crate::DaemonError::Ipc("Request receiver already taken".to_string()))?;
         
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         
         // Spawn IPC server
-        let ipc_config = self.config.ipc.clone();
+        let ipc_server = self.ipc.clone();
         let ipc_handle = tokio::spawn(async move {
-            let ipc_server = IpcServer::new(ipc_config);
             if let Err(e) = ipc_server.run().await {
                 error!("IPC server error: {}", e);
             }
@@ -191,11 +191,16 @@ impl DaemonServer {
             tokio::select! {
                 // Handle incoming requests
                 Some((client_id, request)) = request_rx.recv() => {
+                    let request_id = request.id.clone();
                     let result = control.handle(&client_id, request.action).await;
-                    let response = Response::success(request.id, result);
+                    let response = Response::success(request_id, result);
                     
-                    // TODO: Send response back to client via IPC
-                    info!("Response for {}: success={}", client_id, !response.is_error());
+                    // Send response back to client via IPC
+                    if let Err(e) = self.ipc.send_response(&client_id, response).await {
+                        warn!("Failed to send response to client {}: {}", client_id, e);
+                    } else {
+                        debug!("Response sent to client {}", client_id);
+                    }
                 }
                 
                 // Handle shutdown signal
@@ -268,8 +273,64 @@ impl DaemonServer {
         let tool_count = tools.definitions().await.len();
         info!("Tool registry initialized with {} tools", tool_count);
         
-        // Memory service is disabled for now (needs embedding setup)
-        let memory: Option<Arc<MemoryService>> = None;
+        // Initialize memory service with embeddings if enabled
+        let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
+            // Get embedding client based on provider
+            let embed_client = match self.config.llm.provider.as_str() {
+                "openai" => {
+                    // Use OpenAI embeddings
+                    let api_key = std::env::var("OPENAI_API_KEY").ok();
+                    api_key.map(|key| {
+                        info!("Using OpenAI embeddings: text-embedding-3-small");
+                        Arc::new(nanna_llm::EmbeddingClient::openai(&key))
+                    })
+                }
+                "ollama" => {
+                    // Use Ollama with nomic-embed-text model (default)
+                    info!("Using Ollama embeddings: nomic-embed-text");
+                    Some(Arc::new(nanna_llm::EmbeddingClient::ollama(
+                        &self.config.llm.ollama_host
+                    )))
+                }
+                "anthropic" => {
+                    // Anthropic doesn't provide embeddings, try OpenAI fallback
+                    std::env::var("OPENAI_API_KEY").ok().map(|key| {
+                        warn!("Anthropic doesn't provide embeddings, using OpenAI fallback");
+                        Arc::new(nanna_llm::EmbeddingClient::openai(&key))
+                    })
+                }
+                _ => None,
+            };
+            
+            match embed_client {
+                Some(embed) => {
+                    // Create embedding function that wraps the client
+                    let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
+                        let client = embed.clone();
+                        let text = text.to_string();
+                        Box::pin(async move {
+                            client.embed_one(&text).await.map_err(|e| e.to_string())
+                        })
+                    });
+                    
+                    // Create memory service with default config
+                    let config = nanna_memory::MemoryServiceConfig::default();
+                    let memory_service = nanna_memory::MemoryService::new(config)
+                        .with_embed_fn(embed_fn);
+                    
+                    info!("Memory service initialized with embeddings");
+                    Some(Arc::new(memory_service))
+                }
+                None => {
+                    warn!("Memory service disabled: no embedding provider available");
+                    warn!("To enable memory: set OPENAI_API_KEY or use Ollama with nomic-embed-text model");
+                    None
+                }
+            }
+        } else {
+            info!("Memory service disabled in config");
+            None
+        };
         
         // Create agent service
         let event_tx = self.ipc.event_sender();

@@ -50,7 +50,7 @@ pub struct IpcServer {
     config: IpcServerConfig,
     clients: Arc<RwLock<HashMap<ConnectionId, ClientConnection>>>,
     request_tx: mpsc::Sender<(ConnectionId, Request)>,
-    request_rx: mpsc::Receiver<(ConnectionId, Request)>,
+    request_rx: Arc<RwLock<Option<mpsc::Receiver<(ConnectionId, Request)>>>>,
     event_tx: broadcast::Sender<Event>,
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -66,7 +66,7 @@ impl IpcServer {
             config,
             clients: Arc::new(RwLock::new(HashMap::new())),
             request_tx,
-            request_rx,
+            request_rx: Arc::new(RwLock::new(Some(request_rx))),
             event_tx,
             shutdown_tx,
         }
@@ -83,10 +83,10 @@ impl IpcServer {
     }
     
     /// Get the request receiver (for the daemon to process requests)
-    pub fn take_request_receiver(&mut self) -> mpsc::Receiver<(ConnectionId, Request)> {
-        let (tx, rx) = mpsc::channel(1000);
-        std::mem::replace(&mut self.request_tx, tx);
-        std::mem::replace(&mut self.request_rx, rx)
+    /// Can only be called once - returns None if already taken
+    pub async fn take_request_receiver(&self) -> Option<mpsc::Receiver<(ConnectionId, Request)>> {
+        let mut rx_lock = self.request_rx.write().await;
+        rx_lock.take()
     }
     
     /// Send a response to a specific client

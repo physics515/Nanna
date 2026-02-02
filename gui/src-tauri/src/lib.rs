@@ -11,6 +11,7 @@ pub mod agents;
 pub mod backend;
 pub mod daemon_client;
 pub mod daemon_manager;
+pub mod embedded;
 pub mod tool_authoring;
 
 use backend::{Backend, BackendMode};
@@ -968,6 +969,49 @@ fn parse_retry_after_from_error(error_msg: &str) -> Option<u64> {
 // Commands
 // =============================================================================
 
+/// Send message through daemon (daemon mode)
+async fn send_message_daemon(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: String,
+    message: String,
+) -> Result<ChatMessage, String> {
+    // Send to daemon via backend client
+    let result = state.backend.chat_send(&session_id, &message).await?;
+    
+    // Daemon handles everything (streaming, tools, storage)
+    // Events are forwarded to frontend via backend event forwarder
+    // Just parse and return the result
+    let content = result.get("content")
+        .and_then(|v| v.as_str())
+        .ok_or("Invalid response format: missing 'content' field")?
+        .to_string();
+    
+    let tool_calls = result.get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().filter_map(|tc| {
+                Some(ToolCallInfo {
+                    id: tc.get("id")?.as_str()?.to_string(),
+                    name: tc.get("name")?.as_str()?.to_string(),
+                    input: tc.get("input")?.clone(),
+                    output: tc.get("output")?.as_str().unwrap_or("").to_string(),
+                    success: tc.get("success")?.as_bool().unwrap_or(false),
+                    duration_ms: tc.get("duration_ms")?.as_u64().unwrap_or(0),
+                })
+            }).collect()
+        })
+        .unwrap_or_default();
+    
+    Ok(ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: "assistant".to_string(),
+        content,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        tool_calls,
+    })
+}
+
 /// Send a message and stream the response with tool use
 #[tauri::command]
 async fn send_message(
@@ -977,6 +1021,15 @@ async fn send_message(
     message: String,
 ) -> Result<ChatMessage, String> {
     let state_guard = state.read().await;
+
+    // Check if we're in daemon mode - if so, route through daemon
+    if state_guard.backend.is_daemon_mode().await {
+        info!("Routing message to daemon (daemon mode active)");
+        return send_message_daemon(&app, &state_guard, session_id, message).await;
+    }
+
+    // Otherwise, continue with embedded mode (existing code)
+    info!("Processing message in embedded mode");
 
     // Store user message
     let _user_msg = state_guard
@@ -1827,6 +1880,34 @@ async fn create_session(
         format!("Chat {}", chrono::Utc::now().format("%Y-%m-%d %H:%M"))
     });
 
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.session_create(Some(&session_name)).await?;
+        return Ok(SessionInfo {
+            id: result.get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("Invalid daemon response")?
+                .to_string(),
+            name: result.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&session_name)
+                .to_string(),
+            created_at: result.get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            updated_at: result.get("updated_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            message_count: 0,
+            workspace_id,
+            workspace_name: None,
+        });
+    }
+
+    // Embedded mode: direct storage access
+
     // Get workspace name if workspace_id provided
     let workspace_name = if let Some(ref ws_id) = workspace_id {
         let registry = state_guard.workspaces.read().await;
@@ -1867,6 +1948,27 @@ async fn list_sessions(
 ) -> Result<Vec<SessionInfo>, String> {
     let state_guard = state.read().await;
 
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.sessions_list().await?;
+        // Parse daemon response into Vec<SessionInfo>
+        let sessions_array = result.as_array()
+            .ok_or("Invalid daemon response format")?;
+        
+        return Ok(sessions_array.iter().filter_map(|s| {
+            Some(SessionInfo {
+                id: s.get("id")?.as_str()?.to_string(),
+                name: s.get("name")?.as_str()?.to_string(),
+                created_at: s.get("created_at")?.as_str()?.to_string(),
+                updated_at: s.get("updated_at")?.as_str()?.to_string(),
+                message_count: s.get("message_count")?.as_u64().unwrap_or(0) as u32,
+                workspace_id: s.get("workspace_id")?.as_str().map(|s| s.to_string()),
+                workspace_name: s.get("workspace_name")?.as_str().map(|s| s.to_string()),
+            })
+        }).collect());
+    }
+
+    // Embedded mode: use direct storage access
     // Filter sessions by workspace context
     // Both cases use list_by_workspace - None means "workspace_id IS NULL" (global only)
     let sessions = state_guard
@@ -1913,6 +2015,24 @@ async fn get_session_history(
 ) -> Result<Vec<ChatMessage>, String> {
     let state_guard = state.read().await;
 
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.session_history(&session_id, Some(500)).await?;
+        let messages_array = result.as_array()
+            .ok_or("Invalid daemon response format")?;
+        
+        return Ok(messages_array.iter().filter_map(|m| {
+            Some(ChatMessage {
+                id: m.get("id")?.as_str()?.to_string(),
+                role: m.get("role")?.as_str()?.to_string(),
+                content: m.get("content")?.as_str()?.to_string(),
+                timestamp: m.get("timestamp")?.as_str()?.to_string(),
+                tool_calls: vec![], // TODO: parse tool calls from daemon response
+            })
+        }).collect());
+    }
+
+    // Embedded mode: direct storage access
     let messages = state_guard
         .storage
         .get_session_messages(&session_id, 500)
@@ -6661,6 +6781,17 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         .cloned()
         .unwrap_or_else(|| config.llm.model.clone());
 
+    // Initialize backend with embedded mode
+    let backend = Arc::new(Backend::new());
+    let embedded = embedded::EmbeddedBackend::new(
+        llm.clone(),
+        tools.clone(),
+        memory.clone(),
+        storage.clone(),
+    ).await;
+    backend.set_embedded(embedded).await;
+    info!("Backend initialized (embedded mode ready, daemon will be attempted on startup)");
+
     Ok(AppState {
         storage,
         llm,
@@ -6691,8 +6822,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
         // User tool authoring manager
         user_tools: user_tool_manager,
-        // Backend (will be initialized on setup)
-        backend: Arc::new(Backend::new()),
+        // Backend (initialized above with embedded mode)
+        backend,
         // Close behavior (default: ask user)
         close_mode: Arc::new(RwLock::new(CloseMode::default())),
     })
@@ -6727,6 +6858,14 @@ pub fn run() {
                             state.llm.clone(),
                             state.tools.clone(),
                         );
+                        
+                        // Try to initialize backend in daemon mode (non-blocking)
+                        let backend = state.backend.clone();
+                        let handle_for_backend = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mode = backend.init(&handle_for_backend).await;
+                            info!("Backend initialized in {:?} mode", mode);
+                        });
                         
                         // Manage both states
                         handle.manage(Arc::new(RwLock::new(state)));
