@@ -4323,6 +4323,18 @@ async fn set_active_workspace(
     }
 }
 
+/// Clear active workspace (go back to global)
+#[tauri::command]
+async fn clear_active_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    let mut registry = state_guard.workspaces.write().await;
+    registry.clear_active();
+    info!("Cleared active workspace, now in global mode");
+    Ok(())
+}
+
 /// Get active workspace info
 #[tauri::command]
 async fn get_active_workspace(
@@ -6792,6 +6804,7 @@ pub fn run() {
             list_workspaces,
             open_workspace,
             set_active_workspace,
+            clear_active_workspace,
             get_active_workspace,
             get_workspace_context,
             reload_workspace,

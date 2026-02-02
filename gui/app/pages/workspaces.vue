@@ -102,9 +102,38 @@
         <!-- Workspace List -->
         <div v-else class="space-y-3">
           <h3 class="text-sm font-medium text-nanna-text-muted mb-2">
-            {{ workspaces.length }} Workspace{{ workspaces.length !== 1 ? 's' : '' }}
+            {{ workspaces.length + 1 }} Option{{ workspaces.length !== 0 ? 's' : '' }}
           </h3>
           
+          <!-- Global Option -->
+          <UiCard
+            :class="[
+              'cursor-pointer transition-all hover:border-nanna-primary/40',
+              !activeWorkspace && 'border-nanna-primary/50 bg-nanna-primary/5'
+            ]"
+            @click="clearActiveWorkspace"
+          >
+            <div class="flex items-center gap-3">
+              <!-- Icon -->
+              <div :class="[
+                'w-10 h-10 rounded-lg flex items-center justify-center shrink-0',
+                !activeWorkspace ? 'bg-nanna-primary/30' : 'bg-nanna-bg-elevated'
+              ]">
+                <Globe :class="['w-5 h-5', !activeWorkspace ? 'text-nanna-primary' : 'text-nanna-text-muted']" />
+              </div>
+              
+              <!-- Info -->
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                  <span class="font-medium text-nanna-text">Global</span>
+                  <UiBadge v-if="!activeWorkspace" variant="default" class="shrink-0">Active</UiBadge>
+                </div>
+                <div class="text-xs text-nanna-text-dim">No workspace context • Uses global memory only</div>
+              </div>
+            </div>
+          </UiCard>
+          
+          <!-- Workspace Cards -->
           <UiCard
             v-for="ws in workspaces"
             :key="ws.id"
@@ -433,7 +462,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { 
-  Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench
+  Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
 } from 'lucide-vue-next'
 
 interface WorkspaceInfo {
@@ -636,6 +665,15 @@ async function setActive(ws: WorkspaceInfo) {
     await loadWorkspaces()
   } catch (e) {
     console.error('Failed to set active workspace:', e)
+  }
+}
+
+async function clearActiveWorkspace() {
+  try {
+    await invoke('clear_active_workspace')
+    await loadWorkspaces()
+  } catch (e) {
+    console.error('Failed to clear active workspace:', e)
   }
 }
 
