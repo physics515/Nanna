@@ -1,14 +1,28 @@
 # Copy nanna-daemon to sidecar binaries folder for development
 # Run from gui folder: .\scripts\copy-sidecar.ps1
 
-$target = $env:CARGO_TARGET_DIR
-if (-not $target) {
-    # Check for custom target dir first (Justin's setup)
+# Priority: 1. Project-local target (if .cargo/config.toml overrides)
+#           2. CARGO_TARGET_DIR env var
+#           3. Custom shared target (Justin's setup)
+#           4. Fallback to default
+
+$projectTarget = Join-Path $PSScriptRoot "..\..\target"
+$projectTarget = [System.IO.Path]::GetFullPath($projectTarget)
+
+if (Test-Path "$projectTarget\debug") {
+    $target = $projectTarget
+    Write-Host "Using project-local target: $target"
+} elseif ($env:CARGO_TARGET_DIR) {
+    $target = $env:CARGO_TARGET_DIR
+    Write-Host "Using CARGO_TARGET_DIR: $target"
+} else {
     $customTarget = "D:\Development\Cargo Target"
     if (Test-Path $customTarget) {
         $target = $customTarget
+        Write-Host "Using custom shared target: $target"
     } else {
-        $target = "..\..\target"
+        $target = $projectTarget
+        Write-Host "Using fallback target: $target"
     }
 }
 

@@ -19,6 +19,7 @@ use nanna_tools::{
     ReadFileTool, RecallTool, ReflectTool, ReminderStore, RememberTool, RemindTool, StatusTool,
     ToolRegistry, TursoMemoryStorage, WebFetchTool, WebSearchTool, WonderTool, WriteFileTool,
 };
+use chrono::Utc;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn, Level};
@@ -254,7 +255,10 @@ fn create_scheduler(
     let scheduler_config = SchedulerConfig {
         heartbeat_interval: std::time::Duration::from_secs(300), // 5 minutes
         heartbeat_enabled: true,
+        heartbeat_prompt: "Heartbeat: check in and review state".to_string(),
         max_concurrent: 4,
+        check_interval: std::time::Duration::from_secs(30),
+        default_timezone: "UTC".to_string(),
     };
 
     // Clone storage for the scheduler's persistence
@@ -297,6 +301,9 @@ fn create_scheduler(
             let context = AgentContext::new(&session_id).with_system_prompt(system_prompt);
             let agent = Agent::new(agent_config, llm, tools).with_context(context);
 
+            let started_at = Utc::now();
+            let task_name = task.name.clone();
+
             // Run the task
             match agent.run(&task.payload, RunOptions::default()).await {
                 Ok(response) => {
@@ -315,22 +322,30 @@ fn create_scheduler(
                         })
                         .await;
 
+                    let finished_at = Utc::now();
                     TaskResult {
                         task_id,
+                        task_name,
                         success: true,
                         output: Some(response.text),
                         error: None,
                         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        started_at,
+                        finished_at,
                     }
                 }
                 Err(e) => {
                     tracing::warn!("Scheduled task {} failed: {}", task_id, e);
+                    let finished_at = Utc::now();
                     TaskResult {
                         task_id,
+                        task_name,
                         success: false,
                         output: None,
                         error: Some(e.to_string()),
                         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        started_at,
+                        finished_at,
                     }
                 }
             }
