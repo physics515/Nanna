@@ -41,6 +41,12 @@ reqwest = { version = "0.12", features = ["json"] }
 # TOML for config export/import
 toml = "0.8"
 
+# YAML for skill manifests
+serde_yaml = "0.9"
+
+# Directories for fallback paths
+directories.workspace = true
+
 # Link to nanna crates for IPC
 nanna-core = { path = "../../crates/nanna-core" }
 nanna-llm = { path = "../../crates/nanna-llm" }

@@ -4644,6 +4644,246 @@ async fn test_user_tool(
 }
 
 // =============================================================================
+// Skill Directory Commands (workspace-based tools)
+// =============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SkillInfo {
+    name: String,
+    #[serde(rename = "type")]
+    skill_type: String,
+    language: Option<String>,
+    path: String,
+    code: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SkillListResult {
+    skills: Vec<SkillInfo>,
+    path: String,
+}
+
+/// Helper to get the skills directory path
+async fn get_skills_path(state: &AppState) -> std::path::PathBuf {
+    // Check for active workspace
+    let registry = state.workspaces.read().await;
+    if let Some(ws) = registry.active() {
+        // Use the workspace path (not .nanna folder, but workspace root)
+        return ws.path.join("skills");
+    }
+    drop(registry);
+    
+    // Fallback to config-based path
+    directories::ProjectDirs::from("com", "clawd", "Nanna")
+        .map(|p| p.data_dir().join("skills"))
+        .unwrap_or_else(|| std::path::PathBuf::from("skills"))
+}
+
+/// List all skills in the workspace skills/ directory
+#[tauri::command]
+async fn list_skills(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<SkillListResult, String> {
+    let state_guard = state.read().await;
+    
+    // Get skills directory from workspace or config
+    let skills_path = get_skills_path(&state_guard).await;
+    
+    // Ensure directory exists
+    if !skills_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(&skills_path) {
+            warn!("Failed to create skills directory: {}", e);
+        }
+    }
+    
+    // Discover skills
+    let discovered = nanna_tools::skills::discover_skills(&skills_path);
+    
+    let mut skills = Vec::new();
+    for skill in discovered {
+        let (skill_type, language) = match &skill.source {
+            nanna_tools::skills::SkillSource::Script(p) => {
+                let lang = p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| if e == "ts" { "typescript" } else { "javascript" })
+                    .unwrap_or("javascript");
+                ("script".to_string(), Some(lang.to_string()))
+            }
+            nanna_tools::skills::SkillSource::Manifest(_) => {
+                ("manifest".to_string(), None)
+            }
+        };
+        
+        // Read the code
+        let code_path = match &skill.source {
+            nanna_tools::skills::SkillSource::Script(p) => p.clone(),
+            nanna_tools::skills::SkillSource::Manifest(p) => p.clone(),
+        };
+        let code = std::fs::read_to_string(&code_path).ok();
+        
+        skills.push(SkillInfo {
+            name: skill.name,
+            skill_type,
+            language,
+            path: skill.path.display().to_string(),
+            code,
+        });
+    }
+    
+    Ok(SkillListResult {
+        skills,
+        path: skills_path.display().to_string(),
+    })
+}
+
+/// Create a new skill in the workspace
+#[tauri::command]
+async fn create_skill(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    skill_type: String,
+    code: String,
+) -> Result<SkillInfo, String> {
+    let state_guard = state.read().await;
+    
+    // Validate name (lowercase, underscores, alphanumeric)
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        return Err("Skill name must be lowercase alphanumeric with underscores or hyphens".to_string());
+    }
+    
+    // Get skills directory
+    let skills_path = get_skills_path(&state_guard).await;
+    
+    // Create skill directory
+    let skill_dir = skills_path.join(&name);
+    if skill_dir.exists() {
+        return Err(format!("Skill '{}' already exists", name));
+    }
+    std::fs::create_dir_all(&skill_dir)
+        .map_err(|e| format!("Failed to create skill directory: {}", e))?;
+    
+    // Determine file name and language
+    let (filename, language) = match skill_type.as_str() {
+        "manifest" => ("tool.yaml", None),
+        "script" => ("tool.ts", Some("typescript".to_string())),
+        _ => return Err(format!("Unknown skill type: {}", skill_type)),
+    };
+    
+    // Write the code file
+    let code_path = skill_dir.join(filename);
+    std::fs::write(&code_path, &code)
+        .map_err(|e| format!("Failed to write skill code: {}", e))?;
+    
+    info!("Created new skill: {} at {}", name, skill_dir.display());
+    
+    Ok(SkillInfo {
+        name,
+        skill_type,
+        language,
+        path: skill_dir.display().to_string(),
+        code: Some(code),
+    })
+}
+
+/// Update an existing skill's code
+#[tauri::command]
+async fn update_skill(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+    code: String,
+) -> Result<SkillInfo, String> {
+    let state_guard = state.read().await;
+    
+    // Get skills directory
+    let skills_path = get_skills_path(&state_guard).await;
+    
+    let skill_dir = skills_path.join(&name);
+    if !skill_dir.exists() {
+        return Err(format!("Skill '{}' not found", name));
+    }
+    
+    // Find the code file
+    let code_files = ["tool.ts", "tool.js", "tool.yaml", "tool.yml"];
+    let code_path = code_files.iter()
+        .map(|f| skill_dir.join(f))
+        .find(|p| p.exists())
+        .ok_or_else(|| format!("No tool file found in skill '{}'", name))?;
+    
+    // Write the updated code
+    std::fs::write(&code_path, &code)
+        .map_err(|e| format!("Failed to update skill code: {}", e))?;
+    
+    // Determine type from extension
+    let (skill_type, language) = match code_path.extension().and_then(|e| e.to_str()) {
+        Some("yaml") | Some("yml") => ("manifest".to_string(), None),
+        Some("ts") => ("script".to_string(), Some("typescript".to_string())),
+        Some("js") => ("script".to_string(), Some("javascript".to_string())),
+        _ => ("unknown".to_string(), None),
+    };
+    
+    info!("Updated skill: {}", name);
+    
+    Ok(SkillInfo {
+        name,
+        skill_type,
+        language,
+        path: skill_dir.display().to_string(),
+        code: Some(code),
+    })
+}
+
+/// Delete a skill
+#[tauri::command]
+async fn delete_skill(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+    
+    // Get skills directory
+    let skills_path = get_skills_path(&state_guard).await;
+    
+    let skill_dir = skills_path.join(&name);
+    if !skill_dir.exists() {
+        return Err(format!("Skill '{}' not found", name));
+    }
+    
+    // Remove the entire skill directory
+    std::fs::remove_dir_all(&skill_dir)
+        .map_err(|e| format!("Failed to delete skill: {}", e))?;
+    
+    info!("Deleted skill: {}", name);
+    Ok(())
+}
+
+/// Test a skill with sample input
+#[tauri::command]
+async fn test_skill(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    code: String,
+    skill_type: String,
+    input: std::collections::HashMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    let state = state.read().await;
+    
+    match skill_type.as_str() {
+        "script" => {
+            // Use user_tools test for scripts
+            state.user_tools.test_tool(&code, input).await
+        }
+        "manifest" => {
+            // For manifest tools, we'd need to parse and execute
+            // For now, just validate the YAML
+            match serde_yaml::from_str::<serde_json::Value>(&code) {
+                Ok(_) => Ok("Manifest YAML is valid".to_string()),
+                Err(e) => Err(format!("Invalid YAML: {}", e)),
+            }
+        }
+        _ => Err(format!("Unknown skill type: {}", skill_type)),
+    }
+}
+
+// =============================================================================
 // Backend Mode Commands
 // =============================================================================
 
@@ -5733,6 +5973,12 @@ pub fn run() {
             update_user_tool,
             delete_user_tool,
             test_user_tool,
+            // Skill directory tools
+            list_skills,
+            create_skill,
+            update_skill,
+            delete_skill,
+            test_skill,
             // Backend mode
             get_backend_status,
             init_backend,
