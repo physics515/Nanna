@@ -436,6 +436,16 @@ impl WorkspaceRegistry {
         }
     }
 
+    /// Clear active workspace (switch to global mode)
+    pub fn clear_active(&mut self) {
+        if let Some(prev_id) = &self.active_workspace_id {
+            if let Some(prev) = self.workspaces.get_mut(prev_id) {
+                prev.active = false;
+            }
+        }
+        self.active_workspace_id = None;
+    }
+
     /// Get active workspace
     #[must_use]
     pub fn active(&self) -> Option<&Workspace> {
