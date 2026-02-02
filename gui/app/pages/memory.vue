@@ -9,6 +9,43 @@
             {{ activeTab === 'history' ? 'Search conversation history' : 'Manage semantic memories' }}
           </p>
         </div>
+        
+        <!-- Scope Toggle -->
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-nanna-text-dim hidden sm:inline">Scope:</span>
+          <div class="flex rounded-lg border border-nanna-primary/20 overflow-hidden">
+            <button
+              @click="memoryScope = 'global'"
+              :class="[
+                'px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5',
+                memoryScope === 'global' 
+                  ? 'bg-nanna-primary/20 text-nanna-text' 
+                  : 'text-nanna-text-muted hover:bg-nanna-bg-elevated'
+              ]"
+            >
+              <Globe class="w-3 h-3" />
+              <span class="hidden sm:inline">Global</span>
+            </button>
+            <button
+              @click="memoryScope = 'workspace'"
+              :disabled="!currentWorkspace"
+              :class="[
+                'px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 border-l border-nanna-primary/20',
+                memoryScope === 'workspace' 
+                  ? 'bg-nanna-accent/20 text-nanna-accent' 
+                  : currentWorkspace 
+                    ? 'text-nanna-text-muted hover:bg-nanna-bg-elevated'
+                    : 'text-nanna-text-dim opacity-50 cursor-not-allowed'
+              ]"
+              :title="currentWorkspace ? currentWorkspace.name : 'No workspace selected'"
+            >
+              <FolderKanban class="w-3 h-3" />
+              <span class="hidden sm:inline max-w-[100px] truncate">
+                {{ currentWorkspace?.name || 'Workspace' }}
+              </span>
+            </button>
+          </div>
+        </div>
       </div>
       
       <!-- Tabs -->
@@ -29,6 +66,16 @@
           <UiBadge v-if="semanticMemories.length > 0" variant="accent" class="ml-1 text-xs">
             {{ semanticMemories.length }}
           </UiBadge>
+        </UiButton>
+        
+        <!-- Workspace Files Tab (only when workspace selected and scope is workspace) -->
+        <UiButton
+          v-if="currentWorkspace && memoryScope === 'workspace'"
+          @click="activeTab = 'files'"
+          :variant="activeTab === 'files' ? 'default' : 'ghost'"
+          size="sm"
+        >
+          📁 <span class="hidden sm:inline ml-1">Workspace</span> Files
         </UiButton>
       </div>
     </header>
@@ -252,6 +299,63 @@
       </div>
     </div>
 
+    <!-- Workspace Files Tab Content -->
+    <div v-else-if="activeTab === 'files'" class="flex-1 overflow-hidden flex">
+      <!-- File list sidebar -->
+      <div class="w-48 sm:w-56 border-r border-nanna-primary/10 flex flex-col">
+        <div class="p-3 border-b border-nanna-primary/10">
+          <div class="text-xs text-nanna-text-dim uppercase tracking-wider">Workspace Files</div>
+        </div>
+        <div class="flex-1 overflow-y-auto">
+          <button
+            v-for="file in workspaceFiles"
+            :key="file.path"
+            @click="selectedFile = file"
+            :class="[
+              'w-full text-left px-3 py-2 text-sm transition-colors border-b border-nanna-primary/5',
+              selectedFile?.path === file.path 
+                ? 'bg-nanna-accent/10 text-nanna-accent border-l-2 border-l-nanna-accent' 
+                : 'text-nanna-text-muted hover:bg-nanna-bg-elevated hover:text-nanna-text'
+            ]"
+          >
+            <div class="font-medium truncate">{{ file.name }}</div>
+            <div class="text-xs text-nanna-text-dim">{{ formatDate(file.modified) }}</div>
+          </button>
+          
+          <div v-if="workspaceFiles.length === 0 && !isLoadingFiles" class="p-4 text-center">
+            <div class="text-3xl mb-2">📁</div>
+            <p class="text-xs text-nanna-text-dim">No memory files found</p>
+          </div>
+          
+          <div v-if="isLoadingFiles" class="p-4 text-center">
+            <div class="animate-spin text-2xl">⏳</div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- File content viewer -->
+      <div class="flex-1 flex flex-col">
+        <div v-if="selectedFile" class="flex-1 overflow-y-auto p-4">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="text-lg font-semibold text-nanna-text">{{ selectedFile.name }}</h3>
+            <UiBadge variant="secondary">
+              {{ (selectedFile.content.length / 1024).toFixed(1) }} KB
+            </UiBadge>
+          </div>
+          <div class="prose prose-invert prose-sm max-w-none">
+            <MarkdownContent :content="selectedFile.content" />
+          </div>
+        </div>
+        
+        <div v-else class="flex-1 flex items-center justify-center">
+          <div class="text-center">
+            <div class="text-5xl mb-4">📄</div>
+            <p class="text-nanna-text-muted">Select a file to view</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Clear confirmation modal -->
     <div v-if="showClearConfirm" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
       <UiCard class="max-w-md w-full">
@@ -269,8 +373,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { Globe, FolderKanban } from 'lucide-vue-next'
 
 // Types
 interface MemorySearchResult {
@@ -314,8 +419,40 @@ interface SemanticMemory {
   session_id: string | null
 }
 
+interface WorkspaceInfo {
+  id: string
+  name: string
+  path: string
+}
+
+interface WorkspaceFile {
+  name: string
+  path: string
+  content: string
+  modified: string
+}
+
+interface Tab {
+  type: 'global' | 'workspace'
+  workspaceId?: string
+}
+
+// Inject workspace context from layout
+const currentTabRef = inject<{ value: Tab | null }>('currentTab')
+const openWorkspacesRef = inject<{ value: WorkspaceInfo[] }>('openWorkspaces')
+
+// Computed workspace info
+const currentWorkspace = computed(() => {
+  if (!currentTabRef?.value || currentTabRef.value.type !== 'workspace') return null
+  return openWorkspacesRef?.value.find(w => w.id === currentTabRef.value?.workspaceId) || null
+})
+
 // State
-const activeTab = ref<'history' | 'semantic'>('semantic')
+const activeTab = ref<'history' | 'semantic' | 'files'>('semantic')
+const memoryScope = ref<'global' | 'workspace'>('global')
+const workspaceFiles = ref<WorkspaceFile[]>([])
+const selectedFile = ref<WorkspaceFile | null>(null)
+const isLoadingFiles = ref(false)
 const searchQuery = ref('')
 const results = ref<MemorySearchResult[]>([])
 const stats = ref<MemoryStats | null>(null)
@@ -329,6 +466,20 @@ const editContent = ref('')
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
+// Watch for workspace/tab changes to load files
+watch([() => activeTab.value, () => currentWorkspace.value], async ([tab, ws]) => {
+  if (tab === 'files' && ws) {
+    await loadWorkspaceFiles()
+  }
+}, { immediate: true })
+
+// Watch memoryScope to auto-switch to workspace tab
+watch(memoryScope, (scope) => {
+  if (scope === 'workspace' && currentWorkspace.value && activeTab.value !== 'files') {
+    // Keep current tab, just change scope context
+  }
+})
+
 // Load data on mount
 onMounted(async () => {
   await Promise.all([
@@ -336,7 +487,35 @@ onMounted(async () => {
     loadCognitiveStats(),
     loadSemanticMemories(),
   ])
+  
+  // Auto-select workspace scope if in workspace tab
+  if (currentWorkspace.value) {
+    memoryScope.value = 'workspace'
+  }
 })
+
+async function loadWorkspaceFiles() {
+  if (!currentWorkspace.value) {
+    workspaceFiles.value = []
+    return
+  }
+  
+  isLoadingFiles.value = true
+  try {
+    workspaceFiles.value = await invoke<WorkspaceFile[]>('list_workspace_memory_files', {
+      workspaceId: currentWorkspace.value.id
+    })
+    // Auto-select first file
+    if (workspaceFiles.value.length > 0 && !selectedFile.value) {
+      selectedFile.value = workspaceFiles.value[0]
+    }
+  } catch (e) {
+    console.error('Failed to load workspace files:', e)
+    workspaceFiles.value = []
+  } finally {
+    isLoadingFiles.value = false
+  }
+}
 
 async function loadHistoryStats() {
   try {

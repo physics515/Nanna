@@ -4457,6 +4457,96 @@ async fn get_workspace_recent_memory(
         .map_err(|e| format!("Failed to read memory: {}", e))
 }
 
+/// File info for workspace memory files
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceMemoryFile {
+    name: String,
+    path: String,
+    content: String,
+    modified: String,
+}
+
+/// List all memory files in a workspace (MEMORY.md + memory/*.md)
+#[tauri::command]
+async fn list_workspace_memory_files(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    workspace_id: String,
+) -> Result<Vec<WorkspaceMemoryFile>, String> {
+    use std::path::Path;
+    
+    let state_guard = state.read().await;
+    let registry = state_guard.workspaces.read().await;
+    
+    let ws = registry.get(&workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+    
+    let ws_path = Path::new(&ws.path);
+    let mut files = Vec::new();
+    
+    // Check for MEMORY.md
+    let memory_md = ws_path.join("MEMORY.md");
+    if memory_md.exists() {
+        if let Ok(content) = tokio::fs::read_to_string(&memory_md).await {
+            let modified = tokio::fs::metadata(&memory_md).await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.format("%Y-%m-%d %H:%M").to_string()
+                })
+                .unwrap_or_default();
+            
+            files.push(WorkspaceMemoryFile {
+                name: "MEMORY.md".to_string(),
+                path: memory_md.to_string_lossy().to_string(),
+                content,
+                modified,
+            });
+        }
+    }
+    
+    // Check for memory/*.md files
+    let memory_dir = ws_path.join("memory");
+    if memory_dir.is_dir() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&memory_dir).await {
+            let mut daily_files = Vec::new();
+            
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().map(|e| e == "md").unwrap_or(false) {
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        let name = path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        
+                        let modified = tokio::fs::metadata(&path).await
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .map(|t| {
+                                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                                dt.format("%Y-%m-%d %H:%M").to_string()
+                            })
+                            .unwrap_or_default();
+                        
+                        daily_files.push(WorkspaceMemoryFile {
+                            name,
+                            path: path.to_string_lossy().to_string(),
+                            content,
+                            modified,
+                        });
+                    }
+                }
+            }
+            
+            // Sort by name (date) descending - newest first
+            daily_files.sort_by(|a, b| b.name.cmp(&a.name));
+            files.extend(daily_files);
+        }
+    }
+    
+    Ok(files)
+}
+
 /// Template content for workspace files
 mod workspace_templates {
     pub const SOUL_MD: &str = r#"# SOUL.md - Who You Are
@@ -6711,6 +6801,7 @@ pub fn run() {
             save_workspace_file,
             append_workspace_memory,
             get_workspace_recent_memory,
+            list_workspace_memory_files,
             init_workspace,
             read_workspace_file,
             check_workspace_validity,
