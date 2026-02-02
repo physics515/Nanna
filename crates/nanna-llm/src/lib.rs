@@ -5,6 +5,14 @@
 //!
 //! Supports Anthropic Claude with proper tool calling and streaming.
 
+use tracing::{debug, info, warn};
+
+#[cfg(feature = "auto-refresh")]
+pub mod oauth;
+
+#[cfg(feature = "auto-refresh")]
+pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
+
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use reqwest::Client;
@@ -105,6 +113,9 @@ pub enum Provider {
     Anthropic,
     OpenAI,
     OpenRouter,
+    GitHubModels,
+    /// Claude Max/Pro proxy (OpenAI-compatible, uses claude-max-api-proxy)
+    ClaudeProxy,
     Ollama,
 }
 
@@ -357,6 +368,70 @@ pub struct AnthropicRequest {
     pub thinking: Option<ThinkingConfig>,
 }
 
+/// System prompt block (for OAuth/Claude Code format)
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+}
+
+impl SystemBlock {
+    /// Create a text system block
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            block_type: "text".to_string(),
+            text: content.into(),
+        }
+    }
+}
+
+/// Anthropic request with array-based system prompt (required for OAuth/Claude Code)
+#[derive(Debug, Clone, Serialize)]
+struct OAuthAnthropicRequest {
+    model: String,
+    messages: Vec<AnthropicMessage>,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    system: Vec<SystemBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+}
+
+impl OAuthAnthropicRequest {
+    /// Convert from a standard AnthropicRequest, prepending Claude Code identity
+    fn from_request(request: &AnthropicRequest, prepend_identity: bool) -> Self {
+        let mut system = Vec::new();
+        
+        if prepend_identity {
+            system.push(SystemBlock::text(CLAUDE_CODE_IDENTITY));
+        }
+        
+        if let Some(ref sys) = request.system {
+            if !sys.is_empty() {
+                system.push(SystemBlock::text(sys));
+            }
+        }
+        
+        Self {
+            model: request.model.clone(),
+            messages: request.messages.clone(),
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            system,
+            tools: request.tools.clone(),
+            stream: request.stream,
+            thinking: request.thinking.clone(),
+        }
+    }
+}
+
 /// Anthropic API response
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicResponse {
@@ -374,6 +449,84 @@ pub struct AnthropicResponse {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+// ============================================================================
+// Claude Code Stealth Mode
+// ============================================================================
+
+/// Claude Code version to mimic (update as needed)
+const CLAUDE_CODE_VERSION: &str = "2.1.2";
+
+/// Claude Code canonical tool names (case-sensitive)
+/// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
+const CLAUDE_CODE_TOOLS: &[(&str, &str)] = &[
+    ("read", "Read"),
+    ("read_file", "Read"),
+    ("write", "Write"),
+    ("write_file", "Write"),
+    ("edit", "Edit"),
+    ("edit_file", "Edit"),
+    ("bash", "Bash"),
+    ("exec", "Bash"),
+    ("shell", "Bash"),
+    ("grep", "Grep"),
+    ("glob", "Glob"),
+    ("list_dir", "Glob"),
+    ("ask_user", "AskUserQuestion"),
+    ("web_fetch", "WebFetch"),
+    ("web_search", "WebSearch"),
+    ("notebook_edit", "NotebookEdit"),
+];
+
+/// Claude Code identity prefix (REQUIRED for OAuth tokens)
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Check if a token is an OAuth token (vs API key)
+fn is_oauth_token(token: &str) -> bool {
+    // OAuth tokens start with sk-ant-oat (OAuth Access Token)
+    // Regular API keys start with sk-ant-api
+    token.starts_with("sk-ant-oat") || token.starts_with("oauth:")
+}
+
+/// Get the raw token (stripping any prefix)
+fn get_raw_token(token: &str) -> &str {
+    token.strip_prefix("oauth:").unwrap_or(token)
+}
+
+/// Convert a tool name to Claude Code canonical form
+fn to_claude_code_tool_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    for (pattern, canonical) in CLAUDE_CODE_TOOLS {
+        if lower == *pattern {
+            return (*canonical).to_string();
+        }
+    }
+    // If no match, return original (with first letter capitalized for consistency)
+    let mut chars = name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+    }
+}
+
+/// Convert a tool name from Claude Code form back to original
+fn from_claude_code_tool_name(name: &str, original_tools: &[ToolDefinition]) -> String {
+    let lower = name.to_lowercase();
+    // Find original tool by matching lowercase
+    for tool in original_tools {
+        if tool.name.to_lowercase() == lower {
+            return tool.name.clone();
+        }
+    }
+    // Check Claude Code canonical names and map back
+    for (pattern, canonical) in CLAUDE_CODE_TOOLS {
+        if name == *canonical {
+            // Return the pattern as-is (caller should have original)
+            return (*pattern).to_string();
+        }
+    }
+    name.to_string()
 }
 
 /// LLM client
@@ -395,12 +548,23 @@ impl LlmClient {
             .unwrap_or_else(|_| Client::new())
     }
 
-    /// Create a new Anthropic client
+    /// Create a new Anthropic client with API key
     pub fn anthropic(api_key: impl Into<String>) -> Self {
         Self {
             http: Self::build_http_client(),
             provider: Provider::Anthropic,
             api_key: api_key.into(),
+            base_url: "https://api.anthropic.com".to_string(),
+        }
+    }
+
+    /// Create a new Anthropic client with OAuth token
+    /// Uses Authorization: Bearer header instead of x-api-key
+    pub fn anthropic_oauth(oauth_token: impl Into<String>) -> Self {
+        Self {
+            http: Self::build_http_client(),
+            provider: Provider::Anthropic,
+            api_key: format!("oauth:{}", oauth_token.into()), // Prefix to indicate OAuth
             base_url: "https://api.anthropic.com".to_string(),
         }
     }
@@ -425,6 +589,34 @@ impl LlmClient {
         }
     }
 
+    /// Create a new `GitHub Models` client (uses GitHub PAT)
+    /// GitHub Models provides access to various LLMs including GPT-4o, Llama, Mistral, etc.
+    pub fn github_models(api_key: impl Into<String>) -> Self {
+        Self {
+            http: Self::build_http_client(),
+            provider: Provider::GitHubModels,
+            api_key: api_key.into(),
+            base_url: "https://models.inference.ai.azure.com".to_string(),
+        }
+    }
+
+    /// Create a new `Claude Proxy` client for claude-max-api-proxy
+    /// This proxies requests through a local server that uses Claude Code CLI credentials
+    /// Default URL is http://localhost:3456
+    pub fn claude_proxy(base_url: impl Into<String>) -> Self {
+        Self {
+            http: Self::build_http_client(),
+            provider: Provider::ClaudeProxy,
+            api_key: String::new(), // Proxy handles auth via Claude Code CLI
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Create a Claude Proxy client with default localhost URL
+    pub fn claude_proxy_default() -> Self {
+        Self::claude_proxy("http://localhost:3456")
+    }
+
     /// Create a new `Ollama` client (local, no API key needed)
     pub fn ollama(base_url: impl Into<String>) -> Self {
         Self {
@@ -440,6 +632,41 @@ impl LlmClient {
         Self::ollama("http://localhost:11434")
     }
 
+    /// Check if this client uses OAuth authentication
+    fn is_oauth(&self) -> bool {
+        is_oauth_token(&self.api_key)
+    }
+
+    /// Get the actual token (stripping oauth: prefix if present)
+    fn get_token(&self) -> &str {
+        get_raw_token(&self.api_key)
+    }
+
+    /// Apply Anthropic authentication headers to a request builder
+    /// For OAuth, includes required beta headers and user-agent (matching Claude Code exactly)
+    fn apply_anthropic_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.is_oauth() {
+            // Stealth mode: Mimic Claude Code's headers exactly
+            // Beta features: claude-code identity, oauth, interleaved thinking, fine-grained tool streaming
+            let beta = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+            let user_agent = format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)");
+            debug!(
+                beta = %beta,
+                user_agent = %user_agent,
+                "OAuth stealth mode: applying Claude Code headers"
+            );
+            builder
+                .header("Authorization", format!("Bearer {}", self.get_token()))
+                .header("accept", "application/json")
+                .header("anthropic-beta", beta)
+                .header("user-agent", user_agent)
+                .header("x-app", "cli")
+                .header("anthropic-dangerous-direct-browser-access", "true")
+        } else {
+            builder.header("x-api-key", &self.api_key)
+        }
+    }
+
     /// Validate the API key by making a lightweight request.
     ///
     /// # Errors
@@ -450,10 +677,10 @@ impl LlmClient {
         match self.provider {
             Provider::Anthropic => {
                 // Use count_tokens endpoint for validation - lightweight
-                let response = self
+                let request_builder = self
                     .http
-                    .post(format!("{}/v1/messages/count_tokens", self.base_url))
-                    .header("x-api-key", &self.api_key)
+                    .post(format!("{}/v1/messages/count_tokens", self.base_url));
+                let response = self.apply_anthropic_auth(request_builder)
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
                     .json(&serde_json::json!({
@@ -466,7 +693,7 @@ impl LlmClient {
                 if response.status().as_u16() == 401 {
                     return Err(LlmError::Api {
                         status: 401,
-                        message: "Invalid API key".to_string(),
+                        message: "Invalid API key or OAuth token".to_string(),
                     });
                 }
                 Ok(())
@@ -484,12 +711,17 @@ impl LlmClient {
     pub async fn complete(&self, request: &CompletionRequest) -> Result<String, LlmError> {
         match self.provider {
             Provider::Anthropic => self.complete_anthropic_simple(request).await,
-            Provider::OpenAI | Provider::OpenRouter => self.complete_openai(request).await,
+            Provider::OpenAI | Provider::OpenRouter | Provider::GitHubModels | Provider::ClaudeProxy => self.complete_openai(request).await,
             Provider::Ollama => self.complete_ollama(request).await,
         }
     }
 
     /// Send a full Anthropic request with tools.
+    ///
+    /// For OAuth tokens, this automatically:
+    /// - Prepends Claude Code identity to system prompt (as array of content blocks)
+    /// - Remaps tool names to Claude Code format
+    /// - Remaps tool names back in the response
     ///
     /// # Errors
     ///
@@ -497,15 +729,47 @@ impl LlmClient {
     /// Returns `LlmError::Network` if the request fails.
     /// Returns `LlmError::Parse` if the response cannot be parsed.
     pub async fn complete_anthropic(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
-        let response = self
+        let is_oauth = self.is_oauth();
+        
+        // Store original tools for reverse mapping
+        let original_tools = request.tools.clone().unwrap_or_default();
+
+        let request_builder = self
             .http
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+            .post(format!("{}/v1/messages", self.base_url));
+        
+        let response = if is_oauth {
+            // OAuth mode: Use array-based system prompt and remap tool names
+            let mut oauth_request = OAuthAnthropicRequest::from_request(request, true);
+            
+            // Remap tool names to Claude Code format
+            if let Some(ref mut tools) = oauth_request.tools {
+                for tool in tools {
+                    tool.name = to_claude_code_tool_name(&tool.name);
+                }
+            }
+            
+            debug!(
+                system_blocks = oauth_request.system.len(),
+                tool_names = ?oauth_request.tools.as_ref().map(|t| t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>()),
+                "OAuth request prepared with array-based system prompt"
+            );
+            
+            self.apply_anthropic_auth(request_builder)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&oauth_request)
+                .send()
+                .await?
+        } else {
+            // Standard mode: Use string-based system prompt
+            self.apply_anthropic_auth(request_builder)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(request)
+                .send()
+                .await?
+        };
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -513,7 +777,17 @@ impl LlmClient {
             return Err(LlmError::from_api_response(status, message));
         }
 
-        let result: AnthropicResponse = response.json().await?;
+        let mut result: AnthropicResponse = response.json().await?;
+        
+        // Remap tool names back in response
+        if is_oauth {
+            for block in &mut result.content {
+                if let ContentBlock::ToolUse { name, .. } = block {
+                    *name = from_claude_code_tool_name(name, &original_tools);
+                }
+            }
+        }
+        
         Ok(result)
     }
 
@@ -1286,8 +1560,13 @@ struct ErrorData {
 
 impl LlmClient {
     /// Stream a completion request, yielding events as they arrive.
-    /// 
-    /// Emits `RateLimitInfo` from response headers and `RecoverableError` 
+    ///
+    /// For OAuth tokens, this automatically:
+    /// - Prepends Claude Code identity to system prompt (as array of content blocks)
+    /// - Remaps tool names to Claude Code format
+    /// - Remaps tool names back in streamed responses
+    ///
+    /// Emits `RateLimitInfo` from response headers and `RecoverableError`
     /// for mid-stream failures (with accumulated partial content).
     pub fn stream_anthropic(
         &self,
@@ -1299,19 +1578,91 @@ impl LlmClient {
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
+        let is_oauth = is_oauth_token(&api_key);
+        
+        // Store original tools for reverse mapping
+        let original_tools = request.tools.clone().unwrap_or_default();
+        
+        // Prepare OAuth request with array-based system prompt
+        let oauth_request = if is_oauth {
+            info!("Claude Code stealth mode: applying OAuth headers and array-based system prompt");
+            
+            let mut oauth_req = OAuthAnthropicRequest::from_request(&request, true);
+            oauth_req.stream = Some(true);
+            
+            // Remap tool names to Claude Code format
+            if let Some(ref mut tools) = oauth_req.tools {
+                for tool in tools {
+                    let old_name = tool.name.clone();
+                    tool.name = to_claude_code_tool_name(&tool.name);
+                    if old_name != tool.name {
+                        debug!(old = %old_name, new = %tool.name, "Remapped tool name");
+                    }
+                }
+            }
+            
+            // Log the transformed request for debugging
+            debug!(
+                system_blocks = oauth_req.system.len(),
+                tool_names = ?oauth_req.tools.as_ref().map(|t| t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>()),
+                "OAuth streaming request prepared with array-based system prompt"
+            );
+            
+            Some(oauth_req)
+        } else {
+            None
+        };
 
         stream! {
-            let response = match http
-                .post(format!("{base_url}/v1/messages"))
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
+            let request_builder = http
+                .post(format!("{base_url}/v1/messages"));
+
+            // Apply appropriate auth header (with OAuth beta headers if needed)
+            let request_builder = if is_oauth {
+                let token = get_raw_token(&api_key);
+                request_builder
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("accept", "application/json")
+                    .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"))
+                    .header("x-app", "cli")
+                    .header("anthropic-dangerous-direct-browser-access", "true")
+            } else {
+                request_builder.header("x-api-key", &api_key)
+            };
+
+            debug!(
+                is_oauth = is_oauth,
+                model = %request.model,
+                has_system = request.system.is_some(),
+                tools_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                "Sending Anthropic streaming request"
+            );
+
+            // Send the appropriate request body
+            let response = if let Some(ref oauth_req) = oauth_request {
+                request_builder
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(oauth_req)
+                    .send()
+                    .await
+            } else {
+                request_builder
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&request)
+                    .send()
+                    .await
+            };
+
+            let response = match response {
+                Ok(r) => {
+                    debug!(status = %r.status(), "Anthropic API response received");
+                    r
+                },
                 Err(e) => {
+                    warn!(error = %e, "Anthropic API request failed");
                     yield Err(LlmError::Http(e.to_string()));
                     return;
                 }
@@ -1378,7 +1729,13 @@ impl LlmClient {
 
                 // Parse complete SSE events from buffer
                 while let Some(event_str) = extract_sse_event(&mut buffer) {
-                    if let Some(stream_event) = parse_sse_event(&event_str) {
+                    if let Some(mut stream_event) = parse_sse_event(&event_str) {
+                        // Remap tool names back to original for OAuth
+                        if is_oauth {
+                            if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
+                                *name = from_claude_code_tool_name(name, &original_tools);
+                            }
+                        }
                         // Accumulate content for recovery
                         accumulator.process(&stream_event);
                         yield Ok(stream_event);
@@ -1388,7 +1745,13 @@ impl LlmClient {
 
             // Handle any remaining data in buffer
             if !buffer.trim().is_empty() {
-                if let Some(stream_event) = parse_sse_event(&buffer) {
+                if let Some(mut stream_event) = parse_sse_event(&buffer) {
+                    // Remap tool names back to original for OAuth
+                    if is_oauth {
+                        if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
+                            *name = from_claude_code_tool_name(name, &original_tools);
+                        }
+                    }
                     accumulator.process(&stream_event);
                     yield Ok(stream_event);
                 }
@@ -1396,81 +1759,412 @@ impl LlmClient {
         }
     }
 
+    /// Stream using OpenAI-compatible API (for OpenAI, OpenRouter, GitHub Models, Claude Proxy)
+    /// Supports both text responses and tool calls.
+    pub fn stream_openai(
+        &self,
+        request: &CompletionRequest,
+    ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let base_url = self.base_url.clone();
+        let request = request.clone();
+
+        stream! {
+            // === Request types ===
+            #[derive(Serialize)]
+            struct OpenAIMessage {
+                role: String,
+                content: String,
+            }
+
+            #[derive(Serialize)]
+            struct OpenAITool {
+                #[serde(rename = "type")]
+                tool_type: String,
+                function: OpenAIFunction,
+            }
+
+            #[derive(Serialize)]
+            struct OpenAIFunction {
+                name: String,
+                description: String,
+                parameters: serde_json::Value,
+            }
+
+            #[derive(Serialize)]
+            struct OpenAIRequest {
+                model: String,
+                messages: Vec<OpenAIMessage>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                max_tokens: Option<u32>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                temperature: Option<f32>,
+                stream: bool,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                tools: Option<Vec<OpenAITool>>,
+            }
+
+            // === Response types ===
+            #[derive(Deserialize, Debug)]
+            struct StreamChunk {
+                choices: Vec<ChunkChoice>,
+            }
+
+            #[derive(Deserialize, Debug)]
+            struct ChunkChoice {
+                delta: Option<ChunkDelta>,
+                finish_reason: Option<String>,
+            }
+
+            #[derive(Deserialize, Debug)]
+            struct ChunkDelta {
+                content: Option<String>,
+                role: Option<String>,
+                tool_calls: Option<Vec<ToolCallDelta>>,
+            }
+
+            #[derive(Deserialize, Debug)]
+            struct ToolCallDelta {
+                index: usize,
+                id: Option<String>,
+                function: Option<FunctionDelta>,
+            }
+
+            #[derive(Deserialize, Debug)]
+            struct FunctionDelta {
+                name: Option<String>,
+                arguments: Option<String>,
+            }
+
+            // Convert messages to OpenAI format
+            let messages: Vec<OpenAIMessage> = request
+                .messages
+                .iter()
+                .map(|m| OpenAIMessage {
+                    role: match m.role {
+                        Role::System => "system".to_string(),
+                        Role::User => "user".to_string(),
+                        Role::Assistant => "assistant".to_string(),
+                    },
+                    content: m.content.clone(),
+                })
+                .collect();
+
+            // Convert tools to OpenAI format
+            let tools: Option<Vec<OpenAITool>> = if request.tools.is_empty() {
+                None
+            } else {
+                Some(request.tools.iter().filter_map(|v| {
+                    // Try to parse as ToolDefinition
+                    if let Ok(tool_def) = serde_json::from_value::<ToolDefinition>(v.clone()) {
+                        Some(OpenAITool {
+                            tool_type: "function".to_string(),
+                            function: OpenAIFunction {
+                                name: tool_def.name,
+                                description: tool_def.description,
+                                parameters: tool_def.input_schema,
+                            },
+                        })
+                    } else {
+                        None
+                    }
+                }).collect())
+            };
+
+            let body = OpenAIRequest {
+                model: request.model.clone(),
+                messages,
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+                stream: true,
+                tools,
+            };
+
+            let response = match http
+                .post(format!("{base_url}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(LlmError::Http(e.to_string()));
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let message = response.text().await.unwrap_or_default();
+                yield Err(LlmError::from_api_response(status, message));
+                return;
+            }
+
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer = String::new();
+
+            // Track content blocks (text at index 0, tool calls at higher indices)
+            let mut text_block_started = false;
+            let mut tool_calls_started: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new(); // index -> (id, name)
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(LlmError::Stream(e.to_string()));
+                        return;
+                    }
+                };
+
+                match std::str::from_utf8(&chunk) {
+                    Ok(s) => buffer.push_str(s),
+                    Err(e) => {
+                        yield Err(LlmError::Stream(format!("Invalid UTF-8: {e}")));
+                        return;
+                    }
+                }
+
+                // Parse SSE events from buffer
+                while let Some(line_end) = buffer.find('\n') {
+                    let line = buffer[..line_end].trim().to_string();
+                    buffer = buffer[line_end + 1..].to_string();
+
+                    if line.is_empty() || !line.starts_with("data: ") {
+                        continue;
+                    }
+
+                    let data = &line[6..]; // Strip "data: "
+
+                    if data == "[DONE]" {
+                        // Close any open blocks
+                        if text_block_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                        }
+                        for (idx, _) in &tool_calls_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                        }
+                        yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+                        return;
+                    }
+
+                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                        for choice in chunk.choices {
+                            if let Some(delta) = choice.delta {
+                                // Handle text content
+                                if let Some(text) = delta.content {
+                                    if !text.is_empty() {
+                                        if !text_block_started {
+                                            text_block_started = true;
+                                            yield Ok(StreamEvent::ContentBlockStart {
+                                                index: 0,
+                                                content_type: "text".to_string(),
+                                                tool_id: None,
+                                                tool_name: None,
+                                            });
+                                        }
+                                        yield Ok(StreamEvent::TextDelta { index: 0, text });
+                                    }
+                                }
+
+                                // Handle tool calls
+                                if let Some(tool_calls) = delta.tool_calls {
+                                    for tc in tool_calls {
+                                        // Tool index offset by 1 (text is at 0)
+                                        let block_index = tc.index + 1;
+
+                                        // Check if this is a new tool call
+                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function) {
+                                            if let Some(name) = &func.name {
+                                                // Close text block if open (tool calls come after text)
+                                                if text_block_started {
+                                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                                                    text_block_started = false;
+                                                }
+
+                                                // New tool call
+                                                tool_calls_started.insert(block_index, (id.clone(), name.clone()));
+                                                yield Ok(StreamEvent::ContentBlockStart {
+                                                    index: block_index,
+                                                    content_type: "tool_use".to_string(),
+                                                    tool_id: Some(id.clone()),
+                                                    tool_name: Some(name.clone()),
+                                                });
+                                            }
+                                        }
+
+                                        // Stream tool arguments
+                                        if let Some(func) = &tc.function {
+                                            if let Some(args) = &func.arguments {
+                                                if !args.is_empty() {
+                                                    yield Ok(StreamEvent::ToolUseDelta {
+                                                        index: block_index,
+                                                        partial_json: args.clone(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Check for stop
+                            if let Some(reason) = choice.finish_reason {
+                                // Close any open blocks
+                                if text_block_started {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                                }
+                                for (idx, _) in &tool_calls_started {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                                }
+
+                                let stop_reason = match reason.as_str() {
+                                    "tool_calls" => "tool_use",
+                                    "stop" => "end_turn",
+                                    other => other,
+                                };
+                                yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If we got here without MessageStop, emit it
+            if text_block_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+            }
+            for (idx, _) in &tool_calls_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+            }
+            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+        }
+    }
+
     /// Convenience method to stream a CompletionRequest.
     /// Converts to provider-specific format automatically.
-    /// 
+    ///
     /// Returns `StreamEvent` directly (errors converted to `Error` or `RecoverableError` events).
     pub fn stream(
         &self,
         request: &CompletionRequest,
     ) -> impl Stream<Item = StreamEvent> + '_ {
-        // Extract system message
-        let system_msg = request
-            .messages
-            .iter()
-            .find(|m| m.role == Role::System)
-            .map(|m| m.content.clone());
+        let provider = self.provider.clone();
+        let request = request.clone();
 
-        // Convert to Anthropic format
-        let messages: Vec<AnthropicMessage> = request
-            .messages
-            .iter()
-            .filter(|m| m.role != Role::System)
-            .map(|m| AnthropicMessage {
-                role: match m.role {
-                    Role::User | Role::System => "user",
-                    Role::Assistant => "assistant",
-                }.to_string(),
-                content: vec![ContentBlock::Text { text: m.content.clone() }],
-            })
-            .collect();
-
-        // Merge simple messages with anthropic messages
-        let mut all_messages = messages;
-        all_messages.extend(request.anthropic_messages.clone());
-        
-        // Convert tool JSON values to ToolDefinition
-        let tools = if request.tools.is_empty() {
-            None
-        } else {
-            Some(request.tools.iter().filter_map(|v| {
-                serde_json::from_value::<ToolDefinition>(v.clone()).ok()
-            }).collect())
-        };
-        
-        let anthropic_request = AnthropicRequest {
-            model: request.model.clone(),
-            messages: all_messages,
-            max_tokens: request.max_tokens.unwrap_or(4096),
-            temperature: request.temperature,
-            system: system_msg,
-            tools,
-            stream: Some(true),
-            thinking: None, // TODO: Add thinking support
-        };
-
-        // Create an async stream that filters and maps the raw stream
         stream! {
-            let raw_stream = self.stream_anthropic(&anthropic_request);
-            tokio::pin!(raw_stream);
-            
-            while let Some(result) = raw_stream.next().await {
-                match result {
-                    Ok(event) => yield event,
-                    Err(e) => {
-                        // Convert LlmError to appropriate StreamEvent
-                        if e.should_fallback() {
-                            // Recoverable errors (429, network issues) - these should have
-                            // been converted to RecoverableError upstream if there was content
-                            yield StreamEvent::RecoverableError {
-                                error: e,
-                                partial_text: String::new(),
-                                partial_tool_calls: Vec::new(),
+            // Route to appropriate streaming method based on provider
+            match provider {
+                Provider::Anthropic => {
+                    // Convert to Anthropic format
+                    let system_msg = request
+                        .messages
+                        .iter()
+                        .find(|m| m.role == Role::System)
+                        .map(|m| m.content.clone());
+
+                    let messages: Vec<AnthropicMessage> = request
+                        .messages
+                        .iter()
+                        .filter(|m| m.role != Role::System)
+                        .map(|m| AnthropicMessage {
+                            role: match m.role {
+                                Role::User | Role::System => "user",
+                                Role::Assistant => "assistant",
+                            }.to_string(),
+                            content: vec![ContentBlock::Text { text: m.content.clone() }],
+                        })
+                        .collect();
+
+                    let mut all_messages = messages;
+                    all_messages.extend(request.anthropic_messages.clone());
+
+                    let tools = if request.tools.is_empty() {
+                        None
+                    } else {
+                        Some(request.tools.iter().filter_map(|v| {
+                            serde_json::from_value::<ToolDefinition>(v.clone()).ok()
+                        }).collect())
+                    };
+
+                    let anthropic_request = AnthropicRequest {
+                        model: request.model.clone(),
+                        messages: all_messages,
+                        max_tokens: request.max_tokens.unwrap_or(4096),
+                        temperature: request.temperature,
+                        system: system_msg,
+                        tools,
+                        stream: Some(true),
+                        thinking: None,
+                    };
+
+                    let raw_stream = self.stream_anthropic(&anthropic_request);
+                    tokio::pin!(raw_stream);
+
+                    while let Some(result) = raw_stream.next().await {
+                        match result {
+                            Ok(event) => yield event,
+                            Err(e) => {
+                                if e.should_fallback() {
+                                    yield StreamEvent::RecoverableError {
+                                        error: e,
+                                        partial_text: String::new(),
+                                        partial_tool_calls: Vec::new(),
+                                    };
+                                } else {
+                                    yield StreamEvent::Error { message: e.to_string() };
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+                Provider::OpenAI | Provider::OpenRouter | Provider::GitHubModels | Provider::ClaudeProxy => {
+                    // Use OpenAI-compatible streaming
+                    let raw_stream = self.stream_openai(&request);
+                    tokio::pin!(raw_stream);
+
+                    while let Some(result) = raw_stream.next().await {
+                        match result {
+                            Ok(event) => yield event,
+                            Err(e) => {
+                                if e.should_fallback() {
+                                    yield StreamEvent::RecoverableError {
+                                        error: e,
+                                        partial_text: String::new(),
+                                        partial_tool_calls: Vec::new(),
+                                    };
+                                } else {
+                                    yield StreamEvent::Error { message: e.to_string() };
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+                Provider::Ollama => {
+                    // TODO: Implement Ollama streaming (for now, use non-streaming fallback)
+                    match self.complete_ollama(&request).await {
+                        Ok(text) => {
+                            yield StreamEvent::ContentBlockStart {
+                                index: 0,
+                                content_type: "text".to_string(),
+                                tool_id: None,
+                                tool_name: None,
                             };
-                        } else {
+                            yield StreamEvent::TextDelta {
+                                index: 0,
+                                text,
+                            };
+                            yield StreamEvent::ContentBlockStop { index: 0 };
+                            yield StreamEvent::MessageStop { stop_reason: "end_turn".to_string() };
+                        }
+                        Err(e) => {
                             yield StreamEvent::Error { message: e.to_string() };
                         }
-                        return;
                     }
                 }
             }
