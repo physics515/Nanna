@@ -344,12 +344,43 @@ const activeWorkspace = computed(() => {
   return null
 })
 
+// Tab management functions for child components
+function addWorkspaceTab(ws: WorkspaceInfo) {
+  if (!openWorkspaces.value.some(w => w.id === ws.id)) {
+    openWorkspaces.value.push(ws)
+    saveTabsToStorage()
+  }
+}
+
+function selectWorkspaceTab(workspaceId: string) {
+  // Ensure tab is open
+  const ws = openWorkspaces.value.find(w => w.id === workspaceId)
+  if (!ws) {
+    // Need to fetch workspace info and add it
+    loadOpenWorkspaces().then(() => {
+      const found = openWorkspaces.value.find(w => w.id === workspaceId)
+      if (found) {
+        currentTab.value = { type: 'workspace', workspaceId }
+      }
+    })
+  } else {
+    currentTab.value = { type: 'workspace', workspaceId }
+  }
+}
+
+function selectGlobalTab() {
+  currentTab.value = { type: 'global' }
+}
+
 // Provide to child components
 provide('currentSessionId', currentSessionId)
 provide('sessions', sessions)
 provide('activeWorkspace', activeWorkspace)
 provide('currentTab', currentTab)
 provide('openWorkspaces', openWorkspaces)
+provide('addWorkspaceTab', addWorkspaceTab)
+provide('selectWorkspaceTab', selectWorkspaceTab)
+provide('selectGlobalTab', selectGlobalTab)
 
 // Initialize notifications
 const { checkPermission } = useNotifications()

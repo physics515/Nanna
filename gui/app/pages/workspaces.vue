@@ -458,12 +458,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { 
   Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
 } from 'lucide-vue-next'
+
+// Inject tab management functions from layout
+const addWorkspaceTab = inject<(ws: WorkspaceInfo) => void>('addWorkspaceTab')
+const selectWorkspaceTab = inject<(id: string) => void>('selectWorkspaceTab')
+const selectGlobalTab = inject<() => void>('selectGlobalTab')
 
 interface WorkspaceInfo {
   id: string
@@ -622,6 +627,9 @@ async function openWorkspace(path: string) {
     const ws = await invoke<WorkspaceInfo>('open_workspace', { path })
     workspaces.value = await invoke<WorkspaceInfo[]>('list_workspaces')
     console.log('Opened workspace:', ws.name)
+    
+    // Sync with layout tabs - add tab for new workspace
+    addWorkspaceTab?.(ws)
   } catch (e) {
     console.error('Failed to open workspace:', e)
   } finally {
@@ -663,6 +671,10 @@ async function setActive(ws: WorkspaceInfo) {
   try {
     await invoke('set_active_workspace', { id: ws.id })
     await loadWorkspaces()
+    
+    // Sync with layout tabs - add tab and select it
+    addWorkspaceTab?.(ws)
+    selectWorkspaceTab?.(ws.id)
   } catch (e) {
     console.error('Failed to set active workspace:', e)
   }
@@ -672,6 +684,9 @@ async function clearActiveWorkspace() {
   try {
     await invoke('clear_active_workspace')
     await loadWorkspaces()
+    
+    // Sync with layout tabs - switch to global
+    selectGlobalTab?.()
   } catch (e) {
     console.error('Failed to clear active workspace:', e)
   }
