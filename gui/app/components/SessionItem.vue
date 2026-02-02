@@ -85,6 +85,8 @@ interface SessionInfo {
   created_at: string
   updated_at: string
   message_count: number
+  workspace_id: string | null
+  workspace_name: string | null
 }
 
 const props = defineProps<{

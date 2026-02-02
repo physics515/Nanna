@@ -26,7 +26,6 @@
     <!-- Mobile Sidebar (Sheet) -->
     <UiSheet v-model:open="sidebarOpen" side="left">
       <template #trigger>
-        <!-- Empty - we use the header button -->
         <span></span>
       </template>
       
@@ -34,44 +33,40 @@
         <!-- Logo -->
         <div class="p-4 border-b border-nanna-primary/10">
           <NuxtLink to="/" @click="sidebarOpen = false" class="block">
-            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">
-              NANNA
-            </h1>
-            <p class="text-xs text-nanna-text-muted mt-1">
-              AI Assistant
-            </p>
+            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">NANNA</h1>
+            <p class="text-xs text-nanna-text-muted mt-1">AI Assistant</p>
           </NuxtLink>
         </div>
         
         <!-- New Chat button -->
         <div class="p-4">
-          <UiButton 
-            @click="createNewSession(); sidebarOpen = false"
-            class="w-full justify-start"
-          >
+          <UiButton @click="createNewSession(); sidebarOpen = false" class="w-full justify-start">
             <Plus class="w-4 h-4" />
             <span>New Chat</span>
           </UiButton>
         </div>
         
-        <!-- Workspace indicator (mobile) -->
-        <div v-if="activeWorkspace" class="px-4 py-2 bg-nanna-accent/10 border-b border-nanna-accent/20">
+        <!-- Current Tab indicator (mobile) -->
+        <div :class="[
+          'px-4 py-2 border-b',
+          currentTab?.type === 'workspace' 
+            ? 'bg-nanna-accent/10 border-nanna-accent/20' 
+            : 'bg-nanna-bg-elevated/50 border-nanna-primary/10'
+        ]">
           <div class="flex items-center gap-2 text-xs">
-            <FolderKanban class="w-3 h-3 text-nanna-accent" />
-            <span class="text-nanna-accent font-medium truncate">{{ activeWorkspace.name }}</span>
-          </div>
-        </div>
-        <div v-else class="px-4 py-2 bg-nanna-bg-elevated/50 border-b border-nanna-primary/10">
-          <div class="flex items-center gap-2 text-xs text-nanna-text-dim">
-            <span>Global</span>
-            <span class="text-[10px] opacity-60">(all memory)</span>
+            <component :is="currentTab?.type === 'workspace' ? FolderKanban : Globe" 
+              :class="['w-3 h-3', currentTab?.type === 'workspace' ? 'text-nanna-accent' : 'text-nanna-text-dim']" 
+            />
+            <span :class="currentTab?.type === 'workspace' ? 'text-nanna-accent font-medium' : 'text-nanna-text-dim'">
+              {{ currentTabName }}
+            </span>
           </div>
         </div>
         
         <!-- Sessions list -->
         <nav class="flex-1 px-4 space-y-1 overflow-y-auto pt-2">
           <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
-            {{ activeWorkspace ? 'Workspace Chats' : 'Global Chats' }}
+            {{ currentTab?.type === 'workspace' ? 'Workspace Chats' : 'Global Chats' }}
           </div>
           
           <SessionItem
@@ -85,74 +80,43 @@
           />
           
           <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
-            {{ activeWorkspace ? 'No workspace chats yet' : 'No global chats yet' }}
+            {{ currentTab?.type === 'workspace' ? 'No workspace chats yet' : 'No global chats yet' }}
           </div>
         </nav>
         
         <!-- Footer -->
         <div class="p-4 border-t border-nanna-primary/10 space-y-1">
-          <NuxtLink 
-            to="/memory" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Brain class="w-4 h-4" />
-            <span>Memory</span>
+          <NuxtLink to="/memory" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Brain class="w-4 h-4" /><span>Memory</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/workspaces" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <FolderKanban class="w-4 h-4" />
-            <span>Workspaces</span>
+          <NuxtLink to="/workspaces" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <FolderKanban class="w-4 h-4" /><span>Workspaces</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/agents" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Bot class="w-4 h-4" />
-            <span>Agents</span>
+          <NuxtLink to="/agents" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Bot class="w-4 h-4" /><span>Agents</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/channels" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Radio class="w-4 h-4" />
-            <span>Channels</span>
+          <NuxtLink to="/channels" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Radio class="w-4 h-4" /><span>Channels</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/tools" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Wrench class="w-4 h-4" />
-            <span>Tools</span>
+          <NuxtLink to="/tools" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Wrench class="w-4 h-4" /><span>Tools</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/scheduler" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Clock class="w-4 h-4" />
-            <span>Scheduler</span>
+          <NuxtLink to="/scheduler" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Clock class="w-4 h-4" /><span>Scheduler</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/settings" 
-            @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Settings class="w-4 h-4" />
-            <span>Settings</span>
+          <NuxtLink to="/settings" @click="sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Settings class="w-4 h-4" /><span>Settings</span>
           </NuxtLink>
-          <button 
-            @click="hideToTray(); sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <ChevronDown class="w-4 h-4" />
-            <span>Hide to Tray</span>
+          <button @click="hideToTray(); sidebarOpen = false"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <ChevronDown class="w-4 h-4" /><span>Hide to Tray</span>
           </button>
           <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
             <span>v0.1.0</span>
@@ -171,44 +135,40 @@
         <!-- Logo -->
         <div class="p-4 border-b border-nanna-primary/10">
           <NuxtLink to="/" class="block">
-            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">
-              NANNA
-            </h1>
-            <p class="text-xs text-nanna-text-muted mt-1">
-              AI Assistant
-            </p>
+            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">NANNA</h1>
+            <p class="text-xs text-nanna-text-muted mt-1">AI Assistant</p>
           </NuxtLink>
         </div>
         
         <!-- New Chat button -->
         <div class="p-4">
-          <UiButton 
-            @click="createNewSession"
-            class="w-full justify-start"
-          >
+          <UiButton @click="createNewSession" class="w-full justify-start">
             <Plus class="w-4 h-4" />
             <span>New Chat</span>
           </UiButton>
         </div>
         
-        <!-- Workspace indicator -->
-        <div v-if="activeWorkspace" class="px-4 py-2 bg-nanna-accent/10 border-b border-nanna-accent/20">
+        <!-- Current Tab indicator -->
+        <div :class="[
+          'px-4 py-2 border-b',
+          currentTab?.type === 'workspace' 
+            ? 'bg-nanna-accent/10 border-nanna-accent/20' 
+            : 'bg-nanna-bg-elevated/50 border-nanna-primary/10'
+        ]">
           <div class="flex items-center gap-2 text-xs">
-            <FolderKanban class="w-3 h-3 text-nanna-accent" />
-            <span class="text-nanna-accent font-medium truncate">{{ activeWorkspace.name }}</span>
-          </div>
-        </div>
-        <div v-else class="px-4 py-2 bg-nanna-bg-elevated/50 border-b border-nanna-primary/10">
-          <div class="flex items-center gap-2 text-xs text-nanna-text-dim">
-            <span>Global</span>
-            <span class="text-[10px] opacity-60">(all memory)</span>
+            <component :is="currentTab?.type === 'workspace' ? FolderKanban : Globe" 
+              :class="['w-3 h-3', currentTab?.type === 'workspace' ? 'text-nanna-accent' : 'text-nanna-text-dim']" 
+            />
+            <span :class="currentTab?.type === 'workspace' ? 'text-nanna-accent font-medium truncate' : 'text-nanna-text-dim'">
+              {{ currentTabName }}
+            </span>
           </div>
         </div>
         
         <!-- Sessions list -->
         <nav class="flex-1 px-4 space-y-1 overflow-y-auto pt-2">
           <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
-            {{ activeWorkspace ? 'Workspace Chats' : 'Global Chats' }}
+            {{ currentTab?.type === 'workspace' ? 'Workspace Chats' : 'Global Chats' }}
           </div>
           
           <SessionItem
@@ -222,67 +182,43 @@
           />
           
           <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
-            {{ activeWorkspace ? 'No workspace chats yet' : 'No global chats yet' }}
+            {{ currentTab?.type === 'workspace' ? 'No workspace chats yet' : 'No global chats yet' }}
           </div>
         </nav>
         
         <!-- Footer -->
         <div class="p-4 border-t border-nanna-primary/10 space-y-1">
-          <NuxtLink 
-            to="/memory" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Brain class="w-4 h-4" />
-            <span>Memory</span>
+          <NuxtLink to="/memory" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Brain class="w-4 h-4" /><span>Memory</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/workspaces" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <FolderKanban class="w-4 h-4" />
-            <span>Workspaces</span>
+          <NuxtLink to="/workspaces" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <FolderKanban class="w-4 h-4" /><span>Workspaces</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/agents" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Bot class="w-4 h-4" />
-            <span>Agents</span>
+          <NuxtLink to="/agents" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Bot class="w-4 h-4" /><span>Agents</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/channels" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Radio class="w-4 h-4" />
-            <span>Channels</span>
+          <NuxtLink to="/channels" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Radio class="w-4 h-4" /><span>Channels</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/tools" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Wrench class="w-4 h-4" />
-            <span>Tools</span>
+          <NuxtLink to="/tools" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Wrench class="w-4 h-4" /><span>Tools</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/scheduler" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Clock class="w-4 h-4" />
-            <span>Scheduler</span>
+          <NuxtLink to="/scheduler" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Clock class="w-4 h-4" /><span>Scheduler</span>
           </NuxtLink>
-          <NuxtLink 
-            to="/settings" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <Settings class="w-4 h-4" />
-            <span>Settings</span>
+          <NuxtLink to="/settings" 
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <Settings class="w-4 h-4" /><span>Settings</span>
           </NuxtLink>
-          <button 
-            @click="hideToTray"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-          >
-            <ChevronDown class="w-4 h-4" />
-            <span>Hide to Tray</span>
+          <button @click="hideToTray"
+            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
+            <ChevronDown class="w-4 h-4" /><span>Hide to Tray</span>
           </button>
           <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
             <div class="flex items-center gap-2">
@@ -299,11 +235,40 @@
         </div>
       </aside>
       
-      <!-- Main area -->
+      <!-- Main area with workspace tabs -->
       <main class="flex-1 flex flex-col pt-14 lg:pt-0">
+        <!-- Workspace Tabs (desktop only, on chat page) -->
+        <WorkspaceTabs
+          v-if="route.path === '/' || route.path === ''"
+          class="hidden lg:flex"
+          :open-workspaces="openWorkspaces"
+          :current-tab="currentTab"
+          @select="selectTab"
+          @close="closeWorkspaceTab"
+          @add="showWorkspacePicker = true"
+        />
+        
+        <!-- Mobile workspace tabs (horizontal scroll) -->
+        <WorkspaceTabs
+          v-if="(route.path === '/' || route.path === '') && openWorkspaces.length > 0"
+          class="lg:hidden"
+          :open-workspaces="openWorkspaces"
+          :current-tab="currentTab"
+          @select="selectTab"
+          @close="closeWorkspaceTab"
+          @add="showWorkspacePicker = true"
+        />
+        
         <slot />
       </main>
     </div>
+    
+    <!-- Workspace Picker Modal -->
+    <WorkspacePicker
+      v-model="showWorkspacePicker"
+      :open-tab-ids="openTabIds"
+      @select="openWorkspaceTab"
+    />
     
     <!-- Close confirmation dialog -->
     <CloseDialog />
@@ -311,10 +276,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted, provide } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Menu, Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock } from 'lucide-vue-next'
+import { Menu, Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, Globe } from 'lucide-vue-next'
 
 interface SessionInfo {
   id: string
@@ -330,7 +295,12 @@ interface WorkspaceInfo {
   id: string
   name: string
   path: string
-  active: boolean
+  active?: boolean
+}
+
+interface Tab {
+  type: 'global' | 'workspace'
+  workspaceId?: string
 }
 
 interface AppConfig {
@@ -346,15 +316,40 @@ const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
 const sidebarOpen = ref(false)
-const activeWorkspace = ref<WorkspaceInfo | null>(null)
+const showWorkspacePicker = ref(false)
+
+// Workspace tabs state
+const openWorkspaces = ref<WorkspaceInfo[]>([])
+const currentTab = ref<Tab>({ type: 'global' })
 
 let unlistenTrayNewChat: UnlistenFn | null = null
 let unlistenCloseRequested: UnlistenFn | null = null
 
-// Provide session switching to child components
+// Computed
+const currentTabName = computed(() => {
+  if (!currentTab.value || currentTab.value.type === 'global') {
+    return 'Global'
+  }
+  const ws = openWorkspaces.value.find(w => w.id === currentTab.value.workspaceId)
+  return ws?.name || 'Workspace'
+})
+
+const openTabIds = computed(() => openWorkspaces.value.map(w => w.id))
+
+// For backwards compatibility - provide the current workspace if in workspace tab
+const activeWorkspace = computed(() => {
+  if (currentTab.value?.type === 'workspace') {
+    return openWorkspaces.value.find(w => w.id === currentTab.value.workspaceId) || null
+  }
+  return null
+})
+
+// Provide to child components
 provide('currentSessionId', currentSessionId)
 provide('sessions', sessions)
 provide('activeWorkspace', activeWorkspace)
+provide('currentTab', currentTab)
+provide('openWorkspaces', openWorkspaces)
 
 // Initialize notifications
 const { checkPermission } = useNotifications()
@@ -365,13 +360,22 @@ const { init: initBackend, status: backendStatus, isDaemon } = useBackend()
 // Close handler
 const { handleClose, loadCloseMode } = useCloseHandler()
 
+// LocalStorage keys
+const TABS_STORAGE_KEY = 'nanna-workspace-tabs'
+const CURRENT_TAB_KEY = 'nanna-current-tab'
+
 onMounted(async () => {
-  // Initialize backend first (tries daemon, falls back to embedded)
+  // Initialize backend first
   const mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
   
-  // Load active workspace first, then sessions (sessions filtered by workspace)
-  await loadActiveWorkspace()
+  // Load saved tabs from localStorage
+  loadTabsFromStorage()
+  
+  // Load workspace data for open tabs
+  await loadOpenWorkspaces()
+  
+  // Load sessions for current tab
   await loadSessions()
   await loadConfig()
   
@@ -390,16 +394,11 @@ onMounted(async () => {
   const { getCurrentWindow } = await import('@tauri-apps/api/window')
   const window = getCurrentWindow()
   unlistenCloseRequested = await window.onCloseRequested(async (event) => {
-    // Prevent default close
     event.preventDefault()
-    // Handle via our close handler
     await handleClose()
   })
   
-  // Load close mode preference
   await loadCloseMode()
-  
-  // Check notification permissions on mount
   await checkPermission()
 })
 
@@ -420,21 +419,79 @@ watch(() => route.fullPath, () => {
   sidebarOpen.value = false
 })
 
-async function loadActiveWorkspace() {
+// Reload sessions when tab changes
+watch(currentTab, async () => {
+  await loadSessions()
+  // Reset currentSessionId when switching tabs
+  currentSessionId.value = sessions.value[0]?.id || null
+  if (currentSessionId.value) {
+    navigateTo(`/?session=${currentSessionId.value}`)
+  }
+  saveTabsToStorage()
+}, { deep: true })
+
+// Storage helpers
+function loadTabsFromStorage() {
   try {
-    activeWorkspace.value = await invoke<WorkspaceInfo | null>('get_active_workspace')
+    const savedTabs = localStorage.getItem(TABS_STORAGE_KEY)
+    const savedCurrent = localStorage.getItem(CURRENT_TAB_KEY)
+    
+    if (savedTabs) {
+      const tabIds: string[] = JSON.parse(savedTabs)
+      // We'll populate openWorkspaces after loading from backend
+      // For now just store the IDs
+      openWorkspaces.value = tabIds.map(id => ({ id, name: '', path: '' }))
+    }
+    
+    if (savedCurrent) {
+      currentTab.value = JSON.parse(savedCurrent)
+    }
   } catch (e) {
-    console.error('Failed to load active workspace:', e)
-    activeWorkspace.value = null
+    console.error('Failed to load tabs from storage:', e)
+  }
+}
+
+function saveTabsToStorage() {
+  try {
+    const tabIds = openWorkspaces.value.map(w => w.id)
+    localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabIds))
+    localStorage.setItem(CURRENT_TAB_KEY, JSON.stringify(currentTab.value))
+  } catch (e) {
+    console.error('Failed to save tabs to storage:', e)
+  }
+}
+
+async function loadOpenWorkspaces() {
+  try {
+    // Get all workspaces from backend
+    const allWorkspaces = await invoke<WorkspaceInfo[]>('list_workspaces')
+    
+    // Filter to only those we have tabs for
+    const savedIds = openWorkspaces.value.map(w => w.id)
+    openWorkspaces.value = allWorkspaces.filter(ws => savedIds.includes(ws.id))
+    
+    // Validate currentTab still exists
+    if (currentTab.value?.type === 'workspace') {
+      const exists = openWorkspaces.value.some(w => w.id === currentTab.value.workspaceId)
+      if (!exists) {
+        currentTab.value = { type: 'global' }
+      }
+    }
+    
+    saveTabsToStorage()
+  } catch (e) {
+    console.error('Failed to load workspaces:', e)
+    openWorkspaces.value = []
   }
 }
 
 async function loadSessions() {
   try {
-    // Pass workspace_id to filter sessions
-    // null = show only global sessions, Some(id) = show that workspace's sessions
-    const workspaceId = activeWorkspace.value?.id ?? null
+    const workspaceId = currentTab.value?.type === 'workspace' 
+      ? currentTab.value.workspaceId ?? null 
+      : null
     sessions.value = await invoke<SessionInfo[]>('list_sessions', { workspaceId })
+    
     const firstSession = sessions.value[0]
     if (firstSession && !currentSessionId.value) {
       currentSessionId.value = firstSession.id
@@ -453,20 +510,41 @@ async function loadConfig() {
   }
 }
 
+// Tab management
+function selectTab(tab: Tab) {
+  currentTab.value = tab
+}
+
+function openWorkspaceTab(ws: WorkspaceInfo) {
+  // Add to open workspaces if not already there
+  if (!openWorkspaces.value.some(w => w.id === ws.id)) {
+    openWorkspaces.value.push(ws)
+  }
+  // Switch to the tab
+  currentTab.value = { type: 'workspace', workspaceId: ws.id }
+  saveTabsToStorage()
+}
+
+function closeWorkspaceTab(workspaceId: string) {
+  openWorkspaces.value = openWorkspaces.value.filter(w => w.id !== workspaceId)
+  
+  // If closing current tab, switch to global
+  if (currentTab.value?.type === 'workspace' && currentTab.value.workspaceId === workspaceId) {
+    currentTab.value = { type: 'global' }
+  }
+  
+  saveTabsToStorage()
+}
+
 async function createNewSession() {
   try {
-    // Create session in the active workspace (or global if no workspace)
-    const workspaceId = activeWorkspace.value?.id ?? null
-    const session = await invoke<SessionInfo>('create_session', { 
-      name: null, 
-      workspaceId 
-    })
+    const workspaceId = currentTab.value?.type === 'workspace' 
+      ? currentTab.value.workspaceId ?? null 
+      : null
+    const session = await invoke<SessionInfo>('create_session', { name: null, workspaceId })
     currentSessionId.value = session.id
     
-    // Reload sessions list from backend to avoid duplicates
     await loadSessions()
-    
-    // Navigate with session ID in query
     navigateTo(`/?session=${session.id}`)
   } catch (e) {
     console.error('Failed to create session:', e)
@@ -475,7 +553,6 @@ async function createNewSession() {
 
 function switchSession(session: SessionInfo) {
   currentSessionId.value = session.id
-  // Navigate with session ID in query
   navigateTo(`/?session=${session.id}`)
 }
 
@@ -484,7 +561,7 @@ function onSessionDeleted(sessionId: string) {
   if (currentSessionId.value === sessionId) {
     currentSessionId.value = sessions.value[0]?.id || null
     if (currentSessionId.value) {
-      window.location.reload()
+      navigateTo(`/?session=${currentSessionId.value}`)
     }
   }
 }

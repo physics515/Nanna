@@ -39,29 +39,37 @@ export function useCloseHandler() {
    * Returns true if close should proceed, false if handled (minimized or dialog shown)
    */
   async function handleClose(): Promise<boolean> {
+    console.log('[useCloseHandler] handleClose called')
     try {
+      console.log('[useCloseHandler] Invoking handle_window_close...')
       const action = await invoke<string>('handle_window_close')
+      console.log('[useCloseHandler] Backend returned action:', action)
       
       switch (action) {
         case 'ask':
           // Show the close dialog
+          console.log('[useCloseHandler] Showing close dialog')
           showCloseDialog.value = true
+          console.log('[useCloseHandler] showCloseDialog is now:', showCloseDialog.value)
           return false
           
         case 'minimized':
           // Already minimized to tray
+          console.log('[useCloseHandler] Window minimized to tray')
           return false
           
         case 'quit':
           // Proceed with quit
+          console.log('[useCloseHandler] Proceeding with quit')
           await performQuit()
           return true
           
         default:
+          console.log('[useCloseHandler] Unknown action, returning true')
           return true
       }
     } catch (e) {
-      console.error('Failed to handle close:', e)
+      console.error('[useCloseHandler] Failed to handle close:', e)
       return true
     }
   }
