@@ -317,7 +317,7 @@ highlight.js
 - All see messages in real-time (like multiple Telegram clients)
 - Cross-channel sessions possible (Slack + Discord + GUI on same conversation)
 
-### Daemon Mode ✅ (Core Complete)
+### Daemon Mode ✅ (Functional - Pending Testing)
 **Run Nanna as a background service, headless, with attachable GUI**
 
 **Architecture:** Daemon runs independently; GUI connects as a channel client.
@@ -332,6 +332,7 @@ highlight.js
 └─────────────────────┘     └─────────────────────┘
 ```
 
+**Core Daemon:**
 - [x] **CLI binary** - `nanna-daemon run/start/stop/status/install/uninstall` commands
 - [x] **Service installation** - Windows Service / systemd / launchd
 - [x] **Headless operation** - No GUI required, config-driven
@@ -340,12 +341,22 @@ highlight.js
 - [x] **GUI client library** - `nanna-client` crate for connecting
 - [x] **Session persistence** - JSON persistence with auto-save
 - [x] **Protocol definition** - Complete IPC protocol for all actions
+
+**Integration (2026-02-02):**
+- [x] **Memory service** - Initialized with embedding support (OpenAI/Ollama/Anthropic)
+- [x] **Agent service** - LLM client + tool registry + memory integration
+- [x] **IPC response routing** - Arc-based server sharing, proper request/response pairing
+- [x] **Backend abstraction** - Unified interface for daemon vs embedded modes
+- [x] **GUI routing** - Commands check mode and route through daemon client or embedded
+- [x] **Embedded fallback** - GUI runs direct services when daemon unavailable
+- [x] **Auto-reconnection** - Health monitor detects and reconnects to daemon
+
+**Pending:**
 - [ ] **PID file + lockfile** - Prevent multiple instances
 - [ ] **Auto-restart** - Crash recovery with backoff
 - [ ] **Log rotation** - File-based logs with rotation
 - [ ] **Health endpoint** - HTTP `/health` for monitoring
-- [ ] **GUI integration** - Wire GUI to use daemon client
-- [ ] **Agent integration** - Connect control plane to actual agent
+- [ ] **End-to-end testing** - Verify daemon mode + embedded fallback work
 
 **Platform Support:**
 | Platform | Daemon | GUI Mode | IPC |
@@ -800,8 +811,8 @@ tools = ["*"]  # Full access
 | 60 | ~~Windows Service~~ | ✅ Done |
 | 61 | ~~Session persistence~~ | ✅ Done |
 | 62 | ~~Client library (nanna-client)~~ | ✅ Done |
-| 63 | Wire GUI to daemon client | 🔜 |
-| 64 | Agent integration in daemon | 🔜 |
+| 63 | ~~Wire GUI to daemon client~~ | ✅ Done (2026-02-02) |
+| 64 | ~~Agent integration in daemon~~ | ✅ Done (2026-02-02) |
 | 65 | Webhook server (Axum) | 🔜 |
 | 66 | Telegram listener | ✅ Done |
 | 67 | Unified message router | ✅ Done |
@@ -826,12 +837,12 @@ tools = ["*"]  # Full access
 
 ## Open TODOs (Next Sprint)
 
-### Daemon Completion (High Priority)
-1. **Agent Integration** - Connect `ControlPlane` to `nanna-agent` for actual LLM calls
-2. **GUI Wiring** - Update Tauri backend to use `nanna-client` in daemon mode
-3. **Memory Integration** - Connect daemon to `nanna-memory` for persistence
-4. **Tool Registry** - Wire up `nanna-tools` in daemon
-5. **Fallback Mode** - GUI runs embedded agent when daemon unavailable
+### Daemon Testing & Polish (High Priority)
+1. **End-to-end testing** - Test daemon mode + embedded fallback + reconnection
+2. **Error handling** - Improve error messages for connection failures
+3. **Health endpoint** - Add HTTP `/health` endpoint for monitoring
+4. **PID file** - Prevent multiple daemon instances
+5. **Log rotation** - File-based logs with size/time rotation
 
 ### Channel Listeners (Medium Priority)
 6. **Telegram Listener** - Long-polling `getUpdates` loop
