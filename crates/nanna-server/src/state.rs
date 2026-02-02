@@ -473,6 +473,7 @@ impl AppState {
                     // Check if it's a dreaming task
                     if nanna_core::is_dreaming_task(&task) {
                         let start = std::time::Instant::now();
+                        let started_at = chrono::Utc::now();
                         tracing::info!("Starting memory consolidation (dreaming)...");
 
                         match dreaming.dream().await {
@@ -485,35 +486,48 @@ impl AppState {
                                 );
                                 tracing::info!("{}", output);
 
+                                let finished_at = chrono::Utc::now();
                                 nanna_core::TaskResult {
-                                    task_id: task.id,
+                                    task_id: task.id.clone(),
+                                    task_name: task.name.clone(),
                                     success: true,
                                     output: Some(output),
                                     error: None,
                                     duration_ms: start.elapsed().as_millis() as u64,
+                                    started_at,
+                                    finished_at,
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!("Dreaming failed: {}", e);
+                                let finished_at = chrono::Utc::now();
                                 nanna_core::TaskResult {
-                                    task_id: task.id,
+                                    task_id: task.id.clone(),
+                                    task_name: task.name.clone(),
                                     success: false,
                                     output: None,
                                     error: Some(e.to_string()),
                                     duration_ms: start.elapsed().as_millis() as u64,
+                                    started_at,
+                                    finished_at,
                                 }
                             }
                         }
                     } else {
                         // Default executor for other tasks (heartbeat, etc.)
                         let start = std::time::Instant::now();
+                        let started_at = chrono::Utc::now();
                         tracing::info!("Executing task: {} ({})", task.name, task.id);
+                        let finished_at = chrono::Utc::now();
                         nanna_core::TaskResult {
-                            task_id: task.id,
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
                             success: true,
                             output: Some(task.payload),
                             error: None,
                             duration_ms: start.elapsed().as_millis() as u64,
+                            started_at,
+                            finished_at,
                         }
                     }
                 })
