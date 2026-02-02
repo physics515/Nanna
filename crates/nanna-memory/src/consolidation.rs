@@ -307,6 +307,10 @@ pub fn create_consolidated_entry(
         .max()
         .unwrap_or(0) + 1;
 
+    // Inherit workspace_id from cluster (all memories in cluster should have same workspace)
+    let workspace_id = cluster.memories.first()
+        .and_then(|m| m.workspace_id.clone());
+
     MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         content: consolidated_content,
@@ -314,6 +318,7 @@ pub fn create_consolidated_entry(
         metadata,
         timestamp: now(),
         fsrs,
+        workspace_id,
     }
 }
 
@@ -362,6 +367,7 @@ mod tests {
                 metadata: HashMap::new(),
                 timestamp: 0,
                 fsrs: FsrsState::default(),
+                workspace_id: None,
             },
             MemoryEntry {
                 id: "2".to_string(),
@@ -370,6 +376,7 @@ mod tests {
                 metadata: HashMap::new(),
                 timestamp: 0,
                 fsrs: FsrsState::default(),
+                workspace_id: None,
             },
             MemoryEntry {
                 id: "3".to_string(),
@@ -378,6 +385,7 @@ mod tests {
                 metadata: HashMap::new(),
                 timestamp: 0,
                 fsrs: FsrsState::default(),
+                workspace_id: None,
             },
         ];
 
@@ -397,6 +405,7 @@ mod tests {
                 metadata: HashMap::new(),
                 timestamp: 0,
                 fsrs: FsrsState::default(),
+                workspace_id: None,
             },
             MemoryEntry {
                 id: "2".to_string(),
@@ -405,6 +414,7 @@ mod tests {
                 metadata: HashMap::new(),
                 timestamp: 0,
                 fsrs: FsrsState::default(),
+                workspace_id: None,
             },
         ];
 

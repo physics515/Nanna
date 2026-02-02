@@ -995,11 +995,19 @@ async fn send_message(
     // =========================================================================
     // MEMORY RECALL: Retrieve relevant memories before responding
     // =========================================================================
-    let memory_count = state_guard.memory.count().await;
-    info!("Memory recall: searching {} memories for query: '{}'", 
-          memory_count, message.chars().take(50).collect::<String>());
     
-    let memory_context = match state_guard.memory.recall(&message).await {
+    // Get active workspace ID for scoped memory recall
+    let active_workspace_id = {
+        let registry = state_guard.workspaces.read().await;
+        registry.active().map(|ws| ws.id.clone())
+    };
+    
+    let memory_count = state_guard.memory.count().await;
+    info!("Memory recall: searching {} memories for query: '{}' (workspace: {:?})", 
+          memory_count, message.chars().take(50).collect::<String>(), active_workspace_id);
+    
+    // Use scoped recall - workspace sees global + own, global sees all
+    let memory_context = match state_guard.memory.recall_scoped(&message, active_workspace_id.as_deref()).await {
         Ok(recalled) if !recalled.is_empty() => {
             // Apply FSRS testing effect - recalling strengthens memories
             state_guard.memory.apply_pending_updates().await;
@@ -1134,6 +1142,7 @@ Be concise. Be useful. Be present.{}
     let tools = state_guard.tools.clone();
     let memory = state_guard.memory.clone();
     let user_message = message.clone();
+    let memory_workspace_id = active_workspace_id.clone(); // For scoped memory storage
     
     // Get model priority list and config for fallback
     let model_priority = state_guard.config.llm.model_priority.clone();
@@ -1187,6 +1196,7 @@ Be concise. Be useful. Be present.{}
     
     // Spawn background task to extract memories
     let response_for_extraction = full_response.clone();
+    let workspace_id_for_extraction = memory_workspace_id;
     tokio::spawn(async move {
         extract_and_store_memories(
             &llm_for_extraction,
@@ -1200,6 +1210,7 @@ Be concise. Be useful. Be present.{}
                 extraction_model,
                 chat_model,
             },
+            workspace_id_for_extraction,
         )
         .await;
     });
@@ -1225,6 +1236,7 @@ struct ExtractionConfig {
 /// Skips extraction if embeddings are disabled (recall won't work anyway).
 /// Uses configurable extraction model (falls back to chat model if empty).
 /// Includes importance scoring (1-5) for FSRS prioritization.
+/// Memories are scoped to the provided workspace_id (None = global).
 async fn extract_and_store_memories(
     llm: &LlmClient,
     memory: &MemoryService,
@@ -1233,6 +1245,7 @@ async fn extract_and_store_memories(
     assistant_response: &str,
     session_id: &str,
     config: ExtractionConfig,
+    workspace_id: Option<String>,
 ) {
     // Skip extraction if embeddings are disabled - recall won't work anyway
     if !config.embedding_enabled {
@@ -1327,10 +1340,10 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
                             metadata.insert("importance".to_string(), importance.to_string());
                             metadata.insert("fact_type".to_string(), fact_type.to_string());
                             
-                            // smart_ingest handles duplicate detection via similarity
-                            match memory.remember_with_importance(fact, metadata, importance).await {
+                            // Use scoped remember - memory is tied to current workspace (or global)
+                            match memory.remember_scoped(fact, metadata, importance, workspace_id.clone()).await {
                                 Ok((id, action)) => {
-                                    info!("Memory {} [{}]: {} (id: {}, importance: {})", 
+                                    info!("Memory {} [{}]: {} (id: {}, importance: {}, workspace: {:?})", 
                                         match action {
                                             nanna_memory::IngestAction::Create => "stored",
                                             nanna_memory::IngestAction::Reinforce => "reinforced",
@@ -1339,7 +1352,8 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
                                         fact_type,
                                         fact.chars().take(40).collect::<String>(), 
                                         id,
-                                        importance);
+                                        importance,
+                                        workspace_id);
                                     stored_count += 1;
                                 }
                                 Err(e) => {
@@ -3575,17 +3589,33 @@ pub struct MemoryItem {
     pub access_count: u32,
     pub created_at: String,
     pub session_id: Option<String>,
+    pub workspace_id: Option<String>,  // None = global, Some = workspace-scoped
 }
 
-/// List all semantic memories
+/// List all semantic memories (with optional workspace scope filter)
+/// 
+/// scope: None = all memories, Some("global") = global only, Some(ws_id) = global + that workspace
 #[tauri::command]
 async fn list_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
+    scope: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
     let state_guard = state.read().await;
     let entries = state_guard.memory.list_all().await;
     
-    Ok(entries.into_iter().map(|e| {
+    // Filter by scope
+    let filtered: Vec<_> = entries.into_iter().filter(|e| {
+        match &scope {
+            None => true, // No filter - show all
+            Some(s) if s == "global" => e.workspace_id.is_none(), // Global only
+            Some(ws_id) => {
+                // Workspace scope: show global + that workspace
+                e.workspace_id.is_none() || e.workspace_id.as_deref() == Some(ws_id)
+            }
+        }
+    }).collect();
+    
+    Ok(filtered.into_iter().map(|e| {
         let fact_type = e.metadata.get("fact_type")
             .cloned()
             .unwrap_or_else(|| "stated".to_string());
@@ -3605,6 +3635,7 @@ async fn list_memories(
             access_count: e.access_count,
             created_at,
             session_id,
+            workspace_id: e.workspace_id,
         }
     }).collect())
 }
@@ -3637,6 +3668,7 @@ async fn get_memory(
             access_count: e.access_count,
             created_at,
             session_id,
+            workspace_id: e.workspace_id,
         }
     }))
 }
