@@ -8,6 +8,8 @@
 
 use crate::daemon_client::{ConnectionMode, DaemonClient, DaemonClientConfig, DaemonEvent};
 use crate::daemon_manager::{DaemonManager, DaemonManagerConfig, DaemonState};
+use crate::embedded::EmbeddedBackend;
+use nanna_storage::Session;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -40,6 +42,7 @@ pub struct Backend {
     mode: Arc<RwLock<BackendMode>>,
     daemon_manager: Arc<DaemonManager>,
     daemon_client: Arc<DaemonClient>,
+    embedded: Arc<RwLock<Option<EmbeddedBackend>>>,
     app: Arc<RwLock<Option<AppHandle>>>,
 }
 
@@ -56,8 +59,14 @@ impl Backend {
             mode: Arc::new(RwLock::new(BackendMode::Embedded)),
             daemon_manager: Arc::new(DaemonManager::new(manager_config)),
             daemon_client: Arc::new(DaemonClient::new(client_config)),
+            embedded: Arc::new(RwLock::new(None)),
             app: Arc::new(RwLock::new(None)),
         }
+    }
+    
+    /// Set the embedded backend (must be called before init)
+    pub async fn set_embedded(&self, embedded: EmbeddedBackend) {
+        *self.embedded.write().await = Some(embedded);
     }
     
     /// Set the app handle (required for sidecar and event emission)

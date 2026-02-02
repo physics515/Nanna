@@ -47,6 +47,9 @@ pub enum DaemonError {
     #[error("Config error: {0}")]
     Config(String),
     
+    #[error("Storage error: {0}")]
+    Storage(String),
+    
     #[error("Already running")]
     AlreadyRunning,
     
