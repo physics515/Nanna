@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(cargo check:*)",
+      "WebSearch",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.openclaw.ai)",
+      "WebFetch(domain:www.alif.web.id)",
+      "Bash(npm run build:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl:*)",
+      "Bash(cargo build:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(npm run:*)",
+      "Bash(dir \"%APPDATA%\\\\Claude\")",
+      "Bash(dir \"%USERPROFILE%\\\\.claude\")",
+      "Bash(cd:*)"
+    ]
+  }
+}

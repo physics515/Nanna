@@ -35,14 +35,63 @@
                 API Keys
               </h3>
               <div class="space-y-4">
-                <ApiKeyInput
-                  label="Anthropic"
-                  provider="anthropic"
-                  placeholder="sk-ant-..."
-                  :is-set="settings?.anthropic_key_set"
-                  hint="For Claude models"
-                  @save="saveApiKey"
-                />
+                <!-- Anthropic (OAuth only, via claude setup-token) -->
+                <div class="space-y-3">
+                  <div class="flex items-center justify-between">
+                    <label class="text-sm font-medium text-nanna-text">Anthropic</label>
+                    <UiBadge v-if="settings?.anthropic_oauth_logged_in" variant="success">Logged In</UiBadge>
+                  </div>
+
+                  <!-- Logged in state -->
+                  <div v-if="settings?.anthropic_oauth_logged_in" class="space-y-3">
+                    <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-success/10 border border-nanna-success/30">
+                      <div class="flex items-center gap-2">
+                        <CheckCircle class="w-4 h-4 text-nanna-success" />
+                        <span class="text-sm text-nanna-text">Authenticated via Claude Code</span>
+                      </div>
+                      <UiButton @click="logoutAnthropic" variant="ghost" size="sm">
+                        <LogOut class="w-4 h-4 mr-1" />
+                        Logout
+                      </UiButton>
+                    </div>
+                  </div>
+
+                  <!-- Not logged in state -->
+                  <div v-else class="space-y-3">
+                    <p class="text-xs text-nanna-text-muted">
+                      Run <code class="bg-nanna-bg-elevated px-1 rounded">claude setup-token</code> and paste the token below.
+                    </p>
+
+                    <!-- Token input box -->
+                    <div class="flex gap-2">
+                      <UiInput
+                        v-model="oauthTokenInput"
+                        type="password"
+                        placeholder="Paste token from claude setup-token..."
+                        class="flex-1 font-mono text-sm"
+                      />
+                      <UiButton @click="saveOAuthToken" :disabled="!oauthTokenInput.trim() || oauthLoading" size="sm">
+                        <UiSpinner v-if="oauthLoading" size="sm" class="mr-1" />
+                        {{ oauthLoading ? 'Saving...' : 'Save' }}
+                      </UiButton>
+                    </div>
+
+                    <!-- Helper buttons -->
+                    <div class="flex gap-2">
+                      <UiButton @click="runClaudeSetupToken" :disabled="oauthLoading" variant="outline" size="sm" class="flex-1">
+                        <UiSpinner v-if="oauthLoading && oauthAction === 'setup'" size="sm" class="mr-1" />
+                        <Terminal v-else class="w-3 h-3 mr-1" />
+                        {{ oauthLoading && oauthAction === 'setup' ? 'Running...' : 'Run CLI' }}
+                      </UiButton>
+                      <UiButton @click="importClaudeCodeCredentials" :disabled="oauthLoading" variant="outline" size="sm" class="flex-1">
+                        <UiSpinner v-if="oauthLoading && oauthAction === 'import'" size="sm" class="mr-1" />
+                        <Download v-else class="w-3 h-3 mr-1" />
+                        {{ oauthLoading && oauthAction === 'import' ? 'Importing...' : 'Import' }}
+                      </UiButton>
+                    </div>
+                  </div>
+                </div>
+
                 <ApiKeyInput
                   label="OpenAI"
                   provider="openai"
@@ -59,9 +108,55 @@
                   hint="For multi-provider access"
                   @save="saveApiKey"
                 />
+                <ApiKeyInput
+                  label="GitHub Models"
+                  provider="github"
+                  placeholder="ghp_..."
+                  :is-set="settings?.github_key_set"
+                  hint="Use Copilot models via GitHub token"
+                  @save="saveApiKey"
+                />
+
+                <!-- Claude Proxy (claude-max-api-proxy) -->
+                <div class="space-y-2 p-3 rounded-lg bg-nanna-bg-elevated/50 border border-nanna-border/30">
+                  <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                      <span class="text-sm font-medium text-nanna-text">Claude Proxy</span>
+                      <span
+                        v-if="claudeProxyHealthy"
+                        class="px-1.5 py-0.5 text-[10px] rounded bg-nanna-success/20 text-nanna-success"
+                      >Online</span>
+                      <span
+                        v-else-if="settings?.claude_proxy_enabled"
+                        class="px-1.5 py-0.5 text-[10px] rounded bg-nanna-error/20 text-nanna-error"
+                      >Offline</span>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                      <input
+                        type="checkbox"
+                        :checked="settings?.claude_proxy_enabled"
+                        @change="toggleClaudeProxy"
+                        class="sr-only peer"
+                      >
+                      <div class="w-9 h-5 bg-nanna-bg-elevated peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-nanna-text-muted after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-nanna-primary peer-checked:after:bg-white"></div>
+                    </label>
+                  </div>
+                  <p class="text-xs text-nanna-text-muted">
+                    Route through claude-max-api-proxy to use Claude Pro/Max subscription
+                  </p>
+                  <div v-if="settings?.claude_proxy_enabled" class="flex gap-2 mt-2">
+                    <input
+                      v-model="claudeProxyUrl"
+                      type="text"
+                      placeholder="http://localhost:3456"
+                      class="flex-1 px-2 py-1.5 text-sm bg-nanna-bg rounded border border-nanna-border/50 text-nanna-text placeholder:text-nanna-text-muted/50 focus:outline-none focus:border-nanna-primary"
+                    >
+                    <UiButton @click="saveClaudeProxyUrl" size="sm" variant="ghost">Save</UiButton>
+                  </div>
+                </div>
               </div>
             </UiCard>
-            
+
             <!-- Model Priority (Fallback Chain) -->
             <UiCard>
               <div class="flex items-center justify-between mb-4">
@@ -501,10 +596,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { 
-  ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon, 
+import {
+  ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon,
   RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp,
-  Bot, MessageSquare, AlertTriangle
+  Bot, MessageSquare, AlertTriangle, LogOut, Download, Terminal
 } from 'lucide-vue-next'
 
 interface ToolInfo {
@@ -517,7 +612,13 @@ interface ExtendedSettings {
   anthropic_key_set: boolean
   openai_key_set: boolean
   openrouter_key_set: boolean
+  github_key_set: boolean
+  claude_proxy_enabled: boolean
+  claude_proxy_url: string
   brave_key_set: boolean
+  // Anthropic OAuth
+  anthropic_oauth_logged_in: boolean
+  anthropic_use_oauth: boolean
   provider: string
   available_providers: string[]
   model: string
@@ -589,69 +690,69 @@ const maxTokens = ref(4096)
 const chatModelPriority = ref<string[]>([])
 const embeddingModelPriority = ref<string[]>([])
 
+// Anthropic OAuth state
+const oauthTokenInput = ref('')
+const oauthLoading = ref(false)
+const oauthAction = ref<'setup' | 'import' | null>(null)
+
 // Dynamically fetched models from APIs
 const anthropicModels = ref<ModelInfo[]>([])
 const openaiModels = ref<ModelInfo[]>([])
+const openrouterModels = ref<ModelInfo[]>([])
+const githubModels = ref<ModelInfo[]>([])
+const claudeProxyModels = ref<ModelInfo[]>([])
+
+// Claude Proxy state
+const claudeProxyUrl = ref('http://localhost:3456')
+const claudeProxyHealthy = ref(false)
 
 // All available models with provider info
 import type { ModelOption } from '~/components/ModelPriorityList.vue'
 
 const allChatModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
-  
-  // Anthropic models (dynamically fetched, or fallback)
-  if (settings.value?.anthropic_key_set) {
-    if (anthropicModels.value.length > 0) {
-      // Use dynamically fetched models
-      for (const m of anthropicModels.value) {
-        models.push({ id: m.id, name: m.name, provider: 'anthropic', available: true })
-      }
-    } else {
-      // Fallback to known models if API call failed
-      models.push(
-        { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', provider: 'anthropic', available: true },
-        { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', provider: 'anthropic', available: true },
-        { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', available: true },
-        { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', provider: 'anthropic', available: true },
-      )
+
+  // Anthropic models (dynamically fetched from API)
+  // Available if either API key is set or OAuth is logged in
+  const anthropicAvailable = settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in
+  if (anthropicAvailable && anthropicModels.value.length > 0) {
+    for (const m of anthropicModels.value) {
+      models.push({ id: m.id, name: m.name, provider: 'anthropic', available: true })
     }
   }
-  
-  // OpenAI models (dynamically fetched, or fallback)
-  if (settings.value?.openai_key_set) {
-    const chatModels = openaiModels.value.filter(m => 
+
+  // OpenAI models (dynamically fetched from API)
+  if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    const chatModels = openaiModels.value.filter(m =>
       m.id.startsWith('gpt-') || m.id.startsWith('o1') || m.id.startsWith('o3') || m.id.startsWith('chatgpt')
     )
-    if (chatModels.length > 0) {
-      // Use dynamically fetched models
-      for (const m of chatModels) {
-        models.push({ id: m.id, name: m.name, provider: 'openai', available: true })
-      }
-    } else {
-      // Fallback to known models if API call failed
-      models.push(
-        { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', available: true },
-        { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', available: true },
-        { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', provider: 'openai', available: true },
-        { id: 'o1', name: 'o1', provider: 'openai', available: true },
-        { id: 'o1-mini', name: 'o1 Mini', provider: 'openai', available: true },
-      )
+    for (const m of chatModels) {
+      models.push({ id: m.id, name: m.name, provider: 'openai', available: true })
     }
   }
-  
-  // OpenRouter models (hardcoded popular models - OpenRouter has thousands)
-  if (settings.value?.openrouter_key_set) {
-    models.push(
-      { id: 'anthropic/claude-sonnet-4-20250514', name: 'Claude Sonnet 4 (OR)', provider: 'openrouter', available: true },
-      { id: 'anthropic/claude-opus-4-20250514', name: 'Claude Opus 4 (OR)', provider: 'openrouter', available: true },
-      { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'openrouter', available: true },
-      { id: 'google/gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash', provider: 'openrouter', available: true },
-      { id: 'google/gemini-2.5-pro-preview', name: 'Gemini 2.5 Pro', provider: 'openrouter', available: true },
-      { id: 'openai/gpt-4o', name: 'GPT-4o (OR)', provider: 'openrouter', available: true },
-      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'Llama 3.3 70B', provider: 'openrouter', available: true },
-    )
+
+  // OpenRouter models (dynamically fetched from API)
+  // Prefix with openrouter/ so parse_model_id recognizes the provider
+  if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    for (const m of openrouterModels.value) {
+      models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
+    }
   }
-  
+
+  // GitHub Models (dynamically fetched from API)
+  if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    for (const m of githubModels.value) {
+      models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
+    }
+  }
+
+  // Claude Proxy models (via claude-max-api-proxy)
+  if (settings.value?.claude_proxy_enabled && claudeProxyModels.value.length > 0) {
+    for (const m of claudeProxyModels.value) {
+      models.push({ id: `claude-proxy/${m.id}`, name: `${m.name} (Proxy)`, provider: 'claude-proxy', available: claudeProxyHealthy.value })
+    }
+  }
+
   // Ollama models (dynamically fetched - always dynamic)
   for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
     models.push({ id: `ollama/${m.name}`, name: m.name, provider: 'ollama', available: true })
@@ -662,28 +763,20 @@ const allChatModels = computed<ModelOption[]>(() => {
 
 const allEmbeddingModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
-  
-  // OpenAI embedding models (dynamically fetched, or fallback)
-  if (settings.value?.openai_key_set) {
+
+  // OpenAI embedding models (dynamically fetched from API)
+  if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
     const embeddingModels = openaiModels.value.filter(m => m.id.startsWith('text-embedding'))
-    if (embeddingModels.length > 0) {
-      for (const m of embeddingModels) {
-        models.push({ id: `openai/${m.id}`, name: m.name, provider: 'openai', available: true })
-      }
-    } else {
-      // Fallback
-      models.push(
-        { id: 'openai/text-embedding-3-small', name: 'text-embedding-3-small (1536d)', provider: 'openai', available: true },
-        { id: 'openai/text-embedding-3-large', name: 'text-embedding-3-large (3072d)', provider: 'openai', available: true },
-      )
+    for (const m of embeddingModels) {
+      models.push({ id: `openai/${m.id}`, name: m.name, provider: 'openai', available: true })
     }
   }
-  
+
   // Ollama embedding models (dynamically fetched)
   for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
     models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB)`, provider: 'ollama', available: true })
   }
-  
+
   return models
 })
 
@@ -717,6 +810,7 @@ async function loadSettings() {
     selectedModel.value = settings.value.model
     selectedEmbeddingModel.value = settings.value.embedding_model
     ollamaHostInput.value = settings.value.ollama_host
+    claudeProxyUrl.value = settings.value.claude_proxy_url || 'http://localhost:3456'
     // Load agent settings
     agentName.value = settings.value.agent_name || 'Nanna'
     personalityMode.value = settings.value.personality_mode || 'balanced'
@@ -756,12 +850,12 @@ async function refreshModels() {
   // Fetch models from all available providers in parallel
   const promises: Promise<void>[] = []
   
-  // Anthropic models
-  if (settings.value.anthropic_key_set) {
+  // Anthropic models (fetch if API key OR OAuth is available)
+  if (settings.value.anthropic_key_set || settings.value.anthropic_oauth_logged_in) {
     promises.push(
       invoke<ModelInfo[]>('get_anthropic_models')
         .then(models => { anthropicModels.value = models })
-        .catch(e => { 
+        .catch(e => {
           console.warn('Failed to fetch Anthropic models:', e)
           anthropicModels.value = [] // Will use fallback in computed
         })
@@ -773,13 +867,62 @@ async function refreshModels() {
     promises.push(
       invoke<ModelInfo[]>('get_openai_models')
         .then(models => { openaiModels.value = models })
-        .catch(e => { 
+        .catch(e => {
           console.warn('Failed to fetch OpenAI models:', e)
-          openaiModels.value = [] // Will use fallback in computed
+          openaiModels.value = []
         })
     )
   }
-  
+
+  // OpenRouter models
+  if (settings.value.openrouter_key_set) {
+    promises.push(
+      invoke<ModelInfo[]>('get_openrouter_models')
+        .then(models => { openrouterModels.value = models })
+        .catch(e => {
+          console.warn('Failed to fetch OpenRouter models:', e)
+          openrouterModels.value = []
+        })
+    )
+  }
+
+  // GitHub models
+  if (settings.value.github_key_set) {
+    promises.push(
+      invoke<ModelInfo[]>('get_github_models')
+        .then(models => { githubModels.value = models })
+        .catch(e => {
+          console.warn('Failed to fetch GitHub models:', e)
+          githubModels.value = []
+        })
+    )
+  }
+
+  // Claude Proxy models (check health first)
+  if (settings.value.claude_proxy_enabled) {
+    promises.push(
+      invoke<boolean>('check_claude_proxy_health')
+        .then(async (healthy) => {
+          claudeProxyHealthy.value = healthy
+          if (healthy) {
+            try {
+              claudeProxyModels.value = await invoke<ModelInfo[]>('get_claude_proxy_models')
+            } catch (e) {
+              console.warn('Failed to fetch Claude Proxy models:', e)
+              claudeProxyModels.value = []
+            }
+          } else {
+            claudeProxyModels.value = []
+          }
+        })
+        .catch(e => {
+          console.warn('Failed to check Claude Proxy health:', e)
+          claudeProxyHealthy.value = false
+          claudeProxyModels.value = []
+        })
+    )
+  }
+
   // Wait for all fetches to complete
   await Promise.all(promises)
   loadingModels.value = false
@@ -857,6 +1000,95 @@ async function saveApiKey(provider: string, apiKey: string) {
   try {
     await invoke('set_provider_api_key', { provider, apiKey })
     showToast(`${formatProvider(provider)} API key saved`, 'success')
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+// =============================================================================
+// Claude Proxy (claude-max-api-proxy)
+// =============================================================================
+
+async function toggleClaudeProxy(event: Event) {
+  const enabled = (event.target as HTMLInputElement).checked
+  try {
+    await invoke('set_claude_proxy', { enabled, url: claudeProxyUrl.value })
+    await loadSettings()
+    if (enabled) {
+      await refreshModels()
+    }
+    showToast(enabled ? 'Claude Proxy enabled' : 'Claude Proxy disabled', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveClaudeProxyUrl() {
+  try {
+    await invoke('set_claude_proxy', { enabled: true, url: claudeProxyUrl.value })
+    await refreshModels()
+    showToast('Claude Proxy URL saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+// =============================================================================
+// Anthropic OAuth Token
+// =============================================================================
+
+async function saveOAuthToken() {
+  const token = oauthTokenInput.value.trim()
+  if (!token) return
+
+  try {
+    await invoke('save_anthropic_oauth_token', { token })
+    oauthTokenInput.value = ''
+    showToast('Anthropic token saved', 'success')
+    await loadSettings()
+    await refreshModels()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function runClaudeSetupToken() {
+  oauthLoading.value = true
+  oauthAction.value = 'setup'
+  try {
+    const result = await invoke<string>('run_claude_setup_token')
+    showToast(result || 'Successfully authenticated via Claude Code CLI', 'success')
+    await loadSettings()
+    await refreshModels()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  } finally {
+    oauthLoading.value = false
+    oauthAction.value = null
+  }
+}
+
+async function importClaudeCodeCredentials() {
+  oauthLoading.value = true
+  oauthAction.value = 'import'
+  try {
+    await invoke('import_claude_code_credentials')
+    showToast('Successfully imported Claude Code credentials', 'success')
+    await loadSettings()
+    await refreshModels()
+  } catch (e: any) {
+    showToast(`Failed to import: ${e.message || e}`, 'error')
+  } finally {
+    oauthLoading.value = false
+    oauthAction.value = null
+  }
+}
+
+async function logoutAnthropic() {
+  try {
+    await invoke('logout_anthropic_oauth')
+    showToast('Logged out of Anthropic', 'success')
     await loadSettings()
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')
@@ -1117,7 +1349,7 @@ function formatInterval(seconds: number): string {
 
 function formatProvider(provider: string): string {
   const names: Record<string, string> = {
-    anthropic: 'Anthropic', openai: 'OpenAI', openrouter: 'OpenRouter', ollama: 'Ollama',
+    anthropic: 'Anthropic', openai: 'OpenAI', openrouter: 'OpenRouter', github: 'GitHub Models', 'claude-proxy': 'Claude Proxy', ollama: 'Ollama',
   }
   return names[provider] || provider
 }

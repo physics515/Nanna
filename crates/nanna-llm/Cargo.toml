@@ -3,6 +3,10 @@ name = "nanna-llm"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+auto-refresh = ["nanna-config"]
+
 [dependencies]
 tokio.workspace = true
 reqwest.workspace = true
@@ -12,3 +16,6 @@ tracing.workspace = true
 thiserror.workspace = true
 futures = "0.3"
 async-stream = "0.3"
+
+# Optional: for OAuth auto-refresh
+nanna-config = { path = "../nanna-config", optional = true }

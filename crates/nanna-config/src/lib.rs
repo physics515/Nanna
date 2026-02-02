@@ -3,6 +3,12 @@
 
 //! Configuration management for Nanna
 
+pub mod credentials;
+
+pub use credentials::{
+    ClaudeCredentialManager, CredentialError, CredentialSource, LoadedCredential, OAuthCredential,
+};
+
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -74,9 +80,17 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// OpenAI API key for embeddings (semantic memory)
     pub openai_api_key: Option<String>,
+    /// OpenRouter API key for multi-provider access
+    pub openrouter_api_key: Option<String>,
+    /// GitHub token for GitHub Models
+    pub github_token: Option<String>,
     /// Model priority list for fallback (first working model is used)
     /// Format: ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "ollama/llama3.2"]
     pub model_priority: Vec<String>,
+    /// Anthropic OAuth access token (alternative to API key)
+    pub anthropic_oauth_token: Option<String>,
+    /// Whether to use OAuth token instead of API key for Anthropic
+    pub anthropic_use_oauth: bool,
 }
 
 impl Default for LlmConfig {
@@ -89,10 +103,14 @@ impl Default for LlmConfig {
             max_tokens: 8192,
             temperature: 0.7,
             openai_api_key: None,
+            openrouter_api_key: None,
+            github_token: None,
             model_priority: vec![
                 "claude-sonnet-4-20250514".to_string(),
                 "claude-3-5-sonnet-20241022".to_string(),
             ],
+            anthropic_oauth_token: None,
+            anthropic_use_oauth: false,
         }
     }
 }

@@ -824,6 +824,12 @@ struct PendingToolCall {
 /// Parse a model ID to extract provider and model name
 /// Format: "provider/model" or just "model" (defaults to anthropic)
 fn parse_model_id(model_id: &str) -> (String, String) {
+    // Handle openrouter/vendor/model format (e.g., openrouter/meta-llama/llama-3.3-70b-instruct:free)
+    if model_id.starts_with("openrouter/") {
+        let rest = &model_id["openrouter/".len()..];
+        return ("openrouter".to_string(), rest.to_string());
+    }
+
     if let Some((provider, model)) = model_id.split_once('/') {
         (provider.to_string(), model.to_string())
     } else {
@@ -844,9 +850,16 @@ fn parse_model_id(model_id: &str) -> (String, String) {
 /// Create an LLM client for a specific model
 fn create_llm_client_for_model(model_id: &str, config: &Config, ollama_host: &str) -> Option<(LlmClient, String)> {
     let (provider, model_name) = parse_model_id(model_id);
-    
+
     match provider.as_str() {
         "anthropic" => {
+            // Check if OAuth is enabled and has a token
+            if config.llm.anthropic_use_oauth {
+                if let Some(ref oauth_token) = config.llm.anthropic_oauth_token {
+                    return Some((LlmClient::anthropic_oauth(oauth_token), model_name));
+                }
+            }
+            // Fall back to API key
             let api_key = config.llm.api_key.clone()
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())?;
             Some((LlmClient::anthropic(&api_key), model_name))
@@ -857,8 +870,19 @@ fn create_llm_client_for_model(model_id: &str, config: &Config, ollama_host: &st
             Some((LlmClient::openai(&api_key), model_name))
         }
         "openrouter" => {
-            let api_key = std::env::var("OPENROUTER_API_KEY").ok()?;
+            let api_key = config.llm.openrouter_api_key.clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())?;
             Some((LlmClient::openrouter(&api_key), model_name))
+        }
+        "github" => {
+            let api_key = config.llm.github_token.clone()
+                .or_else(|| std::env::var("GITHUB_TOKEN").ok())?;
+            Some((LlmClient::github_models(&api_key), model_name))
+        }
+        "claude-proxy" => {
+            let proxy_url = std::env::var("CLAUDE_PROXY_URL")
+                .unwrap_or_else(|_| "http://localhost:3456".to_string());
+            Some((LlmClient::claude_proxy(&proxy_url), model_name))
         }
         "ollama" => {
             Some((LlmClient::ollama(ollama_host), model_name))
@@ -889,7 +913,9 @@ fn select_best_model(
         let has_credentials = match provider.as_str() {
             "anthropic" => config.llm.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok(),
             "openai" => config.llm.openai_api_key.is_some() || std::env::var("OPENAI_API_KEY").is_ok(),
-            "openrouter" => std::env::var("OPENROUTER_API_KEY").is_ok(),
+            "openrouter" => config.llm.openrouter_api_key.is_some() || std::env::var("OPENROUTER_API_KEY").is_ok(),
+            "github" => config.llm.github_token.is_some() || std::env::var("GITHUB_TOKEN").is_ok(),
+            "claude-proxy" => std::env::var("CLAUDE_PROXY_ENABLED").is_ok(), // Enabled via env var
             "ollama" => true, // Always available (local)
             _ => false,
         };
@@ -2154,38 +2180,45 @@ pub struct ExtendedSettings {
     pub anthropic_key_set: bool,
     pub openai_key_set: bool,
     pub openrouter_key_set: bool,
+    pub github_key_set: bool,
+    pub claude_proxy_enabled: bool,
+    pub claude_proxy_url: String,
     pub brave_key_set: bool,
-    
+
+    // Anthropic OAuth status
+    pub anthropic_oauth_logged_in: bool,
+    pub anthropic_use_oauth: bool,
+
     // Chat Provider
     pub provider: String,
     pub available_providers: Vec<String>,
-    
+
     // Chat Model
     pub model: String,
     pub available_models: Vec<String>,
-    
+
     // Embedding Provider (separate from chat)
     pub embedding_provider: String,
     pub embedding_model: String,
     pub available_embedding_providers: Vec<String>,
     pub available_embedding_models: Vec<String>,
     pub embedding_enabled: bool,
-    
+
     // Memory extraction model (empty = use chat model)
     pub extraction_model: String,
     pub available_extraction_models: Vec<String>,
-    
+
     // Ollama configuration
     pub ollama_host: String,
-    
+
     // Generation params
     pub temperature: f32,
     pub top_p: f32,
     pub max_tokens: u32,
-    
+
     // Tools
     pub tools: Vec<ToolInfo>,
-    
+
     // Memory & Scheduling
     pub dreaming_enabled: bool,
     pub scheduler_enabled: bool,
@@ -2230,17 +2263,30 @@ async fn get_extended_settings(
     let ollama_host = state_guard.ollama_host.read().await.clone();
     
     Ok(ExtendedSettings {
-        anthropic_key_set: state_guard.config.llm.api_key.is_some() 
+        anthropic_key_set: state_guard.config.llm.api_key.is_some()
             || std::env::var("ANTHROPIC_API_KEY").is_ok(),
-        openai_key_set: std::env::var("OPENAI_API_KEY").is_ok(),
-        openrouter_key_set: std::env::var("OPENROUTER_API_KEY").is_ok(),
+        openai_key_set: state_guard.config.llm.openai_api_key.is_some()
+            || std::env::var("OPENAI_API_KEY").is_ok(),
+        openrouter_key_set: state_guard.config.llm.openrouter_api_key.is_some()
+            || std::env::var("OPENROUTER_API_KEY").is_ok(),
+        github_key_set: state_guard.config.llm.github_token.is_some()
+            || std::env::var("GITHUB_TOKEN").is_ok(),
+        claude_proxy_enabled: std::env::var("CLAUDE_PROXY_ENABLED").is_ok(),
+        claude_proxy_url: std::env::var("CLAUDE_PROXY_URL")
+            .unwrap_or_else(|_| "http://localhost:3456".to_string()),
         brave_key_set: std::env::var("BRAVE_API_KEY").is_ok(),
-        
+
+        // Anthropic OAuth status
+        anthropic_oauth_logged_in: state_guard.config.llm.anthropic_oauth_token.is_some(),
+        anthropic_use_oauth: state_guard.config.llm.anthropic_use_oauth,
+
         provider: state_guard.config.llm.provider.clone(),
         available_providers: vec![
             "anthropic".to_string(),
             "openai".to_string(),
             "openrouter".to_string(),
+            "github".to_string(),
+            "claude-proxy".to_string(),
             "ollama".to_string(),
         ],
         
@@ -2439,11 +2485,31 @@ async fn set_provider_api_key(
             state_guard.tools.register(web_search).await;
         }
         "openrouter" => {
+            state_guard.config.llm.openrouter_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
+
+            if state_guard.config.llm.provider == "openrouter" {
+                state_guard.llm = Arc::new(LlmClient::openrouter(&api_key));
+            }
+        }
+        "github" => {
+            state_guard.config.llm.github_token = Some(api_key.clone());
+            unsafe { std::env::set_var("GITHUB_TOKEN", &api_key); }
+
+            if state_guard.config.llm.provider == "github" {
+                state_guard.llm = Arc::new(LlmClient::github_models(&api_key));
+            }
+        }
+        "claude-proxy" => {
+            // For claude-proxy, the "api_key" is actually the proxy URL
+            unsafe {
+                std::env::set_var("CLAUDE_PROXY_URL", &api_key);
+                std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
+            }
         }
         _ => return Err(format!("Unknown provider: {}", provider)),
     }
-    
+
     // Persist to config file so keys survive restarts
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
@@ -2454,6 +2520,279 @@ async fn set_provider_api_key(
     Ok(())
 }
 
+// =============================================================================
+// Anthropic OAuth Login (via `claude setup-token`)
+// =============================================================================
+
+/// Run `claude setup-token` to authenticate via Claude Code CLI
+/// This opens a browser for OAuth, then imports the resulting credentials
+#[tauri::command]
+async fn run_claude_setup_token(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<String, String> {
+    use nanna_config::ClaudeCredentialManager;
+
+    // Check if Claude CLI is available
+    if !ClaudeCredentialManager::is_claude_cli_available() {
+        return Err(
+            "Claude Code CLI not found. Please install it first:\n\
+             npm install -g @anthropic-ai/claude-code\n\n\
+             Or paste your token from `claude setup-token` directly.".to_string()
+        );
+    }
+
+    info!("Running claude setup-token...");
+
+    // Run claude setup-token (this will open browser and wait for auth)
+    ClaudeCredentialManager::run_setup_token()
+        .map_err(|e| format!("Failed to run claude setup-token: {}", e))?;
+
+    info!("claude setup-token completed");
+
+    // Now import the credentials that were saved
+    let manager = ClaudeCredentialManager::new();
+    let loaded = manager.load()
+        .map_err(|e| format!("Failed to load credentials after setup: {}", e))?;
+
+    // Save the token
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
+    state_guard.config.llm.anthropic_use_oauth = true;
+
+    if state_guard.config.llm.provider == "anthropic" {
+        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&loaded.credential.access_token));
+    }
+
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save OAuth token: {}", e);
+    }
+
+    let subscription = loaded.credential.subscription_type.unwrap_or_else(|| "unknown".to_string());
+    info!("Successfully authenticated via claude setup-token (subscription: {})", subscription);
+
+    Ok(format!("Successfully authenticated! Subscription: {}", subscription))
+}
+
+/// Import credentials from Claude Code CLI (~/.claude/.credentials.json)
+/// This uses the token that Claude Code CLI obtained, which is whitelisted
+#[tauri::command]
+async fn import_claude_code_credentials(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    use nanna_config::ClaudeCredentialManager;
+
+    let manager = ClaudeCredentialManager::new();
+
+    // Load credentials (checks file and keychain)
+    let loaded = manager.load()
+        .map_err(|e| format!("No credentials found: {}. Please run `claude login` first.", e))?;
+
+    // Check if token is expired
+    if loaded.credential.is_expired() {
+        if loaded.credential.can_refresh() {
+            info!("Token expired, attempting auto-refresh...");
+            let refreshed = manager.refresh_token(&loaded.credential).await
+                .map_err(|e| format!("Token expired and refresh failed: {}. Please run `claude login`.", e))?;
+            
+            // Save refreshed token back to source
+            if let Err(e) = manager.save(&refreshed, loaded.source) {
+                warn!("Failed to save refreshed token: {}", e);
+            }
+
+            // Update state with refreshed token
+            let mut state_guard = state.write().await;
+            state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
+            state_guard.config.llm.anthropic_use_oauth = true;
+
+            if state_guard.config.llm.provider == "anthropic" {
+                state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&refreshed.access_token));
+            }
+
+            if let Err(e) = state_guard.config.save() {
+                error!("Failed to save config: {}", e);
+            }
+
+            info!("Token refreshed and imported (subscription: {:?})", refreshed.subscription_type);
+            return Ok(());
+        } else {
+            return Err("Token expired and cannot auto-refresh. Please run `claude login`.".to_string());
+        }
+    }
+
+    info!(
+        "Imported Claude Code credentials (subscription: {:?})",
+        loaded.credential.subscription_type
+    );
+
+    // Save the token and enable OAuth mode
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
+    state_guard.config.llm.anthropic_use_oauth = true;
+
+    // Recreate LLM client with OAuth token
+    if state_guard.config.llm.provider == "anthropic" {
+        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&loaded.credential.access_token));
+    }
+
+    // Persist to config
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save OAuth token: {}", e);
+    }
+
+    info!("Successfully imported Claude Code credentials");
+    Ok(())
+}
+
+/// Save an Anthropic OAuth token directly (from `claude setup-token`)
+#[tauri::command]
+async fn save_anthropic_oauth_token(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    token: String,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("Token cannot be empty".to_string());
+    }
+
+    // Save the token and enable OAuth mode
+    state_guard.config.llm.anthropic_oauth_token = Some(token.clone());
+    state_guard.config.llm.anthropic_use_oauth = true;
+
+    // Recreate LLM client with OAuth token if anthropic is active provider
+    if state_guard.config.llm.provider == "anthropic" {
+        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&token));
+    }
+
+    // Persist to config
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save OAuth token: {}", e);
+    }
+
+    info!("Anthropic OAuth token saved");
+    Ok(())
+}
+
+/// Log out of Anthropic OAuth (clear token and switch to API key mode)
+#[tauri::command]
+async fn logout_anthropic_oauth(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+
+    state_guard.config.llm.anthropic_oauth_token = None;
+    state_guard.config.llm.anthropic_use_oauth = false;
+
+    // If using anthropic, switch back to API key if available
+    if state_guard.config.llm.provider == "anthropic" {
+        if let Some(api_key) = state_guard.config.llm.api_key.clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        {
+            state_guard.llm = Arc::new(LlmClient::anthropic(&api_key));
+        }
+    }
+
+    // Persist to config
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save config after logout: {}", e);
+    }
+
+    info!("Anthropic OAuth logout successful");
+    Ok(())
+}
+
+/// Get Claude CLI credential status
+#[derive(serde::Serialize)]
+struct CredentialStatus {
+    cli_available: bool,
+    credentials_found: bool,
+    source: Option<String>,
+    is_expired: bool,
+    can_refresh: bool,
+    seconds_until_expiry: Option<i64>,
+    subscription_type: Option<String>,
+}
+
+#[tauri::command]
+async fn get_credential_status() -> Result<CredentialStatus, String> {
+    use nanna_config::{ClaudeCredentialManager, CredentialSource};
+
+    let cli_available = ClaudeCredentialManager::is_claude_cli_available();
+    let manager = ClaudeCredentialManager::new();
+
+    match manager.load() {
+        Ok(loaded) => {
+            let source = match loaded.source {
+                CredentialSource::File => "file",
+                CredentialSource::MacOsKeychain => "macos_keychain",
+                CredentialSource::WindowsCredentialManager => "windows_credential_manager",
+            };
+            Ok(CredentialStatus {
+                cli_available,
+                credentials_found: true,
+                source: Some(source.to_string()),
+                is_expired: loaded.credential.is_expired(),
+                can_refresh: loaded.credential.can_refresh(),
+                seconds_until_expiry: loaded.credential.seconds_until_expiry(),
+                subscription_type: loaded.credential.subscription_type,
+            })
+        }
+        Err(_) => {
+            Ok(CredentialStatus {
+                cli_available,
+                credentials_found: false,
+                source: None,
+                is_expired: false,
+                can_refresh: false,
+                seconds_until_expiry: None,
+                subscription_type: None,
+            })
+        }
+    }
+}
+
+/// Refresh the OAuth token if expired or expiring soon
+#[tauri::command]
+async fn refresh_oauth_token(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<String, String> {
+    use nanna_config::ClaudeCredentialManager;
+
+    let manager = ClaudeCredentialManager::new();
+    let loaded = manager.load()
+        .map_err(|e| format!("No credentials found: {}", e))?;
+
+    if !loaded.credential.can_refresh() {
+        return Err("Cannot refresh: no refresh token available".to_string());
+    }
+
+    let refreshed = manager.refresh_token(&loaded.credential).await
+        .map_err(|e| format!("Token refresh failed: {}", e))?;
+
+    // Save back to source
+    if let Err(e) = manager.save(&refreshed, loaded.source) {
+        warn!("Failed to save refreshed token to source: {}", e);
+    }
+
+    // Update app state
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
+
+    if state_guard.config.llm.provider == "anthropic" && state_guard.config.llm.anthropic_use_oauth {
+        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&refreshed.access_token));
+    }
+
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save config: {}", e);
+    }
+
+    let hours = refreshed.seconds_until_expiry().map(|s| s / 3600).unwrap_or(0);
+    info!("OAuth token refreshed, expires in {}h", hours);
+
+    Ok(format!("Token refreshed! Expires in {}h", hours))
+}
+
 /// Set the active LLM provider
 #[tauri::command]
 async fn set_provider(
@@ -2461,24 +2800,38 @@ async fn set_provider(
     provider: String,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    
+
     // Create new LLM client based on provider
     let llm = match provider.as_str() {
         "anthropic" => {
-            let api_key = state_guard.config.llm.api_key.clone()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .ok_or_else(|| "No API key set for anthropic".to_string())?;
-            LlmClient::anthropic(&api_key)
+            // Always use OAuth token for Anthropic (from `claude setup-token`)
+            let oauth_token = state_guard.config.llm.anthropic_oauth_token.clone()
+                .ok_or_else(|| "No OAuth token available. Run `claude setup-token` or paste your token.".to_string())?;
+            LlmClient::anthropic_oauth(&oauth_token)
         }
         "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .map_err(|_| "No API key set for openai".to_string())?;
+            let api_key = state_guard.config.llm.openai_api_key.clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .ok_or_else(|| "No API key set for openai".to_string())?;
             LlmClient::openai(&api_key)
         }
         "openrouter" => {
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .map_err(|_| "No API key set for openrouter".to_string())?;
+            let api_key = state_guard.config.llm.openrouter_api_key.clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .ok_or_else(|| "No API key set for openrouter".to_string())?;
             LlmClient::openrouter(&api_key)
+        }
+        "github" => {
+            let api_key = state_guard.config.llm.github_token.clone()
+                .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+                .ok_or_else(|| "No API key set for github".to_string())?;
+            LlmClient::github_models(&api_key)
+        }
+        "claude-proxy" => {
+            // Claude proxy doesn't need an API key - uses Claude Code CLI credentials
+            let proxy_url = std::env::var("CLAUDE_PROXY_URL")
+                .unwrap_or_else(|_| "http://localhost:3456".to_string());
+            LlmClient::claude_proxy(&proxy_url)
         }
         "ollama" => {
             // Ollama doesn't need an API key - uses configured host
@@ -2487,10 +2840,10 @@ async fn set_provider(
         }
         _ => return Err(format!("Unknown provider: {}", provider)),
     };
-    
+
     state_guard.config.llm.provider = provider.clone();
     state_guard.llm = Arc::new(llm);
-    
+
     info!("Provider changed to: {}", provider);
     Ok(())
 }
@@ -2679,19 +3032,37 @@ async fn get_anthropic_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<ModelInfo>, String> {
     let state_guard = state.read().await;
-    let api_key = state_guard.config.llm.api_key.clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .ok_or("No Anthropic API key configured")?;
-    
+
+    // Check if OAuth is configured, otherwise use API key
+    let (auth_header, auth_value) = if state_guard.config.llm.anthropic_use_oauth {
+        let token = state_guard.config.llm.anthropic_oauth_token.clone()
+            .ok_or("OAuth enabled but no token available")?;
+        ("Authorization".to_string(), format!("Bearer {}", token))
+    } else {
+        let api_key = state_guard.config.llm.api_key.clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            .ok_or("No Anthropic API key configured")?;
+        ("x-api-key".to_string(), api_key)
+    };
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
-    
-    let response = client
+
+    let mut request = client
         .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header(&auth_header, &auth_value)
+        .header("anthropic-version", "2023-06-01");
+
+    // Add OAuth-specific headers if using OAuth
+    if state_guard.config.llm.anthropic_use_oauth {
+        request = request
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("user-agent", "claude-code/2.1.2");
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Failed to fetch Anthropic models: {}", e))?;
@@ -2776,8 +3147,281 @@ async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
     
     // Sort by name
     result.sort_by(|a, b| a.id.cmp(&b.id));
-    
+
     Ok(result)
+}
+
+/// Fetch available models from OpenRouter
+#[tauri::command]
+async fn get_openrouter_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
+    let state_guard = state.read().await;
+
+    let api_key = state_guard.config.llm.openrouter_api_key.clone()
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .ok_or("No OpenRouter API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://openrouter.ai/api/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenRouter models: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenRouter API error {}: {}", status, body));
+    }
+
+    #[derive(Deserialize)]
+    struct OpenRouterModelsResponse {
+        data: Vec<OpenRouterModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenRouterModel {
+        id: String,
+        name: Option<String>,
+    }
+
+    let models: OpenRouterModelsResponse = response.json().await
+        .map_err(|e| format!("Failed to parse OpenRouter response: {}", e))?;
+
+    // Priority prefixes for sorting (these appear first)
+    let priority_prefixes = [
+        "anthropic/claude",
+        "openai/gpt",
+        "openai/o1",
+        "openai/o3",
+        "openai/chatgpt",
+        "google/gemini",
+        "deepseek/",
+        "meta-llama/",
+        "mistralai/",
+        "qwen/",
+        "cohere/",
+        "perplexity/",
+    ];
+
+    // Include ALL models (no filtering)
+    let mut result: Vec<ModelInfo> = models.data.into_iter()
+        .map(|m| ModelInfo {
+            name: m.name.unwrap_or_else(|| m.id.clone()),
+            id: m.id,
+        })
+        .collect();
+
+    // Sort: priority models first, then alphabetically
+    result.sort_by(|a, b| {
+        let a_priority = priority_prefixes.iter().position(|p| a.id.starts_with(p)).unwrap_or(999);
+        let b_priority = priority_prefixes.iter().position(|p| b.id.starts_with(p)).unwrap_or(999);
+        a_priority.cmp(&b_priority).then_with(|| a.id.cmp(&b.id))
+    });
+
+    Ok(result)
+}
+
+/// Fetch available models from GitHub Models API
+#[tauri::command]
+async fn get_github_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
+    let state_guard = state.read().await;
+    let api_key = state_guard.config.llm.github_token.clone()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+        .ok_or("No GitHub token configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // GitHub Models catalog endpoint
+    let response = client
+        .get("https://models.inference.ai.azure.com/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub models: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("GitHub Models API error {}: {}", status, body));
+    }
+
+    #[derive(Deserialize)]
+    struct GitHubModelsResponse {
+        data: Option<Vec<GitHubModel>>,
+        #[serde(default)]
+        models: Vec<GitHubModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct GitHubModel {
+        id: Option<String>,
+        name: Option<String>,
+        #[serde(default)]
+        model_name: Option<String>,
+    }
+
+    let text = response.text().await
+        .map_err(|e| format!("Failed to read GitHub response: {}", e))?;
+
+    // Try to parse as JSON array or object with data/models field
+    let models: Vec<GitHubModel> = if let Ok(arr) = serde_json::from_str::<Vec<GitHubModel>>(&text) {
+        arr
+    } else if let Ok(resp) = serde_json::from_str::<GitHubModelsResponse>(&text) {
+        resp.data.unwrap_or(resp.models)
+    } else {
+        return Err(format!("Failed to parse GitHub response: {}", text));
+    };
+
+    // Filter and map models
+    let result: Vec<ModelInfo> = models.into_iter()
+        .filter_map(|m| {
+            let id = m.id.or(m.model_name)?;
+            let name = m.name.unwrap_or_else(|| id.clone());
+            Some(ModelInfo { id, name })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+/// Fetch available models from Anthropic API for use with Claude Proxy
+/// This queries Anthropic directly to get models available on your subscription
+#[tauri::command]
+async fn get_claude_proxy_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
+    let state_guard = state.read().await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // Try OAuth first (for Pro/Max subscription), then API key
+    let response = if state_guard.config.llm.anthropic_oauth_token.is_some() {
+        let token = state_guard.config.llm.anthropic_oauth_token.clone().unwrap();
+        client
+            .get("https://api.anthropic.com/v1/models")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("user-agent", "claude-code/2.1.2")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch models: {}", e))?
+    } else if let Some(ref api_key) = state_guard.config.llm.api_key {
+        client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch models: {}", e))?
+    } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch models: {}", e))?
+    } else {
+        // No Anthropic credentials - return default Claude models that the proxy supports
+        return Ok(vec![
+            ModelInfo { id: "claude-sonnet-4-20250514".to_string(), name: "Claude Sonnet 4".to_string() },
+            ModelInfo { id: "claude-opus-4-20250514".to_string(), name: "Claude Opus 4".to_string() },
+            ModelInfo { id: "claude-3-5-sonnet-20241022".to_string(), name: "Claude Sonnet 3.5".to_string() },
+            ModelInfo { id: "claude-3-5-haiku-20241022".to_string(), name: "Claude Haiku 3.5".to_string() },
+        ]);
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Anthropic API error {}: {}", status, body));
+    }
+
+    #[derive(Deserialize)]
+    struct AnthropicModelsResponse {
+        data: Vec<AnthropicModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct AnthropicModel {
+        id: String,
+        display_name: Option<String>,
+    }
+
+    let models: AnthropicModelsResponse = response.json().await
+        .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
+
+    // Filter to chat models only (exclude embedding models, etc.)
+    let result: Vec<ModelInfo> = models.data.into_iter()
+        .filter(|m| m.id.starts_with("claude-"))
+        .map(|m| {
+            let name = m.display_name.unwrap_or_else(|| format_claude_model_name(&m.id));
+            ModelInfo { id: m.id, name }
+        })
+        .collect();
+
+    Ok(result)
+}
+
+/// Format Claude model IDs into friendly names
+fn format_claude_model_name(id: &str) -> String {
+    match id {
+        "claude-opus-4-5-20251101" => "Claude Opus 4.5".to_string(),
+        "claude-opus-4-20250514" => "Claude Opus 4".to_string(),
+        "claude-sonnet-4-20250514" => "Claude Sonnet 4".to_string(),
+        "claude-3-5-sonnet-20241022" => "Claude Sonnet 3.5".to_string(),
+        "claude-3-5-haiku-20241022" => "Claude Haiku 3.5".to_string(),
+        _ => id.to_string(),
+    }
+}
+
+/// Enable or disable Claude Proxy
+#[tauri::command]
+async fn set_claude_proxy(enabled: bool, url: Option<String>) -> Result<(), String> {
+    unsafe {
+        if enabled {
+            std::env::set_var("CLAUDE_PROXY_ENABLED", "1");
+            if let Some(u) = url {
+                std::env::set_var("CLAUDE_PROXY_URL", u);
+            }
+        } else {
+            std::env::remove_var("CLAUDE_PROXY_ENABLED");
+        }
+    }
+    Ok(())
+}
+
+/// Check if Claude Proxy is running and reachable
+#[tauri::command]
+async fn check_claude_proxy_health() -> Result<bool, String> {
+    let proxy_url = std::env::var("CLAUDE_PROXY_URL")
+        .unwrap_or_else(|_| "http://localhost:3456".to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    match client.get(format!("{}/health", proxy_url)).send().await {
+        Ok(resp) => Ok(resp.status().is_success()),
+        Err(_) => Ok(false),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5266,19 +5910,65 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     let storage_config = StorageConfig { path: db_path };
     let storage = Arc::new(Storage::new(&storage_config).await?);
 
-    // Initialize LLM client
-    let api_key = config
-        .llm
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .unwrap_or_else(|| "missing-key".to_string());
-
+    // Initialize LLM client (check for OAuth first)
     let llm = match config.llm.provider.as_str() {
-        "openai" => LlmClient::openai(&api_key),
-        _ => LlmClient::anthropic(&api_key),
+        "anthropic" => {
+            // Check if OAuth is enabled and has a token
+            if config.llm.anthropic_use_oauth {
+                if let Some(ref oauth_token) = config.llm.anthropic_oauth_token {
+                    info!("Using Anthropic OAuth authentication");
+                    LlmClient::anthropic_oauth(oauth_token)
+                } else {
+                    // OAuth enabled but no token - fall back to API key
+                    let api_key = config.llm.api_key.clone()
+                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                        .unwrap_or_else(|| "missing-key".to_string());
+                    LlmClient::anthropic(&api_key)
+                }
+            } else {
+                let api_key = config.llm.api_key.clone()
+                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                    .unwrap_or_else(|| "missing-key".to_string());
+                LlmClient::anthropic(&api_key)
+            }
+        }
+        "openai" => {
+            let api_key = config.llm.openai_api_key.clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .unwrap_or_else(|| "missing-key".to_string());
+            LlmClient::openai(&api_key)
+        }
+        "openrouter" => {
+            let api_key = config.llm.openrouter_api_key.clone()
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .unwrap_or_else(|| "missing-key".to_string());
+            LlmClient::openrouter(&api_key)
+        }
+        "github" => {
+            let api_key = config.llm.github_token.clone()
+                .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+                .unwrap_or_else(|| "missing-key".to_string());
+            LlmClient::github_models(&api_key)
+        }
+        _ => {
+            let api_key = config.llm.api_key.clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .unwrap_or_else(|| "missing-key".to_string());
+            LlmClient::anthropic(&api_key)
+        }
     };
     let llm = Arc::new(llm);
+
+    // Set env vars from config (so they're available for model fetching and API calls)
+    if let Some(ref key) = config.llm.openai_api_key {
+        unsafe { std::env::set_var("OPENAI_API_KEY", key); }
+    }
+    if let Some(ref key) = config.llm.openrouter_api_key {
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", key); }
+    }
+    if let Some(ref key) = config.llm.github_token {
+        unsafe { std::env::set_var("GITHUB_TOKEN", key); }
+    }
 
     // Initialize tools
     let tools = ToolRegistry::new();
@@ -5545,36 +6235,56 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
 
     // Create executor for scheduled tasks
     let memory_for_executor = memory.clone();
-    let llm_for_executor = llm.clone();
     let tools_for_executor = tools.clone();
-    let model_for_executor = config.llm.model.clone();
     let channels_for_executor = config.channels.clone();
-    
+    let config_for_executor = config.clone();
+    let ollama_host_for_executor = saved_ollama_host.clone();
+
     let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
         let memory = memory_for_executor.clone();
-        let llm = llm_for_executor.clone();
         let tools = tools_for_executor.clone();
-        let model = model_for_executor.clone();
         let channels = channels_for_executor.clone();
-        
+        let config = config_for_executor.clone();
+        let ollama_host = ollama_host_for_executor.clone();
+
         Box::pin(async move {
             let start = std::time::Instant::now();
             let started_at = chrono::Utc::now();
-            
+
             match task.name.as_str() {
                 "heartbeat" => {
                     info!("Running heartbeat...");
-                    
+
                     // Build the heartbeat prompt with context
                     let prompt = task.payload.clone();
-                    
+
+                    // Get the first available model from priority list
+                    let priority = &config.llm.model_priority;
+                    let (llm, model) = if let Some(model_id) = priority.first() {
+                        if let Some((client, actual_model)) = create_llm_client_for_model(model_id, &config, &ollama_host) {
+                            (Arc::new(client), actual_model)
+                        } else {
+                            // Fallback to default model
+                            let api_key = config.llm.api_key.clone()
+                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                                .unwrap_or_default();
+                            (Arc::new(LlmClient::anthropic(&api_key)), config.llm.model.clone())
+                        }
+                    } else {
+                        // No priority list, use default
+                        let api_key = config.llm.api_key.clone()
+                            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                            .unwrap_or_default();
+                        (Arc::new(LlmClient::anthropic(&api_key)), config.llm.model.clone())
+                    };
+
                     // Create agent config
                     let agent_config = nanna_agent::AgentConfig {
                         model: model.clone(),
                         max_iterations: 5, // Limit turns for heartbeat
                         ..Default::default()
                     };
-                    
+
                     // Create agent and run
                     let agent = nanna_agent::Agent::new(
                         agent_config,
@@ -5640,10 +6350,28 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                 }
                 "memory_consolidation" => {
                     info!("Running scheduled memory consolidation...");
-                    
-                    let config = ConsolidationConfig::default();
+
+                    // Get the first available model from priority list for summarization
+                    let priority = &config.llm.model_priority;
+                    let llm_for_consolidation = if let Some(model_id) = priority.first() {
+                        if let Some((client, _)) = create_llm_client_for_model(model_id, &config, &ollama_host) {
+                            Arc::new(client)
+                        } else {
+                            let api_key = config.llm.api_key.clone()
+                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                                .unwrap_or_default();
+                            Arc::new(LlmClient::anthropic(&api_key))
+                        }
+                    } else {
+                        let api_key = config.llm.api_key.clone()
+                            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                            .unwrap_or_default();
+                        Arc::new(LlmClient::anthropic(&api_key))
+                    };
+
+                    let consolidation_config = ConsolidationConfig::default();
                     let summarize = |prompt: String| {
-                        let llm = llm.clone();
+                        let llm = llm_for_consolidation.clone();
                         async move {
                             let request = nanna_llm::CompletionRequest::default()
                                 .with_model("claude-3-5-haiku-20241022")
@@ -5652,7 +6380,7 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                         }
                     };
                     
-                    match memory.consolidate(&config, summarize).await {
+                    match memory.consolidate(&consolidation_config, summarize).await {
                         Ok(result) => {
                             let finished_at = chrono::Utc::now();
                             info!(
@@ -5690,13 +6418,31 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                     // Generic cron job - run as agent prompt
                     if !task.payload.is_empty() {
                         info!("Running cron job '{}': {}", task.name, task.payload.chars().take(50).collect::<String>());
-                        
+
+                        // Get the first available model from priority list
+                        let priority = &config.llm.model_priority;
+                        let (llm, model) = if let Some(model_id) = priority.first() {
+                            if let Some((client, actual_model)) = create_llm_client_for_model(model_id, &config, &ollama_host) {
+                                (Arc::new(client), actual_model)
+                            } else {
+                                let api_key = config.llm.api_key.clone()
+                                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                                    .unwrap_or_default();
+                                (Arc::new(LlmClient::anthropic(&api_key)), config.llm.model.clone())
+                            }
+                        } else {
+                            let api_key = config.llm.api_key.clone()
+                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                                .unwrap_or_default();
+                            (Arc::new(LlmClient::anthropic(&api_key)), config.llm.model.clone())
+                        };
+
                         let agent_config = nanna_agent::AgentConfig {
                             model: model.clone(),
                             max_iterations: 10,
                             ..Default::default()
                         };
-                        
+
                         let agent = nanna_agent::Agent::new(
                             agent_config,
                             llm.clone(),
@@ -5878,6 +6624,13 @@ pub fn run() {
             get_extended_settings,
             set_provider_api_key,
             set_provider,
+            // Anthropic OAuth (via claude setup-token)
+            run_claude_setup_token,
+            import_claude_code_credentials,
+            save_anthropic_oauth_token,
+            logout_anthropic_oauth,
+            get_credential_status,
+            refresh_oauth_token,
             check_env_var,
             // Cognitive memory (FSRS-6 + dreaming)
             get_cognitive_memory_stats,
@@ -5896,6 +6649,11 @@ pub fn run() {
             // Dynamic model fetching
             get_anthropic_models,
             get_openai_models,
+            get_openrouter_models,
+            get_github_models,
+            get_claude_proxy_models,
+            set_claude_proxy,
+            check_claude_proxy_health,
             // Memory persistence
             save_memories,
             // Memory management

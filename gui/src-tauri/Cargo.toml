@@ -44,6 +44,13 @@ toml = "0.8"
 # YAML for skill manifests
 serde_yaml = "0.9"
 
+# PKCE OAuth flow
+base64 = "0.22"
+sha2 = "0.10"
+urlencoding = "2.1"
+rand = "0.9"
+
+
 # Directories for fallback paths
 directories.workspace = true
 
