@@ -159,6 +159,7 @@ impl MemoryService {
             metadata,
             timestamp: chrono_timestamp(),
             fsrs: FsrsState::new(),
+            workspace_id: None, // smart_ingest creates global memories
         };
 
         self.store.add(entry).await?;
@@ -253,10 +254,71 @@ impl MemoryService {
             metadata,
             timestamp: chrono_timestamp(),
             fsrs,
+            workspace_id: None, // Global memory
         };
 
         self.store.add(entry).await?;
         info!("Remembered (importance {}): {} (id: {})", importance, truncate(content, 50), id);
+        Ok((id, IngestAction::Create))
+    }
+
+    /// Remember something with workspace scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured or storage fails.
+    pub async fn remember_scoped(
+        &self,
+        content: &str,
+        metadata: HashMap<String, String>,
+        importance: f32,
+        workspace_id: Option<String>,
+    ) -> Result<(String, IngestAction), MemoryError> {
+        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
+            MemoryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "No embedding function configured",
+            ))
+        })?;
+
+        // Generate embedding
+        let embedding = (embed_fn)(content)
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+
+        // Check for similar existing memories (within same scope)
+        let results = self.store.search_scoped(&embedding, 1, workspace_id.as_deref()).await;
+        
+        if let Some((existing, similarity)) = results.first() {
+            let action = IngestAction::from_similarity(*similarity);
+            
+            match action {
+                IngestAction::Reinforce | IngestAction::Update => {
+                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    info!("Reinforced (scoped): {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    return Ok((existing.id.clone(), action));
+                }
+                IngestAction::Create => {}
+            }
+        }
+
+        // Create new memory with workspace scope
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut fsrs = FsrsState::new();
+        fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
+        
+        let entry = MemoryEntry {
+            id: id.clone(),
+            content: content.to_string(),
+            embedding,
+            metadata,
+            timestamp: chrono_timestamp(),
+            fsrs,
+            workspace_id,
+        };
+
+        self.store.add(entry).await?;
+        info!("Remembered (scoped, importance {}): {} (id: {})", importance, truncate(content, 50), id);
         Ok((id, IngestAction::Create))
     }
 
@@ -327,6 +389,7 @@ impl MemoryService {
                 weight,
                 state,
                 metadata: entry.metadata,
+                workspace_id: entry.workspace_id,
             });
             
             if filtered.len() >= self.config.max_results {
@@ -340,6 +403,82 @@ impl MemoryService {
         }
 
         debug!("Recall '{}' found {} results", truncate(query, 30), filtered.len());
+        Ok(filtered)
+    }
+
+    /// Recall memories with workspace scope filtering.
+    ///
+    /// Scope rules:
+    /// - `workspace_id = Some(id)`: returns global + that workspace's memories
+    /// - `workspace_id = None` (global): returns all memories
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured.
+    pub async fn recall_scoped(
+        &self,
+        query: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<RecallResult>, MemoryError> {
+        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
+            MemoryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "No embedding function configured",
+            ))
+        })?;
+
+        let store_count = self.store.len().await;
+        info!("Recall (scoped {:?}): generating embedding for query (store has {} entries)", 
+              workspace_id, store_count);
+
+        let query_embedding = (embed_fn)(query)
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        
+        info!("Recall: embedding generated ({} dims), searching...", query_embedding.len());
+
+        // Scoped search
+        let results = self.store.search_scoped(&query_embedding, self.config.max_results * 2, workspace_id).await;
+        let min_score = self.get_min_score();
+        
+        // Filter by min score and weight, apply testing effect
+        let mut filtered = Vec::new();
+        let mut updates = Vec::new();
+        
+        for (entry, score) in results {
+            if score < min_score {
+                continue;
+            }
+            
+            let weight = entry.fsrs.weight(&self.config.fsrs);
+            let state = entry.fsrs.state(&self.config.fsrs);
+            
+            if weight < self.config.min_weight {
+                continue;
+            }
+            
+            updates.push((entry.id.clone(), Rating::Good));
+            
+            filtered.push(RecallResult {
+                id: entry.id,
+                content: entry.content,
+                score,
+                weight,
+                state,
+                metadata: entry.metadata,
+                workspace_id: entry.workspace_id,
+            });
+            
+            if filtered.len() >= self.config.max_results {
+                break;
+            }
+        }
+
+        if !updates.is_empty() {
+            self.pending_updates.write().await.extend(updates);
+        }
+
+        debug!("Recall (scoped) '{}' found {} results", truncate(query, 30), filtered.len());
         Ok(filtered)
     }
 
@@ -476,6 +615,7 @@ impl MemoryService {
                 retrievability,
                 importance: e.fsrs.importance,
                 access_count: e.fsrs.access_count,
+                workspace_id: e.workspace_id,
             }
         }).collect()
     }
@@ -495,6 +635,7 @@ impl MemoryService {
             retrievability: entry.fsrs.retrievability(params),
             importance: entry.fsrs.importance,
             access_count: entry.fsrs.access_count,
+            workspace_id: entry.workspace_id,
         })
     }
 
@@ -742,6 +883,7 @@ pub struct MemoryListEntry {
     pub retrievability: f32,
     pub importance: f32,
     pub access_count: u32,
+    pub workspace_id: Option<String>,
 }
 
 /// Memories grouped by weight bands for consolidation
@@ -771,6 +913,8 @@ pub struct RecallResult {
     /// Current memory state
     pub state: MemoryState,
     pub metadata: HashMap<String, String>,
+    /// Workspace ID if scoped (None = global)
+    pub workspace_id: Option<String>,
 }
 
 fn chrono_timestamp() -> i64 {

@@ -60,6 +60,9 @@ pub struct MemoryEntry {
     /// FSRS-6 cognitive state (stability, retrievability, etc.)
     #[serde(default)]
     pub fsrs: FsrsState,
+    /// Workspace ID if this memory is scoped to a workspace (None = global)
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// Vector store configuration
@@ -219,6 +222,35 @@ impl VectorStore {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k);
         scored
+    }
+
+    /// Search for similar memories with workspace scope filtering.
+    ///
+    /// Scope rules:
+    /// - `workspace_id = Some(id)`: returns global + that workspace's memories
+    /// - `workspace_id = None` (global): returns all memories
+    pub async fn search_scoped(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        workspace_id: Option<&str>,
+    ) -> Vec<(MemoryEntry, f32)> {
+        let all_results = self.search(query_embedding, top_k * 3).await; // Get more to filter
+        
+        let filtered: Vec<(MemoryEntry, f32)> = match workspace_id {
+            // Workspace scope: global + this workspace only
+            Some(ws_id) => all_results
+                .into_iter()
+                .filter(|(entry, _)| {
+                    entry.workspace_id.is_none() || entry.workspace_id.as_deref() == Some(ws_id)
+                })
+                .take(top_k)
+                .collect(),
+            // Global scope: all memories
+            None => all_results.into_iter().take(top_k).collect(),
+        };
+        
+        filtered
     }
 
     /// Get entry by ID
@@ -413,6 +445,7 @@ mod tests {
             metadata: HashMap::new(),
             timestamp: 0,
             fsrs: FsrsState::default(),
+            workspace_id: None,
         };
 
         store.add(entry).await.unwrap();
