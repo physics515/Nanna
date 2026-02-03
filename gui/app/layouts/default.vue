@@ -236,7 +236,12 @@
       </aside>
       
       <!-- Main area with workspace tabs -->
-      <main class="flex-1 flex flex-col pt-14 lg:pt-0">
+      <main class="flex-1 flex flex-col pt-14 lg:pt-0 relative">
+        <!-- Backend Status Indicator (top right) -->
+        <div class="absolute top-2 right-2 z-30">
+          <BackendStatus :show-detail="false" />
+        </div>
+        
         <!-- Workspace Tabs (desktop only, on chat page) -->
         <WorkspaceTabs
           v-if="route.path === '/' || route.path === ''"

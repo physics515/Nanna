@@ -4,6 +4,7 @@ export interface BackendStatus {
   mode: 'daemon' | 'embedded'
   connected: boolean
   daemon_url: string | null
+  daemon_state: string
   version: string
 }
 
@@ -36,6 +37,7 @@ export function useBackend() {
         mode: 'embedded',
         connected: false,
         daemon_url: null,
+        daemon_state: 'not_started',
         version: 'unknown',
       }
       initialized.value = true
