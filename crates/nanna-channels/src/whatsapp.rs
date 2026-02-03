@@ -638,6 +638,7 @@ struct WhatsAppErrorResponse {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // WhatsApp API response - subcode/trace_id unused (only message/code needed)
 struct WhatsAppError {
     message: String,
     code: i32,

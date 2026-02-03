@@ -1818,6 +1818,7 @@ impl LlmClient {
             }
 
             #[derive(Deserialize, Debug)]
+            #[allow(dead_code)] // API response struct - role field unused but part of OpenAI spec
             struct ChunkDelta {
                 content: Option<String>,
                 role: Option<String>,

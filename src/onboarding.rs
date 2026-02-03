@@ -24,8 +24,7 @@ const BANNER: &str = r"
 /// Check if this is a first run (no config exists).
 pub fn is_first_run() -> bool {
     Config::default_config_path()
-        .map(|p| !p.exists())
-        .unwrap_or(true)
+        .map_or(true, |p| !p.exists())
 }
 
 /// Check if API key is configured.

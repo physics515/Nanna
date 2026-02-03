@@ -412,6 +412,7 @@ pub mod tools_bridge {
     use std::collections::HashMap as StdHashMap;
 
     /// Register all tools from a ToolRegistry with the MCP server
+    #[allow(dead_code)] // Public API for MCP server integration, unused internally but available for external use
     pub async fn register_tools_from_registry(
         server: &McpServer,
         registry: Arc<ToolRegistry>,

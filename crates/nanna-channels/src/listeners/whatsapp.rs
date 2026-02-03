@@ -435,6 +435,7 @@ impl Listener for WhatsAppWebListener {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // WhatsApp bridge response - is_ready/status unused (connected/authenticated are primary)
 struct BridgeStatus {
     connected: Option<bool>,
     authenticated: Option<bool>,
@@ -446,6 +447,7 @@ struct BridgeStatus {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // WhatsApp bridge response - event_type/data unused (message field is primary)
 struct BridgeEvent {
     #[serde(alias = "type", alias = "event")]
     event_type: Option<String>,
@@ -456,6 +458,7 @@ struct BridgeEvent {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // WhatsApp bridge response - many fields unused (extracting core content only, TODO: media/metadata)
 struct BridgeMessage {
     // Message identification
     id: Option<String>,
