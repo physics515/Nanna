@@ -281,7 +281,7 @@ fn create_scheduler(
     storage: Arc<Storage>,
 ) -> Scheduler {
     let scheduler_config = SchedulerConfig {
-        heartbeat_interval: std::time::Duration::from_secs(300), // 5 minutes
+        heartbeat_interval: std::time::Duration::from_mins(5), // 5 minutes
         heartbeat_enabled: true,
         heartbeat_prompt: "Heartbeat: check in and review state".to_string(),
         max_concurrent: 4,
@@ -695,24 +695,21 @@ async fn run_cli(
 
     // Try to detect workspace
     let cwd = std::env::current_dir()?;
-    let workspace = match discover_workspace(Some(&cwd)) {
-        Ok(root) => {
-            match Workspace::load(root.clone()).await {
-                Ok(ws) => {
-                    info!("Workspace detected: {} at {}", ws.name(), root.display());
-                    println!("  📂 Workspace: {}\n", ws.name());
-                    Some(ws)
-                }
-                Err(e) => {
-                    warn!("Failed to load workspace: {}", e);
-                    None
-                }
+    let workspace = if let Ok(root) = discover_workspace(Some(&cwd)) {
+        match Workspace::load(root.clone()).await {
+            Ok(ws) => {
+                info!("Workspace detected: {} at {}", ws.name(), root.display());
+                println!("  📂 Workspace: {}\n", ws.name());
+                Some(ws)
+            }
+            Err(e) => {
+                warn!("Failed to load workspace: {}", e);
+                None
             }
         }
-        Err(_) => {
-            debug!("No workspace detected in {}", cwd.display());
-            None
-        }
+    } else {
+        debug!("No workspace detected in {}", cwd.display());
+        None
     };
 
     // Session setup
@@ -951,6 +948,7 @@ async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
 }
 
 /// Handle workspace subcommands
+#[allow(clippy::too_many_lines)] // TODO: Refactor workspace command into smaller functions (Phase 6: Production Hardening)
 async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()> {
     use nanna_agent::nanna_workspace::{
         create_from_template, discover_workspace, list_templates,
@@ -958,9 +956,7 @@ async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()>
 
     match action {
         WorkspaceAction::Init { template, path } => {
-            let target = path
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let target = path.map_or_else(|| std::env::current_dir().unwrap_or_default(), std::path::PathBuf::from);
 
             println!("🌙 Initializing workspace at {}", target.display());
 
@@ -974,15 +970,13 @@ async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()>
             // Create from template
             create_from_template(&target, &template).await?;
 
-            println!("✅ Created workspace with '{}' template", template);
+            println!("✅ Created workspace with '{template}' template");
             println!("\n📁 Files created:");
-            for entry in std::fs::read_dir(&target)? {
-                if let Ok(e) = entry {
-                    let name = e.file_name();
-                    let name = name.to_string_lossy();
-                    if name.ends_with(".md") || name.starts_with('.') {
-                        println!("   - {}", name);
-                    }
+            for e in std::fs::read_dir(&target)?.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".md") || name.starts_with('.') {
+                    println!("   - {name}");
                 }
             }
             println!("\n🚀 Run 'nanna chat' to start chatting in this workspace!");
@@ -991,59 +985,56 @@ async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()>
         WorkspaceAction::Status => {
             let cwd = std::env::current_dir()?;
             
-            match discover_workspace(Some(&cwd)) {
-                Ok(root) => {
-                    let workspace = Workspace::load(root.clone()).await?;
-                    
-                    println!("🌙 Workspace Status\n");
-                    println!("   Root: {}", root.display());
-                    println!("   Name: {}", workspace.name());
-                    println!("   Marker: {:?}", workspace.marker);
-                    println!("\n📁 Context Files:");
-                    
-                    let files = &workspace.files;
-                    if files.agents.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ AGENTS.md");
-                    }
-                    if files.soul.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ SOUL.md");
-                    }
-                    if files.user.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ USER.md");
-                    }
-                    if files.tools.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ TOOLS.md");
-                    }
-                    if files.memory.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ MEMORY.md");
-                    }
-                    if files.identity.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ IDENTITY.md");
-                    }
-                    if files.heartbeat.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ✓ HEARTBEAT.md");
-                    }
-                    if files.bootstrap.as_ref().is_some_and(|f| f.exists) {
-                        println!("   ⚡ BOOTSTRAP.md (fresh workspace)");
-                    }
-                    
-                    if !files.daily_memories.is_empty() {
-                        println!("\n📅 Recent Daily Notes:");
-                        for daily in &files.daily_memories {
-                            println!("   - {}", daily.name);
-                        }
-                    }
-                    
-                    println!("\n📊 Context Size:");
-                    println!("   {} bytes (~{} tokens)", 
-                        files.total_size(), 
-                        files.estimated_tokens()
-                    );
+            if let Ok(root) = discover_workspace(Some(&cwd)) {
+                let workspace = Workspace::load(root.clone()).await?;
+                
+                println!("🌙 Workspace Status\n");
+                println!("   Root: {}", root.display());
+                println!("   Name: {}", workspace.name());
+                println!("   Marker: {:?}", workspace.marker);
+                println!("\n📁 Context Files:");
+                
+                let files = &workspace.files;
+                if files.agents.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ AGENTS.md");
                 }
-                Err(_) => {
-                    println!("❌ No workspace found in current directory.");
-                    println!("   Run 'nanna workspace init' to create one.");
+                if files.soul.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ SOUL.md");
                 }
+                if files.user.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ USER.md");
+                }
+                if files.tools.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ TOOLS.md");
+                }
+                if files.memory.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ MEMORY.md");
+                }
+                if files.identity.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ IDENTITY.md");
+                }
+                if files.heartbeat.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ✓ HEARTBEAT.md");
+                }
+                if files.bootstrap.as_ref().is_some_and(|f| f.exists) {
+                    println!("   ⚡ BOOTSTRAP.md (fresh workspace)");
+                }
+                
+                if !files.daily_memories.is_empty() {
+                    println!("\n📅 Recent Daily Notes:");
+                    for daily in &files.daily_memories {
+                        println!("   - {}", daily.name);
+                    }
+                }
+                
+                println!("\n📊 Context Size:");
+                println!("   {} bytes (~{} tokens)", 
+                    files.total_size(), 
+                    files.estimated_tokens()
+                );
+            } else {
+                println!("❌ No workspace found in current directory.");
+                println!("   Run 'nanna workspace init' to create one.");
             }
         }
 
@@ -1079,6 +1070,7 @@ async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()>
 }
 
 /// Handle credentials subcommands
+#[allow(clippy::too_many_lines)] // TODO: Refactor credentials command into smaller functions (Phase 6: Production Hardening)
 async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result<()> {
     use nanna_config::{ClaudeCredentialManager, CredentialSource};
 
@@ -1104,7 +1096,7 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                         CredentialSource::MacOsKeychain => "macOS Keychain",
                         CredentialSource::WindowsCredentialManager => "Windows Credential Manager",
                     };
-                    println!("   ✓ Credentials found ({})", source);
+                    println!("   ✓ Credentials found ({source})");
 
                     // Show expiry info
                     if let Some(secs) = loaded.credential.seconds_until_expiry() {
@@ -1112,9 +1104,9 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                             let hours = secs / 3600;
                             let mins = (secs % 3600) / 60;
                             if hours > 0 {
-                                println!("   ⏱ Expires in {}h {}m", hours, mins);
+                                println!("   ⏱ Expires in {hours}h {mins}m");
                             } else {
-                                println!("   ⏱ Expires in {}m", mins);
+                                println!("   ⏱ Expires in {mins}m");
                             }
                         } else {
                             println!("   ⚠ Token expired ({} seconds ago)", -secs);
@@ -1126,7 +1118,7 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
 
                     // Show subscription type
                     if let Some(ref sub) = loaded.credential.subscription_type {
-                        println!("   📋 Subscription: {}", sub);
+                        println!("   📋 Subscription: {sub}");
                     }
 
                     // Show refresh capability
@@ -1137,7 +1129,7 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                     }
                 }
                 Err(e) => {
-                    println!("   ✗ No credentials found: {}", e);
+                    println!("   ✗ No credentials found: {e}");
                     println!("\n   To authenticate:");
                     println!("   • Run 'nanna credentials setup' (requires Claude CLI)");
                     println!("   • Or run 'claude login' directly, then 'nanna credentials import'");
@@ -1167,13 +1159,13 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                                     if let Err(e) = manager.save(&new_cred, loaded.source) {
                                         warn!("Failed to save refreshed token: {}", e);
                                     }
-                                    println!("✅ Token refreshed and imported from {}", source);
+                                    println!("✅ Token refreshed and imported from {source}");
                                     if let Some(ref sub) = new_cred.subscription_type {
-                                        println!("   Subscription: {}", sub);
+                                        println!("   Subscription: {sub}");
                                     }
                                 }
                                 Err(e) => {
-                                    println!("❌ Refresh failed: {}", e);
+                                    println!("❌ Refresh failed: {e}");
                                     println!("   Run 'claude login' to re-authenticate");
                                     return Ok(());
                                 }
@@ -1184,13 +1176,13 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                             return Ok(());
                         }
                     } else {
-                        println!("✅ Credentials imported from {}", source);
+                        println!("✅ Credentials imported from {source}");
                         if let Some(ref sub) = loaded.credential.subscription_type {
-                            println!("   Subscription: {}", sub);
+                            println!("   Subscription: {sub}");
                         }
                         if let Some(secs) = loaded.credential.seconds_until_expiry() {
                             let hours = secs / 3600;
-                            println!("   Expires in: {}h", hours);
+                            println!("   Expires in: {hours}h");
                         }
                     }
 
@@ -1205,7 +1197,7 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                     }
                 }
                 Err(e) => {
-                    println!("❌ No credentials found: {}", e);
+                    println!("❌ No credentials found: {e}");
                     println!("\n   Run 'claude login' first, or use 'nanna credentials setup'");
                 }
             }
@@ -1224,7 +1216,7 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
             println!("This will open your browser for authentication.\n");
 
             if let Err(e) = ClaudeCredentialManager::run_setup_token() {
-                println!("❌ Setup failed: {}", e);
+                println!("❌ Setup failed: {e}");
                 return Ok(());
             }
 
@@ -1241,12 +1233,12 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
 
                     println!("\n✅ Authentication complete!");
                     if let Some(ref sub) = loaded.credential.subscription_type {
-                        println!("   Subscription: {}", sub);
+                        println!("   Subscription: {sub}");
                     }
                     println!("   Nanna is now configured to use OAuth");
                 }
                 Err(e) => {
-                    println!("\n⚠ Setup completed but couldn't import credentials: {}", e);
+                    println!("\n⚠ Setup completed but couldn't import credentials: {e}");
                 }
             }
         }
@@ -1279,17 +1271,17 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
                             println!("✅ Token refreshed!");
                             if let Some(secs) = new_cred.seconds_until_expiry() {
                                 let hours = secs / 3600;
-                                println!("   New expiry: {}h from now", hours);
+                                println!("   New expiry: {hours}h from now");
                             }
                         }
                         Err(e) => {
-                            println!("❌ Refresh failed: {}", e);
+                            println!("❌ Refresh failed: {e}");
                             println!("   You may need to re-authenticate with 'nanna credentials setup'");
                         }
                     }
                 }
                 Err(e) => {
-                    println!("❌ No credentials found: {}", e);
+                    println!("❌ No credentials found: {e}");
                 }
             }
         }

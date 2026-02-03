@@ -105,6 +105,7 @@ pub fn detect_skill_source(skill_dir: &Path) -> Result<SkillSource, ToolError> {
 }
 
 /// Check if a directory is a valid skill
+#[allow(dead_code)] // Utility function for future skill management UI/CLI
 pub fn is_skill_dir(path: &Path) -> bool {
     path.is_dir() && detect_skill_source(path).is_ok()
 }

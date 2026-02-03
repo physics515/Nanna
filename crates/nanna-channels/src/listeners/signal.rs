@@ -124,7 +124,7 @@ impl SignalListener {
         let sender_name = envelope.envelope.source_name.clone();
         
         // Determine if this is a group message
-        let (chat_id, group_name) = if let Some(ref group) = data_message.group_info {
+        let (_chat_id, group_name) = if let Some(ref group) = data_message.group_info {
             (group.group_id.clone(), group.group_name.clone())
         } else {
             (source.clone(), None)
@@ -337,6 +337,7 @@ impl Listener for SignalListener {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - account field unused but part of spec
 struct SignalEnvelope {
     envelope: SignalEnvelopeInner,
     #[serde(default)]
@@ -345,6 +346,7 @@ struct SignalEnvelope {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - sync/receipt messages unused (data_message is primary)
 struct SignalEnvelopeInner {
     source_number: Option<String>,
     source_uuid: Option<String>,
@@ -360,6 +362,7 @@ struct SignalEnvelopeInner {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - attachments/reactions/timestamp unused (TODO: implement media handling)
 struct SignalDataMessage {
     message: Option<String>,
     timestamp: Option<i64>,
@@ -375,6 +378,7 @@ struct SignalDataMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - group_type unused
 struct SignalGroupInfo {
     group_id: String,
     #[serde(rename = "type")]
@@ -384,6 +388,7 @@ struct SignalGroupInfo {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - quote details unused (TODO: implement quote display)
 struct SignalQuote {
     id: i64,
     author: Option<String>,
@@ -392,6 +397,7 @@ struct SignalQuote {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - attachment metadata unused (TODO: implement media handling)
 struct SignalAttachment {
     content_type: Option<String>,
     filename: Option<String>,
@@ -401,6 +407,7 @@ struct SignalAttachment {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // signald API response - reaction details unused (TODO: implement reactions)
 struct SignalReactionInfo {
     emoji: String,
     target_author: Option<String>,
