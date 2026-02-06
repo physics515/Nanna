@@ -6,7 +6,7 @@ use crate::session::{Session, SessionId, SessionMessage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::fs;
 use tracing::{debug, error, info, warn};
 

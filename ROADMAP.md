@@ -160,6 +160,42 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Selective context compression** - `compress()` method summarizes old context via LLM ✅
 - [x] **Per-agent context isolation** - `ContextIsolation` enum (Full/SystemOnly/Summary/Isolated) ✅
 - [x] **Context budget allocation** - `allocate_budget()` distributes tokens across parallel agents ✅
+- [x] **Incremental summarization** - summarize once, reuse on subsequent requests ✅ (2026-02-04)
+  - `consolidated_summary` field stores running summary
+  - `messages_for_request()` prepends summary to messages
+  - No re-summarization unless new content exceeds limits
+- [x] **CDC deduplication** - content-defined chunking for duplicate detection ✅ (2026-02-04)
+  - Gear rolling hash (FastCDC algorithm) in `nanna-agent/src/chunker.rs`
+  - Deterministic chunk boundaries at ~2KB-32KB intervals
+  - Same content produces same chunk hashes regardless of split position
+  - 70% chunk overlap threshold triggers deduplication
+  - Handles: same file split differently, minor edits, reordered content
+- [x] **Summarization caching** - in-memory cache for summarization results ✅ (2026-02-04)
+  - `SummaryCache` type alias with LRU eviction (100 entries)
+  - Cache shared across summarization iterations within session
+  - Avoids re-summarizing identical content blocks
+
+### Context Optimization & Token Efficiency ✅ (2026-02-05)
+- [x] **Proactive compression** - Every 5 iterations, if tokens > 40% of compression_threshold, drop oldest messages ✅
+- [x] **`drop_oldest()` fallback** - No-LLM-required compression: drops messages, preserves key fragments in consolidated summary ✅
+- [x] **Strip write content** - `write_file`/`write` tool_use blocks have `content` replaced with `[N bytes written]` in stored context ✅
+- [x] **Task delegation tool** - `task` tool spawns sub-agents with isolated context via `AgentSpawner` trait abstraction ✅
+  - Same adapter pattern as memory tools (trait in nanna-tools, impl in nanna-daemon)
+  - Sub-agent gets fresh context (system prompt + workspace only)
+  - 5-minute timeout, max 25 iterations, returns text + usage metadata
+- [x] **Tiered compression** - Three tiers: proactive (40%), standard (compression_threshold), hard cap (hard_limit) ✅
+  - Tier 1: drop_oldest every 5 iterations
+  - Tier 2: full summarization if models configured, else drop_oldest
+  - Tier 3: aggressive summarization or truncation at hard limit
+- [x] **Token budget tracking** - `RunOptions.token_budget` + `budget_awareness` for pacing ✅
+  - Cumulative tracking across iterations
+  - Warnings at 80%, hard stop at 100%
+  - Budget note injected into context when awareness enabled
+  - `AgentResponse.cumulative_input_tokens` / `cumulative_output_tokens`
+- [x] **Code analysis tools** - Token-efficient codebase understanding ✅
+  - `code_outline`: function signatures, struct/enum/trait defs (~5-20% of file size)
+  - `code_search`: regex search with context lines across files
+  - `project_structure`: directory tree with file sizes and line counts
 
 ### Thinking Mode Enhancements
 - [x] **Explicit thinking toggle** - `ThinkingMode` enum (Instant/Low/Medium/High/Maximum) per request ✅
@@ -350,6 +386,11 @@ highlight.js
 - [x] **GUI routing** - Commands check mode and route through daemon client or embedded
 - [x] **Embedded fallback** - GUI runs direct services when daemon unavailable
 - [x] **Auto-reconnection** - Health monitor detects and reconnects to daemon
+
+**Bug Fixes (2026-02-03):**
+- [x] **Anthropic OAuth support** - Daemon now supports OAuth tokens from GUI (not just API keys)
+- [x] **Detailed tool logging** - Added emoji-prefixed logging showing tool name, input, output, success/failure, duration
+- [x] **Tool name aliases** - Added Claude Code compatibility aliases (read→read_file, bash→exec, glob→list_dir, etc.)
 
 **Pending:**
 - [ ] **PID file + lockfile** - Prevent multiple instances
@@ -813,7 +854,7 @@ tools = ["*"]  # Full access
 | 62 | ~~Client library (nanna-client)~~ | ✅ Done |
 | 63 | ~~Wire GUI to daemon client~~ | ✅ Done (2026-02-02) |
 | 64 | ~~Agent integration in daemon~~ | ✅ Done (2026-02-02) |
-| 65 | Webhook server (Axum) | 🔜 |
+| 65 | Webhook server (Axum) | ✅ Done (2026-02-03) |
 | 66 | Telegram listener | ✅ Done |
 | 67 | Unified message router | ✅ Done |
 | 68 | Cron system + persistence | ✅ Done |
@@ -821,6 +862,23 @@ tools = ["*"]  # Full access
 | 70 | Slack Socket Mode | ✅ Done |
 | 71 | Heartbeats | ✅ Done |
 | 72 | Sub-agent sessions | 🔜 |
+| 72a | Workspaces in daemon | ✅ Done (2026-02-03) |
+| 72b | Config/Settings in daemon | ✅ Done (2026-02-03) |
+| 72c | Shared keyring for credentials | ✅ Done (2026-02-03) |
+| 72d | Scheduler actions in daemon | ✅ Done (2026-02-03) |
+| 72e | User tool authoring in daemon | ✅ Done (2026-02-03) |
+| 72f | Daemon OAuth support | ✅ Done (2026-02-03) |
+| 72g | Tool name aliases (Claude Code compat) | ✅ Done (2026-02-03) |
+| 72h | Detailed tool execution logging | ✅ Done (2026-02-03) |
+| 72i | Incremental summarization | ✅ Done (2026-02-04) |
+| 72j | CDC deduplication (chunker.rs) | ✅ Done (2026-02-04) |
+| 72k | Summarization caching | ✅ Done (2026-02-04) |
+| 72l | Proactive context compression (tiered) | ✅ Done (2026-02-05) |
+| 72m | Strip write content from stored blocks | ✅ Done (2026-02-05) |
+| 72n | Task delegation tool (sub-agent) | ✅ Done (2026-02-05) |
+| 72o | Token budget tracking & pacing | ✅ Done (2026-02-05) |
+| 72p | Code analysis tools (outline/search/structure) | ✅ Done (2026-02-05) |
+| 72q | Per-session message queuing (FIFO mutex) | ✅ Done (2026-02-05) |
 | 73 | TTS (ElevenLabs/OpenAI) | Later |
 | 74 | Browser relay extension | Later |
 | 75 | Paired devices (nodes) | Later |
@@ -837,12 +895,21 @@ tools = ["*"]  # Full access
 
 ## Open TODOs (Next Sprint)
 
+### Daemon Architecture (2026-02-03) - MOSTLY COMPLETE ✅
+1. ✅ **Workspaces in Daemon** - WorkspaceRegistry + WorkspaceAction protocol (List/Get/Open/Close/SetActive/ClearActive/Reload/GetContext/UpdateContext)
+2. ✅ **Config in Daemon** - ConfigAction handlers (Get/Set/Reset/Reload/Export/Import)
+3. ✅ **Scheduler in Daemon** - SchedulerAction handlers (List/Get/Add/Update/Remove/RunNow/History)
+4. ✅ **User Tool Authoring in Daemon** - UserToolManager moved, ToolAction::Create/Update/Delete/Test/ListUser
+5. ✅ **Shared Keyring** - OS keyring for API keys accessible by daemon + GUI (2026-02-03)
+6. 🔜 **GUI Wiring** - Wire GUI to use daemon for all new endpoints
+
 ### Daemon Testing & Polish (High Priority)
-1. **End-to-end testing** - Test daemon mode + embedded fallback + reconnection
-2. **Error handling** - Improve error messages for connection failures
-3. **Health endpoint** - Add HTTP `/health` endpoint for monitoring
-4. **PID file** - Prevent multiple daemon instances
-5. **Log rotation** - File-based logs with size/time rotation
+6. **End-to-end testing** - Test daemon mode + embedded fallback + reconnection
+7. **Error handling** - Improve error messages for connection failures
+8. ✅ **Health endpoint** - Add HTTP `/health`, `/healthz`, `/readyz`, `/status` endpoints (2026-02-03)
+9. ✅ **PID file** - Prevent multiple daemon instances (2026-02-03)
+10. **Log rotation** - File-based logs with size/time rotation
+11. **Health-check based request timeout** - Replace hard timeout on daemon client requests with session health polling. Instead of timing out after N seconds, the GUI periodically pings `get_session_run_state` to check if the session is still alive and making progress. Only timeout if the daemon stops responding or reports the session as unhealthy. Fixes: long-running agent loops (30+ tool iterations) being killed by the client before the daemon finishes.
 
 ### Channel Listeners (Medium Priority)
 6. **Telegram Listener** - Long-polling `getUpdates` loop
@@ -850,11 +917,13 @@ tools = ["*"]  # Full access
 8. **Slack Socket Mode** - Real-time Slack events
 9. **Unified Router** - All channels → single message queue
 
-### Webhook Server (Medium Priority)
-10. **Axum HTTP Server** - Base server with routing
-11. **Telegram Webhook** - `/webhook/telegram` endpoint
-12. **Discord Interactions** - `/webhook/discord` with signature verification
-13. **Slack Events** - `/webhook/slack` with challenge handling
+### Webhook Server ✅ DONE (2026-02-03)
+10. ✅ **Axum HTTP Server** - Base server with routing, CORS support
+11. ✅ **Telegram Webhook** - `/webhook/telegram` endpoint with secret verification
+12. ✅ **Discord Interactions** - `/webhook/discord` with PING handling + signature verification
+13. ✅ **Slack Events** - `/webhook/slack` with URL verification challenge
+14. ✅ **WhatsApp Webhook** - `/webhook/whatsapp` with verify token + Cloud API parsing
+15. ✅ **Generic Webhooks** - `/webhook/:id` with Bearer/secret authentication
 
 ### Cron & Scheduling ✅ DONE
 14. ~~**Cron Parser**~~ - Parse standard cron expressions ✅

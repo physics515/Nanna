@@ -16,6 +16,7 @@ tracing.workspace = true
 thiserror.workspace = true
 futures = "0.3"
 async-stream = "0.3"
+directories = "5"
 
 # Optional: for OAuth auto-refresh
 nanna-config = { path = "../nanna-config", optional = true }

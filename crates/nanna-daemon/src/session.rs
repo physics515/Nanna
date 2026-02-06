@@ -259,7 +259,7 @@ impl SessionManager {
     pub async fn delete(&self, id: &str) -> bool {
         let mut sessions = self.sessions.write().await;
         let removed = sessions.remove(id).is_some();
-        
+
         if removed {
             // Clear default if it was this session
             let mut default = self.default_session.write().await;
@@ -268,10 +268,24 @@ impl SessionManager {
             }
             info!("Deleted session: {}", id);
         }
-        
+
         removed
     }
-    
+
+    /// Delete all sessions
+    pub async fn delete_all(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let count = sessions.len();
+        sessions.clear();
+
+        // Clear default session
+        let mut default = self.default_session.write().await;
+        *default = None;
+
+        info!("Deleted all {} sessions", count);
+        count
+    }
+
     /// Rename a session
     pub async fn rename(&self, id: &str, name: String) -> bool {
         let mut sessions = self.sessions.write().await;

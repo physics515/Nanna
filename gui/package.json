@@ -11,7 +11,9 @@
     "postinstall": "nuxt prepare",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "build:daemon": "node scripts/build-daemon.js",
+    "build:daemon:debug": "node scripts/build-daemon.js --debug"
   },
   "dependencies": {
     "@formkit/drag-and-drop": "^0.5.3",

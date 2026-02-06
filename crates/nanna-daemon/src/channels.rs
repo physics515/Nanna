@@ -5,7 +5,7 @@
 use crate::control::ControlPlane;
 use crate::protocol::ChatAction;
 use nanna_channels::{
-    ChannelId, DiscordChannel, DiscordListener, IncomingMessage, Listener, ListenerManager,
+    ChannelId, DiscordChannel, DiscordListener, IncomingMessage, ListenerManager,
     MessageContent, MessageRouter, OutgoingMessage, SlackChannel, SlackListener, TelegramChannel,
     TelegramListener,
 };
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Channel configuration from config.toml
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -159,7 +159,7 @@ impl ChannelManager {
         };
 
         let control = Arc::clone(&self.control);
-        let channel_sessions = Arc::clone(&self.channel_sessions.read().await.clone().into());
+        let _channel_sessions = Arc::clone(&self.channel_sessions.read().await.clone().into());
 
         // Spawn the message processing loop
         tokio::spawn(async move {

@@ -1,6 +1,7 @@
 //! Agent loop runner
 
-use crate::{AgentContext, AgentError, prompts};
+use crate::summarizer::{Summarizer, SummarizerConfig};
+use crate::{AgentContext, AgentError, ContextSummarizationConfig, prompts};
 use nanna_llm::{
     AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient, StreamEvent,
     ToolDefinition as LlmToolDef,
@@ -11,7 +12,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Thinking mode for extended reasoning
@@ -63,6 +64,13 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     /// Thinking mode for extended reasoning
     pub thinking_mode: ThinkingMode,
+    /// Model priority list for summarization (first working model is used)
+    /// Format: "provider/model" e.g. ["ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-haiku"]
+    pub summarization_priority: Vec<String>,
+    /// Ollama URL for summarization (if using ollama)
+    pub summarization_ollama_url: Option<String>,
+    /// Threshold (in chars) above which tool results get summarized
+    pub summarization_threshold: usize,
 }
 
 impl Default for AgentConfig {
@@ -73,6 +81,9 @@ impl Default for AgentConfig {
             temperature: 0.7,
             max_iterations: 10,
             thinking_mode: ThinkingMode::Instant,
+            summarization_priority: vec![],
+            summarization_ollama_url: Some("http://localhost:11434".to_string()),
+            summarization_threshold: 50_000, // ~12.5k tokens
         }
     }
 }
@@ -107,10 +118,10 @@ pub struct RunOptions {
     pub track_emotions: bool,
     /// Override thinking mode for this run
     pub thinking_mode: Option<ThinkingMode>,
-    /// Enable context compression for long conversations
-    pub enable_context_compression: bool,
-    /// Maximum context tokens before compression kicks in
-    pub context_compression_threshold: Option<usize>,
+    /// Token budget for this run (total input + output tokens allowed)
+    pub token_budget: Option<u64>,
+    /// If true, inject budget awareness note into system prompt
+    pub budget_awareness: bool,
 }
 
 /// Response from an agent run
@@ -133,6 +144,10 @@ pub struct AgentResponse {
     pub emotional_context: Option<EmotionalContext>,
     /// Reasoning/thinking content (if thinking mode was enabled)
     pub reasoning: Option<ReasoningContent>,
+    /// Cumulative input tokens across all iterations
+    pub cumulative_input_tokens: u64,
+    /// Cumulative output tokens across all iterations
+    pub cumulative_output_tokens: u64,
 }
 
 /// Reasoning content from thinking mode
@@ -230,17 +245,134 @@ impl Agent {
         let max_iterations = options.max_iterations.unwrap_or(self.config.max_iterations);
         let mut state = RunState::new();
 
-        // Add user message
-        self.add_user_message(message, &options).await;
+        // Add user message with optional budget awareness
+        self.add_user_message_with_budget(message, &options).await;
 
         // Agent loop
         loop {
             state.iterations += 1;
             if state.iterations > max_iterations {
+                // Extract memories before bailing — don't lose a long run's knowledge
+                if options.auto_extract_memories {
+                    if let Some(ref on_memory) = options.on_memory {
+                        if let Ok(memories) = self.extract_memories().await {
+                            for memory in memories {
+                                on_memory(memory).await;
+                            }
+                        }
+                    }
+                }
+                warn!(
+                    iterations = state.iterations,
+                    max = max_iterations,
+                    final_text_len = state.final_text.len(),
+                    "Agent hit max iterations limit, returning truncated response"
+                );
                 return Ok(state.into_response(true));
             }
 
             debug!("Agent iteration {}/{}", state.iterations, max_iterations);
+
+            // Tiered context compression before API call
+            {
+                let mut ctx = self.context.write().await;
+                let estimated = ctx.estimate_tokens();
+                let compression_threshold = ctx.compression_threshold;
+                let hard_limit = ctx.hard_limit;
+                let proactive_threshold = compression_threshold * 40 / 100; // ~64K for 160K threshold
+
+                // Tier 1 (proactive): Every 5 iterations, if >40% of compression_threshold
+                if state.iterations > 1
+                    && state.iterations % 5 == 0
+                    && estimated > proactive_threshold
+                    && estimated <= compression_threshold
+                {
+                    info!(
+                        estimated_tokens = estimated,
+                        proactive_threshold = proactive_threshold,
+                        tier = "proactive",
+                        "Tier 1: proactive compression triggered"
+                    );
+                    let dropped = ctx.drop_oldest(6);
+                    if dropped > 0 {
+                        info!(dropped_messages = dropped, "Tier 1 compression complete");
+                    }
+                }
+
+                // Tier 2 (standard): When exceeding compression_threshold, full summarization if available
+                if ctx.needs_compression() && !ctx.exceeds_hard_limit() {
+                    if !self.config.summarization_priority.is_empty() {
+                        let summarization_config = ContextSummarizationConfig {
+                            model_priority: self.config.summarization_priority.clone(),
+                            ollama_url: self.config.summarization_ollama_url.clone(),
+                            summarizer_context_window: 8000,
+                            max_iterations: 20,
+                        };
+                        info!(
+                            estimated_tokens = estimated,
+                            compression_threshold = compression_threshold,
+                            tier = "standard",
+                            "Tier 2: standard summarization triggered"
+                        );
+                        match ctx.enforce_limits_with_summarization(&summarization_config).await {
+                            Ok(iterations) if iterations > 0 => {
+                                info!(iterations = iterations, new_tokens = ctx.estimate_tokens(), "Tier 2 summarization complete");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(error = %e, "Tier 2 summarization failed, dropping oldest");
+                                ctx.drop_oldest(6);
+                            }
+                        }
+                    } else {
+                        info!(
+                            estimated_tokens = estimated,
+                            compression_threshold = compression_threshold,
+                            tier = "standard",
+                            "Tier 2: no summarization models, dropping oldest"
+                        );
+                        ctx.drop_oldest(6);
+                    }
+                }
+
+                // Tier 3 (hard cap): When exceeding hard_limit, aggressive truncation
+                if ctx.exceeds_hard_limit() {
+                    let estimated = ctx.estimate_tokens();
+
+                    if !self.config.summarization_priority.is_empty() {
+                        let summarization_config = ContextSummarizationConfig {
+                            model_priority: self.config.summarization_priority.clone(),
+                            ollama_url: self.config.summarization_ollama_url.clone(),
+                            summarizer_context_window: 8000,
+                            max_iterations: 20,
+                        };
+                        warn!(
+                            estimated_tokens = estimated,
+                            hard_limit = hard_limit,
+                            tier = "hard_cap",
+                            "Tier 3: hard limit exceeded, aggressive summarization"
+                        );
+                        match ctx.enforce_limits_with_summarization(&summarization_config).await {
+                            Ok(iterations) if iterations > 0 => {
+                                info!(iterations = iterations, new_tokens = ctx.estimate_tokens(), "Tier 3 summarization complete");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(error = %e, "Tier 3 summarization failed, truncating");
+                                ctx.truncate_to_limit();
+                            }
+                        }
+                    } else {
+                        warn!(
+                            estimated_tokens = estimated,
+                            hard_limit = hard_limit,
+                            tier = "hard_cap",
+                            "Tier 3: hard limit exceeded, truncating"
+                        );
+                        ctx.truncate_to_limit();
+                    }
+                }
+            }
 
             // Build and execute LLM request
             let request = self.build_request_with_thinking(options.thinking_mode).await;
@@ -248,6 +380,32 @@ impl Agent {
 
             state.input_tokens += result.input_tokens;
             state.output_tokens += result.output_tokens;
+
+            // Token budget enforcement
+            if let Some(budget) = options.token_budget {
+                let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
+                let budget_pct = (cumulative * 100) / budget.max(1);
+                if cumulative >= budget {
+                    warn!(
+                        cumulative_tokens = cumulative,
+                        budget = budget,
+                        "Token budget exhausted, stopping agent"
+                    );
+                    state.final_text = format!(
+                        "{}\n\n[Token budget exhausted: used {} of {} tokens]",
+                        state.final_text, cumulative, budget
+                    );
+                    return Ok(state.into_response(true));
+                } else if budget_pct >= 80 {
+                    warn!(
+                        cumulative_tokens = cumulative,
+                        budget = budget,
+                        pct = budget_pct,
+                        "Token budget at {}%, approaching limit",
+                        budget_pct
+                    );
+                }
+            }
 
             // Store assistant response
             self.store_assistant_response(&result.content_blocks).await;
@@ -291,15 +449,49 @@ impl Agent {
             // Execute tools and continue loop
             let tool_results = self.execute_tools(&result.tool_uses, &mut state).await;
             self.store_tool_results(tool_results).await;
+
+            // Periodic memory extraction every 10 iterations
+            if options.auto_extract_memories
+                && state.iterations > 0
+                && state.iterations % 10 == 0
+            {
+                if let Some(ref on_memory) = options.on_memory {
+                    info!(iteration = state.iterations, "Periodic memory extraction");
+                    if let Ok(memories) = self.extract_memories().await {
+                        for memory in memories {
+                            on_memory(memory).await;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    async fn add_user_message(&self, message: &str, options: &RunOptions) {
+    async fn add_user_message_with_budget(&self, message: &str, options: &RunOptions) {
+        // Build budget prefix if budget awareness is enabled
+        let budget_note = if options.budget_awareness {
+            options.token_budget.map(|budget| {
+                format!(
+                    "[Budget: {} tokens. Be efficient with tool calls. \
+                     Delegate independent sub-tasks with the `task` tool to save context.]",
+                    budget
+                )
+            })
+        } else {
+            None
+        };
+
         let mut ctx = self.context.write().await;
-        let msg = options
-            .context_prefix
-            .as_ref()
-            .map_or_else(|| message.to_string(), |prefix| format!("{prefix}\n\n{message}"));
+        let mut msg = String::new();
+        if let Some(ref budget) = budget_note {
+            msg.push_str(budget);
+            msg.push_str("\n\n");
+        }
+        if let Some(ref prefix) = options.context_prefix {
+            msg.push_str(prefix);
+            msg.push_str("\n\n");
+        }
+        msg.push_str(message);
         ctx.messages.push(AnthropicMessage::user_text(msg));
     }
 
@@ -441,8 +633,41 @@ impl Agent {
 
     async fn store_assistant_response(&self, content_blocks: &[ContentBlock]) {
         let mut ctx = self.context.write().await;
+        let stripped = Self::strip_write_content_from_blocks(content_blocks);
         ctx.messages
-            .push(AnthropicMessage::assistant(content_blocks.to_vec()));
+            .push(AnthropicMessage::assistant(stripped));
+    }
+
+    /// Strip large content from write_file/write tool_use blocks before storing in context.
+    ///
+    /// The LLM already generated the content, so keeping it in stored context is pure waste.
+    /// Replaces the `content` field with a size placeholder.
+    fn strip_write_content_from_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+        blocks.iter().map(|block| {
+            match block {
+                ContentBlock::ToolUse { id, name, input } if is_write_tool(name) => {
+                    let mut input = input.clone();
+                    if let Some(obj) = input.as_object_mut() {
+                        if let Some(content_val) = obj.get("content") {
+                            let size = content_val.as_str().map_or_else(
+                                || content_val.to_string().len(),
+                                str::len,
+                            );
+                            obj.insert(
+                                "content".to_string(),
+                                Value::String(format!("[{size} bytes written]")),
+                            );
+                        }
+                    }
+                    ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input,
+                    }
+                }
+                _ => block.clone(),
+            }
+        }).collect()
     }
 
     async fn execute_tools(
@@ -472,10 +697,30 @@ impl Agent {
             let response = self.tools.execute(tool_call).await;
             let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+            // Strip write content from stored tool call record (same as context blocks)
+            let stored_input = if is_write_tool(name) {
+                let mut input = input.clone();
+                if let Some(obj) = input.as_object_mut() {
+                    if let Some(content_val) = obj.get("content") {
+                        let size = content_val.as_str().map_or_else(
+                            || content_val.to_string().len(),
+                            str::len,
+                        );
+                        obj.insert(
+                            "content".to_string(),
+                            Value::String(format!("[{size} bytes written]")),
+                        );
+                    }
+                }
+                input
+            } else {
+                input.clone()
+            };
+
             state.tool_records.push(ToolCallRecord {
                 id: id.clone(),
                 name: name.clone(),
-                input: input.clone(),
+                input: stored_input,
                 output: response.result.content.clone(),
                 success: response.result.success,
                 duration_ms,
@@ -493,9 +738,16 @@ impl Agent {
                 )
             };
 
+            // Summarize large tool results if configured
+            let final_content = if result_content.len() > self.config.summarization_threshold {
+                self.summarize_tool_result(&name, &result_content).await
+            } else {
+                result_content
+            };
+
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content: result_content,
+                content: final_content,
                 is_error: if response.result.success {
                     None
                 } else {
@@ -505,6 +757,155 @@ impl Agent {
         }
 
         tool_results
+    }
+
+    /// Summarize a large tool result using the configured summarization models (with fallback)
+    async fn summarize_tool_result(&self, tool_name: &str, content: &str) -> String {
+        // Check if summarization is configured
+        if self.config.summarization_priority.is_empty() {
+            info!(
+                tool = tool_name,
+                content_len = content.len(),
+                "No summarization models configured, truncating large result"
+            );
+            let max_chars = self.config.summarization_threshold;
+            return format!(
+                "{}\n\n[... truncated {} chars, configure summarization_priority for better results ...]",
+                &content[..max_chars.min(content.len())],
+                content.len().saturating_sub(max_chars)
+            );
+        }
+
+        // Hierarchical summarization handles any size - the summarizer will:
+        // - Chunk content into model-sized pieces (max 20 chunks per level)
+        // - Summarize each chunk
+        // - Recursively summarize if combined result is still large
+        // This keeps API calls bounded (max ~20 calls per level, ~5 levels max = ~100 calls worst case)
+
+        let context_hint = format!(
+            "This is the output from a tool called '{}'. Preserve all important information including file paths, code snippets, error messages, and key data.",
+            tool_name
+        );
+
+        // Try each model in priority order
+        for model_spec in &self.config.summarization_priority {
+            info!(
+                tool = tool_name,
+                content_len = content.len(),
+                model = %model_spec,
+                "Attempting summarization"
+            );
+
+            match self.try_summarize_with_model(model_spec, content, &context_hint).await {
+                Ok(summary) => {
+                    info!(
+                        model = %model_spec,
+                        original_len = content.len(),
+                        summary_len = summary.len(),
+                        compression = format!("{:.1}x", content.len() as f64 / summary.len() as f64),
+                        "Tool result summarized"
+                    );
+                    return format!(
+                        "[Summarized from {} chars using {}]\n\n{}",
+                        content.len(),
+                        model_spec,
+                        summary
+                    );
+                }
+                Err(e) => {
+                    warn!(model = %model_spec, error = %e, "Summarization failed, trying next model");
+                }
+            }
+        }
+
+        // All models failed, truncate as last resort
+        warn!("All summarization models failed, truncating");
+        let max_chars = self.config.summarization_threshold;
+        format!(
+            "{}\n\n[... truncated {} chars, all summarization models failed ...]",
+            &content[..max_chars.min(content.len())],
+            content.len().saturating_sub(max_chars)
+        )
+    }
+
+    /// Try to summarize content with a specific model
+    /// Model format: "provider/model" e.g. "ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-3-haiku"
+    async fn try_summarize_with_model(
+        &self,
+        model_spec: &str,
+        content: &str,
+        context_hint: &str,
+    ) -> Result<String, String> {
+        let (client, model_name) = self.create_client_for_model(model_spec)?;
+
+        // Get model's context window from cache or use default
+        let context_window = self.get_model_context_window(&client, &model_name).await;
+
+        // Calculate chunk size based on model's context window
+        // Reserve tokens for: summarization prompt (~5K), system message (~2K), output (~4K), safety margin (~14K)
+        // Use very conservative 2 chars/token ratio (file listings can tokenize at ~2.6 chars/token)
+        let usable_tokens = context_window.saturating_sub(25000);
+        let chunk_size = (usable_tokens * 2).max(4000); // ~2 chars per token (conservative), min 4k chars
+
+        info!(
+            model = model_name,
+            context_window = context_window,
+            chunk_size = chunk_size,
+            "Using model context window for summarization"
+        );
+
+        let config = SummarizerConfig {
+            model: model_name,
+            chunk_size,
+            target_summary_size: chunk_size / 4, // Target 25% compression per chunk
+            chunk_overlap: (chunk_size / 20).max(100), // 5% overlap, min 100 chars
+            // Use half the context window to reduce VRAM/KV cache usage
+            context_limit: Some((context_window / 2) as u32),
+        };
+
+        let summarizer = Summarizer::new(client, config);
+        summarizer.summarize(content, context_hint).await
+    }
+
+    /// Get a model's context window from cache or API
+    async fn get_model_context_window(&self, client: &LlmClient, model: &str) -> usize {
+        // Try to get from cache, fetch from API if needed, fall back to defaults
+        let cache = nanna_llm::ModelInfoCache::default_location();
+        let info = client.get_model_info(model, cache.as_ref()).await;
+        info.context_window
+    }
+
+    /// Create an LLM client for the specified model
+    /// Model format: "provider/model" or just "model" (uses main client's provider)
+    fn create_client_for_model(&self, model_spec: &str) -> Result<(LlmClient, String), String> {
+        if let Some((provider, model)) = model_spec.split_once('/') {
+            let client = match provider.to_lowercase().as_str() {
+                "ollama" => {
+                    let url = self.config.summarization_ollama_url
+                        .as_deref()
+                        .unwrap_or("http://localhost:11434");
+                    LlmClient::ollama(url)
+                }
+                "openai" => {
+                    // Would need API key from config - for now error
+                    return Err("OpenAI summarization requires API key configuration".to_string());
+                }
+                "anthropic" => {
+                    // Use the same client (it already has auth)
+                    (*self.llm).clone()
+                }
+                "openrouter" => {
+                    return Err("OpenRouter summarization requires API key configuration".to_string());
+                }
+                _ => {
+                    return Err(format!("Unknown provider: {}", provider));
+                }
+            };
+            Ok((client, model.to_string()))
+        } else {
+            // No provider prefix - use the main LLM client with the specified model
+            Ok(((*self.llm).clone(), model_spec.to_string()))
+        }
     }
 
     async fn store_tool_results(&self, tool_results: Vec<ContentBlock>) {
@@ -534,7 +935,8 @@ impl Agent {
 
         AnthropicRequest {
             model: self.config.model.clone(),
-            messages: ctx.messages.clone(),
+            // Use messages_for_request() to include consolidated summary if present
+            messages: ctx.messages_for_request(),
             max_tokens: self.config.max_tokens,
             temperature: Some(self.config.temperature),
             system: if system_prompt.is_empty() {
@@ -883,6 +1285,13 @@ impl RunState {
             confidence: self.confidence,
             emotional_context: self.emotional_context,
             reasoning,
+            cumulative_input_tokens: u64::from(self.input_tokens),
+            cumulative_output_tokens: u64::from(self.output_tokens),
         }
     }
+}
+
+/// Check if a tool name is a write-type tool whose content should be stripped from context.
+fn is_write_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "write" | "Write")
 }

@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::sync::mpsc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+// use tokio::sync::broadcast;
 use tracing::{error, info};
 use windows_service::{
     define_windows_service,
@@ -76,9 +76,10 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), String> {
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
 
     runtime.block_on(async {
-        // Create daemon
-        let config = crate::server::DaemonConfig::default();
-        let mut daemon = crate::server::DaemonServer::new(config);
+        // Create daemon using builder (loads config from file)
+        let mut daemon = crate::server::DaemonBuilder::from_nanna_config()
+            .unwrap_or_else(|_| crate::server::DaemonBuilder::new())
+            .build();
         let daemon_shutdown = daemon.shutdown_handle();
 
         // Spawn the daemon
@@ -146,7 +147,7 @@ pub fn install_service() -> Result<(), String> {
         account_password: None,
     };
 
-    let service = manager
+    let _service = manager
         .create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
         .map_err(|e| format!("Failed to create service: {}", e))?;
 

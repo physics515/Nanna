@@ -81,6 +81,34 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Result from spawning a sub-agent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnResult {
+    /// Final text response from the sub-agent
+    pub text: String,
+    /// Number of iterations the sub-agent used
+    pub iterations: usize,
+    /// Number of tool calls made
+    pub tool_calls: usize,
+    /// Input tokens consumed
+    pub input_tokens: u32,
+    /// Output tokens consumed
+    pub output_tokens: u32,
+}
+
+/// Trait for spawning sub-agents. Implemented in the daemon where Agent is available.
+/// This follows the same adapter pattern as `MemoryServiceAdapter`.
+#[async_trait]
+pub trait AgentSpawner: Send + Sync {
+    /// Spawn a sub-agent with the given prompt and constraints.
+    async fn spawn(
+        &self,
+        prompt: &str,
+        description: &str,
+        max_iterations: usize,
+    ) -> Result<SpawnResult, String>;
+}
+
 /// Helper for creating tool results
 impl ToolResult {
     pub fn success(content: impl Into<String>) -> Self {

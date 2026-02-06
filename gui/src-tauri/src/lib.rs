@@ -24,7 +24,7 @@ use nanna_core::{
     Workspace, WorkspaceRegistry, 
     find_workspace_root, discover_workspaces,
 };
-use nanna_llm::{AnthropicMessage, LlmClient, RequestBuilder, StreamEvent};
+use nanna_llm::{AnthropicMessage, CompletionRequest, LlmClient, Message as LlmMessage, ModelInfoCache, RequestBuilder, Role, StreamEvent};
 use nanna_storage::{Storage, StorageConfig};
 use nanna_tools::{ToolCall, ToolRegistry};
 use serde::{Deserialize, Serialize};
@@ -239,10 +239,17 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
             .map_err(|e| e.to_string())
     }
 
-    async fn list(&self, _limit: usize) -> Result<Vec<nanna_tools::MemoryResult>, String> {
-        // MemoryService doesn't have a direct list method, use search with empty query
-        // or return empty - tools shouldn't need this often
-        Ok(Vec::new())
+    async fn list(&self, limit: usize) -> Result<Vec<nanna_tools::MemoryResult>, String> {
+        // Use list_all to get all memories and take up to limit
+        let all = self.service.list_all().await;
+        Ok(all.into_iter()
+            .take(limit)
+            .map(|e| nanna_tools::MemoryResult {
+                id: e.id,
+                content: e.content,
+                score: Some(e.weight),
+            })
+            .collect())
     }
 }
 
@@ -555,17 +562,196 @@ fn allocate_tool_budgets(entries: &[ToolResultEntry], total_budget_tokens: usize
 ///
 /// Key improvements over naive equal division:
 /// - Proportional: larger results get proportionally more budget
-/// - Recency bias: recent tool calls get priority (20% boost for most recent)
-/// - Minimum floor: every result gets at least MIN_TOOL_RESULT_CHARS
-/// - Smart truncation: tool-specific strategies (code head/tail, command tail-biased, etc.)
-fn fit_tool_results_to_budget(
+/// Configuration for tool result summarization
+#[derive(Clone)]
+struct ToolSummarizationConfig {
+    /// Model priority list (e.g., ["ollama/llama3.2", "anthropic/claude-haiku"])
+    model_priority: Vec<String>,
+    /// Ollama URL for local models
+    ollama_url: String,
+    /// Threshold (chars) above which to summarize
+    threshold: usize,
+    /// Reference to main config for creating clients
+    config: Config,
+}
+
+/// Summarize a large tool result using configured summarization models
+/// Falls back to truncation if all models fail or none are configured
+/// Uses hierarchical summarization for very large content (chunks recursively)
+async fn summarize_tool_result(
+    content: &str,
+    tool_name: &str,
+    summarization_config: &ToolSummarizationConfig,
+    target_chars: usize,
+) -> String {
+    // If content is small enough, return as-is
+    if content.len() <= summarization_config.threshold {
+        return content.to_string();
+    }
+
+    // If no summarization models configured, truncate
+    if summarization_config.model_priority.is_empty() {
+        info!(
+            "No summarization models configured, truncating {} ({} chars)",
+            tool_name, content.len()
+        );
+        return smart_truncate_tool_result(content, tool_name, target_chars);
+    }
+
+    // Hierarchical summarization handles any size - the summarizer will:
+    // - Chunk content into model-sized pieces (max 20 chunks per level)
+    // - Summarize each chunk
+    // - Recursively summarize if combined result is still large
+
+    // Try each model in priority order
+    for model_spec in &summarization_config.model_priority {
+        debug!("Attempting to summarize {} with model {}", tool_name, model_spec);
+
+        match try_summarize_with_model(
+            content,
+            tool_name,
+            model_spec,
+            &summarization_config.ollama_url,
+            &summarization_config.config,
+            target_chars,
+        )
+        .await
+        {
+            Ok(summary) => {
+                info!(
+                    "Summarized tool result '{}': {} -> {} chars using {}",
+                    tool_name,
+                    content.len(),
+                    summary.len(),
+                    model_spec
+                );
+                return format!(
+                    "[Summarized from {} chars using {}]\n\n{}",
+                    content.len(),
+                    model_spec,
+                    summary
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Summarization with {} failed for {}: {}",
+                    model_spec, tool_name, e
+                );
+            }
+        }
+    }
+
+    // All models failed, fall back to truncation
+    warn!(
+        "All summarization models failed for {}, truncating",
+        tool_name
+    );
+    smart_truncate_tool_result(content, tool_name, target_chars)
+}
+
+/// Try to summarize content with a specific model
+/// Uses hierarchical summarization with proper chunking based on model context window
+async fn try_summarize_with_model(
+    content: &str,
+    tool_name: &str,
+    model_spec: &str,
+    ollama_url: &str,
+    config: &Config,
+    _target_chars: usize,
+) -> Result<String, String> {
+    use nanna_agent::{Summarizer, SummarizerConfig};
+
+    // Parse model spec (provider/model or just model)
+    let (client, model_name) = create_summarization_client(model_spec, ollama_url, config)?;
+
+    // Get model's context window from cache or API
+    let cache = ModelInfoCache::default_location();
+    let model_info = client.get_model_info(&model_name, cache.as_ref()).await;
+    let context_window = model_info.context_window;
+
+    // Calculate chunk size based on model's context window
+    // Leave room for prompt overhead (~2k tokens) and output (~1k tokens)
+    let usable_tokens = context_window.saturating_sub(3000);
+    let chunk_size = (usable_tokens * 4).max(4000); // ~4 chars per token, min 4k chars
+
+    info!(
+        "Using model {} (context: {}) for summarization, chunk_size: {}",
+        model_name, context_window, chunk_size
+    );
+
+    let summarizer_config = SummarizerConfig {
+        model: model_name,
+        chunk_size,
+        target_summary_size: chunk_size / 4, // Target 25% compression per chunk
+        chunk_overlap: (chunk_size / 20).max(100), // 5% overlap, min 100 chars
+        context_limit: Some((context_window / 2) as u32), // Half context to reduce VRAM
+    };
+
+    let summarizer = Summarizer::new(client, summarizer_config);
+    let context_hint = format!(
+        "This is the output from a tool called '{}'. Preserve all important information including file paths, code snippets, error messages, and key data.",
+        tool_name
+    );
+
+    summarizer.summarize(content, &context_hint).await
+}
+
+/// Create an LLM client for the specified summarization model
+fn create_summarization_client(
+    model_spec: &str,
+    ollama_url: &str,
+    config: &Config,
+) -> Result<(LlmClient, String), String> {
+    if let Some((provider, model)) = model_spec.split_once('/') {
+        match provider.to_lowercase().as_str() {
+            "ollama" => Ok((LlmClient::ollama(ollama_url), model.to_string())),
+            "anthropic" => {
+                // Use existing Anthropic credentials
+                if let Some(ref key) = config.llm.api_key {
+                    Ok((LlmClient::anthropic(key), model.to_string()))
+                } else if config.llm.anthropic_use_oauth {
+                    if let Some(ref token) = config.llm.anthropic_oauth_token {
+                        Ok((LlmClient::anthropic_oauth(token), model.to_string()))
+                    } else {
+                        Err("Anthropic OAuth enabled but no token available".to_string())
+                    }
+                } else {
+                    Err("No Anthropic API key configured".to_string())
+                }
+            }
+            "openai" => {
+                if let Some(ref key) = config.llm.openai_api_key {
+                    Ok((LlmClient::openai(key), model.to_string()))
+                } else {
+                    Err("No OpenAI API key configured".to_string())
+                }
+            }
+            "openrouter" => {
+                if let Some(ref key) = config.llm.openrouter_api_key {
+                    Ok((LlmClient::openrouter(key), model.to_string()))
+                } else {
+                    Err("No OpenRouter API key configured".to_string())
+                }
+            }
+            _ => Err(format!("Unknown provider: {}", provider)),
+        }
+    } else {
+        // No provider prefix - assume ollama
+        Ok((LlmClient::ollama(ollama_url), model_spec.to_string()))
+    }
+}
+
+/// Fit tool results to budget with optional summarization
+/// This is the async version that can summarize large results
+async fn fit_tool_results_to_budget_with_summarization(
     tool_results: Vec<(String, String, String, bool)>, // (id, name, content, is_error)
     budget_tokens: usize,
-) -> Vec<(String, String, bool)> { // (id, content, is_error)
+    summarization_config: Option<&ToolSummarizationConfig>,
+) -> Vec<(String, String, bool)> {
     if tool_results.is_empty() {
         return vec![];
     }
-    
+
     // Build entries with metadata
     let entries: Vec<ToolResultEntry> = tool_results
         .into_iter()
@@ -582,51 +768,51 @@ fn fit_tool_results_to_budget(
             }
         })
         .collect();
-    
+
     // Calculate total raw tokens
     let total_raw_tokens: usize = entries.iter().map(|e| e.raw_tokens).sum();
-    
+
     // If within budget, return as-is
     if total_raw_tokens <= budget_tokens {
-        return entries.into_iter()
+        return entries
+            .into_iter()
             .map(|e| (e.id, e.content, e.is_error))
             .collect();
     }
-    
+
     // Allocate budgets intelligently
     let allocations = allocate_tool_budgets(&entries, budget_tokens);
-    
-    // Log the allocation strategy
+
     info!(
-        "Tool results over budget ({} > {} tokens, {} results). Allocating proportionally with recency bias.",
-        total_raw_tokens, budget_tokens, entries.len()
+        "Tool results over budget ({} > {} tokens, {} results). Processing with summarization.",
+        total_raw_tokens,
+        budget_tokens,
+        entries.len()
     );
-    
-    for (entry, alloc) in entries.iter().zip(allocations.iter()) {
-        if entry.content.len() > *alloc {
-            debug!(
-                "  {} ({}): {} -> {} chars ({:.0}% of original)",
-                entry.name,
-                entry.id.chars().take(8).collect::<String>(),
-                entry.content.len(),
-                alloc,
-                (*alloc as f64 / entry.content.len() as f64) * 100.0
-            );
-        }
-    }
-    
-    // Apply truncation with allocated budgets
-    entries.into_iter()
-        .zip(allocations)
-        .map(|(entry, budget_chars)| {
-            let truncated = if entry.content.len() <= budget_chars {
-                entry.content
+
+    // Process each entry with summarization or truncation
+    let mut results = Vec::with_capacity(entries.len());
+
+    for (entry, budget_chars) in entries.into_iter().zip(allocations) {
+        let processed = if entry.content.len() <= budget_chars {
+            // Within budget, keep as-is
+            entry.content
+        } else if let Some(config) = summarization_config {
+            // Try summarization for large results
+            if entry.content.len() > config.threshold {
+                summarize_tool_result(&entry.content, &entry.name, config, budget_chars).await
             } else {
                 smart_truncate_tool_result(&entry.content, &entry.name, budget_chars)
-            };
-            (entry.id, truncated, entry.is_error)
-        })
-        .collect()
+            }
+        } else {
+            // No summarization config, just truncate
+            smart_truncate_tool_result(&entry.content, &entry.name, budget_chars)
+        };
+
+        results.push((entry.id, processed, entry.is_error));
+    }
+
+    results
 }
 
 /// Estimate tokens used by a CompletionRequest (for dynamic budget calculation)
@@ -737,6 +923,16 @@ pub struct AppState {
     user_tools: Arc<tool_authoring::UserToolManager>,
     /// Backend abstraction (daemon or embedded mode)
     backend: Arc<Backend>,
+    /// Tracks in-flight agent runs for embedded mode (shared with run_agent_loop)
+    embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
+}
+
+/// Tracks the in-flight state of an embedded mode agent run
+pub struct EmbeddedRunState {
+    pub accumulated_text: Arc<RwLock<String>>,
+    pub active_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
+    pub completed_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Model status event for frontend
@@ -976,15 +1172,35 @@ async fn send_message_daemon(
     session_id: String,
     message: String,
 ) -> Result<ChatMessage, String> {
+    use tracing::info;
+    
+    info!("send_message_daemon: session={}, message={}", session_id, &message[..message.len().min(50)]);
+    
     // Send to daemon via backend client
-    let result = state.backend.chat_send(&session_id, &message).await?;
+    let result = match state.backend.chat_send(&session_id, &message).await {
+        Ok(r) => {
+            info!("Daemon response received: {:?}", r);
+            r
+        }
+        Err(e) => {
+            error!("Daemon chat_send error: {}", e);
+            return Err(format!("Daemon error: {}", e));
+        }
+    };
     
     // Daemon handles everything (streaming, tools, storage)
     // Events are forwarded to frontend via backend event forwarder
     // Just parse and return the result
+    
+    // Check for error first
+    if let Some(error) = result.get("error") {
+        return Err(format!("Daemon error: {}", 
+            result.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")));
+    }
+    
     let content = result.get("content")
         .and_then(|v| v.as_str())
-        .ok_or("Invalid response format: missing 'content' field")?
+        .ok_or_else(|| format!("Invalid response format: {:?}", result))?
         .to_string();
     
     let tool_calls = result.get("tool_calls")
@@ -1020,6 +1236,8 @@ async fn send_message(
     session_id: String,
     message: String,
 ) -> Result<ChatMessage, String> {
+    info!("🚀 send_message called! session={}, message_len={}", session_id, message.len());
+    
     let state_guard = state.read().await;
 
     // Check if we're in daemon mode - if so, route through daemon
@@ -1203,12 +1421,13 @@ Be concise. Be useful. Be present.{}
     let ollama_host = state_guard.ollama_host.read().await.clone();
     let rate_limited = state_guard.rate_limited_models.clone();
     let active_model = state_guard.active_model.clone();
+    let embedded_run_states = state_guard.embedded_run_states.clone();
 
     // Drop the state guard so we can do tool execution without holding the lock
     drop(state_guard);
 
     // Run the agentic loop with fallback support
-    let (full_response, tool_calls) = run_agent_loop_with_fallback(
+    let result = run_agent_loop_with_fallback(
         &app_clone,
         &session_id_clone,
         tools,
@@ -1218,15 +1437,26 @@ Be concise. Be useful. Be present.{}
         &ollama_host,
         rate_limited,
         active_model,
-    ).await?;
+        embedded_run_states.clone(),
+    ).await;
+
+    // Always clean up embedded run state (success or error)
+    embedded_run_states.write().await.remove(&session_id_clone);
+
+    let (full_response, tool_calls) = result?;
 
     // Re-acquire state to store the response
     let state_guard = state.read().await;
 
-    // Store assistant response
+    // Store assistant response with tool calls
+    let tool_calls_json = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(&tool_calls).unwrap_or_default())
+    };
     let assistant_msg = state_guard
         .storage
-        .add_message(&session_id, "assistant", &full_response)
+        .add_message_with_tool_calls(&session_id, "assistant", &full_response, tool_calls_json)
         .await
         .map_err(|e| format!("Failed to store response: {}", e))?;
 
@@ -1444,6 +1674,7 @@ async fn run_agent_loop_with_fallback(
     ollama_host: &str,
     rate_limited: Arc<RwLock<HashMap<String, i64>>>,
     active_model: Arc<RwLock<String>>,
+    embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
 ) -> Result<(String, Vec<ToolCallInfo>), String> {
     use nanna_llm::{estimate_request_tokens, ModelLimits};
     
@@ -1454,10 +1685,22 @@ async fn run_agent_loop_with_fallback(
     // Get rate-limited models
     let rate_limited_map = rate_limited.read().await.clone();
     
+    // Create summarization config if models are configured
+    let summarization_config = if config.llm.summarization_priority.is_empty() {
+        None
+    } else {
+        Some(ToolSummarizationConfig {
+            model_priority: config.llm.summarization_priority.clone(),
+            ollama_url: ollama_host.to_string(),
+            threshold: 10000, // Summarize tool results > 10k chars
+            config: config.clone(),
+        })
+    };
+
     // Try each model in priority order
     let mut last_error = String::from("No models available");
     let mut tried_models = Vec::new();
-    
+
     for model_id in model_priority {
         // Check if we have credentials for this model
         let (_provider, _model_name) = parse_model_id(model_id);
@@ -1517,7 +1760,7 @@ async fn run_agent_loop_with_fallback(
         
         loop {
             let model_request_clone = model_request.clone();
-            match run_agent_loop(app, session_id, &llm, tools.clone(), model_request_clone).await {
+            match run_agent_loop(app, session_id, &llm, tools.clone(), model_request_clone, summarization_config.clone(), embedded_run_states.clone()).await {
                 Ok(result) => {
                     info!("Success with model: {}", model_id);
                     return Ok(result);
@@ -1573,6 +1816,18 @@ async fn run_agent_loop_with_fallback(
     Err(format!("All models exhausted (tried {}). Last error: {}", tried_models.len(), last_error))
 }
 
+/// Find the largest byte index <= max_bytes that is a valid char boundary.
+fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+    if s.len() <= max_bytes {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Run the agent loop with tool execution (parallel tool calls)
 async fn run_agent_loop(
     app: &AppHandle,
@@ -1580,12 +1835,30 @@ async fn run_agent_loop(
     llm: &LlmClient,
     tools: Arc<ToolRegistry>,
     mut request: nanna_llm::CompletionRequest,
+    summarization_config: Option<ToolSummarizationConfig>,
+    embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
 ) -> Result<(String, Vec<ToolCallInfo>), String> {
     use futures::StreamExt;
 
     let mut full_response = String::new();
     let mut all_tool_calls = Vec::new();
     let max_iterations = 10; // Prevent infinite loops
+
+    // Create shared state for run state tracking
+    let accumulated_text = Arc::new(RwLock::new(String::new()));
+    let active_tool_calls_state = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
+    let completed_tool_calls_state = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
+
+    // Insert embedded run state entry
+    {
+        let mut states = embedded_run_states.write().await;
+        states.insert(session_id.to_string(), EmbeddedRunState {
+            accumulated_text: accumulated_text.clone(),
+            active_tool_calls: active_tool_calls_state.clone(),
+            completed_tool_calls: completed_tool_calls_state.clone(),
+            started_at: chrono::Utc::now(),
+        });
+    }
 
     for iteration in 0..max_iterations {
         debug!("Agent loop iteration {}", iteration);
@@ -1621,6 +1894,10 @@ async fn run_agent_loop(
                 }
                 StreamEvent::TextDelta { text, .. } => {
                     current_text.push_str(&text);
+                    // Accumulate for run state recovery
+                    if let Ok(mut buf) = accumulated_text.try_write() {
+                        buf.push_str(&text);
+                    }
                     // Emit chunk to frontend
                     let _ = app.emit(
                         "stream-chunk",
@@ -1715,11 +1992,20 @@ async fn run_agent_loop(
         // Collect with tool name for smart truncation: (id, name, content, is_error)
         let mut tool_results_raw: Vec<(String, String, String, bool)> = Vec::new();
 
-        // Emit "started" events for all tools
+        // Emit "started" events for all tools and track in run state
         for pending in &pending_tool_calls {
             let input: serde_json::Value = serde_json::from_str(&pending.input_json)
                 .unwrap_or(serde_json::Value::Object(Default::default()));
-            
+
+            // Track active tool call in embedded run state
+            if let Ok(mut active) = active_tool_calls_state.try_write() {
+                active.push(serde_json::json!({
+                    "call_id": pending.id,
+                    "name": pending.name,
+                    "started_at": chrono::Utc::now().to_rfc3339(),
+                }));
+            }
+
             let _ = app.emit(
                 "tool-call",
                 ToolCallEvent {
@@ -1738,6 +2024,10 @@ async fn run_agent_loop(
         }
 
         // Execute all tools in parallel
+        // Log which tools are about to be executed
+        let tool_names: Vec<&str> = pending_tool_calls.iter().map(|p| p.name.as_str()).collect();
+        info!("🚀 Starting parallel execution of {} tools: {:?}", pending_tool_calls.len(), tool_names);
+        
         let tool_futures: Vec<_> = pending_tool_calls
             .iter()
             .map(|pending| {
@@ -1778,6 +2068,28 @@ async fn run_agent_loop(
 
         // Process results and emit completion events
         for (id, name, input, response, duration_ms) in tool_executions {
+            // Detailed tool execution logging
+            let input_preview = input.to_string();
+            let input_preview = if input_preview.len() > 200 {
+                let end = truncate_boundary(&input_preview, 200);
+                format!("{}...", &input_preview[..end])
+            } else {
+                input_preview
+            };
+            let output_preview = if response.result.content.len() > 500 {
+                let end = truncate_boundary(&response.result.content, 500);
+                format!("{}...", &response.result.content[..end])
+            } else {
+                response.result.content.clone()
+            };
+            
+            if response.result.success {
+                info!("🔧 Tool '{}' succeeded in {}ms | input: {} | output: {}", 
+                      name, duration_ms, input_preview, output_preview);
+            } else {
+                error!("❌ Tool '{}' FAILED in {}ms | input: {} | error: {}", 
+                       name, duration_ms, input_preview, output_preview);
+            }
             let tool_call_info = ToolCallInfo {
                 id: id.clone(),
                 name,
@@ -1804,6 +2116,20 @@ async fn run_agent_loop(
 
             all_tool_calls.push(tool_call_info.clone());
 
+            // Update embedded run state: move from active to completed
+            if let Ok(mut active) = active_tool_calls_state.try_write() {
+                active.retain(|tc| tc.get("call_id").and_then(|v| v.as_str()) != Some(&id));
+            }
+            if let Ok(mut completed) = completed_tool_calls_state.try_write() {
+                completed.push(serde_json::json!({
+                    "call_id": id,
+                    "name": tool_call_info.name,
+                    "output": tool_call_info.output,
+                    "success": tool_call_info.success,
+                    "duration_ms": tool_call_info.duration_ms,
+                }));
+            }
+
             // Collect raw tool result (will be intelligently truncated below)
             let result_content = if response.result.content.is_empty() && !response.result.success {
                 "Tool execution failed".to_string()
@@ -1819,12 +2145,18 @@ async fn run_agent_loop(
             ));
         }
 
-        // INTELLIGENT TRUNCATION: Fit all tool results within dynamically calculated budget
+        // INTELLIGENT TRUNCATION/SUMMARIZATION: Fit all tool results within dynamically calculated budget
         // Budget is based on: model context limit - (system + history + response reserve)
         // This replaces the old hardcoded 50k constant with actual remaining context space
+        // If summarization models are configured, uses them instead of truncation
         let tool_budget = calculate_dynamic_tool_budget(&request);
-        
-        let tool_results = fit_tool_results_to_budget(tool_results_raw, tool_budget);
+
+        let tool_results = fit_tool_results_to_budget_with_summarization(
+            tool_results_raw,
+            tool_budget,
+            summarization_config.as_ref(),
+        )
+        .await;
 
         // Add assistant message with tool use blocks
         let mut assistant_content = Vec::new();
@@ -1883,20 +2215,23 @@ async fn create_session(
     // Route through daemon if available
     if state_guard.backend.is_daemon_mode().await {
         let result = state_guard.backend.session_create(Some(&session_name)).await?;
+        // Daemon returns { "session": { ... } }
+        let session = result.get("session")
+            .ok_or("Invalid daemon response: missing 'session' field")?;
         return Ok(SessionInfo {
-            id: result.get("id")
+            id: session.get("id")
                 .and_then(|v| v.as_str())
-                .ok_or("Invalid daemon response")?
+                .ok_or("Invalid daemon response: missing 'id'")?
                 .to_string(),
-            name: result.get("name")
+            name: session.get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&session_name)
                 .to_string(),
-            created_at: result.get("created_at")
+            created_at: session.get("created_at")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            updated_at: result.get("updated_at")
+            updated_at: session.get("updated_at")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -1948,24 +2283,58 @@ async fn list_sessions(
 ) -> Result<Vec<SessionInfo>, String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if available
+    // Route through daemon if available, but also merge with local SQLite sessions
     if state_guard.backend.is_daemon_mode().await {
-        let result = state_guard.backend.sessions_list().await?;
-        // Parse daemon response into Vec<SessionInfo>
-        let sessions_array = result.as_array()
-            .ok_or("Invalid daemon response format")?;
+        let mut all_sessions: Vec<SessionInfo> = Vec::new();
         
-        return Ok(sessions_array.iter().filter_map(|s| {
-            Some(SessionInfo {
-                id: s.get("id")?.as_str()?.to_string(),
-                name: s.get("name")?.as_str()?.to_string(),
-                created_at: s.get("created_at")?.as_str()?.to_string(),
-                updated_at: s.get("updated_at")?.as_str()?.to_string(),
-                message_count: s.get("message_count")?.as_u64().unwrap_or(0) as u32,
-                workspace_id: s.get("workspace_id")?.as_str().map(|s| s.to_string()),
-                workspace_name: s.get("workspace_name")?.as_str().map(|s| s.to_string()),
-            })
-        }).collect());
+        // Get daemon sessions (new sessions created in daemon mode)
+        if let Ok(result) = state_guard.backend.sessions_list().await {
+            if let Some(sessions_array) = result.get("sessions").and_then(|v| v.as_array()) {
+                for s in sessions_array {
+                    if let (Some(id), Some(name)) = (
+                        s.get("id").and_then(|v| v.as_str()),
+                        s.get("name").and_then(|v| v.as_str()).or(Some("Untitled"))
+                    ) {
+                        all_sessions.push(SessionInfo {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            created_at: s.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            updated_at: s.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            message_count: s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                            workspace_id: s.get("workspace_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            workspace_name: s.get("workspace_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Also get sessions from local SQLite (old sessions from embedded mode)
+        // This ensures backward compatibility during daemon transition
+        if let Ok(sqlite_sessions) = state_guard.storage.sessions().list_by_workspace(workspace_id.as_deref(), 100).await {
+            let daemon_ids: std::collections::HashSet<_> = all_sessions.iter().map(|s| s.id.clone()).collect();
+            
+            for session in sqlite_sessions {
+                // Only add if not already in daemon list
+                if !daemon_ids.contains(&session.session_id) {
+                    let name = nanna_storage::Storage::get_session_name(&session);
+                    all_sessions.push(SessionInfo {
+                        id: session.session_id,
+                        name,
+                        created_at: session.created_at,
+                        updated_at: session.updated_at,
+                        message_count: 0, // Would need another query
+                        workspace_id: session.workspace_id,
+                        workspace_name: None,
+                    });
+                }
+            }
+        }
+        
+        // Sort by updated_at descending (newest first)
+        all_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        
+        return Ok(all_sessions);
     }
 
     // Embedded mode: use direct storage access
@@ -2009,27 +2378,63 @@ async fn list_sessions(
 
 /// Get session history
 #[tauri::command]
+/// Parse tool calls from message metadata
+fn parse_tool_calls_from_metadata(metadata: &Option<serde_json::Value>) -> Vec<ToolCallInfo> {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|tc| serde_json::from_value::<Vec<ToolCallInfo>>(tc.clone()).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 async fn get_session_history(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if available
+    // Route through daemon if available, with fallback to SQLite for old sessions
     if state_guard.backend.is_daemon_mode().await {
-        let result = state_guard.backend.session_history(&session_id, Some(500)).await?;
-        let messages_array = result.as_array()
-            .ok_or("Invalid daemon response format")?;
-        
-        return Ok(messages_array.iter().filter_map(|m| {
-            Some(ChatMessage {
-                id: m.get("id")?.as_str()?.to_string(),
-                role: m.get("role")?.as_str()?.to_string(),
-                content: m.get("content")?.as_str()?.to_string(),
-                timestamp: m.get("timestamp")?.as_str()?.to_string(),
-                tool_calls: vec![], // TODO: parse tool calls from daemon response
-            })
-        }).collect());
+        // Try daemon first
+        if let Ok(result) = state_guard.backend.session_history(&session_id, Some(500)).await {
+            if let Some(messages_array) = result.get("messages").and_then(|v| v.as_array()) {
+                if !messages_array.is_empty() {
+                    return Ok(messages_array.iter().filter_map(|m| {
+                        // Parse tool calls from daemon response metadata
+                        let tool_calls = m.get("metadata")
+                            .and_then(|meta| meta.get("tool_calls"))
+                            .and_then(|tc| serde_json::from_value::<Vec<ToolCallInfo>>(tc.clone()).ok())
+                            .unwrap_or_default();
+                        Some(ChatMessage {
+                            id: m.get("id")?.as_str()?.to_string(),
+                            role: m.get("role")?.as_str()?.to_string(),
+                            content: m.get("content")?.as_str()?.to_string(),
+                            timestamp: m.get("timestamp")?.as_str()?.to_string(),
+                            tool_calls,
+                        })
+                    }).collect());
+                }
+            }
+        }
+
+        // Fallback to SQLite for old sessions (from embedded mode)
+        // This maintains backward compatibility during daemon transition
+        if let Ok(messages) = state_guard.storage.get_session_messages(&session_id, 500).await {
+            return Ok(messages
+                .into_iter()
+                .map(|m| ChatMessage {
+                    id: m.id.to_string(),
+                    role: m.role,
+                    content: m.content,
+                    timestamp: m.created_at,
+                    tool_calls: parse_tool_calls_from_metadata(&m.metadata),
+                })
+                .collect());
+        }
+
+        // Session truly not found anywhere
+        return Ok(vec![]);
     }
 
     // Embedded mode: direct storage access
@@ -2046,7 +2451,7 @@ async fn get_session_history(
             role: m.role,
             content: m.content,
             timestamp: m.created_at,
-            tool_calls: vec![],
+            tool_calls: parse_tool_calls_from_metadata(&m.metadata),
         })
         .collect())
 }
@@ -2059,6 +2464,16 @@ async fn delete_session(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
 
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        // Try daemon first
+        if let Ok(_) = state_guard.backend.session_delete(&session_id).await {
+            return Ok(());
+        }
+        // Fall through to SQLite for backward compatibility
+    }
+
+    // Embedded mode / fallback: direct storage access
     state_guard
         .storage
         .delete_session(&session_id)
@@ -2066,6 +2481,196 @@ async fn delete_session(
         .map_err(|e| format!("Failed to delete session: {}", e))?;
 
     Ok(())
+}
+
+/// Delete all sessions
+#[tauri::command]
+async fn clear_all_sessions(
+    app: AppHandle,
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<usize, String> {
+    let state_guard = state.read().await;
+
+    // Always clear local SQLite storage (GUI sessions are stored there)
+    // Use list_gui_sessions to get ALL sessions (both global and workspace-scoped)
+    let sessions = state_guard.storage.list_gui_sessions(1000)
+        .await
+        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+
+    let local_count = sessions.len();
+    for session in sessions {
+        if let Err(e) = state_guard.storage.delete_session(&session.session_id).await {
+            warn!("Failed to delete local session {}: {}", session.session_id, e);
+        }
+    }
+    info!("Cleared {} local sessions from SQLite", local_count);
+
+    // Also clear daemon sessions if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        match state_guard.backend.sessions_delete_all().await {
+            Ok(result) => {
+                let daemon_count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                info!("Cleared {} daemon sessions", daemon_count);
+            }
+            Err(e) => {
+                warn!("Failed to clear daemon sessions: {}", e);
+            }
+        }
+    }
+
+    // Emit event to notify frontend to refresh sessions list
+    let _ = app.emit("sessions-cleared", local_count);
+
+    Ok(local_count)
+}
+
+/// Archive session to memory and delete
+/// Extracts important information from the conversation before deletion
+#[tauri::command]
+async fn archive_and_delete_session(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+) -> Result<ArchiveResult, String> {
+    info!("Archiving session {} to memory before deletion", session_id);
+
+    // Get session history first
+    let messages = get_session_history(state.clone(), session_id.clone()).await?;
+
+    if messages.is_empty() {
+        // Nothing to archive, just delete
+        delete_session(state.clone(), session_id).await?;
+        return Ok(ArchiveResult {
+            memories_created: 0,
+            session_deleted: true,
+        });
+    }
+
+    // Build conversation text for analysis
+    let conversation = messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let state_guard = state.read().await;
+
+    // Get session name for context
+    let session_name = state_guard
+        .storage
+        .sessions()
+        .get(&session_id)
+        .await
+        .ok()
+        .map(|s| nanna_storage::Storage::get_session_name(&s))
+        .unwrap_or_else(|| "Unnamed chat".to_string());
+
+    // Check if memory is enabled
+    let embedding_enabled = *state_guard.embedding_enabled.read().await;
+    if !embedding_enabled {
+        drop(state_guard);
+        // Memory not enabled, just delete
+        delete_session(state.clone(), session_id).await?;
+        return Ok(ArchiveResult {
+            memories_created: 0,
+            session_deleted: true,
+        });
+    }
+
+    // Create extraction prompt
+    let extraction_prompt = format!(
+        r#"Analyze this conversation titled "{}" and extract important information that should be remembered.
+
+Focus on:
+- User preferences, habits, or personal information shared
+- Important decisions made
+- Technical solutions or approaches discussed
+- Action items or commitments
+- Key insights or learnings
+- Project context (if any)
+
+For each piece of important information, output it on a separate line prefixed with "MEMORY:" followed by a clear, self-contained statement.
+
+Only extract genuinely important or useful information. Do not extract trivial or temporary information.
+If nothing is worth remembering, output "NO_MEMORIES".
+
+Conversation:
+{}
+"#,
+        session_name, conversation
+    );
+
+    // Use the LLM to extract memories
+    let llm = state_guard.llm.clone();
+    let extraction_model = state_guard.extraction_model.read().await.clone();
+    let model = if extraction_model.is_empty() {
+        state_guard.config.llm.model.clone()
+    } else {
+        extraction_model
+    };
+
+    drop(state_guard);
+
+    // Call LLM to extract memories
+    let request = CompletionRequest {
+        model: model.clone(),
+        messages: vec![LlmMessage {
+            role: Role::User,
+            content: extraction_prompt,
+        }],
+        max_tokens: Some(2000),
+        ..Default::default()
+    };
+
+    let extraction_result = llm.complete(&request).await;
+
+    let mut memories_created = 0;
+
+    if let Ok(response) = extraction_result {
+        // Parse extracted memories
+        let extracted_memories: Vec<String> = response
+            .lines()
+            .filter(|line: &&str| line.starts_with("MEMORY:"))
+            .map(|line: &str| line.trim_start_matches("MEMORY:").trim().to_string())
+            .filter(|s: &String| !s.is_empty())
+            .collect();
+
+        if !extracted_memories.is_empty() {
+            let state_guard = state.read().await;
+            let memory = state_guard.memory.clone();
+            drop(state_guard);
+
+            // Store each extracted memory with metadata
+            for memory_content in &extracted_memories {
+                let tagged_content = format!("[ARCHIVED:{}] {}", session_name, memory_content);
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("source".to_string(), "archived_session".to_string());
+                metadata.insert("session_name".to_string(), session_name.clone());
+                if let Err(e) = memory.remember(&tagged_content, metadata).await {
+                    warn!("Failed to store archived memory: {}", e);
+                } else {
+                    memories_created += 1;
+                }
+            }
+
+            info!("Archived {} memories from session {}", memories_created, session_id);
+        }
+    } else {
+        warn!("Memory extraction failed, proceeding with deletion anyway");
+    }
+
+    // Now delete the session
+    delete_session(state.clone(), session_id).await?;
+
+    Ok(ArchiveResult {
+        memories_created,
+        session_deleted: true,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchiveResult {
+    memories_created: usize,
+    session_deleted: bool,
 }
 
 /// Rename a session
@@ -2077,6 +2682,16 @@ async fn rename_session(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
 
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        // Try daemon first
+        if let Ok(_) = state_guard.backend.session_rename(&session_id, &name).await {
+            return Ok(());
+        }
+        // Fall through to SQLite for backward compatibility
+    }
+
+    // Embedded mode / fallback: direct storage access
     state_guard
         .storage
         .rename_session(&session_id, &name)
@@ -2861,6 +3476,7 @@ async fn get_credential_status() -> Result<CredentialStatus, String> {
                 CredentialSource::File => "file",
                 CredentialSource::MacOsKeychain => "macos_keychain",
                 CredentialSource::WindowsCredentialManager => "windows_credential_manager",
+                CredentialSource::LinuxSecretService => "linux_secret_service",
             };
             Ok(CredentialStatus {
                 cli_available,
@@ -3586,6 +4202,25 @@ async fn get_cognitive_memory_stats(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<CognitiveMemoryStats, String> {
     let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(result) = state_guard.backend.memory_stats().await {
+            // Parse daemon response
+            return Ok(CognitiveMemoryStats {
+                total_memories: result.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                active: result.get("active").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                dormant: result.get("dormant").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                silent: result.get("silent").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                unavailable: result.get("unavailable").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                consolidation_enabled: result.get("consolidation_enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                last_consolidation: result.get("last_consolidation").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            });
+        }
+        // Fall through to local if daemon fails
+    }
+
+    // Embedded mode / fallback: direct memory service access
     let stats = state_guard.memory.stats().await;
     let last = state_guard.last_consolidation.read().await;
     
@@ -3622,6 +4257,26 @@ async fn trigger_consolidation(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<ConsolidationResultInfo, String> {
     let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(result) = state_guard.backend.memory_consolidate().await {
+            // Parse daemon response
+            return Ok(ConsolidationResultInfo {
+                memories_processed: result.get("memories_processed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                clusters_formed: result.get("clusters_formed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                memories_merged: result.get("memories_merged").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                memories_expanded: result.get("memories_expanded").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                errors: result.get("errors")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
+            });
+        }
+        // Fall through to local if daemon fails
+    }
+
+    // Embedded mode / fallback: run consolidation locally
     let llm = state_guard.llm.clone();
     let memory = state_guard.memory.clone();
     let last_consolidation = state_guard.last_consolidation.clone();
@@ -3721,6 +4376,34 @@ async fn list_memories(
     scope: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
     let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        // Use proper memory_list action (scope filtering done by daemon)
+        if let Ok(result) = state_guard.backend.memory_list(scope.as_deref()).await {
+            if let Some(memories_array) = result.get("memories").and_then(|v: &serde_json::Value| v.as_array()) {
+                let items: Vec<MemoryItem> = memories_array.iter().filter_map(|m: &serde_json::Value| {
+                    Some(MemoryItem {
+                        id: m.get("id")?.as_str()?.to_string(),
+                        content: m.get("content")?.as_str()?.to_string(),
+                        fact_type: m.get("fact_type").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("stated").to_string(),
+                        importance: m.get("importance").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(3.0) as f32,
+                        state: m.get("state").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("active").to_string(),
+                        weight: m.get("weight").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(1.0) as f32,
+                        retrievability: m.get("retrievability").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(1.0) as f32,
+                        access_count: m.get("access_count").and_then(|v: &serde_json::Value| v.as_u64()).unwrap_or(0) as u32,
+                        created_at: m.get("created_at").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("").to_string(),
+                        session_id: m.get("session_id").and_then(|v: &serde_json::Value| v.as_str()).map(String::from),
+                        workspace_id: m.get("workspace_id").and_then(|v: &serde_json::Value| v.as_str()).map(String::from),
+                    })
+                }).collect();
+                return Ok(items);
+            }
+        }
+        // Fall through to local if daemon fails
+    }
+
+    // Embedded mode / fallback: direct memory service access
     let entries = state_guard.memory.list_all().await;
     
     // Filter by scope
@@ -3767,7 +4450,31 @@ async fn get_memory(
     id: String,
 ) -> Result<Option<MemoryItem>, String> {
     let state_guard = state.read().await;
-    
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(result) = state_guard.backend.memory_get(&id).await {
+            if let Some(m) = result.get("memory") {
+                return Ok(Some(MemoryItem {
+                    id: m.get("id").and_then(|v| v.as_str()).unwrap_or(&id).to_string(),
+                    content: m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    fact_type: m.get("fact_type").and_then(|v| v.as_str()).unwrap_or("stated").to_string(),
+                    importance: m.get("importance").and_then(|v| v.as_f64()).unwrap_or(3.0) as f32,
+                    state: m.get("state").and_then(|v| v.as_str()).unwrap_or("active").to_string(),
+                    weight: m.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                    retrievability: m.get("retrievability").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                    access_count: m.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    created_at: m.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    session_id: m.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    workspace_id: m.get("workspace_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                }));
+            }
+            return Ok(None);
+        }
+        // Fall through to local if daemon fails
+    }
+
+    // Embedded mode / fallback: direct memory service access
     Ok(state_guard.memory.get(&id).await.map(|e| {
         let fact_type = e.metadata.get("fact_type")
             .cloned()
@@ -3800,6 +4507,17 @@ async fn delete_memory(
     id: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(_) = state_guard.backend.memory_delete(&id).await {
+            info!("Deleted memory via daemon: {}", id);
+            return Ok(());
+        }
+        // Fall through to local if daemon fails
+    }
+
+    // Embedded mode / fallback: direct memory service access
     state_guard.memory.forget(&id).await
         .map_err(|e| format!("Failed to delete memory: {}", e))?;
     
@@ -3819,6 +4537,17 @@ async fn update_memory(
     content: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(_) = state_guard.backend.memory_update(&id, Some(&content), None).await {
+            info!("Updated memory via daemon: {}", id);
+            return Ok(());
+        }
+        // Fall through to local if daemon fails
+    }
+
+    // Embedded mode / fallback: direct memory service access
     state_guard.memory.update_content(&id, &content).await
         .map_err(|e| format!("Failed to update memory: {}", e))?;
     
@@ -3836,12 +4565,21 @@ async fn clear_all_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        state_guard.backend.memory_clear().await?;
+        info!("Cleared all memories (via daemon)");
+        return Ok(());
+    }
+
+    // Embedded mode: direct memory service access
     state_guard.memory.clear().await;
-    
+
     // Save empty state
     state_guard.memory.save(&state_guard.memory_path).await
         .map_err(|e| format!("Failed to save after clear: {}", e))?;
-    
+
     info!("Cleared all memories");
     Ok(())
 }
@@ -4126,6 +4864,31 @@ async fn set_embedding_model_priority(
     Ok(())
 }
 
+/// Get summarization model priority list
+#[tauri::command]
+async fn get_summarization_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.llm.summarization_priority.clone())
+}
+
+/// Set summarization model priority list
+#[tauri::command]
+async fn set_summarization_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    priority: Vec<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.summarization_priority = priority.clone();
+
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    info!("Summarization model priority set: {:?}", priority);
+    Ok(())
+}
+
 // =============================================================================
 // Model Status Commands
 // =============================================================================
@@ -4389,7 +5152,7 @@ struct TestConnectionResult {
 // =============================================================================
 
 /// Workspace info for frontend
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: String,
     pub name: String,
@@ -4504,6 +5267,17 @@ async fn get_workspace_context(
     id: String,
 ) -> Result<String, String> {
     let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.workspace_get_context(&id).await?;
+        return result.get("context")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Invalid response from daemon".to_string());
+    }
+    
+    // Embedded mode: use local registry
     let registry = state_guard.workspaces.read().await;
     
     let ws = registry.get(&id)
@@ -4519,6 +5293,15 @@ async fn reload_workspace(
     id: String,
 ) -> Result<WorkspaceInfo, String> {
     let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.workspace_reload(&id).await?;
+        return serde_json::from_value(result)
+            .map_err(|e| format!("Failed to parse daemon response: {}", e));
+    }
+    
+    // Embedded mode: use local registry
     let mut registry = state_guard.workspaces.write().await;
     
     let ws = registry.get_mut(&id)
@@ -4538,6 +5321,15 @@ async fn close_workspace(
     id: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        state_guard.backend.workspace_close(&id).await?;
+        info!("Closed workspace via daemon: {}", id);
+        return Ok(());
+    }
+    
+    // Embedded mode: use local registry
     let mut registry = state_guard.workspaces.write().await;
     
     if registry.remove(&id).is_some() {
@@ -4575,6 +5367,14 @@ async fn save_workspace_file(
     content: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        state_guard.backend.workspace_update_context(&workspace_id, &filename, &content).await?;
+        return Ok(());
+    }
+    
+    // Embedded mode: use local registry
     let registry = state_guard.workspaces.read().await;
     
     let ws = registry.get(&workspace_id)
@@ -5448,8 +6248,17 @@ async fn unsubscribe_channel_status() -> Result<(), String> {
 async fn list_user_tools_cmd(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<tool_authoring::UserToolMeta>, String> {
-    let state = state.read().await;
-    Ok(state.user_tools.list_tools().await)
+    let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.tool_list_user().await?;
+        return serde_json::from_value(result.get("tools").cloned().unwrap_or(serde_json::json!([])))
+            .map_err(|e| format!("Failed to parse daemon response: {}", e));
+    }
+    
+    // Embedded mode
+    Ok(state_guard.user_tools.list_tools().await)
 }
 
 #[tauri::command]
@@ -5457,8 +6266,19 @@ async fn get_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<Option<tool_authoring::UserToolMeta>, String> {
-    let state = state.read().await;
-    Ok(state.user_tools.get_tool(&name).await)
+    let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode (get via tool_list_user and filter)
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.tool_list_user().await?;
+        let tools: Vec<tool_authoring::UserToolMeta> = serde_json::from_value(
+            result.get("tools").cloned().unwrap_or(serde_json::json!([]))
+        ).map_err(|e| format!("Failed to parse daemon response: {}", e))?;
+        return Ok(tools.into_iter().find(|t| t.name == name));
+    }
+    
+    // Embedded mode
+    Ok(state_guard.user_tools.get_tool(&name).await)
 }
 
 #[tauri::command]
@@ -5470,10 +6290,18 @@ async fn create_user_tool(
     language: Option<String>,
     parameters: Option<serde_json::Value>,
 ) -> Result<tool_authoring::UserToolMeta, String> {
-    let state = state.read().await;
+    let state_guard = state.read().await;
     
-    // Create the tool
-    let meta = state.user_tools.create_tool(
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        // Daemon tool_create uses (name, description, code, needs_shell)
+        let result = state_guard.backend.tool_create(&name, &description, &source, None).await?;
+        return serde_json::from_value(result)
+            .map_err(|e| format!("Failed to parse daemon response: {}", e));
+    }
+    
+    // Embedded mode: Create the tool locally
+    let meta = state_guard.user_tools.create_tool(
         name.clone(),
         description,
         source,
@@ -5483,8 +6311,8 @@ async fn create_user_tool(
     ).await?;
     
     // Register it with the tool registry
-    if let Ok(tool_impl) = state.user_tools.create_tool_impl(&meta) {
-        state.tools.register_boxed(tool_impl).await;
+    if let Ok(tool_impl) = state_guard.user_tools.create_tool_impl(&meta) {
+        state_guard.tools.register_boxed(tool_impl).await;
         info!("Registered new user tool: {}", name);
     }
     
@@ -5500,9 +6328,22 @@ async fn update_user_tool(
     parameters: Option<serde_json::Value>,
     enabled: Option<bool>,
 ) -> Result<tool_authoring::UserToolMeta, String> {
-    let state = state.read().await;
+    let state_guard = state.read().await;
     
-    let meta = state.user_tools.update_tool(
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.tool_update(
+            &name,
+            description.as_deref(),
+            source.as_deref(),
+            None, // needs_shell not exposed in GUI
+        ).await?;
+        return serde_json::from_value(result)
+            .map_err(|e| format!("Failed to parse daemon response: {}", e));
+    }
+    
+    // Embedded mode
+    let meta = state_guard.user_tools.update_tool(
         &name,
         description,
         source,
@@ -5513,8 +6354,8 @@ async fn update_user_tool(
     
     // Re-register if enabled
     if meta.enabled {
-        if let Ok(tool_impl) = state.user_tools.create_tool_impl(&meta) {
-            state.tools.register_boxed(tool_impl).await;
+        if let Ok(tool_impl) = state_guard.user_tools.create_tool_impl(&meta) {
+            state_guard.tools.register_boxed(tool_impl).await;
             info!("Re-registered updated user tool: {}", name);
         }
     }
@@ -5527,8 +6368,16 @@ async fn delete_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<(), String> {
-    let state = state.read().await;
-    state.user_tools.delete_tool(&name).await
+    let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        state_guard.backend.tool_delete(&name).await?;
+        return Ok(());
+    }
+    
+    // Embedded mode
+    state_guard.user_tools.delete_tool(&name).await
 }
 
 #[tauri::command]
@@ -5537,8 +6386,97 @@ async fn test_user_tool(
     source: String,
     input: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
-    let state = state.read().await;
-    state.user_tools.test_tool(&source, input).await
+    let state_guard = state.read().await;
+    
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        let input_value = serde_json::to_value(&input)
+            .map_err(|e| format!("Failed to serialize input: {}", e))?;
+        let result = state_guard.backend.tool_test(&source, input_value).await?;
+        return result.get("output")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Invalid response from daemon".to_string());
+    }
+    
+    // Embedded mode
+    state_guard.user_tools.test_tool(&source, input).await
+}
+
+// =============================================================================
+// Tool Listing Commands (all registered tools)
+// =============================================================================
+
+/// List all registered tools
+#[tauri::command]
+async fn list_tools(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ToolInfo>, String> {
+    let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(result) = state_guard.backend.tool_list().await {
+            if let Some(tools_array) = result.get("tools").and_then(|v| v.as_array()) {
+                let tools: Vec<ToolInfo> = tools_array.iter().filter_map(|t| {
+                    Some(ToolInfo {
+                        name: t.get("name")?.as_str()?.to_string(),
+                        description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                    })
+                }).collect();
+                return Ok(tools);
+            }
+        }
+        return Err("Failed to fetch tools from daemon".to_string());
+    }
+
+    // Embedded mode: get from tool registry
+    let definitions = state_guard.tools.definitions().await;
+    let tools: Vec<ToolInfo> = definitions.into_iter()
+        .map(|t| ToolInfo {
+            name: t.name,
+            description: t.description,
+            enabled: true,
+        })
+        .collect();
+
+    Ok(tools)
+}
+
+/// Get details of a specific tool
+#[tauri::command]
+async fn get_tool(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        if let Ok(result) = state_guard.backend.daemon_request(serde_json::json!({
+            "type": "tool",
+            "action": "get",
+            "name": name
+        })).await {
+            return Ok(result);
+        }
+        return Err("Failed to fetch tool from daemon".to_string());
+    }
+
+    // Embedded mode
+    let definitions = state_guard.tools.definitions().await;
+    if let Some(tool) = definitions.into_iter().find(|t| t.name == name) {
+        Ok(serde_json::json!({
+            "tool": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }
+        }))
+    } else {
+        Err(format!("Tool not found: {}", name))
+    }
 }
 
 // =============================================================================
@@ -5806,6 +6744,50 @@ async fn init_backend(
         BackendMode::Daemon => "daemon".to_string(),
         BackendMode::Embedded => "embedded".to_string(),
     })
+}
+
+/// Get session run state (in-flight streaming text, active tools)
+/// Works in both daemon mode (queries daemon) and embedded mode (local state).
+#[tauri::command]
+async fn get_session_run_state(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    let state = state.read().await;
+
+    // Try daemon mode first
+    if state.backend.is_daemon_mode().await {
+        return state.backend.session_get_run_state(&session_id).await;
+    }
+
+    // Embedded mode: check local run states
+    let run_states = state.embedded_run_states.read().await;
+    let msg_count = state.storage.count_session_messages(&session_id).await
+        .unwrap_or(0) as usize;
+
+    if let Some(run_state) = run_states.get(&session_id) {
+        let text = run_state.accumulated_text.read().await.clone();
+        let active = run_state.active_tool_calls.read().await.clone();
+        let completed = run_state.completed_tool_calls.read().await.clone();
+
+        Ok(serde_json::json!({
+            "is_running": true,
+            "accumulated_text": text,
+            "active_tool_calls": active,
+            "completed_tool_calls": completed,
+            "started_at": run_state.started_at.to_rfc3339(),
+            "message_count": msg_count,
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "is_running": false,
+            "accumulated_text": "",
+            "active_tool_calls": [],
+            "completed_tool_calls": [],
+            "started_at": null,
+            "message_count": msg_count,
+        }))
+    }
 }
 
 // =============================================================================
@@ -6079,6 +7061,17 @@ async fn delete_cron_job(
     Ok(scheduler.remove_task(&job_id).await)
 }
 
+/// Delete all cron jobs with a given name (useful for cleanup)
+#[tauri::command]
+async fn delete_cron_jobs_by_name(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<usize, String> {
+    let state_guard = state.read().await;
+    let scheduler = state_guard.scheduler.read().await;
+    Ok(scheduler.remove_tasks_by_name(&name).await)
+}
+
 /// Run a cron job immediately
 #[tauri::command]
 async fn run_cron_job_now(
@@ -6248,17 +7241,30 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     tools.register(web_search).await;
     tools.register(nanna_tools::EchoTool).await;
 
+    // Register common aliases for Claude Code compatibility
+    // Claude Code uses: read, Write, bash, glob, etc.
+    tools.register_alias("read", "read_file").await;
+    tools.register_alias("Read", "read_file").await;
+    tools.register_alias("write", "write_file").await;
+    tools.register_alias("Write", "write_file").await;
+    tools.register_alias("bash", "exec").await;
+    tools.register_alias("Bash", "exec").await;
+    tools.register_alias("glob", "list_dir").await;
+    tools.register_alias("Glob", "list_dir").await;
+    tools.register_alias("ls", "list_dir").await;
+    info!("Registered Claude Code tool aliases (read, write, bash, glob)");
+
     // Initialize FSRS-6 cognitive memory service
-    // Load embedding config from saved config file (config takes priority over env var)
+    // Load embedding config from saved config file
     let saved_embedding_provider = config.memory.embedding_provider.clone();
     let saved_embedding_model = config.memory.embedding_model.clone();
     let saved_ollama_host = config.memory.ollama_host.clone();
-    
+
     // Get API keys
     let openai_key = std::env::var("OPENAI_API_KEY").ok()
         .or_else(|| config.llm.openai_api_key.clone());
-    
-    info!("Loaded embedding config: provider={}, model={}, ollama_host={}", 
+
+    info!("Loaded embedding config: provider={}, model={}, ollama_host={}",
           saved_embedding_provider, saved_embedding_model, saved_ollama_host);
     
     // Initialize based on configured provider
@@ -6268,9 +7274,15 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                 if let Some(openai_key) = openai_key {
                     unsafe { std::env::set_var("OPENAI_API_KEY", &openai_key); }
                     info!("Using OpenAI embeddings with model: {}", saved_embedding_model);
-                    
-                    // Determine dimension based on model
-                    let dimension = if saved_embedding_model.contains("large") { 3072 } else { 1536 };
+
+                    // Get dimension from model info cache/API
+                    let embed_llm = LlmClient::openai(&openai_key);
+                    let cache = ModelInfoCache::default_location();
+                    let model_info = embed_llm.get_model_info(&saved_embedding_model, cache.as_ref()).await;
+                    let dimension = model_info.embedding_dimension
+                        .unwrap_or_else(|| MemoryServiceConfig::dimension_for_model(&saved_embedding_model));
+                    info!("Embedding dimension: {} for model {} (from cache/API)", dimension, saved_embedding_model);
+
                     let memory_config = MemoryServiceConfig {
                         dimension,
                         ..Default::default()
@@ -6337,16 +7349,15 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
             "ollama" => {
                 let ollama_url = saved_ollama_host.clone();
                 info!("Using Ollama embeddings at {} with model: {}", ollama_url, saved_embedding_model);
-                
-                // Common embedding dimensions (default to 768 for nomic-embed-text)
-                let dimension = match saved_embedding_model.as_str() {
-                    m if m.contains("mxbai") => 1024,
-                    m if m.contains("minilm") => 384,
-                    m if m.contains("bge-large") => 1024,
-                    m if m.contains("bge-m3") => 1024,
-                    _ => 768, // nomic-embed-text default
-                };
-                
+
+                // Get dimension from model info cache/API (Ollama /api/show endpoint)
+                let embed_llm = LlmClient::ollama(&ollama_url);
+                let cache = ModelInfoCache::default_location();
+                let model_info = embed_llm.get_model_info(&saved_embedding_model, cache.as_ref()).await;
+                let dimension = model_info.embedding_dimension
+                    .unwrap_or_else(|| MemoryServiceConfig::dimension_for_model(&saved_embedding_model));
+                info!("Embedding dimension: {} for model {} (from cache/API)", dimension, saved_embedding_model);
+
                 let memory_config = MemoryServiceConfig {
                     dimension,
                     ..Default::default()
@@ -6481,11 +7492,21 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         Ok(count) => info!("Loaded {} cron jobs from database", count),
         Err(e) => warn!("Failed to load cron jobs: {}", e),
     }
-    
-    // Add memory consolidation task (runs every hour)
-    let consolidation = consolidation_task(Some(Duration::from_secs(3600)));
-    scheduler.add_task(consolidation).await;
-    info!("Scheduled memory consolidation task (every 1 hour)");
+
+    // Deduplicate consolidation tasks (fix for historical duplicates)
+    let deduped = scheduler.deduplicate_by_name("memory_consolidation").await;
+    if deduped > 0 {
+        info!("Removed {} duplicate consolidation tasks", deduped);
+    }
+
+    // Only add consolidation task if one doesn't already exist
+    if !scheduler.has_task_named("memory_consolidation").await {
+        let consolidation = consolidation_task(Some(Duration::from_secs(3600)));
+        scheduler.add_task(consolidation).await;
+        info!("Scheduled memory consolidation task (every 1 hour)");
+    } else {
+        info!("Memory consolidation task already scheduled");
+    }
 
     // Create executor for scheduled tasks
     let memory_for_executor = memory.clone();
@@ -6826,6 +7847,8 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         backend,
         // Close behavior (default: ask user)
         close_mode: Arc::new(RwLock::new(CloseMode::default())),
+        // Embedded run state tracking (empty at startup)
+        embedded_run_states: Arc::new(RwLock::new(HashMap::new())),
     })
 }
 
@@ -6886,6 +7909,8 @@ pub fn run() {
             list_sessions,
             get_session_history,
             delete_session,
+            clear_all_sessions,
+            archive_and_delete_session,
             rename_session,
             get_config,
             set_model,
@@ -6968,6 +7993,8 @@ pub fn run() {
             set_chat_model_priority,
             get_embedding_model_priority,
             set_embedding_model_priority,
+            get_summarization_model_priority,
+            set_summarization_model_priority,
             // Model status
             get_model_status,
             clear_rate_limit,
@@ -7006,6 +8033,9 @@ pub fn run() {
             update_user_tool,
             delete_user_tool,
             test_user_tool,
+            // All registered tools
+            list_tools,
+            get_tool,
             // Skill directory tools
             list_skills,
             create_skill,
@@ -7015,6 +8045,7 @@ pub fn run() {
             // Backend mode
             get_backend_status,
             init_backend,
+            get_session_run_state,
             // Window close behavior
             get_close_mode,
             set_close_mode,
@@ -7026,6 +8057,7 @@ pub fn run() {
             update_cron_job,
             set_cron_job_enabled,
             delete_cron_job,
+            delete_cron_jobs_by_name,
             run_cron_job_now,
             get_cron_job_history,
             validate_cron_expression,

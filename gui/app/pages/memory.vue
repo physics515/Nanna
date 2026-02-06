@@ -197,7 +197,7 @@
             size="sm"
             :disabled="isConsolidating"
           >
-            {{ isConsolidating ? '💭 Dreaming...' : '💭 Consolidate' }}
+            {{ isConsolidating ? '💭 Dreaming...' : '💭 Dream Now' }}
           </UiButton>
           <UiButton 
             v-if="semanticMemories.length > 0"
