@@ -95,31 +95,55 @@ impl DaemonManager {
         
         // Spawn the sidecar
         let shell = app.shell();
+        info!("Creating sidecar command for nanna-daemon...");
         let sidecar = shell.sidecar("nanna-daemon")
-            .map_err(|e| format!("Failed to create sidecar command: {}", e))?;
+            .map_err(|e| {
+                error!("Failed to create sidecar command: {}", e);
+                format!("Failed to create sidecar command: {}", e)
+            })?;
         
+        let args = ["--port", &self.config.port.to_string(), "--host", &self.config.host, "run"];
+        info!("Spawning daemon with args: {:?}", args);
         let (mut rx, child) = sidecar
-            .args(["run", "--port", &self.config.port.to_string(), "--host", &self.config.host])
+            .args(args)
             .spawn()
-            .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
+            .map_err(|e| {
+                error!("Failed to spawn daemon: {}", e);
+                format!("Failed to spawn daemon: {}", e)
+            })?;
         
         // Store the child handle
         *self.child.write().await = Some(child);
         
-        // Spawn a task to log daemon output
+        // Spawn a task to log daemon output (use info level so it's visible in production)
         tokio::spawn(async move {
             use tauri_plugin_shell::process::CommandEvent;
             while let Some(event) = rx.recv().await {
                 match event {
                     CommandEvent::Stdout(line) => {
-                        debug!("daemon: {}", String::from_utf8_lossy(&line));
+                        let msg = String::from_utf8_lossy(&line);
+                        info!("daemon stdout: {}", msg);
                     }
                     CommandEvent::Stderr(line) => {
-                        warn!("daemon: {}", String::from_utf8_lossy(&line));
+                        let msg = String::from_utf8_lossy(&line);
+                        error!("daemon stderr: {}", msg);
                     }
                     CommandEvent::Terminated(payload) => {
-                        info!("daemon terminated: {:?}", payload);
+                        if let Some(code) = payload.code {
+                            if code != 0 {
+                                error!("daemon terminated with exit code: {}", code);
+                            } else {
+                                info!("daemon terminated normally (code 0)");
+                            }
+                        } else if let Some(signal) = payload.signal {
+                            warn!("daemon terminated by signal: {}", signal);
+                        } else {
+                            warn!("daemon terminated (unknown reason)");
+                        }
                         break;
+                    }
+                    CommandEvent::Error(err) => {
+                        error!("daemon error event: {}", err);
                     }
                     _ => {}
                 }

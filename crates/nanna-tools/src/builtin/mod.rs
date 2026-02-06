@@ -3,6 +3,7 @@
 mod audio;
 mod authoring;
 mod browser;
+mod code;
 mod curiosity;
 mod echo;
 mod exec;
@@ -12,6 +13,7 @@ mod memory_storage;
 mod ocr;
 mod pdf;
 mod schedule;
+mod task;
 mod vision;
 mod web;
 
@@ -26,15 +28,17 @@ mod audio_wiring;
 pub use audio::{OpenAiTts, OpenAiWhisper, TextToSpeechTool, TranscribeFn, TranscribeTool, TtsFn};
 pub use authoring::{CreateToolTool, DeleteToolTool, ListToolsTool, ScriptTool, ScriptToolExecutor, ToolStore};
 pub use browser::{BrowserActionTool, BrowserEvaluateTool, BrowserExtractTool, BrowserFn, BrowserScreenshotTool};
+pub use code::{CodeOutlineTool, CodeSearchTool, ProjectStructureTool};
 pub use curiosity::{ExploreTool, WonderTool, StatusTool};
 pub use echo::EchoTool;
 pub use exec::ExecTool;
 pub use file::{ReadFileTool, WriteFileTool, ListDirTool};
-pub use memory::{InMemoryStorage, MemoryStorage, MemoryResult, StorageHandle, RememberTool, RecallTool, ReflectTool};
+pub use memory::{InMemoryStorage, MemoryStorage, MemoryResult, StorageHandle, RememberTool, RecallTool, ReflectTool, MemoryServiceStorage, MemoryServiceAdapter};
 pub use memory_storage::{EmbedFn, TursoMemoryStorage};
 pub use ocr::{DescribeImageTool, OcrTool, OcrVisionFn};
 pub use pdf::{ReadPdfTool, PdfVisionFn};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
+pub use task::TaskTool;
 pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};
 pub use web::{WebSearchTool, WebSearchBatchTool, WebFetchTool};
 

@@ -2,23 +2,35 @@
 //!
 //! Handles LLM calls, streaming, and tool execution.
 
+use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
-use crate::session::{MessageRole, SessionId, ToolCallRecord};
-use nanna_agent::{Agent, AgentConfig, AgentResponse, RunOptions, ThinkingMode};
-use nanna_llm::LlmClient;
+use crate::session::{MessageRole, SessionId, SessionMessage, ToolCallRecord};
+use nanna_agent::{Agent, AgentConfig, RunOptions, ThinkingMode};
+use nanna_llm::{AnthropicMessage, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
 use nanna_tools::ToolRegistry;
-use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
+
+/// Per-session queue that serializes chat processing.
+/// Tokio's Mutex is FIFO-fair, so messages are processed in arrival order.
+struct SessionQueue {
+    /// Serializes chat processing — tokio Mutex is FIFO-fair
+    lock: tokio::sync::Mutex<()>,
+    /// Messages waiting + currently processing (for frontend visibility)
+    depth: AtomicUsize,
+}
 
 /// Configuration for the agent service
 #[derive(Debug, Clone)]
 pub struct AgentServiceConfig {
     /// Default model to use
     pub model: String,
+    /// Model priority list for fallback (e.g., ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"])
+    pub model_priority: Vec<String>,
     /// Maximum tokens per response
     pub max_tokens: u32,
     /// Temperature for sampling
@@ -27,16 +39,26 @@ pub struct AgentServiceConfig {
     pub max_iterations: usize,
     /// Default thinking mode
     pub thinking_mode: ThinkingMode,
+    /// Model priority list for summarization
+    pub summarization_priority: Vec<String>,
+    /// Ollama URL for summarization
+    pub summarization_ollama_url: Option<String>,
+    /// Threshold (chars) for summarizing tool results
+    pub summarization_threshold: usize,
 }
 
 impl Default for AgentServiceConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: String::new(), // Populated from config at startup
+            model_priority: vec![], // Dynamically built from available credentials
             max_tokens: 8192,
             temperature: 0.7,
-            max_iterations: 10,
+            max_iterations: 30, // Allow more iterations for complex tool use chains
             thinking_mode: ThinkingMode::Instant,
+            summarization_priority: vec![],
+            summarization_ollama_url: Some("http://localhost:11434".to_string()),
+            summarization_threshold: 50_000,
         }
     }
 }
@@ -45,36 +67,136 @@ impl Default for AgentServiceConfig {
 struct ActiveChat {
     session_id: SessionId,
     cancelled: bool,
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Accumulated streamed text (shared with on_text callback)
+    accumulated_text: Arc<tokio::sync::RwLock<String>>,
+    /// Tool calls currently in progress
+    active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
+    /// Tool calls completed during this run (before final message)
+    completed_tool_calls: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+}
+
+/// Info about a tool call currently executing
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActiveToolCallInfo {
+    pub call_id: String,
+    pub name: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Info about a tool call that completed during the current run
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletedToolCallInfo {
+    pub call_id: String,
+    pub name: String,
+    pub output: String,
+    pub success: bool,
+    pub duration_ms: u64,
+}
+
+/// Snapshot of the current run state for a session
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunStateSnapshot {
+    pub is_running: bool,
+    pub accumulated_text: String,
+    pub active_tool_calls: Vec<ActiveToolCallInfo>,
+    pub completed_tool_calls: Vec<CompletedToolCallInfo>,
+    pub started_at: Option<String>,
+    /// Total completed messages in session (for sync verification)
+    pub message_count: usize,
+    /// ID of the last completed message (for sync verification)
+    pub last_message_id: Option<String>,
+    /// Messages queued behind the current one at the daemon level
+    pub queued_count: usize,
 }
 
 /// The agent service that handles LLM interactions
 pub struct AgentService {
     config: AgentServiceConfig,
-    llm: Arc<LlmClient>,
+    router: Arc<LlmRouter>,
     tools: Arc<ToolRegistry>,
     memory: Option<Arc<MemoryService>>,
     /// Event broadcaster for streaming to clients
     event_tx: broadcast::Sender<Event>,
     /// Currently active chats (session_id -> state)
     active_chats: Arc<RwLock<HashMap<SessionId, ActiveChat>>>,
+    /// Cache for model capabilities
+    model_cache: Option<ModelInfoCache>,
+    /// Cached model info for current model
+    current_model_info: Arc<RwLock<Option<ModelInfo>>>,
+    /// Per-session message queues for serialized chat processing
+    session_queues: Arc<RwLock<HashMap<String, Arc<SessionQueue>>>>,
 }
 
 impl AgentService {
     /// Create a new agent service
     pub fn new(
         config: AgentServiceConfig,
-        llm: Arc<LlmClient>,
+        router: Arc<LlmRouter>,
         tools: Arc<ToolRegistry>,
         memory: Option<Arc<MemoryService>>,
         event_tx: broadcast::Sender<Event>,
     ) -> Self {
+        // Initialize model info cache in default location
+        let model_cache = ModelInfoCache::default_location();
+        if model_cache.is_none() {
+            warn!("Could not determine cache directory for model info");
+        }
+
         Self {
             config,
-            llm,
+            router,
             tools,
             memory,
             event_tx,
             active_chats: Arc::new(RwLock::new(HashMap::new())),
+            model_cache,
+            current_model_info: Arc::new(RwLock::new(None)),
+            session_queues: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Get model info for the current model, fetching if needed
+    pub async fn get_model_info(&self) -> ModelInfo {
+        // Check if we already have cached info for this model
+        {
+            let cached = self.current_model_info.read().await;
+            if let Some(ref info) = *cached {
+                if info.id == self.config.model && !info.is_expired() {
+                    return info.clone();
+                }
+            }
+        }
+
+        // Fetch new info via router
+        let info = self.router.get_model_info(&self.config.model).await;
+
+        info!(
+            model = %info.id,
+            context_window = info.context_window,
+            max_output = info.max_output_tokens,
+            provider = %info.provider,
+            "Fetched model info"
+        );
+
+        // Cache it
+        {
+            let mut cached = self.current_model_info.write().await;
+            *cached = Some(info.clone());
+        }
+
+        info
+    }
+
+    /// Update the model and refresh model info
+    pub async fn set_model(&mut self, model: String) {
+        if self.config.model != model {
+            info!(old_model = %self.config.model, new_model = %model, "Switching model");
+            self.config.model = model;
+
+            // Clear cached model info to force refresh
+            let mut cached = self.current_model_info.write().await;
+            *cached = None;
         }
     }
     
@@ -86,117 +208,321 @@ impl AgentService {
             temperature: self.config.temperature,
             max_iterations: self.config.max_iterations,
             thinking_mode: self.config.thinking_mode,
+            summarization_priority: self.config.summarization_priority.clone(),
+            summarization_ollama_url: self.config.summarization_ollama_url.clone(),
+            summarization_threshold: self.config.summarization_threshold,
         }
     }
     
-    /// Run a chat completion
+    /// Get or create the per-session queue for serializing chat processing
+    async fn get_or_create_queue(&self, session_id: &str) -> Arc<SessionQueue> {
+        // Fast path: read lock
+        {
+            let queues = self.session_queues.read().await;
+            if let Some(queue) = queues.get(session_id) {
+                return queue.clone();
+            }
+        }
+        // Slow path: write lock to insert
+        let mut queues = self.session_queues.write().await;
+        queues
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionQueue {
+                    lock: tokio::sync::Mutex::new(()),
+                    depth: AtomicUsize::new(0),
+                })
+            })
+            .clone()
+    }
+
+    /// Get the current queue depth for a session (messages waiting + processing)
+    pub async fn queue_depth(&self, session_id: &str) -> usize {
+        let queues = self.session_queues.read().await;
+        queues
+            .get(session_id)
+            .map(|q| q.depth.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Run a chat completion with automatic model fallback.
+    ///
+    /// `history` should contain all prior session messages **excluding** the
+    /// current user message (which is passed as `message`). The agent loop
+    /// appends `message` itself, so we only pre-populate the older turns.
     pub async fn chat(
         &self,
         session_id: &str,
         message: &str,
         system_prompt: Option<String>,
+        history: &[SessionMessage],
     ) -> Result<ChatResult, String> {
-        // Mark chat as active
+        // Acquire per-session queue slot (FIFO ordering via tokio Mutex)
+        let queue = self.get_or_create_queue(session_id).await;
+        queue.depth.fetch_add(1, Ordering::Relaxed);
+
+        // Wait for our turn — if another chat is running on this session,
+        // we block here until it completes. Tokio Mutex is FIFO-fair.
+        let _guard = queue.lock.lock().await;
+
+        // Create shared state buffers for run state tracking
+        let accumulated = Arc::new(tokio::sync::RwLock::new(String::new()));
+        let active_tools = Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new()));
+        let completed_tools = Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new()));
+
+        // Register this chat as active (for streaming state tracking)
         {
             let mut active = self.active_chats.write().await;
             active.insert(session_id.to_string(), ActiveChat {
                 session_id: session_id.to_string(),
                 cancelled: false,
+                started_at: chrono::Utc::now(),
+                accumulated_text: accumulated.clone(),
+                active_tool_calls: active_tools.clone(),
+                completed_tool_calls: completed_tools.clone(),
             });
         }
-        
-        // Create agent with custom context if system prompt provided
-        let agent = if let Some(ref prompt) = system_prompt {
-            let context = nanna_agent::AgentContext::new(session_id.to_string())
-                .with_system_prompt(prompt);
-            Agent::new(
-                self.agent_config(),
-                self.llm.clone(),
-                self.tools.clone(),
-            ).with_context(context)
-        } else {
-            Agent::new(
-                self.agent_config(),
-                self.llm.clone(),
-                self.tools.clone(),
-            )
-        };
-        
-        // Create run options with streaming callbacks
-        let session_id_for_stream = session_id.to_string();
-        let event_tx = self.event_tx.clone();
-        
-        let options = RunOptions {
-            on_text: Some(Box::new(move |chunk: &str| {
-                let _ = event_tx.send(Event::MessageDelta {
-                    session_id: session_id_for_stream.clone(),
-                    message_id: String::new(),
-                    delta: chunk.to_string(),
-                });
-            })),
-            ..Default::default()
-        };
-        
-        // Run the agent
+
         let message_id = uuid::Uuid::new_v4().to_string();
-        
+
         // Emit start event
         let _ = self.event_tx.send(Event::MessageStart {
             session_id: session_id.to_string(),
             message_id: message_id.clone(),
         });
-        
-        let result = agent.run(message, options).await;
-        
-        // Remove from active chats
+
+        // Build model list to try (priority list, falling back to single model)
+        let models_to_try: Vec<String> = if self.config.model_priority.is_empty() {
+            vec![self.config.model.clone()]
+        } else {
+            self.config.model_priority.clone()
+        };
+
+        let mut last_error = String::from("No models available");
+        let mut tried_models = Vec::new();
+
+        for model in &models_to_try {
+            tried_models.push(model.clone());
+            info!("Trying model: {} (attempt {})", model, tried_models.len());
+
+            // Get the correct LLM client for this model from the router
+            let llm_client = match self.router.client_for_model(model) {
+                Some(client) => client,
+                None => {
+                    warn!("No provider available for model: {}", model);
+                    last_error = format!("No provider configured for model: {}", model);
+                    continue;
+                }
+            };
+
+            // Create agent config with this model
+            let mut agent_config = self.agent_config();
+            agent_config.model = model.clone();
+
+            // Get model info for context configuration
+            let model_info = self.router.get_model_info(model).await;
+
+            // Create agent with context configured for the model
+            let agent = {
+                let mut context = nanna_agent::AgentContext::new(session_id.to_string());
+
+                // Configure context limits based on model capabilities
+                context.configure_for_model(&model_info);
+
+                // Set system prompt if provided
+                if let Some(ref prompt) = system_prompt {
+                    context = context.with_system_prompt(prompt);
+                }
+
+                // Load prior conversation history into context
+                for msg in history {
+                    let anthropic_msg = match msg.role {
+                        MessageRole::User => AnthropicMessage::user_text(&msg.content),
+                        MessageRole::Assistant => AnthropicMessage::assistant_text(&msg.content),
+                        // System/Tool messages are not standard conversation turns;
+                        // skip them to avoid confusing the LLM message alternation
+                        MessageRole::System | MessageRole::Tool => continue,
+                    };
+                    context.messages.push(anthropic_msg);
+                }
+
+                Agent::new(
+                    agent_config,
+                    llm_client,
+                    self.tools.clone(),
+                )
+                .with_context(context)
+            };
+
+            // Create run options with streaming callbacks
+            let session_id_for_stream = session_id.to_string();
+            let event_tx = self.event_tx.clone();
+
+            // Clone memory service for auto-extraction callback
+            let memory_for_extraction = self.memory.clone();
+            let has_memory = memory_for_extraction.is_some();
+
+            let accumulated_for_cb = accumulated.clone();
+            let options = RunOptions {
+                on_text: Some(Box::new(move |chunk: &str| {
+                    // Accumulate text for run state recovery
+                    if let Ok(mut buf) = accumulated_for_cb.try_write() {
+                        buf.push_str(chunk);
+                    }
+                    let _ = event_tx.send(Event::MessageDelta {
+                        session_id: session_id_for_stream.clone(),
+                        message_id: String::new(),
+                        delta: chunk.to_string(),
+                    });
+                })),
+                // Enable auto-extraction if memory service is available
+                auto_extract_memories: has_memory,
+                on_memory: if has_memory {
+                    Some(Box::new(move |memory: nanna_agent::ExtractedMemory| {
+                        let mem_service = memory_for_extraction.clone();
+                        Box::pin(async move {
+                            if let Some(ref service) = mem_service {
+                                let mut metadata = std::collections::HashMap::new();
+                                metadata.insert("category".to_string(), memory.category.clone());
+                                // Derive importance from category (default 3.0 for medium)
+                                let importance = match memory.category.as_str() {
+                                    "preference" | "identity" => 4.0,
+                                    "fact" | "insight" => 3.5,
+                                    "context" => 3.0,
+                                    _ => 3.0,
+                                };
+                                if let Err(e) = service.remember_with_importance(&memory.content, metadata, importance).await {
+                                    warn!("Failed to auto-store memory: {}", e);
+                                } else {
+                                    info!("Auto-extracted memory [{}]: {}", memory.category, truncate(&memory.content, 50));
+                                }
+                            }
+                        })
+                    }))
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+
+            // Run the agent
+            let result = agent.run(message, options).await;
+
+            match result {
+                Ok(response) => {
+                    // Remove from active chats and decrement queue depth
+                    {
+                        let mut active = self.active_chats.write().await;
+                        active.remove(session_id);
+                    }
+                    queue.depth.fetch_sub(1, Ordering::Relaxed);
+
+                    // Emit tool events and populate completed_tool_calls
+                    for tc in &response.tool_calls {
+                        if let Ok(mut completed) = completed_tools.try_write() {
+                            completed.push(CompletedToolCallInfo {
+                                call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                output: tc.output.clone(),
+                                success: tc.success,
+                                duration_ms: tc.duration_ms,
+                            });
+                        }
+                        let _ = self.event_tx.send(Event::ToolEnd {
+                            session_id: session_id.to_string(),
+                            call_id: tc.id.clone(),
+                            output: tc.output.clone(),
+                            success: tc.success,
+                            duration_ms: tc.duration_ms,
+                        });
+                    }
+
+                    // Emit completion event
+                    let _ = self.event_tx.send(Event::MessageEnd {
+                        session_id: session_id.to_string(),
+                        message_id: message_id.clone(),
+                        content: response.text.clone(),
+                    });
+
+                    info!("Success with model: {}", model);
+
+                    return Ok(ChatResult {
+                        message_id,
+                        content: response.text,
+                        tool_calls: response.tool_calls.into_iter().map(|tc| ToolCallRecord {
+                            id: tc.id,
+                            name: tc.name,
+                            input: tc.input,
+                            output: Some(tc.output),
+                            success: Some(tc.success),
+                            duration_ms: Some(tc.duration_ms),
+                        }).collect(),
+                        input_tokens: response.input_tokens,
+                        output_tokens: response.output_tokens,
+                    });
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    warn!("Model {} failed: {}", model, error_str);
+                    last_error = error_str.clone();
+
+                    // Check if this is a recoverable error (rate limit, overloaded, etc.)
+                    let should_fallback = Self::is_recoverable_error(&error_str);
+
+                    if !should_fallback {
+                        // Non-recoverable error, don't try other models
+                        warn!("Non-recoverable error, not trying fallback models");
+                        break;
+                    }
+
+                    info!("Recoverable error, trying next model in priority list");
+                    // Continue to next model
+                }
+            }
+        }
+
+        // Remove from active chats and decrement queue depth
         {
             let mut active = self.active_chats.write().await;
             active.remove(session_id);
         }
-        
-        match result {
-            Ok(response) => {
-                // Emit tool events
-                for tc in &response.tool_calls {
-                    let _ = self.event_tx.send(Event::ToolEnd {
-                        session_id: session_id.to_string(),
-                        call_id: tc.id.clone(),
-                        output: tc.output.clone(),
-                        success: tc.success,
-                        duration_ms: tc.duration_ms,
-                    });
-                }
-                
-                // Emit completion event
-                let _ = self.event_tx.send(Event::MessageEnd {
-                    session_id: session_id.to_string(),
-                    message_id: message_id.clone(),
-                    content: response.text.clone(),
-                });
-                
-                Ok(ChatResult {
-                    message_id,
-                    content: response.text,
-                    tool_calls: response.tool_calls.into_iter().map(|tc| ToolCallRecord {
-                        id: tc.id,
-                        name: tc.name,
-                        input: tc.input,
-                        output: Some(tc.output),
-                        success: Some(tc.success),
-                        duration_ms: Some(tc.duration_ms),
-                    }).collect(),
-                    input_tokens: response.input_tokens,
-                    output_tokens: response.output_tokens,
-                })
-            }
-            Err(e) => {
-                let _ = self.event_tx.send(Event::Error {
-                    code: "agent_error".to_string(),
-                    message: e.to_string(),
-                });
-                Err(e.to_string())
-            }
+        queue.depth.fetch_sub(1, Ordering::Relaxed);
+
+        // All models failed
+        let _ = self.event_tx.send(Event::Error {
+            code: "all_models_exhausted".to_string(),
+            message: format!("All models failed. Tried: {:?}. Last error: {}", tried_models, last_error),
+        });
+        Err(format!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error))
+    }
+
+    /// Check if an error is recoverable (should try next model)
+    fn is_recoverable_error(error: &str) -> bool {
+        let error_lower = error.to_lowercase();
+
+        // Rate limit errors
+        if error_lower.contains("rate limit")
+            || error_lower.contains("429")
+            || error_lower.contains("too many requests") {
+            return true;
         }
+
+        // Overloaded errors
+        if error_lower.contains("overloaded")
+            || error_lower.contains("529")
+            || error_lower.contains("503")
+            || error_lower.contains("502") {
+            return true;
+        }
+
+        // Temporary server errors
+        if error_lower.contains("temporarily unavailable")
+            || error_lower.contains("service unavailable")
+            || error_lower.contains("timeout") {
+            return true;
+        }
+
+        false
     }
     
     /// Cancel an active chat
@@ -214,6 +540,50 @@ impl AgentService {
     pub async fn is_active(&self, session_id: &str) -> bool {
         let active = self.active_chats.read().await;
         active.contains_key(session_id)
+    }
+
+    /// Get a snapshot of the current run state for a session.
+    /// Includes sync metadata (message_count, last_message_id) from SessionManager.
+    pub async fn get_run_state(
+        &self,
+        session_id: &str,
+        sessions: &crate::session::SessionManager,
+    ) -> RunStateSnapshot {
+        // Get message count + last ID from session for sync verification
+        let (message_count, last_message_id) = if let Some(session) = sessions.get(session_id).await {
+            let count = session.messages.len();
+            let last_id = session.messages.last().map(|m| m.id.clone());
+            (count, last_id)
+        } else {
+            (0, None)
+        };
+
+        // Queue depth: subtract 1 for the currently-processing message (if any)
+        let raw_depth = self.queue_depth(session_id).await;
+
+        let active = self.active_chats.read().await;
+        match active.get(session_id) {
+            Some(chat) => RunStateSnapshot {
+                is_running: true,
+                accumulated_text: chat.accumulated_text.read().await.clone(),
+                active_tool_calls: chat.active_tool_calls.read().await.clone(),
+                completed_tool_calls: chat.completed_tool_calls.read().await.clone(),
+                started_at: Some(chat.started_at.to_rfc3339()),
+                message_count,
+                last_message_id,
+                queued_count: raw_depth.saturating_sub(1), // exclude the active one
+            },
+            None => RunStateSnapshot {
+                is_running: false,
+                accumulated_text: String::new(),
+                active_tool_calls: vec![],
+                completed_tool_calls: vec![],
+                started_at: None,
+                message_count,
+                last_message_id,
+                queued_count: raw_depth, // nothing active, all are waiting
+            },
+        }
     }
     
     /// Get memory context for a query
@@ -269,4 +639,16 @@ pub struct MemoryContext {
     pub id: String,
     pub content: String,
     pub score: f32,
+}
+
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
 }

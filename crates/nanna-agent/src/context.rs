@@ -1,11 +1,54 @@
 //! Agent context management
 
-use nanna_llm::{AnthropicMessage, ContentBlock, LlmClient, RequestBuilder};
+use crate::chunker::{chunk_and_hash, dedup_coverage};
+use crate::summarizer::{new_summary_cache, SummaryCache, Summarizer, SummarizerConfig};
+use nanna_llm::{AnthropicMessage, ContentBlock, LlmClient, ModelInfo, RequestBuilder};
 use nanna_workspace::{Workspace, WorkspaceFiles};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Minimum content size (chars) to consider for deduplication
+const DEDUP_MIN_SIZE: usize = 4_000; // Lowered since CDC handles small chunks well
+
+/// Threshold for considering content "mostly duplicate" (0.0-1.0)
+const DEDUP_THRESHOLD: f32 = 0.7;
+
+/// Configuration for context summarization
+#[derive(Debug, Clone, Default)]
+pub struct ContextSummarizationConfig {
+    /// Model priority list for summarization (e.g., ["ollama/llama3.2", "anthropic/claude-3-haiku"])
+    pub model_priority: Vec<String>,
+    /// Ollama URL if using ollama models
+    pub ollama_url: Option<String>,
+    /// Context window of the summarization model (in tokens)
+    pub summarizer_context_window: usize,
+    /// Maximum iterations to prevent infinite loops
+    pub max_iterations: usize,
+}
+
+impl ContextSummarizationConfig {
+    pub fn new(model_priority: Vec<String>) -> Self {
+        Self {
+            model_priority,
+            ollama_url: Some("http://localhost:11434".to_string()),
+            summarizer_context_window: 8000, // Conservative default for most local models
+            max_iterations: 20,
+        }
+    }
+
+    pub fn with_ollama_url(mut self, url: impl Into<String>) -> Self {
+        self.ollama_url = Some(url.into());
+        self
+    }
+
+    pub fn with_summarizer_context(mut self, tokens: usize) -> Self {
+        self.summarizer_context_window = tokens;
+        self
+    }
+}
 
 /// Compressed context summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +96,12 @@ pub struct AgentContext {
     /// Maximum tokens before compression triggers
     #[serde(default = "default_compression_threshold")]
     pub compression_threshold: usize,
+    /// Hard limit on input tokens (model's context window minus output tokens)
+    #[serde(default = "default_hard_limit")]
+    pub hard_limit: usize,
+    /// Current model ID (for tracking model changes)
+    #[serde(default)]
+    pub current_model: Option<String>,
     /// Parent context ID (if this is a sub-agent)
     #[serde(default)]
     pub parent_context_id: Option<String>,
@@ -71,6 +120,18 @@ pub struct AgentContext {
     /// Whether to include MEMORY.md in workspace context (false for group chats)
     #[serde(default = "default_include_memory")]
     pub include_workspace_memory: bool,
+    /// Consolidated summary of all previously summarized messages.
+    /// This is prepended to messages when building API requests.
+    #[serde(default)]
+    pub consolidated_summary: Option<String>,
+    /// Hashes of content that has been summarized (for deduplication).
+    /// If new messages contain content matching these hashes, we skip it
+    /// since it's already represented in the consolidated_summary.
+    #[serde(default)]
+    summarized_content_hashes: HashSet<u64>,
+    /// Cache for summarization results (not serialized, recreated on load)
+    #[serde(skip)]
+    summary_cache: Option<SummaryCache>,
 }
 
 fn default_include_memory() -> bool {
@@ -78,7 +139,11 @@ fn default_include_memory() -> bool {
 }
 
 fn default_compression_threshold() -> usize {
-    50_000 // ~50k tokens before compression
+    160_000 // 80% of 200k default context window
+}
+
+fn default_hard_limit() -> usize {
+    192_000 // 200k - 8k for output
 }
 
 impl AgentContext {
@@ -91,13 +156,175 @@ impl AgentContext {
             max_messages: 100,
             summaries: Vec::new(),
             compression_threshold: default_compression_threshold(),
+            hard_limit: default_hard_limit(),
+            current_model: None,
             parent_context_id: None,
             isolation_mode: None,
             context_budget: None,
             workspace_root: None,
             workspace_context: None,
             include_workspace_memory: true,
+            consolidated_summary: None,
+            summarized_content_hashes: HashSet::new(),
+            summary_cache: Some(new_summary_cache()),
         }
+    }
+
+    /// Initialize the summary cache if not already present (useful after deserialization)
+    pub fn ensure_summary_cache(&mut self) {
+        if self.summary_cache.is_none() {
+            self.summary_cache = Some(new_summary_cache());
+        }
+    }
+
+    /// Get the summary cache (initializing if needed)
+    fn get_or_init_cache(&mut self) -> SummaryCache {
+        if self.summary_cache.is_none() {
+            self.summary_cache = Some(new_summary_cache());
+        }
+        self.summary_cache.clone().unwrap()
+    }
+
+    /// Get messages for API request, prepending consolidated summary if present.
+    ///
+    /// This is the key method for incremental summarization:
+    /// - If we have a consolidated summary, it's injected as a "context" user message
+    /// - Large content blocks that match previously summarized content are deduplicated
+    /// - This way, previously summarized content is included without re-processing
+    pub fn messages_for_request(&self) -> Vec<AnthropicMessage> {
+        // Deduplicate messages if we have summarized content hashes
+        let deduped_messages = if self.summarized_content_hashes.is_empty() {
+            self.messages.clone()
+        } else {
+            self.deduplicate_messages()
+        };
+
+        if let Some(ref summary) = self.consolidated_summary {
+            let mut messages = Vec::with_capacity(deduped_messages.len() + 2);
+
+            // Inject summary as first user message with clear framing
+            let summary_message = format!(
+                "<previous_context>\nThe following is a summary of earlier conversation that has been compressed to save context space:\n\n{}\n</previous_context>",
+                summary
+            );
+            messages.push(AnthropicMessage::user_text(summary_message));
+
+            // Add a placeholder assistant acknowledgment to maintain user/assistant alternation
+            messages.push(AnthropicMessage::assistant_text(
+                "I understand the previous context. How can I help you continue?"
+            ));
+
+            // Then add deduplicated current messages
+            messages.extend(deduped_messages);
+            messages
+        } else {
+            // No summary, just return (possibly deduplicated) messages
+            deduped_messages
+        }
+    }
+
+    /// Deduplicate messages by replacing large content blocks that were already summarized.
+    ///
+    /// Uses content-defined chunking (CDC) to detect partial duplicates - even if
+    /// content is split differently, overlapping chunks will be detected.
+    fn deduplicate_messages(&self) -> Vec<AnthropicMessage> {
+        let mut dedup_count = 0;
+        let mut bytes_saved = 0;
+        let mut deduped = Vec::with_capacity(self.messages.len());
+
+        for msg in &self.messages {
+            let mut new_content = Vec::with_capacity(msg.content.len());
+
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } if text.len() >= DEDUP_MIN_SIZE => {
+                        // Check CDC coverage - what percentage of chunks are already known?
+                        let coverage = dedup_coverage(text, &self.summarized_content_hashes);
+
+                        if coverage >= DEDUP_THRESHOLD {
+                            // Most of this content was already summarized
+                            new_content.push(ContentBlock::Text {
+                                text: format!(
+                                    "[Content ({:.0}% duplicate) already included in previous context summary]",
+                                    coverage * 100.0
+                                ),
+                            });
+                            dedup_count += 1;
+                            bytes_saved += text.len();
+                            debug!(
+                                coverage = format!("{:.1}%", coverage * 100.0),
+                                original_len = text.len(),
+                                "Deduplicated previously summarized content via CDC"
+                            );
+                        } else if coverage > 0.0 {
+                            // Partial overlap - keep full content but log it
+                            debug!(
+                                coverage = format!("{:.1}%", coverage * 100.0),
+                                original_len = text.len(),
+                                "Partial duplicate detected, keeping full content"
+                            );
+                            new_content.push(block.clone());
+                        } else {
+                            new_content.push(block.clone());
+                        }
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error }
+                        if content.len() >= DEDUP_MIN_SIZE =>
+                    {
+                        let coverage = dedup_coverage(content, &self.summarized_content_hashes);
+
+                        if coverage >= DEDUP_THRESHOLD {
+                            new_content.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: format!(
+                                    "[Output ({:.0}% duplicate) already included in previous context summary]",
+                                    coverage * 100.0
+                                ),
+                                is_error: *is_error,
+                            });
+                            dedup_count += 1;
+                            bytes_saved += content.len();
+                            debug!(
+                                coverage = format!("{:.1}%", coverage * 100.0),
+                                original_len = content.len(),
+                                "Deduplicated previously summarized tool result via CDC"
+                            );
+                        } else {
+                            new_content.push(block.clone());
+                        }
+                    }
+                    _ => {
+                        new_content.push(block.clone());
+                    }
+                }
+            }
+
+            deduped.push(AnthropicMessage {
+                role: msg.role.clone(),
+                content: new_content,
+            });
+        }
+
+        if dedup_count > 0 {
+            info!(
+                dedup_count = dedup_count,
+                bytes_saved = bytes_saved,
+                "Deduplicated content blocks using CDC"
+            );
+        }
+
+        deduped
+    }
+
+    /// Estimate tokens for messages that will be sent to API (includes summary)
+    pub fn estimate_request_tokens(&self) -> usize {
+        let summary_tokens = self
+            .consolidated_summary
+            .as_ref()
+            .map(|s| s.len() / 4 + 100) // ~4 chars per token + framing overhead
+            .unwrap_or(0);
+
+        summary_tokens + self.estimate_tokens()
     }
 
     /// Set the system prompt.
@@ -112,6 +339,73 @@ impl AgentContext {
     pub fn with_compression_threshold(mut self, threshold: usize) -> Self {
         self.compression_threshold = threshold;
         self
+    }
+
+    /// Set the hard limit
+    #[must_use]
+    pub fn with_hard_limit(mut self, limit: usize) -> Self {
+        self.hard_limit = limit;
+        self
+    }
+
+    /// Configure context limits based on model capabilities.
+    ///
+    /// This should be called when:
+    /// - Starting a new session
+    /// - Switching to a different model
+    /// - After fetching updated model info from the API
+    ///
+    /// Returns true if the model changed (and limits were updated).
+    pub fn configure_for_model(&mut self, model_info: &ModelInfo) -> bool {
+        let model_changed = self.current_model.as_ref() != Some(&model_info.id);
+
+        if model_changed {
+            info!(
+                model = %model_info.id,
+                context_window = model_info.context_window,
+                compression_threshold = model_info.compression_threshold(),
+                hard_limit = model_info.hard_input_limit(),
+                "Configuring context for model"
+            );
+        }
+
+        self.compression_threshold = model_info.compression_threshold();
+        self.hard_limit = model_info.hard_input_limit();
+        self.current_model = Some(model_info.id.clone());
+
+        model_changed
+    }
+
+    /// Configure context limits for a model by name using defaults.
+    ///
+    /// Use this when you don't have a ModelInfo instance.
+    pub fn configure_for_model_name(&mut self, model: &str) {
+        // Use the default_model_info logic embedded here to avoid circular deps
+        let (context_window, max_output): (usize, usize) = match model {
+            m if m.contains("claude") => (200_000, 8192),
+            m if m.contains("gpt-4-turbo") || m.contains("gpt-4o") => (128_000, 4096),
+            m if m.contains("gpt-4") => (8_000, 4096),
+            m if m.contains("llama-3.1") || m.contains("llama-3.2") => (128_000, 4096),
+            m if m.contains("mistral-large") => (128_000, 4096),
+            _ => (32_000, 4096),
+        };
+
+        let compression_threshold = (context_window * 80) / 100;
+        let hard_limit = context_window.saturating_sub(max_output);
+
+        if self.current_model.as_ref() != Some(&model.to_string()) {
+            info!(
+                model = %model,
+                context_window = context_window,
+                compression_threshold = compression_threshold,
+                hard_limit = hard_limit,
+                "Configuring context for model (using defaults)"
+            );
+        }
+
+        self.compression_threshold = compression_threshold;
+        self.hard_limit = hard_limit;
+        self.current_model = Some(model.to_string());
     }
 
     /// Set the context budget in tokens
@@ -248,6 +542,11 @@ impl AgentContext {
             }
         }
 
+        // Inherit model limits from parent
+        ctx.compression_threshold = self.compression_threshold;
+        ctx.hard_limit = self.hard_limit;
+        ctx.current_model = self.current_model.clone();
+
         ctx
     }
 
@@ -294,6 +593,484 @@ impl AgentContext {
     #[must_use]
     pub fn needs_compression(&self) -> bool {
         self.estimate_tokens() > self.compression_threshold
+    }
+
+    /// Check if context exceeds hard limit (must truncate before API call)
+    ///
+    /// This checks the full request tokens (including consolidated summary)
+    /// since that's what will actually be sent to the API.
+    #[must_use]
+    pub fn exceeds_hard_limit(&self) -> bool {
+        self.estimate_request_tokens() > self.hard_limit
+    }
+
+    /// Truncate oldest messages to get under the hard limit.
+    ///
+    /// This is a last-resort measure when compression isn't enough or isn't possible.
+    /// Always keeps at least the last user message to avoid empty request errors.
+    /// Returns the number of messages removed.
+    pub fn truncate_to_limit(&mut self) -> usize {
+        let mut removed = 0;
+
+        // Keep at least 1 message (the most recent user message)
+        while self.exceeds_hard_limit() && self.messages.len() > 1 {
+            self.messages.remove(0);
+            removed += 1;
+        }
+
+        // If still over limit with just 1 message, truncate large content blocks
+        if self.exceeds_hard_limit() && !self.messages.is_empty() {
+            self.truncate_large_content_blocks();
+        }
+
+        if removed > 0 {
+            info!(
+                removed_messages = removed,
+                remaining_messages = self.messages.len(),
+                estimated_tokens = self.estimate_tokens(),
+                hard_limit = self.hard_limit,
+                "Truncated context to fit within hard limit"
+            );
+        }
+
+        removed
+    }
+
+    /// Truncate individual content blocks that are too large
+    fn truncate_large_content_blocks(&mut self) {
+        // Target: leave room for output tokens
+        let target_tokens = self.hard_limit.saturating_sub(10_000);
+        let max_block_chars = target_tokens * 4; // ~4 chars per token
+
+        for msg in &mut self.messages {
+            for block in &mut msg.content {
+                match block {
+                    ContentBlock::ToolResult { content, .. } => {
+                        if content.len() > max_block_chars {
+                            let truncated = &content[..max_block_chars.min(content.len())];
+                            *content = format!(
+                                "{}\n\n[... truncated {} chars to fit context limit ...]",
+                                truncated,
+                                content.len() - truncated.len()
+                            );
+                            info!(
+                                original_len = content.len(),
+                                truncated_to = max_block_chars,
+                                "Truncated large tool result"
+                            );
+                        }
+                    }
+                    ContentBlock::Text { text } => {
+                        if text.len() > max_block_chars {
+                            let truncated = &text[..max_block_chars.min(text.len())];
+                            *text = format!(
+                                "{}\n\n[... truncated {} chars to fit context limit ...]",
+                                truncated,
+                                text.len() - truncated.len()
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Ensure context is within limits, compressing or truncating as needed.
+    ///
+    /// Call this before making an API request to avoid context length errors.
+    ///
+    /// # Returns
+    /// - `Ok(true)` if compression was performed
+    /// - `Ok(false)` if no changes were needed
+    /// - `Err` if compression failed (truncation will still be attempted)
+    ///
+    /// # Errors
+    /// Returns error if LLM compression call fails.
+    pub async fn enforce_limits(
+        &mut self,
+        llm: &LlmClient,
+        model: &str,
+    ) -> Result<bool, nanna_llm::LlmError> {
+        let mut compressed = false;
+
+        // Try compression first if over threshold
+        if self.needs_compression() && self.messages.len() > 10 {
+            info!(
+                estimated_tokens = self.estimate_tokens(),
+                compression_threshold = self.compression_threshold,
+                "Context exceeds compression threshold, compressing"
+            );
+            self.compress(llm, model, 10).await?;
+            compressed = true;
+        }
+
+        // If still over hard limit, truncate
+        if self.exceeds_hard_limit() {
+            self.truncate_to_limit();
+        }
+
+        Ok(compressed)
+    }
+
+    /// Recursively summarize context until it fits within the chat model's limit.
+    ///
+    /// This is the main entry point for intelligent context management:
+    /// 1. Estimates current context size
+    /// 2. If over limit, takes chunks that fit the summarization model
+    /// 3. Summarizes each chunk
+    /// 4. Replaces original content with summaries
+    /// 5. Repeats until context fits or max iterations reached
+    ///
+    /// # Arguments
+    /// * `config` - Summarization configuration (models, limits, etc.)
+    ///
+    /// # Returns
+    /// * `Ok(iterations)` - Number of summarization passes performed
+    /// * `Err` - If all summarization models fail
+    pub async fn enforce_limits_with_summarization(
+        &mut self,
+        config: &ContextSummarizationConfig,
+    ) -> Result<usize, String> {
+        if config.model_priority.is_empty() {
+            // No summarization configured, fall back to truncation
+            if self.exceeds_hard_limit() {
+                warn!("No summarization models configured, truncating context");
+                self.truncate_to_limit();
+            }
+            return Ok(0);
+        }
+
+        // Get or create the summary cache for reuse across iterations
+        let cache = self.get_or_init_cache();
+
+        let mut iterations = 0;
+        let max_chars_per_chunk = config.summarizer_context_window * 4; // ~4 chars per token
+
+        while self.exceeds_hard_limit() && iterations < config.max_iterations {
+            iterations += 1;
+
+            let current_tokens = self.estimate_tokens();
+            info!(
+                iteration = iterations,
+                current_tokens = current_tokens,
+                hard_limit = self.hard_limit,
+                "Context exceeds limit, summarizing"
+            );
+
+            // Find content to summarize (oldest messages first, keeping most recent)
+            let content_to_summarize = self.extract_content_for_summarization(max_chars_per_chunk);
+
+            if content_to_summarize.is_empty() {
+                warn!("No content available to summarize, truncating remaining");
+                self.truncate_to_limit();
+                break;
+            }
+
+            // Try to summarize with fallback (using shared cache)
+            match Self::summarize_content_with_fallback(&content_to_summarize, config, &cache).await
+            {
+                Ok(summary) => {
+                    info!(
+                        original_len = content_to_summarize.len(),
+                        summary_len = summary.len(),
+                        compression = format!(
+                            "{:.1}x",
+                            content_to_summarize.len() as f64 / summary.len().max(1) as f64
+                        ),
+                        "Content summarized successfully"
+                    );
+
+                    // Replace the summarized content with the summary
+                    self.replace_with_summary(&content_to_summarize, &summary);
+                }
+                Err(e) => {
+                    warn!(error = %e, "All summarization models failed, truncating");
+                    self.truncate_to_limit();
+                    break;
+                }
+            }
+        }
+
+        if iterations >= config.max_iterations && self.exceeds_hard_limit() {
+            warn!(
+                iterations = iterations,
+                "Max summarization iterations reached, force truncating"
+            );
+            self.truncate_to_limit();
+        }
+
+        Ok(iterations)
+    }
+
+    /// Extract content from oldest messages for summarization
+    fn extract_content_for_summarization(&self, max_chars: usize) -> String {
+        let mut content = String::new();
+        let mut chars_collected = 0;
+
+        // Keep at least the last 2 messages (user query + assistant response in progress)
+        let messages_to_consider = if self.messages.len() > 2 {
+            &self.messages[..self.messages.len() - 2]
+        } else {
+            return String::new(); // Not enough messages to summarize
+        };
+
+        for msg in messages_to_consider {
+            for block in &msg.content {
+                let block_text = match block {
+                    ContentBlock::Text { text } => text.clone(),
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        format!("[Tool call: {} with input: {}]", name, input)
+                    }
+                    ContentBlock::ToolResult { content, .. } => content.clone(),
+                    ContentBlock::Thinking { thinking } => {
+                        format!("[Thinking: {}]", &thinking[..thinking.len().min(200)])
+                    }
+                    ContentBlock::Image { .. } => "[Image]".to_string(),
+                };
+
+                if chars_collected + block_text.len() > max_chars {
+                    // Take partial if we haven't collected anything yet
+                    if content.is_empty() {
+                        content.push_str(&block_text[..max_chars.min(block_text.len())]);
+                    }
+                    return content;
+                }
+
+                content.push_str(&format!("[{}]: {}\n", msg.role, block_text));
+                chars_collected += block_text.len();
+            }
+        }
+
+        content
+    }
+
+    /// Try to summarize content using models in priority order
+    async fn summarize_content_with_fallback(
+        content: &str,
+        config: &ContextSummarizationConfig,
+        cache: &SummaryCache,
+    ) -> Result<String, String> {
+        for model_spec in &config.model_priority {
+            debug!(model = %model_spec, "Attempting summarization");
+
+            match Self::try_summarize_with_model(model_spec, content, config, cache).await {
+                Ok(summary) => {
+                    info!(model = %model_spec, "Summarization succeeded");
+                    return Ok(summary);
+                }
+                Err(e) => {
+                    warn!(model = %model_spec, error = %e, "Summarization failed, trying next");
+                }
+            }
+        }
+
+        Err("All summarization models failed".to_string())
+    }
+
+    /// Try to summarize with a specific model (uses shared cache for efficiency)
+    async fn try_summarize_with_model(
+        model_spec: &str,
+        content: &str,
+        config: &ContextSummarizationConfig,
+        cache: &SummaryCache,
+    ) -> Result<String, String> {
+        let (client, model_name) = Self::create_client_for_model(model_spec, config)?;
+
+        let summarizer_config = SummarizerConfig {
+            model: model_name,
+            chunk_size: config.summarizer_context_window * 4, // chars
+            target_summary_size: (config.summarizer_context_window * 4) / 4, // 25% of input
+            chunk_overlap: 500,
+            // Use half the context window to reduce VRAM/KV cache usage,
+            // allowing more model layers to fit on GPU
+            context_limit: Some((config.summarizer_context_window / 2) as u32),
+        };
+
+        // Use shared cache to avoid re-summarizing the same content
+        let summarizer = Summarizer::with_shared_cache(client, summarizer_config, cache.clone());
+        let context_hint = "This is conversation history. Preserve key facts, decisions, file paths, code snippets, and important context needed to continue the conversation.";
+
+        summarizer.summarize(content, context_hint).await
+    }
+
+    /// Create an LLM client for the specified model
+    fn create_client_for_model(
+        model_spec: &str,
+        config: &ContextSummarizationConfig,
+    ) -> Result<(LlmClient, String), String> {
+        if let Some((provider, model)) = model_spec.split_once('/') {
+            let client = match provider.to_lowercase().as_str() {
+                "ollama" => {
+                    let url = config.ollama_url.as_deref().unwrap_or("http://localhost:11434");
+                    LlmClient::ollama(url)
+                }
+                "anthropic" => {
+                    // This would need API key - for now return error
+                    // In practice, the Agent passes its own client
+                    return Err(
+                        "Anthropic summarization requires passing main client".to_string()
+                    );
+                }
+                "openai" => {
+                    return Err("OpenAI summarization requires API key".to_string());
+                }
+                _ => {
+                    return Err(format!("Unknown provider: {}", provider));
+                }
+            };
+            Ok((client, model.to_string()))
+        } else {
+            // No provider prefix - assume ollama
+            let url = config.ollama_url.as_deref().unwrap_or("http://localhost:11434");
+            Ok((LlmClient::ollama(url), model_spec.to_string()))
+        }
+    }
+
+    /// Replace summarized content with the summary.
+    ///
+    /// Updates the consolidated_summary field for incremental summarization.
+    /// On subsequent requests, the consolidated summary is prepended to messages,
+    /// avoiding the need to re-summarize everything.
+    ///
+    /// Uses content-defined chunking (CDC) for deduplication - this creates
+    /// deterministic chunk boundaries based on content, allowing detection of
+    /// duplicate content even when split differently.
+    fn replace_with_summary(&mut self, _original_content: &str, summary: &str) {
+        // Remove old messages that were summarized (keep last 2)
+        let keep_count = 2.min(self.messages.len());
+        let remove_count = self.messages.len().saturating_sub(keep_count);
+
+        if remove_count > 0 {
+            // Use CDC to hash content blocks from messages being removed
+            let mut new_chunk_hashes = 0;
+            for msg in &self.messages[..remove_count] {
+                for block in &msg.content {
+                    let text = match block {
+                        ContentBlock::Text { text } => text,
+                        ContentBlock::ToolResult { content, .. } => content,
+                        _ => continue,
+                    };
+                    // Only chunk content large enough to produce meaningful chunks
+                    if text.len() >= DEDUP_MIN_SIZE {
+                        // Use CDC to get content-defined chunk hashes
+                        let chunk_hashes = chunk_and_hash(text);
+                        for hash in chunk_hashes {
+                            if self.summarized_content_hashes.insert(hash) {
+                                new_chunk_hashes += 1;
+                            }
+                        }
+                        debug!(
+                            content_len = text.len(),
+                            new_chunks = new_chunk_hashes,
+                            "Stored CDC chunk hashes for deduplication"
+                        );
+                    }
+                }
+            }
+
+            // Update the consolidated summary (append new summary to existing if present)
+            let new_consolidated = if let Some(ref existing) = self.consolidated_summary {
+                // Combine existing summary with new summary
+                format!(
+                    "{}\n\n---\n\n[Additional context from {} more messages:]\n{}",
+                    existing, remove_count, summary
+                )
+            } else {
+                summary.to_string()
+            };
+
+            self.consolidated_summary = Some(new_consolidated.clone());
+
+            // Also store in summaries for history tracking
+            self.summaries.push(ContextSummary {
+                summary: summary.to_string(),
+                messages_compressed: remove_count,
+                tokens_saved: self.estimate_tokens(), // Approximate
+                created_at: chrono_timestamp(),
+            });
+
+            // Remove the old messages
+            self.messages.drain(0..remove_count);
+
+            info!(
+                removed_messages = remove_count,
+                remaining_messages = self.messages.len(),
+                consolidated_summary_len = new_consolidated.len(),
+                new_chunk_hashes = new_chunk_hashes,
+                total_chunk_hashes = self.summarized_content_hashes.len(),
+                "Updated consolidated summary with CDC deduplication"
+            );
+        }
+    }
+
+    /// Drop oldest messages (no LLM required) as a fallback compression strategy.
+    ///
+    /// Keeps the most recent `keep_recent` messages and drops the rest,
+    /// adding a note to `consolidated_summary` about what was dropped.
+    /// Returns the number of messages dropped.
+    pub fn drop_oldest(&mut self, keep_recent: usize) -> usize {
+        if self.messages.len() <= keep_recent {
+            return 0;
+        }
+
+        let drop_count = self.messages.len() - keep_recent;
+
+        // Build a brief summary of what's being dropped
+        let mut dropped_summary_parts = Vec::new();
+        for msg in &self.messages[..drop_count] {
+            let role = &msg.role;
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        let preview = if text.len() > 100 {
+                            format!("{}...", &text[..100])
+                        } else {
+                            text.clone()
+                        };
+                        dropped_summary_parts.push(format!("[{}]: {}", role, preview));
+                    }
+                    ContentBlock::ToolUse { name, .. } => {
+                        dropped_summary_parts.push(format!("[{}]: [tool call: {}]", role, name));
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        let preview = if content.len() > 80 {
+                            format!("{}...", &content[..80])
+                        } else {
+                            content.clone()
+                        };
+                        dropped_summary_parts.push(format!("[tool result]: {}", preview));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let drop_note = format!(
+            "[{} older messages dropped to free context space. Key fragments:\n{}]",
+            drop_count,
+            dropped_summary_parts.join("\n")
+        );
+
+        // Update consolidated summary
+        let new_summary = if let Some(ref existing) = self.consolidated_summary {
+            format!("{}\n\n---\n\n{}", existing, drop_note)
+        } else {
+            drop_note
+        };
+        self.consolidated_summary = Some(new_summary);
+
+        // Actually remove
+        self.messages.drain(0..drop_count);
+
+        info!(
+            dropped = drop_count,
+            remaining = self.messages.len(),
+            estimated_tokens = self.estimate_tokens(),
+            "Dropped oldest messages (no-LLM fallback)"
+        );
+
+        drop_count
     }
 
     /// Compress old messages into a summary using LLM.

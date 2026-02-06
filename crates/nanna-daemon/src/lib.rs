@@ -15,12 +15,16 @@
 pub mod agent_service;
 pub mod channels;
 pub mod control;
+pub mod health;
 pub mod ipc;
+pub mod llm_router;
 pub mod persistence;
 pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod session;
+pub mod user_tools;
+pub mod webhook;
 
 #[cfg(windows)]
 pub mod windows_service;
@@ -30,6 +34,8 @@ pub use protocol::{Request, Response, Event, Action, SessionAction, MemoryAction
 pub use server::{DaemonServer, DaemonConfig};
 pub use session::{Session, SessionManager, SessionId};
 pub use control::ControlPlane;
+pub use health::{PidFile, PidFileError, HealthServer, HealthState, DEFAULT_HEALTH_PORT};
+pub use webhook::{WebhookServer, WebhookConfig, WebhookEvent, WebhookMessage, DEFAULT_WEBHOOK_PORT};
 
 use thiserror::Error;
 

@@ -37,6 +37,7 @@ impl Default for IpcServerConfig {
 }
 
 /// Connected client state
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ClientConnection {
     id: ConnectionId,

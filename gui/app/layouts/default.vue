@@ -119,9 +119,15 @@
             <ChevronDown class="w-4 h-4" /><span>Hide to Tray</span>
           </button>
           <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
-            <span>v0.1.0</span>
-            <span :class="apiKeySet ? 'text-nanna-success' : 'text-nanna-error'">
-              {{ apiKeySet ? '● Connected' : '○ No API Key' }}
+            <div class="flex items-center gap-2">
+              <span>v0.1.0</span>
+              <span v-if="backendStatus" class="px-1.5 py-0.5 rounded text-[10px]" 
+                    :class="isDaemon ? 'bg-nanna-accent/20 text-nanna-accent' : 'bg-nanna-bg-elevated text-nanna-text-dim'">
+                {{ isDaemon ? 'daemon' : 'embedded' }}
+              </span>
+            </div>
+            <span :class="backendStatus?.connected ? 'text-nanna-success' : (apiKeySet ? 'text-nanna-warning' : 'text-nanna-error')">
+              {{ backendStatus?.connected ? '● Connected' : (apiKeySet ? '○ Disconnected' : '○ No API Key') }}
             </span>
           </div>
         </div>
@@ -228,20 +234,15 @@
                 {{ isDaemon ? 'daemon' : 'embedded' }}
               </span>
             </div>
-            <span :class="apiKeySet ? 'text-nanna-success' : 'text-nanna-error'">
-              {{ apiKeySet ? '● Connected' : '○ No API Key' }}
+            <span :class="backendStatus?.connected ? 'text-nanna-success' : (apiKeySet ? 'text-nanna-warning' : 'text-nanna-error')">
+              {{ backendStatus?.connected ? '● Connected' : (apiKeySet ? '○ Disconnected' : '○ No API Key') }}
             </span>
           </div>
         </div>
       </aside>
       
       <!-- Main area with workspace tabs -->
-      <main class="flex-1 flex flex-col pt-14 lg:pt-0 relative">
-        <!-- Backend Status Indicator (top right) -->
-        <div class="absolute top-2 right-2 z-30">
-          <BackendStatus :show-detail="false" />
-        </div>
-        
+      <main class="flex-1 flex flex-col pt-14 lg:pt-0 relative overflow-hidden">
         <!-- Workspace Tabs (desktop only, on chat page) -->
         <WorkspaceTabs
           v-if="route.path === '/' || route.path === ''"
@@ -264,7 +265,10 @@
           @add="showWorkspacePicker = true"
         />
         
-        <slot />
+        <!-- Content area - takes remaining space, allows child to handle scrolling -->
+        <div class="flex-1 overflow-hidden">
+          <slot />
+        </div>
       </main>
     </div>
     
@@ -277,6 +281,9 @@
     
     <!-- Close confirmation dialog -->
     <CloseDialog />
+
+    <!-- Global confirmation dialog -->
+    <ConfirmDialog />
   </div>
 </template>
 
@@ -329,6 +336,8 @@ const currentTab = ref<Tab>({ type: 'global' })
 
 let unlistenTrayNewChat: UnlistenFn | null = null
 let unlistenCloseRequested: UnlistenFn | null = null
+let unlistenSessionsCleared: UnlistenFn | null = null
+let unlistenSessionRenamed: UnlistenFn | null = null
 
 // Computed
 const currentTabName = computed(() => {
@@ -425,7 +434,23 @@ onMounted(async () => {
   unlistenTrayNewChat = await listen('tray-new-chat', () => {
     createNewSession()
   })
-  
+
+  // Listen for sessions cleared event (from settings page)
+  unlistenSessionsCleared = await listen('sessions-cleared', async () => {
+    console.log('Sessions cleared event received, refreshing...')
+    await loadSessions()
+    currentSessionId.value = sessions.value[0]?.id || null
+  })
+
+  // Listen for session renamed event (from auto-naming or other sources)
+  unlistenSessionRenamed = await listen<{ id: string, name: string }>('session-renamed', (event) => {
+    const { id, name } = event.payload
+    const idx = sessions.value.findIndex(s => s.id === id)
+    if (idx !== -1) {
+      sessions.value[idx] = { ...sessions.value[idx], name }
+    }
+  })
+
   // Listen for window close request
   const { getCurrentWindow } = await import('@tauri-apps/api/window')
   const window = getCurrentWindow()
@@ -441,6 +466,8 @@ onMounted(async () => {
 onUnmounted(() => {
   if (unlistenTrayNewChat) unlistenTrayNewChat()
   if (unlistenCloseRequested) unlistenCloseRequested()
+  if (unlistenSessionsCleared) unlistenSessionsCleared()
+  if (unlistenSessionRenamed) unlistenSessionRenamed()
 })
 
 // Watch for route changes to sync currentSessionId

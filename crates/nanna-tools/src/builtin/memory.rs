@@ -1,6 +1,6 @@
 //! Memory tools for remembering and recalling information
 //!
-//! Uses Turso/SQLite for persistent storage.
+//! Uses MemoryService for persistent storage with embeddings and FSRS.
 
 use crate::{Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
@@ -8,6 +8,51 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
+
+/// Adapter that wraps MemoryService to implement MemoryStorage trait.
+/// This bridges the gap between the tool abstraction and the actual memory service.
+pub struct MemoryServiceStorage {
+    service: Arc<dyn MemoryServiceAdapter + Send + Sync>,
+}
+
+/// Trait to abstract over MemoryService (allows using it without direct dependency)
+#[async_trait]
+pub trait MemoryServiceAdapter: Send + Sync {
+    async fn remember(&self, content: &str, metadata: HashMap<String, String>, importance: f32) -> Result<String, String>;
+    async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryResult>, String>;
+    async fn forget(&self, id: &str) -> Result<(), String>;
+    async fn list(&self, limit: usize) -> Result<Vec<MemoryResult>, String>;
+}
+
+impl MemoryServiceStorage {
+    pub fn new(service: Arc<dyn MemoryServiceAdapter + Send + Sync>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl MemoryStorage for MemoryServiceStorage {
+    async fn store(&self, content: &str, tags: &[String]) -> Result<String, String> {
+        let mut metadata = HashMap::new();
+        if !tags.is_empty() {
+            metadata.insert("tags".to_string(), tags.join(","));
+        }
+        // Default importance of 3.0 (medium)
+        self.service.remember(content, metadata, 3.0).await
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryResult>, String> {
+        self.service.recall(query, limit).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, String> {
+        self.service.forget(id).await.map(|()| true)
+    }
+
+    async fn list(&self, limit: usize) -> Result<Vec<MemoryResult>, String> {
+        self.service.list(limit).await
+    }
+}
 
 /// Storage handle for memory tools
 pub type StorageHandle = Arc<dyn MemoryStorage + Send + Sync>;

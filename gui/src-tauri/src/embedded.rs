@@ -2,15 +2,16 @@
 //!
 //! Fallback mode when daemon is unavailable
 
-use nanna_agent::{Agent, AgentConfig, AgentContext, RunOptions};
+use nanna_agent::{Agent, AgentConfig, AgentContext, ExtractedMemory, RunOptions};
 use nanna_llm::LlmClient;
 use nanna_memory::MemoryService;
 use nanna_storage::{Message, Session, Storage};
 use nanna_tools::ToolRegistry;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Embedded backend that runs the agent directly
 pub struct EmbeddedBackend {
@@ -74,9 +75,38 @@ impl EmbeddedBackend {
             self.llm.clone(),
             self.tools.clone(),
         ).with_context(context);
-        
+
+        // Clone memory service for auto-extraction callback
+        let memory_for_extraction = self.memory.clone();
+
+        // Create run options with auto memory extraction enabled
+        let run_options = RunOptions {
+            auto_extract_memories: true,
+            on_memory: Some(Box::new(move |memory: ExtractedMemory| {
+                let mem_service = memory_for_extraction.clone();
+                Box::pin(async move {
+                    let mut metadata = HashMap::new();
+                    metadata.insert("category".to_string(), memory.category.clone());
+                    metadata.insert("source".to_string(), "auto_extract".to_string());
+                    // Derive importance from category
+                    let importance = match memory.category.as_str() {
+                        "preference" | "identity" => 4.0,
+                        "fact" | "insight" => 3.5,
+                        "context" => 3.0,
+                        _ => 3.0,
+                    };
+                    if let Err(e) = mem_service.remember_with_importance(&memory.content, metadata, importance).await {
+                        warn!("Failed to auto-store memory: {}", e);
+                    } else {
+                        info!("Auto-extracted memory [{}]: {}", memory.category, truncate(&memory.content, 50));
+                    }
+                })
+            })),
+            ..Default::default()
+        };
+
         // Run the agent
-        let result = agent.run(&message, RunOptions::default())
+        let result = agent.run(&message, run_options)
             .await
             .map_err(|e| e.to_string())?;
         
@@ -209,5 +239,13 @@ impl EmbeddedBackend {
             "memory_total": memory_stats.total,
             "version": env!("CARGO_PKG_VERSION"),
         }))
+    }
+}
+
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
     }
 }

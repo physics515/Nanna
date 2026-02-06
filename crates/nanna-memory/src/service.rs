@@ -41,6 +41,69 @@ impl Default for MemoryServiceConfig {
     }
 }
 
+impl MemoryServiceConfig {
+    /// Create config with dimension inferred from embedding model name
+    #[must_use]
+    pub fn for_model(model: &str) -> Self {
+        Self {
+            dimension: Self::dimension_for_model(model),
+            ..Default::default()
+        }
+    }
+
+    /// Get the embedding dimension for a given model name
+    /// Covers common embedding models from OpenAI, Ollama, and other providers
+    #[must_use]
+    pub fn dimension_for_model(model: &str) -> usize {
+        let model_lower = model.to_lowercase();
+
+        // OpenAI models
+        if model_lower.contains("text-embedding-3-large") {
+            return 3072;
+        }
+        if model_lower.contains("text-embedding-3-small") || model_lower.contains("ada-002") {
+            return 1536;
+        }
+
+        // BGE models (BAAI)
+        if model_lower.contains("bge-large") {
+            return 1024;
+        }
+        if model_lower.contains("bge-m3") {
+            return 1024;
+        }
+        if model_lower.contains("bge-small") {
+            return 384;
+        }
+        if model_lower.contains("bge-base") {
+            return 768;
+        }
+
+        // MxBai models
+        if model_lower.contains("mxbai") {
+            return 1024;
+        }
+
+        // MiniLM models
+        if model_lower.contains("minilm") {
+            return 384;
+        }
+
+        // Nomic models
+        if model_lower.contains("nomic-embed") {
+            return 768;
+        }
+
+        // Jina models
+        if model_lower.contains("jina") {
+            return 768;
+        }
+
+        // Default to 768 (common for many models)
+        768
+    }
+}
+
 /// Callback for generating embeddings (injected dependency)
 pub type EmbedFn = Arc<dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + Send>> + Send + Sync>;
 

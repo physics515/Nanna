@@ -44,6 +44,8 @@ pub struct Backend {
     daemon_client: Arc<DaemonClient>,
     embedded: Arc<RwLock<Option<EmbeddedBackend>>>,
     app: Arc<RwLock<Option<AppHandle>>>,
+    /// Flag to prevent concurrent init attempts
+    initializing: Arc<RwLock<bool>>,
 }
 
 impl Backend {
@@ -61,6 +63,7 @@ impl Backend {
             daemon_client: Arc::new(DaemonClient::new(client_config)),
             embedded: Arc::new(RwLock::new(None)),
             app: Arc::new(RwLock::new(None)),
+            initializing: Arc::new(RwLock::new(false)),
         }
     }
     
@@ -79,30 +82,54 @@ impl Backend {
     /// 2. Connect the client
     /// 3. Fall back to embedded if daemon fails
     pub async fn init(&self, app: &AppHandle) -> BackendMode {
+        // Check if already initialized
+        let current_mode = *self.mode.read().await;
+        if current_mode == BackendMode::Daemon {
+            info!("Backend already initialized in daemon mode");
+            return BackendMode::Daemon;
+        }
+
+        // Check if initialization is already in progress
+        {
+            let mut initializing = self.initializing.write().await;
+            if *initializing {
+                info!("Backend initialization already in progress, waiting...");
+                drop(initializing);
+                // Wait for initialization to complete
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if !*self.initializing.read().await {
+                        return *self.mode.read().await;
+                    }
+                }
+            }
+            *initializing = true;
+        }
+
         info!("Initializing backend...");
         
         // Store app handle
         *self.app.write().await = Some(app.clone());
         
         // Step 1: Start the daemon sidecar
-        match self.daemon_manager.start(app).await {
+        let result = match self.daemon_manager.start(app).await {
             Ok(()) => {
                 info!("Daemon sidecar started");
-                
+
                 // Step 2: Connect the client
                 let mode = self.daemon_client.connect_or_embed().await;
-                
+
                 match mode {
                     ConnectionMode::Daemon => {
                         info!("Backend: daemon mode (sidecar)");
                         *self.mode.write().await = BackendMode::Daemon;
-                        
+
                         // Start event forwarding
                         self.start_event_forwarding(app.clone());
-                        
+
                         // Start health monitoring
                         self.daemon_manager.clone().start_health_monitor(app.clone());
-                        
+
                         BackendMode::Daemon
                     }
                     ConnectionMode::Embedded => {
@@ -118,7 +145,11 @@ impl Backend {
                 *self.mode.write().await = BackendMode::Embedded;
                 BackendMode::Embedded
             }
-        }
+        };
+
+        // Mark initialization as complete
+        *self.initializing.write().await = false;
+        result
     }
     
     /// Shutdown the backend (stop daemon if running)
@@ -278,6 +309,439 @@ impl Backend {
                 "mode": "embedded",
                 "version": env!("CARGO_PKG_VERSION"),
             }))
+        }
+    }
+    
+    // =========================================================================
+    // Session management (additional methods)
+    // =========================================================================
+    
+    /// Delete a session
+    pub async fn session_delete(&self, session_id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.session_delete(session_id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Delete all sessions
+    pub async fn sessions_delete_all(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.sessions_delete_all().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Rename a session
+    pub async fn session_rename(&self, session_id: &str, name: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.session_rename(session_id, name).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Get session run state (in-flight streaming text, active tools)
+    pub async fn session_get_run_state(&self, session_id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.session_get_run_state(session_id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Clear session history
+    pub async fn session_clear(&self, session_id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.session_clear(session_id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    // =========================================================================
+    // Memory operations
+    // =========================================================================
+    
+    /// List all memories
+    pub async fn memory_list(&self, scope: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_list(scope).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Search memories
+    pub async fn memory_search(&self, query: &str, limit: Option<usize>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_search(query, limit).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Get a specific memory
+    pub async fn memory_get(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_get(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Create a memory
+    pub async fn memory_create(&self, content: &str, tags: Option<Vec<String>>, importance: Option<u8>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_create(content, tags, importance).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Update a memory
+    pub async fn memory_update(&self, id: &str, content: Option<&str>, tags: Option<Vec<String>>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_update(id, content, tags).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Delete a memory
+    pub async fn memory_delete(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_delete(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Clear all memories
+    pub async fn memory_clear(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_clear().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Get memory stats
+    pub async fn memory_stats(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_stats().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Trigger memory consolidation
+    pub async fn memory_consolidate(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.memory_consolidate().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    // =========================================================================
+    // Scheduler operations
+    // =========================================================================
+    
+    /// List scheduled jobs
+    pub async fn scheduler_list(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_list().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Get job details
+    pub async fn scheduler_get(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_get(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Add a cron job
+    pub async fn scheduler_add(&self, schedule: &str, task: &str, name: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_add(schedule, task, name).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Update a job
+    pub async fn scheduler_update(&self, id: &str, schedule: Option<&str>, task: Option<&str>, enabled: Option<bool>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_update(id, schedule, task, enabled).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Remove a job
+    pub async fn scheduler_remove(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_remove(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Run a job immediately
+    pub async fn scheduler_run_now(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_run_now(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Get job history
+    pub async fn scheduler_history(&self, id: &str, limit: Option<usize>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.scheduler_history(id, limit).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    // =========================================================================
+    // Tool operations
+    // =========================================================================
+    
+    /// List all tools
+    pub async fn tool_list(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_list().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Execute a tool
+    pub async fn tool_execute(&self, name: &str, input: Value) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_execute(name, input).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Create a user tool
+    pub async fn tool_create(&self, name: &str, description: &str, code: &str, needs_shell: Option<bool>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_create(name, description, code, needs_shell).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Update a user tool
+    pub async fn tool_update(&self, name: &str, description: Option<&str>, code: Option<&str>, needs_shell: Option<bool>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_update(name, description, code, needs_shell).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Delete a user tool
+    pub async fn tool_delete(&self, name: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_delete(name).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Test a user tool
+    pub async fn tool_test(&self, code: &str, input: Value) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_test(code, input).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// List user tools
+    pub async fn tool_list_user(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_list_user().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    // =========================================================================
+    // Config operations
+    // =========================================================================
+    
+    /// Get config (full or by path)
+    pub async fn config_get(&self, path: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.config_get(path).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Set config value
+    pub async fn config_set(&self, path: &str, value: Value) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.config_set(path, value).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Reset config
+    pub async fn config_reset(&self, path: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.config_reset(path).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Reload config from disk
+    pub async fn config_reload(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.config_reload().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Export config
+    pub async fn config_export(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.config_export().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Import config
+    pub async fn config_import(&self, config: Value) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.config_import(config).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    // =========================================================================
+    // Workspace operations
+    // =========================================================================
+    
+    /// List workspaces
+    pub async fn workspace_list(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_list().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Get workspace details
+    pub async fn workspace_get(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_get(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Open/register a workspace
+    pub async fn workspace_open(&self, path: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_open(path).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Close/unregister a workspace
+    pub async fn workspace_close(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_close(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Set active workspace
+    pub async fn workspace_set_active(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_set_active(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Clear active workspace (global mode)
+    pub async fn workspace_clear_active(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_clear_active().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Reload workspace context
+    pub async fn workspace_reload(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_reload(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Get workspace context
+    pub async fn workspace_get_context(&self, id: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_get_context(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Update workspace context file
+    pub async fn workspace_update_context(&self, id: &str, file: &str, content: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.workspace_update_context(id, file, content).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    // =========================================================================
+    // Channel operations
+    // =========================================================================
+    
+    /// List channels
+    pub async fn channel_list(&self) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.channel_list().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+    
+    /// Get channel status
+    pub async fn channel_status(&self, id: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.channel_status(id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
         }
     }
 }

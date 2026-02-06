@@ -18,6 +18,8 @@ nanna-tools = { path = "crates/nanna-tools" }
 nanna-config = { path = "crates/nanna-config" }
 nanna-storage = { path = "crates/nanna-storage" }
 nanna-llm = { path = "crates/nanna-llm" }
+nanna-daemon = { path = "crates/nanna-daemon" }
+nanna-client = { path = "crates/nanna-client" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

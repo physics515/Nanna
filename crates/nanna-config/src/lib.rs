@@ -91,6 +91,12 @@ pub struct LlmConfig {
     pub anthropic_oauth_token: Option<String>,
     /// Whether to use OAuth token instead of API key for Anthropic
     pub anthropic_use_oauth: bool,
+    /// Model priority list for summarization (first working model is used)
+    /// Format: ["ollama/llama3.2", "ollama/mistral", "claude-haiku"]
+    /// If empty, truncates instead of summarizing
+    pub summarization_priority: Vec<String>,
+    /// Ollama server URL for summarization (if using ollama model)
+    pub ollama_url: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -105,12 +111,11 @@ impl Default for LlmConfig {
             openai_api_key: None,
             openrouter_api_key: None,
             github_token: None,
-            model_priority: vec![
-                "claude-sonnet-4-20250514".to_string(),
-                "claude-3-5-sonnet-20241022".to_string(),
-            ],
+            model_priority: vec![], // Empty - dynamically populated from available providers
             anthropic_oauth_token: None,
             anthropic_use_oauth: false,
+            summarization_priority: vec![], // Empty = truncate instead of summarize
+            ollama_url: Some("http://localhost:11434".to_string()),
         }
     }
 }

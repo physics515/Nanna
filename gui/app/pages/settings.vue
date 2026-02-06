@@ -189,7 +189,25 @@
                   </div>
                 </div>
               </div>
-              
+
+              <!-- Summarization Models -->
+              <div class="mt-6 pt-6 border-t border-nanna-primary/10">
+                <h3 class="text-sm font-semibold text-nanna-accent mb-3 flex items-center gap-2">
+                  <Layers class="w-4 h-4" />
+                  Context Summarization
+                </h3>
+                <p class="text-xs text-nanna-text-dim mb-3">
+                  When conversation context exceeds the chat model's limit, these models recursively summarize older content until it fits. Any chat model works; local Ollama models avoid API costs.
+                </p>
+                <ModelPriorityList
+                  label="Summarization Model Priority"
+                  hint="Used to compress context when it exceeds limits. Empty = truncate instead of summarize."
+                  :all-models="allSummarizationModels"
+                  v-model="summarizationModelPriority"
+                  @update:model-value="saveSummarizationModelPriority"
+                />
+              </div>
+
               <!-- Ollama Host -->
               <div class="mt-4 pt-4 border-t border-nanna-primary/10">
                 <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
@@ -596,10 +614,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { useConfirm } from '~/composables/useConfirm'
 import {
   ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon,
   RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp,
-  Bot, MessageSquare, AlertTriangle, LogOut, Download, Terminal
+  Bot, MessageSquare, AlertTriangle, LogOut, Download, Terminal, Layers
 } from 'lucide-vue-next'
 
 interface ToolInfo {
@@ -666,6 +685,8 @@ const tabs = [
   { id: 'data', label: 'Data', icon: Database },
 ]
 
+const { confirm } = useConfirm()
+
 const activeTab = ref('models')
 const settings = ref<ExtendedSettings | null>(null)
 const selectedModel = ref('')
@@ -689,6 +710,7 @@ const maxTokens = ref(4096)
 // Model priority lists (fallback chains)
 const chatModelPriority = ref<string[]>([])
 const embeddingModelPriority = ref<string[]>([])
+const summarizationModelPriority = ref<string[]>([])
 
 // Anthropic OAuth state
 const oauthTokenInput = ref('')
@@ -780,6 +802,50 @@ const allEmbeddingModels = computed<ModelOption[]>(() => {
   return models
 })
 
+// Models available for context summarization (any chat model can be used)
+const allSummarizationModels = computed<ModelOption[]>(() => {
+  const models: ModelOption[] = []
+
+  // Ollama chat models (listed first - local, free, private)
+  for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
+    models.push({ id: `ollama/${m.name}`, name: `${m.name} (local)`, provider: 'ollama', available: true })
+  }
+
+  // Anthropic models
+  const anthropicAvailable = settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in
+  if (anthropicAvailable && anthropicModels.value.length > 0) {
+    for (const m of anthropicModels.value) {
+      models.push({ id: `anthropic/${m.id}`, name: m.name, provider: 'anthropic', available: true })
+    }
+  }
+
+  // OpenAI models
+  if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    const chatModels = openaiModels.value.filter(m =>
+      m.id.startsWith('gpt-') || m.id.startsWith('o1') || m.id.startsWith('o3') || m.id.startsWith('chatgpt')
+    )
+    for (const m of chatModels) {
+      models.push({ id: `openai/${m.id}`, name: m.name, provider: 'openai', available: true })
+    }
+  }
+
+  // OpenRouter models
+  if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    for (const m of openrouterModels.value) {
+      models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
+    }
+  }
+
+  // GitHub Models
+  if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    for (const m of githubModels.value) {
+      models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
+    }
+  }
+
+  return models
+})
+
 const configPath = computed(() => {
   if (navigator.platform.includes('Win')) {
     return '%APPDATA%\\clawd\\Nanna\\config\\config.toml'
@@ -833,7 +899,13 @@ async function loadSettings() {
         embeddingModelPriority.value = []
       }
     }
-    
+    try {
+      summarizationModelPriority.value = await invoke<string[]>('get_summarization_model_priority')
+    } catch {
+      // Default to empty (truncate instead of summarize)
+      summarizationModelPriority.value = []
+    }
+
     // Always refresh Ollama models to populate the lists
     await refreshOllamaModels()
     await refreshModels()
@@ -966,6 +1038,15 @@ async function saveEmbeddingModelPriority(priority: string[]) {
   try {
     await invoke('set_embedding_model_priority', { priority })
     showToast('Embedding model priority saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveSummarizationModelPriority(priority: string[]) {
+  try {
+    await invoke('set_summarization_model_priority', { priority })
+    showToast('Summarization model priority saved', 'success')
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')
   }
@@ -1259,13 +1340,18 @@ async function triggerConsolidation() {
 }
 
 async function confirmClearSessions() {
-  if (!confirm('Delete all chat sessions? This cannot be undone.')) return
+  const confirmed = await confirm({
+    title: 'Delete All Sessions',
+    message: 'Delete all chat sessions? This cannot be undone.',
+    confirmText: 'Delete All',
+    destructive: true
+  })
+
+  if (!confirmed) return
+
   try {
-    const sessions = await invoke<{ id: string }[]>('list_sessions')
-    for (const session of sessions) {
-      await invoke('delete_session', { sessionId: session.id })
-    }
-    showToast('All sessions cleared', 'success')
+    const count = await invoke<number>('clear_all_sessions')
+    showToast(`Cleared ${count} sessions`, 'success')
     sessionCount.value = 0
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')
@@ -1273,7 +1359,15 @@ async function confirmClearSessions() {
 }
 
 async function confirmClearMemories() {
-  if (!confirm('Delete all memories? This cannot be undone.')) return
+  const confirmed = await confirm({
+    title: 'Delete All Memories',
+    message: 'Delete all memories? This cannot be undone.',
+    confirmText: 'Delete All',
+    destructive: true
+  })
+
+  if (!confirmed) return
+
   try {
     await invoke('clear_all_memories')
     showToast('All memories cleared', 'success')

@@ -11,7 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use nanna_daemon::server::DaemonBuilder;
-use nanna_daemon::service::{ServiceConfig, ServiceManager, ServiceStatus};
+use nanna_daemon::service::ServiceStatus;
 use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -27,13 +27,33 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
     
-    /// Port to listen on
+    /// WebSocket port to listen on
     #[arg(short, long, default_value = "5149")]
     port: u16,
     
     /// Host to bind to
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+    
+    /// HTTP health port (default: 5148)
+    #[arg(long, default_value = "5148")]
+    health_port: u16,
+    
+    /// Disable HTTP health server
+    #[arg(long)]
+    no_health_server: bool,
+    
+    /// Disable PID file (allows multiple instances)
+    #[arg(long)]
+    no_pid_file: bool,
+    
+    /// Enable webhook server for inbound messages
+    #[arg(long)]
+    enable_webhooks: bool,
+    
+    /// Webhook server port (default: 3000)
+    #[arg(long, default_value = "3000")]
+    webhook_port: u16,
     
     /// Data directory
     #[arg(long)]
@@ -119,10 +139,17 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
         .map_err(|e| format!("Failed to create runtime: {}", e))?;
     
     runtime.block_on(async {
-        let mut builder = DaemonBuilder::new()
+        // Load config from Nanna config file (includes API keys)
+        let mut builder = DaemonBuilder::from_nanna_config()
+            .map_err(|e| format!("Failed to load config: {}", e))?
             .with_port(cli.port)
             .with_host(&cli.host)
-            .with_log_level(&cli.log_level);
+            .with_log_level(&cli.log_level)
+            .with_health_port(cli.health_port)
+            .with_health_server(!cli.no_health_server)
+            .with_pid_file(!cli.no_pid_file)
+            .with_webhook_server(cli.enable_webhooks)
+            .with_webhook_port(cli.webhook_port);
         
         if let Some(ref data_dir) = cli.data_dir {
             builder = builder.with_data_dir(data_dir);
@@ -233,7 +260,7 @@ fn stop_service(cli: &Cli) -> Result<(), String> {
     }
 }
 
-fn restart_service(cli: &Cli) -> Result<(), String> {
+fn restart_service(_cli: &Cli) -> Result<(), String> {
     #[cfg(windows)]
     {
         if windows_service::query_service_status() == ServiceStatus::Running {
@@ -278,14 +305,48 @@ fn show_status(cli: &Cli) -> Result<(), String> {
         ServiceStatus::Stopping => "Stopping...",
         ServiceStatus::Unknown => "Unknown",
     });
-    println!("Port: {}", cli.port);
+    println!("WebSocket Port: {}", cli.port);
+    println!("Health Port: {}", cli.health_port);
     println!("Host: {}", cli.host);
     
-    // Try to connect to running daemon
-    if status == ServiceStatus::Running {
-        println!("\nTrying to connect to ws://{}:{}...", cli.host, cli.port);
-        // TODO: Actually test WebSocket connection
-        println!("(Connection test not implemented yet)");
+    // Try to connect to health endpoint
+    if status == ServiceStatus::Running || status == ServiceStatus::Unknown {
+        let health_url = format!("http://{}:{}/health", cli.host, cli.health_port);
+        println!("\nChecking health endpoint: {}", health_url);
+        
+        // Try to fetch health endpoint
+        match std::process::Command::new("curl")
+            .args(["-s", "-m", "2", &health_url])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let body = String::from_utf8_lossy(&output.stdout);
+                if body.contains("ok") {
+                    println!("Health: OK ✓");
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(uptime) = json.get("uptime_secs").and_then(|v| v.as_u64()) {
+                            let hours = uptime / 3600;
+                            let mins = (uptime % 3600) / 60;
+                            let secs = uptime % 60;
+                            println!("Uptime: {}h {}m {}s", hours, mins, secs);
+                        }
+                        if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
+                            println!("Version: {}", version);
+                        }
+                    }
+                } else {
+                    println!("Health: Unknown (response: {})", body.chars().take(50).collect::<String>());
+                }
+            }
+            Ok(_) => {
+                println!("Health: Not responding (daemon may be starting or not running)");
+            }
+            Err(_) => {
+                println!("Health: Could not check (curl not available)");
+                println!("\nTrying WebSocket at ws://{}:{}...", cli.host, cli.port);
+                println!("(WebSocket test not implemented)");
+            }
+        }
     }
     
     Ok(())

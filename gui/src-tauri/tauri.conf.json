@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.nanna.app",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm build:daemon:debug && pnpm dev",
     "devUrl": "http://localhost:3000",
-    "beforeBuildCommand": "pnpm generate",
+    "beforeBuildCommand": "pnpm build:daemon && pnpm generate",
     "frontendDist": "../.output/public"
   },
   "app": {
@@ -47,6 +47,7 @@
     ],
     "externalBin": [
       "binaries/nanna-daemon"
-    ]
+    ],
+    "resources": []
   }
 }

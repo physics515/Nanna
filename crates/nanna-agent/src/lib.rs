@@ -5,11 +5,13 @@
 //!
 //! Implements the agentic loop with tool calling, memory, and context management.
 
+mod chunker;
 mod context;
 mod loop_runner;
 mod multi;
-mod prompts;
+pub mod prompts;
 mod registry;
+mod summarizer;
 mod supervisor;
 
 #[cfg(feature = "mcp")]
@@ -19,7 +21,7 @@ pub mod mcp;
 pub use nanna_workspace;
 pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, WorkspaceTemplate};
 
-pub use context::{AgentContext, ContextIsolation, ContextSummary};
+pub use context::{AgentContext, ContextIsolation, ContextSummary, ContextSummarizationConfig};
 pub use registry::{
     AgentMetadata, AgentRegistry, AgentRole, AgentState as RegistryAgentState, LifecycleEvent, 
     RegisteredAgent,
@@ -38,6 +40,10 @@ pub use multi::{
 pub use supervisor::{
     AgentState, AgentStats, HealthCheckConfig, RestartPolicy, SupervisedAgentConfig,
     SupervisionStrategy, Supervisor, SupervisorEvent, SupervisorEventType,
+};
+pub use summarizer::{
+    new_summary_cache, summarize_if_large, SummaryCache, SummaryCacheEntry, Summarizer,
+    SummarizerConfig,
 };
 
 use serde::{Deserialize, Serialize};

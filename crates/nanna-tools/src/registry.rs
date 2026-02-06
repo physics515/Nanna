@@ -3,7 +3,7 @@
 use crate::{Tool, ToolCall, ToolDefinition, ToolResponse, ToolResult};
 use crate::skills::{load_skill, discover_skills};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,6 +12,8 @@ use tracing::{debug, info, warn};
 /// Registry of available tools
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    /// Alias names (not included in definitions sent to API)
+    aliases: RwLock<HashSet<String>>,
 }
 
 impl ToolRegistry {
@@ -19,6 +21,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashSet::new()),
         }
     }
 
@@ -40,43 +43,80 @@ impl ToolRegistry {
         info!("Registered tool: {}", name);
     }
 
+    /// Register an alias for an existing tool
+    /// This allows the same tool to be called by different names.
+    /// Aliases are used for execution lookup but NOT sent to the API (to avoid duplicates).
+    pub async fn register_alias(&self, alias: &str, target: &str) {
+        let tools = self.tools.read().await;
+        if let Some(tool) = tools.get(target).cloned() {
+            drop(tools); // Release read lock before acquiring write lock
+            let mut tools = self.tools.write().await;
+            tools.insert(alias.to_string(), tool);
+            drop(tools);
+            // Track this as an alias so we don't include it in definitions
+            let mut aliases = self.aliases.write().await;
+            aliases.insert(alias.to_string());
+            info!("Registered tool alias: {} -> {}", alias, target);
+        } else {
+            warn!("Cannot create alias '{}': target tool '{}' not found", alias, target);
+        }
+    }
+
     /// Get a tool by name
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         let tools = self.tools.read().await;
         tools.get(name).cloned()
     }
 
-    /// Get all tool definitions
+    /// Get all tool definitions (excludes aliases to avoid duplicates)
     pub async fn definitions(&self) -> Vec<ToolDefinition> {
         let tools = self.tools.read().await;
-        tools.values().map(|t| t.definition()).collect()
-    }
-
-    /// Get tool definitions in Anthropic format
-    pub async fn to_anthropic_format(&self) -> Vec<Value> {
-        let tools = self.tools.read().await;
+        let aliases = self.aliases.read().await;
         tools
-            .values()
-            .map(|t| t.definition().to_anthropic_format())
+            .iter()
+            .filter(|(name, _)| !aliases.contains(*name))
+            .map(|(_, t)| t.definition())
             .collect()
     }
 
-    /// Get tool definitions in `OpenAI` format
+    /// Get tool definitions in Anthropic format (excludes aliases to avoid duplicates)
+    pub async fn to_anthropic_format(&self) -> Vec<Value> {
+        let tools = self.tools.read().await;
+        let aliases = self.aliases.read().await;
+        tools
+            .iter()
+            .filter(|(name, _)| !aliases.contains(*name))
+            .map(|(_, t)| t.definition().to_anthropic_format())
+            .collect()
+    }
+
+    /// Get tool definitions in `OpenAI` format (excludes aliases to avoid duplicates)
     pub async fn to_openai_format(&self) -> Vec<Value> {
         let tools = self.tools.read().await;
+        let aliases = self.aliases.read().await;
         tools
-            .values()
-            .map(|t| t.definition().to_openai_format())
+            .iter()
+            .filter(|(name, _)| !aliases.contains(*name))
+            .map(|(_, t)| t.definition().to_openai_format())
             .collect()
     }
 
     /// Execute a tool call
     pub async fn execute(&self, call: ToolCall) -> ToolResponse {
-        debug!("Executing tool: {} (id: {})", call.name, call.id);
+        // Log input parameters (truncated for readability)
+        let params_str = serde_json::to_string(&call.parameters).unwrap_or_default();
+        let params_preview = if params_str.len() > 300 {
+            let end = truncate_boundary(&params_str, 300);
+            format!("{}...", &params_str[..end])
+        } else {
+            params_str
+        };
+        debug!("Executing tool: {} (id: {}) with params: {}", call.name, call.id, params_preview);
 
         let tool = match self.get(&call.name).await {
             Some(t) => t,
             None => {
+                warn!("Tool not found: {}", call.name);
                 return ToolResponse {
                     id: call.id,
                     name: call.name.clone(),
@@ -85,6 +125,8 @@ impl ToolRegistry {
             }
         };
 
+        let start = std::time::Instant::now();
+        
         // Execute with timeout if specified
         let result = if let Some(timeout_secs) = tool.timeout_secs() {
             match tokio::time::timeout(
@@ -94,15 +136,40 @@ impl ToolRegistry {
             .await
             {
                 Ok(Ok(result)) => result,
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
-                Err(_) => ToolResult::error("Tool execution timed out"),
+                Ok(Err(e)) => {
+                    warn!("Tool {} execution error: {}", call.name, e);
+                    ToolResult::error(e.to_string())
+                }
+                Err(_) => {
+                    warn!("Tool {} timed out after {}s", call.name, timeout_secs);
+                    ToolResult::error("Tool execution timed out")
+                }
             }
         } else {
             match tool.execute(call.parameters.clone()).await {
                 Ok(result) => result,
-                Err(e) => ToolResult::error(e.to_string()),
+                Err(e) => {
+                    warn!("Tool {} execution error: {}", call.name, e);
+                    ToolResult::error(e.to_string())
+                }
             }
         };
+
+        let duration_ms = start.elapsed().as_millis();
+        
+        // Log result summary
+        let output_preview = if result.content.len() > 200 {
+            let end = truncate_boundary(&result.content, 200);
+            format!("{}...", &result.content[..end])
+        } else {
+            result.content.clone()
+        };
+        
+        if result.success {
+            debug!("Tool {} completed in {}ms: {}", call.name, duration_ms, output_preview);
+        } else {
+            warn!("Tool {} failed in {}ms: {}", call.name, duration_ms, output_preview);
+        }
 
         ToolResponse {
             id: call.id,
@@ -173,6 +240,18 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Find the largest byte index <= max_bytes that is a valid char boundary.
+fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
+    if s.len() <= max_bytes {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[cfg(test)]

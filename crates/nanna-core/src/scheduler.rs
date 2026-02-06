@@ -394,6 +394,60 @@ impl Scheduler {
         tasks.get(task_id).cloned()
     }
 
+    /// Find tasks by name
+    pub async fn find_by_name(&self, name: &str) -> Vec<ScheduledTask> {
+        let tasks = self.tasks.read().await;
+        tasks.values().filter(|t| t.name == name).cloned().collect()
+    }
+
+    /// Check if a task with the given name exists
+    pub async fn has_task_named(&self, name: &str) -> bool {
+        let tasks = self.tasks.read().await;
+        tasks.values().any(|t| t.name == name)
+    }
+
+    /// Remove all tasks with a given name (useful for cleaning up duplicates)
+    pub async fn remove_tasks_by_name(&self, name: &str) -> usize {
+        let task_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            tasks.values()
+                .filter(|t| t.name == name)
+                .map(|t| t.id.clone())
+                .collect()
+        };
+
+        let count = task_ids.len();
+        for task_id in task_ids {
+            self.remove_task(&task_id).await;
+        }
+        count
+    }
+
+    /// Remove all tasks except one with a given name (keep the most recent one)
+    pub async fn deduplicate_by_name(&self, name: &str) -> usize {
+        let task_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            let mut matching: Vec<_> = tasks.values()
+                .filter(|t| t.name == name)
+                .collect();
+
+            // Keep one (the first alphabetically by ID)
+            matching.sort_by(|a, b| a.id.cmp(&b.id));
+
+            // Skip the first one, return the rest for deletion
+            matching.into_iter()
+                .skip(1)
+                .map(|t| t.id.clone())
+                .collect()
+        };
+
+        let count = task_ids.len();
+        for task_id in task_ids {
+            self.remove_task(&task_id).await;
+        }
+        count
+    }
+
     /// Get job run history
     pub async fn get_history(&self, job_id: &str, limit: usize) -> Vec<JobRun> {
         let history = self.history.read().await;

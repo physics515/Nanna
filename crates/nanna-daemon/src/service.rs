@@ -42,6 +42,7 @@ impl Default for ServiceConfig {
 }
 
 /// Platform-specific service operations
+#[allow(dead_code)]
 pub struct ServiceManager {
     config: ServiceConfig,
 }

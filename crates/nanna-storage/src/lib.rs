@@ -211,6 +211,28 @@ impl Storage {
         }).await
     }
 
+    /// Add a message with tool calls to a session
+    /// Tool calls are stored in the metadata field as JSON
+    pub async fn add_message_with_tool_calls(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: Option<serde_json::Value>,
+    ) -> Result<Message, StorageError> {
+        let metadata = tool_calls.map(|tc| serde_json::json!({ "tool_calls": tc }));
+        self.messages().create(NewMessage {
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            content_type: "text".to_string(),
+            tool_use_id: None,
+            tokens_in: None,
+            tokens_out: None,
+            metadata,
+        }).await
+    }
+
     /// Count messages in a session
     pub async fn count_session_messages(&self, session_id: &str) -> Result<i64, StorageError> {
         let conn = self.conn.lock().await;

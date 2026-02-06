@@ -309,6 +309,9 @@ impl AppState {
             temperature: 0.7,
             max_iterations: 10,
             thinking_mode: nanna_agent::ThinkingMode::Instant,
+            summarization_priority: vec![],
+            summarization_ollama_url: Some("http://localhost:11434".to_string()),
+            summarization_threshold: 50_000,
         };
 
         let context = AgentContext::new(session_id)

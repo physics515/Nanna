@@ -12,12 +12,15 @@
     >
       <div class="flex items-center justify-between">
         <span class="truncate flex-1">{{ session.name }}</span>
-        <button 
-          @click.stop="showMenu = !showMenu"
-          class="opacity-0 group-hover:opacity-100 p-1 hover:bg-nanna-bg-elevated rounded transition-opacity"
-        >
-          ⋮
-        </button>
+        <div class="flex items-center gap-1">
+          <SessionActivityBadge :session-id="session.id" compact />
+          <button
+            @click.stop="showMenu = !showMenu"
+            class="opacity-0 group-hover:opacity-100 p-1 hover:bg-nanna-bg-elevated rounded transition-opacity"
+          >
+            ⋮
+          </button>
+        </div>
       </div>
       <div class="text-xs text-nanna-text-dim mt-0.5">
         {{ formatDate(session.updated_at) }}
@@ -78,6 +81,9 @@
 <script setup lang="ts">
 import { ref, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { useConfirm } from '~/composables/useConfirm'
+
+const { confirm } = useConfirm()
 
 interface SessionInfo {
   id: string
@@ -132,9 +138,16 @@ async function saveRename() {
 
 async function confirmDelete() {
   showMenu.value = false
-  
-  if (!confirm(`Delete "${props.session.name}"? This cannot be undone.`)) return
-  
+
+  const confirmed = await confirm({
+    title: 'Delete Session',
+    message: `Delete "${props.session.name}"? This cannot be undone.`,
+    confirmText: 'Delete',
+    destructive: true
+  })
+
+  if (!confirmed) return
+
   try {
     await invoke('delete_session', { sessionId: props.session.id })
     emit('deleted', props.session.id)

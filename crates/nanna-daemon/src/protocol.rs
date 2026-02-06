@@ -62,6 +62,11 @@ pub enum Action {
     System(SystemAction),
     
     // =========================================================================
+    // Workspaces
+    // =========================================================================
+    Workspace(WorkspaceAction),
+    
+    // =========================================================================
     // Subscriptions
     // =========================================================================
     Subscribe(SubscribeAction),
@@ -113,6 +118,8 @@ pub enum SessionAction {
     Rename { id: String, name: String },
     /// Delete a session
     Delete { id: String },
+    /// Delete all sessions
+    DeleteAll,
     /// Clear session history
     Clear { id: String },
     /// Get session history
@@ -121,6 +128,8 @@ pub enum SessionAction {
     Switch { id: String },
     /// Fork a session (create copy)
     Fork { id: String, name: Option<String> },
+    /// Get current execution state (in-flight streaming text, active tools)
+    GetRunState { id: String },
 }
 
 // =============================================================================
@@ -130,6 +139,8 @@ pub enum SessionAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum MemoryAction {
+    /// List all memories
+    List { scope: Option<String> },
     /// Search memories
     Search { query: String, limit: Option<usize> },
     /// Get a specific memory
@@ -140,6 +151,8 @@ pub enum MemoryAction {
     Update { id: String, content: Option<String>, tags: Option<Vec<String>> },
     /// Delete a memory
     Delete { id: String },
+    /// Clear all memories
+    Clear,
     /// Get memory stats
     Stats,
     /// Trigger consolidation
@@ -186,8 +199,14 @@ pub enum ToolAction {
     Execute { name: String, input: Value },
     /// Create a user tool
     Create { name: String, description: String, code: String, needs_shell: Option<bool> },
+    /// Update a user tool
+    Update { name: String, description: Option<String>, code: Option<String>, needs_shell: Option<bool> },
     /// Delete a user tool
     Delete { name: String },
+    /// Test a user tool (without saving)
+    Test { code: String, input: Value },
+    /// List only user-created tools
+    ListUser,
 }
 
 // =============================================================================
@@ -232,6 +251,33 @@ pub enum ChannelAction {
     Test { id: String },
     /// Send a message via channel
     Send { channel_id: String, target: String, content: String },
+}
+
+// =============================================================================
+// Workspace Actions
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum WorkspaceAction {
+    /// List all registered workspaces
+    List,
+    /// Get workspace details
+    Get { id: String },
+    /// Open/register a workspace from path
+    Open { path: String },
+    /// Close/unregister a workspace
+    Close { id: String },
+    /// Set active workspace
+    SetActive { id: String },
+    /// Clear active workspace (global mode)
+    ClearActive,
+    /// Reload workspace context files
+    Reload { id: String },
+    /// Get workspace context (SOUL.md, USER.md, etc.)
+    GetContext { id: String },
+    /// Update workspace context file
+    UpdateContext { id: String, file: String, content: String },
 }
 
 // =============================================================================

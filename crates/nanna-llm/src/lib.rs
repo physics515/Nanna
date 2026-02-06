@@ -32,13 +32,259 @@ pub enum LlmError {
     #[error("Missing API key for provider: {0}")]
     MissingApiKey(String),
     #[error("Rate limit exceeded: {message}")]
-    RateLimit { 
+    RateLimit {
         message: String,
         /// Seconds until rate limit resets (if available)
         retry_after: Option<u64>,
     },
     #[error("All fallback models exhausted")]
     AllModelsExhausted,
+    #[error("IO error: {0}")]
+    Io(String),
+}
+
+impl From<std::io::Error> for LlmError {
+    fn from(e: std::io::Error) -> Self {
+        LlmError::Io(e.to_string())
+    }
+}
+
+// ============================================================================
+// Model Information & Capabilities
+// ============================================================================
+
+/// Model capabilities and limits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Model identifier
+    pub id: String,
+    /// Maximum input context window in tokens
+    pub context_window: usize,
+    /// Maximum output tokens
+    pub max_output_tokens: usize,
+    /// Whether the model supports tool/function calling
+    #[serde(default)]
+    pub supports_tools: bool,
+    /// Whether the model supports vision/images
+    #[serde(default)]
+    pub supports_vision: bool,
+    /// Embedding dimension (if this is an embedding model)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimension: Option<usize>,
+    /// Unix timestamp when this info was cached
+    #[serde(default)]
+    pub cached_at: i64,
+    /// Provider this info came from
+    #[serde(default)]
+    pub provider: String,
+}
+
+impl ModelInfo {
+    /// Cache TTL: 1 week in seconds
+    pub const CACHE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+    /// Check if this cached info has expired
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        let now = current_timestamp();
+        now - self.cached_at > Self::CACHE_TTL_SECS
+    }
+
+    /// Recommended compression threshold (80% of context window)
+    #[must_use]
+    pub fn compression_threshold(&self) -> usize {
+        (self.context_window * 80) / 100
+    }
+
+    /// Hard limit for input (leaves room for output)
+    #[must_use]
+    pub fn hard_input_limit(&self) -> usize {
+        self.context_window.saturating_sub(self.max_output_tokens)
+    }
+
+    /// Create with current timestamp
+    fn with_timestamp(mut self) -> Self {
+        self.cached_at = current_timestamp();
+        self
+    }
+}
+
+/// Get current Unix timestamp
+fn current_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Default context windows for known models (fallback when API doesn't provide)
+fn default_model_info(model: &str, provider: &str) -> ModelInfo {
+    let model_lower = model.to_lowercase();
+
+    // Check if this is an embedding model first
+    let embedding_dimension = embedding_dimension_for_model(&model_lower);
+
+    let (context_window, max_output, supports_tools, supports_vision) = match model {
+        // Claude models - 200K context (can be 1M with beta header)
+        m if m.contains("claude-3") || m.contains("claude-sonnet") || m.contains("claude-opus") || m.contains("claude-haiku") => {
+            (200_000, 8192, true, true)
+        }
+        // GPT-4 Turbo / GPT-4o - 128K context
+        m if m.contains("gpt-4-turbo") || m.contains("gpt-4o") => {
+            (128_000, 4096, true, true)
+        }
+        // GPT-4 (original) - 8K or 32K
+        m if m.contains("gpt-4-32k") => (32_000, 4096, true, false),
+        m if m.contains("gpt-4") => (8_000, 4096, true, false),
+        // GPT-3.5 Turbo - 16K
+        m if m.contains("gpt-3.5-turbo-16k") => (16_000, 4096, true, false),
+        m if m.contains("gpt-3.5") => (4_000, 4096, true, false),
+        // Llama models
+        m if m.contains("llama-3.1") || m.contains("llama-3.2") => (128_000, 4096, true, false),
+        m if m.contains("llama") => (8_000, 4096, false, false),
+        // Mistral models
+        m if m.contains("mistral-large") => (128_000, 4096, true, false),
+        m if m.contains("mistral") => (32_000, 4096, true, false),
+        // Conservative default
+        _ => (32_000, 4096, false, false),
+    };
+
+    ModelInfo {
+        id: model.to_string(),
+        context_window,
+        max_output_tokens: max_output,
+        supports_tools,
+        supports_vision,
+        embedding_dimension,
+        cached_at: current_timestamp(),
+        provider: provider.to_string(),
+    }
+}
+
+/// Get embedding dimension for known embedding models (fallback when API doesn't provide)
+/// Returns None if the model is not a known embedding model
+pub fn embedding_dimension_for_model(model: &str) -> Option<usize> {
+    let model_lower = model.to_lowercase();
+
+    // OpenAI embedding models
+    if model_lower.contains("text-embedding-3-large") {
+        return Some(3072);
+    }
+    if model_lower.contains("text-embedding-3-small") {
+        return Some(1536);
+    }
+    if model_lower.contains("text-embedding-ada") || model_lower.contains("ada-002") {
+        return Some(1536);
+    }
+
+    // BGE models (BAAI)
+    if model_lower.contains("bge-large") {
+        return Some(1024);
+    }
+    if model_lower.contains("bge-m3") {
+        return Some(1024);
+    }
+    if model_lower.contains("bge-small") {
+        return Some(384);
+    }
+    if model_lower.contains("bge-base") {
+        return Some(768);
+    }
+
+    // MxBai models
+    if model_lower.contains("mxbai-embed") {
+        return Some(1024);
+    }
+
+    // MiniLM models
+    if model_lower.contains("minilm") {
+        return Some(384);
+    }
+
+    // Nomic models
+    if model_lower.contains("nomic-embed") {
+        return Some(768);
+    }
+
+    // Jina models
+    if model_lower.contains("jina-embed") {
+        return Some(768);
+    }
+
+    // Not a known embedding model
+    None
+}
+
+/// File-based cache for model information
+pub struct ModelInfoCache {
+    cache_dir: std::path::PathBuf,
+}
+
+impl ModelInfoCache {
+    /// Create a new cache with the specified directory
+    pub fn new(cache_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            cache_dir: cache_dir.into(),
+        }
+    }
+
+    /// Create cache in the default location (user's cache directory)
+    pub fn default_location() -> Option<Self> {
+        directories::ProjectDirs::from("bot", "clawd", "Nanna")
+            .map(|dirs| Self::new(dirs.cache_dir().join("model_info")))
+    }
+
+    /// Get cached model info if it exists and is not expired
+    pub fn get(&self, model: &str) -> Option<ModelInfo> {
+        let path = self.cache_path(model);
+        if !path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        let info: ModelInfo = serde_json::from_str(&content).ok()?;
+
+        if info.is_expired() {
+            // Remove expired cache
+            let _ = std::fs::remove_file(&path);
+            debug!(model = %model, "Model info cache expired, removed");
+            return None;
+        }
+
+        debug!(model = %model, context_window = info.context_window, "Loaded model info from cache");
+        Some(info)
+    }
+
+    /// Store model info in cache
+    pub fn set(&self, info: &ModelInfo) -> Result<(), LlmError> {
+        // Ensure cache directory exists
+        std::fs::create_dir_all(&self.cache_dir)?;
+
+        let path = self.cache_path(&info.id);
+        let content = serde_json::to_string_pretty(info)?;
+        std::fs::write(&path, content)?;
+
+        debug!(model = %info.id, path = %path.display(), "Cached model info");
+        Ok(())
+    }
+
+    /// Clear all cached model info
+    pub fn clear(&self) -> Result<(), LlmError> {
+        if self.cache_dir.exists() {
+            std::fs::remove_dir_all(&self.cache_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Get cache file path for a model
+    fn cache_path(&self, model: &str) -> std::path::PathBuf {
+        // Sanitize model name for use as filename
+        let safe_name: String = model
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        self.cache_dir.join(format!("{safe_name}.json"))
+    }
 }
 
 impl From<reqwest::Error> for LlmError {
@@ -296,6 +542,9 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
     pub stream: bool,
     pub tools: Vec<serde_json::Value>,
+    /// Context window limit (for Ollama num_ctx). If set, limits the context
+    /// window to reduce VRAM usage and allow more model layers on GPU.
+    pub context_limit: Option<u32>,
 }
 
 impl Default for CompletionRequest {
@@ -308,6 +557,7 @@ impl Default for CompletionRequest {
             temperature: Some(0.7),
             stream: false,
             tools: Vec::new(),
+            context_limit: None,
         }
     }
 }
@@ -702,6 +952,274 @@ impl LlmClient {
         }
     }
 
+    /// Get the provider for this client
+    #[must_use]
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    /// Get model information with caching.
+    ///
+    /// Checks the file cache first, then fetches from the API if needed.
+    /// Falls back to defaults if the API doesn't provide context window info.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError` if both cache and API fail (uses defaults as final fallback).
+    pub async fn get_model_info(&self, model: &str, cache: Option<&ModelInfoCache>) -> ModelInfo {
+        // Check cache first
+        if let Some(cache) = cache {
+            if let Some(info) = cache.get(model) {
+                return info;
+            }
+        }
+
+        // Fetch from API
+        let info = match self.fetch_model_info(model).await {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(model = %model, error = %e, "Failed to fetch model info, using defaults");
+                default_model_info(model, &format!("{:?}", self.provider))
+            }
+        };
+
+        // Cache the result
+        if let Some(cache) = cache {
+            if let Err(e) = cache.set(&info) {
+                warn!(model = %model, error = %e, "Failed to cache model info");
+            }
+        }
+
+        info
+    }
+
+    /// Force refresh model info from API (bypasses cache).
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmError` if the API request fails.
+    pub async fn refresh_model_info(&self, model: &str, cache: Option<&ModelInfoCache>) -> Result<ModelInfo, LlmError> {
+        let info = self.fetch_model_info(model).await?;
+
+        if let Some(cache) = cache {
+            cache.set(&info)?;
+        }
+
+        Ok(info)
+    }
+
+    /// Fetch model info from the provider API
+    async fn fetch_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
+        match self.provider {
+            Provider::Anthropic => self.fetch_anthropic_model_info(model).await,
+            Provider::OpenAI => self.fetch_openai_model_info(model).await,
+            Provider::Ollama => self.fetch_ollama_model_info(model).await,
+            Provider::OpenRouter => self.fetch_openrouter_model_info(model).await,
+            // For proxies and GitHub Models, use defaults
+            Provider::ClaudeProxy | Provider::GitHubModels => {
+                Ok(default_model_info(model, &format!("{:?}", self.provider)))
+            }
+        }
+    }
+
+    /// Fetch model info from Anthropic API
+    async fn fetch_anthropic_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
+        // Anthropic's /v1/models/{model_id} endpoint
+        let url = format!("{}/v1/models/{}", self.base_url, model);
+
+        let request_builder = self.http.get(&url);
+        let response = self
+            .apply_anthropic_auth(request_builder)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            // If model not found or API doesn't support this, use defaults
+            if status == 404 {
+                info!(model = %model, "Model not found in API, using defaults");
+                return Ok(default_model_info(model, "anthropic"));
+            }
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, message });
+        }
+
+        // Parse response - Anthropic may or may not include context_window
+        #[derive(Deserialize)]
+        struct AnthropicModelResponse {
+            id: String,
+            #[serde(default)]
+            context_window: Option<usize>,
+            #[serde(default)]
+            max_output_tokens: Option<usize>,
+        }
+
+        let api_response: AnthropicModelResponse = response.json().await?;
+
+        // Use API values if available, otherwise use defaults
+        let defaults = default_model_info(model, "anthropic");
+        Ok(ModelInfo {
+            id: api_response.id,
+            context_window: api_response.context_window.unwrap_or(defaults.context_window),
+            max_output_tokens: api_response.max_output_tokens.unwrap_or(defaults.max_output_tokens),
+            supports_tools: defaults.supports_tools,
+            supports_vision: defaults.supports_vision,
+            embedding_dimension: None, // Anthropic doesn't provide embedding models via this API
+            cached_at: current_timestamp(),
+            provider: "anthropic".to_string(),
+        })
+    }
+
+    /// Fetch model info from OpenAI API
+    async fn fetch_openai_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
+        let url = format!("{}/v1/models/{}", self.base_url, model);
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            if status == 404 {
+                return Ok(default_model_info(model, "openai"));
+            }
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, message });
+        }
+
+        // OpenAI doesn't return context_window in their model endpoint
+        // So we use defaults with the model ID from the API
+        #[derive(Deserialize)]
+        struct OpenAIModelResponse {
+            id: String,
+        }
+
+        let api_response: OpenAIModelResponse = response.json().await?;
+        Ok(default_model_info(&api_response.id, "openai").with_timestamp())
+    }
+
+    /// Fetch model info from Ollama API
+    async fn fetch_ollama_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
+        let url = format!("{}/api/show", self.base_url);
+
+        let response = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "name": model }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            if status == 404 {
+                return Ok(default_model_info(model, "ollama"));
+            }
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, message });
+        }
+
+        // Ollama returns model info including context length and embedding dimension
+        #[derive(Deserialize)]
+        struct OllamaShowResponse {
+            #[serde(default)]
+            model_info: Option<OllamaModelInfo>,
+        }
+
+        #[derive(Deserialize)]
+        struct OllamaModelInfo {
+            #[serde(rename = "general.context_length", default)]
+            context_length: Option<usize>,
+            /// Embedding dimension (for embedding models)
+            #[serde(rename = "general.embedding_length", default)]
+            embedding_length: Option<usize>,
+        }
+
+        let api_response: OllamaShowResponse = response.json().await?;
+
+        // Try to extract context_length and embedding_length from model_info
+        let (context_window, embedding_dimension) = match api_response.model_info {
+            Some(info) => (
+                info.context_length.unwrap_or(8_000),
+                info.embedding_length.or_else(|| embedding_dimension_for_model(model)),
+            ),
+            None => (8_000, embedding_dimension_for_model(model)),
+        };
+
+        Ok(ModelInfo {
+            id: model.to_string(),
+            context_window,
+            max_output_tokens: 4096,
+            supports_tools: false, // Most Ollama models don't support tools
+            supports_vision: false,
+            embedding_dimension,
+            cached_at: current_timestamp(),
+            provider: "ollama".to_string(),
+        })
+    }
+
+    /// Fetch model info from OpenRouter API
+    async fn fetch_openrouter_model_info(&self, model: &str) -> Result<ModelInfo, LlmError> {
+        // OpenRouter has a models endpoint that lists all models
+        let url = format!("{}/v1/models", self.base_url);
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Ok(default_model_info(model, "openrouter"));
+        }
+
+        #[derive(Deserialize)]
+        struct OpenRouterModelsResponse {
+            data: Vec<OpenRouterModel>,
+        }
+
+        #[derive(Deserialize)]
+        struct OpenRouterModel {
+            id: String,
+            #[serde(default)]
+            context_length: Option<usize>,
+            #[serde(default)]
+            top_provider: Option<OpenRouterTopProvider>,
+        }
+
+        #[derive(Deserialize)]
+        struct OpenRouterTopProvider {
+            #[serde(default)]
+            max_completion_tokens: Option<usize>,
+        }
+
+        let api_response: OpenRouterModelsResponse = response.json().await?;
+
+        // Find our model in the list
+        if let Some(m) = api_response.data.iter().find(|m| m.id == model) {
+            return Ok(ModelInfo {
+                id: m.id.clone(),
+                context_window: m.context_length.unwrap_or(32_000),
+                max_output_tokens: m
+                    .top_provider
+                    .as_ref()
+                    .and_then(|p| p.max_completion_tokens)
+                    .unwrap_or(4096),
+                supports_tools: true, // OpenRouter usually routes to capable models
+                supports_vision: false,
+                embedding_dimension: embedding_dimension_for_model(model),
+                cached_at: current_timestamp(),
+                provider: "openrouter".to_string(),
+            });
+        }
+
+        Ok(default_model_info(model, "openrouter"))
+    }
+
     /// Send a completion request (simple, no tools).
     ///
     /// # Errors
@@ -914,6 +1432,9 @@ impl LlmClient {
             temperature: Option<f32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             num_predict: Option<u32>,
+            /// Context window size - limits KV cache to reduce VRAM usage
+            #[serde(skip_serializing_if = "Option::is_none")]
+            num_ctx: Option<u32>,
         }
 
         #[derive(Deserialize)]
@@ -939,10 +1460,11 @@ impl LlmClient {
             })
             .collect();
 
-        let options = if request.temperature.is_some() || request.max_tokens.is_some() {
+        let options = if request.temperature.is_some() || request.max_tokens.is_some() || request.context_limit.is_some() {
             Some(OllamaOptions {
                 temperature: request.temperature,
                 num_predict: request.max_tokens,
+                num_ctx: request.context_limit,
             })
         } else {
             None
@@ -1219,6 +1741,17 @@ impl RequestBuilder for CompletionRequest {
 
     fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+}
+
+impl CompletionRequest {
+    /// Set context window limit (for Ollama num_ctx).
+    /// This reduces VRAM usage by limiting the KV cache size,
+    /// allowing more model layers to fit on GPU.
+    #[must_use]
+    pub fn with_context_limit(mut self, limit: u32) -> Self {
+        self.context_limit = Some(limit);
         self
     }
 }
