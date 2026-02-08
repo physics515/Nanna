@@ -16,9 +16,15 @@ SIMD-accelerated vector operations for fast embedding comparisons. Uses AVX/AVX2
 - Fallback to scalar operations when SIMD unavailable
 
 **Suggestions:**
+
 - Consider adding AVX-512 support for newer CPUs
 - Add ARM NEON support for Apple Silicon and mobile
 - Benchmark against `simsimd` crate (already a dependency) to see if native Rust SIMD matches performance
+
+**Todo**
+
+* Consider adding AVX-512 support for newer CPUs - plan this out further and implement
+* Add ARM NEON support for Apple Silicon and mobile - critical
 
 ---
 
@@ -38,7 +44,13 @@ GPU-accelerated vector search using WebGPU (wgpu). Falls back to SIMD when GPU u
 - Consider lowering GPU threshold based on benchmarks (1000 may be conservative)
 - Add GPU memory management for very large vector stores
 - Implement batched GPU operations to avoid memory limits
-- Add compute shader for embedding generation (if using local models)
+- Add compute shader for embedding generation (if using local models) - support for ollama for local embedding
+
+**Todo**
+
+* Consider lowering GPU threshold based on benchmarks (1000 may be conservative) - lets create the benchmark and study this further
+* Add GPU memory management for very large vector stores - lets implement
+* Implement batched GPU operations to avoid memory limits - approved
 
 ---
 
@@ -46,7 +58,7 @@ GPU-accelerated vector search using WebGPU (wgpu). Falls back to SIMD when GPU u
 **Location:** `crates/nanna-storage/`
 
 **Description:**
-Persistent storage using Turso (libSQL/SQLite). Supports both local SQLite and Turso cloud sync.
+Persistent storage using Turso. Supports both Turso cloud sync.
 
 **Current Implementation:**
 - Session storage
@@ -58,7 +70,14 @@ Persistent storage using Turso (libSQL/SQLite). Supports both local SQLite and T
 - Add database migrations system
 - Consider WAL mode for better concurrent access
 - Add backup/restore functionality
-- Document Turso cloud setup for multi-device sync
+- Document Turso cloud setup for multi-device sync - will be supported be multi-agent swam system using custom tor based agent sync
+
+**Todo**
+
+* Add database migrations system
+* Consider WAL mode for better concurrent access
+* Add backup/restore functionality
+* Remove SQLite support, use turso only
 
 ---
 
@@ -80,6 +99,13 @@ In-memory vector store with semantic search and conversation context management.
 - Consider HNSW or IVF indexing for very large stores
 - Add compression for embedding storage (f16 flag exists but verify usage)
 - Implement memory compaction/garbage collection
+
+**Todo**
+
+* Add persistent vector index (currently reloads all to memory) - implement with turso database
+* Consider HNSW or IVF indexing for very large stores - approved
+* Add compression for embedding storage (f16 flag exists but verify usage) - approved add dreaming
+* Implement memory compaction/garbage collection - implement in dreaming
 
 ---
 
@@ -104,6 +130,16 @@ Multi-provider LLM client with streaming and tool calling support.
 - Add request caching for identical prompts
 - Track token usage per session for cost estimation
 
+**Todo**
+
+* Add Google Gemini support - approved
+* Add Mistral API support - approved
+* Implement provider failover/fallback - approved
+* Add grok support
+* investigate github copilot api masking (similar to how we pretend to be claude code)
+* Add request caching for identical prompts - approved
+* Track token usage per session for cost estimation - high priority
+
 ---
 
 ### Streaming + Tool Calling
@@ -124,6 +160,18 @@ Agent loop that handles streaming responses and tool execution.
 - Implement tool call batching for efficiency
 - Add circuit breaker for failing tools
 - Consider tool priority/ordering hints
+
+**Todo**
+
+* Add tool call caching for idempotent tools
+* Implement tool call batching for efficiency
+* Add circuit breaker for failing tools
+* Consider tool priority/ordering hints
+* rebuild tool authoring tool so nanna can build her own tools
+* rebuild manual tool authoring GUI
+  * plan for advanced tool authoring features
+* Current tools code isn't visible in the GUI
+* Build and test a tool
 
 ---
 
@@ -147,6 +195,13 @@ Agentic loop with context window management and summarization.
 - Add user-configurable context strategies
 - Consider semantic chunking for long documents
 
+**Todo**
+
+* Add context budget visualization in GUI - High Priority
+* Implement priority-based message retention
+* Add user-configurable context strategies - plan what this would even look like.
+* Consider semantic chunking for long documents
+
 ---
 
 ### Scheduler (Heartbeats, Cron)
@@ -167,3 +222,13 @@ Background task scheduling with cron expressions and heartbeat support.
 - Implement job dependencies (run B after A)
 - Add missed job handling on startup
 - Create GUI cron builder with visual schedule
+
+**Todo**
+
+* Add timezone support per job - use the  chrono crate for this support
+* Add https://docs.rs/chrono-english/latest/chrono_english/ support for cron jobs
+  * eg. "set a timer for 15 mins" and set a timer for 15 minutes
+  * eg. "do this task every 3rd Thursday of the month but skip every 5th event" and schedule it correctly
+* Implement job dependencies (run B after A)
+* Add missed job handling on startup
+* Create GUI cron builder with visual schedule - explore what a calendar interface would look like

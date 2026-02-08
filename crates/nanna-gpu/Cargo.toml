@@ -11,3 +11,19 @@ thiserror.workspace = true
 half.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
 futures = "0.3"
+
+[[bench]]
+name = "gpu_vs_simd"
+harness = false
+
+[[bench]]
+name = "gpu_vs_simd_quick"
+harness = false
+
+[[bench]]
+name = "gpu_vs_simd_extended"
+harness = false
+
+[dev-dependencies]
+nanna-simd = { path = "../nanna-simd" }
+tokio = { version = "1.43", features = ["full"] }

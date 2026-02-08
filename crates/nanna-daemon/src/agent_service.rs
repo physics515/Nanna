@@ -35,8 +35,8 @@ pub struct AgentServiceConfig {
     pub max_tokens: u32,
     /// Temperature for sampling
     pub temperature: f32,
-    /// Maximum tool iterations per request
-    pub max_iterations: usize,
+    /// Maximum tool iterations per request. None = unlimited.
+    pub max_iterations: Option<usize>,
     /// Default thinking mode
     pub thinking_mode: ThinkingMode,
     /// Model priority list for summarization
@@ -54,7 +54,7 @@ impl Default for AgentServiceConfig {
             model_priority: vec![], // Dynamically built from available credentials
             max_tokens: 8192,
             temperature: 0.7,
-            max_iterations: 30, // Allow more iterations for complex tool use chains
+            max_iterations: None, // Unlimited iterations — agent stops when done
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
@@ -112,7 +112,7 @@ pub struct RunStateSnapshot {
 
 /// The agent service that handles LLM interactions
 pub struct AgentService {
-    config: AgentServiceConfig,
+    config: Arc<RwLock<AgentServiceConfig>>,
     router: Arc<LlmRouter>,
     tools: Arc<ToolRegistry>,
     memory: Option<Arc<MemoryService>>,
@@ -144,7 +144,7 @@ impl AgentService {
         }
 
         Self {
-            config,
+            config: Arc::new(RwLock::new(config)),
             router,
             tools,
             memory,
@@ -158,18 +158,20 @@ impl AgentService {
 
     /// Get model info for the current model, fetching if needed
     pub async fn get_model_info(&self) -> ModelInfo {
+        let current_model = self.config.read().await.model.clone();
+
         // Check if we already have cached info for this model
         {
             let cached = self.current_model_info.read().await;
             if let Some(ref info) = *cached {
-                if info.id == self.config.model && !info.is_expired() {
+                if info.id == current_model && !info.is_expired() {
                     return info.clone();
                 }
             }
         }
 
         // Fetch new info via router
-        let info = self.router.get_model_info(&self.config.model).await;
+        let info = self.router.get_model_info(&current_model).await;
 
         info!(
             model = %info.id,
@@ -188,29 +190,39 @@ impl AgentService {
         info
     }
 
-    /// Update the model and refresh model info
-    pub async fn set_model(&mut self, model: String) {
-        if self.config.model != model {
-            info!(old_model = %self.config.model, new_model = %model, "Switching model");
-            self.config.model = model;
-
-            // Clear cached model info to force refresh
-            let mut cached = self.current_model_info.write().await;
-            *cached = None;
+    /// Update model configuration at runtime (hot-reload from control plane)
+    pub async fn update_config(&self, model: Option<String>, model_priority: Option<Vec<String>>) {
+        let mut config = self.config.write().await;
+        if let Some(m) = model {
+            if config.model != m {
+                info!(old = %config.model, new = %m, "Switching model");
+                config.model = m;
+            }
         }
+        if let Some(p) = model_priority {
+            info!(new_priority = ?p, "Updating model priority list");
+            config.model_priority = p;
+        }
+        drop(config);
+
+        // Clear cached model info to force refresh on next request
+        let mut cached = self.current_model_info.write().await;
+        *cached = None;
     }
     
     /// Create agent config from service config
-    fn agent_config(&self) -> AgentConfig {
+    async fn agent_config(&self) -> AgentConfig {
+        let config = self.config.read().await;
         AgentConfig {
-            model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
-            temperature: self.config.temperature,
-            max_iterations: self.config.max_iterations,
-            thinking_mode: self.config.thinking_mode,
-            summarization_priority: self.config.summarization_priority.clone(),
-            summarization_ollama_url: self.config.summarization_ollama_url.clone(),
-            summarization_threshold: self.config.summarization_threshold,
+            model: config.model.clone(),
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            max_iterations: config.max_iterations,
+            thinking_mode: config.thinking_mode,
+            summarization_priority: config.summarization_priority.clone(),
+            summarization_ollama_url: config.summarization_ollama_url.clone(),
+            summarization_threshold: config.summarization_threshold,
+            ..Default::default()
         }
     }
     
@@ -292,10 +304,13 @@ impl AgentService {
         });
 
         // Build model list to try (priority list, falling back to single model)
-        let models_to_try: Vec<String> = if self.config.model_priority.is_empty() {
-            vec![self.config.model.clone()]
-        } else {
-            self.config.model_priority.clone()
+        let models_to_try: Vec<String> = {
+            let config = self.config.read().await;
+            if config.model_priority.is_empty() {
+                vec![config.model.clone()]
+            } else {
+                config.model_priority.clone()
+            }
         };
 
         let mut last_error = String::from("No models available");
@@ -316,7 +331,7 @@ impl AgentService {
             };
 
             // Create agent config with this model
-            let mut agent_config = self.agent_config();
+            let mut agent_config = self.agent_config().await;
             agent_config.model = model.clone();
 
             // Get model info for context configuration
@@ -382,10 +397,11 @@ impl AgentService {
                         let mem_service = memory_for_extraction.clone();
                         Box::pin(async move {
                             if let Some(ref service) = mem_service {
-                                let mut metadata = std::collections::HashMap::new();
+                                let mut metadata = memory.tags.unwrap_or_default();
                                 metadata.insert("category".to_string(), memory.category.clone());
-                                // Derive importance from category (default 3.0 for medium)
+                                // Derive importance from category
                                 let importance = match memory.category.as_str() {
+                                    "tool_result" => 2.0, // Lower importance for ephemeral tool output
                                     "preference" | "identity" => 4.0,
                                     "fact" | "insight" => 3.5,
                                     "context" => 3.0,

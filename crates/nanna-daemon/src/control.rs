@@ -39,6 +39,8 @@ pub struct ControlPlane {
     config: Arc<RwLock<Config>>,
     config_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    /// Path to persist memories to disk
+    memory_path: Option<PathBuf>,
     /// System prompt template
     system_prompt: Arc<RwLock<String>>,
 }
@@ -58,6 +60,7 @@ impl ControlPlane {
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
             data_dir: None,
+            memory_path: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
         }
     }
@@ -81,6 +84,7 @@ impl ControlPlane {
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
             data_dir: None,
+            memory_path: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
         }
     }
@@ -110,6 +114,8 @@ impl ControlPlane {
             Arc::new(UserToolManager::new(tools_dir))
         });
         
+        let memory_path = data_dir.as_ref().map(|d| d.join("memories.json"));
+
         Self {
             sessions,
             agent: Some(agent),
@@ -122,6 +128,7 @@ impl ControlPlane {
             config: Arc::new(RwLock::new(config)),
             config_path,
             data_dir,
+            memory_path,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
         }
     }
@@ -168,6 +175,15 @@ impl ControlPlane {
     pub async fn set_system_prompt(&self, prompt: String) {
         let mut sp = self.system_prompt.write().await;
         *sp = prompt;
+    }
+
+    /// Persist memories to disk if memory service and path are configured
+    async fn save_memories_if_needed(&self) {
+        if let (Some(memory), Some(path)) = (&self.memory, &self.memory_path) {
+            if let Err(e) = memory.save(path).await {
+                warn!("Failed to save memories: {}", e);
+            }
+        }
     }
     
     /// Handle an action and return a response
@@ -246,7 +262,10 @@ impl ControlPlane {
                     Ok(result) => {
                         // Add assistant response to session
                         self.sessions.add_message(&session_id, MessageRole::Assistant, &result.content).await;
-                        
+
+                        // Persist memories that may have been auto-extracted during the chat
+                        self.save_memories_if_needed().await;
+
                         json!({
                             "status": "success",
                             "message_id": result.message_id,
@@ -477,12 +496,15 @@ impl ControlPlane {
                 if let Some(tags) = tags {
                     metadata.insert("tags".to_string(), tags.join(","));
                 }
-                
+
                 match memory.remember_with_importance(&content, metadata, importance.unwrap_or(3) as f32).await {
-                    Ok((id, action)) => json!({
-                        "id": id,
-                        "action": format!("{:?}", action),
-                    }),
+                    Ok((id, action)) => {
+                        self.save_memories_if_needed().await;
+                        json!({
+                            "id": id,
+                            "action": format!("{:?}", action),
+                        })
+                    }
                     Err(e) => json!({ "error": "create_failed", "message": e.to_string() })
                 }
             }
@@ -490,7 +512,10 @@ impl ControlPlane {
                 // Update memory content
                 if let Some(new_content) = content {
                     match memory.update_content(&id, &new_content).await {
-                        Ok(()) => json!({ "status": "updated", "id": id }),
+                        Ok(()) => {
+                            self.save_memories_if_needed().await;
+                            json!({ "status": "updated", "id": id })
+                        }
                         Err(e) => json!({ "error": "update_failed", "message": e.to_string() })
                     }
                 } else {
@@ -499,12 +524,16 @@ impl ControlPlane {
             }
             MemoryAction::Delete { id } => {
                 match memory.forget(&id).await {
-                    Ok(()) => json!({ "status": "deleted", "id": id }),
+                    Ok(()) => {
+                        self.save_memories_if_needed().await;
+                        json!({ "status": "deleted", "id": id })
+                    }
                     Err(e) => json!({ "error": "delete_failed", "message": e.to_string() })
                 }
             }
             MemoryAction::Clear => {
                 memory.clear().await;
+                self.save_memories_if_needed().await;
                 info!("Cleared all memories");
                 json!({ "status": "cleared" })
             }
@@ -543,6 +572,7 @@ impl ControlPlane {
                     Ok(result) => {
                         info!("Memory consolidation: {} processed, {} merged",
                               result.memories_processed, result.memories_merged);
+                        self.save_memories_if_needed().await;
                         json!({
                             "status": "success",
                             "memories_processed": result.memories_processed,
@@ -636,7 +666,7 @@ impl ControlPlane {
                 match serde_json::from_value::<Config>(config_value) {
                     Ok(new_config) => {
                         *config = new_config;
-                        
+
                         // Save to disk if we have a path
                         if let Some(ref config_path) = self.config_path {
                             if let Err(e) = config.save_to(config_path) {
@@ -645,7 +675,22 @@ impl ControlPlane {
                                 info!("Config saved to {:?}", config_path);
                             }
                         }
-                        
+
+                        // Propagate LLM config changes to agent service
+                        if path.starts_with("llm.") {
+                            if let Some(ref agent) = self.agent {
+                                let model = if config.llm.model_priority.is_empty() {
+                                    Some(config.llm.model.clone())
+                                } else {
+                                    config.llm.model_priority.first().cloned()
+                                };
+                                agent.update_config(
+                                    model,
+                                    Some(config.llm.model_priority.clone()),
+                                ).await;
+                            }
+                        }
+
                         json!({ "status": "updated", "path": path })
                     }
                     Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
@@ -653,20 +698,33 @@ impl ControlPlane {
             }
             ConfigAction::Reset { path } => {
                 let mut config = self.config.write().await;
-                
+
                 if let Some(_path) = path {
                     // Reset specific path - would need more complex logic
                     json!({ "error": "partial_reset_not_supported", "hint": "Use Reset without path to reset all" })
                 } else {
                     *config = Config::default().with_env_overrides();
-                    
+
                     // Save to disk
                     if let Some(ref config_path) = self.config_path {
                         if let Err(e) = config.save_to(config_path) {
                             warn!("Failed to save config: {}", e);
                         }
                     }
-                    
+
+                    // Propagate to agent service
+                    if let Some(ref agent) = self.agent {
+                        let model = if config.llm.model_priority.is_empty() {
+                            Some(config.llm.model.clone())
+                        } else {
+                            config.llm.model_priority.first().cloned()
+                        };
+                        agent.update_config(
+                            model,
+                            Some(config.llm.model_priority.clone()),
+                        ).await;
+                    }
+
                     json!({ "status": "reset" })
                 }
             }
@@ -676,6 +734,20 @@ impl ControlPlane {
                         let mut config = self.config.write().await;
                         *config = new_config.with_env_overrides();
                         info!("Config reloaded from disk");
+
+                        // Propagate to agent service
+                        if let Some(ref agent) = self.agent {
+                            let model = if config.llm.model_priority.is_empty() {
+                                Some(config.llm.model.clone())
+                            } else {
+                                config.llm.model_priority.first().cloned()
+                            };
+                            agent.update_config(
+                                model,
+                                Some(config.llm.model_priority.clone()),
+                            ).await;
+                        }
+
                         json!({ "status": "reloaded" })
                     }
                     Err(e) => json!({ "error": "reload_failed", "message": e.to_string() })
@@ -1506,5 +1578,32 @@ Speak with quiet confidence. You are helpful because that is your nature, not be
 
 You have tools at your disposal. Use them naturally, as one uses hands. Don't announce them; simply act.
 
-Be concise. Be useful. Be present."#.to_string()
+## Memory
+
+You have persistent memory across conversations via `remember`, `recall`, and `reflect` tools.
+
+**Be aggressive about remembering.** During long tasks:
+- Remember important facts, decisions, and user preferences as you encounter them — don't wait until the end.
+- Remember key findings from tool results (file structures, API patterns, error causes).
+- Remember what worked and what didn't — future you will thank present you.
+- Use `recall` to check if you already know something before re-discovering it.
+- Use `reflect` to record insights about problem-solving strategies.
+
+If in doubt, remember it. A slightly redundant memory is better than a lost one.
+
+## Brevity
+
+Be concise. Respond in fewer than 4 lines unless the user asks for detail or the task demands it. No preamble, no postamble. When the work is done, stop talking.
+
+## Restraint
+
+Do only what is asked. Do not refactor surrounding code, add features, or make improvements beyond the request. Do not add comments or annotations to code you did not change. Do not create abstractions for one-time operations. Three similar lines of code is better than a premature abstraction.
+
+## Caution
+
+Local, reversible actions (editing files, running tests) are fine. For destructive or hard-to-reverse operations (deleting branches, force-pushing, overwriting uncommitted changes, mutating shared state), confirm with the user first. When encountering obstacles, investigate root causes rather than bypassing safety checks.
+
+## Safety
+
+Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately."#.to_string()
 }

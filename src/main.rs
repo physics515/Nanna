@@ -374,11 +374,12 @@ fn create_scheduler(
                 model,
                 max_tokens: 4096,
                 temperature: 0.7,
-                max_iterations: 5,
+                max_iterations: Some(5),
                 thinking_mode: nanna_agent::ThinkingMode::Instant,
                 summarization_priority: vec![],
                 summarization_ollama_url: Some("http://localhost:11434".to_string()),
                 summarization_threshold: 50_000,
+                ..Default::default()
             };
 
             let session_id = format!("scheduler:{}", task.name);
@@ -847,11 +848,12 @@ async fn run_cli(
         model: model.unwrap_or_else(|| config.llm.model.clone()),
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
-        max_iterations: 10,
+        max_iterations: Some(10),
         thinking_mode: nanna_agent::ThinkingMode::Instant,
         summarization_priority: config.llm.summarization_priority.clone(),
         summarization_ollama_url: config.llm.ollama_url.clone(),
         summarization_threshold: 50_000,
+        ..Default::default()
     };
 
     // Build context with system prompt (includes workspace context if available)
@@ -993,11 +995,12 @@ async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> anyho
         model: model.unwrap_or_else(|| config.llm.model.clone()),
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
-        max_iterations: 10,
+        max_iterations: Some(10),
         thinking_mode: nanna_agent::ThinkingMode::Instant,
         summarization_priority: config.llm.summarization_priority.clone(),
         summarization_ollama_url: config.llm.ollama_url.clone(),
         summarization_threshold: 50_000,
+        ..Default::default()
     };
 
     let cwd = std::env::current_dir()?;
