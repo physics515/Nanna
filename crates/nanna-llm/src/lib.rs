@@ -1153,7 +1153,7 @@ impl LlmClient {
             id: model.to_string(),
             context_window,
             max_output_tokens: 4096,
-            supports_tools: false, // Most Ollama models don't support tools
+            supports_tools: true, // Ollama v0.5+ supports tool calling
             supports_vision: false,
             embedding_dimension,
             cached_at: current_timestamp(),
@@ -1234,45 +1234,55 @@ impl LlmClient {
         }
     }
 
-    /// Send a full Anthropic request with tools.
+    /// Send a full Anthropic-format request with tools.
     ///
-    /// For OAuth tokens, this automatically:
-    /// - Prepends Claude Code identity to system prompt (as array of content blocks)
-    /// - Remaps tool names to Claude Code format
-    /// - Remaps tool names back in the response
+    /// Dispatches to the appropriate provider backend:
+    /// - Anthropic: Native Anthropic API (`/v1/messages`)
+    /// - OpenAI/OpenRouter/GitHub/ClaudeProxy: Converts to OpenAI chat completions format
+    /// - Ollama: Converts to Ollama `/api/chat` format
     ///
     /// # Errors
     ///
     /// Returns `LlmError::Api` if the API returns an error.
     /// Returns `LlmError::Network` if the request fails.
-    /// Returns `LlmError::Parse` if the response cannot be parsed.
     pub async fn complete_anthropic(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        match self.provider {
+            Provider::Anthropic => self.complete_anthropic_native(request).await,
+            Provider::OpenAI | Provider::OpenRouter | Provider::GitHubModels | Provider::ClaudeProxy =>
+                self.complete_anthropic_via_openai(request).await,
+            Provider::Ollama =>
+                self.complete_anthropic_via_ollama(request).await,
+        }
+    }
+
+    /// Native Anthropic API implementation for complete_anthropic
+    async fn complete_anthropic_native(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
         let is_oauth = self.is_oauth();
-        
+
         // Store original tools for reverse mapping
         let original_tools = request.tools.clone().unwrap_or_default();
 
         let request_builder = self
             .http
             .post(format!("{}/v1/messages", self.base_url));
-        
+
         let response = if is_oauth {
             // OAuth mode: Use array-based system prompt and remap tool names
             let mut oauth_request = OAuthAnthropicRequest::from_request(request, true);
-            
+
             // Remap tool names to Claude Code format
             if let Some(ref mut tools) = oauth_request.tools {
                 for tool in tools {
                     tool.name = to_claude_code_tool_name(&tool.name);
                 }
             }
-            
+
             debug!(
                 system_blocks = oauth_request.system.len(),
                 tool_names = ?oauth_request.tools.as_ref().map(|t| t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>()),
                 "OAuth request prepared with array-based system prompt"
             );
-            
+
             self.apply_anthropic_auth(request_builder)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -1296,7 +1306,7 @@ impl LlmClient {
         }
 
         let mut result: AnthropicResponse = response.json().await?;
-        
+
         // Remap tool names back in response
         if is_oauth {
             for block in &mut result.content {
@@ -1305,8 +1315,86 @@ impl LlmClient {
                 }
             }
         }
-        
+
         Ok(result)
+    }
+
+    /// Convert AnthropicRequest → OpenAI chat completions and execute
+    async fn complete_anthropic_via_openai(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        let (messages_json, tools_json) = anthropic_to_openai_request(request);
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages_json,
+            "max_tokens": request.max_tokens,
+        });
+        if let Some(temp) = request.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(tools) = tools_json {
+            body["tools"] = tools;
+        }
+
+        let response = self
+            .http
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::from_api_response(status, message));
+        }
+
+        let result: serde_json::Value = response.json().await?;
+        openai_response_to_anthropic(&request.model, &result)
+    }
+
+    /// Convert AnthropicRequest → Ollama /api/chat and execute
+    async fn complete_anthropic_via_ollama(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        let (messages_json, tools_json) = anthropic_to_openai_request(request);
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages_json,
+            "stream": false,
+        });
+
+        // Ollama uses "options" for parameters
+        let mut options = serde_json::Map::new();
+        if let Some(temp) = request.temperature {
+            options.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+        options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
+        if !options.is_empty() {
+            body["options"] = serde_json::Value::Object(options);
+        }
+
+        // Ollama supports tools since v0.5
+        if let Some(tools) = tools_json {
+            body["tools"] = tools;
+        }
+
+        let response = self
+            .http
+            .post(format!("{}/api/chat", self.base_url))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::from_api_response(status, message));
+        }
+
+        let result: serde_json::Value = response.json().await?;
+        ollama_response_to_anthropic(&request.model, &result)
     }
 
     async fn complete_anthropic_simple(&self, request: &CompletionRequest) -> Result<String, LlmError> {
@@ -2092,16 +2180,47 @@ struct ErrorData {
 }
 
 impl LlmClient {
-    /// Stream a completion request, yielding events as they arrive.
+    /// Stream an Anthropic-format request, dispatching to the appropriate provider.
     ///
-    /// For OAuth tokens, this automatically:
-    /// - Prepends Claude Code identity to system prompt (as array of content blocks)
-    /// - Remaps tool names to Claude Code format
-    /// - Remaps tool names back in streamed responses
-    ///
-    /// Emits `RateLimitInfo` from response headers and `RecoverableError`
-    /// for mid-stream failures (with accumulated partial content).
+    /// - Anthropic: Native SSE streaming via `/v1/messages`
+    /// - OpenAI/OpenRouter/GitHub/ClaudeProxy: Converts to OpenAI SSE streaming
+    /// - Ollama: Converts to Ollama streaming via `/api/chat`
     pub fn stream_anthropic(
+        &self,
+        request: &AnthropicRequest,
+    ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
+        let provider = self.provider;
+        let request = request.clone();
+
+        stream! {
+            match provider {
+                Provider::Anthropic => {
+                    let raw = self.stream_anthropic_native(&request);
+                    tokio::pin!(raw);
+                    while let Some(item) = raw.next().await {
+                        yield item;
+                    }
+                }
+                Provider::OpenAI | Provider::OpenRouter | Provider::GitHubModels | Provider::ClaudeProxy => {
+                    let raw = self.stream_anthropic_via_openai(&request);
+                    tokio::pin!(raw);
+                    while let Some(item) = raw.next().await {
+                        yield item;
+                    }
+                }
+                Provider::Ollama => {
+                    let raw = self.stream_anthropic_via_ollama(&request);
+                    tokio::pin!(raw);
+                    while let Some(item) = raw.next().await {
+                        yield item;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Native Anthropic SSE streaming implementation
+    fn stream_anthropic_native(
         &self,
         request: &AnthropicRequest,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
@@ -2112,17 +2231,17 @@ impl LlmClient {
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let is_oauth = is_oauth_token(&api_key);
-        
+
         // Store original tools for reverse mapping
         let original_tools = request.tools.clone().unwrap_or_default();
-        
+
         // Prepare OAuth request with array-based system prompt
         let oauth_request = if is_oauth {
             info!("Claude Code stealth mode: applying OAuth headers and array-based system prompt");
-            
+
             let mut oauth_req = OAuthAnthropicRequest::from_request(&request, true);
             oauth_req.stream = Some(true);
-            
+
             // Remap tool names to Claude Code format
             if let Some(ref mut tools) = oauth_req.tools {
                 for tool in tools {
@@ -2133,14 +2252,13 @@ impl LlmClient {
                     }
                 }
             }
-            
-            // Log the transformed request for debugging
+
             debug!(
                 system_blocks = oauth_req.system.len(),
                 tool_names = ?oauth_req.tools.as_ref().map(|t| t.iter().map(|x| x.name.as_str()).collect::<Vec<_>>()),
                 "OAuth streaming request prepared with array-based system prompt"
             );
-            
+
             Some(oauth_req)
         } else {
             None
@@ -2150,7 +2268,6 @@ impl LlmClient {
             let request_builder = http
                 .post(format!("{base_url}/v1/messages"));
 
-            // Apply appropriate auth header (with OAuth beta headers if needed)
             let request_builder = if is_oauth {
                 let token = get_raw_token(&api_key);
                 request_builder
@@ -2172,7 +2289,6 @@ impl LlmClient {
                 "Sending Anthropic streaming request"
             );
 
-            // Send the appropriate request body
             let response = if let Some(ref oauth_req) = oauth_request {
                 request_builder
                     .header("anthropic-version", "2023-06-01")
@@ -2201,7 +2317,6 @@ impl LlmClient {
                 }
             };
 
-            // Parse rate limit headers and emit info
             let rate_headers = RateLimitHeaders::from_headers(response.headers());
             if rate_headers.limit_tokens.is_some() || rate_headers.remaining_tokens.is_some() {
                 yield Ok(StreamEvent::RateLimitInfo {
@@ -2218,7 +2333,6 @@ impl LlmClient {
                 return;
             }
 
-            // True SSE streaming using bytes_stream with accumulator for recovery
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut accumulator = StreamAccumulator::new();
@@ -2227,7 +2341,6 @@ impl LlmClient {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        // Mid-stream error - emit recoverable error with accumulated content
                         let error = LlmError::Http(e.to_string());
                         if accumulator.has_content() {
                             yield Ok(StreamEvent::RecoverableError {
@@ -2242,7 +2355,6 @@ impl LlmClient {
                     }
                 };
 
-                // Append chunk to buffer (assuming UTF-8)
                 match std::str::from_utf8(&chunk) {
                     Ok(s) => buffer.push_str(s),
                     Err(e) => {
@@ -2260,26 +2372,21 @@ impl LlmClient {
                     }
                 }
 
-                // Parse complete SSE events from buffer
                 while let Some(event_str) = extract_sse_event(&mut buffer) {
                     if let Some(mut stream_event) = parse_sse_event(&event_str) {
-                        // Remap tool names back to original for OAuth
                         if is_oauth {
                             if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
                                 *name = from_claude_code_tool_name(name, &original_tools);
                             }
                         }
-                        // Accumulate content for recovery
                         accumulator.process(&stream_event);
                         yield Ok(stream_event);
                     }
                 }
             }
 
-            // Handle any remaining data in buffer
             if !buffer.trim().is_empty() {
                 if let Some(mut stream_event) = parse_sse_event(&buffer) {
-                    // Remap tool names back to original for OAuth
                     if is_oauth {
                         if let StreamEvent::ContentBlockStart { tool_name: Some(ref mut name), .. } = stream_event {
                             *name = from_claude_code_tool_name(name, &original_tools);
@@ -2289,6 +2396,368 @@ impl LlmClient {
                     yield Ok(stream_event);
                 }
             }
+        }
+    }
+
+    /// Stream an AnthropicRequest via OpenAI-compatible SSE streaming.
+    /// Converts the request to OpenAI format, streams via /v1/chat/completions,
+    /// and converts events back to Anthropic StreamEvent format.
+    fn stream_anthropic_via_openai(
+        &self,
+        request: &AnthropicRequest,
+    ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let base_url = self.base_url.clone();
+        let request = request.clone();
+
+        stream! {
+            let (messages_json, tools_json) = anthropic_to_openai_request(&request);
+
+            let mut body = serde_json::json!({
+                "model": request.model,
+                "messages": messages_json,
+                "max_tokens": request.max_tokens,
+                "stream": true,
+            });
+            if let Some(temp) = request.temperature {
+                body["temperature"] = serde_json::json!(temp);
+            }
+            if let Some(tools) = tools_json {
+                body["tools"] = tools;
+            }
+
+            let response = match http
+                .post(format!("{base_url}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(LlmError::Http(e.to_string()));
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let message = response.text().await.unwrap_or_default();
+                yield Err(LlmError::from_api_response(status, message));
+                return;
+            }
+
+            // Reuse OpenAI SSE parsing logic (same format as stream_openai)
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut text_block_started = false;
+            let mut tool_calls_started: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(LlmError::Stream(e.to_string()));
+                        return;
+                    }
+                };
+
+                match std::str::from_utf8(&chunk) {
+                    Ok(s) => buffer.push_str(s),
+                    Err(e) => {
+                        yield Err(LlmError::Stream(format!("Invalid UTF-8: {e}")));
+                        return;
+                    }
+                }
+
+                while let Some(line_end) = buffer.find('\n') {
+                    let line = buffer[..line_end].trim().to_string();
+                    buffer = buffer[line_end + 1..].to_string();
+
+                    if line.is_empty() || !line.starts_with("data: ") {
+                        continue;
+                    }
+
+                    let data = &line[6..];
+
+                    if data == "[DONE]" {
+                        if text_block_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                        }
+                        for (idx, _) in &tool_calls_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                        }
+                        yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+                        return;
+                    }
+
+                    #[derive(Deserialize, Debug)]
+                    struct StreamChunk {
+                        choices: Vec<ChunkChoice>,
+                    }
+                    #[derive(Deserialize, Debug)]
+                    struct ChunkChoice {
+                        delta: Option<ChunkDelta>,
+                        finish_reason: Option<String>,
+                    }
+                    #[derive(Deserialize, Debug)]
+                    struct ChunkDelta {
+                        content: Option<String>,
+                        tool_calls: Option<Vec<ToolCallDelta>>,
+                    }
+                    #[derive(Deserialize, Debug)]
+                    struct ToolCallDelta {
+                        index: usize,
+                        id: Option<String>,
+                        function: Option<FunctionDelta>,
+                    }
+                    #[derive(Deserialize, Debug)]
+                    struct FunctionDelta {
+                        name: Option<String>,
+                        arguments: Option<String>,
+                    }
+
+                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                        for choice in chunk.choices {
+                            if let Some(delta) = choice.delta {
+                                if let Some(text) = delta.content {
+                                    if !text.is_empty() {
+                                        if !text_block_started {
+                                            text_block_started = true;
+                                            yield Ok(StreamEvent::ContentBlockStart {
+                                                index: 0,
+                                                content_type: "text".to_string(),
+                                                tool_id: None,
+                                                tool_name: None,
+                                            });
+                                        }
+                                        yield Ok(StreamEvent::TextDelta { index: 0, text });
+                                    }
+                                }
+
+                                if let Some(tool_calls) = delta.tool_calls {
+                                    for tc in tool_calls {
+                                        let block_index = tc.index + 1;
+                                        if let (Some(id), Some(func)) = (&tc.id, &tc.function) {
+                                            if let Some(name) = &func.name {
+                                                if text_block_started {
+                                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                                                    text_block_started = false;
+                                                }
+                                                tool_calls_started.insert(block_index, (id.clone(), name.clone()));
+                                                yield Ok(StreamEvent::ContentBlockStart {
+                                                    index: block_index,
+                                                    content_type: "tool_use".to_string(),
+                                                    tool_id: Some(id.clone()),
+                                                    tool_name: Some(name.clone()),
+                                                });
+                                            }
+                                        }
+                                        if let Some(func) = &tc.function {
+                                            if let Some(args) = &func.arguments {
+                                                if !args.is_empty() {
+                                                    yield Ok(StreamEvent::ToolUseDelta {
+                                                        index: block_index,
+                                                        partial_json: args.clone(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(reason) = choice.finish_reason {
+                                if text_block_started {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                                }
+                                for (idx, _) in &tool_calls_started {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                                }
+                                let stop_reason = match reason.as_str() {
+                                    "tool_calls" => "tool_use",
+                                    "stop" => "end_turn",
+                                    other => other,
+                                };
+                                yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit close events if stream ended without finish_reason
+            if text_block_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+            }
+            for (idx, _) in &tool_calls_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+            }
+            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+        }
+    }
+
+    /// Stream an AnthropicRequest via Ollama `/api/chat` with `stream: true`.
+    /// Ollama streams NDJSON (one JSON object per line, not SSE).
+    fn stream_anthropic_via_ollama(
+        &self,
+        request: &AnthropicRequest,
+    ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let request = request.clone();
+
+        stream! {
+            let (messages_json, tools_json) = anthropic_to_openai_request(&request);
+
+            let mut body = serde_json::json!({
+                "model": request.model,
+                "messages": messages_json,
+                "stream": true,
+            });
+
+            let mut options = serde_json::Map::new();
+            if let Some(temp) = request.temperature {
+                options.insert("temperature".to_string(), serde_json::json!(temp));
+            }
+            options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
+            if !options.is_empty() {
+                body["options"] = serde_json::Value::Object(options);
+            }
+            if let Some(tools) = tools_json {
+                body["tools"] = tools;
+            }
+
+            let response = match http
+                .post(format!("{base_url}/api/chat"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(LlmError::Http(e.to_string()));
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let message = response.text().await.unwrap_or_default();
+                yield Err(LlmError::from_api_response(status, message));
+                return;
+            }
+
+            // Ollama streams NDJSON: one JSON per line
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut text_block_started = false;
+            let mut tool_block_count = 0usize;
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(LlmError::Stream(e.to_string()));
+                        return;
+                    }
+                };
+
+                match std::str::from_utf8(&chunk) {
+                    Ok(s) => buffer.push_str(s),
+                    Err(e) => {
+                        yield Err(LlmError::Stream(format!("Invalid UTF-8: {e}")));
+                        return;
+                    }
+                }
+
+                // Process complete lines (NDJSON)
+                while let Some(line_end) = buffer.find('\n') {
+                    let line = buffer[..line_end].trim().to_string();
+                    buffer = buffer[line_end + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+
+                    // Check for done
+                    let done = obj["done"].as_bool().unwrap_or(false);
+
+                    // Stream text content
+                    if let Some(content) = obj["message"]["content"].as_str() {
+                        if !content.is_empty() {
+                            if !text_block_started {
+                                text_block_started = true;
+                                yield Ok(StreamEvent::ContentBlockStart {
+                                    index: 0,
+                                    content_type: "text".to_string(),
+                                    tool_id: None,
+                                    tool_name: None,
+                                });
+                            }
+                            yield Ok(StreamEvent::TextDelta { index: 0, text: content.to_string() });
+                        }
+                    }
+
+                    // Tool calls appear in the final message when done=true
+                    if done {
+                        if let Some(tool_calls) = obj["message"]["tool_calls"].as_array() {
+                            if text_block_started {
+                                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                                text_block_started = false;
+                            }
+                            for tc in tool_calls {
+                                tool_block_count += 1;
+                                let block_idx = tool_block_count;
+                                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                let args = tc["function"]["arguments"].to_string();
+                                let id = format!("toolu_{:08x}", block_idx);
+                                yield Ok(StreamEvent::ContentBlockStart {
+                                    index: block_idx,
+                                    content_type: "tool_use".to_string(),
+                                    tool_id: Some(id),
+                                    tool_name: Some(name),
+                                });
+                                yield Ok(StreamEvent::ToolUseDelta {
+                                    index: block_idx,
+                                    partial_json: args,
+                                });
+                                yield Ok(StreamEvent::ContentBlockStop { index: block_idx });
+                            }
+                        }
+
+                        // Emit output token count
+                        if let Some(eval_count) = obj["eval_count"].as_u64() {
+                            yield Ok(StreamEvent::MessageDelta {
+                                stop_reason: None,
+                                output_tokens: eval_count as u32,
+                            });
+                        }
+
+                        // Close remaining blocks and stop
+                        if text_block_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                        }
+                        let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
+                        yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                        return;
+                    }
+                }
+            }
+
+            // If we get here without done=true, close gracefully
+            if text_block_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+            }
+            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
     }
 
@@ -2724,6 +3193,220 @@ impl LlmClient {
             }
         }
     }
+}
+
+// ============================================================================
+// Anthropic ↔ OpenAI/Ollama Conversion Layer
+// ============================================================================
+
+/// Convert an AnthropicRequest into OpenAI-compatible messages and tools JSON.
+/// Returns (messages_json_array, tools_json_array_or_none).
+fn anthropic_to_openai_request(request: &AnthropicRequest) -> (serde_json::Value, Option<serde_json::Value>) {
+    let mut messages = Vec::new();
+
+    // System prompt → system message
+    if let Some(ref system) = request.system {
+        if !system.is_empty() {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": system,
+            }));
+        }
+    }
+
+    // Convert Anthropic messages to OpenAI messages
+    for msg in &request.messages {
+        let role = msg.role.as_str();
+        match role {
+            "user" => {
+                // User messages: may contain text and/or tool_result blocks
+                let mut text_parts = Vec::new();
+                let mut tool_results = Vec::new();
+
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => text_parts.push(text.clone()),
+                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            tool_results.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": if is_error.unwrap_or(false) {
+                                    format!("Error: {content}")
+                                } else {
+                                    content.clone()
+                                },
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Emit text parts as a user message
+                if !text_parts.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": text_parts.join("\n"),
+                    }));
+                }
+                // Emit tool results as separate "tool" role messages
+                messages.extend(tool_results);
+            }
+            "assistant" => {
+                // Assistant messages: may contain text and/or tool_use blocks
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => text_parts.push(text.clone()),
+                        ContentBlock::ToolUse { id, name, input } => {
+                            tool_calls.push(serde_json::json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": input.to_string(),
+                                }
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut assistant_msg = serde_json::json!({ "role": "assistant" });
+                if !text_parts.is_empty() {
+                    assistant_msg["content"] = serde_json::json!(text_parts.join("\n"));
+                }
+                if !tool_calls.is_empty() {
+                    assistant_msg["tool_calls"] = serde_json::json!(tool_calls);
+                }
+                messages.push(assistant_msg);
+            }
+            _ => {}
+        }
+    }
+
+    // Convert tools to OpenAI format
+    let tools_json = request.tools.as_ref().and_then(|tools| {
+        if tools.is_empty() {
+            None
+        } else {
+            let converted: Vec<serde_json::Value> = tools.iter().map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            }).collect();
+            Some(serde_json::json!(converted))
+        }
+    });
+
+    (serde_json::json!(messages), tools_json)
+}
+
+/// Convert an OpenAI chat completion response JSON to AnthropicResponse
+fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
+    let choice = response["choices"]
+        .as_array()
+        .and_then(|c| c.first())
+        .ok_or_else(|| LlmError::Api { status: 500, message: "No choices in response".to_string() })?;
+
+    let message = &choice["message"];
+    let mut content = Vec::new();
+
+    // Text content
+    if let Some(text) = message["content"].as_str() {
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text: text.to_string() });
+        }
+    }
+
+    // Tool calls
+    if let Some(tool_calls) = message["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+            let input = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+            content.push(ContentBlock::ToolUse { id, name, input });
+        }
+    }
+
+    // Map finish_reason
+    let finish_reason = choice["finish_reason"].as_str().unwrap_or("end_turn");
+    let stop_reason = match finish_reason {
+        "tool_calls" => "tool_use",
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        other => other,
+    };
+
+    let input_tokens = response["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    let output_tokens = response["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+
+    Ok(AnthropicResponse {
+        id: response["id"].as_str().unwrap_or("").to_string(),
+        response_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content,
+        model: model.to_string(),
+        stop_reason: Some(stop_reason.to_string()),
+        usage: Usage { input_tokens, output_tokens },
+    })
+}
+
+/// Convert an Ollama /api/chat response JSON to AnthropicResponse
+fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
+    let message = &response["message"];
+    let mut content = Vec::new();
+
+    // Text content
+    if let Some(text) = message["content"].as_str() {
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text: text.to_string() });
+        }
+    }
+
+    // Tool calls (Ollama v0.5+ format)
+    if let Some(tool_calls) = message["tool_calls"].as_array() {
+        for (i, tc) in tool_calls.iter().enumerate() {
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let input = tc["function"]["arguments"].clone();
+            // Ollama doesn't provide tool call IDs, generate one
+            let id = format!("toolu_{:08x}", i);
+            content.push(ContentBlock::ToolUse { id, name, input });
+        }
+    }
+
+    // Determine stop reason
+    let done_reason = response["done_reason"].as_str().unwrap_or("stop");
+    let stop_reason = if content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })) {
+        "tool_use"
+    } else {
+        match done_reason {
+            "stop" => "end_turn",
+            "length" => "max_tokens",
+            other => other,
+        }
+    };
+
+    // Ollama provides eval_count, prompt_eval_count
+    let input_tokens = response["prompt_eval_count"].as_u64().unwrap_or(0) as u32;
+    let output_tokens = response["eval_count"].as_u64().unwrap_or(0) as u32;
+
+    Ok(AnthropicResponse {
+        id: format!("ollama-{}", current_timestamp()),
+        response_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content,
+        model: model.to_string(),
+        stop_reason: Some(stop_reason.to_string()),
+        usage: Usage { input_tokens, output_tokens },
+    })
 }
 
 /// Extract a complete SSE event from the buffer.

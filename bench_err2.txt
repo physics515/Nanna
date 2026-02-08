@@ -1,0 +1,77 @@
+    Checking nanna-gpu v0.1.0 (D:\Development\nanna\crates\nanna-gpu)
+error: cannot explicitly borrow within an implicitly-borrowing pattern
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:129:22
+    |
+129 |         if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                      ^^^            ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+    |                      |
+    |                      explicit `ref` binding modifier not allowed when implicitly borrowing
+    |
+    = note: for more information, see <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:129:32
+    |
+129 |         if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                                ^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:129:17
+    |
+129 |         if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                 ^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+help: remove the unnecessary binding modifiers
+    |
+129 -         if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+129 +         if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
+    |
+
+error: cannot explicitly borrow within an implicitly-borrowing pattern
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:164:26
+    |
+164 |             if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                          ^^^            ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+    |                          |
+    |                          explicit `ref` binding modifier not allowed when implicitly borrowing
+    |
+    = note: for more information, see <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:164:36
+    |
+164 |             if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                                    ^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:164:21
+    |
+164 |             if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                     ^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+help: remove the unnecessary binding modifiers
+    |
+164 -             if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+164 +             if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
+    |
+
+error: cannot explicitly borrow within an implicitly-borrowing pattern
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:176:18
+    |
+176 |     if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                  ^^^            ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+    |                  |
+    |                  explicit `ref` binding modifier not allowed when implicitly borrowing
+    |
+    = note: for more information, see <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:176:28
+    |
+176 |     if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |                            ^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+   --> crates\nanna-gpu\benches\gpu_vs_simd_quick.rs:176:13
+    |
+176 |     if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+    |             ^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+help: remove the unnecessary binding modifiers
+    |
+176 -     if let (Some(ref ctx), Some(ref pipeline)) = (&ctx, &pipeline) {
+176 +     if let (Some(ctx), Some(pipeline)) = (&ctx, &pipeline) {
+    |
+
+error: could not compile `nanna-gpu` (bench "gpu_vs_simd_quick") due to 3 previous errors

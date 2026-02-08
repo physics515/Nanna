@@ -60,8 +60,8 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     /// Temperature for sampling
     pub temperature: f32,
-    /// Maximum iterations (tool call rounds)
-    pub max_iterations: usize,
+    /// Maximum iterations (tool call rounds). None = unlimited.
+    pub max_iterations: Option<usize>,
     /// Thinking mode for extended reasoning
     pub thinking_mode: ThinkingMode,
     /// Model priority list for summarization (first working model is used)
@@ -71,6 +71,9 @@ pub struct AgentConfig {
     pub summarization_ollama_url: Option<String>,
     /// Threshold (in chars) above which tool results get summarized
     pub summarization_threshold: usize,
+    /// Threshold (in chars) above which tool results are stored in memory
+    /// and replaced with a summary stub in context. Default: 2000.
+    pub context_result_threshold: usize,
 }
 
 impl Default for AgentConfig {
@@ -79,11 +82,12 @@ impl Default for AgentConfig {
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 8192,
             temperature: 0.7,
-            max_iterations: 10,
+            max_iterations: None,
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
             summarization_threshold: 50_000, // ~12.5k tokens
+            context_result_threshold: 2000,
         }
     }
 }
@@ -242,7 +246,8 @@ impl Agent {
         message: &str,
         options: RunOptions,
     ) -> Result<AgentResponse, AgentError> {
-        let max_iterations = options.max_iterations.unwrap_or(self.config.max_iterations);
+        // Resolve effective max_iterations: run option > config > unlimited
+        let max_iterations = options.max_iterations.or(self.config.max_iterations);
         let mut state = RunState::new();
 
         // Add user message with optional budget awareness
@@ -251,27 +256,33 @@ impl Agent {
         // Agent loop
         loop {
             state.iterations += 1;
-            if state.iterations > max_iterations {
-                // Extract memories before bailing — don't lose a long run's knowledge
-                if options.auto_extract_memories {
-                    if let Some(ref on_memory) = options.on_memory {
-                        if let Ok(memories) = self.extract_memories().await {
-                            for memory in memories {
-                                on_memory(memory).await;
+            if let Some(max) = max_iterations {
+                if state.iterations > max {
+                    // Extract memories before bailing — don't lose a long run's knowledge
+                    if options.auto_extract_memories {
+                        if let Some(ref on_memory) = options.on_memory {
+                            if let Ok(memories) = self.extract_memories().await {
+                                for memory in memories {
+                                    on_memory(memory).await;
+                                }
                             }
                         }
                     }
+                    warn!(
+                        iterations = state.iterations,
+                        max = max,
+                        final_text_len = state.final_text.len(),
+                        "Agent hit max iterations limit, returning truncated response"
+                    );
+                    return Ok(state.into_response(true));
                 }
-                warn!(
-                    iterations = state.iterations,
-                    max = max_iterations,
-                    final_text_len = state.final_text.len(),
-                    "Agent hit max iterations limit, returning truncated response"
-                );
-                return Ok(state.into_response(true));
             }
 
-            debug!("Agent iteration {}/{}", state.iterations, max_iterations);
+            debug!(
+                iterations = state.iterations,
+                max = ?max_iterations,
+                "Agent iteration"
+            );
 
             // Tiered context compression before API call
             {
@@ -447,7 +458,7 @@ impl Agent {
             }
 
             // Execute tools and continue loop
-            let tool_results = self.execute_tools(&result.tool_uses, &mut state).await;
+            let tool_results = self.execute_tools(&result.tool_uses, &mut state, &options).await;
             self.store_tool_results(tool_results).await;
 
             // Periodic memory extraction every 10 iterations
@@ -674,6 +685,7 @@ impl Agent {
         &self,
         tool_uses: &[(String, String, Value)],
         state: &mut RunState,
+        options: &RunOptions,
     ) -> Vec<ContentBlock> {
         let mut tool_results = Vec::new();
 
@@ -738,9 +750,42 @@ impl Agent {
                 )
             };
 
-            // Summarize large tool results if configured
+            // Store tool result chunks in memory for future targeted recall
+            if let Some(ref on_memory) = options.on_memory {
+                let source_id = &Uuid::new_v4().to_string()[..8];
+                let chunks = if result_content.len() > 3200 {
+                    semantic_chunk(&result_content, 3200, 0.15)
+                } else {
+                    vec![(0, result_content.clone())]
+                };
+                let total_chunks = chunks.len();
+
+                for (idx, chunk_content) in &chunks {
+                    let mut tags = HashMap::new();
+                    tags.insert("tool".to_string(), name.clone());
+                    tags.insert("source_id".to_string(), source_id.to_string());
+                    tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
+
+                    on_memory(ExtractedMemory {
+                        content: format!("[Tool: {name}] {chunk_content}"),
+                        category: "tool_result".to_string(),
+                        tags: Some(tags),
+                    }).await;
+                }
+            }
+
+            // For context: summarize large results, noting they're in memory
             let final_content = if result_content.len() > self.config.summarization_threshold {
+                // Very large results get full summarization
                 self.summarize_tool_result(&name, &result_content).await
+            } else if result_content.len() > self.config.context_result_threshold && options.on_memory.is_some() {
+                // Medium results: summary stub + memory note
+                let preview = &result_content[..self.config.context_result_threshold.min(result_content.len())];
+                let chunk_count = (result_content.len() / 3200).max(1);
+                format!(
+                    "{preview}\n\n[Full result stored in memory ({chunk_count} chunks, {} chars). Use recall to query specific sections.]",
+                    result_content.len()
+                )
             } else {
                 result_content
             };
@@ -1164,14 +1209,26 @@ Focus on:
 Conversation:
 {conversation_text}
 
-Respond with a JSON array of objects, each with "content" (the fact to remember) and "category" (preference/fact/decision/reminder). 
+Respond with a JSON array of objects, each with "content" (the fact to remember) and "category" (preference/fact/decision/reminder).
 If nothing notable, respond with an empty array: []
 
 Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
         );
 
+        // Use the first summarization model if available (cheaper than main model)
+        let (client, model_name) = if !self.config.summarization_priority.is_empty() {
+            match self.create_client_for_model(&self.config.summarization_priority[0]) {
+                Ok(pair) => pair,
+                Err(_) => ((*self.llm).clone(), self.config.model.clone()),
+            }
+        } else {
+            ((*self.llm).clone(), self.config.model.clone())
+        };
+
+        info!(model = %model_name, "Running memory extraction");
+
         let request = AnthropicRequest {
-            model: self.config.model.clone(),
+            model: model_name,
             messages: vec![AnthropicMessage::user_text(extraction_prompt)],
             max_tokens: 1024,
             temperature: Some(0.3), // Lower temperature for more consistent extraction
@@ -1181,7 +1238,7 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
             thinking: None,
         };
 
-        let response = self.llm.complete_anthropic(&request).await?;
+        let response = client.complete_anthropic(&request).await?;
 
         // Parse the response
         let mut memories = Vec::new();
@@ -1193,6 +1250,7 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
                         memories.push(ExtractedMemory {
                             content: raw.content,
                             category: raw.category,
+                            tags: None,
                         });
                     }
                 }
@@ -1209,6 +1267,9 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
 pub struct ExtractedMemory {
     pub content: String,
     pub category: String,
+    /// Optional metadata tags (e.g. tool name, source_id, chunk index)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1289,6 +1350,35 @@ impl RunState {
             cumulative_output_tokens: u64::from(self.output_tokens),
         }
     }
+}
+
+/// Chunk text into pieces of ~`target_chars` with `overlap_pct` overlap, snapping to line boundaries.
+/// Returns (chunk_index, chunk_content) pairs.
+fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usize, String)> {
+    if text.len() <= target_chars {
+        return vec![(0, text.to_string())];
+    }
+    let overlap = (target_chars as f32 * overlap_pct) as usize;
+    let step = target_chars.saturating_sub(overlap).max(1);
+    let mut chunks = Vec::new();
+    let mut pos = 0;
+
+    while pos < text.len() {
+        let end = (pos + target_chars).min(text.len());
+        // Snap to nearest newline after target (prefer not splitting mid-line)
+        let snap_end = if end < text.len() {
+            text[pos..end]
+                .rfind('\n')
+                .map_or(end, |nl| pos + nl + 1)
+        } else {
+            end
+        };
+        // Ensure we make progress
+        let snap_end = if snap_end <= pos { end } else { snap_end };
+        chunks.push((chunks.len(), text[pos..snap_end].to_string()));
+        pos += step.min(snap_end - pos).max(1);
+    }
+    chunks
 }
 
 /// Check if a tool name is a write-type tool whose content should be stripped from context.

@@ -50,7 +50,11 @@
       "Bash(dir:*)",
       "Bash(git -C \"D:\\\\Development\\\\nanna\" diff --stat HEAD)",
       "Bash(git -C:*)",
-      "Bash(powershell:*)"
+      "Bash(powershell:*)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:rastrigin.systems)",
+      "WebFetch(domain:news.ycombinator.com)"
     ]
   }
 }

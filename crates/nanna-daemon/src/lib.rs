@@ -18,6 +18,7 @@ pub mod control;
 pub mod health;
 pub mod ipc;
 pub mod llm_router;
+pub mod log_buffer;
 pub mod persistence;
 pub mod protocol;
 pub mod server;
@@ -36,6 +37,7 @@ pub use session::{Session, SessionManager, SessionId};
 pub use control::ControlPlane;
 pub use health::{PidFile, PidFileError, HealthServer, HealthState, DEFAULT_HEALTH_PORT};
 pub use webhook::{WebhookServer, WebhookConfig, WebhookEvent, WebhookMessage, DEFAULT_WEBHOOK_PORT};
+pub use log_buffer::{LogBuffer, LogEntry};
 
 use thiserror::Error;
 

@@ -7556,7 +7556,7 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
                     // Create agent config
                     let agent_config = nanna_agent::AgentConfig {
                         model: model.clone(),
-                        max_iterations: 5, // Limit turns for heartbeat
+                        max_iterations: Some(5), // Limit turns for heartbeat
                         ..Default::default()
                     };
 
@@ -7714,7 +7714,7 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
 
                         let agent_config = nanna_agent::AgentConfig {
                             model: model.clone(),
-                            max_iterations: 10,
+                            max_iterations: Some(10),
                             ..Default::default()
                         };
 

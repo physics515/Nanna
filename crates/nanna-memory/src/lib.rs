@@ -156,9 +156,23 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Search for similar memories using GPU or SIMD-accelerated cosine similarity.
+    /// Search for similar memories using SIMD-accelerated cosine similarity.
     ///
-    /// Uses GPU for large vector counts (>1000), SIMD for smaller sets.
+    /// GPU dispatch is available but only engaged for very large vector counts
+    /// (>50,000) due to buffer upload/readback overhead dominating compute savings.
+    ///
+    /// ## Benchmark findings (RTX 4070 Ti SUPER + Zen 4 AVX-512)
+    ///
+    /// GPU fixed overhead: ~750us per dispatch (buffer alloc + upload + shader + readback).
+    /// SIMD single cosine similarity (768-dim): ~0.1us (AVX-512).
+    /// GPU never beat SIMD up to 10,000 vectors at any dimension tested (768/1536/3072).
+    /// At 10,000 vectors: SIMD 1.5ms vs GPU 5.2ms (GPU still 3.5x slower).
+    ///
+    /// The crossover point with the current per-search buffer upload model is estimated
+    /// at ~50,000+ vectors. To make GPU worthwhile at lower counts, we would need
+    /// GPU-resident persistent buffers (upload once, search many times).
+    ///
+    /// See: `cargo bench -p nanna-gpu --bench gpu_vs_simd` for full results.
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(MemoryEntry, f32)> {
         if query_embedding.len() != self.config.dimension {
             return Vec::new();
@@ -175,12 +189,17 @@ impl VectorStore {
             return Vec::new();
         }
 
-        // Use GPU for large vector counts, SIMD for smaller sets
-        const GPU_THRESHOLD: usize = 1000;
+        // Benchmark-calibrated threshold: GPU only wins with persistent buffers or
+        // very large vector counts. With per-search buffer upload, the ~750us fixed
+        // overhead means GPU needs >50k vectors to amortize the cost vs AVX-512.
+        //
+        // Previous threshold was 1000 — benchmarks showed GPU was 23x SLOWER there.
+        // See: docs/benchmarks/gpu-vs-simd-analysis.md
+        const GPU_THRESHOLD: usize = 50_000;
 
         let similarities: Vec<f32> = if entry_count >= GPU_THRESHOLD && self.has_gpu() {
             // GPU path: batch all vectors together
-            debug!("Using GPU for {} vectors", entry_count);
+            debug!("Using GPU for {} vectors (above {} threshold)", entry_count, GPU_THRESHOLD);
             let gpu = self.gpu.as_ref().unwrap();
             let pipeline = self.gpu_pipeline.as_ref().unwrap();
 
@@ -202,8 +221,8 @@ impl VectorStore {
                 }
             }
         } else {
-            // SIMD path
-            debug!("Using SIMD for {} vectors", entry_count);
+            // SIMD path — fast for all practical memory store sizes
+            debug!("Using SIMD ({}) for {} vectors", nanna_simd::simd_tier(), entry_count);
             entries
                 .iter()
                 .map(|entry| cosine_similarity_f32(&query, &entry.embedding))

@@ -39,8 +39,8 @@ impl ProviderId {
         }
     }
 
-    /// Strip provider prefix from model name
-    fn strip_prefix(model: &str) -> &str {
+    /// Strip provider prefix from model name (e.g., "ollama/deepseek-r1:14b" -> "deepseek-r1:14b")
+    pub fn strip_prefix(model: &str) -> &str {
         if let Some(rest) = model.strip_prefix("openrouter/") {
             rest
         } else if let Some(rest) = model.strip_prefix("github/") {
@@ -133,6 +133,13 @@ impl LlmRouter {
     pub fn client_for_model(&self, model: &str) -> Option<Arc<LlmClient>> {
         let provider = ProviderId::from_model(model);
         self.providers.get(&provider).cloned()
+    }
+
+    /// Strip provider prefix from a model name.
+    /// Public convenience method for use by agent_service and other consumers.
+    /// e.g., "ollama/deepseek-r1:14b" -> "deepseek-r1:14b"
+    pub fn strip_model_prefix(model: &str) -> String {
+        ProviderId::strip_prefix(model).to_string()
     }
 
     /// Get the primary LLM client (first available, preferring Anthropic).

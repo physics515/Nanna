@@ -102,7 +102,7 @@ impl AgentSpawner for AgentSpawnerImpl {
 
         // Configure agent with overridden max_iterations
         let mut config = self.agent_config.clone();
-        config.max_iterations = max_iterations;
+        config.max_iterations = Some(max_iterations);
 
         let agent = Agent::new(config, self.llm.clone(), self.tools.clone())
             .with_context(context);
@@ -112,14 +112,10 @@ impl AgentSpawner for AgentSpawnerImpl {
             ..Default::default()
         };
 
-        // Run with timeout
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            agent.run(prompt, options),
-        )
-        .await
-        .map_err(|_| "Sub-agent timed out after 5 minutes".to_string())?
-        .map_err(|e| format!("Sub-agent error: {e}"))?;
+        // Run without timeout — agent stops when done or cancelled
+        let result = agent.run(prompt, options)
+            .await
+            .map_err(|e| format!("Sub-agent error: {e}"))?;
 
         info!(
             description = description,
@@ -477,17 +473,49 @@ impl DaemonServer {
             info!("Webhook server listening on http://{}:{}", self.config.ipc.host, self.config.webhook_port);
         }
         
-        // Spawn auto-save task
+        // Spawn session auto-save task
         let persistence = self.persistence.clone();
         let sessions_for_save = self.sessions.clone();
         let save_interval = Duration::from_secs(self.config.auto_save_interval_secs);
         let save_shutdown = self.shutdown_tx.subscribe();
-        
+
         let save_handle = tokio::spawn(async move {
             let sessions_map = sessions_for_save.sessions_map();
             let default_session = sessions_for_save.default_session_id();
             persistence.auto_save_loop(sessions_map, default_session, save_interval, save_shutdown).await;
         });
+
+        // Spawn memory auto-save task (parallels session auto-save)
+        let mem_save_handle = if let (Some(mem_service), Some(mem_path)) = (&memory, &self.memory_path) {
+            let mem = mem_service.clone();
+            let path = mem_path.clone();
+            let save_interval = Duration::from_secs(self.config.auto_save_interval_secs);
+            let mut mem_shutdown = self.shutdown_tx.subscribe();
+
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(save_interval);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if let Err(e) = mem.save(&path).await {
+                                error!("Memory auto-save failed: {}", e);
+                            }
+                        }
+                        _ = mem_shutdown.recv() => {
+                            // Final save on shutdown
+                            if let Err(e) = mem.save(&path).await {
+                                error!("Memory final save failed: {}", e);
+                            } else {
+                                info!("Memory final save completed");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
         
         info!("Daemon ready. IPC server listening on ws://{}", self.ipc.address());
         
@@ -525,8 +553,11 @@ impl DaemonServer {
         info!("Shutting down daemon...");
         self.ipc.shutdown();
         
-        // Wait for auto-save to complete final save
+        // Wait for auto-save tasks to complete final saves
         let _ = tokio::time::timeout(Duration::from_secs(5), save_handle).await;
+        if let Some(handle) = mem_save_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
         
         ipc_handle.abort();
         
@@ -742,11 +773,12 @@ impl DaemonServer {
                     model: self.config.agent.model.clone(),
                     max_tokens: self.config.agent.max_tokens,
                     temperature: self.config.agent.temperature,
-                    max_iterations: 10, // default, overridden per-spawn
+                    max_iterations: Some(10), // default for sub-agents, overridden per-spawn
                     thinking_mode: self.config.agent.thinking_mode,
                     summarization_priority: self.config.agent.summarization_priority.clone(),
                     summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
                     summarization_threshold: self.config.agent.summarization_threshold,
+                    ..Default::default()
                 },
                 system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
                 workspace_root: None, // Will be set per-session in the future
