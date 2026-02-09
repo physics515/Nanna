@@ -311,7 +311,6 @@ impl AppState {
             thinking_mode: nanna_agent::ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
-            summarization_threshold: 50_000,
             ..Default::default()
         };
 

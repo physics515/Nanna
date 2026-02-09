@@ -43,8 +43,6 @@ pub struct AgentServiceConfig {
     pub summarization_priority: Vec<String>,
     /// Ollama URL for summarization
     pub summarization_ollama_url: Option<String>,
-    /// Threshold (chars) for summarizing tool results
-    pub summarization_threshold: usize,
 }
 
 impl Default for AgentServiceConfig {
@@ -58,7 +56,6 @@ impl Default for AgentServiceConfig {
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
-            summarization_threshold: 50_000,
         }
     }
 }
@@ -221,7 +218,6 @@ impl AgentService {
             thinking_mode: config.thinking_mode,
             summarization_priority: config.summarization_priority.clone(),
             summarization_ollama_url: config.summarization_ollama_url.clone(),
-            summarization_threshold: config.summarization_threshold,
             ..Default::default()
         }
     }

@@ -1,6 +1,5 @@
 //! Agent loop runner
 
-use crate::summarizer::{Summarizer, SummarizerConfig};
 use crate::{AgentContext, AgentError, ContextSummarizationConfig, prompts};
 use nanna_llm::{
     AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient, StreamEvent,
@@ -69,10 +68,8 @@ pub struct AgentConfig {
     pub summarization_priority: Vec<String>,
     /// Ollama URL for summarization (if using ollama)
     pub summarization_ollama_url: Option<String>,
-    /// Threshold (in chars) above which tool results get summarized
-    pub summarization_threshold: usize,
-    /// Threshold (in chars) above which tool results are stored in memory
-    /// and replaced with a summary stub in context. Default: 2000.
+    /// Threshold (in chars) above which tool results are replaced with a
+    /// memory-reference stub in context. Default: 2000.
     pub context_result_threshold: usize,
 }
 
@@ -86,7 +83,6 @@ impl Default for AgentConfig {
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
-            summarization_threshold: 50_000, // ~12.5k tokens
             context_result_threshold: 2000,
         }
     }
@@ -751,8 +747,8 @@ impl Agent {
             };
 
             // Store tool result chunks in memory for future targeted recall
+            let source_id = Uuid::new_v4().to_string()[..8].to_string();
             if let Some(ref on_memory) = options.on_memory {
-                let source_id = &Uuid::new_v4().to_string()[..8];
                 let chunks = if result_content.len() > 3200 {
                     semantic_chunk(&result_content, 3200, 0.15)
                 } else {
@@ -763,7 +759,7 @@ impl Agent {
                 for (idx, chunk_content) in &chunks {
                     let mut tags = HashMap::new();
                     tags.insert("tool".to_string(), name.clone());
-                    tags.insert("source_id".to_string(), source_id.to_string());
+                    tags.insert("source_id".to_string(), source_id.clone());
                     tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
 
                     on_memory(ExtractedMemory {
@@ -774,19 +770,16 @@ impl Agent {
                 }
             }
 
-            // For context: summarize large results, noting they're in memory
-            let final_content = if result_content.len() > self.config.summarization_threshold {
-                // Very large results get full summarization
-                self.summarize_tool_result(&name, &result_content).await
-            } else if result_content.len() > self.config.context_result_threshold && options.on_memory.is_some() {
-                // Medium results: summary stub + memory note
-                let preview = &result_content[..self.config.context_result_threshold.min(result_content.len())];
+            // For context: stub large results that are in memory, keep small ones inline
+            let final_content = if options.on_memory.is_some() && result_content.len() > self.config.context_result_threshold {
                 let chunk_count = (result_content.len() / 3200).max(1);
                 format!(
-                    "{preview}\n\n[Full result stored in memory ({chunk_count} chunks, {} chars). Use recall to query specific sections.]",
-                    result_content.len()
+                    "[Result from '{}' stored in memory (source_id={}, {} chunks, {} chars). \
+                     Use recall('query about {}') to retrieve specific sections.]",
+                    name, source_id, chunk_count, result_content.len(), name
                 )
             } else {
+                // No memory callback or small result — keep inline
                 result_content
             };
 
@@ -802,122 +795,6 @@ impl Agent {
         }
 
         tool_results
-    }
-
-    /// Summarize a large tool result using the configured summarization models (with fallback)
-    async fn summarize_tool_result(&self, tool_name: &str, content: &str) -> String {
-        // Check if summarization is configured
-        if self.config.summarization_priority.is_empty() {
-            info!(
-                tool = tool_name,
-                content_len = content.len(),
-                "No summarization models configured, truncating large result"
-            );
-            let max_chars = self.config.summarization_threshold;
-            return format!(
-                "{}\n\n[... truncated {} chars, configure summarization_priority for better results ...]",
-                &content[..max_chars.min(content.len())],
-                content.len().saturating_sub(max_chars)
-            );
-        }
-
-        // Hierarchical summarization handles any size - the summarizer will:
-        // - Chunk content into model-sized pieces (max 20 chunks per level)
-        // - Summarize each chunk
-        // - Recursively summarize if combined result is still large
-        // This keeps API calls bounded (max ~20 calls per level, ~5 levels max = ~100 calls worst case)
-
-        let context_hint = format!(
-            "This is the output from a tool called '{}'. Preserve all important information including file paths, code snippets, error messages, and key data.",
-            tool_name
-        );
-
-        // Try each model in priority order
-        for model_spec in &self.config.summarization_priority {
-            info!(
-                tool = tool_name,
-                content_len = content.len(),
-                model = %model_spec,
-                "Attempting summarization"
-            );
-
-            match self.try_summarize_with_model(model_spec, content, &context_hint).await {
-                Ok(summary) => {
-                    info!(
-                        model = %model_spec,
-                        original_len = content.len(),
-                        summary_len = summary.len(),
-                        compression = format!("{:.1}x", content.len() as f64 / summary.len() as f64),
-                        "Tool result summarized"
-                    );
-                    return format!(
-                        "[Summarized from {} chars using {}]\n\n{}",
-                        content.len(),
-                        model_spec,
-                        summary
-                    );
-                }
-                Err(e) => {
-                    warn!(model = %model_spec, error = %e, "Summarization failed, trying next model");
-                }
-            }
-        }
-
-        // All models failed, truncate as last resort
-        warn!("All summarization models failed, truncating");
-        let max_chars = self.config.summarization_threshold;
-        format!(
-            "{}\n\n[... truncated {} chars, all summarization models failed ...]",
-            &content[..max_chars.min(content.len())],
-            content.len().saturating_sub(max_chars)
-        )
-    }
-
-    /// Try to summarize content with a specific model
-    /// Model format: "provider/model" e.g. "ollama/llama3.2", "openai/gpt-4o-mini", "anthropic/claude-3-haiku"
-    async fn try_summarize_with_model(
-        &self,
-        model_spec: &str,
-        content: &str,
-        context_hint: &str,
-    ) -> Result<String, String> {
-        let (client, model_name) = self.create_client_for_model(model_spec)?;
-
-        // Get model's context window from cache or use default
-        let context_window = self.get_model_context_window(&client, &model_name).await;
-
-        // Calculate chunk size based on model's context window
-        // Reserve tokens for: summarization prompt (~5K), system message (~2K), output (~4K), safety margin (~14K)
-        // Use very conservative 2 chars/token ratio (file listings can tokenize at ~2.6 chars/token)
-        let usable_tokens = context_window.saturating_sub(25000);
-        let chunk_size = (usable_tokens * 2).max(4000); // ~2 chars per token (conservative), min 4k chars
-
-        info!(
-            model = model_name,
-            context_window = context_window,
-            chunk_size = chunk_size,
-            "Using model context window for summarization"
-        );
-
-        let config = SummarizerConfig {
-            model: model_name,
-            chunk_size,
-            target_summary_size: chunk_size / 4, // Target 25% compression per chunk
-            chunk_overlap: (chunk_size / 20).max(100), // 5% overlap, min 100 chars
-            // Use half the context window to reduce VRAM/KV cache usage
-            context_limit: Some((context_window / 2) as u32),
-        };
-
-        let summarizer = Summarizer::new(client, config);
-        summarizer.summarize(content, context_hint).await
-    }
-
-    /// Get a model's context window from cache or API
-    async fn get_model_context_window(&self, client: &LlmClient, model: &str) -> usize {
-        // Try to get from cache, fetch from API if needed, fall back to defaults
-        let cache = nanna_llm::ModelInfoCache::default_location();
-        let info = client.get_model_info(model, cache.as_ref()).await;
-        info.context_window
     }
 
     /// Create an LLM client for the specified model

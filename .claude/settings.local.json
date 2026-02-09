@@ -54,7 +54,8 @@
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:rastrigin.systems)",
-      "WebFetch(domain:news.ycombinator.com)"
+      "WebFetch(domain:news.ycombinator.com)",
+      "Bash(cargo test:*)"
     ]
   }
 }
