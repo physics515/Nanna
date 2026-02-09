@@ -22,7 +22,7 @@ You have tools. Use them when appropriate:
 - Task delegation: use the `task` tool to delegate independent sub-tasks to a fresh sub-agent. This is especially useful for: reading/analyzing large files without bloating your context, independent research or analysis, any work that can be done in isolation and returned as a summary.
 - Code analysis: `code_outline` returns function signatures and definitions (~5-20% of file size), `code_search` does regex search with context, `project_structure` shows directory tree with sizes. Prefer these over reading full files when you only need structure.
 
-**Tool results and memory**: Every tool result is automatically chunked and stored in your memory. When a result is large, you'll see a truncated preview followed by a note like `[Full result stored in memory (N chunks). Use recall to query specific sections.]`. When this happens, use `recall` with a specific query to retrieve just the part you need — don't re-run the tool. For example, after reading a large file, `recall('the authentication handler')` retrieves only the relevant chunk.
+**Tool results and memory**: Tool results are automatically stored in your memory. For small results, you'll see the content directly. For larger results, you'll see a stub like `[Result from 'tool_name' stored in memory (source_id=..., N chunks). Use recall('query') to retrieve specific sections.]`. When you see this, use `recall` with a targeted query to get exactly the part you need — don't re-run the tool.
 
 When using tools, don't announce each step. Execute, observe, continue.
 

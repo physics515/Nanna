@@ -777,7 +777,6 @@ impl DaemonServer {
                     thinking_mode: self.config.agent.thinking_mode,
                     summarization_priority: self.config.agent.summarization_priority.clone(),
                     summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
-                    summarization_threshold: self.config.agent.summarization_threshold,
                     ..Default::default()
                 },
                 system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
