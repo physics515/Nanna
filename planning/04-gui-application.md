@@ -34,7 +34,7 @@ gui/
 ### Frontend (Nuxt v4)
 
 **Pages:**
-- `index.vue` (727 lines) — Chat interface with streaming, tool call cards, markdown rendering
+- `index.vue` — Chat interface with streaming, tool call cards, markdown rendering, thinking/reasoning display
 - `settings.vue` (1483 lines) — Tabbed settings: Models, Agent, Memory, Tools, Scheduler, Data
 - `memory.vue` (657 lines) — Memory browser with search, stats, CRUD
 - `channels.vue` (282 lines) — Channel dashboard with setup wizards
@@ -56,7 +56,7 @@ gui/
 
 **Composables:**
 - `useBackend.ts` — Backend mode detection and initialization
-- `useSessionState.ts` — Session CRUD, message history, active session tracking
+- `useSessionState.ts` — Session state management (streaming, thinking, tool calls, message queue)
 - `useCloseHandler.ts` — Window close behavior (minimize to tray vs quit)
 - `useNotifications.ts` — Native notification handling
 - `useConfirm.ts` — Confirmation dialogs
@@ -86,6 +86,26 @@ gui/
 - Request/response correlation
 - Event subscription (streaming, tool calls)
 - Auto-reconnection
+
+## Recent Completions (2026-02-09)
+
+### Chat Persistence & Reliability
+- **Tool calls persisted in session history** — `SessionMessage` stores `tool_calls: Vec<ToolCallRecord>` and `reasoning: Option<String>` via `add_full_message()`. Survive reload.
+- **Thinking/reasoning persisted** — `reasoning` field on `SessionMessage`, displayed as collapsible `<details>` block in chat UI
+- **ThinkingDelta event pipeline** — Agent `on_thinking` callback → `Event::ThinkingDelta` → WebSocket → `thinking-chunk` Tauri event → Vue `streamingThinking` composable → live indicator during streaming
+- **ToolStart event pipeline** — Agent `on_tool_start` callback → `Event::ToolStart` → WebSocket → `tool-started` Tauri event → active tool tracking in run state
+- **Empty content block prevention** — Tool results never empty (`[No output]` fallback), `sanitize_messages()` removes empty text blocks, `max_block_chars` floored to 100
+- **GUI history parsing fixed** — Reads `tool_calls` and `reasoning` from top-level session message fields (was incorrectly reading from `metadata.tool_calls`)
+
+### Token Optimization
+- **Smart memory recall gating** — Only recalls memories for messages with >5 words, contains `?`, or >80 chars. Saves ~500-2000 tokens per trivial exchange.
+- **Memory dedup** — Skips injecting recalled memories whose content already appears in the last 4 messages of conversation history.
+
+### Model Fallback
+- **LLM Router** — Multi-provider routing with automatic model→provider detection (Anthropic, OpenAI, OpenRouter, GitHub Models, Ollama)
+- **Ollama tag notation** — Models with `:` (e.g. `deepseek-r1:14b`) auto-detected as Ollama
+- **Stateless fallback** — Each `chat()` call rebuilds model list from `model_priority` config. No persistent "last successful model" state — heartbeats always start from top of priority list.
+- **Diagnostic logging** — Logs detected provider and available providers when a model can't be routed
 
 ## Issues & Suggestions
 

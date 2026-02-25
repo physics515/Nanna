@@ -11,6 +11,7 @@
 
 use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
+use crate::log_buffer::LogBuffer;
 use crate::protocol::*;
 use crate::session::{MessageRole, SessionManager};
 use crate::user_tools::UserToolManager;
@@ -18,6 +19,7 @@ use nanna_config::Config;
 use nanna_core::{Scheduler, WorkspaceRegistry, Workspace};
 use nanna_llm::RequestBuilder;
 use nanna_memory::{ConsolidationConfig, MemoryService};
+use nanna_storage::{Storage, StoredModelStats};
 use nanna_tools::ToolRegistry;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -43,6 +45,14 @@ pub struct ControlPlane {
     memory_path: Option<PathBuf>,
     /// System prompt template
     system_prompt: Arc<RwLock<String>>,
+    /// Log buffer for serving daemon logs to the GUI
+    log_buffer: Option<LogBuffer>,
+    /// Tools directory for reading tool source files
+    tools_dir: Option<PathBuf>,
+    /// Shared model stats tracker
+    pub model_stats: nanna_agent::ModelStatsTracker,
+    /// Storage for persisting model stats
+    storage: Option<Arc<Storage>>,
 }
 
 impl ControlPlane {
@@ -62,6 +72,10 @@ impl ControlPlane {
             data_dir: None,
             memory_path: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
+            log_buffer: None,
+            tools_dir: None,
+            model_stats: nanna_agent::ModelStatsTracker::new(),
+            storage: None,
         }
     }
 
@@ -86,6 +100,10 @@ impl ControlPlane {
             data_dir: None,
             memory_path: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
+            log_buffer: None,
+            tools_dir: None,
+            model_stats: nanna_agent::ModelStatsTracker::new(),
+            storage: None,
         }
     }
 
@@ -130,13 +148,59 @@ impl ControlPlane {
             data_dir,
             memory_path,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
+            log_buffer: None,
+            tools_dir: None,
+            model_stats: nanna_agent::ModelStatsTracker::new(),
+            storage: None,
         }
+    }
+
+    /// Set the tools directory for reading tool source files
+    pub fn with_tools_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.tools_dir = dir;
+        self
     }
 
     /// Set the scheduler
     pub fn with_scheduler(mut self, scheduler: Arc<RwLock<Scheduler>>) -> Self {
         self.scheduler = Some(scheduler);
         self
+    }
+
+    /// Set the log buffer for serving daemon logs
+    pub fn with_log_buffer(mut self, buffer: LogBuffer) -> Self {
+        self.log_buffer = Some(buffer);
+        self
+    }
+
+    /// Set storage and load persisted model stats from it.
+    pub async fn with_storage(mut self, storage: Arc<Storage>) -> Self {
+        match storage.load_model_stats().await {
+            Ok(stored) if !stored.is_empty() => {
+                let storable: Vec<nanna_agent::model_stats::StorableModelStats> = stored.into_iter().map(From::from).collect();
+                self.model_stats.import_from_storage(storable).await;
+                info!("Loaded model stats from storage ({} models)", self.model_stats.summaries().await.len());
+            }
+            Ok(_) => debug!("No persisted model stats found"),
+            Err(e) => warn!("Failed to load model stats from storage: {e}"),
+        }
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Persist current model stats to storage. Call periodically.
+    pub async fn save_model_stats(&self) {
+        if let Some(ref storage) = self.storage {
+            let stats = self.model_stats.export_for_storage().await;
+            if stats.is_empty() {
+                return;
+            }
+            let stored_stats: Vec<StoredModelStats> = stats.into_iter().map(From::from).collect();
+            match storage.save_model_stats(&stored_stats).await {
+                Ok(()) => info!("Saved model stats for {} models to storage", stored_stats.len()),
+                Err(e) => warn!("Failed to save model stats: {e}"),
+            }
+        }
     }
     
     /// Get a reference to the workspace registry
@@ -248,20 +312,49 @@ impl ControlPlane {
                 // Build system prompt with memory context
                 let mut system_prompt = self.system_prompt.read().await.clone();
 
-                // Add memory context if available
-                let memories = agent.recall_memories(&content, 5).await;
-                if !memories.is_empty() {
-                    system_prompt.push_str("\n\n## Remembered Context\n");
-                    for mem in memories {
-                        system_prompt.push_str(&format!("- {}\n", mem.content));
+                // Add memory context if available (gate on message complexity)
+                let should_recall = content.split_whitespace().count() > 5
+                    || content.contains('?')
+                    || content.len() > 80;
+
+                if should_recall {
+                    let memories = agent.recall_memories(&content, 5).await;
+                    if !memories.is_empty() {
+                        // Dedup: skip memories whose content already appears in recent history
+                        let recent_text: String = prior_messages.iter()
+                            .rev().take(4)
+                            .map(|m| m.content.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+
+                        let fresh_memories: Vec<_> = memories.into_iter()
+                            .filter(|m| {
+                                let snippet = &m.content[..m.content.len().min(100)];
+                                !recent_text.contains(snippet)
+                            })
+                            .collect();
+
+                        if !fresh_memories.is_empty() {
+                            system_prompt.push_str("\n\n## Remembered Context\n");
+                            for mem in fresh_memories {
+                                system_prompt.push_str(&format!("- {}\n", mem.content));
+                            }
+                        }
                     }
                 }
 
                 // Run the agent with conversation history
                 match agent.chat(&session_id, &content, Some(system_prompt), &prior_messages).await {
                     Ok(result) => {
-                        // Add assistant response to session
-                        self.sessions.add_message(&session_id, MessageRole::Assistant, &result.content).await;
+                        // Add assistant response to session with tool calls and reasoning
+                        let reasoning = result.reasoning.clone();
+                        self.sessions.add_full_message(
+                            &session_id,
+                            MessageRole::Assistant,
+                            &result.content,
+                            result.tool_calls.clone(),
+                            reasoning,
+                        ).await;
 
                         // Persist memories that may have been auto-extracted during the chat
                         self.save_memories_if_needed().await;
@@ -271,6 +364,7 @@ impl ControlPlane {
                             "message_id": result.message_id,
                             "content": result.content,
                             "tool_calls": result.tool_calls,
+                            "reasoning": result.reasoning,
                             "usage": {
                                 "input_tokens": result.input_tokens,
                                 "output_tokens": result.output_tokens
@@ -949,23 +1043,49 @@ impl ControlPlane {
                     Err(e) => json!({ "status": "error", "error": e })
                 }
             }
+            ToolAction::GetSource { name } => {
+                // Try tools directory first, then user tools
+                if let Some(ref dir) = self.tools_dir {
+                    let path = dir.join(&name).join("tool.ts");
+                    if let Ok(source) = std::fs::read_to_string(&path) {
+                        return json!({
+                            "name": name,
+                            "source": source,
+                            "language": "typescript",
+                            "path": path.to_string_lossy(),
+                        });
+                    }
+                }
+                // Fall back to user tools
+                if let Some(ref user_tools) = self.user_tools {
+                    if let Some(meta) = user_tools.get_tool(&name).await {
+                        return json!({
+                            "name": meta.name,
+                            "source": meta.source,
+                            "language": meta.language,
+                        });
+                    }
+                }
+                json!({ "error": "not_found", "name": name })
+            }
             ToolAction::ListUser => {
                 let Some(ref user_tools) = self.user_tools else {
                     return json!({ "error": "user_tools_unavailable", "message": "User tool manager not configured" });
                 };
-                
+
                 let tools = user_tools.list_tools().await;
                 let tool_list: Vec<_> = tools.into_iter()
                     .map(|t| json!({
                         "name": t.name,
                         "description": t.description,
+                        "source": t.source,
                         "language": t.language,
                         "enabled": t.enabled,
                         "created_at": t.created_at,
                         "updated_at": t.updated_at,
                     }))
                     .collect();
-                json!({ "user_tools": tool_list })
+                json!({ "tools": tool_list })
             }
         }
     }
@@ -1310,13 +1430,19 @@ impl ControlPlane {
                 json!({ "error": "not_implemented" })
             }
             SystemAction::Logs { lines, level } => {
-                // TODO: Integrate with tracing/log files
-                json!({ 
-                    "logs": [],
-                    "lines": lines.unwrap_or(100),
-                    "level": level.unwrap_or_else(|| "info".to_string()),
-                    "message": "Log retrieval not yet implemented"
-                })
+                if let Some(ref buf) = self.log_buffer {
+                    let entries = buf.get_recent(lines.unwrap_or(1000));
+                    // Filter by level if specified
+                    let filtered: Vec<_> = if let Some(ref lvl) = level {
+                        let lvl = lvl.to_lowercase();
+                        entries.into_iter().filter(|e| e.level == lvl).collect()
+                    } else {
+                        entries
+                    };
+                    json!({ "logs": filtered })
+                } else {
+                    json!({ "logs": [], "message": "Log buffer not available" })
+                }
             }
             SystemAction::Health => {
                 let memory_ok = self.memory.is_some();
@@ -1336,6 +1462,12 @@ impl ControlPlane {
                         "config": "ok",
                         "workspaces": "ok",
                     }
+                })
+            }
+            SystemAction::ModelStats => {
+                let summaries = self.model_stats.summaries().await;
+                json!({
+                    "models": summaries,
                 })
             }
         }

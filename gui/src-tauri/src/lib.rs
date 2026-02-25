@@ -649,8 +649,7 @@ async fn summarize_tool_result(
     smart_truncate_tool_result(content, tool_name, target_chars)
 }
 
-/// Try to summarize content with a specific model
-/// Uses hierarchical summarization with proper chunking based on model context window
+/// Try to summarize content with a specific model via direct LLM call
 async fn try_summarize_with_model(
     content: &str,
     tool_name: &str,
@@ -659,7 +658,7 @@ async fn try_summarize_with_model(
     config: &Config,
     _target_chars: usize,
 ) -> Result<String, String> {
-    use nanna_agent::{Summarizer, SummarizerConfig};
+    use nanna_llm::{AnthropicMessage, AnthropicRequest, ContentBlock};
 
     // Parse model spec (provider/model or just model)
     let (client, model_name) = create_summarization_client(model_spec, ollama_url, config)?;
@@ -669,31 +668,54 @@ async fn try_summarize_with_model(
     let model_info = client.get_model_info(&model_name, cache.as_ref()).await;
     let context_window = model_info.context_window;
 
-    // Calculate chunk size based on model's context window
-    // Leave room for prompt overhead (~2k tokens) and output (~1k tokens)
+    // Truncate content to fit the model's context window (leave room for prompt + output)
     let usable_tokens = context_window.saturating_sub(3000);
-    let chunk_size = (usable_tokens * 4).max(4000); // ~4 chars per token, min 4k chars
+    let max_chars = (usable_tokens * 4).max(4000); // ~4 chars per token, min 4k chars
 
     info!(
-        "Using model {} (context: {}) for summarization, chunk_size: {}",
-        model_name, context_window, chunk_size
+        "Using model {} (context: {}) for summarization, max_chars: {}",
+        model_name, context_window, max_chars
     );
 
-    let summarizer_config = SummarizerConfig {
-        model: model_name,
-        chunk_size,
-        target_summary_size: chunk_size / 4, // Target 25% compression per chunk
-        chunk_overlap: (chunk_size / 20).max(100), // 5% overlap, min 100 chars
-        context_limit: Some((context_window / 2) as u32), // Half context to reduce VRAM
+    let truncated = if content.len() > max_chars {
+        &content[..max_chars]
+    } else {
+        content
     };
 
-    let summarizer = Summarizer::new(client, summarizer_config);
-    let context_hint = format!(
-        "This is the output from a tool called '{}'. Preserve all important information including file paths, code snippets, error messages, and key data.",
-        tool_name
+    let prompt = format!(
+        "Summarize the following output from a tool called '{}'. Preserve all important information \
+         including file paths, code snippets, error messages, and key data.\n\n\
+         ---\n{}\n---\n\nProvide a concise summary:",
+        tool_name, truncated
     );
 
-    summarizer.summarize(content, &context_hint).await
+    let request = AnthropicRequest {
+        model: model_name.clone(),
+        messages: vec![AnthropicMessage::user_text(prompt)],
+        max_tokens: 2048,
+        temperature: Some(0.3),
+        system: Some("You are a summarizer. Output only the summary, no preamble.".to_string()),
+        tools: None,
+        stream: None,
+        thinking: None,
+        cache_control: None,
+    };
+
+    let response = client.complete_anthropic(&request).await.map_err(|e| e.to_string())?;
+
+    let mut summary = String::new();
+    for block in &response.content {
+        if let ContentBlock::Text { text } = block {
+            summary.push_str(text);
+        }
+    }
+
+    if summary.is_empty() {
+        Err("Empty summary returned".to_string())
+    } else {
+        Ok(summary)
+    }
 }
 
 /// Create an LLM client for the specified summarization model
@@ -952,6 +974,8 @@ pub struct ChatMessage {
     pub timestamp: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCallInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Tool call info for frontend
@@ -1008,6 +1032,7 @@ pub struct AppConfig {
 /// Pending tool call being assembled from stream
 #[derive(Debug, Clone)]
 struct PendingToolCall {
+    #[allow(dead_code)]
     index: usize,
     id: String,
     name: String,
@@ -1089,6 +1114,7 @@ fn create_llm_client_for_model(model_id: &str, config: &Config, ollama_host: &st
 }
 
 /// Select the best available model from priority list, skipping rate-limited ones
+#[allow(dead_code)]
 fn select_best_model(
     priority: &[String],
     rate_limited: &HashMap<String, i64>,
@@ -1167,7 +1193,7 @@ fn parse_retry_after_from_error(error_msg: &str) -> Option<u64> {
 
 /// Send message through daemon (daemon mode)
 async fn send_message_daemon(
-    app: &AppHandle,
+    _app: &AppHandle,
     state: &AppState,
     session_id: String,
     message: String,
@@ -1193,7 +1219,7 @@ async fn send_message_daemon(
     // Just parse and return the result
     
     // Check for error first
-    if let Some(error) = result.get("error") {
+    if let Some(_error) = result.get("error") {
         return Err(format!("Daemon error: {}", 
             result.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")));
     }
@@ -1225,6 +1251,7 @@ async fn send_message_daemon(
         content,
         timestamp: chrono::Utc::now().to_rfc3339(),
         tool_calls,
+        reasoning: None,
     })
 }
 
@@ -1504,6 +1531,7 @@ Be concise. Be useful. Be present.{}
         content: full_response,
         timestamp: assistant_msg.created_at,
         tool_calls,
+        reasoning: None,
     })
 }
 
@@ -2401,17 +2429,21 @@ async fn get_session_history(
             if let Some(messages_array) = result.get("messages").and_then(|v| v.as_array()) {
                 if !messages_array.is_empty() {
                     return Ok(messages_array.iter().filter_map(|m| {
-                        // Parse tool calls from daemon response metadata
-                        let tool_calls = m.get("metadata")
-                            .and_then(|meta| meta.get("tool_calls"))
+                        // Parse tool calls from top-level field (daemon SessionMessage format)
+                        let tool_calls = m.get("tool_calls")
                             .and_then(|tc| serde_json::from_value::<Vec<ToolCallInfo>>(tc.clone()).ok())
                             .unwrap_or_default();
+                        // Parse reasoning from top-level field
+                        let reasoning = m.get("reasoning")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string());
                         Some(ChatMessage {
                             id: m.get("id")?.as_str()?.to_string(),
                             role: m.get("role")?.as_str()?.to_string(),
                             content: m.get("content")?.as_str()?.to_string(),
                             timestamp: m.get("timestamp")?.as_str()?.to_string(),
                             tool_calls,
+                            reasoning,
                         })
                     }).collect());
                 }
@@ -2429,6 +2461,7 @@ async fn get_session_history(
                     content: m.content,
                     timestamp: m.created_at,
                     tool_calls: parse_tool_calls_from_metadata(&m.metadata),
+                    reasoning: None,
                 })
                 .collect());
         }
@@ -2452,6 +2485,7 @@ async fn get_session_history(
             content: m.content,
             timestamp: m.created_at,
             tool_calls: parse_tool_calls_from_metadata(&m.metadata),
+            reasoning: None,
         })
         .collect())
 }
@@ -2959,6 +2993,7 @@ pub struct ExtendedSettings {
 
     // Ollama configuration
     pub ollama_host: String,
+    pub ollama_api_key: String,
 
     // Generation params
     pub temperature: f32,
@@ -3086,6 +3121,7 @@ async fn get_extended_settings(
         ],
         
         ollama_host,
+        ollama_api_key: state_guard.config.llm.ollama_api_key.clone().unwrap_or_default(),
         
         // Memory extraction model
         extraction_model: state_guard.extraction_model.read().await.clone(),
@@ -3682,6 +3718,27 @@ async fn set_ollama_host(
     unsafe { std::env::set_var("OLLAMA_HOST", &host); }
     
     Ok(format!("Ollama host saved: {}", host))
+}
+
+/// Set Ollama API key (for remote/authenticated instances)
+#[tauri::command]
+async fn set_ollama_api_key(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    key: String,
+) -> Result<String, String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.ollama_api_key = if key.is_empty() { None } else { Some(key.clone()) };
+    match state_guard.config.save() {
+        Ok(()) => {
+            info!("Ollama API key saved");
+        }
+        Err(e) => {
+            let err_msg = format!("Failed to save config: {}", e);
+            error!("{}", err_msg);
+            return Err(err_msg);
+        }
+    }
+    Ok("Ollama API key saved".to_string())
 }
 
 /// Fetch available models from Ollama
@@ -4382,7 +4439,7 @@ async fn list_memories(
         // Use proper memory_list action (scope filtering done by daemon)
         if let Ok(result) = state_guard.backend.memory_list(scope.as_deref()).await {
             if let Some(memories_array) = result.get("memories").and_then(|v: &serde_json::Value| v.as_array()) {
-                let items: Vec<MemoryItem> = memories_array.iter().filter_map(|m: &serde_json::Value| {
+                let mut items: Vec<MemoryItem> = memories_array.iter().filter_map(|m: &serde_json::Value| {
                     Some(MemoryItem {
                         id: m.get("id")?.as_str()?.to_string(),
                         content: m.get("content")?.as_str()?.to_string(),
@@ -4397,6 +4454,7 @@ async fn list_memories(
                         workspace_id: m.get("workspace_id").and_then(|v: &serde_json::Value| v.as_str()).map(String::from),
                     })
                 }).collect();
+                items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 return Ok(items);
             }
         }
@@ -4418,7 +4476,7 @@ async fn list_memories(
         }
     }).collect();
     
-    Ok(filtered.into_iter().map(|e| {
+    let mut items: Vec<MemoryItem> = filtered.into_iter().map(|e| {
         let fact_type = e.metadata.get("fact_type")
             .cloned()
             .unwrap_or_else(|| "stated".to_string());
@@ -4426,7 +4484,7 @@ async fn list_memories(
         let created_at = chrono::DateTime::from_timestamp(e.timestamp, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| e.timestamp.to_string());
-        
+
         MemoryItem {
             id: e.id,
             content: e.content,
@@ -4440,7 +4498,9 @@ async fn list_memories(
             session_id,
             workspace_id: e.workspace_id,
         }
-    }).collect())
+    }).collect();
+    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(items)
 }
 
 /// Get a single memory by ID
@@ -4810,21 +4870,43 @@ async fn get_chat_model_priority(
 /// Set chat model priority list
 #[tauri::command]
 async fn set_chat_model_priority(
+    app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
     priority: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
     state_guard.config.llm.model_priority = priority.clone();
-    
+
     // Also set the primary model to the first in the list for backwards compatibility
-    if let Some(first) = priority.first() {
-        // Strip provider prefix if present (e.g., "ollama/llama3.2" -> "llama3.2" for ollama)
-        state_guard.config.llm.model = first.clone();
+    let new_active = priority.first().cloned().unwrap_or_default();
+    if !new_active.is_empty() {
+        state_guard.config.llm.model = new_active.clone();
     }
-    
+
+    // Update active_model so the badge reflects the change immediately
+    {
+        let mut active = state_guard.active_model.write().await;
+        *active = new_active.clone();
+    }
+
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    
+
+    // Propagate to running daemon so changes take effect without restart
+    if state_guard.backend.is_daemon_mode().await {
+        let _ = state_guard.backend.config_set(
+            "llm.model_priority",
+            serde_json::to_value(&priority).unwrap_or_default(),
+        ).await;
+    }
+
+    // Emit model-status event so the GUI badge updates
+    let _ = app.emit("model-status", ModelStatusEvent {
+        active_model: new_active,
+        fallback_reason: None,
+        rate_limited_models: vec![],
+    });
+
     info!("Chat model priority set: {:?}", priority);
     Ok(())
 }
@@ -6282,6 +6364,22 @@ async fn get_user_tool(
 }
 
 #[tauri::command]
+async fn get_tool_source(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+
+    // Route through daemon if in daemon mode
+    if state_guard.backend.is_daemon_mode().await {
+        return state_guard.backend.tool_get_source(&name).await;
+    }
+
+    // Embedded mode: not supported (no tools_dir available)
+    Err("Tool source not available in embedded mode".to_string())
+}
+
+#[tauri::command]
 async fn create_user_tool(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
@@ -6787,6 +6885,39 @@ async fn get_session_run_state(
             "started_at": null,
             "message_count": msg_count,
         }))
+    }
+}
+
+// =============================================================================
+// Cancellation & Logs
+// =============================================================================
+
+/// Cancel an active agent session
+#[tauri::command]
+async fn cancel_session(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+) -> Result<bool, String> {
+    let state_guard = state.read().await;
+    if state_guard.backend.is_daemon_mode().await {
+        state_guard.backend.chat_cancel(&session_id).await
+    } else {
+        // Embedded mode: not yet supported
+        Ok(false)
+    }
+}
+
+/// Get daemon logs
+#[tauri::command]
+async fn get_daemon_logs(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let state_guard = state.read().await;
+    if state_guard.backend.is_daemon_mode().await {
+        state_guard.backend.get_logs(limit).await
+    } else {
+        Ok(vec![])
     }
 }
 
@@ -7475,6 +7606,24 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     tools.register(tool_authoring::ListUserToolsTool::new(user_tool_manager.clone())).await;
     info!("Registered tool authoring tools (create_tool, list_user_tools)");
 
+    // Register discover_tools (JS/TS skill with registry access)
+    {
+        let tools_dir = nanna_tools::skills::defaults::resolve_tools_dir(
+            config.tools.tools_dir.as_deref()
+        );
+        if let Some(ref dir) = tools_dir {
+            if let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
+                let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source("discover_tools", &source)
+                    .expect("discover_tools skill must parse")
+                    .with_registry(std::sync::Arc::downgrade(&tools));
+                tools.register(wrapper).await;
+                info!("Registered discover_tools skill from {:?}", dir);
+            } else {
+                warn!("discover_tools not found in tools directory");
+            }
+        }
+    }
+
     // Initialize scheduler with consolidation task
     let scheduler_config = SchedulerConfig {
         heartbeat_interval: Duration::from_secs(1800), // 30 minutes
@@ -7944,6 +8093,7 @@ pub fn run() {
             set_embedding_config,
             get_ollama_models,
             set_ollama_host,
+            set_ollama_api_key,
             // Dynamic model fetching
             get_anthropic_models,
             get_openai_models,
@@ -8029,6 +8179,7 @@ pub fn run() {
             // User tool authoring
             list_user_tools_cmd,
             get_user_tool,
+            get_tool_source,
             create_user_tool,
             update_user_tool,
             delete_user_tool,
@@ -8046,6 +8197,9 @@ pub fn run() {
             get_backend_status,
             init_backend,
             get_session_run_state,
+            // Cancellation & Logs
+            cancel_session,
+            get_daemon_logs,
             // Window close behavior
             get_close_mode,
             set_close_mode,

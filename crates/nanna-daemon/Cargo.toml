@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # Internal crates
 nanna-core = { path = "../nanna-core" }
 nanna-agent = { path = "../nanna-agent" }
-nanna-tools = { path = "../nanna-tools" }
+nanna-tools = { path = "../nanna-tools", features = ["scripting"] }
 nanna-channels = { path = "../nanna-channels" }
 nanna-config = { path = "../nanna-config" }
 nanna-storage = { path = "../nanna-storage" }

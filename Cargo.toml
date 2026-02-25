@@ -14,7 +14,7 @@ path = "src/main.rs"
 nanna-core = { path = "crates/nanna-core" }
 nanna-server = { path = "crates/nanna-server" }
 nanna-agent = { path = "crates/nanna-agent" }
-nanna-tools = { path = "crates/nanna-tools" }
+nanna-tools = { path = "crates/nanna-tools", features = ["scripting"] }
 nanna-config = { path = "crates/nanna-config" }
 nanna-storage = { path = "crates/nanna-storage" }
 nanna-llm = { path = "crates/nanna-llm" }

@@ -96,10 +96,16 @@ impl ModelInfo {
         (self.context_window * 80) / 100
     }
 
-    /// Hard limit for input (leaves room for output)
+    /// Hard limit for input (leaves room for output).
+    ///
+    /// Never returns 0 — some providers report `max_output_tokens >= context_window`
+    /// which would produce 0 and cause the context manager to nuke all messages
+    /// on every iteration.  Floor: 50% of context_window.
     #[must_use]
     pub fn hard_input_limit(&self) -> usize {
-        self.context_window.saturating_sub(self.max_output_tokens)
+        let raw = self.context_window.saturating_sub(self.max_output_tokens);
+        let floor = self.context_window / 2;
+        raw.max(floor)
     }
 
     /// Create with current timestamp
@@ -616,6 +622,32 @@ pub struct AnthropicRequest {
     /// Extended thinking configuration (Claude 3.5+ models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// Prompt caching: automatic mode caches the longest prefix up to the last cacheable block.
+    /// Set to `Some(CacheControl::ephemeral())` to enable automatic prompt caching.
+    /// Cached input tokens cost 90% less on Anthropic, 50% less on OpenAI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Cache control configuration for prompt caching.
+///
+/// When set at the request level, enables automatic caching: the API caches all content
+/// up to and including the last cacheable block. On subsequent requests with the same
+/// prefix, cached content is reused automatically (~5 minute TTL on Anthropic).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl CacheControl {
+    /// Create an ephemeral cache control (standard ~5 minute TTL)
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral".to_string(),
+        }
+    }
 }
 
 /// System prompt block (for OAuth/Claude Code format)
@@ -624,6 +656,10 @@ pub struct SystemBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
+    /// Cache control for this specific block (enables explicit cache breakpoints).
+    /// Place on the last system block to cache the entire system prompt prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl SystemBlock {
@@ -632,6 +668,16 @@ impl SystemBlock {
         Self {
             block_type: "text".to_string(),
             text: content.into(),
+            cache_control: None,
+        }
+    }
+
+    /// Create a text system block with ephemeral cache control
+    pub fn text_cached(content: impl Into<String>) -> Self {
+        Self {
+            block_type: "text".to_string(),
+            text: content.into(),
+            cache_control: Some(CacheControl::ephemeral()),
         }
     }
 }
@@ -652,6 +698,8 @@ struct OAuthAnthropicRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 impl OAuthAnthropicRequest {
@@ -668,6 +716,14 @@ impl OAuthAnthropicRequest {
                 system.push(SystemBlock::text(sys));
             }
         }
+
+        // Place explicit cache breakpoint on the last system block.
+        // This ensures the system prompt prefix is cached server-side (~5 min TTL).
+        if request.cache_control.is_some() {
+            if let Some(last) = system.last_mut() {
+                last.cache_control = Some(CacheControl::ephemeral());
+            }
+        }
         
         Self {
             model: request.model.clone(),
@@ -678,6 +734,7 @@ impl OAuthAnthropicRequest {
             tools: request.tools.clone(),
             stream: request.stream,
             thinking: request.thinking.clone(),
+            cache_control: request.cache_control.clone(),
         }
     }
 }
@@ -699,6 +756,12 @@ pub struct AnthropicResponse {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens written to the prompt cache on this request (billed at cache write rate)
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// Tokens read from the prompt cache on this request (billed at 10% of input rate on Anthropic)
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 // ============================================================================
@@ -877,6 +940,16 @@ impl LlmClient {
         }
     }
 
+    /// Create an Ollama client with an API key (for remote/authenticated instances)
+    pub fn ollama_with_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            http: Self::build_http_client(),
+            provider: Provider::Ollama,
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+        }
+    }
+
     /// Create an Ollama client with default localhost URL
     pub fn ollama_default() -> Self {
         Self::ollama("http://localhost:11434")
@@ -919,6 +992,15 @@ impl LlmClient {
 
     /// Validate the API key by making a lightweight request.
     ///
+    /// Apply Ollama auth header if an API key is configured.
+    fn apply_ollama_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if !self.api_key.is_empty() {
+            builder.header("Authorization", format!("Bearer {}", self.api_key))
+        } else {
+            builder
+        }
+    }
+
     /// # Errors
     ///
     /// Returns `LlmError::Api` with status 401 if the API key is invalid.
@@ -1140,13 +1222,17 @@ impl LlmClient {
 
         let api_response: OllamaShowResponse = response.json().await?;
 
-        // Try to extract context_length and embedding_length from model_info
+        // Try to extract context_length and embedding_length from model_info.
+        // Ollama models often report a small default context (e.g. 8K) even though
+        // they support much more.  We floor at 32K so the agent has room to work.
+        // The actual context is set via num_ctx in each request.
+        const OLLAMA_MIN_CONTEXT: usize = 32_768;
         let (context_window, embedding_dimension) = match api_response.model_info {
             Some(info) => (
-                info.context_length.unwrap_or(8_000),
+                info.context_length.unwrap_or(OLLAMA_MIN_CONTEXT).max(OLLAMA_MIN_CONTEXT),
                 info.embedding_length.or_else(|| embedding_dimension_for_model(model)),
             ),
-            None => (8_000, embedding_dimension_for_model(model)),
+            None => (OLLAMA_MIN_CONTEXT, embedding_dimension_for_model(model)),
         };
 
         Ok(ModelInfo {
@@ -1307,6 +1393,18 @@ impl LlmClient {
 
         let mut result: AnthropicResponse = response.json().await?;
 
+        // Log prompt cache usage
+        if result.usage.cache_read_input_tokens > 0 || result.usage.cache_creation_input_tokens > 0 {
+            info!(
+                cache_read = result.usage.cache_read_input_tokens,
+                cache_write = result.usage.cache_creation_input_tokens,
+                input = result.usage.input_tokens,
+                "📦 Prompt cache: read {} tokens, wrote {} tokens",
+                result.usage.cache_read_input_tokens,
+                result.usage.cache_creation_input_tokens,
+            );
+        }
+
         // Remap tool names back in response
         if is_oauth {
             for block in &mut result.content {
@@ -1351,7 +1449,19 @@ impl LlmClient {
         }
 
         let result: serde_json::Value = response.json().await?;
-        openai_response_to_anthropic(&request.model, &result)
+        let response = openai_response_to_anthropic(&request.model, &result)?;
+
+        // Log OpenAI prompt cache usage (automatic for prompts >1024 tokens, 50% discount)
+        if response.usage.cache_read_input_tokens > 0 {
+            info!(
+                cache_read = response.usage.cache_read_input_tokens,
+                input = response.usage.input_tokens,
+                "📦 OpenAI prompt cache: read {} cached tokens (50% discount)",
+                response.usage.cache_read_input_tokens,
+            );
+        }
+
+        Ok(response)
     }
 
     /// Convert AnthropicRequest → Ollama /api/chat and execute
@@ -1369,7 +1479,12 @@ impl LlmClient {
         if let Some(temp) = request.temperature {
             options.insert("temperature".to_string(), serde_json::json!(temp));
         }
-        options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
+        // num_predict=-1 means unlimited output — lets thinking models (qwen3)
+        // use as many tokens as needed for reasoning without starving the response.
+        options.insert("num_predict".to_string(), serde_json::json!(-1));
+        // Request 32K context so the agent has room for system prompt + conversation.
+        // Ollama models default to small contexts (e.g. 8K) even if they support more.
+        options.insert("num_ctx".to_string(), serde_json::json!(32768));
         if !options.is_empty() {
             body["options"] = serde_json::Value::Object(options);
         }
@@ -1379,10 +1494,10 @@ impl LlmClient {
             body["tools"] = tools;
         }
 
-        let response = self
+        let response = self.apply_ollama_auth(self
             .http
             .post(format!("{}/api/chat", self.base_url))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json"))
             .json(&body)
             .send()
             .await?;
@@ -1428,6 +1543,7 @@ impl LlmClient {
             tools: None,
             stream: None,
             thinking: None,
+            cache_control: None,
         };
 
         let result = self.complete_anthropic(&anthropic_request).await?;
@@ -1565,10 +1681,10 @@ impl LlmClient {
             options,
         };
 
-        let response = self
+        let response = self.apply_ollama_auth(self
             .http
             .post(format!("{}/api/chat", self.base_url))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json"))
             .json(&body)
             .send()
             .await?;
@@ -1974,10 +2090,14 @@ impl EmbeddingClient {
         let mut results = Vec::with_capacity(texts.len());
 
         for text in texts {
-            let response = self
+            let mut req = self
                 .http
                 .post(format!("{}/api/embeddings", self.base_url))
-                .header("Content-Type", "application/json")
+                .header("Content-Type", "application/json");
+            if !self.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+            let response = req
                 .json(&OllamaEmbedRequest {
                     model: &self.model,
                     prompt: text,
@@ -2162,6 +2282,10 @@ enum DeltaData {
     TextDelta { text: String },
     ThinkingDelta { thinking: String },
     InputJsonDelta { partial_json: String },
+    /// Catch-all for unknown delta types (e.g. `signature_delta`) so the
+    /// surrounding `ContentBlockDelta` event still deserializes successfully.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2608,6 +2732,7 @@ impl LlmClient {
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
         let http = self.http.clone();
         let base_url = self.base_url.clone();
+        let api_key = self.api_key.clone();
         let request = request.clone();
 
         stream! {
@@ -2623,7 +2748,11 @@ impl LlmClient {
             if let Some(temp) = request.temperature {
                 options.insert("temperature".to_string(), serde_json::json!(temp));
             }
-            options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
+            // num_predict=-1 means unlimited output — lets thinking models use
+            // as many tokens as needed for reasoning without starving the response.
+            options.insert("num_predict".to_string(), serde_json::json!(-1));
+            // Request 32K context (Ollama models default to small contexts).
+            options.insert("num_ctx".to_string(), serde_json::json!(32768));
             if !options.is_empty() {
                 body["options"] = serde_json::Value::Object(options);
             }
@@ -2631,9 +2760,13 @@ impl LlmClient {
                 body["tools"] = tools;
             }
 
-            let response = match http
+            let mut req = http
                 .post(format!("{base_url}/api/chat"))
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {api_key}"));
+            }
+            let response = match req
                 .json(&body)
                 .send()
                 .await
@@ -2690,6 +2823,14 @@ impl LlmClient {
 
                     // Check for done
                     let done = obj["done"].as_bool().unwrap_or(false);
+
+                    // Stream thinking content (qwen3 and other thinking models)
+                    // Ollama returns thinking tokens in message.thinking
+                    if let Some(thinking) = obj["message"]["thinking"].as_str() {
+                        if !thinking.is_empty() {
+                            yield Ok(StreamEvent::ThinkingDelta { index: 0, thinking: thinking.to_string() });
+                        }
+                    }
 
                     // Stream text content
                     if let Some(content) = obj["message"]["content"].as_str() {
@@ -3102,6 +3243,7 @@ impl LlmClient {
                         tools,
                         stream: Some(true),
                         thinking: None,
+                        cache_control: None,
                     };
 
                     let raw_stream = self.stream_anthropic(&anthropic_request);
@@ -3274,7 +3416,12 @@ fn anthropic_to_openai_request(request: &AnthropicRequest) -> (serde_json::Value
                 }
 
                 let mut assistant_msg = serde_json::json!({ "role": "assistant" });
-                if !text_parts.is_empty() {
+                // Always include `content` — some OpenAI-compatible providers
+                // (e.g. Arcee AI via OpenRouter) reject messages where it's missing,
+                // even when `tool_calls` is present.
+                if text_parts.is_empty() {
+                    assistant_msg["content"] = serde_json::Value::Null;
+                } else {
                     assistant_msg["content"] = serde_json::json!(text_parts.join("\n"));
                 }
                 if !tool_calls.is_empty() {
@@ -3347,6 +3494,8 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
 
     let input_tokens = response["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
     let output_tokens = response["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+    // OpenAI returns cached tokens in usage.prompt_tokens_details.cached_tokens
+    let cache_read_input_tokens = response["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as u32;
 
     Ok(AnthropicResponse {
         id: response["id"].as_str().unwrap_or("").to_string(),
@@ -3355,7 +3504,7 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         content,
         model: model.to_string(),
         stop_reason: Some(stop_reason.to_string()),
-        usage: Usage { input_tokens, output_tokens },
+        usage: Usage { input_tokens, output_tokens, cache_creation_input_tokens: 0, cache_read_input_tokens },
     })
 }
 
@@ -3363,6 +3512,13 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
 fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
     let message = &response["message"];
     let mut content = Vec::new();
+
+    // Thinking content (qwen3 and other thinking models)
+    if let Some(thinking) = message["thinking"].as_str() {
+        if !thinking.is_empty() {
+            content.push(ContentBlock::Thinking { thinking: thinking.to_string() });
+        }
+    }
 
     // Text content
     if let Some(text) = message["content"].as_str() {
@@ -3405,7 +3561,7 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         content,
         model: model.to_string(),
         stop_reason: Some(stop_reason.to_string()),
-        usage: Usage { input_tokens, output_tokens },
+        usage: Usage { input_tokens, output_tokens, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
     })
 }
 
@@ -3427,41 +3583,50 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
         .find_map(|line| line.strip_prefix("data: ").map(str::trim))?;
 
     // Parse the JSON data (skip malformed events)
-    serde_json::from_str::<AnthropicSSE>(data)
-        .ok()
-        .map(|sse| match sse {
-            AnthropicSSE::MessageStart { message } => StreamEvent::MessageStart {
-                id: message.id,
-                model: message.model,
-            },
-            AnthropicSSE::ContentBlockStart { index, content_block } => {
-                StreamEvent::ContentBlockStart {
-                    index,
-                    content_type: content_block.block_type,
-                    tool_id: content_block.id,
-                    tool_name: content_block.name,
-                }
+    let sse = match serde_json::from_str::<AnthropicSSE>(data) {
+        Ok(sse) => sse,
+        Err(e) => {
+            debug!(error = %e, data_prefix = &data[..data.len().min(120)], "Skipping unrecognised SSE event");
+            return None;
+        }
+    };
+    match sse {
+        AnthropicSSE::MessageStart { message } => Some(StreamEvent::MessageStart {
+            id: message.id,
+            model: message.model,
+        }),
+        AnthropicSSE::ContentBlockStart { index, content_block } => {
+            Some(StreamEvent::ContentBlockStart {
+                index,
+                content_type: content_block.block_type,
+                tool_id: content_block.id,
+                tool_name: content_block.name,
+            })
+        }
+        AnthropicSSE::ContentBlockDelta { index, delta } => match delta {
+            DeltaData::TextDelta { text } => Some(StreamEvent::TextDelta { index, text }),
+            DeltaData::ThinkingDelta { thinking } => Some(StreamEvent::ThinkingDelta { index, thinking }),
+            DeltaData::InputJsonDelta { partial_json } => {
+                Some(StreamEvent::ToolUseDelta { index, partial_json })
             }
-            AnthropicSSE::ContentBlockDelta { index, delta } => match delta {
-                DeltaData::TextDelta { text } => StreamEvent::TextDelta { index, text },
-                DeltaData::ThinkingDelta { thinking } => StreamEvent::ThinkingDelta { index, thinking },
-                DeltaData::InputJsonDelta { partial_json } => {
-                    StreamEvent::ToolUseDelta { index, partial_json }
-                }
-            },
-            AnthropicSSE::ContentBlockStop { index } => StreamEvent::ContentBlockStop { index },
-            AnthropicSSE::MessageDelta { delta, usage } => StreamEvent::MessageDelta {
-                stop_reason: delta.stop_reason,
-                output_tokens: usage.map_or(0, |u| u.output_tokens),
-            },
-            AnthropicSSE::MessageStop => StreamEvent::MessageStop {
-                stop_reason: "end_turn".to_string(),
-            },
-            AnthropicSSE::Ping => StreamEvent::Ping,
-            AnthropicSSE::Error { error } => StreamEvent::Error {
-                message: error.message,
-            },
-        })
+            DeltaData::Unknown => {
+                debug!(index, "Ignoring unknown content_block_delta type");
+                None
+            }
+        },
+        AnthropicSSE::ContentBlockStop { index } => Some(StreamEvent::ContentBlockStop { index }),
+        AnthropicSSE::MessageDelta { delta, usage } => Some(StreamEvent::MessageDelta {
+            stop_reason: delta.stop_reason,
+            output_tokens: usage.map_or(0, |u| u.output_tokens),
+        }),
+        AnthropicSSE::MessageStop => Some(StreamEvent::MessageStop {
+            stop_reason: "end_turn".to_string(),
+        }),
+        AnthropicSSE::Ping => Some(StreamEvent::Ping),
+        AnthropicSSE::Error { error } => Some(StreamEvent::Error {
+            message: error.message,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -3487,5 +3652,46 @@ mod tests {
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.max_tokens, Some(1000));
         assert_eq!(request.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn test_delta_data_unknown_variant() {
+        // Unknown delta types (e.g. signature_delta) should deserialize to Unknown
+        let json = r#"{"type": "signature_delta", "signature": "abc123"}"#;
+        let delta: DeltaData = serde_json::from_str(json).unwrap();
+        assert!(matches!(delta, DeltaData::Unknown));
+    }
+
+    #[test]
+    fn test_delta_data_known_variants() {
+        let text = r#"{"type": "text_delta", "text": "hello"}"#;
+        let delta: DeltaData = serde_json::from_str(text).unwrap();
+        assert!(matches!(delta, DeltaData::TextDelta { .. }));
+
+        let json_delta = r#"{"type": "input_json_delta", "partial_json": "{\"key\":"}"#;
+        let delta: DeltaData = serde_json::from_str(json_delta).unwrap();
+        assert!(matches!(delta, DeltaData::InputJsonDelta { .. }));
+    }
+
+    #[test]
+    fn test_content_block_delta_with_unknown_delta() {
+        // A ContentBlockDelta with an unknown inner delta type should still parse
+        let json = r#"{"type": "content_block_delta", "index": 1, "delta": {"type": "signature_delta", "signature": "sig"}}"#;
+        let sse: AnthropicSSE = serde_json::from_str(json).unwrap();
+        match sse {
+            AnthropicSSE::ContentBlockDelta { index, delta } => {
+                assert_eq!(index, 1);
+                assert!(matches!(delta, DeltaData::Unknown));
+            }
+            other => panic!("Expected ContentBlockDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_event_unknown_delta() {
+        let event = "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"signature_delta\", \"signature\": \"abc\"}}";
+        // Should return None (unknown delta filtered out) instead of failing
+        let result = parse_sse_event(event);
+        assert!(result.is_none());
     }
 }

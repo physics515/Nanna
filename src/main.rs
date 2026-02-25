@@ -568,9 +568,25 @@ async fn init_components(
     tools.register(WonderTool).await;
     tools.register(StatusTool).await;
 
+    register_discover_tools(&tools, config).await;
+
     info!("{} tools ready", tools.definitions().await.len());
 
     Ok((llm, tools, storage))
+}
+
+/// Register the `discover_tools` JS/TS skill with the tool registry.
+async fn register_discover_tools(tools: &Arc<ToolRegistry>, config: &Config) {
+    let tools_dir = nanna_tools::skills::defaults::resolve_tools_dir(
+        config.tools.tools_dir.as_deref()
+    );
+    if let Some(ref dir) = tools_dir
+        && let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
+            let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source("discover_tools", &source)
+                .expect("discover_tools skill must parse")
+                .with_registry(Arc::downgrade(tools));
+            tools.register(wrapper).await;
+        }
 }
 
 /// Run the HTTP server
@@ -693,8 +709,9 @@ async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<
 
 /// Run the daemon server (background mode)
 async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
-    use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig};
-    use nanna_daemon::server::LlmConfig;
+    use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig, WebhookConfig};
+    use nanna_daemon::server::{LlmConfig, EmbeddingConfig};
+    use nanna_daemon::agent_service::AgentServiceConfig;
 
     // Configure daemon
     let data_dir = Config::default_data_dir()?;
@@ -719,20 +736,22 @@ async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<
             ollama_host: "http://localhost:11434".to_string(),
             api_key: config.llm.api_key.clone(),
         },
-        agent: Default::default(),
+        agent: AgentServiceConfig::default(),
         enable_memory: true,
         enable_health_server: true,
         health_port: 5148,
         enable_pid_file: true,
         enable_webhook_server: false,
         webhook_port: 3000,
-        webhook: Default::default(),
+        webhook: WebhookConfig::default(),
+        use_script_tools: config.tools.use_script_tools,
+        tools_dir: config.tools.tools_dir.clone(),
     };
 
     info!("Initializing daemon server...");
     let mut server = DaemonServer::new(
         daemon_config,
-        Default::default(),
+        EmbeddingConfig::default(),
         None,
         None,
     );
@@ -1438,67 +1457,19 @@ async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result
 }
 
 /// Handle daemon subcommands
-async fn handle_daemon_command(action: DaemonAction, config: &Config) -> anyhow::Result<()> {
-    use std::fs;
-    use std::process::{Command, Stdio};
-
-    // Get PID file path
+async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> anyhow::Result<()> {
     let pid_file = Config::default_data_dir()?.join("nanna-daemon.pid");
 
     match action {
         DaemonAction::Start { host, port } => {
             println!("🌙 Starting Nanna daemon...\n");
-
-            // Check if already running
-            if is_daemon_running(&pid_file).await {
+            if is_daemon_running(&pid_file) {
                 println!("⚠️  Daemon is already running");
                 println!("   Run 'nanna daemon status' to check details");
                 println!("   Run 'nanna daemon stop' to stop it");
                 return Ok(());
             }
-
-            // Spawn daemon process in background
-            let exe = std::env::current_exe()?;
-            
-            // Create log file in data directory
-            let log_dir = Config::default_data_dir()?;
-            fs::create_dir_all(&log_dir)?;
-            let log_file = log_dir.join("daemon.log");
-            
-            let log_handle = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_file)?;
-
-            info!("Spawning daemon process...");
-            
-            #[cfg(windows)]
-            let child = Command::new(exe)
-                .arg("--daemon-mode")
-                .arg("--host")
-                .arg(&host)
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::from(log_handle.try_clone()?))
-                .stderr(Stdio::from(log_handle))
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW on Windows
-                .spawn()?;
-
-            #[cfg(not(windows))]
-            let child = Command::new(exe)
-                .arg("--daemon-mode")
-                .arg("--host")
-                .arg(&host)
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::from(log_handle.try_clone()?))
-                .stderr(Stdio::from(log_handle))
-                .spawn()?;
-
-            // Save PID
-            let pid = child.id();
-            fs::write(&pid_file, pid.to_string())?;
-
+            let (pid, log_file) = spawn_daemon_process(&host, port, &pid_file)?;
             println!("✅ Daemon started!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -1506,183 +1477,26 @@ async fn handle_daemon_command(action: DaemonAction, config: &Config) -> anyhow:
             println!("\n   Use 'nanna daemon status' to check status");
             println!("   Use 'nanna daemon stop' to stop the daemon");
         }
-
         DaemonAction::Stop => {
             println!("🌙 Stopping Nanna daemon...\n");
-
-            if !pid_file.exists() {
-                println!("❌ No daemon PID file found");
-                println!("   Daemon may not be running");
-                return Ok(());
-            }
-
-            let pid_str = fs::read_to_string(&pid_file)?;
-            let pid: u32 = pid_str.trim().parse()?;
-
-            #[cfg(windows)]
-            {
-                use std::process::Command;
-                let status = Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/F"])
-                    .status()?;
-
-                if status.success() {
-                    println!("✅ Daemon stopped (PID {pid})");
-                } else {
-                    println!("⚠️  Failed to stop daemon (PID {pid})");
-                    println!("   It may have already been terminated");
-                }
-            }
-
-            #[cfg(not(windows))]
-            {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-                    Ok(_) => println!("✅ Daemon stopped (PID {pid})"),
-                    Err(e) => {
-                        println!("⚠️  Failed to stop daemon (PID {pid}): {e}");
-                        println!("   It may have already been terminated");
-                    }
-                }
-            }
-
-            // Remove PID file
-            let _ = fs::remove_file(&pid_file);
+            stop_daemon_process(&pid_file)?;
         }
-
         DaemonAction::Status => {
-            println!("🌙 Nanna Daemon Status\n");
-
-            if !pid_file.exists() {
-                println!("   Status: Not running");
-                println!("   Start with: nanna daemon start");
-                return Ok(());
-            }
-
-            let pid_str = fs::read_to_string(&pid_file)?;
-            let pid: u32 = pid_str.trim().parse()?;
-
-            // Check if process is actually running
-            let is_running = is_process_alive(pid);
-
-            if is_running {
-                println!("   Status: ✅ Running");
-                println!("   PID: {pid}");
-                
-                // Try to connect and get more info
-                use nanna_client::{Client, ClientConfig};
-                let client_config = ClientConfig::new("ws://127.0.0.1:5149");
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    Client::connect(client_config)
-                ).await {
-                    Ok(Ok(_)) => {
-                        println!("   Connection: ✅ Healthy");
-                        println!("   Address: ws://127.0.0.1:5149");
-                    }
-                    _ => {
-                        println!("   Connection: ⚠️  Not responding");
-                        println!("   (Daemon may be starting up or misconfigured)");
-                    }
-                }
-            } else {
-                println!("   Status: ❌ Not running (stale PID file)");
-                println!("   Cleaning up...");
-                let _ = fs::remove_file(&pid_file);
-                println!("   Start with: nanna daemon start");
-            }
+            print_daemon_status(&pid_file).await?;
         }
-
         DaemonAction::Restart { host, port } => {
             println!("🌙 Restarting Nanna daemon...\n");
-
-            // Stop if running
-            if is_daemon_running(&pid_file).await {
+            if is_daemon_running(&pid_file) {
                 println!("Stopping current daemon...");
-                
-                if pid_file.exists() {
-                    let pid_str = fs::read_to_string(&pid_file)?;
-                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        #[cfg(windows)]
-                        {
-                            let status = Command::new("taskkill")
-                                .args(["/PID", &pid.to_string(), "/F"])
-                                .status()?;
-
-                            if status.success() {
-                                println!("✅ Daemon stopped (PID {pid})");
-                            } else {
-                                println!("⚠️  Failed to stop daemon (PID {pid})");
-                            }
-                        }
-
-                        #[cfg(not(windows))]
-                        {
-                            use nix::sys::signal::{self, Signal};
-                            use nix::unistd::Pid;
-
-                            match signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-                                Ok(_) => println!("✅ Daemon stopped (PID {pid})"),
-                                Err(e) => println!("⚠️  Failed to stop daemon: {e}"),
-                            }
-                        }
-                    }
-                    
-                    // Remove PID file
-                    let _ = fs::remove_file(&pid_file);
-                }
-                
-                // Give it a moment to shut down
+                stop_daemon_process(&pid_file)?;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-
-            // Start fresh - inline the start logic
             println!("Starting daemon...");
-            
-            if is_daemon_running(&pid_file).await {
+            if is_daemon_running(&pid_file) {
                 println!("⚠️  Daemon is already running");
                 return Ok(());
             }
-
-            let exe = std::env::current_exe()?;
-            
-            let log_dir = Config::default_data_dir()?;
-            fs::create_dir_all(&log_dir)?;
-            let log_file = log_dir.join("daemon.log");
-            
-            let log_handle = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_file)?;
-
-            #[cfg(windows)]
-            let child = Command::new(exe)
-                .arg("--daemon-mode")
-                .arg("--host")
-                .arg(&host)
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::from(log_handle.try_clone()?))
-                .stderr(Stdio::from(log_handle))
-                .creation_flags(0x08000000)
-                .spawn()?;
-
-            #[cfg(not(windows))]
-            let child = Command::new(exe)
-                .arg("--daemon-mode")
-                .arg("--host")
-                .arg(&host)
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::from(log_handle.try_clone()?))
-                .stderr(Stdio::from(log_handle))
-                .spawn()?;
-
-            let pid = child.id();
-            fs::write(&pid_file, pid.to_string())?;
-
+            let (pid, _) = spawn_daemon_process(&host, port, &pid_file)?;
             println!("✅ Daemon restarted!");
             println!("   PID: {pid}");
             println!("   Address: ws://{host}:{port}/ws");
@@ -1692,17 +1506,147 @@ async fn handle_daemon_command(action: DaemonAction, config: &Config) -> anyhow:
     Ok(())
 }
 
+/// Spawn a daemon process in the background. Returns (PID, log file path).
+fn spawn_daemon_process(host: &str, port: u16, pid_file: &std::path::Path) -> anyhow::Result<(u32, PathBuf)> {
+    use std::fs;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let log_dir = Config::default_data_dir()?;
+    fs::create_dir_all(&log_dir)?;
+    let log_file = log_dir.join("daemon.log");
+
+    let log_handle = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)?;
+
+    info!("Spawning daemon process...");
+
+    #[cfg(windows)]
+    let child = Command::new(exe)
+        .arg("--daemon-mode")
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::from(log_handle.try_clone()?))
+        .stderr(Stdio::from(log_handle))
+        .creation_flags(0x0800_0000)
+        .spawn()?;
+
+    #[cfg(not(windows))]
+    let child = Command::new(exe)
+        .arg("--daemon-mode")
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::from(log_handle.try_clone()?))
+        .stderr(Stdio::from(log_handle))
+        .spawn()?;
+
+    let pid = child.id();
+    fs::write(pid_file, pid.to_string())?;
+    Ok((pid, log_file))
+}
+
+/// Stop the daemon process identified by the PID file.
+fn stop_daemon_process(pid_file: &std::path::Path) -> anyhow::Result<()> {
+    use std::fs;
+
+    if !pid_file.exists() {
+        println!("❌ No daemon PID file found");
+        println!("   Daemon may not be running");
+        return Ok(());
+    }
+
+    let pid_str = fs::read_to_string(pid_file)?;
+    let pid: u32 = pid_str.trim().parse()?;
+
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()?;
+
+        if status.success() {
+            println!("✅ Daemon stopped (PID {pid})");
+        } else {
+            println!("⚠️  Failed to stop daemon (PID {pid})");
+            println!("   It may have already been terminated");
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        use nix::sys::signal::{self, Signal};
+        use nix::unistd::Pid;
+
+        match signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+            Ok(()) => println!("✅ Daemon stopped (PID {pid})"),
+            Err(e) => {
+                println!("⚠️  Failed to stop daemon (PID {pid}): {e}");
+                println!("   It may have already been terminated");
+            }
+        }
+    }
+
+    let _ = fs::remove_file(pid_file);
+    Ok(())
+}
+
+/// Print daemon status information.
+async fn print_daemon_status(pid_file: &std::path::Path) -> anyhow::Result<()> {
+    use nanna_client::{Client, ClientConfig};
+
+    println!("🌙 Nanna Daemon Status\n");
+
+    if !pid_file.exists() {
+        println!("   Status: Not running");
+        println!("   Start with: nanna daemon start");
+        return Ok(());
+    }
+
+    let pid_str = std::fs::read_to_string(pid_file)?;
+    let pid: u32 = pid_str.trim().parse()?;
+    let is_running = is_process_alive(pid);
+
+    if is_running {
+        println!("   Status: ✅ Running");
+        println!("   PID: {pid}");
+
+        let client_config = ClientConfig::new("ws://127.0.0.1:5149");
+        if let Ok(Ok(_)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            Client::connect(client_config)
+        ).await {
+            println!("   Connection: ✅ Healthy");
+            println!("   Address: ws://127.0.0.1:5149");
+        } else {
+            println!("   Connection: ⚠️  Not responding");
+            println!("   (Daemon may be starting up or misconfigured)");
+        }
+    } else {
+        println!("   Status: ❌ Not running (stale PID file)");
+        println!("   Cleaning up...");
+        let _ = std::fs::remove_file(pid_file);
+        println!("   Start with: nanna daemon start");
+    }
+    Ok(())
+}
+
 /// Check if daemon is running based on PID file
-async fn is_daemon_running(pid_file: &PathBuf) -> bool {
+fn is_daemon_running(pid_file: &PathBuf) -> bool {
     if !pid_file.exists() {
         return false;
     }
 
-    if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+    if let Ok(pid_str) = std::fs::read_to_string(pid_file)
+        && let Ok(pid) = pid_str.trim().parse::<u32>() {
             return is_process_alive(pid);
         }
-    }
 
     false
 }
@@ -1715,11 +1659,10 @@ fn is_process_alive(pid: u32) -> bool {
         Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output()
-            .map(|output| {
+            .is_ok_and(|output| {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 stdout.contains(&pid.to_string())
             })
-            .unwrap_or(false)
     }
 
     #[cfg(not(windows))]

@@ -120,13 +120,18 @@ Multi-provider LLM client with streaming and tool calling support.
 - OpenAI (GPT-4, etc.)
 - OpenRouter (proxy to multiple models)
 - Ollama (local models)
+- GitHub Models
 - Streaming responses
 - Tool/function calling
+- Multi-provider LLM router (`nanna-daemon/src/llm_router.rs`) with automatic model→provider detection
+- Model fallback chain: tries each model in `model_priority` list, resets to top on every call (including heartbeats)
+- Ollama tag notation detection (e.g. `deepseek-r1:14b` routes to Ollama automatically)
+- Diagnostic logging when provider is missing for a model
 
 **Suggestions:**
 - Add Google Gemini support
 - Add Mistral API support
-- Implement provider failover/fallback
+- ~~Implement provider failover/fallback~~ ✅ Implemented (LlmRouter + model_priority)
 - Add request caching for identical prompts
 - Track token usage per session for cost estimation
 
@@ -151,9 +156,13 @@ Agent loop that handles streaming responses and tool execution.
 **Current Implementation:**
 - `Agent::run()` - Main agent loop
 - `StreamCallback` - Real-time token streaming
+- `ThinkingCallback` - Real-time thinking/reasoning streaming
+- `ToolStartCallback` - Tool start event callback (emits `Event::ToolStart` before execution)
 - `ToolCallRecord` - Tool execution tracking
 - Parallel tool execution when tools are independent
 - Tool output truncation with budget allocation
+- Empty content block prevention (tool results never empty, messages sanitized before API call)
+- `on_tool_start` callback in `RunOptions` for real-time tool tracking
 
 **Suggestions:**
 - Add tool call caching for idempotent tools
@@ -185,9 +194,12 @@ Agentic loop with context window management and summarization.
 - Sliding window truncation
 - Message truncation (50KB limit)
 - Intelligent tool output truncation
-- Context compression via LLM summarization
-- Incremental summarization caching
-- CDC deduplication for duplicate content
+- Context compression via LLM summarization (direct LLM calls with model fallback)
+- CDC deduplication for duplicate content (chunk hashing via `Chunk::split_on_boundaries`)
+- `sanitize_messages()` removes empty text blocks before API calls (prevents Anthropic rejection)
+- `max_block_chars` floored to 100 to prevent truncation creating empty blocks
+- Smart memory recall gating: only recalls memories for non-trivial messages (>5 words, has `?`, or >80 chars)
+- Memory dedup: skips injecting memories already present in the last 4 messages
 
 **Suggestions:**
 - Add context budget visualization in GUI

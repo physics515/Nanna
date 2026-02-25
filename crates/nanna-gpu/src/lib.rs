@@ -12,6 +12,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
+pub mod memory_manager;
+
+pub use memory_manager::{BatchedSearch, GpuMemoryStats, GpuVectorStore};
+
 #[derive(Error, Debug)]
 pub enum GpuError {
     #[error("No suitable GPU adapter found")]
@@ -22,6 +26,8 @@ pub enum GpuError {
     ShaderCompilation(String),
     #[error("Buffer mapping failed")]
     BufferMapping,
+    #[error("GPU memory insufficient: {0}")]
+    InsufficientMemory(String),
 }
 
 /// GPU compute context

@@ -97,6 +97,15 @@ pub struct LlmConfig {
     pub summarization_priority: Vec<String>,
     /// Ollama server URL for summarization (if using ollama model)
     pub ollama_url: Option<String>,
+    /// Ollama API key (optional — for remote/authenticated Ollama instances)
+    pub ollama_api_key: Option<String>,
+    /// Model routing priority for cost optimization.
+    /// Format: ["model:tier", ...] where tier is simple|medium|complex.
+    /// Cheapest models first. Empty = disabled (always use primary model).
+    /// Example: ["claude-haiku-3-5-20241022:simple", "claude-sonnet-4-20250514:complex"]
+    pub model_routing: Vec<String>,
+    /// Whether to always use the primary model for the first iteration. Default: true.
+    pub routing_first_turn_primary: bool,
 }
 
 impl Default for LlmConfig {
@@ -116,6 +125,9 @@ impl Default for LlmConfig {
             anthropic_use_oauth: false,
             summarization_priority: vec![], // Empty = truncate instead of summarize
             ollama_url: Some("http://localhost:11434".to_string()),
+            ollama_api_key: None,
+            model_routing: vec![], // Empty = disabled (always use primary model)
+            routing_first_turn_primary: true,
         }
     }
 }
@@ -233,6 +245,11 @@ pub struct ToolsConfig {
     pub file_sandbox: Option<PathBuf>,
     /// Brave Search API key for web_search tool
     pub brave_api_key: Option<String>,
+    /// Use TypeScript skill implementations instead of Rust builtins
+    pub use_script_tools: bool,
+    /// Directory containing tool scripts (default: {data_dir}/tools/)
+    /// Can be overridden with NANNA_TOOLS_DIR environment variable
+    pub tools_dir: Option<PathBuf>,
 }
 
 impl Default for ToolsConfig {
@@ -243,6 +260,8 @@ impl Default for ToolsConfig {
             exec_allowlist: None,
             file_sandbox: None,
             brave_api_key: None,
+            use_script_tools: true,
+            tools_dir: None,
         }
     }
 }

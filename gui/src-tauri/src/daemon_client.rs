@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+// use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -109,6 +109,8 @@ pub enum DaemonEvent {
     MessageStart { session_id: String, message_id: String },
     MessageDelta { session_id: String, message_id: String, delta: String },
     MessageEnd { session_id: String, message_id: String, content: String },
+    ThinkingDelta { session_id: String, delta: String },
+    ModelSwitch { model: String, reason: Option<String> },
     ToolStart { session_id: String, call_id: String, name: String },
     ToolEnd { session_id: String, call_id: String, output: String, success: bool },
     Error { code: String, message: String },
@@ -708,6 +710,25 @@ impl DaemonClient {
         ).await
     }
     
+    /// Cancel an active chat
+    pub async fn chat_cancel(&self, session_id: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "chat",
+            "action": "cancel",
+            "session_id": session_id
+        })).await
+    }
+
+    /// Get system logs
+    pub async fn system_logs(&self, limit: Option<usize>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "system",
+            "action": "logs",
+            "lines": limit,
+            "level": null
+        })).await
+    }
+
     /// List sessions
     pub async fn sessions_list(&self) -> Result<Value, String> {
         self.request(serde_json::json!({
@@ -1022,6 +1043,15 @@ impl DaemonClient {
         self.request(serde_json::json!({
             "type": "tool",
             "action": "list_user"
+        })).await
+    }
+
+    /// Get tool source code
+    pub async fn tool_get_source(&self, name: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "tool",
+            "action": "get_source",
+            "name": name
         })).await
     }
     

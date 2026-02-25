@@ -199,7 +199,7 @@ impl DaemonManager {
         info!("Stopping nanna-daemon...");
         
         // Kill the child process
-        if let Some(mut child) = self.child.write().await.take() {
+        if let Some(child) = self.child.write().await.take() {
             if let Err(e) = child.kill() {
                 warn!("Failed to kill daemon process: {}", e);
             }

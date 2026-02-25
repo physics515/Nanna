@@ -1,0 +1,50 @@
+    Checking nanna-gpu v0.1.0 (D:\Development\nanna\crates\nanna-gpu)
+warning: unused import: `bytemuck::Pod`
+ --> crates\nanna-gpu\src\memory_manager.rs:6:5
+  |
+6 | use bytemuck::Pod;
+  |     ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0609]: no field `max_buffer_binding_size` on type `wgpu::Limits`
+  --> crates\nanna-gpu\src\memory_manager.rs:69:51
+   |
+69 |         let max_buffer_size = ctx.device.limits().max_buffer_binding_size;
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^ unknown field
+   |
+   = note: available fields are: `max_texture_dimension_1d`, `max_texture_dimension_2d`, `max_texture_dimension_3d`, `max_texture_array_layers`, `max_bind_groups` ... and 29 others
+
+error[E0609]: no field `max_buffer_binding_size` on type `wgpu::Limits`
+   --> crates\nanna-gpu\src\memory_manager.rs:247:51
+    |
+247 |         let bytes_available = ctx.device.limits().max_buffer_binding_size;
+    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `max_texture_dimension_1d`, `max_texture_dimension_2d`, `max_texture_dimension_3d`, `max_texture_array_layers`, `max_bind_groups` ... and 29 others
+
+error[E0609]: no field `max_buffer_binding_size` on type `wgpu::Limits`
+   --> crates\nanna-gpu\src\memory_manager.rs:312:51
+    |
+312 |         let max_buffer_size = ctx.device.limits().max_buffer_binding_size;
+    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `max_texture_dimension_1d`, `max_texture_dimension_2d`, `max_texture_dimension_3d`, `max_texture_array_layers`, `max_bind_groups` ... and 29 others
+
+warning: unused variable: `gpu_buffer`
+   --> crates\nanna-gpu\src\memory_manager.rs:218:13
+    |
+218 |         let gpu_buffer = self.gpu_buffer.as_ref().ok_or(MemoryError::EmptyStore)?;
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gpu_buffer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `vec`
+   --> crates\nanna-gpu\src\memory_manager.rs:231:24
+    |
+231 |         for (orig_idx, vec) in self.vectors.iter().enumerate() {
+    |                        ^^^ help: if this is intentional, prefix it with an underscore: `_vec`
+
+For more information about this error, try `rustc --explain E0609`.
+warning: `nanna-gpu` (lib) generated 3 warnings
+error: could not compile `nanna-gpu` (lib) due to 3 previous errors; 3 warnings emitted

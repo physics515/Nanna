@@ -27,6 +27,8 @@ pub struct SessionMessage {
     pub tool_calls: Vec<ToolCallRecord>,
     #[serde(default)]
     pub attachments: Vec<AttachmentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +117,29 @@ impl Session {
             timestamp: Utc::now(),
             tool_calls: Vec::new(),
             attachments: Vec::new(),
+            reasoning: None,
+        });
+        self.updated_at = Utc::now();
+        id
+    }
+
+    /// Add a message with tool calls and reasoning to the session
+    pub fn add_full_message(
+        &mut self,
+        role: MessageRole,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallRecord>,
+        reasoning: Option<String>,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.messages.push(SessionMessage {
+            id: id.clone(),
+            role,
+            content: content.into(),
+            timestamp: Utc::now(),
+            tool_calls,
+            attachments: Vec::new(),
+            reasoning,
         });
         self.updated_at = Utc::now();
         id
@@ -314,6 +339,23 @@ impl SessionManager {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
             Some(session.add_message(role, content))
+        } else {
+            None
+        }
+    }
+
+    /// Add a message with tool calls and reasoning to a session
+    pub async fn add_full_message(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallRecord>,
+        reasoning: Option<String>,
+    ) -> Option<String> {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            Some(session.add_full_message(role, content, tool_calls, reasoning))
         } else {
             None
         }

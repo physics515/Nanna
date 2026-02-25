@@ -13,8 +13,12 @@ use clap::{Parser, Subcommand};
 use nanna_daemon::server::DaemonBuilder;
 use nanna_daemon::service::ServiceStatus;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Global log buffer initialized before the tracing subscriber
+static LOG_BUFFER: OnceLock<nanna_daemon::log_buffer::LogBuffer> = OnceLock::new();
 
 #[cfg(windows)]
 use nanna_daemon::windows_service;
@@ -104,14 +108,21 @@ fn main() {
         return;
     }
     
-    // Setup logging for non-service modes
+    // Setup logging for non-service modes with log buffer for GUI
+    let log_buffer = nanna_daemon::log_buffer::LogBuffer::new(5000);
+    let log_layer = nanna_daemon::log_buffer::LogBufferLayer::new(log_buffer.clone());
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
-    
+
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
+        .with(log_layer)
         .init();
+
+    // Store log_buffer so run_daemon can pass it to the DaemonBuilder
+    LOG_BUFFER.set(log_buffer).ok();
     
     let result = match cli.command {
         Commands::Run => run_daemon(&cli),
@@ -154,7 +165,12 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
         if let Some(ref data_dir) = cli.data_dir {
             builder = builder.with_data_dir(data_dir);
         }
-        
+
+        // Pass log buffer to daemon for serving logs via control plane
+        if let Some(buf) = LOG_BUFFER.get() {
+            builder = builder.with_log_buffer(buf.clone());
+        }
+
         let mut daemon = builder.build();
         
         // Setup signal handlers

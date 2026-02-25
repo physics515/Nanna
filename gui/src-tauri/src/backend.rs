@@ -9,11 +9,11 @@
 use crate::daemon_client::{ConnectionMode, DaemonClient, DaemonClientConfig, DaemonEvent};
 use crate::daemon_manager::{DaemonManager, DaemonManagerConfig, DaemonState};
 use crate::embedded::EmbeddedBackend;
-use nanna_storage::Session;
+use crate::AppState;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -176,7 +176,7 @@ impl Backend {
     pub async fn status(&self) -> BackendStatus {
         let mode = *self.mode.read().await;
         let daemon_state = self.daemon_manager.state().await;
-        let client_status = self.daemon_client.status().await;
+        let _client_status = self.daemon_client.status().await;
         
         BackendStatus {
             mode,
@@ -225,6 +225,12 @@ impl Backend {
                             "done": true,
                         }));
                     }
+                    DaemonEvent::ThinkingDelta { session_id, delta, .. } => {
+                        let _ = app.emit("thinking-chunk", serde_json::json!({
+                            "session_id": session_id,
+                            "delta": delta,
+                        }));
+                    }
                     DaemonEvent::ToolStart { session_id, call_id, name, .. } => {
                         let _ = app.emit("tool-call", serde_json::json!({
                             "session_id": session_id,
@@ -246,6 +252,19 @@ impl Backend {
                             "status": if *success { "completed" } else { "error" },
                         }));
                     }
+                    DaemonEvent::ModelSwitch { model, reason } => {
+                        // Update AppState's active_model so get_model_status stays in sync
+                        if let Some(state) = app.try_state::<Arc<RwLock<AppState>>>() {
+                            let state_guard = state.read().await;
+                            let mut active = state_guard.active_model.write().await;
+                            *active = model.clone();
+                        }
+                        let _ = app.emit("model-status", serde_json::json!({
+                            "active_model": model,
+                            "fallback_reason": reason,
+                            "rate_limited_models": [],
+                        }));
+                    }
                     DaemonEvent::Error { code, message, .. } => {
                         let _ = app.emit("error", serde_json::json!({
                             "code": code,
@@ -262,6 +281,36 @@ impl Backend {
     // High-level API (works in both modes)
     // =========================================================================
     
+    /// Cancel an active chat
+    pub async fn chat_cancel(&self, session_id: &str) -> Result<bool, String> {
+        if self.is_daemon_mode().await {
+            match self.daemon_client.chat_cancel(session_id).await {
+                Ok(val) => Ok(val.get("status").and_then(|s| s.as_str()) == Some("cancelled")),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get daemon logs
+    pub async fn get_logs(&self, limit: Option<usize>) -> Result<Vec<Value>, String> {
+        if self.is_daemon_mode().await {
+            match self.daemon_client.system_logs(limit).await {
+                Ok(val) => {
+                    let logs = val.get("logs")
+                        .and_then(|l| l.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(logs)
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(vec![])
+        }
+    }
+
     /// Send a chat message
     /// In daemon mode: forwards to daemon
     /// In embedded mode: caller should use embedded agent
@@ -575,6 +624,15 @@ impl Backend {
     pub async fn tool_list_user(&self) -> Result<Value, String> {
         if self.is_daemon_mode().await {
             self.daemon_client.tool_list_user().await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
+    /// Get tool source code
+    pub async fn tool_get_source(&self, name: &str) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.tool_get_source(name).await
         } else {
             Err("EMBEDDED_MODE".to_string())
         }

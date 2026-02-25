@@ -9,6 +9,12 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Vec<ToolParameter>,
+    /// Optional JSON Schema describing the tool's output format.
+    /// Used for documentation and post-processing optimization.
+    /// Tools returning structured JSON can declare their schema here
+    /// so context compression can parse/truncate outputs intelligently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 }
 
 /// Tool parameter definition
@@ -53,7 +59,15 @@ impl ToolDefinition {
             name: name.into(),
             description: description.into(),
             parameters: Vec::new(),
+            output_schema: None,
         }
+    }
+
+    /// Set the output schema for this tool definition.
+    #[must_use]
+    pub fn with_output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
+        self
     }
 
     #[must_use] 

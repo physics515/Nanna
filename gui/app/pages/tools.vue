@@ -161,6 +161,16 @@
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Description</label>
                   <UiTextarea v-model="editingTool.description" placeholder="What does this tool do?" :rows="2" class="text-sm" />
                 </div>
+                <div>
+                  <label class="block text-xs font-medium text-nanna-text-muted mb-1">Output Routing</label>
+                  <select v-model="editingTool.outputTarget" class="w-full px-3 py-2 bg-nanna-bg-elevated border border-nanna-primary/20 rounded-lg text-sm text-nanna-text">
+                    <option value="memory">Memory (default) — large results stored in memory, stubbed in context</option>
+                    <option value="context">Context — results always inline, summarized if large</option>
+                  </select>
+                  <p class="text-[10px] text-nanna-text-dim mt-1">
+                    Use "context" for tools whose results the agent needs to see directly (e.g. search, lookup).
+                  </p>
+                </div>
               </div>
             </div>
           </div>
@@ -184,8 +194,24 @@
               </div>
             </div>
 
+            <!-- Loading source -->
+            <div v-if="!creating && loadingSource" class="flex-1 flex items-center justify-center">
+              <Loader2 class="w-5 h-5 animate-spin text-nanna-text-muted" />
+            </div>
+
+            <!-- No source available -->
+            <div v-else-if="!creating && !editingTool.code" class="flex-1 flex items-center justify-center">
+              <div class="text-center max-w-sm px-8">
+                <Wrench class="w-10 h-10 mx-auto mb-3 text-nanna-text-dim" />
+                <p class="text-sm text-nanna-text-muted mb-2">Source unavailable</p>
+                <p class="text-xs text-nanna-text-dim">
+                  Could not load source code for this tool.
+                </p>
+              </div>
+            </div>
+
             <!-- Monaco Editor -->
-            <div class="flex-1 min-h-0">
+            <div v-else class="flex-1 min-h-0">
               <VueMonacoEditor
                 v-model:value="editingTool.code"
                 :language="editorLanguage"
@@ -311,6 +337,7 @@ interface Tool {
   name: string
   description: string
   enabled: boolean
+  isUserTool?: boolean
 }
 
 interface ToolDetails {
@@ -347,6 +374,7 @@ const hasChanges = ref(false)
 const showTestPanel = ref(false)
 const showCreateModal = ref(false)
 const showDeleteModal = ref(false)
+const loadingSource = ref(false)
 const activeTab = ref<'details' | 'code'>('details')
 
 // Editing state
@@ -355,6 +383,7 @@ const editingTool = ref({
   description: '',
   toolType: 'script' as 'script' | 'manifest',
   code: '',
+  outputTarget: 'memory' as 'memory' | 'context',
 })
 const originalCode = ref('')
 
@@ -527,6 +556,7 @@ async function selectTool(tool: Tool) {
   selectedTool.value = tool
   creating.value = false
   hasChanges.value = false
+  loadingSource.value = true
   activeTab.value = 'details'
 
   // Load tool details
@@ -534,17 +564,43 @@ async function selectTool(tool: Tool) {
     const result = await invoke<{ tool: ToolDetails }>('get_tool', { name: tool.name })
     toolDetails.value = result.tool
 
-    // Try to load code if it's a user tool
     editingTool.value = {
       name: tool.name,
       description: tool.description,
       toolType: 'script',
       code: '',
+      outputTarget: 'memory',
     }
     originalCode.value = ''
+
+    // Load source code from tools directory
+    try {
+      const source = await invoke<{ name: string; source: string; language?: string; path?: string }>('get_tool_source', { name: tool.name })
+      if (source && source.source) {
+        editingTool.value.code = source.source
+        editingTool.value.toolType = source.language === 'yaml' ? 'manifest' : 'script'
+        editingTool.value.outputTarget = detectOutputTarget(source.source)
+        originalCode.value = source.source
+      }
+    } catch {
+      // Fall back to user tool manager
+      try {
+        const userTool = await invoke<{ name: string; source: string; language: string } | null>('get_user_tool', { name: tool.name })
+        if (userTool && userTool.source) {
+          editingTool.value.code = userTool.source
+          editingTool.value.toolType = userTool.language === 'yaml' ? 'manifest' : 'script'
+          editingTool.value.outputTarget = detectOutputTarget(userTool.source)
+          originalCode.value = userTool.source
+        }
+      } catch {
+        // Source not available
+      }
+    }
   } catch (e) {
     console.error('Failed to load tool details:', e)
     toolDetails.value = null
+  } finally {
+    loadingSource.value = false
   }
 }
 
@@ -566,6 +622,7 @@ function createFromTemplate(template: Template) {
     description: '',
     toolType: template.toolType,
     code: template.code,
+    outputTarget: 'memory',
   }
   originalCode.value = ''
   hasChanges.value = true
@@ -674,6 +731,59 @@ function onEditorMount(_editor: any) {
   // Editor mounted
 }
 
+/** Detect output target from tool source code */
+function detectOutputTarget(source: string): 'memory' | 'context' {
+  // Match output: "context" or output: 'context' (JS/TS)
+  if (/output:\s*["']context["']/.test(source)) return 'context'
+  // Match output: context (YAML)
+  if (/^output:\s*context\s*$/m.test(source)) return 'context'
+  return 'memory'
+}
+
+/** Sync the output target dropdown value into the tool source code */
+function syncOutputTargetToSource() {
+  const code = editingTool.value.code
+  const target = editingTool.value.outputTarget
+  const isYaml = editingTool.value.toolType === 'manifest'
+
+  if (isYaml) {
+    // YAML: add/update/remove `output: context` line
+    if (target === 'context') {
+      if (/^output:\s*\w+/m.test(code)) {
+        editingTool.value.code = code.replace(/^output:\s*\w+/m, 'output: context')
+      } else {
+        // Add after description line
+        editingTool.value.code = code.replace(
+          /^(description:.*)/m,
+          `$1\noutput: context`
+        )
+      }
+    } else {
+      // Remove the output line
+      editingTool.value.code = code.replace(/\n?\s*output:\s*(memory|context)\s*$/m, '')
+    }
+  } else {
+    // JS/TS: add/update/remove `output: "context"` field
+    if (target === 'context') {
+      if (/output:\s*["'](memory|context)["']/.test(code)) {
+        editingTool.value.code = code.replace(
+          /output:\s*["'](memory|context)["']/,
+          'output: "context"'
+        )
+      } else {
+        // Add after description line
+        editingTool.value.code = code.replace(
+          /(description:\s*["'][^"']*["'],?\s*\n)/,
+          `$1  output: "context",\n`
+        )
+      }
+    } else {
+      // Remove the output line
+      editingTool.value.code = code.replace(/\s*output:\s*["'](memory|context)["'],?\n?/, '\n')
+    }
+  }
+}
+
 // Watch for changes
 watch(() => editingTool.value.code, (newCode) => {
   hasChanges.value = newCode !== originalCode.value
@@ -683,6 +793,11 @@ watch(() => editingTool.value.description, () => {
   if (selectedTool.value && editingTool.value.description !== selectedTool.value.description) {
     hasChanges.value = true
   }
+})
+
+watch(() => editingTool.value.outputTarget, () => {
+  syncOutputTargetToSource()
+  hasChanges.value = editingTool.value.code !== originalCode.value
 })
 
 // Load on mount

@@ -78,6 +78,16 @@
               </div>
               <MarkdownContent :content="msg.content" />
 
+              <!-- Reasoning/thinking block (collapsible) -->
+              <details v-if="msg.reasoning" class="mt-2 text-xs">
+                <summary class="cursor-pointer text-nanna-text-dim hover:text-nanna-text-secondary">
+                  Thinking
+                </summary>
+                <div class="mt-1 p-2 bg-nanna-bg-deep rounded whitespace-pre-wrap max-h-[200px] overflow-y-auto text-nanna-text-dim">
+                  {{ msg.reasoning }}
+                </div>
+              </details>
+
               <!-- Tool calls for this message -->
               <div v-if="msg.toolCalls?.length" class="mt-3 space-y-2">
                 <ToolCallCard
@@ -112,11 +122,20 @@
             <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
+              <!-- Live thinking indicator -->
+              <details v-if="streamingThinking" class="mb-2 text-xs" open>
+                <summary class="cursor-pointer text-nanna-text-dim hover:text-nanna-text-secondary">
+                  Thinking...
+                </summary>
+                <div class="mt-1 p-2 bg-nanna-bg-deep rounded whitespace-pre-wrap max-h-[150px] overflow-y-auto text-nanna-text-dim">
+                  {{ streamingThinking }}
+                </div>
+              </details>
               <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
                 <MarkdownContent :content="streamingContent" />
                 <span class="cursor-blink inline-block ml-0.5">▋</span>
               </div>
-              <div v-else class="text-nanna-text-muted flex items-center gap-2">
+              <div v-else-if="!streamingThinking" class="text-nanna-text-muted flex items-center gap-2">
                 <span class="animate-pulse">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
@@ -202,7 +221,9 @@
           v-model="input"
           :placeholder="hasActiveWork ? 'Type to queue a message...' : 'Type your message...'"
           :disabled="false"
+          :is-active="hasActiveWork"
           @submit="sendMessage"
+          @stop="stopSession"
         />
       </div>
     </div>
@@ -234,6 +255,7 @@ interface Message {
   content: string
   timestamp: string
   toolCalls?: ToolCallInfo[]
+  reasoning?: string
 }
 
 interface SessionInfo {
@@ -296,6 +318,7 @@ const {
   isLoading,
   isStreaming,
   streamingContent,
+  streamingThinking,
   activeToolCalls,
   messageQueue,
   hasActiveWork,
@@ -312,6 +335,7 @@ const {
 
 let unlistenChunk: UnlistenFn | null = null
 let unlistenTool: UnlistenFn | null = null
+let unlistenThinking: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -484,17 +508,18 @@ onMounted(async () => {
       // Streaming complete - finalize message
       const finalContent = sessionState.streamingContent.value
       const finalToolCalls = [...sessionState.activeToolCalls.value]
+      const finalThinking = sessionState.streamingThinking.value || undefined
 
       // Clear streaming state
       sessionState.clearStreamingState()
 
       // If this is the current session, add to messages
       if (eventSessionId === currentSession.value?.id) {
-        if (finalContent || finalToolCalls.length > 0) {
+        if (finalContent || finalToolCalls.length > 0 || finalThinking) {
           messages.value.push({
             id: Date.now().toString(),
             role: 'assistant',
-            content: finalContent,
+            content: finalContent || (finalThinking ? '*[thinking only — no visible response]*' : ''),
             timestamp: new Date().toISOString(),
             toolCalls: finalToolCalls.map(t => ({
               id: t.id,
@@ -504,6 +529,7 @@ onMounted(async () => {
               success: t.success,
               duration_ms: t.duration_ms,
             })),
+            reasoning: finalThinking,
           })
 
           // Notify if window is not focused
@@ -553,6 +579,13 @@ onMounted(async () => {
     }
   })
 
+  // Listen for thinking/reasoning chunks
+  unlistenThinking = await listen<{ session_id: string; delta: string }>('thinking-chunk', (event) => {
+    const eventSessionId = event.payload.session_id
+    const sessionState = useSessionState(ref(eventSessionId))
+    sessionState.streamingThinking.value += event.payload.delta
+  })
+
   // Load initial session (listeners are already active to capture any events)
   await loadSession()
 })
@@ -560,6 +593,7 @@ onMounted(async () => {
 onUnmounted(() => {
   if (unlistenChunk) unlistenChunk()
   if (unlistenTool) unlistenTool()
+  if (unlistenThinking) unlistenThinking()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null
@@ -589,6 +623,24 @@ watch(() => route.query.session, async (newSessionId) => {
     await loadSession()
   }
 })
+
+async function stopSession() {
+  if (!currentSession.value) return
+  try {
+    const cancelled = await invoke<boolean>('cancel_session', {
+      sessionId: currentSession.value.id,
+    })
+    if (cancelled) {
+      // Append cancellation note to streaming content
+      if (streamingContent.value) {
+        streamingContent.value += '\n\n[Stopped by user]'
+      }
+      clearStreamingState()
+    }
+  } catch (e) {
+    console.error('Failed to cancel session:', e)
+  }
+}
 
 async function sendMessage() {
   if (!input.value.trim() || !currentSession.value) return

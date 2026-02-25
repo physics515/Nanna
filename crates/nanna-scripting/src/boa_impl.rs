@@ -192,6 +192,46 @@ fn register_nanna_bridge(context: &mut Context) -> Result<()> {
             js_string!("exec"),
             2,
         )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_read_file),
+            js_string!("readFile"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_write_file),
+            js_string!("writeFile"),
+            2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_list_dir),
+            js_string!("listDir"),
+            2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_stat),
+            js_string!("stat"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_fetch),
+            js_string!("fetch"),
+            2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_get_env),
+            js_string!("getEnv"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_list_tools),
+            js_string!("listTools"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_service),
+            js_string!("service"),
+            2,
+        )
         .property(
             js_string!("platform"),
             js_string!(NannaBridge::platform()),
@@ -219,6 +259,20 @@ fn nanna_log(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<J
     }
     
     Ok(JsValue::undefined())
+}
+
+fn nanna_list_tools(_: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    match bridge.list_tools() {
+        Some(defs) => json_to_js(defs, context).map_err(|e| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
+        }),
+        None => Ok(JsValue::null()),
+    }
 }
 
 fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -270,6 +324,231 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             tracing::error!(target: "script", "Exec failed: {}", e);
             Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str()))))
         }
+    }
+}
+
+fn nanna_read_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let path = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.read_file(&path))
+    })
+    .join()
+    .map_err(|_| {
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+
+    match result {
+        Ok(content) => Ok(JsValue::from(js_string!(content.as_str()))),
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
+    }
+}
+
+fn nanna_write_file(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let path = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let content = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.write_file(&path, &content))
+    })
+    .join()
+    .map_err(|_| {
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+
+    match result {
+        Ok(()) => Ok(JsValue::undefined()),
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
+    }
+}
+
+fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let path = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let recursive = args.get(1)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .map(|v| v.to_boolean())
+        .unwrap_or(false);
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.list_dir(&path, recursive))
+    })
+    .join()
+    .map_err(|_| {
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+
+    match result {
+        Ok(entries) => {
+            let js_array = boa_engine::object::builtins::JsArray::new(context);
+            for entry in entries {
+                let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+                obj.set(js_string!("name"), JsValue::from(js_string!(entry.name.as_str())), false, context)?;
+                obj.set(js_string!("entry_type"), JsValue::from(js_string!(entry.entry_type.as_str())), false, context)?;
+                obj.set(js_string!("size"), JsValue::from(entry.size as f64), false, context)?;
+                obj.set(js_string!("modified"), entry.modified.map_or(JsValue::null(), |m| JsValue::from(m as f64)), false, context)?;
+                js_array.push(JsValue::from(obj), context)?;
+            }
+            Ok(js_array.into())
+        }
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
+    }
+}
+
+fn nanna_stat(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let path = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.stat(&path))
+    })
+    .join()
+    .map_err(|_| {
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+
+    match result {
+        Ok(stat) => {
+            let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("size"), JsValue::from(stat.size as f64), false, context)?;
+            obj.set(js_string!("is_file"), JsValue::from(stat.is_file), false, context)?;
+            obj.set(js_string!("is_dir"), JsValue::from(stat.is_dir), false, context)?;
+            obj.set(js_string!("modified"), stat.modified.map_or(JsValue::null(), |m| JsValue::from(m as f64)), false, context)?;
+            Ok(obj.into())
+        }
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
+    }
+}
+
+fn nanna_fetch(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let url = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+
+    // Parse optional options object
+    let options = if let Some(opts_val) = args.get(1).filter(|v| v.is_object()) {
+        let opts_json = js_to_json(opts_val, context).map_err(|e| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
+        })?;
+        serde_json::from_value::<crate::bridge::FetchOptions>(opts_json).ok()
+    } else {
+        None
+    };
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.fetch(&url, options))
+    })
+    .join()
+    .map_err(|_| {
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+
+    match result {
+        Ok(response) => {
+            let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            obj.set(js_string!("status"), JsValue::from(response.status as f64), false, context)?;
+            obj.set(js_string!("body"), JsValue::from(js_string!(response.body.as_str())), false, context)?;
+            // Convert headers to JS object
+            let headers_obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
+            for (key, value) in &response.headers {
+                headers_obj.set(js_string!(key.as_str()), JsValue::from(js_string!(value.as_str())), false, context)?;
+            }
+            obj.set(js_string!("headers"), JsValue::from(headers_obj), false, context)?;
+            Ok(obj.into())
+        }
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
+    }
+}
+
+fn nanna_get_env(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let key = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    // get_env is sync — no thread spawn needed
+    match bridge.get_env(&key) {
+        Ok(Some(value)) => Ok(JsValue::from(js_string!(value.as_str()))),
+        Ok(None) => Ok(JsValue::null()),
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
+    }
+}
+
+fn nanna_service(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let params = if let Some(p) = args.get(1).filter(|v| v.is_object()) {
+        js_to_json(p, context).map_err(|e| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
+        })?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    let bridge = BRIDGE.with(|b| b.borrow().clone())
+        .ok_or_else(|| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!("Bridge not initialized")))
+        })?;
+
+    let result = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create runtime");
+        rt.block_on(bridge.call_service(&name, params))
+    })
+    .join()
+    .map_err(|_| {
+        boa_engine::JsError::from_opaque(JsValue::from(js_string!("Thread panicked")))
+    })?;
+
+    match result {
+        Ok(value) => json_to_js(&value, context).map_err(|e| {
+            boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
+        }),
+        Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.as_str())))),
     }
 }
 

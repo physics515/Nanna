@@ -139,6 +139,7 @@ mod tools_impl {
                 name: self.full_name(),
                 description: self.tool.description.clone().unwrap_or_default(),
                 parameters: Self::schema_to_parameters(&self.tool.input_schema),
+                output_schema: None,
             }
         }
 

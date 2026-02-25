@@ -18,6 +18,7 @@ async-trait.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures = "0.3"
+nanna-storage = { path = "../nanna-storage" }
 
 nanna-llm = { path = "../nanna-llm" }
 nanna-tools = { path = "../nanna-tools" }

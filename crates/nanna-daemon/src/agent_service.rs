@@ -5,12 +5,12 @@
 use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
 use crate::session::{MessageRole, SessionId, SessionMessage, ToolCallRecord};
-use nanna_agent::{Agent, AgentConfig, RunOptions, ThinkingMode};
+use nanna_agent::{Agent, AgentConfig, ModelTier, RunOptions, ThinkingMode};
 use nanna_llm::{AnthropicMessage, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
 use nanna_tools::ToolRegistry;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -43,6 +43,11 @@ pub struct AgentServiceConfig {
     pub summarization_priority: Vec<String>,
     /// Ollama URL for summarization
     pub summarization_ollama_url: Option<String>,
+    /// Model routing priority for cost optimization.
+    /// Format: ["model:tier", ...] where tier is simple|medium|complex.
+    pub model_routing: Vec<String>,
+    /// Whether to use primary model for first iteration
+    pub routing_first_turn_primary: bool,
 }
 
 impl Default for AgentServiceConfig {
@@ -56,14 +61,20 @@ impl Default for AgentServiceConfig {
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
+            model_routing: vec![],
+            routing_first_turn_primary: true,
         }
     }
 }
 
 /// Active chat request state
 struct ActiveChat {
+    #[allow(dead_code)]
+    // Used for future session tracking features
     session_id: SessionId,
     cancelled: bool,
+    /// Shared cancellation flag passed into the agent loop for cooperative cancellation
+    cancellation_flag: Arc<AtomicBool>,
     started_at: chrono::DateTime<chrono::Utc>,
     /// Accumulated streamed text (shared with on_text callback)
     accumulated_text: Arc<tokio::sync::RwLock<String>>,
@@ -117,7 +128,8 @@ pub struct AgentService {
     event_tx: broadcast::Sender<Event>,
     /// Currently active chats (session_id -> state)
     active_chats: Arc<RwLock<HashMap<SessionId, ActiveChat>>>,
-    /// Cache for model capabilities
+    #[allow(dead_code)]
+    // Reserved for future model caching optimization
     model_cache: Option<ModelInfoCache>,
     /// Cached model info for current model
     current_model_info: Arc<RwLock<Option<ModelInfo>>>,
@@ -218,6 +230,8 @@ impl AgentService {
             thinking_mode: config.thinking_mode,
             summarization_priority: config.summarization_priority.clone(),
             summarization_ollama_url: config.summarization_ollama_url.clone(),
+            model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
+            routing_first_turn_primary: config.routing_first_turn_primary,
             ..Default::default()
         }
     }
@@ -277,6 +291,7 @@ impl AgentService {
         let accumulated = Arc::new(tokio::sync::RwLock::new(String::new()));
         let active_tools = Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new()));
         let completed_tools = Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new()));
+        let cancellation_flag = Arc::new(AtomicBool::new(false));
 
         // Register this chat as active (for streaming state tracking)
         {
@@ -284,6 +299,7 @@ impl AgentService {
             active.insert(session_id.to_string(), ActiveChat {
                 session_id: session_id.to_string(),
                 cancelled: false,
+                cancellation_flag: cancellation_flag.clone(),
                 started_at: chrono::Utc::now(),
                 accumulated_text: accumulated.clone(),
                 active_tool_calls: active_tools.clone(),
@@ -299,7 +315,10 @@ impl AgentService {
             message_id: message_id.clone(),
         });
 
-        // Build model list to try (priority list, falling back to single model)
+        // Build model list to try (priority list, falling back to single model).
+        // This is rebuilt fresh on every chat() call — no persistent "last successful model"
+        // state. Each invocation (including heartbeats) always starts from the top of the
+        // priority list, so transient failures don't permanently shift the preferred model.
         let models_to_try: Vec<String> = {
             let config = self.config.read().await;
             if config.model_priority.is_empty() {
@@ -316,19 +335,34 @@ impl AgentService {
             tried_models.push(model.clone());
             info!("Trying model: {} (attempt {})", model, tried_models.len());
 
+            // Notify clients which model we're using
+            let fallback_reason = if tried_models.len() > 1 {
+                Some(last_error.clone())
+            } else {
+                None
+            };
+            let _ = self.event_tx.send(Event::ModelSwitch {
+                model: model.clone(),
+                reason: fallback_reason,
+            });
+
             // Get the correct LLM client for this model from the router
             let llm_client = match self.router.client_for_model(model) {
                 Some(client) => client,
                 None => {
-                    warn!("No provider available for model: {}", model);
-                    last_error = format!("No provider configured for model: {}", model);
+                    let detected = crate::llm_router::ProviderId::from_model(model);
+                    warn!(
+                        "No provider for model: {} (detected: {:?}, available: {:?})",
+                        model, detected, self.router.available_providers()
+                    );
+                    last_error = format!("No provider for model: {} (detected: {:?})", model, detected);
                     continue;
                 }
             };
 
             // Create agent config with this model
             let mut agent_config = self.agent_config().await;
-            agent_config.model = model.clone();
+            agent_config.model = LlmRouter::strip_model_prefix(model);
 
             // Get model info for context configuration
             let model_info = self.router.get_model_info(model).await;
@@ -374,7 +408,13 @@ impl AgentService {
             let has_memory = memory_for_extraction.is_some();
 
             let accumulated_for_cb = accumulated.clone();
+            let event_tx_thinking = self.event_tx.clone();
+            let session_id_thinking = session_id.to_string();
+            let event_tx_tool_start = self.event_tx.clone();
+            let session_id_tool_start = session_id.to_string();
+            let active_tools_for_cb = active_tools.clone();
             let options = RunOptions {
+                cancellation_flag: Some(cancellation_flag.clone()),
                 on_text: Some(Box::new(move |chunk: &str| {
                     // Accumulate text for run state recovery
                     if let Ok(mut buf) = accumulated_for_cb.try_write() {
@@ -384,6 +424,28 @@ impl AgentService {
                         session_id: session_id_for_stream.clone(),
                         message_id: String::new(),
                         delta: chunk.to_string(),
+                    });
+                })),
+                on_thinking: Some(Box::new(move |chunk: &str| {
+                    let _ = event_tx_thinking.send(Event::ThinkingDelta {
+                        session_id: session_id_thinking.clone(),
+                        delta: chunk.to_string(),
+                    });
+                })),
+                on_tool_start: Some(Box::new(move |call_id: &str, name: &str, input: &serde_json::Value| {
+                    // Track active tool calls for run state recovery
+                    if let Ok(mut tools) = active_tools_for_cb.try_write() {
+                        tools.push(ActiveToolCallInfo {
+                            call_id: call_id.to_string(),
+                            name: name.to_string(),
+                            started_at: chrono::Utc::now(),
+                        });
+                    }
+                    let _ = event_tx_tool_start.send(Event::ToolStart {
+                        session_id: session_id_tool_start.clone(),
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        input: input.clone(),
                     });
                 })),
                 // Enable auto-extraction if memory service is available
@@ -471,6 +533,7 @@ impl AgentService {
                         }).collect(),
                         input_tokens: response.input_tokens,
                         output_tokens: response.output_tokens,
+                        reasoning: response.reasoning.map(|r| r.content),
                     });
                 }
                 Err(e) => {
@@ -478,17 +541,14 @@ impl AgentService {
                     warn!("Model {} failed: {}", model, error_str);
                     last_error = error_str.clone();
 
-                    // Check if this is a recoverable error (rate limit, overloaded, etc.)
-                    let should_fallback = Self::is_recoverable_error(&error_str);
+                    // Emit error as a warning so it's visible, but continue trying
+                    let _ = self.event_tx.send(Event::Error {
+                        code: "model_error".to_string(),
+                        message: format!("Model {} failed: {}. Trying next model...", model, error_str),
+                    });
 
-                    if !should_fallback {
-                        // Non-recoverable error, don't try other models
-                        warn!("Non-recoverable error, not trying fallback models");
-                        break;
-                    }
-
-                    info!("Recoverable error, trying next model in priority list");
-                    // Continue to next model
+                    // Always fall back to next model in priority list
+                    info!("Model {} failed, trying next model in priority list", model);
                 }
             }
         }
@@ -508,8 +568,9 @@ impl AgentService {
         Err(format!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error))
     }
 
-    /// Check if an error is recoverable (should try next model)
-    fn is_recoverable_error(error: &str) -> bool {
+    /// Check if an error is a rate-limit / transient overload (may warrant retry with backoff)
+    #[allow(dead_code)]
+    fn is_rate_limit_error(error: &str) -> bool {
         let error_lower = error.to_lowercase();
 
         // Rate limit errors
@@ -542,6 +603,7 @@ impl AgentService {
         let mut active = self.active_chats.write().await;
         if let Some(chat) = active.get_mut(session_id) {
             chat.cancelled = true;
+            chat.cancellation_flag.store(true, Ordering::Relaxed);
             true
         } else {
             false
@@ -643,6 +705,7 @@ pub struct ChatResult {
     pub tool_calls: Vec<ToolCallRecord>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning: Option<String>,
 }
 
 /// Memory context for injection

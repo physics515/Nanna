@@ -7,6 +7,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("003_config", MIGRATION_003),
     ("004_workspaces", MIGRATION_004),
     ("005_job_runs", MIGRATION_005),
+    ("006_model_stats", MIGRATION_006),
 ];
 
 const MIGRATION_001: &str = r"
@@ -136,4 +137,51 @@ ALTER TABLE cron_jobs ADD COLUMN timezone TEXT DEFAULT 'UTC';
 -- Add target channel/session for cron results
 ALTER TABLE cron_jobs ADD COLUMN target_channel TEXT;
 ALTER TABLE cron_jobs ADD COLUMN target_session TEXT;
+";
+
+const MIGRATION_006: &str = r"
+-- Model performance statistics (aggregated per model)
+CREATE TABLE IF NOT EXISTS model_stats (
+    model TEXT PRIMARY KEY,
+    total_requests INTEGER NOT NULL DEFAULT 0,
+    successful_requests INTEGER NOT NULL DEFAULT 0,
+    failed_requests INTEGER NOT NULL DEFAULT 0,
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_success_epoch_ms INTEGER NOT NULL DEFAULT 0,
+    last_failure_epoch_ms INTEGER NOT NULL DEFAULT 0,
+    tier_successes_simple INTEGER NOT NULL DEFAULT 0,
+    tier_successes_medium INTEGER NOT NULL DEFAULT 0,
+    tier_successes_complex INTEGER NOT NULL DEFAULT 0,
+    tier_failures_simple INTEGER NOT NULL DEFAULT 0,
+    tier_failures_medium INTEGER NOT NULL DEFAULT 0,
+    tier_failures_complex INTEGER NOT NULL DEFAULT 0,
+    escalations INTEGER NOT NULL DEFAULT 0,
+    -- Recent latencies/throughput stored as JSON arrays (ring buffer)
+    latencies_ms_json TEXT NOT NULL DEFAULT '[]',
+    throughput_tps_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Per-request model observations (detailed log for analysis)
+CREATE TABLE IF NOT EXISTS model_request_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    tier TEXT,
+    escalated INTEGER NOT NULL DEFAULT 0,
+    session_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_request_log_model ON model_request_log(model);
+CREATE INDEX IF NOT EXISTS idx_model_request_log_created ON model_request_log(created_at);
 ";

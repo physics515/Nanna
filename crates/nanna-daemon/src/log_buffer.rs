@@ -1,23 +1,26 @@
 //! In-memory circular log buffer for recent daemon logs
 //!
-//! Captures info/error level logs and makes them available to the GUI.
+//! Captures log events via a tracing Layer and makes them available to the GUI.
+//! Uses std::sync::Mutex (not tokio) so it works before the Tokio runtime starts.
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing_subscriber::fmt::MakeWriter;
+use std::sync::{Arc, Mutex};
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::Layer;
 
 /// A single log entry
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
     pub level: String,
+    pub target: String,
     pub message: String,
 }
 
 /// Circular buffer for recent logs (last N entries)
 #[derive(Clone)]
 pub struct LogBuffer {
-    entries: Arc<RwLock<Vec<LogEntry>>>,
+    entries: Arc<Mutex<Vec<LogEntry>>>,
     max_entries: usize,
 }
 
@@ -25,14 +28,14 @@ impl LogBuffer {
     /// Create a new log buffer with max capacity
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: Arc::new(RwLock::new(Vec::with_capacity(max_entries))),
+            entries: Arc::new(Mutex::new(Vec::with_capacity(max_entries))),
             max_entries,
         }
     }
 
     /// Add a log entry
-    pub async fn push(&self, entry: LogEntry) {
-        let mut entries = self.entries.write().await;
+    pub fn push(&self, entry: LogEntry) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.push(entry);
 
         // Keep only the last N entries
@@ -43,13 +46,13 @@ impl LogBuffer {
     }
 
     /// Get all entries
-    pub async fn get_all(&self) -> Vec<LogEntry> {
-        self.entries.read().await.clone()
+    pub fn get_all(&self) -> Vec<LogEntry> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Get last N entries
-    pub async fn get_recent(&self, limit: usize) -> Vec<LogEntry> {
-        let entries = self.entries.read().await;
+    pub fn get_recent(&self, limit: usize) -> Vec<LogEntry> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
             .iter()
             .rev()
@@ -62,65 +65,66 @@ impl LogBuffer {
     }
 
     /// Clear all entries
-    pub async fn clear(&self) {
-        self.entries.write().await.clear();
+    pub fn clear(&self) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
-/// Writer that captures logs to the buffer
-pub struct LogBufferWriter {
-    buffer: LogBuffer,
-    level: String,
+// =============================================================================
+// Tracing Layer for capturing logs into the buffer
+// =============================================================================
+
+/// Visitor that extracts the message field from tracing events
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
 }
 
-impl LogBufferWriter {
-    pub fn new(buffer: LogBuffer, level: String) -> Self {
-        Self { buffer, level }
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{:?}", value);
+        }
     }
-}
 
-impl<'a> MakeWriter<'a> for LogBufferWriter {
-    type Writer = LogBufferWriterInner;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogBufferWriterInner {
-            buffer: self.buffer.clone(),
-            level: self.level.clone(),
-            message: Vec::new(),
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
         }
     }
 }
 
-pub struct LogBufferWriterInner {
+/// Tracing layer that captures events into a LogBuffer
+pub struct LogBufferLayer {
     buffer: LogBuffer,
-    level: String,
-    message: Vec<u8>,
 }
 
-impl std::io::Write for LogBufferWriterInner {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.message.extend_from_slice(buf);
-        Ok(buf.len())
+impl LogBufferLayer {
+    pub fn new(buffer: LogBuffer) -> Self {
+        Self { buffer }
     }
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        if !self.message.is_empty() {
-            let msg = String::from_utf8_lossy(&self.message).to_string();
-            let entry = LogEntry {
-                timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-                level: self.level.clone(),
-                message: msg.trim().to_string(),
-            };
+impl<S: tracing::Subscriber> Layer<S> for LogBufferLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let metadata = event.metadata();
+        let level = metadata.level().as_str().to_lowercase();
+        let target = metadata.target().to_string();
 
-            // Spawn async task to push to buffer
-            let buffer = self.buffer.clone();
-            tokio::spawn(async move {
-                buffer.push(entry).await;
-            });
+        // Extract message from event fields
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
 
-            self.message.clear();
-        }
-        Ok(())
+        let entry = LogEntry {
+            timestamp: chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+            level,
+            target,
+            message: visitor.message,
+        };
+
+        self.buffer.push(entry);
     }
 }
 
@@ -128,41 +132,39 @@ impl std::io::Write for LogBufferWriterInner {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_log_buffer() {
+    #[test]
+    fn test_log_buffer() {
         let buffer = LogBuffer::new(10);
 
         for i in 0..15 {
-            buffer
-                .push(LogEntry {
-                    timestamp: format!("2024-01-01 12:00:{:02}", i),
-                    level: "info".to_string(),
-                    message: format!("Message {}", i),
-                })
-                .await;
+            buffer.push(LogEntry {
+                timestamp: format!("2024-01-01 12:00:{:02}", i),
+                level: "info".to_string(),
+                target: "test".to_string(),
+                message: format!("Message {}", i),
+            });
         }
 
-        let entries = buffer.get_all().await;
+        let entries = buffer.get_all();
         assert_eq!(entries.len(), 10);
         assert_eq!(entries[0].message, "Message 5");
         assert_eq!(entries[9].message, "Message 14");
     }
 
-    #[tokio::test]
-    async fn test_get_recent() {
+    #[test]
+    fn test_get_recent() {
         let buffer = LogBuffer::new(100);
 
         for i in 0..20 {
-            buffer
-                .push(LogEntry {
-                    timestamp: format!("2024-01-01 12:00:{:02}", i),
-                    level: "info".to_string(),
-                    message: format!("Message {}", i),
-                })
-                .await;
+            buffer.push(LogEntry {
+                timestamp: format!("2024-01-01 12:00:{:02}", i),
+                level: "info".to_string(),
+                target: "test".to_string(),
+                message: format!("Message {}", i),
+            });
         }
 
-        let recent = buffer.get_recent(5).await;
+        let recent = buffer.get_recent(5);
         assert_eq!(recent.len(), 5);
         assert_eq!(recent[0].message, "Message 15");
         assert_eq!(recent[4].message, "Message 19");

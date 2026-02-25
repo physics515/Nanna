@@ -3,36 +3,59 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use crate::ToolError;
+use crate::{ToolError, OutputTarget};
+
+/// Serde-friendly output target field for YAML manifests.
+/// Accepts "memory" (default) or "context".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputTargetField {
+    #[default]
+    Memory,
+    Context,
+}
+
+impl From<&OutputTargetField> for OutputTarget {
+    fn from(field: &OutputTargetField) -> Self {
+        match field {
+            OutputTargetField::Memory => OutputTarget::Memory,
+            OutputTargetField::Context => OutputTarget::Context,
+        }
+    }
+}
 
 /// Skill manifest loaded from tool.yaml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillManifest {
     /// Tool name (required)
     pub name: String,
-    
+
     /// Tool description (required)
     pub description: String,
-    
+
     /// JSON Schema for parameters (optional)
     #[serde(default)]
     pub parameters: Option<Value>,
-    
+
     /// Execution method
     #[serde(flatten)]
     pub execution: ExecutionMethod,
-    
+
     /// Timeout in seconds (default: 30)
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    
+
     /// Working directory (relative to skill dir, default: skill dir)
     #[serde(default)]
     pub workdir: Option<PathBuf>,
-    
+
     /// Environment variables to set
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+
+    /// Output routing: "memory" (default) or "context"
+    #[serde(default)]
+    pub output: OutputTargetField,
 }
 
 fn default_timeout() -> u64 {
@@ -137,5 +160,30 @@ shell: hash.sh
 "#;
         let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(manifest.execution, ExecutionMethod::Shell(_)));
+    }
+
+    #[test]
+    fn test_parse_output_context() {
+        let yaml = r#"
+name: my_lookup
+description: Look something up
+output: context
+shell: lookup.sh
+"#;
+        let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(manifest.output, OutputTargetField::Context));
+        assert_eq!(OutputTarget::from(&manifest.output), OutputTarget::Context);
+    }
+
+    #[test]
+    fn test_parse_output_defaults_to_memory() {
+        let yaml = r#"
+name: runner
+description: Run a thing
+shell: run.sh
+"#;
+        let manifest: SkillManifest = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(manifest.output, OutputTargetField::Memory));
+        assert_eq!(OutputTarget::from(&manifest.output), OutputTarget::Memory);
     }
 }

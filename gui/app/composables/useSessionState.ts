@@ -30,6 +30,7 @@ interface SessionState {
   isLoading: boolean
   isStreaming: boolean
   streamingContent: string
+  streamingThinking: string
   activeToolCalls: (ToolCallInfo & { status: 'started' | 'completed' | 'error' })[]
   messageQueue: QueuedMessage[]
   lastError: string | null
@@ -46,6 +47,7 @@ function getSessionState(sessionId: string): SessionState {
       isLoading: false,
       isStreaming: false,
       streamingContent: '',
+      streamingThinking: '',
       activeToolCalls: [],
       messageQueue: [],
       lastError: null,
@@ -80,6 +82,13 @@ export function useSessionState(sessionId: Ref<string | null>) {
     get: () => state.value?.streamingContent ?? '',
     set: (val: string) => {
       if (state.value) state.value.streamingContent = val
+    }
+  })
+
+  const streamingThinking = computed({
+    get: () => state.value?.streamingThinking ?? '',
+    set: (val: string) => {
+      if (state.value) state.value.streamingThinking = val
     }
   })
 
@@ -161,6 +170,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
     if (state.value) {
       state.value.isStreaming = false
       state.value.streamingContent = ''
+      state.value.streamingThinking = ''
       state.value.activeToolCalls = []
       state.value.isLoading = false
     }
@@ -172,6 +182,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
       state.value.isLoading = false
       state.value.isStreaming = false
       state.value.streamingContent = ''
+      state.value.streamingThinking = ''
       state.value.activeToolCalls = []
       state.value.messageQueue = []
       state.value.lastError = null
@@ -197,6 +208,7 @@ export function useSessionState(sessionId: Ref<string | null>) {
     isLoading,
     isStreaming,
     streamingContent,
+    streamingThinking,
     activeToolCalls,
     messageQueue,
     lastError,
