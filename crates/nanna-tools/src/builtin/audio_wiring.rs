@@ -63,6 +63,7 @@ pub fn create_audio_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Tool;
 
     #[test]
     fn test_tts_tool_creation() {

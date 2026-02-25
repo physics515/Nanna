@@ -369,3 +369,165 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 }
+
+// =============================================================================
+// Model Stats Persistence
+// =============================================================================
+
+/// Stored model statistics row (mirrors nanna-agent::ModelStats without the dependency)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredModelStats {
+    pub model: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub consecutive_failures: u32,
+    pub last_success_epoch_ms: u64,
+    pub last_failure_epoch_ms: u64,
+    pub tier_successes_simple: u64,
+    pub tier_successes_medium: u64,
+    pub tier_successes_complex: u64,
+    pub tier_failures_simple: u64,
+    pub tier_failures_medium: u64,
+    pub tier_failures_complex: u64,
+    pub escalations: u64,
+    pub latencies_ms: Vec<u64>,
+    pub throughput_tps: Vec<f64>,
+}
+
+impl Storage {
+    /// Save model stats to the database (upsert).
+    pub async fn save_model_stats(&self, stats: &[StoredModelStats]) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        for s in stats {
+            let latencies_json = serde_json::to_string(&s.latencies_ms)?;
+            let throughput_json = serde_json::to_string(&s.throughput_tps)?;
+            conn.execute(
+                "INSERT INTO model_stats (
+                    model, total_requests, successful_requests, failed_requests,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_read_tokens, total_cache_creation_tokens,
+                    consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
+                    tier_successes_simple, tier_successes_medium, tier_successes_complex,
+                    tier_failures_simple, tier_failures_medium, tier_failures_complex,
+                    escalations, latencies_ms_json, throughput_tps_json, updated_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,datetime('now'))
+                ON CONFLICT(model) DO UPDATE SET
+                    total_requests=?2, successful_requests=?3, failed_requests=?4,
+                    total_input_tokens=?5, total_output_tokens=?6,
+                    total_cache_read_tokens=?7, total_cache_creation_tokens=?8,
+                    consecutive_failures=?9, last_success_epoch_ms=?10, last_failure_epoch_ms=?11,
+                    tier_successes_simple=?12, tier_successes_medium=?13, tier_successes_complex=?14,
+                    tier_failures_simple=?15, tier_failures_medium=?16, tier_failures_complex=?17,
+                    escalations=?18, latencies_ms_json=?19, throughput_tps_json=?20, updated_at=datetime('now')",
+                turso::params![
+                    s.model.clone(),
+                    s.total_requests as i64,
+                    s.successful_requests as i64,
+                    s.failed_requests as i64,
+                    s.total_input_tokens as i64,
+                    s.total_output_tokens as i64,
+                    s.total_cache_read_tokens as i64,
+                    s.total_cache_creation_tokens as i64,
+                    s.consecutive_failures as i64,
+                    s.last_success_epoch_ms as i64,
+                    s.last_failure_epoch_ms as i64,
+                    s.tier_successes_simple as i64,
+                    s.tier_successes_medium as i64,
+                    s.tier_successes_complex as i64,
+                    s.tier_failures_simple as i64,
+                    s.tier_failures_medium as i64,
+                    s.tier_failures_complex as i64,
+                    s.escalations as i64,
+                    latencies_json,
+                    throughput_json
+                ],
+            ).await?;
+        }
+        Ok(())
+    }
+
+    /// Load all model stats from the database.
+    pub async fn load_model_stats(&self) -> Result<Vec<StoredModelStats>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT model, total_requests, successful_requests, failed_requests,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_read_tokens, total_cache_creation_tokens,
+                    consecutive_failures, last_success_epoch_ms, last_failure_epoch_ms,
+                    tier_successes_simple, tier_successes_medium, tier_successes_complex,
+                    tier_failures_simple, tier_failures_medium, tier_failures_complex,
+                    escalations, latencies_ms_json, throughput_tps_json
+             FROM model_stats",
+            (),
+        ).await?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let latencies_json: String = row.get::<String>(18)?;
+            let throughput_json: String = row.get::<String>(19)?;
+            result.push(StoredModelStats {
+                model: row.get::<String>(0)?,
+                total_requests: row.get::<i64>(1)? as u64,
+                successful_requests: row.get::<i64>(2)? as u64,
+                failed_requests: row.get::<i64>(3)? as u64,
+                total_input_tokens: row.get::<i64>(4)? as u64,
+                total_output_tokens: row.get::<i64>(5)? as u64,
+                total_cache_read_tokens: row.get::<i64>(6)? as u64,
+                total_cache_creation_tokens: row.get::<i64>(7)? as u64,
+                consecutive_failures: row.get::<i64>(8)? as u32,
+                last_success_epoch_ms: row.get::<i64>(9)? as u64,
+                last_failure_epoch_ms: row.get::<i64>(10)? as u64,
+                tier_successes_simple: row.get::<i64>(11)? as u64,
+                tier_successes_medium: row.get::<i64>(12)? as u64,
+                tier_successes_complex: row.get::<i64>(13)? as u64,
+                tier_failures_simple: row.get::<i64>(14)? as u64,
+                tier_failures_medium: row.get::<i64>(15)? as u64,
+                tier_failures_complex: row.get::<i64>(16)? as u64,
+                escalations: row.get::<i64>(17)? as u64,
+                latencies_ms: serde_json::from_str(&latencies_json).unwrap_or_default(),
+                throughput_tps: serde_json::from_str(&throughput_json).unwrap_or_default(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Log a single model request observation (detailed per-request log).
+    pub async fn log_model_request(
+        &self,
+        model: &str,
+        success: bool,
+        latency_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_creation_tokens: u32,
+        tier: Option<&str>,
+        escalated: bool,
+        session_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO model_request_log (model, success, latency_ms, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, tier, escalated, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            turso::params![
+                model,
+                success as i64,
+                latency_ms as i64,
+                input_tokens as i64,
+                output_tokens as i64,
+                cache_read_tokens as i64,
+                cache_creation_tokens as i64,
+                tier.unwrap_or(""),
+                escalated as i64,
+                session_id.unwrap_or("")
+            ],
+        ).await?;
+        Ok(())
+    }
+}

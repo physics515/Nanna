@@ -20,7 +20,7 @@ pub enum ProviderId {
 
 impl ProviderId {
     /// Parse provider from model string prefix
-    fn from_model(model: &str) -> Self {
+    pub fn from_model(model: &str) -> Self {
         let lower = model.to_lowercase();
 
         if lower.starts_with("openrouter/") {
@@ -33,6 +33,9 @@ impl ProviderId {
             ProviderId::OpenAI
         } else if lower.starts_with("claude") {
             ProviderId::Anthropic
+        } else if lower.contains(':') {
+            // Tag notation (e.g., "deepseek-r1:14b", "llama3.2:latest") = local Ollama model
+            ProviderId::Ollama
         } else {
             // Default to Anthropic for unknown models
             ProviderId::Anthropic
@@ -110,6 +113,13 @@ impl LlmRouter {
     pub fn with_ollama(mut self, host: &str) -> Self {
         info!("Adding Ollama provider to router");
         self.providers.insert(ProviderId::Ollama, Arc::new(LlmClient::ollama(host)));
+        self
+    }
+
+    /// Add an Ollama provider with API key authentication
+    pub fn with_ollama_authenticated(mut self, host: &str, api_key: &str) -> Self {
+        info!("Adding Ollama provider to router (authenticated)");
+        self.providers.insert(ProviderId::Ollama, Arc::new(LlmClient::ollama_with_key(host, api_key)));
         self
     }
 

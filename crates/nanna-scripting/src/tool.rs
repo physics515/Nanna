@@ -146,6 +146,16 @@ impl ToolPermissions {
     }
 }
 
+/// Where a tool's output should be routed after execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OutputTarget {
+    /// Large results are chunked and stored in memory; a stub replaces them in context (default).
+    #[default]
+    Memory,
+    /// Results always stay in context. Large results are summarized (or truncated as fallback).
+    Context,
+}
+
 /// Tool manifest extracted from source
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolManifest {
@@ -155,6 +165,9 @@ pub struct ToolManifest {
     pub description: Option<String>,
     /// Input parameter schema (JSON Schema)
     pub parameters: Option<Value>,
+    /// Where tool output should be routed
+    #[serde(default)]
+    pub output: OutputTarget,
 }
 
 /// Extract manifest from tool source (looks for default export)
@@ -164,11 +177,16 @@ pub fn extract_manifest(source: &str) -> Option<ToolManifest> {
     
     let name = extract_string_field(source, "name")?;
     let description = extract_string_field(source, "description");
-    
+    let output = match extract_string_field(source, "output").as_deref() {
+        Some("context") => OutputTarget::Context,
+        _ => OutputTarget::Memory,
+    };
+
     Some(ToolManifest {
         name,
         description,
         parameters: None, // TODO: Parse parameters schema
+        output,
     })
 }
 
@@ -212,6 +230,40 @@ mod tests {
         let manifest = extract_manifest(source).unwrap();
         assert_eq!(manifest.name, "greet");
         assert_eq!(manifest.description, Some("Greet someone by name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_manifest_with_output_context() {
+        let source = r#"
+            export default {
+                name: "recall",
+                description: "Search memory",
+                output: "context",
+                execute({ query }) {
+                    return "results";
+                }
+            }
+        "#;
+
+        let manifest = extract_manifest(source).unwrap();
+        assert_eq!(manifest.name, "recall");
+        assert_eq!(manifest.output, OutputTarget::Context);
+    }
+
+    #[test]
+    fn test_extract_manifest_output_defaults_to_memory() {
+        let source = r#"
+            export default {
+                name: "exec",
+                description: "Run a command",
+                execute({ command }) {
+                    return "done";
+                }
+            }
+        "#;
+
+        let manifest = extract_manifest(source).unwrap();
+        assert_eq!(manifest.output, OutputTarget::Memory);
     }
 
     #[test]

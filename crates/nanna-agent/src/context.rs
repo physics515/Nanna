@@ -1,8 +1,7 @@
 //! Agent context management
 
-use crate::chunker::{chunk_and_hash, dedup_coverage};
-use crate::summarizer::{new_summary_cache, SummaryCache, Summarizer, SummarizerConfig};
-use nanna_llm::{AnthropicMessage, ContentBlock, LlmClient, ModelInfo, RequestBuilder};
+use crate::chunker::Chunk;
+use nanna_llm::{AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient, ModelInfo, RequestBuilder};
 use nanna_workspace::{Workspace, WorkspaceFiles};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +14,24 @@ const DEDUP_MIN_SIZE: usize = 4_000; // Lowered since CDC handles small chunks w
 
 /// Threshold for considering content "mostly duplicate" (0.0-1.0)
 const DEDUP_THRESHOLD: f32 = 0.7;
+
+/// Calculate deduplication coverage: fraction of chunks whose hashes are already known.
+fn dedup_coverage(content: &str, known_hashes: &HashSet<u64>) -> f32 {
+    let chunks = Chunk::split_on_boundaries(content);
+    if chunks.is_empty() {
+        return 0.0;
+    }
+    let known_count = chunks.iter().filter(|c| known_hashes.contains(&c.hash)).count();
+    known_count as f32 / chunks.len() as f32
+}
+
+/// Get chunk hashes for content (for dedup tracking after summarization).
+fn chunk_and_hash(content: &str) -> Vec<u64> {
+    Chunk::split_on_boundaries(content)
+        .into_iter()
+        .map(|c| c.hash)
+        .collect()
+}
 
 /// Configuration for context summarization
 #[derive(Debug, Clone, Default)]
@@ -129,9 +146,6 @@ pub struct AgentContext {
     /// since it's already represented in the consolidated_summary.
     #[serde(default)]
     summarized_content_hashes: HashSet<u64>,
-    /// Cache for summarization results (not serialized, recreated on load)
-    #[serde(skip)]
-    summary_cache: Option<SummaryCache>,
 }
 
 fn default_include_memory() -> bool {
@@ -166,23 +180,7 @@ impl AgentContext {
             include_workspace_memory: true,
             consolidated_summary: None,
             summarized_content_hashes: HashSet::new(),
-            summary_cache: Some(new_summary_cache()),
         }
-    }
-
-    /// Initialize the summary cache if not already present (useful after deserialization)
-    pub fn ensure_summary_cache(&mut self) {
-        if self.summary_cache.is_none() {
-            self.summary_cache = Some(new_summary_cache());
-        }
-    }
-
-    /// Get the summary cache (initializing if needed)
-    fn get_or_init_cache(&mut self) -> SummaryCache {
-        if self.summary_cache.is_none() {
-            self.summary_cache = Some(new_summary_cache());
-        }
-        self.summary_cache.clone().unwrap()
     }
 
     /// Get messages for API request, prepending consolidated summary if present.
@@ -191,6 +189,7 @@ impl AgentContext {
     /// - If we have a consolidated summary, it's injected as a "context" user message
     /// - Large content blocks that match previously summarized content are deduplicated
     /// - This way, previously summarized content is included without re-processing
+    /// - Final messages are sanitized to remove empty text blocks (Anthropic rejects them)
     pub fn messages_for_request(&self) -> Vec<AnthropicMessage> {
         // Deduplicate messages if we have summarized content hashes
         let deduped_messages = if self.summarized_content_hashes.is_empty() {
@@ -199,7 +198,7 @@ impl AgentContext {
             self.deduplicate_messages()
         };
 
-        if let Some(ref summary) = self.consolidated_summary {
+        let raw = if let Some(ref summary) = self.consolidated_summary {
             let mut messages = Vec::with_capacity(deduped_messages.len() + 2);
 
             // Inject summary as first user message with clear framing
@@ -220,7 +219,31 @@ impl AgentContext {
         } else {
             // No summary, just return (possibly deduplicated) messages
             deduped_messages
-        }
+        };
+
+        // Sanitize: remove empty text blocks and ensure every message has content
+        Self::sanitize_messages(raw)
+    }
+
+    /// Remove empty text blocks from messages and ensure every message has at least one content block.
+    /// Anthropic API rejects requests with empty text content blocks.
+    fn sanitize_messages(messages: Vec<AnthropicMessage>) -> Vec<AnthropicMessage> {
+        messages
+            .into_iter()
+            .map(|mut msg| {
+                // Remove empty text blocks
+                msg.content.retain(|block| {
+                    !matches!(block, ContentBlock::Text { text } if text.is_empty())
+                });
+                // Ensure message has at least one content block
+                if msg.content.is_empty() {
+                    msg.content.push(ContentBlock::Text {
+                        text: "[No content]".to_string(),
+                    });
+                }
+                msg
+            })
+            .collect()
     }
 
     /// Deduplicate messages by replacing large content blocks that were already summarized.
@@ -640,7 +663,7 @@ impl AgentContext {
     fn truncate_large_content_blocks(&mut self) {
         // Target: leave room for output tokens
         let target_tokens = self.hard_limit.saturating_sub(10_000);
-        let max_block_chars = target_tokens * 4; // ~4 chars per token
+        let max_block_chars = (target_tokens * 4).max(100); // ~4 chars per token, floor at 100
 
         for msg in &mut self.messages {
             for block in &mut msg.content {
@@ -741,9 +764,6 @@ impl AgentContext {
             return Ok(0);
         }
 
-        // Get or create the summary cache for reuse across iterations
-        let cache = self.get_or_init_cache();
-
         let mut iterations = 0;
         let max_chars_per_chunk = config.summarizer_context_window * 4; // ~4 chars per token
 
@@ -767,8 +787,8 @@ impl AgentContext {
                 break;
             }
 
-            // Try to summarize with fallback (using shared cache)
-            match Self::summarize_content_with_fallback(&content_to_summarize, config, &cache).await
+            // Try to summarize with fallback
+            match Self::summarize_content_with_fallback(&content_to_summarize, config).await
             {
                 Ok(summary) => {
                     info!(
@@ -849,12 +869,11 @@ impl AgentContext {
     async fn summarize_content_with_fallback(
         content: &str,
         config: &ContextSummarizationConfig,
-        cache: &SummaryCache,
     ) -> Result<String, String> {
         for model_spec in &config.model_priority {
             debug!(model = %model_spec, "Attempting summarization");
 
-            match Self::try_summarize_with_model(model_spec, content, config, cache).await {
+            match Self::try_summarize_with_model(model_spec, content, config).await {
                 Ok(summary) => {
                     info!(model = %model_spec, "Summarization succeeded");
                     return Ok(summary);
@@ -868,30 +887,56 @@ impl AgentContext {
         Err("All summarization models failed".to_string())
     }
 
-    /// Try to summarize with a specific model (uses shared cache for efficiency)
+    /// Try to summarize with a specific model via direct LLM call
     async fn try_summarize_with_model(
         model_spec: &str,
         content: &str,
         config: &ContextSummarizationConfig,
-        cache: &SummaryCache,
     ) -> Result<String, String> {
         let (client, model_name) = Self::create_client_for_model(model_spec, config)?;
 
-        let summarizer_config = SummarizerConfig {
-            model: model_name,
-            chunk_size: config.summarizer_context_window * 4, // chars
-            target_summary_size: (config.summarizer_context_window * 4) / 4, // 25% of input
-            chunk_overlap: 500,
-            // Use half the context window to reduce VRAM/KV cache usage,
-            // allowing more model layers to fit on GPU
-            context_limit: Some((config.summarizer_context_window / 2) as u32),
+        // Truncate content to fit the summarizer's context window
+        let max_chars = config.summarizer_context_window * 4; // ~4 chars per token
+        let truncated = if content.len() > max_chars {
+            &content[..max_chars]
+        } else {
+            content
         };
 
-        // Use shared cache to avoid re-summarizing the same content
-        let summarizer = Summarizer::with_shared_cache(client, summarizer_config, cache.clone());
-        let context_hint = "This is conversation history. Preserve key facts, decisions, file paths, code snippets, and important context needed to continue the conversation.";
+        let prompt = format!(
+            "Summarize the following conversation history concisely. Preserve key facts, decisions, \
+             file paths, code snippets, and important context needed to continue the conversation.\n\n\
+             ---\n{}\n---\n\nProvide a concise summary:",
+            truncated
+        );
 
-        summarizer.summarize(content, context_hint).await
+        let request = AnthropicRequest {
+            model: model_name,
+            messages: vec![AnthropicMessage::user_text(prompt)],
+            max_tokens: 2048,
+            temperature: Some(0.3),
+            system: Some("You are a conversation summarizer. Output only the summary, no preamble.".to_string()),
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        };
+
+        let response = client.complete_anthropic(&request).await.map_err(|e| e.to_string())?;
+
+        // Extract text from response
+        let mut summary = String::new();
+        for block in &response.content {
+            if let ContentBlock::Text { text } = block {
+                summary.push_str(text);
+            }
+        }
+
+        if summary.is_empty() {
+            Err("Empty summary returned".to_string())
+        } else {
+            Ok(summary)
+        }
     }
 
     /// Create an LLM client for the specified model

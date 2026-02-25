@@ -1,6 +1,6 @@
 //! Executable tool wrapper (Python, shell, binary, command)
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult, ParameterType, ToolParameter};
+use crate::{Tool, ToolDefinition, ToolError, ToolResult, ParameterType, ToolParameter, OutputTarget};
 use crate::skills::manifest::{SkillManifest, ExecutionMethod};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -113,6 +113,7 @@ impl Tool for ExecutableTool {
             name: self.manifest.name.clone(),
             description: self.manifest.description.clone(),
             parameters,
+            output_schema: None,
         }
     }
 
@@ -165,6 +166,10 @@ impl Tool for ExecutableTool {
         }
         
         Ok(ToolResult::success(stdout.trim().to_string()))
+    }
+
+    fn output_target(&self) -> OutputTarget {
+        OutputTarget::from(&self.manifest.output)
     }
 
     fn timeout_secs(&self) -> Option<u64> {

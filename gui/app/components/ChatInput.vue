@@ -59,8 +59,18 @@
           </span>
         </div>
         
-        <!-- Right: send button -->
-        <UiButton 
+        <!-- Right: stop or send button -->
+        <UiButton
+          v-if="isActive"
+          @click="emit('stop')"
+          size="sm"
+          class="shrink-0 !bg-red-600 hover:!bg-red-700 !border-red-600"
+        >
+          <Square class="w-3.5 h-3.5 sm:mr-1 fill-current" />
+          <span class="hidden sm:inline">Stop</span>
+        </UiButton>
+        <UiButton
+          v-else
           @click="submit"
           :disabled="isEmpty || disabled"
           size="sm"
@@ -81,18 +91,20 @@ import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
 import { MonacoCodeBlock } from '~/extensions/MonacoCodeBlock'
-import { Send, Eye, X } from 'lucide-vue-next'
+import { Send, Eye, X, Square } from 'lucide-vue-next'
 
 const props = defineProps<{
   modelValue: string
   placeholder?: string
   disabled?: boolean
   maxHeight?: number
+  isActive?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'update:modelValue', value: string): void
   (e: 'submit'): void
+  (e: 'stop'): void
 }>()
 
 const isFocused = ref(false)

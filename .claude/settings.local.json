@@ -55,7 +55,16 @@
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:rastrigin.systems)",
       "WebFetch(domain:news.ycombinator.com)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(git stash:*)",
+      "Bash(find:*)",
+      "Bash(ls -la \"D:\\\\Development\\\\nanna\\\\crates\\\\nanna-tools\\\\default-skills\"\" 2>&1 || echo \"Directory check \")",
+      "Bash(for f in D:/Development/nanna/crates/nanna-tools/default-skills/*/tool.ts)",
+      "Bash(done)",
+      "Bash(ls -la \"D:\\\\Development\\\\nanna\\\\crates\\\\nanna-tools\"\" | grep -E \"Cargo)",
+      "Bash(src)",
+      "Bash(default \")",
+      "Bash(CARGO_BUILD_JOBS=1 cargo build:*)"
     ]
   }
 }

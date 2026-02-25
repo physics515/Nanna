@@ -224,7 +224,7 @@ impl UserToolManager {
         let tool = ScriptedTool::new("_test", source);
         let input_value = Value::Object(input.into_iter().collect());
         
-        match self.engine.execute(&tool, input_value).await {
+        match self.engine.execute(&tool, input_value, None, None).await {
             Ok(result) => {
                 let output = match result.value {
                     Value::String(s) => s,
@@ -296,13 +296,14 @@ impl Tool for UserToolWrapper {
             name: self.meta.name.clone(),
             description: self.meta.description.clone(),
             parameters,
+            output_schema: None,
         }
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
         let input = Value::Object(params.into_iter().collect());
         
-        let result = self.engine.execute(&self.tool, input).await.map_err(|e| {
+        let result = self.engine.execute(&self.tool, input, None, None).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
         

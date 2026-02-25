@@ -208,14 +208,64 @@
                 />
               </div>
 
+              <!-- Embedding Models -->
+              <div class="mt-6 pt-6 border-t border-nanna-primary/10">
+                <h3 class="text-sm font-semibold text-nanna-accent mb-3 flex items-center gap-2">
+                  <Link class="w-4 h-4" />
+                  Embedding Models
+                </h3>
+                <p class="text-xs text-nanna-text-dim mb-3">
+                  Used for semantic memory recall. First working model is used.
+                </p>
+                <ModelPriorityList
+                  label="Embedding Priority"
+                  hint="Used for memory recall. First working model is used."
+                  :all-models="allEmbeddingModels"
+                  v-model="embeddingModelPriority"
+                  @update:model-value="saveEmbeddingModelPriority"
+                />
+                <div v-if="allEmbeddingModels.length === 0" class="mt-3 p-3 rounded-lg bg-nanna-warning/10 border border-nanna-warning/30">
+                  <div class="flex items-start gap-2">
+                    <AlertTriangle class="w-4 h-4 text-nanna-warning shrink-0 mt-0.5" />
+                    <p class="text-xs text-nanna-warning">No embedding models available. Set up an API key or install Ollama embedding models.</p>
+                  </div>
+                </div>
+                <div v-else class="flex items-center gap-2 mt-3">
+                  <UiBadge v-if="embeddingModelPriority.length > 0" variant="success">✓ Memory recall enabled</UiBadge>
+                  <UiBadge v-else variant="warning">⚠ No embedding models selected — memory recall disabled</UiBadge>
+                </div>
+              </div>
+
               <!-- Ollama Host -->
               <div class="mt-4 pt-4 border-t border-nanna-primary/10">
                 <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
                 <div class="flex gap-2">
                   <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
                   <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
+                  <UiButton @click="refreshOllamaModels" size="sm" variant="outline" :disabled="loadingOllamaModels">
+                    <RefreshCw class="w-4 h-4" :class="{ 'animate-spin': loadingOllamaModels }" />
+                  </UiButton>
                 </div>
-                <p class="text-xs text-nanna-text-dim mt-1">Local Ollama instance for fallback models</p>
+                <div class="flex items-center gap-2 mt-1">
+                  <span v-if="ollamaStatus === 'connected'" class="flex items-center gap-1 text-xs text-green-500">
+                    <CheckCircle class="w-3 h-3" /> Connected · {{ ollamaModels.length }} model{{ ollamaModels.length !== 1 ? 's' : '' }}
+                  </span>
+                  <span v-else-if="ollamaStatus === 'error'" class="flex items-center gap-1 text-xs text-red-400">
+                    <XCircle class="w-3 h-3" /> {{ ollamaError || 'Connection failed' }}
+                  </span>
+                  <span v-else-if="ollamaStatus === 'checking'" class="text-xs text-nanna-text-dim">Checking…</span>
+                  <span v-else class="text-xs text-nanna-text-dim">Local Ollama instance for fallback models</span>
+                </div>
+              </div>
+
+              <!-- Ollama API Key -->
+              <div class="mt-4 pt-4 border-t border-nanna-primary/10">
+                <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama API Key</label>
+                <div class="flex gap-2">
+                  <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="Optional — for remote/authenticated Ollama" class="flex-1" />
+                  <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
+                </div>
+                <p class="text-xs text-nanna-text-dim mt-1">Only needed for remote Ollama instances that require authentication</p>
               </div>
             </UiCard>
           </div>
@@ -263,6 +313,55 @@
               </div>
             </UiCard>
             
+            <!-- Model Routing -->
+            <UiCard>
+              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+                <Cpu class="w-4 h-4" />
+                Model Routing
+              </h3>
+              <div class="space-y-4">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="text-sm font-medium text-nanna-text">Primary Model</div>
+                    <div class="text-xs text-nanna-text-dim">Default model for all tasks</div>
+                  </div>
+                  <!-- TODO: Actually fetch available models from daemon -->
+                  <UiSelect 
+                    :model-value="settings?.model ?? ''"
+                    @update:model-value="saveSetting('model', $event)"
+                    :options="primaryModelOptions"
+                    class="w-64"
+                  />
+                </div>
+
+                <div class="flex items-center justify-between">
+                  <div>
+                    <div class="text-sm font-medium text-nanna-text">Routing Enabled</div>
+                    <div class="text-xs text-nanna-text-dim">Use cheaper models for simpler tasks</div>
+                  </div>
+                  <UiSwitch :model-value="settings?.routing_first_turn_primary ?? true" @update:model-value="saveSetting('routing_first_turn_primary', $event)" />
+                </div>
+
+                <!-- Dynamic list for model_routing -->
+                <div v-if="settings?.routing_first_turn_primary" class="space-y-3">
+                  <label class="block text-sm font-medium text-nanna-text">Route Priority List</label>
+                  <p class="text-xs text-nanna-text-muted mb-2">
+                    Format: <code class="bg-nanna-bg-elevated px-1 rounded">model_spec:tier</code> (e.g., <code class="bg-nanna-bg-elevated px-1 rounded">claude-haiku-3-5-20241022:simple</code>). Cheapest models first.
+                  </p>
+                  <div v-for="(route, index) in settings?.model_routing" :key="index" class="flex items-center gap-2">
+                    <UiInput v-model="settings.model_routing[index]" @update:model-value="saveSetting('model_routing', settings.model_routing); updateChanges()" placeholder="e.g., claude-haiku-3-5-20241022:simple" class="flex-1" />
+                    <UiButton @click="removeModelRoute(index)" variant="outline" size="sm">
+                      <Trash2 class="w-4 h-4" />
+                    </UiButton>
+                  </div>
+                  <UiButton @click="addModelRoute" variant="outline" size="sm">
+                    <Plus class="w-4 h-4 mr-1" />
+                    Add Route
+                  </UiButton>
+                </div>
+              </div>
+            </UiCard>
+
             <!-- Response Preferences -->
             <UiCard>
               <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
@@ -297,7 +396,7 @@
                     :value="maxTokens"
                     @change="setMaxTokens(Number(($event.target as HTMLInputElement).value))"
                     class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
-                  >
+                  />
                   <div class="flex justify-between text-xs text-nanna-text-dim mt-1">
                     <span>256</span>
                     <span>8192 tokens</span>
@@ -311,41 +410,6 @@
         <!-- Memory Tab -->
         <UiTabPanel :active="activeTab === 'memory'">
           <div class="space-y-6">
-            <!-- Embedding Configuration -->
-            <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
-                <Link class="w-4 h-4" />
-                Embedding Models
-              </h3>
-              
-              <ModelPriorityList
-                label="Embedding Priority"
-                hint="Used for memory recall. First working model is used."
-                :all-models="allEmbeddingModels"
-                v-model="embeddingModelPriority"
-                @update:model-value="saveEmbeddingModelPriority"
-              />
-              
-              <!-- No Embedding Models Warning -->
-              <div v-if="allEmbeddingModels.length === 0" class="mt-4 p-4 rounded-lg bg-nanna-warning/10 border border-nanna-warning/30">
-                <div class="flex items-start gap-3">
-                  <AlertTriangle class="w-5 h-5 text-nanna-warning shrink-0 mt-0.5" />
-                  <div>
-                    <div class="font-medium text-nanna-warning">No embedding models available</div>
-                    <p class="text-sm text-nanna-text-muted mt-1">
-                      Set up an OpenAI API key or install Ollama embedding models (e.g., <code class="text-nanna-accent">ollama pull bge-m3</code>).
-                    </p>
-                  </div>
-                </div>
-              </div>
-              
-              <!-- Status -->
-              <div v-else class="flex items-center gap-2 mt-4 pt-4 border-t border-nanna-primary/10">
-                <UiBadge v-if="embeddingModelPriority.length > 0" variant="success">✓ Memory recall enabled</UiBadge>
-                <UiBadge v-else variant="warning">⚠ No embedding models selected — memory recall disabled</UiBadge>
-              </div>
-            </UiCard>
-            
             <!-- Memory Settings -->
             <UiCard>
               <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
@@ -618,7 +682,8 @@ import { useConfirm } from '~/composables/useConfirm'
 import {
   ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon,
   RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp,
-  Bot, MessageSquare, AlertTriangle, LogOut, Download, Terminal, Layers
+  Bot, MessageSquare, AlertTriangle, LogOut, Download, Terminal, Layers,
+  Cpu, Plus
 } from 'lucide-vue-next'
 
 interface ToolInfo {
@@ -645,6 +710,7 @@ interface ExtendedSettings {
   embedding_model: string
   embedding_enabled: boolean
   ollama_host: string
+  ollama_api_key: string
   tools: ToolInfo[]
   dreaming_enabled: boolean
   scheduler_enabled: boolean
@@ -695,6 +761,9 @@ const sessionCount = ref(0)
 const ollamaModels = ref<OllamaModelInfo[]>([])
 const loadingOllamaModels = ref(false)
 const ollamaHostInput = ref('')
+const ollamaApiKeyInput = ref('')
+const ollamaStatus = ref<'unchecked' | 'checking' | 'connected' | 'error'>('unchecked')
+const ollamaError = ref('')
 const availableModels = ref<ModelInfo[]>([])
 const loadingModels = ref(false)
 const memoryStats = ref<CognitiveMemoryStats | null>(null)
@@ -777,7 +846,7 @@ const allChatModels = computed<ModelOption[]>(() => {
 
   // Ollama models (dynamically fetched - always dynamic)
   for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
-    models.push({ id: `ollama/${m.name}`, name: m.name, provider: 'ollama', available: true })
+    models.push({ id: `ollama/${m.name}`, name: m.name, provider: 'ollama', available: ollamaStatus.value === 'connected' })
   }
   
   return models
@@ -786,7 +855,12 @@ const allChatModels = computed<ModelOption[]>(() => {
 const allEmbeddingModels = computed<ModelOption[]>(() => {
   const models: ModelOption[] = []
 
-  // OpenAI embedding models (dynamically fetched from API)
+  // Ollama embedding models (local, free — listed first)
+  for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
+    models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB, local)`, provider: 'ollama', available: ollamaStatus.value === 'connected' })
+  }
+
+  // OpenAI embedding models
   if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
     const embeddingModels = openaiModels.value.filter(m => m.id.startsWith('text-embedding'))
     for (const m of embeddingModels) {
@@ -794,9 +868,24 @@ const allEmbeddingModels = computed<ModelOption[]>(() => {
     }
   }
 
-  // Ollama embedding models (dynamically fetched)
-  for (const m of ollamaModels.value.filter(m => m.is_embedding_model)) {
-    models.push({ id: `ollama/${m.name}`, name: `${m.name} (${m.size_mb}MB)`, provider: 'ollama', available: true })
+  // OpenRouter embedding models
+  if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    const embeddingModels = openrouterModels.value.filter(m =>
+      m.id.includes('embed') || m.id.includes('embedding')
+    )
+    for (const m of embeddingModels) {
+      models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
+    }
+  }
+
+  // GitHub embedding models
+  if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    const embeddingModels = githubModels.value.filter(m =>
+      m.id.includes('embed') || m.id.includes('embedding')
+    )
+    for (const m of embeddingModels) {
+      models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
+    }
   }
 
   return models
@@ -808,7 +897,7 @@ const allSummarizationModels = computed<ModelOption[]>(() => {
 
   // Ollama chat models (listed first - local, free, private)
   for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
-    models.push({ id: `ollama/${m.name}`, name: `${m.name} (local)`, provider: 'ollama', available: true })
+    models.push({ id: `ollama/${m.name}`, name: `${m.name} (local)`, provider: 'ollama', available: ollamaStatus.value === 'connected' })
   }
 
   // Anthropic models
@@ -876,6 +965,7 @@ async function loadSettings() {
     selectedModel.value = settings.value.model
     selectedEmbeddingModel.value = settings.value.embedding_model
     ollamaHostInput.value = settings.value.ollama_host
+    ollamaApiKeyInput.value = settings.value.ollama_api_key || ''
     claudeProxyUrl.value = settings.value.claude_proxy_url || 'http://localhost:3456'
     // Load agent settings
     agentName.value = settings.value.agent_name || 'Nanna'
@@ -1002,10 +1092,14 @@ async function refreshModels() {
 
 async function refreshOllamaModels() {
   loadingOllamaModels.value = true
+  ollamaStatus.value = 'checking'
+  ollamaError.value = ''
   try {
     ollamaModels.value = await invoke<OllamaModelInfo[]>('get_ollama_models')
+    ollamaStatus.value = 'connected'
   } catch (e: any) {
-    showToast(`Ollama: ${e.message || e}`, 'error')
+    ollamaStatus.value = 'error'
+    ollamaError.value = e.message || String(e)
     ollamaModels.value = []
   } finally {
     loadingOllamaModels.value = false
@@ -1202,6 +1296,16 @@ async function saveOllamaHost() {
     await invoke('set_ollama_host', { host: ollamaHostInput.value })
     showToast('Ollama host saved', 'success')
     await refreshOllamaModels()
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveOllamaApiKey() {
+  try {
+    await invoke('set_ollama_api_key', { key: ollamaApiKeyInput.value })
+    showToast('Ollama API key saved', 'success')
     await loadSettings()
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')

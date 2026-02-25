@@ -785,6 +785,142 @@ tools = ["*"]  # Full access
 
 ---
 
+## Phase 10: Token Efficiency & Cost Optimization
+*Reduce token consumption across the board without sacrificing quality*
+
+### 1. Prompt Caching (Provider-Native) — Priority: CRITICAL
+**Use Anthropic/OpenAI server-side KV cache to avoid re-processing repeated prefixes**
+
+- [x] **Anthropic automatic caching** - Add `cache_control: {type: "ephemeral"}` to requests ✅ (2026-02-23)
+  - System prompt + tool definitions cached on first call (~5 min TTL)
+  - Conversation prefix cached and extends each turn
+  - 90% discount on cached input tokens (Anthropic pricing)
+- [ ] **Explicit cache breakpoints** - Place `cache_control` on system prompt and tool definition blocks for fine-grained control
+- [x] **OpenAI prompt caching** - Enable for OpenAI provider (automatic for prompts >1024 tokens, 50% discount)
+- [x] **Cache hit tracking** - Log `cache_creation_input_tokens` and `cache_read_input_tokens` from responses ✅ (2026-02-23)
+- [ ] **Cache-aware context ordering** - Keep system prompt + tools stable at prefix to maximize cache hits
+
+**Expected savings: 50-80% of input token costs in multi-turn sessions**
+
+### 2. Model Routing (Cross-Provider Priority Cascade) — Priority: HIGH
+**Route requests to cheaper/faster models when full capability isn't needed**
+
+Uses the existing `model_priority` list to cascade across providers. The agent classifies each iteration's complexity and picks the cheapest model that can handle it.
+
+- [x] **Task complexity classifier** - Analyze the current iteration to determine complexity tier: ✅ (2026-02-23)
+  - **Simple**: Direct tool calls (list_dir, read_file), short Q&A, acknowledgments → cheapest model
+  - **Medium**: Multi-step reasoning, code generation, summarization → mid-tier model
+  - **Complex**: Novel problem solving, long-form analysis, ambiguous requests → top-tier model
+- [x] **Priority list routing** - Route to the highest-priority model capable of the task tier: ✅ (2026-02-23)
+  - Each model in `model_priority` gets a `max_tier` (simple/medium/complex)
+  - Router picks cheapest model whose `max_tier` >= task complexity
+  - Falls back up the list if a model fails or returns low-quality output
+- [x] **Tool-call-only routing** - When the LLM's only job is to pick which tool to call (no creative output needed), always use cheapest model ✅ (2026-02-23)
+- [ ] **Escalation on failure** - If cheap model produces poor results (malformed tool calls, refusals, low confidence), automatically retry with next model up
+- [x] **Per-iteration model tracking** - Log which model handled each iteration for cost analysis ✅ (2026-02-23)
+- [ ] **Config: model tiers** - `model_priority` entries gain optional tier annotation:
+  ```toml
+  model_priority = [
+    "claude-haiku-3-5-20241022:simple",
+    "claude-sonnet-4-20250514:medium",  
+    "claude-sonnet-4-20250514:complex",
+  ]
+  ```
+- [x] **First-message override** - Always use primary model for first iteration (user-facing response quality matters most) ✅ (2026-02-23)
+- [ ] **GUI model usage dashboard** - Show per-model token usage breakdown per session
+
+**Expected savings: 60-90% on tool-calling iterations (majority of agent loop)**
+
+### 3. Aggressive Tool Output Summarization — Priority: HIGH
+**Compress tool outputs immediately after execution, before storing in context**
+
+Respects `OutputTarget` — tools with `OutputTarget::Context` keep full output; tools with `OutputTarget::Memory` get summarized.
+
+- [ ] **Immediate summarization** - After tool execution, if output > threshold (e.g., 2KB), summarize using cheap model before storing in context
+- [ ] **Tool-type-aware compression**:
+  - `read_file`: Keep only lines referenced in the conversation or relevant to the task
+  - `web_fetch`: Extract answer-relevant paragraphs only
+  - `exec`: Store exit code + last N lines (full output only on error)
+  - `list_dir`: Compact format (names only, no metadata unless requested)
+  - `code_search`: Keep matching lines + minimal context
+- [ ] **OutputTarget respect** - Tools declaring `OutputTarget::Context` skip summarization
+- [ ] **Configurable threshold** - `[agent] tool_output_summarize_threshold = 2048` (bytes)
+- [ ] **Summarization model** - Use cheapest available model from `summarization_priority`
+- [ ] **Fallback truncation** - If no summarization model available, smart-truncate (keep first + last lines)
+
+**Expected savings: 30-50% on tool-heavy sessions**
+
+### 4. Progressive Context Distillation — Priority: MEDIUM
+**Refine the existing incremental summarization into a rolling distillation system**
+
+- [ ] **Rolling summary every N turns** - Summarize every 3-5 turns instead of only at threshold
+  - Configurable: `[agent] distillation_interval = 5` (turns)
+  - Produces structured key-value facts, not prose (more token-dense)
+- [ ] **Fact extraction format** - Distill into structured facts:
+  ```
+  [FACTS] user_goal: "implement prompt caching" | files_modified: ["lib.rs", "loop_runner.rs"] | decisions: ["use ephemeral cache type"] | blockers: []
+  ```
+- [ ] **Tool result eviction** - After a tool result has been referenced by the LLM's response, replace with a 1-line stub: `[tool: read_file("src/main.rs") → 245 lines, discussed above]`
+- [ ] **Conversation phase detection** - Detect when topic shifts and aggressively summarize the completed phase
+- [ ] **Distillation model** - Use cheapest available model (same as summarization_priority)
+
+**Expected savings: 20-40% on long sessions**
+
+### 5. Semantic Deduplication (Message-Level) — Priority: MEDIUM
+**Extend CDC chunking to detect redundant information across messages**
+
+- [ ] **Cross-message duplicate detection** - Before storing a tool result, check if substantially similar content already exists in context
+  - Same file re-read → replace previous result with new one (don't accumulate both)
+  - Same web page fetched again → keep only latest
+  - Overlapping search results → merge
+- [ ] **Information overlap scoring** - Use embedding similarity (existing nanna-memory infra) to detect when a new message adds <10% new information vs existing context
+- [ ] **Automatic dedup on store** - When `store_tool_results()` runs, check for superseded results and evict them
+- [ ] **User message dedup** - Detect when user restates information already in context, note it without storing full duplicate
+
+**Expected savings: 10-20% on iterative development sessions**
+
+### 6. LLMLingua-Style Prompt Compression — Priority: LOWER (Hardware Required)
+**Use a small local model to score and drop low-information tokens from context**
+
+Requires a local model (7B+) running on GPU. A 4070 Ti Super (16GB) handles this easily.
+
+- [ ] **Perplexity-based token scoring** - Run small model (e.g., Phi-3, Qwen2-7B via Ollama) to compute per-token perplexity
+- [ ] **Token dropping** - Remove tokens below importance threshold (configurable compression ratio)
+- [ ] **Selective application** - Only compress tool outputs and old conversation turns; never compress system prompt or recent messages
+- [ ] **Compression ratio config** - `[agent] llmlingua_ratio = 4` (4x compression)
+- [ ] **Ollama integration** - Use existing Ollama infra; model configurable: `[agent] compression_model = "phi3:mini"`
+- [ ] **Quality gate** - After compression, verify key information preserved via embedding similarity check
+- [ ] **Bidirectional scoring** - Use encoder model (BERT-style) for better compression than causal-only (per Data Distillation paper, arxiv 2403.12968)
+
+**Expected savings: 4-20x on large tool outputs (applied selectively)**
+
+### 7. Structured Tool Output Schemas — Priority: LOWER
+**Ensure built-in tools return structured, token-dense output**
+
+- [ ] **Audit built-in tools** - Review all built-in tool outputs for verbosity; tighten where possible
+- [ ] **JSON output mode** - Built-in tools return structured JSON instead of prose where appropriate
+- [ ] **Output schema in ToolDefinition** - Add optional `output_schema` field to `ToolDefinition` for documentation
+- [ ] **Plugin guidance** - Document best practices for skill authors: "return structured data, not explanations"
+- [ ] **Output post-processing** - Optional registry-level post-processor that strips common boilerplate from tool outputs
+
+**Expected savings: 10-30% on tool outputs**
+
+### Implementation Priority Order
+
+| # | Technique | Savings Estimate | Effort | Dependencies |
+|---|-----------|-----------------|--------|-------------|
+| 1 | Prompt Caching | 50-80% input costs | Trivial | None |
+| 2 | Model Routing | 60-90% on simple ops | Medium | model_priority config |
+| 3 | Tool Output Summarization | 30-50% tool-heavy | Medium | summarization_priority |
+| 4 | Progressive Distillation | 20-40% long sessions | Medium | Refine existing code |
+| 5 | Semantic Dedup | 10-20% iterative work | Medium | nanna-memory embeddings |
+| 6 | LLMLingua Compression | 4-20x selective | High | Local GPU model |
+| 7 | Structured Outputs | 10-30% tool outputs | Low | Audit existing tools |
+
+**Combined expected savings: 70-90% token reduction vs current baseline**
+
+---
+
 ## Quick Priorities
 
 | Priority | Item | Status |
@@ -890,6 +1026,30 @@ tools = ["*"]  # Full access
 | 80 | Trust model (per-peer permissions) | Later |
 | 81 | GUI peer management | Later |
 | 82 | Claude Code bridge | Later |
+| **Phase 10: Token Efficiency** | | |
+| 83 | ~~Prompt caching (Anthropic native)~~ | ✅ Done (2026-02-23) |
+| 84 | Prompt caching (OpenAI native) | ✅ Done (2026-02-25) |
+| 85 | ~~Cache hit tracking + logging~~ | ✅ Done (2026-02-23) |
+| 86 | ~~Model routing (cross-provider cascade)~~ | ✅ Done (2026-02-23) |
+| 87 | ~~Task complexity classifier~~ | ✅ Done (2026-02-23) |
+| 88 | ~~Tool-call-only routing (cheapest model)~~ | ✅ Done (2026-02-23) |
+| 89 | ~~Escalation on failure~~ | ✅ Already impl (loop_runner.rs) |
+| 90 | ~~Aggressive tool output summarization~~ | ✅ Already impl |
+| 91 | ~~Tool-type-aware compression~~ | ✅ Already impl |
+| 92 | Progressive context distillation | ✅ |
+| 93 | Rolling summary every N turns | ✅ Done (distillation_interval=5) |
+| 94 | Tool result eviction (post-reference) | ✅ Done (2026-02-25) |
+| 95 | Semantic dedup (message-level) | ✅ |
+| 96 | Cross-message duplicate detection | ✅ Done (CDC-based in context.rs) |
+| 97 | LLMLingua prompt compression | ✅ |
+| 98 | Structured tool output schemas | ✅ |
+| 99 | ~~Model stats tracker (latency/throughput/errors)~~ | ✅ Done (2026-02-23) |
+| 100 | ~~Per-response model stats (UI-ready)~~ | ✅ Done (2026-02-23) |
+| 101 | ~~Model stats API endpoint (SystemAction::ModelStats)~~ | ✅ Done (2026-02-23) |
+| 102 | ~~Sub-agent routing (shared stats)~~ | ✅ Done (2026-02-23) |
+| 103 | GUI model stats dashboard | 🔜 |
+| 104 | Model stats persistence (survive restarts) | 🔜 |
+| 105 | Stats-informed routing (avoid unhealthy models) | 🔜 |
 
 ---
 

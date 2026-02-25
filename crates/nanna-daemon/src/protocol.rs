@@ -207,6 +207,8 @@ pub enum ToolAction {
     Test { code: String, input: Value },
     /// List only user-created tools
     ListUser,
+    /// Get source code for a tool (reads from tools directory)
+    GetSource { name: String },
 }
 
 // =============================================================================
@@ -303,6 +305,8 @@ pub enum SystemAction {
     Logs { lines: Option<usize>, level: Option<String> },
     /// Health check
     Health,
+    /// Get model performance statistics (routing, latency, cache hits, etc.)
+    ModelStats,
 }
 
 // =============================================================================
@@ -404,6 +408,9 @@ pub enum Event {
     MessageDelta { session_id: String, message_id: String, delta: String },
     MessageEnd { session_id: String, message_id: String, content: String },
     
+    // Thinking/reasoning events
+    ThinkingDelta { session_id: String, delta: String },
+
     // Tool events
     ToolStart { session_id: String, call_id: String, name: String, input: Value },
     ToolEnd { session_id: String, call_id: String, output: String, success: bool, duration_ms: u64 },
@@ -424,6 +431,9 @@ pub enum Event {
     ChannelError { id: String, error: String },
     ChannelMessage { channel_id: String, sender: String, content: String },
     
+    // Model events
+    ModelSwitch { model: String, reason: Option<String> },
+
     // System events
     StatusChange { status: String },
     Error { code: String, message: String },

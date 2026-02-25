@@ -29,6 +29,16 @@ use serde_json::Value;
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Where a tool's output should be routed after execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OutputTarget {
+    /// Large results are chunked and stored in memory; a stub replaces them in context (default).
+    #[default]
+    Memory,
+    /// Results always stay in context. Large results are summarized (or truncated as fallback).
+    Context,
+}
+
 #[derive(Error, Debug)]
 pub enum ToolError {
     #[error("Tool not found: {0}")]
@@ -59,6 +69,9 @@ pub struct ToolResponse {
     pub id: String,
     pub name: String,
     pub result: ToolResult,
+    /// Where this tool's output should be routed
+    #[serde(default)]
+    pub output_target: OutputTarget,
 }
 
 /// Trait for implementing tools
@@ -69,6 +82,11 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given parameters
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError>;
+
+    /// Where tool output should be routed (memory stub vs inline context)
+    fn output_target(&self) -> OutputTarget {
+        OutputTarget::Memory
+    }
 
     /// Check if the tool requires elevated permissions
     fn requires_elevation(&self) -> bool {

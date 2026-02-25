@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use nanna_scripting::{ScriptEngine, ScriptedTool, ToolPermissions, extract_manifest};
-use nanna_tools::{Tool, ToolDefinition, ToolError, ToolRegistry, ToolResult, ParameterType, ToolParameter};
+use nanna_tools::{Tool, ToolDefinition, ToolError, ToolRegistry, ToolResult, ParameterType, ToolParameter, OutputTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -224,7 +224,7 @@ impl UserToolManager {
         let tool = ScriptedTool::new("_test", source);
         let input_value = Value::Object(input.into_iter().collect());
         
-        match self.engine.execute(&tool, input_value).await {
+        match self.engine.execute(&tool, input_value, None, None).await {
             Ok(result) => {
                 let output = match result.value {
                     Value::String(s) => s,
@@ -241,13 +241,24 @@ impl UserToolManager {
     pub fn create_tool_impl(&self, meta: &UserToolMeta) -> Result<Arc<dyn Tool>, String> {
         let tool = ScriptedTool::new(&meta.name, &meta.source)
             .with_permissions(meta.permissions.clone().into());
-        
+
+        // Parse output target from the source
+        let output = match extract_manifest(&meta.source)
+            .and_then(|m| match m.output {
+                nanna_scripting::OutputTarget::Context => Some(OutputTarget::Context),
+                nanna_scripting::OutputTarget::Memory => None,
+            }) {
+            Some(target) => target,
+            None => OutputTarget::Memory,
+        };
+
         let wrapper = UserToolWrapper {
             meta: meta.clone(),
             tool,
             engine: self.engine.clone(),
+            output,
         };
-        
+
         Ok(Arc::new(wrapper))
     }
 
@@ -281,6 +292,7 @@ struct UserToolWrapper {
     meta: UserToolMeta,
     tool: ScriptedTool,
     engine: Arc<ScriptEngine>,
+    output: OutputTarget,
 }
 
 #[async_trait]
@@ -291,18 +303,23 @@ impl Tool for UserToolWrapper {
         } else {
             vec![]
         };
-        
+
         ToolDefinition {
             name: self.meta.name.clone(),
             description: self.meta.description.clone(),
             parameters,
+            output_schema: None,
         }
+    }
+
+    fn output_target(&self) -> OutputTarget {
+        self.output
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
         let input = Value::Object(params.into_iter().collect());
         
-        let result = self.engine.execute(&self.tool, input).await.map_err(|e| {
+        let result = self.engine.execute(&self.tool, input, None, None).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
         
@@ -428,6 +445,7 @@ impl Tool for CreateToolTool {
                     enum_values: None,
                 },
             ],
+            output_schema: None,
         }
     }
 
@@ -506,6 +524,7 @@ impl Tool for ListUserToolsTool {
             name: "list_user_tools".to_string(),
             description: "List all user-created tools".to_string(),
             parameters: vec![],
+            output_schema: None,
         }
     }
 

@@ -45,6 +45,8 @@ pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageToo
                 system: Some("You are a helpful vision assistant. Analyze the image and respond to the user's prompt accurately and concisely.".to_string()),
                 tools: None,
                 stream: None,
+                thinking: None,
+                cache_control: None,
             };
 
             let response = llm

@@ -1,8 +1,9 @@
 //! Script engine abstraction with automatic fallback
 
-use crate::{Result, ScriptError, ScriptedTool, NannaBridge};
+use crate::{Result, ScriptError, ScriptedTool, NannaBridge, bridge::ServiceFn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -70,16 +71,45 @@ impl ScriptEngine {
     }
 
     /// Execute a scripted tool
+    ///
+    /// `tool_definitions` is an optional JSON array of tool definitions for `Nanna.listTools()`.
+    /// `services` is an optional map of service functions callable via `Nanna.service()`.
     pub async fn execute(
         &self,
         tool: &ScriptedTool,
         input: Value,
+        tool_definitions: Option<Value>,
+        services: Option<HashMap<String, ServiceFn>>,
     ) -> Result<ExecutionResult> {
-        let bridge = Arc::new(NannaBridge::new(tool.permissions.clone()));
+        let mut bridge = NannaBridge::new(tool.permissions.clone());
+        if let Some(defs) = tool_definitions {
+            bridge = bridge.with_tool_definitions(defs);
+        }
+        if let Some(svcs) = services {
+            bridge = bridge.with_services(svcs);
+        }
+        let bridge = Arc::new(bridge);
         let start = std::time::Instant::now();
 
+        // Check if script needs an advanced engine (async/await, TypeScript, etc.)
+        let needs_advanced = needs_advanced_engine(&tool.source);
+
         // Determine engine order
-        let (primary, secondary): (EngineKind, Option<EngineKind>) = if self.prefer_boa {
+        let (primary, secondary): (EngineKind, Option<EngineKind>) = if needs_advanced {
+            // Skip Boa for scripts that use features it can't handle
+            debug!(tool = %tool.name, "Script needs advanced engine, preferring Deno");
+            #[cfg(feature = "deno")]
+            let p = EngineKind::Deno;
+            #[cfg(not(feature = "deno"))]
+            let p = EngineKind::Boa; // Try Boa anyway if Deno unavailable
+
+            #[cfg(all(feature = "deno", feature = "boa"))]
+            let s = Some(EngineKind::Boa);
+            #[cfg(not(all(feature = "deno", feature = "boa")))]
+            let s = None;
+
+            (p, s)
+        } else if self.prefer_boa {
             #[cfg(feature = "boa")]
             let p = EngineKind::Boa;
             #[cfg(not(feature = "boa"))]
@@ -219,6 +249,16 @@ impl Default for ScriptEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Detect if a script uses features that Boa can't handle.
+///
+/// Returns `true` if the script should skip Boa and go straight to Deno.
+/// Uses simple string checks (cheap, no regex needed).
+fn needs_advanced_engine(source: &str) -> bool {
+    source.contains("async ") || source.contains("await ")
+        || source.contains(": string") || source.contains(": number") || source.contains(": boolean")
+        || source.contains("interface ") || source.contains("import {")
 }
 
 #[cfg(test)]

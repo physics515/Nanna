@@ -6,8 +6,10 @@
 //! Implements the agentic loop with tool calling, memory, and context management.
 
 mod chunker;
+pub mod compressor;
 mod context;
 mod loop_runner;
+pub mod model_stats;
 mod multi;
 pub mod prompts;
 mod registry;
@@ -28,8 +30,8 @@ pub use registry::{
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
-    ReasoningBlock, ReasoningContent, RunOptions, StreamCallback, ThinkingCallback,
-    ThinkingMode, ToolCallRecord,
+    ModelTier, ReasoningBlock, ReasoningContent, RunOptions, StreamCallback, TaskComplexity,
+    ThinkingCallback, ThinkingMode, ToolCallRecord,
 };
 pub use multi::{
     AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,
@@ -42,8 +44,12 @@ pub use supervisor::{
     SupervisionStrategy, Supervisor, SupervisorEvent, SupervisorEventType,
 };
 pub use summarizer::{
-    new_summary_cache, summarize_if_large, SummaryCache, SummaryCacheEntry, Summarizer,
+    Summarizer,
     SummarizerConfig,
+};
+pub use model_stats::{
+    ModelStatsTracker, ModelStats, ModelStatsSummary, RequestModelStats, RequestObservation,
+    StorableModelStats,
 };
 
 use serde::{Deserialize, Serialize};

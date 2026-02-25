@@ -24,6 +24,11 @@ harness = false
 name = "gpu_vs_simd_extended"
 harness = false
 
+[[bench]]
+name = "threshold_benchmark"
+harness = false
+
 [dev-dependencies]
 nanna-simd = { path = "../nanna-simd" }
 tokio = { version = "1.43", features = ["full"] }
+criterion = { version = "0.5", features = ["html_reports"] }

@@ -59,7 +59,7 @@ nanna-core = { path = "../../crates/nanna-core" }
 nanna-llm = { path = "../../crates/nanna-llm" }
 nanna-config = { path = "../../crates/nanna-config" }
 nanna-storage = { path = "../../crates/nanna-storage" }
-nanna-tools = { path = "../../crates/nanna-tools" }
+nanna-tools = { path = "../../crates/nanna-tools", features = ["scripting"] }
 nanna-memory = { path = "../../crates/nanna-memory" }
 nanna-agent = { path = "../../crates/nanna-agent" }
 nanna-workspace = { path = "../../crates/nanna-workspace" }

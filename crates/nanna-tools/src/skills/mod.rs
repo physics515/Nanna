@@ -22,6 +22,7 @@
 mod manifest;
 mod executable;
 mod discovery;
+pub mod defaults;
 
 #[cfg(feature = "scripting")]
 mod scripted;
@@ -34,13 +35,15 @@ pub use discovery::{discover_skills, SkillSource, DiscoveredSkill};
 pub use scripted::ScriptedToolWrapper;
 
 use crate::{Tool, ToolError};
+#[cfg(feature = "scripting")]
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 /// Load a skill from a directory, returning a boxed Tool
 pub async fn load_skill(skill_dir: &Path) -> Result<Arc<dyn Tool>, ToolError> {
     let source = discovery::detect_skill_source(skill_dir)?;
-    
+
     match source {
         #[cfg(feature = "scripting")]
         SkillSource::Script(path) => {
@@ -60,14 +63,35 @@ pub async fn load_skill(skill_dir: &Path) -> Result<Arc<dyn Tool>, ToolError> {
     }
 }
 
+/// Load a skill from a directory with service functions attached
+#[cfg(feature = "scripting")]
+pub async fn load_skill_with_services(
+    skill_dir: &Path,
+    services: &HashMap<String, nanna_scripting::ServiceFn>,
+) -> Result<Arc<dyn Tool>, ToolError> {
+    let source = discovery::detect_skill_source(skill_dir)?;
+
+    match source {
+        SkillSource::Script(path) => {
+            let tool = scripted::ScriptedToolWrapper::from_file(&path).await?
+                .with_services(services.clone());
+            Ok(Arc::new(tool))
+        }
+        SkillSource::Manifest(path) => {
+            let tool = executable::ExecutableTool::from_manifest(&path)?;
+            Ok(Arc::new(tool))
+        }
+    }
+}
+
 /// Load all skills from a skills directory
 pub async fn load_skills_from_dir(skills_dir: &Path) -> Vec<Result<Arc<dyn Tool>, ToolError>> {
     let discovered = discover_skills(skills_dir);
     let mut results = Vec::with_capacity(discovered.len());
-    
+
     for skill in discovered {
         results.push(load_skill(&skill.path).await);
     }
-    
+
     results
 }

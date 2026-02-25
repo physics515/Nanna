@@ -15,56 +15,13 @@ use nanna_config::credentials::{self, SecureStore};
 use nanna_llm::LlmClient;
 use nanna_memory::MemoryService;
 use nanna_tools::{
-    ToolRegistry, EchoTool, ExecTool, ReadFileTool, WriteFileTool, ListDirTool,
-    WebSearchTool, WebFetchTool, RememberTool, RecallTool, ReflectTool,
-    MemoryServiceStorage, MemoryServiceAdapter, MemoryResult, StorageHandle,
-    TaskTool, AgentSpawner, SpawnResult,
-    CodeOutlineTool, CodeSearchTool, ProjectStructureTool,
+    ToolRegistry, AgentSpawner, SpawnResult,
 };
+use nanna_scripting::ServiceFn;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Adapter to make MemoryService implement MemoryServiceAdapter trait
-struct MemoryServiceWrapper(Arc<MemoryService>);
-
-#[async_trait]
-impl MemoryServiceAdapter for MemoryServiceWrapper {
-    async fn remember(&self, content: &str, metadata: HashMap<String, String>, importance: f32) -> Result<String, String> {
-        self.0.remember_with_importance(content, metadata, importance)
-            .await
-            .map(|(id, _)| id)
-            .map_err(|e| e.to_string())
-    }
-
-    async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryResult>, String> {
-        let results = self.0.recall(query).await.map_err(|e| e.to_string())?;
-        Ok(results.into_iter()
-            .take(limit)
-            .map(|r| MemoryResult {
-                id: r.id,
-                content: r.content,
-                score: Some(r.score),
-            })
-            .collect())
-    }
-
-    async fn forget(&self, id: &str) -> Result<(), String> {
-        self.0.forget(id).await.map_err(|e| e.to_string())
-    }
-
-    async fn list(&self, limit: usize) -> Result<Vec<MemoryResult>, String> {
-        let all = self.0.list_all().await;
-        Ok(all.into_iter()
-            .take(limit)
-            .map(|e| MemoryResult {
-                id: e.id,
-                content: e.content,
-                score: Some(e.weight),
-            })
-            .collect())
-    }
-}
 /// Concrete implementation of AgentSpawner that lives in the daemon
 /// where it can create Agent instances with isolated context.
 struct AgentSpawnerImpl {
@@ -74,6 +31,8 @@ struct AgentSpawnerImpl {
     system_prompt: String,
     workspace_root: Option<PathBuf>,
     workspace_context: Option<String>,
+    /// Shared model stats tracker (sub-agents contribute to the same stats)
+    stats: Option<nanna_agent::ModelStatsTracker>,
 }
 
 #[async_trait]
@@ -104,8 +63,13 @@ impl AgentSpawner for AgentSpawnerImpl {
         let mut config = self.agent_config.clone();
         config.max_iterations = Some(max_iterations);
 
-        let agent = Agent::new(config, self.llm.clone(), self.tools.clone())
+        let mut agent = Agent::new(config, self.llm.clone(), self.tools.clone())
             .with_context(context);
+
+        // Share model stats tracker with sub-agents
+        if let Some(ref tracker) = self.stats {
+            agent = agent.with_stats(tracker.clone());
+        }
 
         let options = RunOptions {
             max_iterations: Some(max_iterations),
@@ -138,6 +102,103 @@ impl AgentSpawner for AgentSpawnerImpl {
 
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Build service closures for script tools.
+///
+/// These closures allow JS/TS tools to call back into Rust subsystems via `Nanna.service(name, params)`.
+fn build_script_services(
+    memory: &Option<Arc<MemoryService>>,
+    spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
+) -> HashMap<String, ServiceFn> {
+    use serde_json::{json, Value};
+
+    let mut services: HashMap<String, ServiceFn> = HashMap::new();
+
+    // Memory services
+    if let Some(mem) = memory {
+        let mem_store = mem.clone();
+        services.insert("memory.store".to_string(), Arc::new(move |params: Value| {
+            let mem = mem_store.clone();
+            Box::pin(async move {
+                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tags: HashMap<String, String> = params.get("tags")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                    .unwrap_or_default();
+                let importance = params.get("importance").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                match mem.remember_with_importance(&content, tags, importance).await {
+                    Ok((id, _)) => Ok(json!({"id": id})),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }));
+
+        let mem_search = mem.clone();
+        services.insert("memory.search".to_string(), Arc::new(move |params: Value| {
+            let mem = mem_search.clone();
+            Box::pin(async move {
+                let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                match mem.recall(&query).await {
+                    Ok(results) => {
+                        let items: Vec<Value> = results.into_iter().take(limit).map(|r| {
+                            json!({"id": r.id, "content": r.content, "score": r.score})
+                        }).collect();
+                        Ok(Value::Array(items))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }));
+
+        let mem_delete = mem.clone();
+        services.insert("memory.delete".to_string(), Arc::new(move |params: Value| {
+            let mem = mem_delete.clone();
+            Box::pin(async move {
+                let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                match mem.forget(&id).await {
+                    Ok(()) => Ok(json!({"deleted": true})),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }));
+
+        let mem_list = mem.clone();
+        services.insert("memory.list".to_string(), Arc::new(move |params: Value| {
+            let mem = mem_list.clone();
+            Box::pin(async move {
+                let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let all = mem.list_all().await;
+                let items: Vec<Value> = all.into_iter().take(limit).map(|e| {
+                    json!({"id": e.id, "content": e.content, "weight": e.weight})
+                }).collect();
+                Ok(Value::Array(items))
+            })
+        }));
+    }
+
+    // Agent spawner service
+    if let Some(spawner) = spawner {
+        services.insert("agent.spawn".to_string(), Arc::new(move |params: Value| {
+            let spawner = spawner.clone();
+            Box::pin(async move {
+                let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("sub-task").to_string();
+                let max_iterations = params.get("max_iterations").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                match spawner.spawn(&prompt, &description, max_iterations).await {
+                    Ok(result) => Ok(json!({
+                        "text": result.text,
+                        "iterations": result.iterations,
+                        "tool_calls": result.tool_calls,
+                    })),
+                    Err(e) => Err(e),
+                }
+            })
+        }));
+    }
+
+    services
+}
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
@@ -170,6 +231,10 @@ pub struct DaemonConfig {
     pub webhook_port: u16,
     /// Webhook configuration
     pub webhook: WebhookConfig,
+    /// Use TypeScript skill implementations instead of Rust builtins
+    pub use_script_tools: bool,
+    /// Directory containing tool scripts (resolved from env/config/default)
+    pub tools_dir: Option<PathBuf>,
 }
 
 /// LLM provider configuration (multi-provider)
@@ -191,6 +256,8 @@ pub struct LlmConfig {
     pub github_token: Option<String>,
     /// Ollama host
     pub ollama_host: String,
+    /// Ollama API key (optional — for remote/authenticated instances)
+    pub ollama_api_key: Option<String>,
     /// Legacy: API key field (for backwards compatibility)
     pub api_key: Option<String>,
 }
@@ -206,6 +273,7 @@ impl Default for LlmConfig {
             openrouter_api_key: std::env::var("OPENROUTER_API_KEY").ok(),
             github_token: std::env::var("GITHUB_TOKEN").ok(),
             ollama_host: "http://localhost:11434".to_string(),
+            ollama_api_key: std::env::var("OLLAMA_API_KEY").ok(),
             api_key: None, // Legacy
         }
     }
@@ -231,6 +299,8 @@ impl Default for DaemonConfig {
             enable_webhook_server: false, // Disabled by default (needs configuration)
             webhook_port: DEFAULT_WEBHOOK_PORT,
             webhook: WebhookConfig::default(),
+            use_script_tools: true,
+            tools_dir: None,
         }
     }
 }
@@ -249,6 +319,10 @@ pub struct DaemonServer {
     shutdown_tx: broadcast::Sender<()>,
     /// PID file (prevents multiple instances)
     pid_file: Option<PidFile>,
+    /// Log buffer for capturing daemon logs
+    log_buffer: Option<crate::log_buffer::LogBuffer>,
+    /// Shared storage for model stats persistence
+    storage: Option<Arc<nanna_storage::Storage>>,
 }
 
 impl DaemonServer {
@@ -314,9 +388,16 @@ impl DaemonServer {
             persistence,
             shutdown_tx,
             pid_file,
+            log_buffer: None,
+            storage: None,
         }
     }
     
+    /// Set the storage backend for model stats persistence.
+    pub fn set_storage(&mut self, storage: Arc<nanna_storage::Storage>) {
+        self.storage = Some(storage);
+    }
+
     /// Get the shutdown sender (for signaling shutdown)
     pub fn shutdown_handle(&self) -> broadcast::Sender<()> {
         self.shutdown_tx.clone()
@@ -374,16 +455,25 @@ impl DaemonServer {
         }
         
         // Initialize services
-        let (tools, memory, agent, router) = self.init_services().await?;
+        let (tools, memory, agent, router, tools_dir) = self.init_services().await?;
 
         // Create control plane with all services (including router for consolidation)
-        let control = Arc::new(ControlPlane::with_all_services(
+        let mut control = ControlPlane::with_all_services(
             self.sessions.clone(),
             agent,
             memory.clone(),
             Some(tools),
-            Some(router), // Pass router for consolidation
-        ));
+            Some(router),
+        )
+        .with_tools_dir(tools_dir);
+        if let Some(ref buf) = self.log_buffer {
+            control = control.with_log_buffer(buf.clone());
+        }
+        // Load persisted model stats from storage
+        if let Some(ref storage) = self.storage {
+            control = control.with_storage(storage.clone()).await;
+        }
+        let control = Arc::new(control);
         
         // Take the request receiver from IPC server
         let mut request_rx = self.ipc.take_request_receiver().await
@@ -517,6 +607,26 @@ impl DaemonServer {
             None
         };
         
+        // Spawn model stats auto-save task (every 5 minutes)
+        let stats_control = control.clone();
+        let mut stats_shutdown = self.shutdown_tx.subscribe();
+        let stats_save_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        stats_control.save_model_stats().await;
+                    }
+                    _ = stats_shutdown.recv() => {
+                        // Final save on shutdown
+                        stats_control.save_model_stats().await;
+                        info!("Model stats final save completed");
+                        break;
+                    }
+                }
+            }
+        });
+
         info!("Daemon ready. IPC server listening on ws://{}", self.ipc.address());
         
         // Main event loop
@@ -558,6 +668,7 @@ impl DaemonServer {
         if let Some(handle) = mem_save_handle {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
+        let _ = tokio::time::timeout(Duration::from_secs(5), stats_save_handle).await;
         
         ipc_handle.abort();
         
@@ -576,6 +687,7 @@ impl DaemonServer {
         Option<Arc<MemoryService>>,
         Arc<AgentService>,
         Arc<LlmRouter>,
+        Option<PathBuf>,  // tools_dir
     ), crate::DaemonError> {
         // Create LLM router with all available providers
         let mut router = LlmRouter::new();
@@ -625,9 +737,17 @@ impl DaemonServer {
             router = router.with_github_models(&token);
         }
 
-        // Always add Ollama (local, no auth needed)
+        // Add Ollama (optionally with API key for remote instances)
         info!("Adding Ollama provider at {}", self.config.llm.ollama_host);
-        router = router.with_ollama(&self.config.llm.ollama_host);
+        if let Some(ref key) = self.config.llm.ollama_api_key {
+            if !key.is_empty() {
+                router = router.with_ollama_authenticated(&self.config.llm.ollama_host, key);
+            } else {
+                router = router.with_ollama(&self.config.llm.ollama_host);
+            }
+        } else {
+            router = router.with_ollama(&self.config.llm.ollama_host);
+        }
 
         let available = router.available_providers();
         if available.is_empty() {
@@ -637,44 +757,25 @@ impl DaemonServer {
         }
         info!("LLM router initialized with {} providers: {:?}", available.len(), available);
         
-        // Create tool registry with built-in tools
+        // Create empty tool registry — all tools loaded from disk
         let tools = Arc::new(ToolRegistry::new());
-        
-        // Register built-in tools
-        tools.register(EchoTool).await;
-        tools.register(ExecTool::new()).await;
-        tools.register(ReadFileTool::new()).await;
-        tools.register(WriteFileTool::new()).await;
-        tools.register(ListDirTool::new()).await;
-        tools.register(WebFetchTool::new()).await;
-        tools.register(CodeOutlineTool::new()).await;
-        tools.register(CodeSearchTool::new()).await;
-        tools.register(ProjectStructureTool::new()).await;
-        
-        // Register web search if API key available (from config or env)
-        let brave_key = self.brave_api_key.clone()
-            .or_else(|| std::env::var("BRAVE_API_KEY").ok());
-        if let Some(api_key) = brave_key {
-            info!("Registering web_search tool with Brave API");
-            tools.register(WebSearchTool::new().with_api_key(&api_key)).await;
+
+        // Resolve tools directory (env var > config > dev fallback > {data_dir}/tools/)
+        let tools_dir = if self.config.use_script_tools {
+            let config_dir = self.config.tools_dir.as_deref();
+            let resolved = nanna_tools::skills::defaults::resolve_tools_dir(config_dir)
+                .unwrap_or_else(|| self.config.data_dir.join("tools"));
+
+            if resolved.is_dir() {
+                nanna_tools::skills::defaults::ensure_permissions(&resolved);
+                info!("Tools directory: {:?}", resolved);
+            } else {
+                warn!("Tools directory does not exist: {:?}", resolved);
+            }
+            Some(resolved)
         } else {
-            info!("Web search disabled: no Brave API key configured");
-        }
-        
-        // Register common aliases for Claude Code compatibility
-        // Claude Code uses: read, Write, bash, glob, etc.
-        tools.register_alias("read", "read_file").await;
-        tools.register_alias("Read", "read_file").await;
-        tools.register_alias("write", "write_file").await;
-        tools.register_alias("Write", "write_file").await;
-        tools.register_alias("bash", "exec").await;
-        tools.register_alias("Bash", "exec").await;
-        tools.register_alias("glob", "list_dir").await;
-        tools.register_alias("Glob", "list_dir").await;
-        tools.register_alias("ls", "list_dir").await;
-        
-        let tool_count = tools.definitions().await.len();
-        info!("Tool registry initialized with {} tools (including aliases)", tool_count);
+            None
+        };
         
         // Initialize memory service with embeddings if enabled
         let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
@@ -749,44 +850,69 @@ impl DaemonServer {
             None
         };
 
-        // Register memory tools if memory service is available
-        if let Some(ref mem_service) = memory {
-            let wrapper: Arc<dyn MemoryServiceAdapter + Send + Sync> = Arc::new(MemoryServiceWrapper(mem_service.clone()));
-            let storage: StorageHandle = Arc::new(MemoryServiceStorage::new(wrapper));
+        // Build script services and load all tools from disk
+        {
+            let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> =
+                if let Some(primary_client) = router.primary_client() {
+                    Some(Arc::new(AgentSpawnerImpl {
+                        llm: primary_client,
+                        tools: tools.clone(),
+                        agent_config: nanna_agent::AgentConfig {
+                            model: self.config.agent.model.clone(),
+                            max_tokens: self.config.agent.max_tokens,
+                            temperature: self.config.agent.temperature,
+                            max_iterations: Some(10),
+                            thinking_mode: self.config.agent.thinking_mode,
+                            summarization_priority: self.config.agent.summarization_priority.clone(),
+                            summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
+                            ..Default::default()
+                        },
+                        system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
+                        workspace_root: None,
+                        workspace_context: None,
+                        stats: None, // TODO: wire shared stats tracker from daemon state
+                    }))
+                } else {
+                    None
+                };
 
-            tools.register(RememberTool::new(storage.clone())).await;
-            tools.register(RecallTool::new(storage.clone())).await;
-            tools.register(ReflectTool::new(storage)).await;
+            let services = build_script_services(&memory, spawner_arc);
 
-            info!("Registered memory tools (remember, recall, reflect)");
-        } else {
-            info!("Memory tools not registered: memory service not available");
+            if let Some(ref dir) = tools_dir {
+                if dir.is_dir() {
+                    let loaded = tools.load_skills_with_services(dir, &services).await;
+                    info!("Loaded {} tools from {:?}", loaded, dir);
+                }
+            }
         }
 
-        // Register task delegation tool (sub-agent spawner)
-        // Get the primary LLM client for the sub-agent
-        if let Some(primary_client) = router.primary_client() {
-            let spawner = AgentSpawnerImpl {
-                llm: primary_client,
-                tools: tools.clone(),
-                agent_config: nanna_agent::AgentConfig {
-                    model: self.config.agent.model.clone(),
-                    max_tokens: self.config.agent.max_tokens,
-                    temperature: self.config.agent.temperature,
-                    max_iterations: Some(10), // default for sub-agents, overridden per-spawn
-                    thinking_mode: self.config.agent.thinking_mode,
-                    summarization_priority: self.config.agent.summarization_priority.clone(),
-                    summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
-                    ..Default::default()
-                },
-                system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
-                workspace_root: None, // Will be set per-session in the future
-                workspace_context: None,
-            };
-            tools.register(TaskTool::new(Arc::new(spawner))).await;
-            info!("Registered task delegation tool");
-        } else {
-            warn!("No primary LLM client available, task tool not registered");
+        // Register common aliases for Claude Code compatibility (after tools are loaded)
+        tools.register_alias("read", "read_file").await;
+        tools.register_alias("Read", "read_file").await;
+        tools.register_alias("write", "write_file").await;
+        tools.register_alias("Write", "write_file").await;
+        tools.register_alias("bash", "exec").await;
+        tools.register_alias("Bash", "exec").await;
+        tools.register_alias("glob", "list_dir").await;
+        tools.register_alias("Glob", "list_dir").await;
+        tools.register_alias("ls", "list_dir").await;
+
+        {
+            let tool_count = tools.definitions().await.len();
+            info!("Tool registry: {} tools (including aliases)", tool_count);
+        }
+
+        // Register discover_tools (JS/TS skill with registry access)
+        if let Some(ref dir) = tools_dir {
+            if let Some(source) = nanna_tools::skills::defaults::load_discover_tools_source(dir) {
+                let wrapper = nanna_tools::skills::ScriptedToolWrapper::from_source("discover_tools", &source)
+                    .expect("discover_tools skill must parse")
+                    .with_registry(Arc::downgrade(&tools));
+                tools.register(wrapper).await;
+                info!("Registered discover_tools skill from {:?}", dir);
+            } else {
+                warn!("discover_tools not found in tools directory");
+            }
         }
 
         // Create agent service with multi-provider router
@@ -802,7 +928,7 @@ impl DaemonServer {
 
         info!("Agent service initialized");
 
-        Ok((tools, memory, agent, router))
+        Ok((tools, memory, agent, router, tools_dir))
     }
 }
 
@@ -833,6 +959,7 @@ pub struct DaemonBuilder {
     embedding: EmbeddingConfig,
     memory_path: Option<PathBuf>,
     brave_api_key: Option<String>,
+    log_buffer: Option<crate::log_buffer::LogBuffer>,
 }
 
 impl DaemonBuilder {
@@ -842,6 +969,7 @@ impl DaemonBuilder {
             embedding: EmbeddingConfig::default(),
             memory_path: None,
             brave_api_key: None,
+            log_buffer: None,
         }
     }
     
@@ -905,9 +1033,20 @@ impl DaemonBuilder {
         builder.config.agent.summarization_priority = config.llm.summarization_priority.clone();
         builder.config.agent.summarization_ollama_url = config.llm.ollama_url.clone();
 
+        // Set model routing configuration
+        builder.config.agent.model_routing = config.llm.model_routing.clone();
+        builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
+        if !config.llm.model_routing.is_empty() {
+            info!("Model routing enabled: {:?}", config.llm.model_routing);
+        }
+
         // Set Brave API key for web search
         builder.brave_api_key = config.tools.brave_api_key.clone();
-        
+
+        // Set script tools flag and tools directory
+        builder.config.use_script_tools = config.tools.use_script_tools;
+        builder.config.tools_dir = config.tools.tools_dir.clone();
+
         // Log configured providers
         let mut providers = Vec::new();
         if builder.config.llm.anthropic_api_key.is_some() || builder.config.llm.anthropic_oauth_token.is_some() {
@@ -1009,8 +1148,20 @@ impl DaemonBuilder {
         self
     }
     
+    pub fn with_script_tools(mut self, enable: bool) -> Self {
+        self.config.use_script_tools = enable;
+        self
+    }
+
+    pub fn with_log_buffer(mut self, buffer: crate::log_buffer::LogBuffer) -> Self {
+        self.log_buffer = Some(buffer);
+        self
+    }
+
     pub fn build(self) -> DaemonServer {
-        DaemonServer::new(self.config, self.embedding, self.memory_path, self.brave_api_key)
+        let mut server = DaemonServer::new(self.config, self.embedding, self.memory_path, self.brave_api_key);
+        server.log_buffer = self.log_buffer;
+        server
     }
 }
 

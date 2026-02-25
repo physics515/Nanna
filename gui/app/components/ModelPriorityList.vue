@@ -50,7 +50,7 @@
 
             <!-- Status Indicators -->
             <div class="flex items-center gap-1 shrink-0">
-              <span v-if="!getModel(modelId)?.available" class="text-xs text-nanna-warning" title="No API key">⚠️</span>
+              <span v-if="!getModel(modelId)?.available" class="text-xs text-nanna-warning" :title="getModel(modelId)?.provider === 'ollama' ? 'Ollama not connected' : 'No API key'">⚠️</span>
             </div>
 
             <!-- Remove Button -->
@@ -131,7 +131,7 @@
                 <div class="text-sm text-nanna-text truncate">{{ model.name }}</div>
                 <div class="text-xs text-nanna-text-dim">{{ model.provider }}</div>
               </div>
-              <span v-if="!model.available" class="text-xs text-nanna-warning">No key</span>
+              <span v-if="!model.available" class="text-xs text-nanna-warning">{{ model.provider === 'ollama' ? 'Not connected' : 'No key' }}</span>
             </button>
           </div>
 
