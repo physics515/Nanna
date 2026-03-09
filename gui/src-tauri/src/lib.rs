@@ -5019,6 +5019,117 @@ async fn clear_rate_limit(
     Ok(())
 }
 
+/// Get detailed model performance statistics
+#[tauri::command]
+async fn get_model_stats(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+
+    // Try daemon mode first
+    if let Some(ref backend) = state_guard.backend {
+        let status = backend.status().await;
+        if status.connected {
+            return backend.daemon_request(serde_json::json!({
+                "type": "system",
+                "action": "model_stats"
+            })).await;
+        }
+    }
+
+    // Embedded mode: no model stats tracker available
+    Ok(serde_json::json!({
+        "models": [],
+        "note": "Model stats are only available in daemon mode"
+    }))
+}
+
+// =============================================================================
+// Sub-Session Commands (#72)
+// =============================================================================
+
+/// Spawn a sub-agent session
+#[tauri::command]
+async fn spawn_sub_session(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    task: String,
+    label: Option<String>,
+    parent_id: Option<String>,
+    model: Option<String>,
+    max_iterations: Option<usize>,
+    timeout_secs: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    state_guard.backend.daemon_request(serde_json::json!({
+        "type": "session",
+        "action": "spawn_sub_session",
+        "task": task,
+        "label": label,
+        "parent_id": parent_id,
+        "model": model,
+        "max_iterations": max_iterations,
+        "timeout_secs": timeout_secs,
+    })).await
+}
+
+/// List sub-sessions
+#[tauri::command]
+async fn list_sub_sessions(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    parent_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    state_guard.backend.daemon_request(serde_json::json!({
+        "type": "session",
+        "action": "list_sub_sessions",
+        "parent_id": parent_id,
+    })).await
+}
+
+/// Kill a sub-session
+#[tauri::command]
+async fn kill_sub_session(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    state_guard.backend.daemon_request(serde_json::json!({
+        "type": "session",
+        "action": "kill_sub_session",
+        "target": target,
+    })).await
+}
+
+/// Get sub-session status
+#[tauri::command]
+async fn get_sub_session_status(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    state_guard.backend.daemon_request(serde_json::json!({
+        "type": "session",
+        "action": "get_sub_session_status",
+        "target": target,
+    })).await
+}
+
+/// Send a message to a sub-session
+#[tauri::command]
+async fn send_to_sub_session(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    target: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    state_guard.backend.daemon_request(serde_json::json!({
+        "type": "session",
+        "action": "send_to_sub_session",
+        "target": target,
+        "message": message,
+    })).await
+}
+
 // =============================================================================
 // Config Persistence Commands
 // =============================================================================
@@ -8147,6 +8258,12 @@ pub fn run() {
             set_summarization_model_priority,
             // Model status
             get_model_status,
+            get_model_stats,
+            spawn_sub_session,
+            list_sub_sessions,
+            kill_sub_session,
+            get_sub_session_status,
+            send_to_sub_session,
             clear_rate_limit,
             // Workspaces
             list_workspaces,

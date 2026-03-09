@@ -465,7 +465,8 @@ impl DaemonServer {
             Some(tools),
             Some(router),
         )
-        .with_tools_dir(tools_dir);
+        .with_tools_dir(tools_dir)
+        .with_event_tx(self.ipc.event_sender());
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
         }
@@ -473,6 +474,14 @@ impl DaemonServer {
         if let Some(ref storage) = self.storage {
             control = control.with_storage(storage.clone()).await;
         }
+
+        // Wire model stats tracker into the router for health-aware routing.
+        // The control plane owns the canonical tracker; the router reads it.
+        if let Some(ref router) = control.router() {
+            router.set_stats(control.model_stats.clone()).await;
+            info!("Stats-informed routing enabled on LLM router");
+        }
+
         let control = Arc::new(control);
         
         // Take the request receiver from IPC server
@@ -1158,9 +1167,25 @@ impl DaemonBuilder {
         self
     }
 
-    pub fn build(self) -> DaemonServer {
+    pub async fn build(self) -> DaemonServer {
         let mut server = DaemonServer::new(self.config, self.embedding, self.memory_path, self.brave_api_key);
         server.log_buffer = self.log_buffer;
+
+        // Initialize SQLite storage for model stats persistence
+        let db_path = server.config.data_dir.join("nanna.db");
+        let storage_config = nanna_storage::StorageConfig {
+            path: db_path.to_string_lossy().to_string(),
+        };
+        match nanna_storage::Storage::new(&storage_config).await {
+            Ok(storage) => {
+                info!("Storage initialized at {:?}", db_path);
+                server.set_storage(Arc::new(storage));
+            }
+            Err(e) => {
+                warn!("Failed to initialize storage: {}. Model stats will not persist.", e);
+            }
+        }
+
         server
     }
 }

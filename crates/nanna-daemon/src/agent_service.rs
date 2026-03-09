@@ -319,7 +319,7 @@ impl AgentService {
         // This is rebuilt fresh on every chat() call — no persistent "last successful model"
         // state. Each invocation (including heartbeats) always starts from the top of the
         // priority list, so transient failures don't permanently shift the preferred model.
-        let models_to_try: Vec<String> = {
+        let base_models: Vec<String> = {
             let config = self.config.read().await;
             if config.model_priority.is_empty() {
                 vec![config.model.clone()]
@@ -327,6 +327,9 @@ impl AgentService {
                 config.model_priority.clone()
             }
         };
+
+        // Apply health-aware reordering: healthy models first, skip unhealthy ones
+        let models_to_try = self.router.health_sorted_models(&base_models).await;
 
         let mut last_error = String::from("No models available");
         let mut tried_models = Vec::new();
