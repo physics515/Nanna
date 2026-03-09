@@ -9,7 +9,7 @@
         />
 
         <!-- Dialog -->
-        <div class="relative bg-nanna-bg-surface border border-nanna-primary/20 rounded-xl p-6 w-96 max-w-[90vw] shadow-xl">
+        <div class="relative glass border border-white/[0.06] rounded-xl p-6 w-96 max-w-[90vw] shadow-xl">
           <h3 v-if="state.options.title" class="text-lg font-semibold text-nanna-text mb-2">
             {{ state.options.title }}
           </h3>
@@ -19,7 +19,7 @@
           <div class="flex justify-end gap-3">
             <button
               @click="handleCancel"
-              class="px-4 py-2 text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated rounded-lg transition-colors"
+              class="px-4 py-2 text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-white/[0.06] rounded-lg transition-colors"
             >
               {{ state.options.cancelText || 'Cancel' }}
             </button>

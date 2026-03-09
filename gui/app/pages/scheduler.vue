@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center justify-between">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Scheduler</h2>
@@ -180,7 +180,7 @@
           <textarea
             v-model="form.payload"
             rows="4"
-            class="w-full bg-nanna-bg-surface border border-nanna-border rounded-md px-3 py-2 text-sm text-nanna-text placeholder-nanna-text-dim focus:ring-2 focus:ring-nanna-primary/50 focus:border-nanna-primary"
+            class="w-full glass border border-nanna-border rounded-md px-3 py-2 text-sm text-nanna-text placeholder-nanna-text-dim focus:ring-2 focus:ring-nanna-primary/50 focus:border-nanna-primary"
             placeholder="What should Nanna do when this job runs?"
           />
         </div>

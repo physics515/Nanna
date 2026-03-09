@@ -1,7 +1,11 @@
 <template>
-  <div class="code-block-container" :class="{ 'code-block-editable': !readOnly }">
-    <!-- Language label + copy button -->
-    <div v-if="language || showCopy" class="code-block-header">
+  <div class="code-block-container" :class="{ 'code-block-editable': !readOnly }"
+    @mouseenter="splatterEnter(); glassEnter()"
+    @mouseleave="splatterLeave(); glassLeave()"
+  >
+    <!-- Language label + copy button (ground glass) -->
+    <div v-if="language || showCopy" class="code-block-header" :style="glassStyle">
+      <span class="code-block-header__mesh" :style="{ background: meshBg }" />
       <span v-if="language" class="code-lang">{{ language }}</span>
       <button 
         v-if="showCopy" 
@@ -14,13 +18,15 @@
       </button>
     </div>
     
-    <!-- Monaco Editor -->
+    <!-- Monaco Editor (splatter) -->
     <div class="monaco-wrapper" :style="{ height: computedHeight }">
+      <span class="monaco-splatter" :style="{ background: splatterBg }" />
       <VueMonacoEditor
         v-model:value="internalValue"
         :language="monacoLanguage"
         theme="nanna-dark"
         :options="editorOptions"
+        @mount="handleMount"
       />
     </div>
   </div>
@@ -51,6 +57,32 @@ const props = withDefaults(defineProps<{
   showCopy: true,
   lineNumbers: true,
   wordWrap: false,
+})
+
+// Splatter effect for the editor content area
+const {
+  splatterBg,
+  onEnter: splatterEnter,
+  onLeave: splatterLeave,
+} = useSplatter({
+  opacityRanges: [[0.08, 0.12], [0.06, 0.10], [0.04, 0.08]],
+  sizes: ['65%', '60%', '50%'],
+  lerpSpeed: 0.008,
+  interval: 3000,
+})
+
+// Ground glass effect for the toolbar
+const {
+  meshBg,
+  containerStyle: glassStyle,
+  onEnter: glassEnter,
+  onLeave: glassLeave,
+} = useGroundGlass({
+  opacity: 1.8,
+  sizes: ['55%', '50%', '45%'],
+  lerpSpeed: 0.008,
+  interval: 2200,
+  blur: 8,
 })
 
 const emit = defineEmits<{
@@ -142,7 +174,7 @@ const computedHeight = computed(() => {
   const content = internalValue.value
   const lineCount = (content.match(/\n/g) || []).length + 1
   const lineHeight = 19
-  const padding = 16
+  const padding = 8
   const calculatedHeight = lineCount * lineHeight + padding
   
   return `${Math.min(Math.max(calculatedHeight, props.minHeight), props.maxHeight)}px`
@@ -170,9 +202,10 @@ const editorOptions = computed(() => ({
   },
   wordWrap: props.wordWrap ? 'on' : 'off',
   fontSize: 13,
+  lineHeight: 19,
   fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
   fontLigatures: true,
-  padding: { top: 8, bottom: 8 },
+  padding: { top: 4, bottom: 4 },
   contextmenu: !props.readOnly,
   domReadOnly: props.readOnly,
   // Disable features in read-only mode
@@ -186,6 +219,23 @@ const editorOptions = computed(() => ({
     wordBasedSuggestions: 'off',
   }),
 }))
+
+// Fix line number alignment — Tailwind preflight shifts content area down.
+function handleMount(editor: any) {
+  const container = editor.getDomNode()
+  if (container) {
+    const s = document.createElement('style')
+    s.textContent = `.margin-view-overlays { transform: translateY(1rem) !important; }`
+    const fixBg = () => {
+      const m = container.querySelector('.margin') as HTMLElement
+      if (m) m.style.backgroundColor = 'transparent'
+    }
+    fixBg()
+    requestAnimationFrame(fixBg)
+    setTimeout(fixBg, 100)
+    container.appendChild(s)
+  }
+}
 
 // Copy functionality
 const copied = ref(false)
@@ -204,7 +254,7 @@ async function copyCode() {
 @reference "../assets/css/main.css";
 
 .code-block-container {
-  @apply relative rounded-lg overflow-hidden border border-nanna-primary/30 bg-nanna-bg-surface;
+  @apply relative rounded-lg overflow-hidden border border-white/[0.08] bg-nanna-bg-surface;
 }
 
 .code-block-editable {
@@ -212,7 +262,24 @@ async function copyCode() {
 }
 
 .code-block-header {
-  @apply flex items-center justify-between px-3 py-1.5 bg-nanna-bg-elevated/50 border-b border-nanna-primary/20;
+  @apply flex items-center justify-between px-3 py-1.5 border-b border-white/[0.06];
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: rgba(30, 41, 59, 0.25);
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.code-block-header__mesh {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.code-block-header > *:not(.code-block-header__mesh) {
+  position: relative;
+  z-index: 1;
 }
 
 .code-lang {
@@ -225,12 +292,28 @@ async function copyCode() {
 
 .monaco-wrapper {
   @apply w-full;
+  position: relative;
+  isolation: isolate;
 }
+
+.monaco-splatter {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+  opacity: 0.5;
+}
+
+
 
 /* Override Monaco's default background */
 .monaco-wrapper :deep(.monaco-editor),
-.monaco-wrapper :deep(.monaco-editor-background),
-.monaco-wrapper :deep(.monaco-editor .margin) {
+.monaco-wrapper :deep(.monaco-editor-background) {
   background-color: #1e293b !important;
+}
+
+.monaco-wrapper :deep(.monaco-editor .margin) {
+  background-color: transparent !important;
 }
 </style>

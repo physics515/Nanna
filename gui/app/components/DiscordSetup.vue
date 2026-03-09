@@ -22,7 +22,7 @@
     <div v-if="step === 1" class="space-y-4">
       <h4 class="font-medium text-nanna-text">1. Create a Discord Application</h4>
       
-      <div class="bg-nanna-bg-elevated/50 rounded-lg p-4 space-y-3">
+      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
         <ol class="text-sm text-nanna-text-muted space-y-2 list-decimal list-inside">
           <li>Go to the Discord Developer Portal</li>
           <li>Click <strong>"New Application"</strong></li>
@@ -90,7 +90,7 @@
     <div v-if="step === 3" class="space-y-4">
       <h4 class="font-medium text-nanna-text">3. Create Bot & Get Token</h4>
       
-      <div class="bg-nanna-bg-elevated/50 rounded-lg p-4 space-y-3">
+      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
         <ol class="text-sm text-nanna-text-muted space-y-2 list-decimal list-inside">
           <li>In your application, go to <strong>"Bot"</strong> section</li>
           <li>Click <strong>"Add Bot"</strong> if you haven't already</li>
@@ -129,7 +129,7 @@
     <div v-if="step === 4" class="space-y-4">
       <h4 class="font-medium text-nanna-text">4. Invite Bot & Test</h4>
       
-      <div class="bg-nanna-bg-elevated/50 rounded-lg p-4 space-y-3">
+      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           Invite your bot to a server:
         </p>
@@ -175,7 +175,7 @@
     </div>
     
     <!-- Already Configured -->
-    <div v-if="status?.configured" class="mt-4 pt-4 border-t border-nanna-primary/10">
+    <div v-if="status?.configured" class="mt-4 pt-4 border-t border-white/[0.04]">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
           <span class="w-2 h-2 rounded-full bg-nanna-success"></span>

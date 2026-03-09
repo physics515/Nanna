@@ -1,0 +1,139 @@
+/* Clother — default app font, locally embedded from Adobe Fonts */
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-300.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 300;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-300i.woff2") format("woff2");
+  font-display: swap;
+  font-style: italic;
+  font-weight: 300;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-400.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-400i.woff2") format("woff2");
+  font-display: swap;
+  font-style: italic;
+  font-weight: 400;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-700.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 700;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-700i.woff2") format("woff2");
+  font-display: swap;
+  font-style: italic;
+  font-weight: 700;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-900.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 900;
+}
+@font-face {
+  font-family: "clother";
+  src: url("/fonts/clother-900i.woff2") format("woff2");
+  font-display: swap;
+  font-style: italic;
+  font-weight: 900;
+}
+
+/* Clarendon Wide Sketch — locally embedded from Adobe Fonts */
+@font-face {
+  font-family: "clarendon-wide-sketch";
+  src: url("/fonts/clarendon-wide-sketch-200.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 200;
+}
+
+@font-face {
+  font-family: "clarendon-wide-sketch";
+  src: url("/fonts/clarendon-wide-sketch-700.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 700;
+}
+
+/* Pulpo Rust — locally embedded from Adobe Fonts */
+@font-face {
+  font-family: "pulpo-rust-25";
+  src: url("/fonts/pulpo-rust-25.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "pulpo-rust-50";
+  src: url("/fonts/pulpo-rust-50.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "pulpo-rust-75";
+  src: url("/fonts/pulpo-rust-75.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "pulpo-rust-100";
+  src: url("/fonts/pulpo-rust-100.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+/* Jubilat — locally embedded from Adobe Fonts */
+@font-face {
+  font-family: "jubilat";
+  src: url("/fonts/jubilat-500.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 500;
+}
+
+/* ── Etched glass text effect ── */
+.glass-etched {
+  font-family: "pulpo-rust-50", serif;
+  color: rgba(255, 255, 255, 0.22);
+  mix-blend-mode: overlay;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.glass-etched-sm {
+  font-family: "pulpo-rust-25", serif;
+  color: rgba(255, 255, 255, 0.8);
+  mix-blend-mode: soft-light;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* ── Glass form text (labels + inputs) ── */
+.glass-text {
+  font-family: "jubilat", serif;
+  font-weight: 500;
+}

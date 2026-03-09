@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { TooltipRoot, TooltipTrigger, TooltipPortal, TooltipContent, TooltipArrow, TooltipProvider } from 'radix-vue'
-import { cn } from '~/lib/utils'
 
 interface Props {
   content: string
@@ -25,18 +24,54 @@ const props = withDefaults(defineProps<Props>(), {
         <TooltipContent
           :side="props.side"
           :side-offset="5"
-          :class="cn(
-            'z-50 overflow-hidden rounded-md bg-nanna-bg-elevated border border-nanna-primary/20 px-3 py-1.5 text-xs text-nanna-text shadow-md',
-            'animate-in fade-in-0 zoom-in-95',
-            'data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95',
-            'data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2',
-            props.class
-          )"
+          class="tooltip-content"
         >
           {{ props.content }}
-          <TooltipArrow class="fill-nanna-bg-elevated" />
+          <TooltipArrow class="fill-[#334155]" />
         </TooltipContent>
       </TooltipPortal>
     </TooltipRoot>
   </TooltipProvider>
 </template>
+
+<style scoped>
+.tooltip-content {
+  z-index: 50;
+  overflow: hidden;
+  border-radius: 0.375rem;
+  background: rgba(51, 65, 85, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+  color: #e2e8f0;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+}
+.tooltip-content[data-state="delayed-open"],
+.tooltip-content[data-state="instant-open"] {
+  animation: tooltip-in 150ms ease-out forwards;
+}
+.tooltip-content[data-state="closed"] {
+  animation: tooltip-out 100ms ease-in forwards;
+}
+
+@keyframes tooltip-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes tooltip-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+}
+</style>

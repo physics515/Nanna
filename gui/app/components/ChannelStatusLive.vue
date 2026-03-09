@@ -72,7 +72,7 @@
         </div>
         
         <!-- Expanded Stats (when configured) -->
-        <div v-if="channel.configured && showDetails" class="mt-3 pt-3 border-t border-nanna-primary/10">
+        <div v-if="channel.configured && showDetails" class="mt-3 pt-3 border-t border-white/[0.04]">
           <div class="grid grid-cols-4 gap-4 text-xs">
             <div>
               <div class="text-nanna-text-muted">Sent/hr</div>
@@ -248,7 +248,7 @@ function getStateClasses(state: string): string {
     case 'auth_failed':
       return 'bg-nanna-error/5 border-nanna-error/30'
     default:
-      return 'bg-nanna-bg-elevated/50 border-nanna-primary/10'
+      return 'bg-nanna-bg-elevated/40 border-white/[0.04]'
   }
 }
 

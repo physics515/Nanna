@@ -72,7 +72,8 @@ pub struct AgentConfig {
     /// Ollama URL for summarization (if using ollama)
     pub summarization_ollama_url: Option<String>,
     /// Threshold (in chars) above which tool results are replaced with a
-    /// memory-reference stub in context. Default: 2000.
+    /// memory-reference stub in context. 0 = auto (scales with model context window).
+    /// Default: 0 (auto).
     pub context_result_threshold: usize,
     /// Progressive context distillation interval (in iterations).
     /// Every N iterations, the agent produces a rolling structured summary of the conversation.
@@ -139,7 +140,7 @@ impl Default for AgentConfig {
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
-            context_result_threshold: 2000,
+            context_result_threshold: 0, // 0 = auto (scales with model context window)
             distillation_interval: 5,
             model_routing: vec![],
             routing_first_turn_primary: true,
@@ -1003,7 +1004,14 @@ impl Agent {
             };
 
             let output_target = response.output_target;
-            let threshold = self.config.context_result_threshold;
+            // Dynamic threshold: 0 = auto-scale based on max_tokens (proxy for model size)
+            // ~4 chars per token, use 2x max_tokens as threshold (generous for large models)
+            // Floor: 2000 chars, Cap: 32000 chars
+            let threshold = if self.config.context_result_threshold == 0 {
+                (self.config.max_tokens as usize * 2).clamp(2000, 32000)
+            } else {
+                self.config.context_result_threshold
+            };
 
             let final_content = match output_target {
                 OutputTarget::Context => {

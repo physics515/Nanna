@@ -160,19 +160,19 @@ function truncateOutput(output: string): string {
 
 <style scoped>
 .tool-call-card {
-  background: var(--color-nanna-bg-elevated);
+  background: rgba(15, 23, 42, 0.5);
   border-radius: 0.5rem;
   padding: 0.75rem;
   margin: 0.5rem 0;
-  border-left: 3px solid var(--color-nanna-secondary);
+  border-left: 3px solid rgba(139, 92, 246, 0.3);
+  border: 1px solid rgba(71, 85, 105, 0.15);
+  border-left: 3px solid rgba(139, 92, 246, 0.3);
   font-size: 0.875rem;
   transition: all 0.2s ease;
 }
 
 .tool-running {
-  border-left-color: var(--color-nanna-warning);
-  box-shadow: 0 0 0 1px var(--color-nanna-warning) inset,
-              0 0 20px -5px var(--color-nanna-warning);
+  border-left-color: rgba(251, 191, 36, 0.5);
 }
 
 .tool-success {

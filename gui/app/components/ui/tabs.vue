@@ -2,7 +2,7 @@
   <div class="w-full">
     <!-- Tab List -->
     <div 
-      class="flex border-b border-nanna-primary/20 overflow-x-auto scrollbar-none"
+      class="flex border-b border-white/[0.06] overflow-x-auto scrollbar-none"
       role="tablist"
     >
       <button
@@ -13,8 +13,8 @@
         :class="[
           'flex items-center gap-2 px-4 py-2.5 text-sm font-medium whitespace-nowrap transition-all border-b-2 -mb-px',
           modelValue === tab.id
-            ? 'text-nanna-accent border-nanna-accent'
-            : 'text-nanna-text-muted border-transparent hover:text-nanna-text hover:border-nanna-primary/30'
+            ? 'text-nanna-primary border-nanna-primary'
+            : 'text-nanna-text-muted border-transparent hover:text-nanna-text hover:border-white/[0.08]'
         ]"
         @click="$emit('update:modelValue', tab.id)"
       >

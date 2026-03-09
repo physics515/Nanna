@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center gap-3 sm:gap-4">
         <NuxtLink to="/" class="text-nanna-text-muted hover:text-nanna-text transition-colors">
           <ArrowLeft class="w-5 h-5" />
@@ -30,7 +30,7 @@
           <div class="space-y-6">
             <!-- API Keys -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Key class="w-4 h-4" />
                 API Keys
               </h3>
@@ -118,7 +118,7 @@
                 />
 
                 <!-- Claude Proxy (claude-max-api-proxy) -->
-                <div class="space-y-2 p-3 rounded-lg bg-nanna-bg-elevated/50 border border-nanna-border/30">
+                <div class="space-y-2 p-3 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30">
                   <div class="flex items-center justify-between">
                     <div class="flex items-center gap-2">
                       <span class="text-sm font-medium text-nanna-text">Claude Proxy</span>
@@ -160,7 +160,7 @@
             <!-- Model Priority (Fallback Chain) -->
             <UiCard>
               <div class="flex items-center justify-between mb-4">
-                <h3 class="text-base font-semibold text-nanna-accent flex items-center gap-2">
+                <h3 class="text-base font-semibold text-nanna-primary flex items-center gap-2">
                   <Brain class="w-4 h-4" />
                   Chat Models
                 </h3>
@@ -191,8 +191,8 @@
               </div>
 
               <!-- Summarization Models -->
-              <div class="mt-6 pt-6 border-t border-nanna-primary/10">
-                <h3 class="text-sm font-semibold text-nanna-accent mb-3 flex items-center gap-2">
+              <div class="mt-6 pt-6 border-t border-white/[0.04]">
+                <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
                   <Layers class="w-4 h-4" />
                   Context Summarization
                 </h3>
@@ -209,8 +209,8 @@
               </div>
 
               <!-- Embedding Models -->
-              <div class="mt-6 pt-6 border-t border-nanna-primary/10">
-                <h3 class="text-sm font-semibold text-nanna-accent mb-3 flex items-center gap-2">
+              <div class="mt-6 pt-6 border-t border-white/[0.04]">
+                <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
                   <Link class="w-4 h-4" />
                   Embedding Models
                 </h3>
@@ -237,7 +237,7 @@
               </div>
 
               <!-- Ollama Host -->
-              <div class="mt-4 pt-4 border-t border-nanna-primary/10">
+              <div class="mt-4 pt-4 border-t border-white/[0.04]">
                 <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
                 <div class="flex gap-2">
                   <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
@@ -259,7 +259,7 @@
               </div>
 
               <!-- Ollama API Key -->
-              <div class="mt-4 pt-4 border-t border-nanna-primary/10">
+              <div class="mt-4 pt-4 border-t border-white/[0.04]">
                 <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama API Key</label>
                 <div class="flex gap-2">
                   <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="Optional — for remote/authenticated Ollama" class="flex-1" />
@@ -282,7 +282,7 @@
             
             <!-- Agent Identity -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Bot class="w-4 h-4" />
                 Agent Identity
               </h3>
@@ -315,7 +315,7 @@
             
             <!-- Model Routing -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Cpu class="w-4 h-4" />
                 Model Routing
               </h3>
@@ -364,7 +364,7 @@
 
             <!-- Response Preferences -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <MessageSquare class="w-4 h-4" />
                 Response Preferences
               </h3>
@@ -386,7 +386,7 @@
                 </div>
                 
                 <!-- Max Tokens -->
-                <div class="p-3 rounded-lg bg-nanna-bg-elevated/50">
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
                   <div class="flex items-center justify-between mb-2">
                     <span class="text-sm font-medium text-nanna-text">Max Response Length</span>
                     <span class="text-sm text-nanna-accent font-mono">{{ maxTokens.toLocaleString() }}</span>
@@ -412,7 +412,7 @@
           <div class="space-y-6">
             <!-- Memory Settings -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <BrainCircuit class="w-4 h-4" />
                 Cognitive Memory
                 <UiBadge variant="secondary" class="ml-auto">FSRS-6</UiBadge>
@@ -420,26 +420,26 @@
               <div class="space-y-4">
                 <!-- Stats Grid -->
                 <div class="grid grid-cols-4 gap-2">
-                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/50 text-center">
+                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
                     <div class="text-lg font-bold text-nanna-success">{{ memoryStats?.active || 0 }}</div>
                     <div class="text-xs text-nanna-text-dim">Active</div>
                   </div>
-                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/50 text-center">
+                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
                     <div class="text-lg font-bold text-nanna-warning">{{ memoryStats?.dormant || 0 }}</div>
                     <div class="text-xs text-nanna-text-dim">Dormant</div>
                   </div>
-                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/50 text-center">
+                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
                     <div class="text-lg font-bold text-nanna-text-muted">{{ memoryStats?.silent || 0 }}</div>
                     <div class="text-xs text-nanna-text-dim">Silent</div>
                   </div>
-                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/50 text-center">
+                  <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
                     <div class="text-lg font-bold text-nanna-error">{{ memoryStats?.unavailable || 0 }}</div>
                     <div class="text-xs text-nanna-text-dim">Faded</div>
                   </div>
                 </div>
                 
                 <!-- Similarity Threshold -->
-                <div class="p-3 rounded-lg bg-nanna-bg-elevated/50">
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
                   <div class="flex items-center justify-between mb-2">
                     <span class="text-sm font-medium text-nanna-text">Recall Threshold</span>
                     <span class="text-sm text-nanna-accent font-mono">{{ (similarityThreshold * 100).toFixed(0) }}%</span>
@@ -480,7 +480,7 @@
           <div class="space-y-6">
             <!-- Tool API Keys -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Key class="w-4 h-4" />
                 Tool API Keys
               </h3>
@@ -498,7 +498,7 @@
             
             <!-- Available Tools -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Wrench class="w-4 h-4" />
                 Available Tools
                 <UiBadge variant="outline" class="ml-auto">{{ settings?.tools?.length || 0 }}</UiBadge>
@@ -507,7 +507,7 @@
                 <div
                   v-for="tool in settings?.tools || []"
                   :key="tool.name"
-                  class="flex items-center justify-between gap-2 p-3 rounded-lg bg-nanna-bg-elevated/50"
+                  class="flex items-center justify-between gap-2 p-3 rounded-lg bg-nanna-bg-elevated/40"
                 >
                   <div class="flex items-center gap-2 min-w-0">
                     <span class="text-lg">{{ getToolIcon(tool.name) }}</span>
@@ -529,7 +529,7 @@
         <UiTabPanel :active="activeTab === 'scheduler'">
           <div class="space-y-6">
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Clock class="w-4 h-4" />
                 Scheduler Settings
               </h3>
@@ -551,7 +551,7 @@
                 </div>
                 
                 <!-- Heartbeat Interval -->
-                <div class="p-3 rounded-lg bg-nanna-bg-elevated/50">
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
                   <div class="flex items-center justify-between mb-2">
                     <span class="text-sm font-medium text-nanna-text">Heartbeat Interval</span>
                     <span class="text-sm text-nanna-accent font-mono">{{ formatInterval(settings?.heartbeat_interval_seconds || 300) }}</span>
@@ -577,12 +577,12 @@
           <div class="space-y-6">
             <!-- Sessions -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Database class="w-4 h-4" />
                 Data Management
               </h3>
               <div class="space-y-4">
-                <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/50">
+                <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
                   <div>
                     <div class="text-sm font-medium text-nanna-text">Chat Sessions</div>
                     <div class="text-xs text-nanna-text-dim">{{ sessionCount }} sessions stored</div>
@@ -593,7 +593,7 @@
                   </UiButton>
                 </div>
                 
-                <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/50">
+                <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
                   <div>
                     <div class="text-sm font-medium text-nanna-text">Memories</div>
                     <div class="text-xs text-nanna-text-dim">{{ memoryStats?.total_memories || 0 }} memories stored</div>
@@ -608,7 +608,7 @@
             
             <!-- Import/Export -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <FileDown class="w-4 h-4" />
                 Configuration
               </h3>
@@ -634,7 +634,7 @@
             
             <!-- About -->
             <UiCard>
-              <h3 class="text-base font-semibold text-nanna-accent mb-4 flex items-center gap-2">
+              <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Moon class="w-4 h-4" />
                 About Nanna
               </h3>

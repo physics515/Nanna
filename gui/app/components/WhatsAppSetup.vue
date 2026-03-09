@@ -82,7 +82,7 @@
     <div v-if="step === 2 && connectionMethod === 'cloud-api'" class="space-y-4">
       <h4 class="font-medium text-nanna-text">2. Set Up Meta Developer App</h4>
       
-      <div class="bg-nanna-bg-elevated/50 rounded-lg p-4 space-y-3">
+      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
         <ol class="text-sm text-nanna-text-muted space-y-2 list-decimal list-inside">
           <li>Go to Meta for Developers</li>
           <li>Create a new app → Select <strong>"Business"</strong> type</li>
@@ -130,7 +130,7 @@
         </div>
       </div>
       
-      <div class="bg-nanna-bg-elevated/50 rounded-lg p-4 text-center">
+      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 text-center">
         <div v-if="!qrCode" class="space-y-3">
           <p class="text-sm text-nanna-text-muted">
             Click below to generate a QR code for linking
@@ -246,7 +246,7 @@
       <h4 class="font-medium text-nanna-text">4. Test & Save</h4>
       
       <!-- Webhook URL for Cloud API -->
-      <div v-if="connectionMethod === 'cloud-api'" class="bg-nanna-bg-elevated/50 rounded-lg p-4 space-y-2">
+      <div v-if="connectionMethod === 'cloud-api'" class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-2">
         <p class="text-sm text-nanna-text-muted">
           Configure this webhook URL in Meta Developer Console:
         </p>
@@ -299,7 +299,7 @@
     </div>
     
     <!-- Already Configured -->
-    <div v-if="status?.configured" class="mt-4 pt-4 border-t border-nanna-primary/10">
+    <div v-if="status?.configured" class="mt-4 pt-4 border-t border-white/[0.04]">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
           <span class="w-2 h-2 rounded-full bg-nanna-success"></span>

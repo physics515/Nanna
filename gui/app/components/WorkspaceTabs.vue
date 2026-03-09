@@ -1,12 +1,12 @@
 <template>
-  <div class="flex items-center gap-1 px-2 py-1.5 bg-nanna-bg-deep/50 border-b border-nanna-primary/10 overflow-x-auto scrollbar-thin">
+  <div class="flex items-center gap-1 px-2 py-1.5 bg-nanna-bg-deep/50 border-b border-white/[0.04] overflow-x-auto scrollbar-thin">
     <!-- Global Tab -->
     <button
       :class="[
         'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all whitespace-nowrap',
-        'hover:bg-nanna-bg-elevated',
+        'hover:bg-white/[0.04]',
         isGlobalActive 
-          ? 'bg-nanna-bg-surface text-nanna-text border border-nanna-primary/20' 
+          ? 'glass text-nanna-text' 
           : 'text-nanna-text-muted'
       ]"
       @click="$emit('select', { type: 'global' })"
@@ -16,7 +16,7 @@
     </button>
 
     <!-- Divider -->
-    <div v-if="openWorkspaces.length > 0" class="w-px h-5 bg-nanna-primary/20 mx-1" />
+    <div v-if="openWorkspaces.length > 0" class="w-px h-5 bg-white/[0.06] mx-1" />
 
     <!-- Workspace Tabs -->
     <div
@@ -24,9 +24,9 @@
       :key="ws.id"
       :class="[
         'group flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all whitespace-nowrap',
-        'hover:bg-nanna-bg-elevated',
+        'hover:bg-white/[0.04]',
         currentTab?.type === 'workspace' && currentTab?.workspaceId === ws.id
-          ? 'bg-nanna-bg-surface text-nanna-accent border border-nanna-accent/30'
+          ? 'glass text-nanna-primary'
           : 'text-nanna-text-muted'
       ]"
     >
@@ -40,7 +40,7 @@
       
       <!-- Close button -->
       <button
-        class="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-nanna-bg-elevated transition-opacity"
+        class="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.04] transition-opacity"
         @click.stop="$emit('close', ws.id)"
         title="Close tab"
       >
@@ -50,7 +50,7 @@
 
     <!-- Add Workspace Button -->
     <button
-      class="flex items-center justify-center w-7 h-7 rounded-lg text-nanna-text-dim hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors ml-1"
+      class="flex items-center justify-center w-7 h-7 rounded-lg text-nanna-text-dim hover:text-nanna-text hover:bg-white/[0.04] transition-colors ml-1"
       @click="$emit('add')"
       title="Open workspace"
     >

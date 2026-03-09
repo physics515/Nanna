@@ -1,8 +1,8 @@
 <template>
   <div class="flex h-full">
     <!-- Sidebar: Tools List -->
-    <aside class="w-64 border-r border-nanna-primary/10 bg-nanna-bg-surface/50 flex flex-col">
-      <header class="px-3 py-3 border-b border-nanna-primary/10">
+    <aside class="w-64 border-r border-white/[0.04] bg-nanna-bg-surface/80 flex flex-col">
+      <header class="px-3 py-3 border-b border-white/[0.04]">
         <div class="flex items-center justify-between mb-2">
           <h2 class="font-semibold text-nanna-text text-sm">Tools</h2>
           <div class="flex gap-1">
@@ -51,7 +51,7 @@
       </div>
 
       <!-- Tool count -->
-      <footer class="px-3 py-2 border-t border-nanna-primary/10 text-[10px] text-nanna-text-dim">
+      <footer class="px-3 py-2 border-t border-white/[0.04] text-[10px] text-nanna-text-dim">
         {{ tools.length }} tools available
       </footer>
     </aside>
@@ -81,7 +81,7 @@
       <!-- Tool Details / Editor -->
       <div v-else class="flex-1 flex flex-col min-h-0">
         <!-- Header -->
-        <header class="px-4 py-2 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+        <header class="px-4 py-2 border-b border-white/[0.04] bg-nanna-bg-surface/80">
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-3">
               <div class="flex items-center gap-2">
@@ -108,7 +108,7 @@
         </header>
 
         <!-- Tabs -->
-        <div class="flex border-b border-nanna-primary/10 bg-nanna-bg-surface/30">
+        <div class="flex border-b border-white/[0.04] bg-nanna-bg-surface/30">
           <button
             v-for="tab in editorTabs"
             :key="tab.id"
@@ -163,7 +163,7 @@
                 </div>
                 <div>
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Output Routing</label>
-                  <select v-model="editingTool.outputTarget" class="w-full px-3 py-2 bg-nanna-bg-elevated border border-nanna-primary/20 rounded-lg text-sm text-nanna-text">
+                  <select v-model="editingTool.outputTarget" class="w-full px-3 py-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded-lg text-sm text-nanna-text">
                     <option value="memory">Memory (default) — large results stored in memory, stubbed in context</option>
                     <option value="context">Context — results always inline, summarized if large</option>
                   </select>
@@ -178,7 +178,7 @@
           <!-- Code Tab -->
           <div v-show="activeTab === 'code'" class="flex-1 flex flex-col min-w-0">
             <!-- Creating: Name input -->
-            <div v-if="creating" class="px-4 py-3 border-b border-nanna-primary/10 bg-nanna-bg-surface/30">
+            <div v-if="creating" class="px-4 py-3 border-b border-white/[0.04] bg-nanna-bg-surface/30">
               <div class="flex gap-4">
                 <div class="flex-1">
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Tool Name</label>
@@ -186,7 +186,7 @@
                 </div>
                 <div class="w-32">
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Type</label>
-                  <select v-model="editingTool.toolType" class="w-full px-3 py-2 bg-nanna-bg-elevated border border-nanna-primary/20 rounded-lg text-sm text-nanna-text">
+                  <select v-model="editingTool.toolType" class="w-full px-3 py-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded-lg text-sm text-nanna-text">
                     <option value="script">Script (JS/TS)</option>
                     <option value="manifest">Manifest (YAML)</option>
                   </select>
@@ -224,8 +224,8 @@
           </div>
 
           <!-- Test Panel (slide out) -->
-          <aside v-if="showTestPanel" class="w-80 border-l border-nanna-primary/10 bg-nanna-bg-surface/50 flex flex-col">
-            <header class="px-3 py-2 border-b border-nanna-primary/10 flex items-center justify-between">
+          <aside v-if="showTestPanel" class="w-80 border-l border-white/[0.04] bg-nanna-bg-surface/80 flex flex-col">
+            <header class="px-3 py-2 border-b border-white/[0.04] flex items-center justify-between">
               <span class="text-sm font-semibold text-nanna-text">Test Tool</span>
               <button @click="showTestPanel = false" class="p-1 rounded hover:bg-nanna-primary/20">
                 <X class="w-4 h-4 text-nanna-text-muted" />
@@ -257,7 +257,7 @@
                 <label class="block text-xs font-medium text-nanna-text-muted mb-1">Input (JSON)</label>
                 <textarea
                   v-model="testInputJson"
-                  class="w-full h-24 p-2 bg-nanna-bg-elevated border border-nanna-primary/20 rounded text-xs font-mono text-nanna-text resize-none"
+                  class="w-full h-24 p-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded text-xs font-mono text-nanna-text resize-none"
                   placeholder='{ "param": "value" }'
                 ></textarea>
               </div>
@@ -295,7 +295,7 @@
             v-for="template in templates"
             :key="template.id"
             @click="createFromTemplate(template)"
-            class="p-4 text-left bg-nanna-bg-elevated hover:bg-nanna-primary/10 border border-nanna-primary/20 hover:border-nanna-accent/50 rounded-lg transition-colors"
+            class="p-4 text-left bg-nanna-bg-elevated hover:bg-nanna-primary/10 border border-white/[0.06] hover:border-nanna-accent/50 rounded-lg transition-colors"
           >
             <div class="text-lg mb-1">{{ template.icon }}</div>
             <div class="font-medium text-nanna-text text-sm">{{ template.name }}</div>
@@ -303,7 +303,7 @@
           </button>
         </div>
 
-        <div class="flex justify-end pt-4 border-t border-nanna-primary/10">
+        <div class="flex justify-end pt-4 border-t border-white/[0.04]">
           <UiButton @click="showCreateModal = false" variant="ghost">Cancel</UiButton>
         </div>
       </div>

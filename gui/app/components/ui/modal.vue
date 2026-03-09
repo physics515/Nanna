@@ -1,33 +1,12 @@
 <script setup lang="ts">
 import { DialogRoot, DialogTrigger, DialogPortal, DialogOverlay, DialogContent, DialogClose, DialogTitle, DialogDescription } from 'radix-vue'
-import { cva, type VariantProps } from 'class-variance-authority'
-import { cn } from '~/lib/utils'
 import { X } from 'lucide-vue-next'
-
-const modalVariants = cva(
-  'fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border border-nanna-primary/20 bg-nanna-bg-surface p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg',
-  {
-    variants: {
-      size: {
-        sm: 'max-w-sm',
-        md: 'max-w-lg',
-        lg: 'max-w-2xl',
-        xl: 'max-w-4xl',
-      },
-    },
-    defaultVariants: {
-      size: 'md',
-    },
-  }
-)
-
-type ModalVariants = VariantProps<typeof modalVariants>
 
 interface Props {
   modelValue?: boolean
   title?: string
   description?: string
-  size?: ModalVariants['size']
+  size?: 'sm' | 'md' | 'lg' | 'xl'
   closable?: boolean
 }
 
@@ -45,6 +24,13 @@ const open = computed({
   get: () => props.modelValue,
   set: (value) => emit('update:modelValue', value),
 })
+
+const sizeClass = computed(() => ({
+  sm: 'max-w-sm',
+  md: 'max-w-lg',
+  lg: 'max-w-2xl',
+  xl: 'max-w-4xl',
+}[props.size ?? 'md']))
 </script>
 
 <template>
@@ -53,31 +39,29 @@ const open = computed({
       <slot name="trigger" />
     </DialogTrigger>
     <DialogPortal>
-      <DialogOverlay 
-        class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" 
-      />
-      <DialogContent :class="cn(modalVariants({ size: props.size }))">
+      <DialogOverlay class="modal-overlay" />
+      <DialogContent :class="['modal-content', sizeClass]">
         <!-- Header -->
         <div v-if="title || closable" class="flex items-center justify-between">
-          <DialogTitle v-if="title" class="text-lg font-semibold text-nanna-text">
+          <DialogTitle v-if="title" class="text-lg font-semibold" style="color: #e2e8f0">
             {{ title }}
           </DialogTitle>
-          <DialogClose 
+          <DialogClose
             v-if="closable"
-            class="rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-nanna-accent focus:ring-offset-2 disabled:pointer-events-none"
+            class="rounded-sm opacity-70 transition-opacity hover:opacity-100 focus:outline-none"
           >
             <X class="h-4 w-4" />
             <span class="sr-only">Close</span>
           </DialogClose>
         </div>
-        
-        <DialogDescription v-if="description" class="text-sm text-nanna-text-muted">
+
+        <DialogDescription v-if="description" class="text-sm" style="color: #94a3b8">
           {{ description }}
         </DialogDescription>
-        
+
         <!-- Content -->
         <slot />
-        
+
         <!-- Footer -->
         <div v-if="$slots.footer">
           <slot name="footer" />
@@ -86,3 +70,70 @@ const open = computed({
     </DialogPortal>
   </DialogRoot>
 </template>
+
+<style scoped>
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+}
+.modal-overlay[data-state="open"] {
+  animation: fade-in 200ms ease-out forwards;
+}
+.modal-overlay[data-state="closed"] {
+  animation: fade-out 150ms ease-in forwards;
+}
+
+.modal-content {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  z-index: 50;
+  display: grid;
+  width: 100%;
+  gap: 1rem;
+  padding: 1.5rem;
+  transform: translate(-50%, -50%);
+  border-radius: 0.75rem;
+  background: #1e293b;
+  border: 1px solid rgba(71, 85, 105, 0.3);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.modal-content[data-state="open"] {
+  animation: modal-in 200ms ease-out forwards;
+}
+.modal-content[data-state="closed"] {
+  animation: modal-out 150ms ease-in forwards;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+@keyframes modal-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.95);
+  }
+}
+</style>

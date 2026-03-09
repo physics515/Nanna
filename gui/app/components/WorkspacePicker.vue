@@ -8,7 +8,7 @@
           v-model="searchQuery"
           type="text"
           placeholder="Search workspaces..."
-          class="w-full pl-10 pr-4 py-2 rounded-lg bg-nanna-bg-elevated border border-nanna-primary/20 text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
+          class="w-full pl-10 pr-4 py-2 rounded-lg bg-nanna-bg-elevated/30 border border-white/[0.06] text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
         />
       </div>
 
@@ -37,7 +37,7 @@
             'w-full flex items-center gap-3 p-3 rounded-lg text-left transition-colors',
             isAlreadyOpen(ws.id) 
               ? 'bg-nanna-accent/10 border border-nanna-accent/20 cursor-default'
-              : 'hover:bg-nanna-bg-elevated'
+              : 'hover:bg-white/[0.06]'
           ]"
           :disabled="isAlreadyOpen(ws.id)"
           @click="selectWorkspace(ws)"
@@ -72,7 +72,7 @@
       </div>
 
       <!-- Footer with link to workspaces page -->
-      <div class="pt-2 border-t border-nanna-primary/10">
+      <div class="pt-2 border-t border-white/[0.04]">
         <NuxtLink 
           to="/workspaces" 
           class="flex items-center justify-center gap-2 text-sm text-nanna-text-muted hover:text-nanna-accent transition-colors"

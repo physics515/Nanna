@@ -13,16 +13,16 @@ export default {
   theme: {
     extend: {
       colors: {
-        // 80s Hacker Retro - Palenight inspired
+        // Palenight-inspired — adapted from nisaba design system
         nanna: {
           bg: {
-            DEFAULT: '#0f172a', // slate-900
-            deep: '#020617',    // slate-950
-            surface: '#1e293b', // slate-800
-            elevated: '#334155', // slate-700
+            DEFAULT: '#0f172a', // deep sidebar / main bg
+            deep: '#020617',    // darkest
+            surface: '#1e293b', // card surfaces
+            elevated: '#334155', // elevated elements
           },
           primary: {
-            DEFAULT: '#8b5cf6', // violet-500
+            DEFAULT: '#8b5cf6', // violet-500 accent
             hover: '#a78bfa',   // violet-400
             muted: '#6d28d9',   // violet-700
           },
@@ -36,23 +36,28 @@ export default {
             glow: '#06b6d4',    // cyan-500
           },
           text: {
-            DEFAULT: '#e2e8f0', // slate-200
-            muted: '#94a3b8',   // slate-400
+            DEFAULT: '#e2e8f0', // foreground
+            muted: '#c4cdd6',   // muted text (nisaba muted)
             dim: '#64748b',     // slate-500
           },
+          border: '#475569',    // nisaba border
           success: '#34d399',   // emerald-400
           warning: '#fbbf24',   // amber-400
           error: '#fb7185',     // rose-400
         },
       },
       fontFamily: {
+        sans: ['clother', 'Inter', 'system-ui', 'sans-serif'],
+        heading: ['pulpo-rust-50', 'serif'],
+        glass: ['jubilat', 'serif'],
         mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
-        sans: ['Inter', 'system-ui', 'sans-serif'],
       },
       boxShadow: {
-        'glow': '0 0 20px rgba(34, 211, 238, 0.3)',
-        'glow-sm': '0 0 10px rgba(34, 211, 238, 0.2)',
+        'glow': '0 0 20px rgba(139, 92, 246, 0.3)',
+        'glow-sm': '0 0 10px rgba(139, 92, 246, 0.2)',
         'glow-violet': '0 0 20px rgba(139, 92, 246, 0.3)',
+        'glow-cyan': '0 0 20px rgba(34, 211, 238, 0.3)',
+        'glass': 'inset 0 1px 0 0 rgba(255,255,255,0.04), 0 1.5px 1px -0.5px rgba(0,0,0,0.18), 0 3px 8px -3px rgba(0,0,0,0.12)',
       },
       animation: {
         'pulse-glow': 'pulse-glow 2s ease-in-out infinite',
@@ -74,8 +79,8 @@ export default {
         },
       },
       backgroundImage: {
-        'grid-pattern': `linear-gradient(rgba(34, 211, 238, 0.03) 1px, transparent 1px),
-                         linear-gradient(90deg, rgba(34, 211, 238, 0.03) 1px, transparent 1px)`,
+        'grid-pattern': `linear-gradient(rgba(139, 92, 246, 0.03) 1px, transparent 1px),
+                         linear-gradient(90deg, rgba(139, 92, 246, 0.03) 1px, transparent 1px)`,
         'scanlines': `repeating-linear-gradient(
           0deg,
           transparent,

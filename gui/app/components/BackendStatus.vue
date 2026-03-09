@@ -1,6 +1,6 @@
 <template>
   <div :class="['backend-status', modeClass]" :title="tooltip">
-    <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg backdrop-blur-sm">
+    <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg ">
       <span class="status-indicator">{{ icon }}</span>
       <div class="flex flex-col">
         <span class="text-xs font-mono font-semibold">{{ modeLabel }}</span>

@@ -2,13 +2,13 @@
   <div class="chat-input-container">
     <!-- Preview pane (collapsible) -->
     <Transition name="preview">
-      <div 
+      <div
         v-if="showPreview && modelValue.trim()"
-        class="preview-pane mb-2 rounded-xl border border-nanna-primary/20 bg-nanna-bg-surface/50 overflow-hidden"
+        class="preview-pane mb-2 rounded-xl overflow-hidden glass-editor-wrap"
       >
-        <div class="flex items-center justify-between px-3 py-1.5 border-b border-nanna-primary/10 bg-nanna-bg-elevated/30">
+        <div class="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.04]">
           <span class="text-[10px] uppercase tracking-wider text-nanna-text-dim font-medium">Preview</span>
-          <button 
+          <button
             @click="showPreview = false"
             class="text-nanna-text-dim hover:text-nanna-text p-0.5"
           >
@@ -20,78 +20,96 @@
         </div>
       </div>
     </Transition>
-    
-    <!-- TipTap Editor -->
-    <div 
-      :class="[
-        'relative rounded-xl border transition-all duration-200',
-        isFocused 
-          ? 'border-nanna-accent/50 ring-2 ring-nanna-accent/20' 
-          : 'border-nanna-primary/20 hover:border-nanna-primary/30',
-        disabled && 'opacity-50 cursor-not-allowed'
-      ]"
-    >
-      <EditorContent 
-        :editor="editor" 
-        class="chat-editor"
-      />
-      
-      <!-- Bottom toolbar -->
-      <div class="flex items-center justify-between px-3 py-2 border-t border-nanna-primary/10">
-        <!-- Left: formatting hints + preview toggle -->
-        <div class="flex items-center gap-2 text-xs text-nanna-text-dim">
-          <button
-            @click="showPreview = !showPreview"
-            :class="[
-              'flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors',
-              showPreview 
-                ? 'bg-nanna-primary/20 text-nanna-accent' 
-                : 'hover:bg-nanna-primary/10 hover:text-nanna-text'
-            ]"
-            title="Toggle preview (Ctrl+P)"
+
+    <!-- Combined input card -->
+    <div class="input-card" :class="{ 'input-card--focused': isFocused }">
+
+      <!-- ═══ Top: Editor with Splatter ═══ -->
+      <div class="input-editor-zone">
+        <!-- Splatter layer -->
+        <span class="input-editor-zone__splatter" :style="{ background: splatterBg }" />
+
+        <!-- Editor content -->
+        <EditorContent
+          :editor="editor"
+          class="chat-editor"
+          :class="{ 'opacity-50 cursor-not-allowed': disabled }"
+        />
+      </div>
+
+      <!-- ═══ Bottom: Toolbar with Ground Glass ═══ -->
+      <div
+        class="input-toolbar"
+        :style="glassStyle"
+        @mouseenter="handleToolbarEnter"
+        @mouseleave="handleToolbarLeave"
+      >
+        <!-- Glass mesh layer -->
+        <span class="input-toolbar__mesh" :style="{ background: meshBg }" />
+
+        <!-- Glass noise overlay -->
+        <span class="input-toolbar__noise" />
+
+        <!-- Toolbar content -->
+        <div class="input-toolbar__content">
+          <!-- Left: formatting hints + preview toggle -->
+          <div class="flex items-center gap-2 text-xs" style="color: rgba(203, 213, 225, 0.85);">
+            <UiGlassButton
+              pill
+              size="sm"
+              :color="showPreview ? 'accent' : 'default'"
+              @click="showPreview = !showPreview"
+              title="Toggle preview (Ctrl+P)"
+            >
+              <Eye class="w-3.5 h-3.5 sm:mr-1" />
+              <span class="hidden sm:inline">Preview</span>
+            </UiGlassButton>
+            <span class="text-nanna-text-muted hidden sm:inline">&middot;</span>
+            <span class="hidden md:inline">
+              <kbd class="px-1 py-0.5 rounded bg-white/[0.04] text-[10px]">Ctrl+Enter</kbd> send
+            </span>
+          </div>
+
+          <!-- Right: stop or send button -->
+          <UiGlassButton
+            v-if="isActive"
+            @click="emit('stop')"
+            size="sm"
+            color="danger"
+            pill
+            class="shrink-0"
           >
-            <Eye class="w-3.5 h-3.5" />
-            <span class="hidden sm:inline">Preview</span>
-          </button>
-          <span class="text-nanna-text-muted hidden sm:inline">·</span>
-          <span class="hidden md:inline">
-            <kbd class="px-1 py-0.5 rounded bg-nanna-bg-elevated text-[10px]">Ctrl+Enter</kbd> send
-          </span>
+            <Square class="w-3.5 h-3.5 sm:mr-1 fill-current" />
+            <span class="hidden sm:inline">Stop</span>
+          </UiGlassButton>
+          <UiGlassButton
+            v-else
+            @click="submit"
+            :disabled="isEmpty || disabled"
+            size="sm"
+            color="accent"
+            pill
+            class="shrink-0"
+          >
+            <Send class="w-4 h-4 sm:mr-1" />
+            <span class="hidden sm:inline">Send</span>
+          </UiGlassButton>
         </div>
-        
-        <!-- Right: stop or send button -->
-        <UiButton
-          v-if="isActive"
-          @click="emit('stop')"
-          size="sm"
-          class="shrink-0 !bg-red-600 hover:!bg-red-700 !border-red-600"
-        >
-          <Square class="w-3.5 h-3.5 sm:mr-1 fill-current" />
-          <span class="hidden sm:inline">Stop</span>
-        </UiButton>
-        <UiButton
-          v-else
-          @click="submit"
-          :disabled="isEmpty || disabled"
-          size="sm"
-          class="shrink-0"
-        >
-          <Send class="w-4 h-4 sm:mr-1" />
-          <span class="hidden sm:inline">Send</span>
-        </UiButton>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
 import { MonacoCodeBlock } from '~/extensions/MonacoCodeBlock'
 import { Send, Eye, X, Square } from 'lucide-vue-next'
+import { useSplatter } from '~/composables/useSplatter'
+import { useGroundGlass } from '~/composables/useGroundGlass'
 
 const props = defineProps<{
   modelValue: string
@@ -110,12 +128,49 @@ const emit = defineEmits<{
 const isFocused = ref(false)
 const showPreview = ref(false)
 
+// Splatter for the editor area (focus-driven)
+const {
+  splatterBg,
+  onEnter: splatterEnter,
+  onLeave: splatterLeave,
+} = useSplatter({
+  opacityRanges: [[0.08, 0.12], [0.06, 0.10], [0.04, 0.08]],
+  sizes: ['65%', '60%', '50%'],
+  lerpSpeed: 0.008,
+  interval: 3000,
+})
+
+// Ground glass for the toolbar (hover-driven)
+const {
+  meshBg,
+  containerStyle: glassStyle,
+  onEnter: glassEnter,
+  onLeave: glassLeave,
+} = useGroundGlass({
+  opacity: 1.8,
+  sizes: ['55%', '50%', '45%'],
+  lerpSpeed: 0.008,
+  interval: 2200,
+  blur: 8,
+})
+
+// Prevent mount animation
+const ready = ref(false)
+onMounted(() => { setTimeout(() => { ready.value = true }, 200) })
+
+function handleToolbarEnter() {
+  if (ready.value) glassEnter()
+}
+function handleToolbarLeave() {
+  if (ready.value) glassLeave()
+}
+
 // Initialize Tiptap editor with Monaco code blocks
 const editor = useEditor({
   content: props.modelValue,
   extensions: [
     StarterKit.configure({
-      codeBlock: false, // Disable default, use Monaco
+      codeBlock: false,
       heading: false,
       horizontalRule: false,
     }),
@@ -136,23 +191,16 @@ const editor = useEditor({
       class: 'prose prose-invert prose-sm max-w-none focus:outline-none',
     },
     handleKeyDown: (view, event) => {
-      // Ctrl+P to toggle preview
       if (event.key === 'p' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault()
         showPreview.value = !showPreview.value
         return true
       }
-      
-      // Ctrl+Enter to submit
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault()
         submit()
         return true
       }
-      
-      // Let TipTap handle:
-      // - Enter = new paragraph
-      // - Shift+Enter = line break (hard break)
       return false
     },
   },
@@ -160,28 +208,31 @@ const editor = useEditor({
     const text = getMarkdownContent(editor)
     emit('update:modelValue', text)
   },
-  onFocus: () => { isFocused.value = true },
-  onBlur: () => { isFocused.value = false },
+  onFocus: () => {
+    isFocused.value = true
+    splatterEnter()
+  },
+  onBlur: () => {
+    isFocused.value = false
+    splatterLeave()
+  },
 })
 
-// Convert editor content to markdown
 function getMarkdownContent(editorInstance: any): string {
   if (!editorInstance) return ''
-  
   const json = editorInstance.getJSON()
   return jsonToMarkdown(json)
 }
 
 function jsonToMarkdown(doc: any): string {
   if (!doc.content) return ''
-  
+
   return doc.content.map((node: any) => {
     switch (node.type) {
       case 'paragraph':
         return nodeContentToText(node)
       case 'monacoCodeBlock':
         const lang = node.attrs?.language || ''
-        // Get text content from the node
         const code = node.content?.[0]?.text || node.attrs?.content || ''
         return '```' + lang + '\n' + code + '\n```'
       case 'bulletList':
@@ -198,10 +249,10 @@ function jsonToMarkdown(doc: any): string {
 
 function nodeContentToText(node: any): string {
   if (!node?.content) return ''
-  
+
   return node.content.map((item: any) => {
     let text = item.text || ''
-    
+
     if (item.marks) {
       for (const mark of item.marks) {
         switch (mark.type) {
@@ -220,7 +271,7 @@ function nodeContentToText(node: any): string {
         }
       }
     }
-    
+
     return text
   }).join('')
 }
@@ -259,12 +310,79 @@ onBeforeUnmount(() => {
 <style>
 @reference "../assets/css/main.css";
 
-/* Preview transition */
+/* ═══ Input Card (outer shell) ═══ */
+.input-card {
+  border-radius: 0 0 0.75rem 0.75rem;
+  overflow: hidden;
+}
+
+/* ═══ Editor Zone (splatter) ═══ */
+.input-editor-zone {
+  position: relative;
+  isolation: isolate;
+}
+
+.input-editor-zone__splatter {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+  opacity: 0.5;
+}
+.input-card--focused .input-editor-zone__splatter {
+  opacity: 1;
+}
+
+/* ═══ Toolbar (ground glass) ═══ */
+.input-toolbar {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: rgba(30, 41, 59, 0.25);
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.input-toolbar__mesh {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.input-toolbar__noise {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0.14;
+  background-blend-mode: soft-light;
+  background: repeating-radial-gradient(
+    circle,
+    #1a2035,
+    #1a2035 2px,
+    #253050 2px 4px,
+    #1a2035 4px 6px,
+    #253050 6px 8px,
+    #1a2035 8px 10px,
+    #253050 10px 12px
+  ) 0 0 / 100% 100%;
+}
+
+.input-toolbar__content {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+}
+
+/* ═══ Preview transition ═══ */
 .preview-enter-active,
 .preview-leave-active {
   transition: all 0.2s ease;
 }
-
 .preview-enter-from,
 .preview-leave-to {
   opacity: 0;
@@ -275,8 +393,16 @@ onBeforeUnmount(() => {
   @apply text-sm;
 }
 
-/* Tiptap editor styles */
+/* ═══ Glass preview wrap ═══ */
+.glass-editor-wrap {
+  background: rgba(15, 23, 42, 0.5);
+  border: 1px solid rgba(71, 85, 105, 0.2);
+}
+
+/* ═══ Tiptap editor styles ═══ */
 .chat-editor {
+  position: relative;
+  z-index: 1;
   @apply min-h-[60px] max-h-[400px] overflow-y-auto;
 }
 

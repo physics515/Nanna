@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center justify-between gap-3">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Channels</h2>
@@ -58,7 +58,7 @@
           
           <!-- Expanded Setup Wizard -->
           <Transition name="expand">
-            <div v-if="expandedChannel === channel.id" class="mt-4 pt-4 border-t border-nanna-primary/10">
+            <div v-if="expandedChannel === channel.id" class="mt-4 pt-4 border-t border-white/[0.04]">
               
               <!-- Telegram Setup -->
               <TelegramSetup 
@@ -107,7 +107,7 @@
         <!-- Live Status Dashboard -->
         <UiCard>
           <div class="flex items-center justify-between mb-4">
-            <h3 class="font-semibold text-nanna-accent flex items-center gap-2">
+            <h3 class="font-semibold text-nanna-primary flex items-center gap-2">
               <Activity class="w-4 h-4" />
               Live Status
             </h3>

@@ -861,7 +861,7 @@ impl DaemonServer {
                             model: self.config.agent.model.clone(),
                             max_tokens: self.config.agent.max_tokens,
                             temperature: self.config.agent.temperature,
-                            max_iterations: Some(10),
+                            max_iterations: None, // Unlimited — model stops when done
                             thinking_mode: self.config.agent.thinking_mode,
                             summarization_priority: self.config.agent.summarization_priority.clone(),
                             summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
