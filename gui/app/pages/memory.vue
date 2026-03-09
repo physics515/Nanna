@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header with tabs -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center justify-between mb-3 sm:mb-4">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Memory</h2>
@@ -13,14 +13,14 @@
         <!-- Scope Toggle -->
         <div class="flex items-center gap-2">
           <span class="text-xs text-nanna-text-dim hidden sm:inline">Scope:</span>
-          <div class="flex rounded-lg border border-nanna-primary/20 overflow-hidden">
+          <div class="flex rounded-lg border border-white/[0.06] overflow-hidden">
             <button
               @click="memoryScope = 'global'"
               :class="[
                 'px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5',
                 memoryScope === 'global' 
                   ? 'bg-nanna-primary/20 text-nanna-text' 
-                  : 'text-nanna-text-muted hover:bg-nanna-bg-elevated'
+                  : 'text-nanna-text-muted hover:bg-white/[0.06]'
               ]"
             >
               <Globe class="w-3 h-3" />
@@ -30,11 +30,11 @@
               @click="memoryScope = 'workspace'"
               :disabled="!currentWorkspace"
               :class="[
-                'px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 border-l border-nanna-primary/20',
+                'px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 border-l border-white/[0.06]',
                 memoryScope === 'workspace' 
                   ? 'bg-nanna-accent/20 text-nanna-accent' 
                   : currentWorkspace 
-                    ? 'text-nanna-text-muted hover:bg-nanna-bg-elevated'
+                    ? 'text-nanna-text-muted hover:bg-white/[0.06]'
                     : 'text-nanna-text-dim opacity-50 cursor-not-allowed'
               ]"
               :title="currentWorkspace ? currentWorkspace.name : 'No workspace selected'"
@@ -83,7 +83,7 @@
     <!-- History Tab Content -->
     <div v-if="activeTab === 'history'" class="flex-1 overflow-y-auto">
       <!-- Search bar -->
-      <div class="px-4 sm:px-6 py-4 border-b border-nanna-primary/10">
+      <div class="px-4 sm:px-6 py-4 border-b border-white/[0.04]">
         <form @submit.prevent="performSearch" class="flex gap-2 sm:gap-3">
           <div class="relative flex-1">
             <UiInput
@@ -178,7 +178,7 @@
     <!-- Semantic Memory Tab Content -->
     <div v-else-if="activeTab === 'semantic'" class="flex-1 overflow-y-auto">
       <!-- Stats bar -->
-      <div class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+      <div class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div v-if="cognitiveStats" class="flex flex-wrap gap-3 sm:gap-4 text-xs sm:text-sm">
           <span class="text-nanna-text-dim">
             <span class="text-nanna-success font-medium">{{ cognitiveStats.active }}</span> active
@@ -302,8 +302,8 @@
     <!-- Workspace Files Tab Content -->
     <div v-else-if="activeTab === 'files'" class="flex-1 overflow-hidden flex">
       <!-- File list sidebar -->
-      <div class="w-48 sm:w-56 border-r border-nanna-primary/10 flex flex-col">
-        <div class="p-3 border-b border-nanna-primary/10">
+      <div class="w-48 sm:w-56 border-r border-white/[0.04] flex flex-col">
+        <div class="p-3 border-b border-white/[0.04]">
           <div class="text-xs text-nanna-text-dim uppercase tracking-wider">Workspace Files</div>
         </div>
         <div class="flex-1 overflow-y-auto">
@@ -315,7 +315,7 @@
               'w-full text-left px-3 py-2 text-sm transition-colors border-b border-nanna-primary/5',
               selectedFile?.path === file.path 
                 ? 'bg-nanna-accent/10 text-nanna-accent border-l-2 border-l-nanna-accent' 
-                : 'text-nanna-text-muted hover:bg-nanna-bg-elevated hover:text-nanna-text'
+                : 'text-nanna-text-muted hover:bg-white/[0.06] hover:text-nanna-text'
             ]"
           >
             <div class="font-medium truncate">{{ file.name }}</div>

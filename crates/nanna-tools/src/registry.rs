@@ -402,6 +402,16 @@ impl ToolRegistry {
         tools.len()
     }
 
+    /// Get all registered tool names (excluding aliases)
+    pub async fn tool_names(&self) -> Vec<String> {
+        let tools = self.tools.read().await;
+        let aliases = self.aliases.read().await;
+        tools.keys()
+            .filter(|k| !aliases.contains(k.as_str()))
+            .cloned()
+            .collect()
+    }
+
     /// Check if the registry is empty
     pub async fn is_empty(&self) -> bool {
         let tools = self.tools.read().await;

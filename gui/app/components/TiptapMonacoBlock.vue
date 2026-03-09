@@ -1,20 +1,25 @@
 <template>
   <NodeViewWrapper class="tiptap-monaco-wrapper my-2" data-type="monacoCodeBlock">
-    <div class="monaco-code-block rounded-lg border border-nanna-primary/30 bg-nanna-bg-surface overflow-hidden">
-      <!-- Header with language selector -->
-      <div class="flex items-center justify-between px-3 py-1.5 bg-nanna-bg-elevated/50 border-b border-nanna-primary/20">
+    <div class="monaco-code-block rounded-lg overflow-hidden"
+      @mouseenter="splatterEnter(); glassEnter()"
+      @mouseleave="splatterLeave(); glassLeave()"
+    >
+      <!-- Header with language selector (ground glass) -->
+      <div class="monaco-header" :style="glassStyle">
+        <span class="monaco-header__mesh" :style="{ background: meshBg }" />
+        <span class="monaco-header__noise" />
         <input
           ref="langInput"
           v-model="localLanguage"
           type="text"
           placeholder="language"
           spellcheck="false"
-          class="bg-transparent text-[10px] uppercase tracking-wider text-nanna-text-dim font-medium w-24 outline-none placeholder:text-nanna-text-dim/50"
+          class="bg-transparent text-[10px] uppercase tracking-wider text-nanna-text-dim font-medium w-24 outline-none placeholder:text-nanna-text-dim/50 relative z-1"
           @change="updateLanguage"
           @keydown.enter.prevent="focusEditor"
         />
         <div class="flex items-center gap-1">
-          <button 
+          <button
             @click="copyCode"
             class="p-1 rounded text-nanna-text-dim hover:text-nanna-text hover:bg-nanna-primary/20 transition-colors"
             :title="copied ? 'Copied!' : 'Copy code'"
@@ -22,7 +27,7 @@
             <Check v-if="copied" class="w-3.5 h-3.5 text-nanna-success" />
             <Copy v-else class="w-3.5 h-3.5" />
           </button>
-          <button 
+          <button
             @click="deleteNode"
             class="p-1 rounded text-nanna-text-dim hover:text-nanna-error hover:bg-nanna-error/10 transition-colors"
             title="Remove code block"
@@ -31,14 +36,16 @@
           </button>
         </div>
       </div>
-      
-      <!-- Monaco Editor -->
+
+      <!-- Monaco Editor (splatter) -->
       <div class="monaco-embed" :style="{ height: computedHeight }">
+        <span class="monaco-splatter" :style="{ background: splatterBg }" />
         <VueMonacoEditor
           ref="monacoRef"
           v-model:value="localCode"
           :language="monacoLanguage"
-          theme="nanna-dark"
+          theme="nanna-dark-transparent"
+          :height="computedHeight"
           :options="editorOptions"
           @mount="handleMount"
           @change="handleCodeChange"
@@ -49,41 +56,58 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { NodeViewWrapper, nodeViewProps } from '@tiptap/vue-3'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import { X, Copy, Check } from 'lucide-vue-next'
+import { useSplatter } from '~/composables/useSplatter'
+import { useGroundGlass } from '~/composables/useGroundGlass'
 import type * as Monaco from 'monaco-editor'
 
 const props = defineProps(nodeViewProps)
+
+// Splatter effect for the editor content area
+const {
+  splatterBg,
+  onEnter: splatterEnter,
+  onLeave: splatterLeave,
+} = useSplatter({
+  opacityRanges: [[0.08, 0.12], [0.06, 0.10], [0.04, 0.08]],
+  sizes: ['65%', '60%', '50%'],
+  lerpSpeed: 0.008,
+  interval: 3000,
+})
+
+// Ground glass effect for the toolbar
+const {
+  meshBg,
+  containerStyle: glassStyle,
+  onEnter: glassEnter,
+  onLeave: glassLeave,
+} = useGroundGlass({
+  opacity: 1.8,
+  sizes: ['55%', '50%', '45%'],
+  lerpSpeed: 0.008,
+  interval: 2200,
+  blur: 8,
+})
 
 const monacoRef = ref()
 const langInput = ref()
 const copied = ref(false)
 let editorInstance: Monaco.editor.IStandaloneCodeEditor | null = null
 
-// Local state
-const localCode = ref('')
-const localLanguage = ref('')
+// Local state — initialised from node attrs (atom node, no textContent)
+const localCode = ref(props.node.attrs.content || '')
+const localLanguage = ref(props.node.attrs.language || '')
 
-// Initialize from node
-onMounted(() => {
-  localLanguage.value = props.node.attrs.language || ''
-  // Get text content from node
-  localCode.value = props.node.textContent || ''
+// Watch for external attribute changes (e.g. undo/redo, collaboration)
+watch(() => props.node.attrs.language, (v) => {
+  if (v !== localLanguage.value) localLanguage.value = v || ''
 })
 
-// Watch for external changes to the node
-watch(() => props.node.attrs.language, (newLang) => {
-  if (newLang !== localLanguage.value) {
-    localLanguage.value = newLang || ''
-  }
-})
-
-watch(() => props.node.textContent, (newContent) => {
-  if (newContent !== localCode.value) {
-    localCode.value = newContent || ''
-  }
+watch(() => props.node.attrs.content, (v) => {
+  if (v !== localCode.value) localCode.value = v ?? ''
 })
 
 // Language mapping
@@ -103,7 +127,7 @@ const monacoLanguage = computed(() => {
 // Auto-height based on lines
 const computedHeight = computed(() => {
   const lineCount = Math.max(1, (localCode.value.match(/\n/g) || []).length + 1)
-  const height = Math.min(350, Math.max(80, lineCount * 19 + 20))
+  const height = Math.min(350, Math.max(5 * 19 + 8, lineCount * 19 + 8))
   return `${height}px`
 })
 
@@ -125,48 +149,48 @@ const editorOptions = computed(() => ({
   },
   wordWrap: 'off' as const,
   fontSize: 13,
+  lineHeight: 19,
   fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
   fontLigatures: true,
-  padding: { top: 8, bottom: 8 },
   automaticLayout: true,
+  padding: { top: 4, bottom: 4 },
 }))
 
 function handleMount(editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof Monaco) {
   editorInstance = editor
-  
+
+  // Fix line number alignment — Tailwind preflight shifts content area down.
+  const container = editor.getDomNode()
+  if (container) {
+    const s = document.createElement('style')
+    s.textContent = `.margin-view-overlays { transform: translateY(1rem) !important; }`
+    container.appendChild(s)
+    // Force margin background transparent (Monaco dynamically sets it)
+    const fixBg = () => {
+      const m = container.querySelector('.margin') as HTMLElement
+      if (m) m.style.backgroundColor = 'transparent'
+    }
+    fixBg()
+    editor.onDidChangeConfiguration(fixBg)
+    requestAnimationFrame(fixBg)
+    setTimeout(fixBg, 100)
+  }
+
+  // Auto-focus when created empty (e.g. via ``` input rule)
+  if (!localCode.value) {
+    setTimeout(() => editor.focus(), 50)
+  }
+
   // Escape to blur and return to TipTap
   editor.addCommand(monaco.KeyCode.Escape, () => {
     editor.blur()
-    // Focus back on TipTap editor
     props.editor.commands.focus()
   })
 }
 
+// Sync Monaco content → TipTap node attribute (no ProseMirror transactions)
 function handleCodeChange(value: string) {
-  // Update the node content in TipTap
-  const { state, view } = props.editor
-  const { from, to } = props.getPos 
-    ? { from: props.getPos(), to: props.getPos() + props.node.nodeSize }
-    : { from: 0, to: 0 }
-  
-  if (from === 0 && to === 0) return
-  
-  // Create a transaction to update the text content
-  const transaction = state.tr
-  
-  // Delete old content and insert new
-  const nodeStart = from + 1 // +1 to get inside the node
-  const nodeEnd = to - 1 // -1 to stay inside the node
-  
-  if (nodeEnd > nodeStart) {
-    transaction.delete(nodeStart, nodeEnd)
-  }
-  
-  if (value) {
-    transaction.insertText(value, nodeStart)
-  }
-  
-  view.dispatch(transaction)
+  props.updateAttributes({ content: value })
 }
 
 function updateLanguage() {
@@ -195,19 +219,61 @@ async function copyCode() {
   @apply relative;
 }
 
-.monaco-code-block {
-  /* Don't capture all clicks - let Monaco handle them */
+.monaco-header {
+  @apply flex items-center justify-between px-3 py-1.5;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: transparent;
+}
+
+.monaco-header__mesh {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.monaco-header__noise {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.14;
+  background-blend-mode: soft-light;
+  background: repeating-radial-gradient(
+    circle,
+    #1a2035,
+    #1a2035 2px,
+    #253050 2px 4px,
+    #1a2035 4px 6px,
+    #253050 6px 8px,
+    #1a2035 8px 10px,
+    #253050 10px 12px
+  ) 0 0 / 100% 100%;
+}
+
+.monaco-header > *:not(.monaco-header__mesh):not(.monaco-header__noise) {
+  position: relative;
+  z-index: 2;
 }
 
 .monaco-embed {
   @apply w-full;
+  position: relative;
+  isolation: isolate;
 }
 
-.monaco-embed :deep(.monaco-editor),
-.monaco-embed :deep(.monaco-editor-background),
-.monaco-embed :deep(.monaco-editor .margin) {
-  background-color: #1e293b !important;
+.monaco-splatter {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+  opacity: 0.5;
 }
+
+
 
 /* Ensure Monaco captures keyboard events */
 .monaco-embed :deep(.monaco-editor textarea) {

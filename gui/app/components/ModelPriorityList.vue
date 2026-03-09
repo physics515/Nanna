@@ -10,7 +10,7 @@
 
     <!-- Active Models (Drag & Drop) -->
     <div
-      class="min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-nanna-primary/20"
+      class="min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-white/[0.06]"
     >
       <div v-if="localModels.length === 0" class="text-center py-4 text-sm text-nanna-text-dim">
         No models selected. Click "Add" to enable models.
@@ -29,7 +29,7 @@
       >
         <template #item="{ element: modelId, index }">
           <div
-            class="flex items-center gap-2 p-2 rounded-lg transition-all select-none bg-nanna-bg-surface border-2 border-nanna-primary/20"
+            class="flex items-center gap-2 p-2 rounded-lg transition-all select-none glass border-2 border-white/[0.06]"
           >
             <!-- Drag Handle -->
             <GripVertical class="drag-handle w-4 h-4 text-nanna-text-dim shrink-0 cursor-grab active:cursor-grabbing" />
@@ -79,7 +79,7 @@
         <div
           v-for="model in excludedModels"
           :key="model.id"
-          class="flex items-center gap-2 p-2 rounded bg-nanna-bg-elevated/50 opacity-60"
+          class="flex items-center gap-2 p-2 rounded bg-nanna-bg-elevated/40 opacity-60"
         >
           <span class="text-sm">{{ getProviderIcon(model.provider) }}</span>
           <span class="text-sm text-nanna-text-muted flex-1 truncate">{{ model.name }}</span>
@@ -100,7 +100,7 @@
         class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
         @click.self="closeAddDialog"
       >
-        <div class="bg-nanna-bg-surface rounded-xl p-4 w-full max-w-sm border border-nanna-primary/20 shadow-xl">
+        <div class="bg-nanna-bg-surface rounded-xl p-4 w-full max-w-sm border border-white/[0.06] shadow-xl">
           <h3 class="font-semibold text-nanna-text mb-3">Add Model</h3>
 
           <!-- Search Input -->
@@ -124,7 +124,7 @@
               v-for="model in filteredModelsToAdd"
               :key="model.id"
               @click="addModel(model)"
-              class="w-full flex items-center gap-2 p-2 rounded-lg hover:bg-nanna-bg-elevated/50 text-left transition-colors"
+              class="w-full flex items-center gap-2 p-2 rounded-lg hover:bg-white/[0.06] text-left transition-colors"
             >
               <span>{{ getProviderIcon(model.provider) }}</span>
               <div class="flex-1 min-w-0">

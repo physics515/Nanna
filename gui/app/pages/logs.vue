@@ -1,7 +1,7 @@
 <template>
   <div class="h-full flex flex-col bg-nanna-bg-deep">
     <!-- Header -->
-    <div class="px-6 py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface">
+    <div class="px-6 py-4 border-b border-white/[0.04] bg-nanna-bg-surface">
       <div class="flex items-center justify-between">
         <div>
           <h1 class="text-2xl font-bold text-nanna-text">Daemon Logs</h1>
@@ -22,7 +22,7 @@
           </button>
           <button
             @click="clearLogs"
-            class="px-3 py-2 rounded-lg text-sm font-medium bg-nanna-bg-elevated text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated/80 transition-colors"
+            class="px-3 py-2 rounded-lg text-sm font-medium bg-nanna-bg-elevated text-nanna-text-muted hover:text-nanna-text hover:bg-white/[0.06]/80 transition-colors"
           >
             <Trash2 class="w-4 h-4 inline mr-1" />
             Clear
@@ -46,7 +46,7 @@
     <!-- Log viewer -->
     <div class="flex-1 overflow-hidden flex flex-col">
       <!-- Status bar -->
-      <div class="px-6 py-2 bg-nanna-bg-elevated/30 border-b border-nanna-primary/10 text-xs text-nanna-text-muted flex items-center justify-between">
+      <div class="px-6 py-2 bg-nanna-bg-elevated/30 border-b border-white/[0.04] text-xs text-nanna-text-muted flex items-center justify-between">
         <div class="flex items-center gap-4">
           <span>Total lines: {{ logs.length }}</span>
           <span v-if="backendStatus">
@@ -75,7 +75,7 @@
           v-for="(log, idx) in logs"
           :key="idx"
           :class="[
-            'py-1 px-2 rounded hover:bg-nanna-bg-elevated/30 transition-colors group',
+            'py-1 px-2 rounded hover:bg-white/[0.06]/15 transition-colors group',
             log.level === 'error' ? 'text-nanna-error' :
             log.level === 'warn' ? 'text-nanna-warning' :
             log.level === 'info' ? 'text-nanna-success' :

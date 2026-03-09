@@ -128,11 +128,11 @@ const isTerminalState = computed(() =>
 
 function getCardClasses(): string {
   const state = props.agent.state
-  const base = 'bg-nanna-bg-surface'
+  const base = 'glass'
   
   const stateClasses: Record<string, string> = {
-    spawned: 'border-nanna-primary/10',
-    idle: 'border-nanna-primary/20',
+    spawned: 'border-white/[0.04]',
+    idle: 'border-white/[0.06]',
     thinking: 'border-nanna-warning/40 bg-nanna-warning/5',
     tool_use: 'border-nanna-accent/40 bg-nanna-accent/5',
     waiting: 'border-nanna-primary/30',
@@ -141,7 +141,7 @@ function getCardClasses(): string {
     cancelled: 'border-nanna-text-dim/20 opacity-50',
   }
   
-  return `${base} ${stateClasses[state] || 'border-nanna-primary/10'}`
+  return `${base} ${stateClasses[state] || 'border-white/[0.04]'}`
 }
 
 function getStateBackground(): string {

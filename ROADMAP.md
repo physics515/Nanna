@@ -1091,6 +1091,14 @@ Requires a local model (7B+) running on GPU. A 4070 Ti Super (16GB) handles this
 16. ~~**Job Execution**~~ - Run prompts/tools on schedule ✅
 17. ~~**GUI Cron Editor**~~ - Visual cron builder ✅
 
+### Session Tool Profiles (Phase 11 - UX)
+1. **Profile definitions** - Named tool/prompt profiles (e.g. "coding", "chat", "research")
+2. **Per-session profile** - Sessions can be assigned a profile that controls which tools are available and system prompt tuning
+3. **Auto-detection** - Classify user intent on first message and suggest/apply appropriate profile
+4. **Custom profiles** - Users can create/edit profiles in settings (tool selection, system prompt overrides, iteration limits)
+5. **Profile-specific system prompts** - Coding profile gets concise action-oriented prompt; chat profile gets conversational prompt
+6. **Tool budget per profile** - Control how many tool definitions are sent to the LLM (reduce context usage for simple profiles)
+
 ### Multi-Device Swarm (Phase 9 - Foundation)
 18. **nanna-identity** - Ed25519 keypair + onion address derivation
 19. **nanna-tor** - Embedded arti + hidden service publishing

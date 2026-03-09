@@ -1,4 +1,4 @@
-import { Node, mergeAttributes, textblockTypeInputRule } from '@tiptap/core'
+import { Node, mergeAttributes, InputRule } from '@tiptap/core'
 import { VueNodeViewRenderer } from '@tiptap/vue-3'
 import TiptapMonacoBlock from '../components/TiptapMonacoBlock.vue'
 
@@ -21,15 +21,13 @@ export const MonacoCodeBlock = Node.create<MonacoCodeBlockOptions>({
 
   group: 'block',
 
-  content: 'text*',
-
-  marks: '',
+  // Atom node — no ProseMirror contentDOM. Monaco is the sole editor.
+  // Code content lives in the `content` attribute, not in PM's text layer.
+  atom: true,
 
   defining: true,
 
   isolating: true,
-
-  code: true,
 
   addOptions() {
     return {
@@ -41,10 +39,18 @@ export const MonacoCodeBlock = Node.create<MonacoCodeBlockOptions>({
     return {
       language: {
         default: '',
-        parseHTML: element => element.getAttribute('data-language'),
+        parseHTML: element => element.getAttribute('data-language') || '',
         renderHTML: attributes => ({
           'data-language': attributes.language,
         }),
+      },
+      content: {
+        default: '',
+        parseHTML: element => {
+          const code = element.querySelector('code')
+          return (code || element).textContent || ''
+        },
+        renderHTML: () => ({}), // rendered in renderHTML body
       },
     }
   },
@@ -61,10 +67,10 @@ export const MonacoCodeBlock = Node.create<MonacoCodeBlockOptions>({
   renderHTML({ node, HTMLAttributes }) {
     return [
       'pre',
-      mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, { 
-        'data-language': node.attrs.language 
+      mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, {
+        'data-language': node.attrs.language,
       }),
-      ['code', 0],
+      ['code', {}, node.attrs.content || ''],
     ]
   },
 
@@ -86,22 +92,14 @@ export const MonacoCodeBlock = Node.create<MonacoCodeBlockOptions>({
         },
       insertMonacoCodeBlock:
         (attributes) =>
-        ({ chain, state }) => {
-          const { selection } = state
-          const { $from } = selection
-          
-          // Check if we're already in a code block
-          if ($from.parent.type.name === 'monacoCodeBlock') {
-            return false
-          }
-          
-          // If cursor is at the end of text, just insert after
-          // Otherwise, split the paragraph and insert
+        ({ chain }) => {
           return chain()
             .insertContent([
-              { type: 'paragraph' }, // Ensure we're on a new line
-              { type: 'monacoCodeBlock', attrs: attributes || { language: '' } },
-              { type: 'paragraph' }, // Add paragraph after for continued typing
+              {
+                type: 'monacoCodeBlock',
+                attrs: { language: '', content: '', ...attributes },
+              },
+              { type: 'paragraph' },
             ])
             .focus()
             .run()
@@ -111,27 +109,24 @@ export const MonacoCodeBlock = Node.create<MonacoCodeBlockOptions>({
 
   addKeyboardShortcuts() {
     return {
-      // Ctrl/Cmd + Alt + C to insert code block at cursor
       'Mod-Alt-c': () => this.editor.commands.insertMonacoCodeBlock(),
-      // Tab in code block inserts tab
-      'Tab': () => {
-        if (this.editor.isActive(this.name)) {
-          return this.editor.commands.insertContent('\t')
-        }
-        return false
-      },
     }
   },
 
   addInputRules() {
     return [
-      // Match ```language at start of paragraph, followed by space
-      textblockTypeInputRule({
+      // Replace ```language + whitespace with an empty code block
+      new InputRule({
         find: /^```([a-zA-Z0-9_+-]*)[\s]$/,
-        type: this.type,
-        getAttributes: match => ({
-          language: match[1] || '',
-        }),
+        handler: ({ state, range, match }) => {
+          const language = match[1] || ''
+          const node = this.type.create({ language, content: '' })
+          const tr = state.tr.delete(range.from, range.to)
+          tr.insert(range.from, node)
+          // Add a paragraph after for continued typing
+          const paragraphPos = range.from + node.nodeSize
+          tr.insert(paragraphPos, state.schema.nodes.paragraph.create())
+        },
       }),
     ]
   },

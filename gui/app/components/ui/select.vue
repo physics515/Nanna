@@ -31,8 +31,8 @@ const emit = defineEmits<{
       :value="props.modelValue"
       :disabled="props.disabled"
       :class="cn(
-        'flex h-10 w-full appearance-none rounded-lg bg-nanna-bg-surface/50 border border-nanna-primary/20 px-4 py-2 pr-10 text-sm text-nanna-text transition-all cursor-pointer',
-        'focus:outline-none focus:border-nanna-accent focus:ring-1 focus:ring-nanna-accent/30',
+        'flex h-10 w-full appearance-none rounded-lg bg-black/20 border border-white/[0.08] px-4 py-2 pr-10 text-sm text-nanna-text transition-colors cursor-pointer',
+        'focus:outline-none focus:border-nanna-primary/50 focus:ring-1 focus:ring-nanna-primary/20',
         'disabled:cursor-not-allowed disabled:opacity-50',
         props.class
       )"

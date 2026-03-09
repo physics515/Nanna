@@ -1,7 +1,7 @@
 <template>
   <UiCard>
     <div class="flex items-center justify-between mb-4">
-      <h3 class="text-base font-semibold text-nanna-accent flex items-center gap-2">
+      <h3 class="text-base font-semibold text-nanna-primary flex items-center gap-2">
         <MessageSquare class="w-4 h-4" />
         System Prompt
       </h3>
@@ -22,7 +22,7 @@
     <!-- View Mode -->
     <div v-if="!isEditing" class="space-y-3">
       <div 
-        class="bg-nanna-bg-elevated/50 rounded-lg p-4 max-h-64 overflow-y-auto"
+        class="bg-nanna-bg-elevated/40 rounded-lg p-4 max-h-64 overflow-y-auto"
       >
         <pre class="text-sm text-nanna-text whitespace-pre-wrap font-sans leading-relaxed">{{ currentPrompt || defaultPrompt }}</pre>
       </div>
@@ -63,7 +63,7 @@
         <textarea
           v-model="editedPrompt"
           :placeholder="defaultPrompt"
-          class="w-full h-64 bg-nanna-bg-deep text-nanna-text text-sm p-4 rounded-lg border border-nanna-primary/20 focus:border-nanna-primary focus:outline-none resize-none font-mono leading-relaxed"
+          class="w-full h-64 bg-nanna-bg-deep text-nanna-text text-sm p-4 rounded-lg border border-white/[0.06] focus:border-nanna-primary focus:outline-none resize-none font-mono leading-relaxed"
           @input="markChanged"
         />
         <div class="absolute bottom-2 right-2 text-xs text-nanna-text-dim">
@@ -76,7 +76,7 @@
         <summary class="cursor-pointer text-nanna-text-muted hover:text-nanna-text">
           Available Variables
         </summary>
-        <div class="mt-2 p-3 bg-nanna-bg-elevated/50 rounded-lg space-y-1 text-xs">
+        <div class="mt-2 p-3 bg-nanna-bg-elevated/40 rounded-lg space-y-1 text-xs">
           <div v-for="v in variables" :key="v.name" class="flex gap-2">
             <code class="text-nanna-accent font-mono">{{ v.name }}</code>
             <span class="text-nanna-text-dim">{{ v.description }}</span>

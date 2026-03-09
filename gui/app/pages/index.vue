@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Chat header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4">
       <div class="flex items-center justify-between gap-2">
         <h2 class="text-base sm:text-lg font-semibold text-nanna-text truncate">
           {{ currentSession?.name || 'New Chat' }}
@@ -12,7 +12,7 @@
           <!-- Daemon-level queue depth (messages from other channels waiting) -->
           <span
             v-if="daemonQueueCount > 0"
-            class="flex items-center gap-1 text-xs text-nanna-text-muted bg-nanna-bg-surface/80 border border-nanna-primary/20 rounded-full px-2 py-0.5"
+            class="flex items-center gap-1 text-xs text-nanna-text-muted bg-nanna-bg-surface border border-white/[0.06] rounded-full px-2 py-0.5"
             :title="`${daemonQueueCount} message${daemonQueueCount > 1 ? 's' : ''} queued at daemon`"
           >
             <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -36,10 +36,7 @@
       <!-- Welcome message -->
       <div v-if="messages.length === 0 && !hasActiveWork" class="flex items-center justify-center h-full">
         <div class="text-center max-w-md px-4">
-          <div class="text-5xl sm:text-6xl mb-4">🌙</div>
-          <h3 class="text-xl sm:text-2xl font-bold text-nanna-accent crt-glow mb-2">
-            Nanna
-          </h3>
+          <img src="/logo.svg" alt="Nanna" class="w-32 sm:w-40 mx-auto mb-4" />
           <p class="text-nanna-text-muted italic mb-2 text-sm sm:text-base">
             Patron deity of Ur
           </p>
@@ -152,7 +149,7 @@
 
       <!-- Message queue indicator -->
       <div v-if="hasQueuedMessages" class="max-w-4xl mx-auto">
-        <div class="bg-nanna-bg-surface/80 border border-nanna-primary/20 rounded-lg p-3">
+        <div class="bg-nanna-bg-surface/60 border border-white/[0.04] rounded-xl p-3">
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2 text-sm text-nanna-text-muted">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -208,10 +205,10 @@
     </div>
 
     <!-- Input area -->
-    <div class="p-3 sm:p-4 border-t border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <div class="p-3 sm:p-4">
       <div class="max-w-4xl mx-auto">
         <!-- Queue mode indicator -->
-        <div v-if="hasActiveWork && input.trim()" class="mb-2 text-xs text-nanna-accent flex items-center gap-1">
+        <div v-if="hasActiveWork && input.trim()" class="mb-2 text-xs text-nanna-primary flex items-center gap-1">
           <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
           </svg>
@@ -590,7 +587,21 @@ onMounted(async () => {
   await loadSession()
 })
 
+// Auto-scroll when new content is added to the messages container
+let scrollObserver: MutationObserver | null = null
+
+watch(messagesContainer, (el) => {
+  if (scrollObserver) scrollObserver.disconnect()
+  if (el) {
+    scrollObserver = new MutationObserver(() => {
+      scrollToBottom()
+    })
+    scrollObserver.observe(el, { childList: true, subtree: true, characterData: true })
+  }
+}, { immediate: true })
+
 onUnmounted(() => {
+  if (scrollObserver) scrollObserver.disconnect()
   if (unlistenChunk) unlistenChunk()
   if (unlistenTool) unlistenTool()
   if (unlistenThinking) unlistenThinking()
@@ -772,8 +783,10 @@ function handleScroll() {
 }
 
 function scrollToBottom(force = false) {
-  if (messagesContainer.value && (force || !userScrolledUp.value)) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-  }
+  nextTick(() => {
+    if (messagesContainer.value && (force || !userScrolledUp.value)) {
+      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+    }
+  })
 }
 </script>

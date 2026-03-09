@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center justify-between gap-3">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text flex items-center gap-2">
@@ -47,7 +47,7 @@
 
         <!-- Global stats bar -->
         <div v-if="stats && stats.total_agents > 0" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div class="p-3 rounded-xl bg-nanna-bg-elevated border border-nanna-primary/10">
+          <div class="p-3 rounded-xl bg-nanna-bg-elevated/30 border border-white/[0.04]">
             <div class="text-2xl font-bold text-nanna-text">{{ stats.total_agents }}</div>
             <div class="text-xs text-nanna-text-muted">Total Agents</div>
           </div>
@@ -55,11 +55,11 @@
             <div class="text-2xl font-bold text-nanna-success">{{ stats.active_agents }}</div>
             <div class="text-xs text-nanna-text-muted">Active</div>
           </div>
-          <div class="p-3 rounded-xl bg-nanna-bg-elevated border border-nanna-primary/10">
+          <div class="p-3 rounded-xl bg-nanna-bg-elevated/30 border border-white/[0.04]">
             <div class="text-2xl font-bold text-nanna-text">{{ stats.workspaces }}</div>
             <div class="text-xs text-nanna-text-muted">Workspaces</div>
           </div>
-          <div class="p-3 rounded-xl bg-nanna-bg-elevated border border-nanna-primary/10">
+          <div class="p-3 rounded-xl bg-nanna-bg-elevated/30 border border-white/[0.04]">
             <div class="text-lg font-mono text-nanna-text">
               {{ formatTokens(stats.total_tokens_in) }} / {{ formatTokens(stats.total_tokens_out) }}
             </div>
@@ -102,7 +102,7 @@
           </div>
 
           <!-- Agent cards -->
-          <div v-if="!collapsedClusters[cluster.path]" class="ml-4 pl-4 border-l border-nanna-primary/10 space-y-2">
+          <div v-if="!collapsedClusters[cluster.path]" class="ml-4 pl-4 border-l border-white/[0.04] space-y-2">
             <AgentCard
               v-for="agent in cluster.agents"
               :key="agent.id"
@@ -115,7 +115,7 @@
         </div>
 
         <!-- State legend -->
-        <div v-if="stats && stats.total_agents > 0" class="mt-8 p-4 rounded-xl bg-nanna-bg-elevated/50 border border-nanna-primary/10">
+        <div v-if="stats && stats.total_agents > 0" class="mt-8 p-4 rounded-xl bg-nanna-bg-elevated/40 border border-white/[0.04]">
           <h4 class="text-xs font-semibold text-nanna-text-muted uppercase mb-3">State Legend</h4>
           <div class="flex flex-wrap gap-3">
             <div v-for="(color, state) in stateColors" :key="state" class="flex items-center gap-2">
@@ -135,9 +135,9 @@
         class="fixed inset-0 bg-black/60 flex justify-end z-50"
         @click.self="selectedAgent = null"
       >
-        <div class="w-full max-w-md bg-nanna-bg-surface h-full overflow-y-auto border-l border-nanna-primary/20 shadow-2xl">
+        <div class="w-full max-w-md bg-nanna-bg-surface h-full overflow-y-auto border-l border-white/[0.06] shadow-2xl">
           <!-- Sidebar header -->
-          <div class="sticky top-0 bg-nanna-bg-surface border-b border-nanna-primary/10 p-4 flex items-center justify-between">
+          <div class="sticky top-0 glass border-b border-white/[0.04] p-4 flex items-center justify-between">
             <div class="flex items-center gap-3">
               <div :class="['w-10 h-10 rounded-lg flex items-center justify-center', getStateBackground(selectedAgent.state)]">
                 <Bot :class="['w-5 h-5', getStateTextColor(selectedAgent.state)]" />

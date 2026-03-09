@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-nanna-primary/10 bg-nanna-bg-surface/50">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center justify-between gap-3">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Workspaces</h2>
@@ -206,32 +206,32 @@
 
         <!-- Workspace Files Reference -->
         <UiCard class="mt-8">
-          <h3 class="text-sm font-semibold text-nanna-accent mb-3 flex items-center gap-2">
+          <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
             <FileText class="w-4 h-4" />
             Workspace Files Reference
           </h3>
           <div class="grid gap-2 text-sm">
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/50">
+            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
               <code class="text-nanna-accent shrink-0">SOUL.md</code>
               <span class="text-nanna-text-muted">Agent personality, identity, voice</span>
             </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/50">
+            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
               <code class="text-nanna-accent shrink-0">USER.md</code>
               <span class="text-nanna-text-muted">Info about the user (name, preferences)</span>
             </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/50">
+            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
               <code class="text-nanna-accent shrink-0">AGENTS.md</code>
               <span class="text-nanna-text-muted">How the agent should behave in this workspace</span>
             </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/50">
+            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
               <code class="text-nanna-accent shrink-0">TOOLS.md</code>
               <span class="text-nanna-text-muted">Tool-specific notes and configurations</span>
             </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/50">
+            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
               <code class="text-nanna-accent shrink-0">MEMORY.md</code>
               <span class="text-nanna-text-muted">Long-term curated memories</span>
             </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/50">
+            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
               <code class="text-nanna-accent shrink-0">memory/</code>
               <span class="text-nanna-text-muted">Daily notes (YYYY-MM-DD.md files)</span>
             </div>
@@ -244,9 +244,9 @@
     <!-- Create Workspace Dialog -->
     <Teleport to="body">
       <div v-if="showCreateDialog" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" @click.self="showCreateDialog = false">
-        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-lg overflow-hidden border border-nanna-primary/20 shadow-2xl">
+        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-lg overflow-hidden border border-white/[0.06] shadow-2xl">
           <!-- Dialog Header -->
-          <div class="flex items-center justify-between p-4 border-b border-nanna-primary/10">
+          <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
             <div class="flex items-center gap-3">
               <FolderPlus class="w-5 h-5 text-nanna-accent" />
               <h3 class="font-semibold text-nanna-text">Create Workspace</h3>
@@ -265,7 +265,7 @@
                 <input 
                   v-model="createPath"
                   type="text"
-                  class="flex-1 px-3 py-2 rounded-lg bg-nanna-bg-elevated border border-nanna-primary/20 text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
+                  class="flex-1 px-3 py-2 rounded-lg bg-nanna-bg-elevated/30 border border-white/[0.06] text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
                   placeholder="Select a folder..."
                   readonly
                 />
@@ -285,7 +285,7 @@
                 <label 
                   v-for="file in availableFiles" 
                   :key="file.name"
-                  class="flex items-center gap-3 p-2 rounded-lg hover:bg-nanna-bg-elevated/50 cursor-pointer"
+                  class="flex items-center gap-3 p-2 rounded-lg hover:bg-white/[0.06] cursor-pointer"
                 >
                   <input 
                     type="checkbox" 
@@ -307,7 +307,7 @@
           </div>
           
           <!-- Dialog Footer -->
-          <div class="flex justify-end gap-2 p-4 border-t border-nanna-primary/10">
+          <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
             <UiButton @click="showCreateDialog = false" variant="ghost" size="sm">
               Cancel
             </UiButton>
@@ -327,9 +327,9 @@
     <!-- Workspace Details Modal -->
     <Teleport to="body">
       <div v-if="selectedWorkspace" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" @click.self="selectedWorkspace = null">
-        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-2xl max-h-[80vh] overflow-hidden border border-nanna-primary/20 shadow-2xl">
+        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-2xl max-h-[80vh] overflow-hidden border border-white/[0.06] shadow-2xl">
           <!-- Modal Header -->
-          <div class="flex items-center justify-between p-4 border-b border-nanna-primary/10">
+          <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
             <div class="flex items-center gap-3">
               <FolderCheck class="w-5 h-5 text-nanna-accent" />
               <h3 class="font-semibold text-nanna-text">{{ selectedWorkspace.name }}</h3>
@@ -342,7 +342,7 @@
           <!-- Modal Content -->
           <div class="p-4 overflow-y-auto max-h-[60vh] space-y-4">
             <!-- Path -->
-            <div class="p-3 rounded-lg bg-nanna-bg-elevated/50">
+            <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
               <div class="text-xs text-nanna-text-muted mb-1">Path</div>
               <code class="text-sm text-nanna-text break-all">{{ selectedWorkspace.path }}</code>
             </div>
@@ -386,7 +386,7 @@
           </div>
           
           <!-- Modal Footer -->
-          <div class="flex justify-end gap-2 p-4 border-t border-nanna-primary/10">
+          <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
             <UiButton @click="reloadWorkspaceById(selectedWorkspace.id)" variant="secondary" size="sm">
               <RefreshCw class="w-4 h-4 mr-1" />
               Reload
@@ -403,8 +403,8 @@
     <!-- Repair Dialog -->
     <Teleport to="body">
       <div v-if="showRepairDialog" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" @click.self="showRepairDialog = false">
-        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-lg overflow-hidden border border-nanna-primary/20 shadow-2xl">
-          <div class="flex items-center justify-between p-4 border-b border-nanna-primary/10">
+        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-lg overflow-hidden border border-white/[0.06] shadow-2xl">
+          <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
             <div class="flex items-center gap-3">
               <Wrench class="w-5 h-5 text-nanna-warning" />
               <h3 class="font-semibold text-nanna-text">Add Missing Files</h3>
@@ -424,7 +424,7 @@
               <label 
                 v-for="file in missingFilesForRepair" 
                 :key="file.name"
-                class="flex items-center gap-3 p-2 rounded-lg hover:bg-nanna-bg-elevated/50 cursor-pointer"
+                class="flex items-center gap-3 p-2 rounded-lg hover:bg-white/[0.06] cursor-pointer"
               >
                 <input 
                   type="checkbox" 
@@ -438,7 +438,7 @@
             </div>
           </div>
           
-          <div class="flex justify-end gap-2 p-4 border-t border-nanna-primary/10">
+          <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
             <UiButton @click="showRepairDialog = false" variant="ghost" size="sm">
               Cancel
             </UiButton>

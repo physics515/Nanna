@@ -10,10 +10,7 @@ const props = defineProps<Props>()
 
 <template>
   <div
-    :class="cn(
-      'rounded-xl bg-nanna-bg-surface border border-nanna-primary/10 p-4',
-      props.class
-    )"
+    :class="cn('rounded-xl bg-[#0f172a]/60 border border-white/[0.06] p-4', props.class)"
   >
     <slot />
   </div>

@@ -1,292 +1,142 @@
 <template>
-  <div class="min-h-screen bg-nanna-bg-deep bg-grid relative">
-    <!-- Mobile Header -->
-    <header class="lg:hidden fixed top-0 left-0 right-0 z-40 flex items-center justify-between px-4 py-3 bg-nanna-bg-surface/95 backdrop-blur border-b border-nanna-primary/10">
-      <button 
-        @click="sidebarOpen = true"
-        class="p-2 rounded-lg text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-        aria-label="Open menu"
-      >
-        <Menu class="w-5 h-5" />
-      </button>
-      
-      <NuxtLink to="/" class="flex items-center gap-2">
-        <span class="text-lg font-bold text-nanna-accent crt-glow">NANNA</span>
-      </NuxtLink>
-      
-      <button 
-        @click="createNewSession"
-        class="p-2 rounded-lg text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors"
-        aria-label="New chat"
-      >
-        <Plus class="w-5 h-5" />
-      </button>
-    </header>
-    
-    <!-- Mobile Sidebar (Sheet) -->
-    <UiSheet v-model:open="sidebarOpen" side="left">
-      <template #trigger>
-        <span></span>
-      </template>
-      
-      <div class="flex flex-col h-full -m-6">
-        <!-- Logo -->
-        <div class="p-4 border-b border-nanna-primary/10">
-          <NuxtLink to="/" @click="sidebarOpen = false" class="block">
-            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">NANNA</h1>
-            <p class="text-xs text-nanna-text-muted mt-1">AI Assistant</p>
-          </NuxtLink>
-        </div>
-        
-        <!-- New Chat button -->
-        <div class="p-4">
-          <UiButton @click="createNewSession(); sidebarOpen = false" class="w-full justify-start">
-            <Plus class="w-4 h-4" />
-            <span>New Chat</span>
-          </UiButton>
-        </div>
-        
-        <!-- Current Tab indicator (mobile) -->
-        <div :class="[
-          'px-4 py-2 border-b',
-          currentTab?.type === 'workspace' 
-            ? 'bg-nanna-accent/10 border-nanna-accent/20' 
-            : 'bg-nanna-bg-elevated/50 border-nanna-primary/10'
-        ]">
-          <div class="flex items-center gap-2 text-xs">
-            <component :is="currentTab?.type === 'workspace' ? FolderKanban : Globe" 
-              :class="['w-3 h-3', currentTab?.type === 'workspace' ? 'text-nanna-accent' : 'text-nanna-text-dim']" 
+  <div class="app-shell" style="display: flex; height: 100vh; overflow: hidden;">
+
+    <!-- ═══ Activity Bar (icon-only sidebar) ═══ -->
+    <aside class="activity-bar">
+      <!-- Logo -->
+      <div class="activity-logo" data-tauri-drag-region>
+        <img src="/logo.svg" alt="Nanna" style="width: 46px; height: 46px; object-fit: contain; pointer-events: none;" />
+      </div>
+
+      <!-- Navigation icons -->
+      <nav class="activity-nav">
+        <!-- Chat (toggles session panel) -->
+        <button
+          :class="['activity-icon', { active: chatPanelOpen || route.path === '/' }]"
+          @click="toggleChatPanel"
+        >
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M4 4h12a2 2 0 012 2v7a2 2 0 01-2 2H8l-4 3v-3a2 2 0 01-2-2V6a2 2 0 012-2z" />
+          </svg>
+          <svg
+            class="chat-arrow"
+            :class="{ 'chat-arrow--open': chatPanelOpen }"
+            viewBox="0 0 6 10"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M1 1l4 4-4 4" />
+          </svg>
+          <span class="tooltip">Chats</span>
+        </button>
+
+        <NuxtLink
+          v-for="item in navItems" :key="item.to" :to="item.to"
+          :class="['activity-icon', { active: isNavActive(item.to) }]"
+          @click="chatPanelOpen = false"
+        >
+          <component :is="item.icon" />
+          <span class="tooltip">{{ item.label }}</span>
+        </NuxtLink>
+      </nav>
+
+      <!-- Bottom: settings + hide -->
+      <div class="activity-bottom">
+        <NuxtLink to="/settings" :class="['activity-icon', { active: route.path === '/settings' }]" @click="chatPanelOpen = false">
+          <Settings />
+          <span class="tooltip">Settings</span>
+        </NuxtLink>
+        <button class="activity-icon" @click="hideToTray">
+          <ChevronDown />
+          <span class="tooltip">Hide to Tray</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- ═══ Right column: chat panel + main + status bar ═══ -->
+    <div style="flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0;">
+
+      <!-- Top row: chat panel + main content (resizable) -->
+      <UiResizableGroup direction="horizontal" style="flex: 1; min-height: 0;">
+
+        <!-- Chat Panel -->
+        <UiResizablePanel
+          v-if="chatPanelOpen"
+          :default-size="18"
+          :min-size="12"
+          :max-size="35"
+          :order="1"
+          class="chat-panel"
+        >
+          <!-- Workspace Switcher -->
+          <WorkspaceSwitcher />
+
+          <!-- Header -->
+          <div style="padding: 0.25rem 0.75rem; display: flex; align-items: center; justify-content: space-between;">
+            <span style="font-size: 0.7rem; font-weight: 500; color: rgba(196,205,214,0.5); text-transform: uppercase; letter-spacing: 0.06em;">Chats</span>
+            <button class="panel-icon-btn" @click="createNewSession" title="New chat">
+              <Plus style="width: 14px; height: 14px;" />
+            </button>
+          </div>
+
+          <!-- Session list -->
+          <nav style="flex: 1; overflow-y: auto; min-height: 0; padding: 0 0.375rem;">
+            <SessionItem
+              v-for="session in sessions"
+              :key="session.id"
+              :session="session"
+              :is-active="currentSessionId === session.id"
+              @select="(s) => { switchSession(s); }"
+              @deleted="onSessionDeleted"
+              @renamed="onSessionRenamed"
             />
-            <span :class="currentTab?.type === 'workspace' ? 'text-nanna-accent font-medium' : 'text-nanna-text-dim'">
-              {{ currentTabName }}
-            </span>
-          </div>
-        </div>
-        
-        <!-- Sessions list -->
-        <nav class="flex-1 px-4 space-y-1 overflow-y-auto pt-2">
-          <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
-            {{ currentTab?.type === 'workspace' ? 'Workspace Chats' : 'Global Chats' }}
-          </div>
-          
-          <SessionItem
-            v-for="session in sessions" 
-            :key="session.id"
-            :session="session"
-            :is-active="currentSessionId === session.id"
-            @select="(s) => { switchSession(s); sidebarOpen = false }"
-            @deleted="onSessionDeleted"
-            @renamed="onSessionRenamed"
-          />
-          
-          <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
-            {{ currentTab?.type === 'workspace' ? 'No workspace chats yet' : 'No global chats yet' }}
-          </div>
-        </nav>
-        
-        <!-- Footer -->
-        <div class="p-4 border-t border-nanna-primary/10 space-y-1">
-          <NuxtLink to="/memory" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Brain class="w-4 h-4" /><span>Memory</span>
-          </NuxtLink>
-          <NuxtLink to="/logs" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <FileText class="w-4 h-4" /><span>Logs</span>
-          </NuxtLink>
-          <NuxtLink to="/workspaces" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <FolderKanban class="w-4 h-4" /><span>Workspaces</span>
-          </NuxtLink>
-          <NuxtLink to="/agents" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Bot class="w-4 h-4" /><span>Agents</span>
-          </NuxtLink>
-          <NuxtLink to="/channels" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Radio class="w-4 h-4" /><span>Channels</span>
-          </NuxtLink>
-          <NuxtLink to="/tools" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Wrench class="w-4 h-4" /><span>Tools</span>
-          </NuxtLink>
-          <NuxtLink to="/scheduler" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Clock class="w-4 h-4" /><span>Scheduler</span>
-          </NuxtLink>
-          <NuxtLink to="/settings" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Settings class="w-4 h-4" /><span>Settings</span>
-          </NuxtLink>
-          <button @click="hideToTray(); sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <ChevronDown class="w-4 h-4" /><span>Hide to Tray</span>
-          </button>
-          <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
-            <div class="flex items-center gap-2">
-              <span>v0.1.0</span>
-              <span v-if="backendStatus" class="px-1.5 py-0.5 rounded text-[10px]" 
-                    :class="isDaemon ? 'bg-nanna-accent/20 text-nanna-accent' : 'bg-nanna-bg-elevated text-nanna-text-dim'">
-                {{ isDaemon ? 'daemon' : 'embedded' }}
-              </span>
+            <div v-if="sessions.length === 0" style="font-size: 0.7rem; color: rgba(100,116,139,0.5); padding: 2rem 0.5rem; text-align: center;">
+              No chats yet
             </div>
-            <span :class="backendStatus?.connected ? 'text-nanna-success' : (apiKeySet ? 'text-nanna-warning' : 'text-nanna-error')">
-              {{ backendStatus?.connected ? '● Connected' : (apiKeySet ? '○ Disconnected' : '○ No API Key') }}
-            </span>
-          </div>
+          </nav>
+        </UiResizablePanel>
+
+        <UiResizableHandle v-if="chatPanelOpen" />
+
+        <!-- Main content column -->
+        <UiResizablePanel :default-size="chatPanelOpen ? 82 : 100" :order="2" style="display: flex; flex-direction: column; min-height: 0; min-width: 0;">
+          <TitleBar />
+          <main style="flex: 1; overflow: hidden;">
+            <slot />
+          </main>
+        </UiResizablePanel>
+
+      </UiResizableGroup>
+
+      <!-- ═══ Bottom Status Bar (full width except activity bar) ═══ -->
+      <div class="status-bar">
+        <div class="status-left">
+          <span class="status-version">v0.1.0</span>
+          <span v-if="backendStatus" :class="['status-badge', isDaemon ? 'status-badge-accent' : '']">
+            {{ isDaemon ? 'daemon' : 'embedded' }}
+          </span>
+        </div>
+        <div class="status-right">
+          <span :class="['status-dot', backendStatus?.connected ? 'dot-ok' : (apiKeySet ? 'dot-warn' : 'dot-err')]"></span>
+          <span class="status-label">
+            {{ backendStatus?.connected ? 'Connected' : (apiKeySet ? 'Disconnected' : 'No API Key') }}
+          </span>
         </div>
       </div>
-    </UiSheet>
-    
-    <!-- Main content -->
-    <div class="flex h-screen">
-      <!-- Desktop Sidebar -->
-      <aside class="hidden lg:flex w-64 bg-nanna-bg-surface border-r border-nanna-primary/10 flex-col">
-        <!-- Logo -->
-        <div class="p-4 border-b border-nanna-primary/10">
-          <NuxtLink to="/" class="block">
-            <h1 class="text-2xl font-bold text-nanna-accent crt-glow">NANNA</h1>
-            <p class="text-xs text-nanna-text-muted mt-1">AI Assistant</p>
-          </NuxtLink>
-        </div>
-        
-        <!-- New Chat button -->
-        <div class="p-4">
-          <UiButton @click="createNewSession" class="w-full justify-start">
-            <Plus class="w-4 h-4" />
-            <span>New Chat</span>
-          </UiButton>
-        </div>
-        
-        <!-- Current Tab indicator -->
-        <div :class="[
-          'px-4 py-2 border-b',
-          currentTab?.type === 'workspace' 
-            ? 'bg-nanna-accent/10 border-nanna-accent/20' 
-            : 'bg-nanna-bg-elevated/50 border-nanna-primary/10'
-        ]">
-          <div class="flex items-center gap-2 text-xs">
-            <component :is="currentTab?.type === 'workspace' ? FolderKanban : Globe" 
-              :class="['w-3 h-3', currentTab?.type === 'workspace' ? 'text-nanna-accent' : 'text-nanna-text-dim']" 
-            />
-            <span :class="currentTab?.type === 'workspace' ? 'text-nanna-accent font-medium truncate' : 'text-nanna-text-dim'">
-              {{ currentTabName }}
-            </span>
-          </div>
-        </div>
-        
-        <!-- Sessions list -->
-        <nav class="flex-1 px-4 space-y-1 overflow-y-auto pt-2">
-          <div class="text-xs text-nanna-text-dim uppercase tracking-wider mb-2">
-            {{ currentTab?.type === 'workspace' ? 'Workspace Chats' : 'Global Chats' }}
-          </div>
-          
-          <SessionItem
-            v-for="session in sessions" 
-            :key="session.id"
-            :session="session"
-            :is-active="currentSessionId === session.id"
-            @select="switchSession"
-            @deleted="onSessionDeleted"
-            @renamed="onSessionRenamed"
-          />
-          
-          <div v-if="sessions.length === 0" class="text-sm text-nanna-text-dim py-4 text-center">
-            {{ currentTab?.type === 'workspace' ? 'No workspace chats yet' : 'No global chats yet' }}
-          </div>
-        </nav>
-        
-        <!-- Footer -->
-        <div class="p-4 border-t border-nanna-primary/10 space-y-1">
-          <NuxtLink to="/memory" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Brain class="w-4 h-4" /><span>Memory</span>
-          </NuxtLink>
-          <NuxtLink to="/logs" @click="sidebarOpen = false"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <FileText class="w-4 h-4" /><span>Logs</span>
-          </NuxtLink>
-          <NuxtLink to="/workspaces" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <FolderKanban class="w-4 h-4" /><span>Workspaces</span>
-          </NuxtLink>
-          <NuxtLink to="/agents" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Bot class="w-4 h-4" /><span>Agents</span>
-          </NuxtLink>
-          <NuxtLink to="/channels" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Radio class="w-4 h-4" /><span>Channels</span>
-          </NuxtLink>
-          <NuxtLink to="/tools" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Wrench class="w-4 h-4" /><span>Tools</span>
-          </NuxtLink>
-          <NuxtLink to="/scheduler" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Clock class="w-4 h-4" /><span>Scheduler</span>
-          </NuxtLink>
-          <NuxtLink to="/settings" 
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <Settings class="w-4 h-4" /><span>Settings</span>
-          </NuxtLink>
-          <button @click="hideToTray"
-            class="flex items-center gap-3 w-full text-left px-3 py-2 rounded-lg text-sm text-nanna-text-muted hover:text-nanna-text hover:bg-nanna-bg-elevated transition-colors">
-            <ChevronDown class="w-4 h-4" /><span>Hide to Tray</span>
-          </button>
-          <div class="flex items-center justify-between text-xs text-nanna-text-dim px-3 pt-2">
-            <div class="flex items-center gap-2">
-              <span>v0.1.0</span>
-              <span v-if="backendStatus" class="px-1.5 py-0.5 rounded text-[10px]" 
-                    :class="isDaemon ? 'bg-nanna-accent/20 text-nanna-accent' : 'bg-nanna-bg-elevated text-nanna-text-dim'">
-                {{ isDaemon ? 'daemon' : 'embedded' }}
-              </span>
-            </div>
-            <span :class="backendStatus?.connected ? 'text-nanna-success' : (apiKeySet ? 'text-nanna-warning' : 'text-nanna-error')">
-              {{ backendStatus?.connected ? '● Connected' : (apiKeySet ? '○ Disconnected' : '○ No API Key') }}
-            </span>
-          </div>
-        </div>
-      </aside>
-      
-      <!-- Main area with workspace tabs -->
-      <main class="flex-1 flex flex-col pt-14 lg:pt-0 relative overflow-hidden">
-        <!-- Workspace Tabs (desktop only, on chat page) -->
-        <WorkspaceTabs
-          v-if="route.path === '/' || route.path === ''"
-          class="hidden lg:flex"
-          :open-workspaces="openWorkspaces"
-          :current-tab="currentTab"
-          @select="selectTab"
-          @close="closeWorkspaceTab"
-          @add="showWorkspacePicker = true"
-        />
-        
-        <!-- Mobile workspace tabs (horizontal scroll) -->
-        <WorkspaceTabs
-          v-if="(route.path === '/' || route.path === '') && openWorkspaces.length > 0"
-          class="lg:hidden"
-          :open-workspaces="openWorkspaces"
-          :current-tab="currentTab"
-          @select="selectTab"
-          @close="closeWorkspaceTab"
-          @add="showWorkspacePicker = true"
-        />
-        
-        <!-- Content area - takes remaining space, allows child to handle scrolling -->
-        <div class="flex-1 overflow-hidden">
-          <slot />
-        </div>
-      </main>
+
     </div>
-    
+
     <!-- Workspace Picker Modal -->
     <WorkspacePicker
+      v-if="showWorkspacePicker"
       v-model="showWorkspacePicker"
       :open-tab-ids="openTabIds"
       @select="openWorkspaceTab"
     />
-    
+
     <!-- Close confirmation dialog -->
     <CloseDialog />
 
@@ -299,7 +149,17 @@
 import { ref, computed, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Menu, Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, Globe, FileText } from 'lucide-vue-next'
+import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText } from 'lucide-vue-next'
+
+const navItems = [
+  { to: '/memory', label: 'Memory', icon: Brain },
+  { to: '/logs', label: 'Logs', icon: FileText },
+  { to: '/workspaces', label: 'Workspaces', icon: FolderKanban },
+  { to: '/agents', label: 'Agents', icon: Bot },
+  { to: '/channels', label: 'Channels', icon: Radio },
+  { to: '/tools', label: 'Tools', icon: Wrench },
+  { to: '/scheduler', label: 'Scheduler', icon: Clock },
+]
 
 interface SessionInfo {
   id: string
@@ -335,10 +195,9 @@ const route = useRoute()
 const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
-const sidebarOpen = ref(false)
 const showWorkspacePicker = ref(false)
+const chatPanelOpen = ref(false)
 
-// Workspace tabs state
 const openWorkspaces = ref<WorkspaceInfo[]>([])
 const currentTab = ref<Tab>({ type: 'global' })
 
@@ -347,18 +206,19 @@ let unlistenCloseRequested: UnlistenFn | null = null
 let unlistenSessionsCleared: UnlistenFn | null = null
 let unlistenSessionRenamed: UnlistenFn | null = null
 
-// Computed
-const currentTabName = computed(() => {
-  if (!currentTab.value || currentTab.value.type === 'global') {
-    return 'Global'
+function isNavActive(path: string) {
+  return route.path === path || (path !== '/' && route.path.startsWith(path))
+}
+
+function toggleChatPanel() {
+  chatPanelOpen.value = !chatPanelOpen.value
+  if (chatPanelOpen.value && route.path !== '/') {
+    navigateTo('/')
   }
-  const ws = openWorkspaces.value.find(w => w.id === currentTab.value.workspaceId)
-  return ws?.name || 'Workspace'
-})
+}
 
 const openTabIds = computed(() => openWorkspaces.value.map(w => w.id))
 
-// For backwards compatibility - provide the current workspace if in workspace tab
 const activeWorkspace = computed(() => {
   if (currentTab.value?.type === 'workspace') {
     return openWorkspaces.value.find(w => w.id === currentTab.value.workspaceId) || null
@@ -366,7 +226,6 @@ const activeWorkspace = computed(() => {
   return null
 })
 
-// Tab management functions for child components
 function addWorkspaceTab(ws: WorkspaceInfo) {
   if (!openWorkspaces.value.some(w => w.id === ws.id)) {
     openWorkspaces.value.push(ws)
@@ -375,15 +234,11 @@ function addWorkspaceTab(ws: WorkspaceInfo) {
 }
 
 function selectWorkspaceTab(workspaceId: string) {
-  // Ensure tab is open
   const ws = openWorkspaces.value.find(w => w.id === workspaceId)
   if (!ws) {
-    // Need to fetch workspace info and add it
     loadOpenWorkspaces().then(() => {
       const found = openWorkspaces.value.find(w => w.id === workspaceId)
-      if (found) {
-        currentTab.value = { type: 'workspace', workspaceId }
-      }
+      if (found) currentTab.value = { type: 'workspace', workspaceId }
     })
   } else {
     currentTab.value = { type: 'workspace', workspaceId }
@@ -394,7 +249,6 @@ function selectGlobalTab() {
   currentTab.value = { type: 'global' }
 }
 
-// Provide to child components
 provide('currentSessionId', currentSessionId)
 provide('sessions', sessions)
 provide('activeWorkspace', activeWorkspace)
@@ -403,223 +257,149 @@ provide('openWorkspaces', openWorkspaces)
 provide('addWorkspaceTab', addWorkspaceTab)
 provide('selectWorkspaceTab', selectWorkspaceTab)
 provide('selectGlobalTab', selectGlobalTab)
+provide('selectTab', selectTab)
+provide('closeWorkspaceTab', closeWorkspaceTab)
+provide('showWorkspacePicker', showWorkspacePicker)
 
-// Initialize notifications
 const { checkPermission } = useNotifications()
-
-// Initialize backend (daemon or embedded mode)
 const { init: initBackend, status: backendStatus, isDaemon } = useBackend()
-
-// Close handler
 const { handleClose, loadCloseMode } = useCloseHandler()
 
-// LocalStorage keys
 const TABS_STORAGE_KEY = 'nanna-workspace-tabs'
 const CURRENT_TAB_KEY = 'nanna-current-tab'
 
 onMounted(async () => {
-  // Initialize backend first
   const mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
-  
-  // Load saved tabs from localStorage
   loadTabsFromStorage()
-  
-  // Load workspace data for open tabs
   await loadOpenWorkspaces()
-  
-  // Load sessions for current tab
   await loadSessions()
   await loadConfig()
-  
-  // Sync currentSessionId from URL query param
+
   const urlSessionId = route.query.session as string | undefined
   if (urlSessionId && sessions.value.some(s => s.id === urlSessionId)) {
     currentSessionId.value = urlSessionId
   }
-  
-  // Listen for tray "new chat" event
-  unlistenTrayNewChat = await listen('tray-new-chat', () => {
-    createNewSession()
-  })
 
-  // Listen for sessions cleared event (from settings page)
+  unlistenTrayNewChat = await listen('tray-new-chat', () => createNewSession())
   unlistenSessionsCleared = await listen('sessions-cleared', async () => {
-    console.log('Sessions cleared event received, refreshing...')
     await loadSessions()
     currentSessionId.value = sessions.value[0]?.id || null
   })
-
-  // Listen for session renamed event (from auto-naming or other sources)
   unlistenSessionRenamed = await listen<{ id: string, name: string }>('session-renamed', (event) => {
     const { id, name } = event.payload
     const idx = sessions.value.findIndex(s => s.id === id)
-    if (idx !== -1) {
-      sessions.value[idx] = { ...sessions.value[idx], name }
-    }
+    if (idx !== -1) sessions.value[idx] = { ...sessions.value[idx], name }
   })
 
-  // Listen for window close request
   const { getCurrentWindow } = await import('@tauri-apps/api/window')
   const window = getCurrentWindow()
   unlistenCloseRequested = await window.onCloseRequested(async (event) => {
     event.preventDefault()
     await handleClose()
   })
-  
+
   await loadCloseMode()
   await checkPermission()
 })
 
 onUnmounted(() => {
-  if (unlistenTrayNewChat) unlistenTrayNewChat()
-  if (unlistenCloseRequested) unlistenCloseRequested()
-  if (unlistenSessionsCleared) unlistenSessionsCleared()
-  if (unlistenSessionRenamed) unlistenSessionRenamed()
+  unlistenTrayNewChat?.()
+  unlistenCloseRequested?.()
+  unlistenSessionsCleared?.()
+  unlistenSessionRenamed?.()
 })
 
-// Watch for route changes to sync currentSessionId
 watch(() => route.query.session, (newSessionId) => {
   if (typeof newSessionId === 'string' && sessions.value.some(s => s.id === newSessionId)) {
     currentSessionId.value = newSessionId
   }
 })
 
-// Close sidebar on route change (mobile)
-watch(() => route.fullPath, () => {
-  sidebarOpen.value = false
+// Close chat panel when navigating away from chat
+watch(() => route.path, (path) => {
+  if (path !== '/' && path !== '') chatPanelOpen.value = false
 })
 
-// Reload sessions when tab changes
 watch(currentTab, async () => {
   await loadSessions()
-  // Reset currentSessionId when switching tabs
   currentSessionId.value = sessions.value[0]?.id || null
-  if (currentSessionId.value) {
-    navigateTo(`/?session=${currentSessionId.value}`)
-  }
+  if (currentSessionId.value) navigateTo(`/?session=${currentSessionId.value}`)
   saveTabsToStorage()
 }, { deep: true })
 
-// Storage helpers
 function loadTabsFromStorage() {
   try {
     const savedTabs = localStorage.getItem(TABS_STORAGE_KEY)
     const savedCurrent = localStorage.getItem(CURRENT_TAB_KEY)
-    
     if (savedTabs) {
       const tabIds: string[] = JSON.parse(savedTabs)
-      // We'll populate openWorkspaces after loading from backend
-      // For now just store the IDs
       openWorkspaces.value = tabIds.map(id => ({ id, name: '', path: '' }))
     }
-    
-    if (savedCurrent) {
-      currentTab.value = JSON.parse(savedCurrent)
-    }
-  } catch (e) {
-    console.error('Failed to load tabs from storage:', e)
-  }
+    if (savedCurrent) currentTab.value = JSON.parse(savedCurrent)
+  } catch (e) { console.error('Failed to load tabs from storage:', e) }
 }
 
 function saveTabsToStorage() {
   try {
-    const tabIds = openWorkspaces.value.map(w => w.id)
-    localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(tabIds))
+    localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify(openWorkspaces.value.map(w => w.id)))
     localStorage.setItem(CURRENT_TAB_KEY, JSON.stringify(currentTab.value))
-  } catch (e) {
-    console.error('Failed to save tabs to storage:', e)
-  }
+  } catch (e) { console.error('Failed to save tabs to storage:', e) }
 }
 
 async function loadOpenWorkspaces() {
   try {
-    // Get all workspaces from backend
     const allWorkspaces = await invoke<WorkspaceInfo[]>('list_workspaces')
-    
-    // Filter to only those we have tabs for
     const savedIds = openWorkspaces.value.map(w => w.id)
     openWorkspaces.value = allWorkspaces.filter(ws => savedIds.includes(ws.id))
-    
-    // Validate currentTab still exists
     if (currentTab.value?.type === 'workspace') {
-      const exists = openWorkspaces.value.some(w => w.id === currentTab.value.workspaceId)
-      if (!exists) {
+      if (!openWorkspaces.value.some(w => w.id === currentTab.value.workspaceId)) {
         currentTab.value = { type: 'global' }
       }
     }
-    
     saveTabsToStorage()
-  } catch (e) {
-    console.error('Failed to load workspaces:', e)
-    openWorkspaces.value = []
-  }
+  } catch (e) { console.error('Failed to load workspaces:', e); openWorkspaces.value = [] }
 }
 
 async function loadSessions() {
   try {
-    const workspaceId = currentTab.value?.type === 'workspace' 
-      ? currentTab.value.workspaceId ?? null 
-      : null
+    const workspaceId = currentTab.value?.type === 'workspace' ? currentTab.value.workspaceId ?? null : null
     sessions.value = await invoke<SessionInfo[]>('list_sessions', { workspaceId })
-    
-    const firstSession = sessions.value[0]
-    if (firstSession && !currentSessionId.value) {
-      currentSessionId.value = firstSession.id
-    }
-  } catch (e) {
-    console.error('Failed to load sessions:', e)
-  }
+    if (sessions.value[0] && !currentSessionId.value) currentSessionId.value = sessions.value[0].id
+  } catch (e) { console.error('Failed to load sessions:', e) }
 }
 
 async function loadConfig() {
   try {
     const config = await invoke<AppConfig>('get_config')
     apiKeySet.value = config.api_key_set
-  } catch (e) {
-    console.error('Failed to load config:', e)
-  }
+  } catch (e) { console.error('Failed to load config:', e) }
 }
 
-// Tab management
-function selectTab(tab: Tab) {
-  currentTab.value = tab
-}
+function selectTab(tab: Tab) { currentTab.value = tab }
 
 function openWorkspaceTab(ws: WorkspaceInfo) {
-  // Add to open workspaces if not already there
-  if (!openWorkspaces.value.some(w => w.id === ws.id)) {
-    openWorkspaces.value.push(ws)
-  }
-  // Switch to the tab
+  if (!openWorkspaces.value.some(w => w.id === ws.id)) openWorkspaces.value.push(ws)
   currentTab.value = { type: 'workspace', workspaceId: ws.id }
   saveTabsToStorage()
 }
 
 function closeWorkspaceTab(workspaceId: string) {
   openWorkspaces.value = openWorkspaces.value.filter(w => w.id !== workspaceId)
-  
-  // If closing current tab, switch to global
   if (currentTab.value?.type === 'workspace' && currentTab.value.workspaceId === workspaceId) {
     currentTab.value = { type: 'global' }
   }
-  
   saveTabsToStorage()
 }
 
 async function createNewSession() {
   try {
-    const workspaceId = currentTab.value?.type === 'workspace' 
-      ? currentTab.value.workspaceId ?? null 
-      : null
+    const workspaceId = currentTab.value?.type === 'workspace' ? currentTab.value.workspaceId ?? null : null
     const session = await invoke<SessionInfo>('create_session', { name: null, workspaceId })
     currentSessionId.value = session.id
-    
     await loadSessions()
     navigateTo(`/?session=${session.id}`)
-  } catch (e) {
-    console.error('Failed to create session:', e)
-  }
+  } catch (e) { console.error('Failed to create session:', e) }
 }
 
 function switchSession(session: SessionInfo) {
@@ -631,24 +411,206 @@ function onSessionDeleted(sessionId: string) {
   sessions.value = sessions.value.filter(s => s.id !== sessionId)
   if (currentSessionId.value === sessionId) {
     currentSessionId.value = sessions.value[0]?.id || null
-    if (currentSessionId.value) {
-      navigateTo(`/?session=${currentSessionId.value}`)
-    }
+    if (currentSessionId.value) navigateTo(`/?session=${currentSessionId.value}`)
   }
 }
 
 function onSessionRenamed(updated: SessionInfo) {
   const idx = sessions.value.findIndex(s => s.id === updated.id)
-  if (idx !== -1) {
-    sessions.value[idx] = updated
-  }
+  if (idx !== -1) sessions.value[idx] = updated
 }
 
 async function hideToTray() {
-  try {
-    await invoke('hide_to_tray')
-  } catch (e) {
-    console.error('Failed to hide to tray:', e)
-  }
+  try { await invoke('hide_to_tray') } catch (e) { console.error('Failed to hide to tray:', e) }
 }
 </script>
+
+<style scoped>
+/* ═══ Activity Bar ═══ */
+.activity-bar {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 64px;
+  /* no border, no background — inherits shell gradient */
+}
+
+.activity-logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.activity-nav {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  padding: 0 8px;
+}
+
+.activity-icon {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 40px;
+  border-radius: 8px;
+  color: rgba(196, 205, 214, 0.4);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  text-decoration: none;
+}
+.activity-icon svg,
+.activity-icon :deep(svg) {
+  width: 20px;
+  height: 20px;
+}
+.activity-icon:hover {
+  color: #c4cdd6;
+  background: rgba(255, 255, 255, 0.04);
+}
+.activity-icon.active {
+  color: #e2e8f0;
+}
+/* Active indicator bar */
+.activity-icon.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  background: #8b5cf6;
+  border-radius: 0 2px 2px 0;
+}
+
+/* Chat drawer arrow */
+.chat-arrow {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 4px !important;
+  height: 7px !important;
+  opacity: 0.35;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.activity-icon:hover .chat-arrow {
+  opacity: 0.7;
+}
+.chat-arrow--open {
+  transform: translateY(-50%) rotate(180deg);
+}
+
+.activity-bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  padding: 0 8px 12px;
+}
+
+/* Tooltip */
+.tooltip {
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-left: 8px;
+  padding: 4px 10px;
+  background: #1a1a2e;
+  color: #e2e8f0;
+  font-size: 12px;
+  white-space: nowrap;
+  border-radius: 4px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 100;
+}
+.activity-icon:hover .tooltip {
+  opacity: 1;
+}
+
+/* ═══ Chat Panel (secondary slide-out) ═══ */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  /* borderless — no background, no border, inherits shell gradient */
+}
+
+.panel-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #c4cdd6;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.panel-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e2e8f0;
+}
+
+/* ═══ Bottom Status Bar ═══ */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  height: 28px;
+  flex-shrink: 0;
+  border: none;
+  font-size: 11px;
+  color: #64748b;
+  background: transparent;
+}
+.status-left, .status-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status-version {
+  color: #64748b;
+}
+.status-badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  background: rgba(51, 65, 85, 0.6);
+  color: #64748b;
+}
+.status-badge-accent {
+  background: rgba(34, 211, 238, 0.15);
+  color: #22d3ee;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.dot-ok { background: #34d399; }
+.dot-warn { background: #fbbf24; }
+.dot-err { background: #fb7185; }
+.status-label {
+  color: #94a3b8;
+}
+</style>

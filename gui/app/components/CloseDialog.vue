@@ -1,5 +1,5 @@
 <template>
-  <UiModal v-model="showCloseDialog" title="Close Nanna?" size="sm" :closable="true">
+  <UiModal v-if="showCloseDialog" v-model="showCloseDialog" title="Close Nanna?" size="sm" :closable="true">
     <div class="space-y-4">
       <p class="text-nanna-text-muted">
         What would you like to do?
