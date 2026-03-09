@@ -210,11 +210,63 @@ impl From<&Session> for SessionSummary {
     }
 }
 
+/// State of a sub-agent session
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubSessionState {
+    Spawning,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Killed,
+}
+
+/// Metadata for a sub-agent session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubSessionInfo {
+    /// Session ID
+    pub session_id: SessionId,
+    /// Parent session ID (None for top-level sessions)
+    pub parent_id: Option<SessionId>,
+    /// Human-readable label
+    pub label: Option<String>,
+    /// Task description / initial prompt
+    pub task: String,
+    /// Current state
+    pub state: SubSessionState,
+    /// When it was spawned
+    pub spawned_at: DateTime<Utc>,
+    /// When it completed/failed/was killed
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Model used
+    pub model: Option<String>,
+    /// Result summary (on completion)
+    pub result: Option<String>,
+    /// Error message (on failure)
+    pub error: Option<String>,
+    /// Cancellation flag for cooperative shutdown
+    #[serde(skip)]
+    pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// A message in the sub-session mailbox
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxMessage {
+    pub from: String,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Manages all sessions
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SessionId, Session>>>,
     /// Default session ID (for new clients)
     default_session: Arc<RwLock<Option<SessionId>>>,
+    /// Sub-session registry (session_id -> info)
+    sub_sessions: Arc<RwLock<HashMap<SessionId, SubSessionInfo>>>,
+    /// Per-session mailbox for inter-session messaging
+    mailboxes: Arc<RwLock<HashMap<SessionId, Vec<MailboxMessage>>>>,
 }
 
 impl SessionManager {
@@ -223,6 +275,8 @@ impl SessionManager {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_session: Arc::new(RwLock::new(None)),
+            sub_sessions: Arc::new(RwLock::new(HashMap::new())),
+            mailboxes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     
@@ -443,6 +497,152 @@ impl SessionManager {
     /// Get the default session ID holder (for persistence)
     pub fn default_session_id(&self) -> Arc<RwLock<Option<SessionId>>> {
         self.default_session.clone()
+    }
+}
+
+impl SessionManager {
+    // =========================================================================
+    // Sub-Session Management (#72)
+    // =========================================================================
+
+    /// Register a new sub-session (called after creating the Session)
+    pub async fn register_sub_session(&self, info: SubSessionInfo) {
+        let id = info.session_id.clone();
+        info!("Registered sub-session: {} (parent: {:?}, label: {:?})", id, info.parent_id, info.label);
+        self.sub_sessions.write().await.insert(id.clone(), info);
+        // Initialize empty mailbox
+        self.mailboxes.write().await.entry(id).or_default();
+    }
+
+    /// Update sub-session state
+    pub async fn set_sub_session_state(&self, session_id: &str, state: SubSessionState) {
+        let mut subs = self.sub_sessions.write().await;
+        if let Some(info) = subs.get_mut(session_id) {
+            info.state = state;
+            if matches!(state, SubSessionState::Completed | SubSessionState::Failed | SubSessionState::Killed) {
+                info.finished_at = Some(Utc::now());
+            }
+        }
+    }
+
+    /// Set sub-session result (on completion)
+    pub async fn set_sub_session_result(&self, session_id: &str, result: String) {
+        let mut subs = self.sub_sessions.write().await;
+        if let Some(info) = subs.get_mut(session_id) {
+            info.result = Some(result);
+            info.state = SubSessionState::Completed;
+            info.finished_at = Some(Utc::now());
+        }
+    }
+
+    /// Set sub-session error (on failure)
+    pub async fn set_sub_session_error(&self, session_id: &str, error: String) {
+        let mut subs = self.sub_sessions.write().await;
+        if let Some(info) = subs.get_mut(session_id) {
+            info.error = Some(error);
+            info.state = SubSessionState::Failed;
+            info.finished_at = Some(Utc::now());
+        }
+    }
+
+    /// Get sub-session info
+    pub async fn get_sub_session(&self, session_id: &str) -> Option<SubSessionInfo> {
+        self.sub_sessions.read().await.get(session_id).cloned()
+    }
+
+    /// Find a sub-session by label
+    pub async fn find_sub_session_by_label(&self, label: &str) -> Option<SubSessionInfo> {
+        self.sub_sessions.read().await.values()
+            .find(|s| s.label.as_deref() == Some(label))
+            .cloned()
+    }
+
+    /// Resolve a sub-session target (label or ID) to a SubSessionInfo
+    pub async fn resolve_sub_session(&self, target: &str) -> Option<SubSessionInfo> {
+        // Try by ID first, then by label
+        let subs = self.sub_sessions.read().await;
+        if let Some(info) = subs.get(target) {
+            return Some(info.clone());
+        }
+        subs.values()
+            .find(|s| s.label.as_deref() == Some(target))
+            .cloned()
+    }
+
+    /// List sub-sessions, optionally filtered by parent
+    pub async fn list_sub_sessions(&self, parent_id: Option<&str>) -> Vec<SubSessionInfo> {
+        let subs = self.sub_sessions.read().await;
+        subs.values()
+            .filter(|s| match parent_id {
+                Some(pid) => s.parent_id.as_deref() == Some(pid),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Kill a sub-session (set cancellation flag + state)
+    pub async fn kill_sub_session(&self, session_id: &str) -> bool {
+        let mut subs = self.sub_sessions.write().await;
+        if let Some(info) = subs.get_mut(session_id) {
+            // Signal cancellation
+            if let Some(ref flag) = info.cancellation_flag {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            info.state = SubSessionState::Killed;
+            info.finished_at = Some(Utc::now());
+            info!("Killed sub-session: {}", session_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Send a message to a session's mailbox
+    pub async fn send_to_mailbox(&self, session_id: &str, from: &str, content: String) -> bool {
+        let mut mailboxes = self.mailboxes.write().await;
+        if let Some(mailbox) = mailboxes.get_mut(session_id) {
+            mailbox.push(MailboxMessage {
+                from: from.to_string(),
+                content,
+                timestamp: Utc::now(),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drain all messages from a session's mailbox
+    pub async fn drain_mailbox(&self, session_id: &str) -> Vec<MailboxMessage> {
+        let mut mailboxes = self.mailboxes.write().await;
+        mailboxes.get_mut(session_id)
+            .map(|mb| std::mem::take(mb))
+            .unwrap_or_default()
+    }
+
+    /// Clean up completed/failed/killed sub-sessions older than the given duration
+    pub async fn cleanup_sub_sessions(&self, max_age: std::time::Duration) {
+        let cutoff = Utc::now() - chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::hours(24));
+        let mut subs = self.sub_sessions.write().await;
+        let mut mailboxes = self.mailboxes.write().await;
+
+        let to_remove: Vec<String> = subs.iter()
+            .filter(|(_, info)| {
+                matches!(info.state, SubSessionState::Completed | SubSessionState::Failed | SubSessionState::Killed)
+                    && info.finished_at.map(|t| t < cutoff).unwrap_or(false)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &to_remove {
+            subs.remove(id);
+            mailboxes.remove(id);
+        }
+
+        if !to_remove.is_empty() {
+            info!("Cleaned up {} completed sub-sessions", to_remove.len());
+        }
     }
 }
 

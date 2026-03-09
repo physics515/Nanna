@@ -130,6 +130,48 @@ pub enum SessionAction {
     Fork { id: String, name: Option<String> },
     /// Get current execution state (in-flight streaming text, active tools)
     GetRunState { id: String },
+
+    // --- Sub-Agent Sessions (#72) ---
+    
+    /// Spawn a sub-agent session
+    SpawnSubSession {
+        /// Task description / initial prompt for the sub-agent
+        task: String,
+        /// Optional human-readable label for easy reference
+        label: Option<String>,
+        /// Parent session ID (if called from within a session)
+        parent_id: Option<String>,
+        /// Model override (uses default if None)
+        model: Option<String>,
+        /// Maximum iterations before auto-stop (None = unlimited)
+        max_iterations: Option<usize>,
+        /// Timeout in seconds (None = no timeout)
+        timeout_secs: Option<u64>,
+        /// System prompt override
+        system_prompt: Option<String>,
+    },
+    /// Send a message to a sub-session (by label or ID)
+    SendToSubSession {
+        /// Target session: label or session ID
+        target: String,
+        /// Message to inject
+        message: String,
+    },
+    /// List sub-sessions (optionally filtered by parent)
+    ListSubSessions {
+        /// Only show children of this session (None = show all sub-sessions)
+        parent_id: Option<String>,
+    },
+    /// Kill / abort a sub-session
+    KillSubSession {
+        /// Session ID or label to kill
+        target: String,
+    },
+    /// Get detailed status of a sub-session
+    GetSubSessionStatus {
+        /// Session ID or label
+        target: String,
+    },
 }
 
 // =============================================================================
@@ -431,6 +473,31 @@ pub enum Event {
     ChannelError { id: String, error: String },
     ChannelMessage { channel_id: String, sender: String, content: String },
     
+    // Sub-session lifecycle events
+    SubSessionSpawned {
+        session_id: String,
+        parent_id: Option<String>,
+        label: Option<String>,
+        task: String,
+    },
+    SubSessionCompleted {
+        session_id: String,
+        parent_id: Option<String>,
+        label: Option<String>,
+        result: String,
+    },
+    SubSessionFailed {
+        session_id: String,
+        parent_id: Option<String>,
+        label: Option<String>,
+        error: String,
+    },
+    SubSessionKilled {
+        session_id: String,
+        parent_id: Option<String>,
+        label: Option<String>,
+    },
+
     // Model events
     ModelSwitch { model: String, reason: Option<String> },
 

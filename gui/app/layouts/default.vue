@@ -149,7 +149,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText } from 'lucide-vue-next'
+import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3 } from 'lucide-vue-next'
 
 const navItems = [
   { to: '/memory', label: 'Memory', icon: Brain },
@@ -159,6 +159,7 @@ const navItems = [
   { to: '/channels', label: 'Channels', icon: Radio },
   { to: '/tools', label: 'Tools', icon: Wrench },
   { to: '/scheduler', label: 'Scheduler', icon: Clock },
+  { to: '/model-stats', label: 'Model Stats', icon: BarChart3 },
 ]
 
 interface SessionInfo {

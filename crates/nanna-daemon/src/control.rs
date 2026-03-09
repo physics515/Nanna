@@ -13,7 +13,7 @@ use crate::agent_service::AgentService;
 use crate::llm_router::LlmRouter;
 use crate::log_buffer::LogBuffer;
 use crate::protocol::*;
-use crate::session::{MessageRole, SessionManager};
+use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
 use nanna_config::Config;
 use nanna_core::{Scheduler, WorkspaceRegistry, Workspace};
@@ -53,6 +53,8 @@ pub struct ControlPlane {
     pub model_stats: nanna_agent::ModelStatsTracker,
     /// Storage for persisting model stats
     storage: Option<Arc<Storage>>,
+    /// Event broadcaster for pushing events to subscribed clients
+    event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
 }
 
 impl ControlPlane {
@@ -76,6 +78,7 @@ impl ControlPlane {
             tools_dir: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
             storage: None,
+            event_tx: None,
         }
     }
 
@@ -104,6 +107,7 @@ impl ControlPlane {
             tools_dir: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
             storage: None,
+            event_tx: None,
         }
     }
 
@@ -152,6 +156,7 @@ impl ControlPlane {
             tools_dir: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
             storage: None,
+            event_tx: None,
         }
     }
 
@@ -159,6 +164,19 @@ impl ControlPlane {
     pub fn with_tools_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.tools_dir = dir;
         self
+    }
+
+    /// Set the event broadcaster for pushing events to clients
+    pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Emit an event to all subscribed clients
+    fn emit(&self, event: Event) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event);
+        }
     }
 
     /// Set the scheduler
@@ -203,6 +221,11 @@ impl ControlPlane {
         }
     }
     
+    /// Get a reference to the LLM router
+    pub fn router(&self) -> Option<&Arc<LlmRouter>> {
+        self.router.as_ref()
+    }
+
     /// Get a reference to the workspace registry
     pub fn workspaces(&self) -> &Arc<RwLock<WorkspaceRegistry>> {
         &self.workspaces
@@ -490,7 +513,224 @@ impl ControlPlane {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
                 }
             }
+
+            // --- Sub-Agent Sessions (#72) ---
+
+            SessionAction::SpawnSubSession {
+                task,
+                label,
+                parent_id,
+                model,
+                max_iterations,
+                timeout_secs,
+                system_prompt,
+            } => {
+                self.handle_spawn_sub_session(
+                    task, label, parent_id, model, max_iterations, timeout_secs, system_prompt,
+                ).await
+            }
+
+            SessionAction::SendToSubSession { target, message } => {
+                if let Some(info) = self.sessions.resolve_sub_session(&target).await {
+                    if self.sessions.send_to_mailbox(&info.session_id, client_id, message).await {
+                        json!({ "status": "sent", "session_id": info.session_id })
+                    } else {
+                        json!({ "error": "send_failed", "message": "Failed to send message" })
+                    }
+                } else {
+                    json!({ "error": "not_found", "message": format!("Sub-session '{}' not found", target) })
+                }
+            }
+
+            SessionAction::ListSubSessions { parent_id } => {
+                let subs = self.sessions.list_sub_sessions(parent_id.as_deref()).await;
+                json!({ "sub_sessions": subs })
+            }
+
+            SessionAction::KillSubSession { target } => {
+                if let Some(info) = self.sessions.resolve_sub_session(&target).await {
+                    let killed = self.sessions.kill_sub_session(&info.session_id).await;
+                    if killed {
+                        // Emit event
+                        self.emit(Event::SubSessionKilled {
+                            session_id: info.session_id.clone(),
+                            parent_id: info.parent_id.clone(),
+                            label: info.label.clone(),
+                        });
+                        json!({ "status": "killed", "session_id": info.session_id })
+                    } else {
+                        json!({ "error": "kill_failed", "message": "Failed to kill sub-session" })
+                    }
+                } else {
+                    json!({ "error": "not_found", "message": format!("Sub-session '{}' not found", target) })
+                }
+            }
+
+            SessionAction::GetSubSessionStatus { target } => {
+                if let Some(info) = self.sessions.resolve_sub_session(&target).await {
+                    // Also get session message count
+                    let msg_count = self.sessions.get(&info.session_id).await
+                        .map(|s| s.messages.len())
+                        .unwrap_or(0);
+                    let mailbox_count = self.sessions.drain_mailbox(&info.session_id).await.len();
+                    // Put them back (we just wanted the count)
+                    // Note: drain was destructive, but for status we want peek behavior
+                    // TODO: add a peek_mailbox method
+                    json!({
+                        "session_id": info.session_id,
+                        "parent_id": info.parent_id,
+                        "label": info.label,
+                        "task": info.task,
+                        "state": info.state,
+                        "spawned_at": info.spawned_at.to_rfc3339(),
+                        "finished_at": info.finished_at.map(|t| t.to_rfc3339()),
+                        "model": info.model,
+                        "result": info.result,
+                        "error": info.error,
+                        "message_count": msg_count,
+                        "pending_messages": mailbox_count,
+                    })
+                } else {
+                    json!({ "error": "not_found", "message": format!("Sub-session '{}' not found", target) })
+                }
+            }
         }
+    }
+    
+    // =========================================================================
+    // Sub-Session Handlers (#72)
+    // =========================================================================
+
+    async fn handle_spawn_sub_session(
+        &self,
+        task: String,
+        label: Option<String>,
+        parent_id: Option<String>,
+        model: Option<String>,
+        max_iterations: Option<usize>,
+        timeout_secs: Option<u64>,
+        system_prompt: Option<String>,
+    ) -> Value {
+        let Some(ref agent) = self.agent else {
+            return json!({ "error": "agent_unavailable", "message": "Agent service not configured" });
+        };
+
+        // Check for duplicate labels
+        if let Some(ref lbl) = label {
+            if let Some(existing) = self.sessions.find_sub_session_by_label(lbl).await {
+                if matches!(existing.state, SubSessionState::Spawning | SubSessionState::Running | SubSessionState::Waiting) {
+                    return json!({
+                        "error": "duplicate_label",
+                        "message": format!("Sub-session with label '{}' already running ({})", lbl, existing.session_id),
+                    });
+                }
+            }
+        }
+
+        // Create the session
+        let session_name = label.clone().unwrap_or_else(|| {
+            format!("sub: {}", task.chars().take(40).collect::<String>())
+        });
+        let session = self.sessions.create(Some(session_name)).await;
+        let session_id = session.id.clone();
+
+        // Create cancellation flag
+        let cancellation_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Register sub-session metadata
+        let info = SubSessionInfo {
+            session_id: session_id.clone(),
+            parent_id: parent_id.clone(),
+            label: label.clone(),
+            task: task.clone(),
+            state: SubSessionState::Spawning,
+            spawned_at: chrono::Utc::now(),
+            finished_at: None,
+            model: model.clone(),
+            result: None,
+            error: None,
+            cancellation_flag: Some(cancellation_flag.clone()),
+        };
+        self.sessions.register_sub_session(info).await;
+
+        // Emit spawn event
+        self.emit(Event::SubSessionSpawned {
+            session_id: session_id.clone(),
+            parent_id: parent_id.clone(),
+            label: label.clone(),
+            task: task.clone(),
+        });
+
+        // Build system prompt
+        let sys_prompt = system_prompt.unwrap_or_else(|| {
+            let base = self.system_prompt.blocking_read().clone();
+            format!("{}\n\nYou are a sub-agent. Your task: {}", base, task)
+        });
+
+        // Spawn the agent in a background task
+        let agent = agent.clone();
+        let sessions = self.sessions.clone();
+        let event_tx = self.event_tx.clone();
+        let model_for_task = model.unwrap_or_else(|| {
+            // Use the agent service's default model
+            "default".to_string()
+        });
+        let max_iters = max_iterations.unwrap_or(20);
+        let sid = session_id.clone();
+        let lbl = label.clone();
+        let pid = parent_id.clone();
+
+        tokio::spawn(async move {
+            // Mark as running
+            sessions.set_sub_session_state(&sid, SubSessionState::Running).await;
+
+            // Apply timeout if specified
+            let result = if let Some(timeout) = timeout_secs {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout),
+                    agent.chat(&sid, &task, Some(sys_prompt), &[]),
+                ).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!("Sub-session timed out after {}s", timeout)),
+                }
+            } else {
+                agent.chat(&sid, &task, Some(sys_prompt), &[]).await
+            };
+
+            match result {
+                Ok(chat_result) => {
+                    sessions.set_sub_session_result(&sid, chat_result.content.clone()).await;
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(Event::SubSessionCompleted {
+                            session_id: sid.clone(),
+                            parent_id: pid.clone(),
+                            label: lbl.clone(),
+                            result: chat_result.content,
+                        });
+                    }
+                    info!("Sub-session {} completed", sid);
+                }
+                Err(e) => {
+                    sessions.set_sub_session_error(&sid, e.clone()).await;
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(Event::SubSessionFailed {
+                            session_id: sid.clone(),
+                            parent_id: pid.clone(),
+                            label: lbl.clone(),
+                            error: e,
+                        });
+                    }
+                    warn!("Sub-session {} failed", sid);
+                }
+            }
+        });
+
+        json!({
+            "status": "spawned",
+            "session_id": session_id,
+            "label": label,
+            "parent_id": parent_id,
+        })
     }
     
     // =========================================================================

@@ -2,11 +2,15 @@
 //!
 //! Routes model requests to the appropriate LLM client based on model name/prefix.
 //! Supports fallback across multiple providers.
+//! Includes health-aware model selection (stats-informed routing).
 
+use nanna_agent::ModelStatsTracker;
 use nanna_llm::{LlmClient, ModelInfo, ModelInfoCache, CompletionRequest, LlmError};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, debug};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{info, debug, warn};
 
 /// Provider identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,12 +60,48 @@ impl ProviderId {
     }
 }
 
+/// Model health status for routing decisions
+#[derive(Debug, Clone, Serialize)]
+pub enum ModelHealth {
+    /// Model is working normally
+    Healthy,
+    /// Model has elevated errors or latency but is still usable
+    Degraded(String),
+    /// Model is failing consistently and should be skipped
+    Unhealthy(String),
+    /// Model was unhealthy but is in a cooldown/recovery period
+    Cooldown {
+        reason: String,
+        /// Timestamp (epoch ms) after which to retry
+        retry_after_ms: u64,
+    },
+}
+
+impl ModelHealth {
+    /// Whether this model should be used for new requests
+    pub fn is_usable(&self) -> bool {
+        match self {
+            ModelHealth::Healthy | ModelHealth::Degraded(_) => true,
+            ModelHealth::Unhealthy(_) => false,
+            ModelHealth::Cooldown { retry_after_ms, .. } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                now >= *retry_after_ms
+            }
+        }
+    }
+}
+
 /// Multi-provider LLM router
 pub struct LlmRouter {
     /// Available providers and their clients
     providers: HashMap<ProviderId, Arc<LlmClient>>,
     /// Model info cache
     model_cache: Option<ModelInfoCache>,
+    /// Shared model stats tracker for health-aware routing (set post-init)
+    stats: tokio::sync::RwLock<Option<ModelStatsTracker>>,
 }
 
 impl LlmRouter {
@@ -71,7 +111,13 @@ impl LlmRouter {
         Self {
             providers: HashMap::new(),
             model_cache,
+            stats: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Set the stats tracker (can be called after construction, even behind Arc)
+    pub async fn set_stats(&self, stats: ModelStatsTracker) {
+        *self.stats.write().await = Some(stats);
     }
 
     /// Add an Anthropic provider
@@ -192,6 +238,120 @@ impl LlmRouter {
                 cached_at: chrono::Utc::now().timestamp(),
             }
         }
+    }
+
+    /// Check the health of a model based on recent stats.
+    ///
+    /// Thresholds:
+    /// - Unhealthy: success_rate < 50% with 5+ requests, or 5+ consecutive failures
+    /// - Degraded: success_rate < 80% or avg latency > 30s
+    /// - Cooldown: was unhealthy, apply exponential backoff before retry
+    pub async fn model_health(&self, model: &str) -> ModelHealth {
+        let stats_guard = self.stats.read().await;
+        let Some(ref stats) = *stats_guard else {
+            return ModelHealth::Healthy; // No stats tracker, assume healthy
+        };
+
+        let summaries = stats.summaries().await;
+        let summary = match summaries.iter().find(|s| s.model == model) {
+            Some(s) => s,
+            None => return ModelHealth::Healthy, // No data yet
+        };
+
+        // Not enough data to judge
+        if summary.total_requests < 3 {
+            return ModelHealth::Healthy;
+        }
+
+        let error_rate = 1.0 - summary.success_rate;
+        let total_errors = (summary.total_requests as f64 * error_rate).round() as u64;
+
+        // Check for consecutive failures (unhealthy → cooldown)
+        if summary.consecutive_failures >= 5 {
+            // Exponential cooldown: 30s * 2^(consecutive-5), capped at 10 min
+            let exponent = (summary.consecutive_failures.saturating_sub(5)).min(8);
+            let backoff_secs = (30u64).saturating_mul(1u64 << exponent).min(600);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // Estimate: cooldown started ~now (conservative; we don't have exact last-error time)
+            let retry_after_ms = now_ms + (backoff_secs * 1000);
+
+            return ModelHealth::Cooldown {
+                reason: format!("{} consecutive failures", summary.consecutive_failures),
+                retry_after_ms,
+            };
+        }
+
+        // High error rate → unhealthy
+        if error_rate > 0.5 && summary.total_requests >= 5 {
+            return ModelHealth::Unhealthy(format!(
+                "Success rate {:.0}% ({} errors in {} requests)",
+                summary.success_rate * 100.0,
+                total_errors,
+                summary.total_requests
+            ));
+        }
+
+        // Moderate error rate or high latency → degraded
+        if error_rate > 0.2 {
+            return ModelHealth::Degraded(format!(
+                "Success rate {:.0}% ({} errors in {} requests)",
+                summary.success_rate * 100.0,
+                total_errors,
+                summary.total_requests
+            ));
+        }
+
+        if summary.avg_latency_ms > 30_000 {
+            return ModelHealth::Degraded(format!(
+                "High latency: {:.1}s avg",
+                summary.avg_latency_ms as f64 / 1000.0
+            ));
+        }
+
+        ModelHealth::Healthy
+    }
+
+    /// Filter a model priority list to prefer healthy models.
+    ///
+    /// Returns the reordered list: healthy models first (in original order),
+    /// then degraded models, then cooldown-eligible models. Unhealthy models
+    /// and models still in cooldown are excluded.
+    pub async fn health_sorted_models(&self, models: &[String]) -> Vec<String> {
+        let mut healthy = Vec::new();
+        let mut degraded = Vec::new();
+        let mut cooldown_ready = Vec::new();
+
+        for model in models {
+            let health = self.model_health(model).await;
+            match health {
+                ModelHealth::Healthy => healthy.push(model.clone()),
+                ModelHealth::Degraded(_) => degraded.push(model.clone()),
+                ModelHealth::Cooldown { .. } if health.is_usable() => {
+                    cooldown_ready.push(model.clone());
+                }
+                ModelHealth::Cooldown { reason, .. } => {
+                    debug!("Skipping model {} (cooldown: {})", model, reason);
+                }
+                ModelHealth::Unhealthy(reason) => {
+                    warn!("Skipping unhealthy model {}: {}", model, reason);
+                }
+            }
+        }
+
+        // If all models are unhealthy, fall back to the original list
+        // (better to try something than give up entirely)
+        if healthy.is_empty() && degraded.is_empty() && cooldown_ready.is_empty() {
+            warn!("All models unhealthy, falling back to original priority list");
+            return models.to_vec();
+        }
+
+        let mut result = healthy;
+        result.extend(degraded);
+        result.extend(cooldown_ready);
+        result
     }
 
     /// Complete a request (routing to correct provider)
