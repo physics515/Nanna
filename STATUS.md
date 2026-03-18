@@ -12,7 +12,7 @@
 | **5. Agent Swarm** | ✅ Complete | Parallel orchestration, context management, CDC dedup, thinking modes |
 | **6. Production Hardening** | 🔶 Partial | Rate limiting, error recovery, message queuing, health endpoint, PID file done. Metrics, tracing, cost tracking pending |
 | **7. Rich Editor** | ✅ Complete | Tiptap + Monaco code blocks, BubbleMenu floating toolbar, slash commands, drag-drop blocks, mobile toolbar, task lists, images, typography |
-| **8. Clawdbot Parity** | 🔶 Partial | Daemon, IPC, channels, listeners, webhooks done. Channel response routing, sub-agent sessions, TTS, browser relay pending |
+| **8. Clawdbot Parity** | 🔶 Partial | Daemon, IPC, channels, listeners, webhooks, channel response routing done. TTS, browser relay, paired devices pending |
 | **9. Multi-Device Swarm** | ❌ Not Started | Tor P2P, nanna-identity, nanna-tor — entirely greenfield |
 | **10. Token Efficiency** | 🔶 Mostly Done | Prompt caching, model routing, task classifier, tool summarization, CDC dedup done. LLMLingua, structured outputs pending |
 
@@ -39,6 +39,8 @@
 - **Tool result recall** fixed — tool results now properly stored in memory for recall
 - **FSRS memory persistence** — memories stored directly to SQLite, JSON auto-save removed
 - **Memory page** uses useGroundGlass() and useSplatter() composable effects
+- **Channel response routing** — webhook/listener messages routed to agent, responses sent back to originating channel
+- **ChannelManager** wired into server startup with Telegram/Discord/Slack listeners + outbound
 
 ---
 
@@ -46,10 +48,8 @@
 
 ### 🔴 High Priority — Functional Gaps
 
-1. **Channel response routing** — `channels.rs:228`: Agent processes messages but response never sent back to channel. `send()` method exists but isn't called after agent response.
 2. **Discord Ed25519 verification** — `webhook.rs:306`: Trusts any non-empty headers. Needs `ed25519-dalek`.
 3. **Slack HMAC verification** — `webhook.rs:438`: Placeholder. Needs `ring` or `hmac` crate.
-4. **Webhook→agent routing** — `server.rs:561`: Logs inbound webhook messages but doesn't route to agent/control plane.
 
 ### 🟡 Medium Priority — Polish & Completeness
 

@@ -56,8 +56,8 @@ pub struct SlackConfig {
 pub struct ChannelManager {
     /// Listener manager for inbound messages
     listener_manager: RwLock<ListenerManager>,
-    /// Message router for outbound messages
-    router: RwLock<MessageRouter>,
+    /// Message router for outbound messages — Arc so it can be shared with spawned tasks
+    router: Arc<RwLock<MessageRouter>>,
     /// Control plane reference for processing messages
     control: Arc<ControlPlane>,
     /// Map of channel IDs to session IDs
@@ -71,7 +71,7 @@ impl ChannelManager {
     pub fn new(control: Arc<ControlPlane>) -> Self {
         Self {
             listener_manager: RwLock::new(ListenerManager::new(1000)),
-            router: RwLock::new(MessageRouter::new()),
+            router: Arc::new(RwLock::new(MessageRouter::new())),
             control,
             channel_sessions: RwLock::new(HashMap::new()),
             shutdown_tx: None,
@@ -146,6 +146,25 @@ impl ChannelManager {
         }
     }
 
+    /// Register an outbound channel in the router.
+    ///
+    /// Useful for registering webhook-sourced channels that aren't covered by
+    /// the standard `configure()` path (e.g. when bot tokens come from webhook
+    /// config rather than channel config).
+    pub async fn register_channel(&self, name: impl Into<String>, channel: Box<dyn nanna_channels::Channel>) {
+        let mut router = self.router.write().await;
+        router.register(name, channel);
+    }
+
+    /// Get a clone of the shared router Arc.
+    ///
+    /// The returned `Arc<RwLock<MessageRouter>>` can be held by external
+    /// components (e.g. the webhook processor) to send outbound messages
+    /// through registered channels.
+    pub fn router(&self) -> Arc<RwLock<MessageRouter>> {
+        Arc::clone(&self.router)
+    }
+
     /// Start processing incoming messages
     pub async fn start(&mut self) -> Result<(), String> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -159,7 +178,8 @@ impl ChannelManager {
         };
 
         let control = Arc::clone(&self.control);
-        let _channel_sessions = Arc::clone(&self.channel_sessions.read().await.clone().into());
+        // Share the router Arc with the spawned task — no ownership transfer needed
+        let router = Arc::clone(&self.router);
 
         // Spawn the message processing loop
         tokio::spawn(async move {
@@ -170,7 +190,8 @@ impl ChannelManager {
                         break;
                     }
                     Some(msg) = message_rx.recv() => {
-                        Self::process_message(msg, &control).await;
+                        let router_guard = router.read().await;
+                        Self::process_message(msg, &control, &router_guard).await;
                     }
                 }
             }
@@ -179,8 +200,11 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Process an incoming message
-    async fn process_message(msg: IncomingMessage, control: &ControlPlane) {
+    /// Process an incoming message and send the agent response back to the originating channel.
+    ///
+    /// This is `pub` so the webhook event processor in `server.rs` can call it
+    /// directly after converting a `WebhookEvent` into an `IncomingMessage`.
+    pub async fn process_message(msg: IncomingMessage, control: &ControlPlane, router: &MessageRouter) {
         let text = match &msg.content {
             MessageContent::Text { text } => text.clone(),
             _ => {
@@ -189,7 +213,7 @@ impl ChannelManager {
             }
         };
 
-        // Generate session ID from channel
+        // Generate deterministic session ID from channel + sender
         let session_id = format!(
             "{}:{}:{}",
             msg.channel.provider, msg.channel.id, msg.sender.id
@@ -225,8 +249,21 @@ impl ChannelManager {
             response_text.chars().take(100).collect::<String>()
         );
 
-        // TODO: Send response back through the appropriate channel
-        // This requires access to the router, which we'd need to pass in
+        // Send response back through the originating channel
+        let outgoing = OutgoingMessage {
+            channel: msg.channel.clone(),
+            content: MessageContent::Text {
+                text: response_text.to_string(),
+            },
+            reply_to: Some(msg.id.clone()),
+        };
+
+        if let Err(e) = router.send(outgoing).await {
+            error!(
+                "Failed to send response to {}:{}: {}",
+                msg.channel.provider, msg.channel.id, e
+            );
+        }
     }
 
     /// Stop all listeners

@@ -11,7 +11,9 @@ use crate::llm_router::LlmRouter;
 use crate::persistence::PersistenceManager;
 use crate::protocol::Response;
 use crate::session::SessionManager;
+use crate::channels::{ChannelManager, ChannelsConfig};
 use crate::webhook::{WebhookConfig, WebhookServer, DEFAULT_WEBHOOK_PORT};
+use nanna_channels::{ChannelId, IncomingMessage, MessageContent, MessageRouter as ChannelMessageRouter, Sender as ChannelSender, TelegramChannel};
 use nanna_config::credentials::{self, SecureStore};
 use nanna_llm::LlmClient;
 use nanna_memory::MemoryService;
@@ -288,6 +290,8 @@ pub struct DaemonConfig {
     pub use_script_tools: bool,
     /// Directory containing tool scripts (resolved from env/config/default)
     pub tools_dir: Option<PathBuf>,
+    /// Channel configurations (Telegram, Discord, Slack, etc.)
+    pub channels: Option<nanna_config::ChannelsConfig>,
 }
 
 /// LLM provider configuration (multi-provider)
@@ -354,6 +358,7 @@ impl Default for DaemonConfig {
             webhook: WebhookConfig::default(),
             use_script_tools: true,
             tools_dir: None,
+            channels: None,
         }
     }
 }
@@ -616,45 +621,119 @@ impl DaemonServer {
             None
         };
         
+        // Start ChannelManager if any channels are configured.
+        // This handles listener-based inbound (polling) and routes responses back out.
+        let channel_manager = if let Some(ref channels_config) = self.config.channels {
+            // Build a daemon-local ChannelsConfig from the nanna_config::ChannelsConfig.
+            // We re-map from nanna_config types to the daemon-local types.
+            let daemon_channels = build_daemon_channels_config(channels_config);
+
+            let mut manager = ChannelManager::new(Arc::clone(&control));
+            manager.configure(&daemon_channels).await;
+
+            // Also register outbound channels for webhook-sourced providers that have
+            // bot tokens in the channel config (Telegram, Discord, Slack).
+            // The listener-based configure() already does this; this is a no-op guard.
+
+            match manager.start().await {
+                Ok(()) => {
+                    info!("Channel manager started");
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    error!("Failed to start channel manager: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Spawn webhook HTTP server if enabled
         if self.config.enable_webhook_server {
             let mut webhook_config = self.config.webhook.clone();
             webhook_config.host = self.config.ipc.host.clone();
             webhook_config.port = self.config.webhook_port;
-            
+
+            // Keep a copy of the config for outbound channel registration below
+            let webhook_config_copy = webhook_config.clone();
+
             let (webhook_server, mut webhook_rx) = WebhookServer::new(webhook_config);
-            
+
             // Spawn the webhook server
             tokio::spawn(async move {
                 if let Err(e) = webhook_server.run().await {
                     error!("Webhook server error: {}", e);
                 }
             });
-            
-            // Spawn webhook event processor
-            let _control_for_webhooks = control.clone();
-            let _sessions_for_webhooks = self.sessions.clone();
+
+            // Build a shared router for the webhook event processor.
+            // If a ChannelManager is running, share its router so outbound channels
+            // (bot tokens) are already registered.  Otherwise create a standalone
+            // router that may only cover providers registered via webhook config.
+            let webhook_router = if let Some(ref mgr) = channel_manager {
+                mgr.router()
+            } else {
+                // No channel manager — create a standalone router.
+                // Outbound channels can be registered here from webhook config if
+                // bot tokens are provided.
+                let standalone_router = Arc::new(tokio::sync::RwLock::new(ChannelMessageRouter::new()));
+
+                // Register outbound channels from webhook config credentials
+                {
+                    let mut router = standalone_router.write().await;
+                    if let Some(ref token) = webhook_config_copy.telegram_token {
+                        router.register("telegram", Box::new(TelegramChannel::new(token)));
+                        info!("Registered Telegram outbound channel from webhook config");
+                    }
+                    if webhook_config_copy.discord_public_key.is_some() {
+                        // discord_public_key is for verification; bot token for sending
+                        // is not separately stored in WebhookConfig currently.
+                        // Log a warning — users should configure channels.discord instead.
+                        debug!("Discord public key found in webhook config; for outbound replies configure channels.discord with a bot_token");
+                    }
+                }
+
+                standalone_router
+            };
+
+            // Spawn webhook event processor — routes events through the same pipeline
+            // as channel listener messages.
+            let control_for_webhooks = Arc::clone(&control);
             tokio::spawn(async move {
                 while let Some(event) = webhook_rx.recv().await {
                     debug!("Webhook event from {}: {:?}", event.source, event.message);
-                    
-                    // Route webhook message to appropriate session
+
                     if let Some(ref msg) = event.message {
-                        // Create or get session for this chat
-                        let session_key = format!("{}:{}", event.source, msg.chat_id);
-                        
-                        // For now, just log the message
-                        // TODO: Route to control plane for agent processing
-                        info!(
-                            "Webhook message from {} in {}: {}",
-                            msg.sender_name.as_deref().unwrap_or(&msg.sender_id),
-                            session_key,
-                            msg.content.chars().take(100).collect::<String>()
-                        );
+                        // Convert WebhookMessage → IncomingMessage
+                        let incoming = IncomingMessage {
+                            id: msg.message_id.clone()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            channel: ChannelId::new(&event.source, &msg.chat_id),
+                            sender: ChannelSender {
+                                id: msg.sender_id.clone(),
+                                name: msg.sender_name.clone(),
+                                username: None,
+                            },
+                            content: MessageContent::Text {
+                                text: msg.content.clone(),
+                            },
+                            timestamp: event.timestamp,
+                            reply_to: None,
+                        };
+
+                        // Process through the same pipeline as channel listeners
+                        let router_guard = webhook_router.read().await;
+                        ChannelManager::process_message(
+                            incoming,
+                            &control_for_webhooks,
+                            &router_guard,
+                        )
+                        .await;
                     }
                 }
             });
-            
+
             info!("Webhook server listening on http://{}:{}", self.config.ipc.host, self.config.webhook_port);
         }
         
@@ -730,7 +809,12 @@ impl DaemonServer {
         // Cleanup
         info!("Shutting down daemon...");
         self.ipc.shutdown();
-        
+
+        // Keep channel_manager alive until the end of run() so the spawned
+        // listener task doesn't get prematurely shut down via shutdown_tx drop.
+        // Explicit drop here makes the intent clear.
+        drop(channel_manager);
+
         // Wait for auto-save tasks to complete final saves
         let _ = tokio::time::timeout(Duration::from_secs(5), save_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), stats_save_handle).await;
@@ -1307,6 +1391,17 @@ impl DaemonBuilder {
         builder.config.use_script_tools = config.tools.use_script_tools;
         builder.config.tools_dir = config.tools.tools_dir.clone();
 
+        // Load channel configuration (Telegram, Discord, Slack, etc.)
+        let has_channels = config.channels.telegram.is_some()
+            || config.channels.discord.is_some()
+            || config.channels.slack.is_some()
+            || config.channels.signal.is_some()
+            || config.channels.whatsapp.is_some();
+        if has_channels {
+            builder.config.channels = Some(config.channels.clone());
+            info!("Channel configuration loaded");
+        }
+
         // Log configured providers
         let mut providers = Vec::new();
         if builder.config.llm.anthropic_api_key.is_some() || builder.config.llm.anthropic_oauth_token.is_some() {
@@ -1444,5 +1539,44 @@ impl DaemonBuilder {
 impl Default for DaemonBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// =============================================================================
+// Helper: convert nanna_config::ChannelsConfig → daemon-local ChannelsConfig
+// =============================================================================
+
+/// Map the high-level `nanna_config::ChannelsConfig` (with its richer field names)
+/// to the daemon-local `ChannelsConfig` used by `ChannelManager::configure()`.
+///
+/// Fields that exist in `nanna_config` but not in the daemon-local type are
+/// silently dropped — the local type only covers what `ChannelManager` actually
+/// needs at runtime.
+fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsConfig {
+    use crate::channels::{
+        DiscordConfig as DaemonDiscord, SlackConfig as DaemonSlack, TelegramConfig as DaemonTelegram,
+    };
+
+    ChannelsConfig {
+        telegram: src.telegram.as_ref().map(|tg| DaemonTelegram {
+            bot_token: tg.bot_token.clone(),
+            // nanna_config::TelegramConfig uses webhook_url; treat presence of it as
+            // "use webhooks" mode (listener-based polling is disabled when webhook URL set).
+            allowed_chats: tg.allowed_users.clone().unwrap_or_default(),
+            use_webhooks: tg.webhook_url.is_some(),
+        }),
+        discord: src.discord.as_ref().map(|dc| DaemonDiscord {
+            bot_token: dc.bot_token.clone(),
+            allowed_guilds: vec![], // nanna_config::DiscordConfig has no allowed_guilds yet
+            intents: None,
+        }),
+        slack: src.slack.as_ref().and_then(|sl| {
+            // Slack Socket Mode listener requires an app_token; fall back gracefully
+            sl.app_token.as_ref().map(|app_token| DaemonSlack {
+                app_token: app_token.clone(),
+                bot_token: sl.bot_token.clone(),
+                allowed_channels: vec![], // nanna_config::SlackConfig has no allowed_channels yet
+            })
+        }),
     }
 }

@@ -134,6 +134,9 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **FSRS fields on NewMemory** — added missing FSRS fields (stability, difficulty, importance, etc.) to memory_storage.rs initializer (2026-03-17)
 - [x] **Memory persistence to SQLite** — removed JSON auto-save, dead `memory_path` field from ControlPlane (2026-03-17)
 - [x] **code_search diagnostics** — reports file count and read error count when returning no matches (2026-03-17)
+- [x] **Channel response routing** — webhook and listener messages routed through agent, responses sent back to originating channel via MessageRouter (2026-03-17)
+- [x] **ChannelManager server integration** — started on daemon boot when channels configured, shares router with webhook processor (2026-03-17)
+- [x] **Webhook → agent pipeline** — WebhookEvent converted to IncomingMessage, processed through same pipeline as channel listeners (2026-03-17)
 
 ### Settings Overhaul âœ…
 - [x] **Tabbed settings UI** - organize settings into logical tabs (Models, Agent, Memory, Tools, Scheduler, Data)
