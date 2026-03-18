@@ -37,13 +37,12 @@ impl Default for IpcServerConfig {
 }
 
 /// Connected client state
-#[allow(dead_code)]
 #[derive(Debug)]
 struct ClientConnection {
-    id: ConnectionId,
-    addr: SocketAddr,
+    _id: ConnectionId,
+    _addr: SocketAddr,
     tx: mpsc::Sender<Message>,
-    subscriptions: Vec<String>,
+    _subscriptions: Vec<String>,
 }
 
 /// IPC Server for daemon communication
@@ -177,10 +176,10 @@ impl IpcServer {
         {
             let mut clients = self.clients.write().await;
             clients.insert(client_id.clone(), ClientConnection {
-                id: client_id.clone(),
-                addr,
+                _id: client_id.clone(),
+                _addr: addr,
                 tx: msg_tx.clone(),
-                subscriptions: vec![],
+                _subscriptions: vec![],
             });
         }
         

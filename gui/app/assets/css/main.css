@@ -202,18 +202,7 @@ body {
   border: 1px solid rgba(71, 85, 105, 0.2);
 }
 
-/* Message bubbles */
-.message-user {
-  background: rgba(139, 92, 246, 0.08);
-  border-left: 2px solid rgba(139, 92, 246, 0.4);
-  border-radius: 0.5rem;
-}
-
-.message-assistant {
-  background: rgba(15, 23, 42, 0.4);
-  border-left: 2px solid rgba(139, 92, 246, 0.15);
-  border-radius: 0.5rem;
-}
+/* Message bubbles now use MessageBubble.vue component with useGroundGlass */
 
 /* Tool call styling */
 .tool-call {

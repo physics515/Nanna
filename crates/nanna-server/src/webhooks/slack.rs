@@ -1,5 +1,4 @@
 //! Slack webhook handler
-#![allow(dead_code)]
 
 use crate::state::AppState;
 use axum::{
@@ -19,8 +18,10 @@ pub struct SlackEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     pub challenge: Option<String>,
-    pub token: Option<String>,
-    pub team_id: Option<String>,
+#[serde(rename = "token")]
+    pub _token: Option<String>,
+#[serde(rename = "team_id")]
+    pub _team_id: Option<String>,
     pub event: Option<SlackEventInner>,
 }
 
@@ -34,7 +35,8 @@ pub struct SlackEventInner {
     /// Message timestamp (used as message ID)
     pub ts: Option<String>,
     /// Parent thread timestamp for replies
-    pub thread_ts: Option<String>,
+#[serde(rename = "thread_ts")]
+    pub _thread_ts: Option<String>,
     pub bot_id: Option<String>,
     /// For reaction events
     pub reaction: Option<String>,
@@ -53,7 +55,7 @@ pub struct SlackReactionItem {
 
 /// Slack slash command
 #[derive(Debug, Deserialize)]
-pub struct SlackSlashCommand {
+pub struct _SlackSlashCommand {
     pub token: String,
     pub team_id: String,
     pub team_domain: String,
@@ -189,9 +191,9 @@ pub async fn handle(
 }
 
 /// Handle Slack slash commands
-pub async fn handle_slash_command(
+pub async fn _handle_slash_command(
     State(state): State<AppState>,
-    Form(command): Form<SlackSlashCommand>,
+    Form(command): Form<_SlackSlashCommand>,
 ) -> Result<Json<SlackResponse>, StatusCode> {
     info!("Slack slash command from {}: {} {}", command.user_name, command.command, command.text);
 

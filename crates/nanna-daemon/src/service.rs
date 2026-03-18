@@ -42,7 +42,6 @@ impl Default for ServiceConfig {
 }
 
 /// Platform-specific service operations
-#[allow(dead_code)]
 pub struct ServiceManager {
     config: ServiceConfig,
 }
@@ -134,26 +133,40 @@ impl ServiceManager {
     #[cfg(windows)]
     fn install_windows(&self) -> Result<(), String> {
         // TODO: Use windows-service crate
-        Err("Windows service installation not yet implemented".to_string())
+        Err(format!(
+            "Windows service installation not yet implemented for '{}'",
+            self.config.name
+        ))
     }
     
     #[cfg(windows)]
     fn uninstall_windows(&self) -> Result<(), String> {
-        Err("Windows service uninstallation not yet implemented".to_string())
+        Err(format!(
+            "Windows service uninstallation not yet implemented for '{}'",
+            self.config.name
+        ))
     }
     
     #[cfg(windows)]
     fn start_windows(&self) -> Result<(), String> {
-        Err("Windows service start not yet implemented".to_string())
+        Err(format!(
+            "Windows service start not yet implemented for '{}'",
+            self.config.name
+        ))
     }
     
     #[cfg(windows)]
     fn stop_windows(&self) -> Result<(), String> {
-        Err("Windows service stop not yet implemented".to_string())
+        Err(format!(
+            "Windows service stop not yet implemented for '{}'",
+            self.config.name
+        ))
     }
     
     #[cfg(windows)]
     fn status_windows(&self) -> ServiceStatus {
+        // TODO: Query Windows SCM for service '{}' status
+        eprintln!("Windows service status not yet implemented for '{}'", self.config.name);
         ServiceStatus::Unknown
     }
     

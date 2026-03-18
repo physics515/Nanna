@@ -108,12 +108,16 @@ pub struct Attachment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SessionAction {
-    /// List all sessions
+    /// List all sessions (optionally filtered by workspace)
     List,
+    /// List sessions for a specific workspace (None = global only)
+    ListByWorkspace { workspace_id: Option<String> },
     /// Get session details
     Get { id: String },
     /// Create a new session
     Create { name: Option<String> },
+    /// Create a new session in a specific workspace
+    CreateInWorkspace { name: Option<String>, workspace_id: Option<String> },
     /// Rename a session
     Rename { id: String, name: String },
     /// Delete a session
@@ -130,6 +134,8 @@ pub enum SessionAction {
     Fork { id: String, name: Option<String> },
     /// Get current execution state (in-flight streaming text, active tools)
     GetRunState { id: String },
+    /// Set/change the workspace for a session (None = make global)
+    SetWorkspace { id: String, workspace_id: Option<String> },
 
     // --- Sub-Agent Sessions (#72) ---
     
@@ -183,8 +189,8 @@ pub enum SessionAction {
 pub enum MemoryAction {
     /// List all memories
     List { scope: Option<String> },
-    /// Search memories
-    Search { query: String, limit: Option<usize> },
+    /// Search memories (optionally scoped to workspace)
+    Search { query: String, limit: Option<usize>, scope: Option<String> },
     /// Get a specific memory
     Get { id: String },
     /// Create a memory
@@ -349,6 +355,16 @@ pub enum SystemAction {
     Health,
     /// Get model performance statistics (routing, latency, cache hits, etc.)
     ModelStats,
+    /// Get per-tool performance statistics (call counts, latency, error rates)
+    ToolStats,
+    /// Get global tool + session dashboard stats
+    GlobalStats,
+    /// Get hourly tool stats time-series (for graphs)
+    ToolStatsHourly { tool_name: Option<String>, hours: Option<u32> },
+    /// Get daily tool stats time-series (for graphs)
+    ToolStatsDaily { tool_name: Option<String>, days: Option<u32> },
+    /// Get recent tool call log entries
+    ToolCallLog { tool_name: Option<String>, limit: Option<u32> },
 }
 
 // =============================================================================
@@ -546,7 +562,7 @@ impl From<ControlAction> for Action {
             ControlAction::ListSessions => Action::Session(SessionAction::List),
             ControlAction::CreateSession { name } => Action::Session(SessionAction::Create { name }),
             ControlAction::SwitchSession { id } => Action::Session(SessionAction::Switch { id }),
-            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search { query, limit }),
+            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search { query, limit, scope: None }),
             ControlAction::GetConfig => Action::Config(ConfigAction::Get { path: None }),
             ControlAction::SetConfig { path, value } => Action::Config(ConfigAction::Set { path, value }),
             ControlAction::ListTools => Action::Tool(ToolAction::List),

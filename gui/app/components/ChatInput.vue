@@ -29,6 +29,9 @@
         <!-- Splatter layer -->
         <span class="input-editor-zone__splatter" :style="{ background: splatterBg }" />
 
+        <!-- Floating toolbar (appears on text selection) -->
+        <FloatingToolbar :editor="editor" v-if="editor" />
+
         <!-- Editor content -->
         <EditorContent
           :editor="editor"
@@ -37,7 +40,77 @@
         />
       </div>
 
+      <!-- ═══ Mobile formatting toolbar ═══ -->
+      <div v-if="isFocused && editor" class="mobile-toolbar sm:hidden">
+        <button
+          @click="editor.chain().focus().toggleBold().run()"
+          :class="{ active: editor.isActive('bold') }"
+          class="mobile-toolbar__btn"
+        >
+          <Bold class="w-4 h-4" />
+        </button>
+        <button
+          @click="editor.chain().focus().toggleItalic().run()"
+          :class="{ active: editor.isActive('italic') }"
+          class="mobile-toolbar__btn"
+        >
+          <Italic class="w-4 h-4" />
+        </button>
+        <button
+          @click="editor.chain().focus().toggleStrike().run()"
+          :class="{ active: editor.isActive('strike') }"
+          class="mobile-toolbar__btn"
+        >
+          <Strikethrough class="w-4 h-4" />
+        </button>
+        <button
+          @click="editor.chain().focus().toggleCode().run()"
+          :class="{ active: editor.isActive('code') }"
+          class="mobile-toolbar__btn"
+        >
+          <Code class="w-4 h-4" />
+        </button>
+        <span class="mobile-toolbar__divider" />
+        <button
+          @click="editor.chain().focus().toggleHeading({ level: 2 }).run()"
+          :class="{ active: editor.isActive('heading') }"
+          class="mobile-toolbar__btn"
+        >
+          <Heading2 class="w-4 h-4" />
+        </button>
+        <button
+          @click="editor.chain().focus().toggleBulletList().run()"
+          :class="{ active: editor.isActive('bulletList') }"
+          class="mobile-toolbar__btn"
+        >
+          <List class="w-4 h-4" />
+        </button>
+        <button
+          @click="editor.chain().focus().toggleBlockquote().run()"
+          :class="{ active: editor.isActive('blockquote') }"
+          class="mobile-toolbar__btn"
+        >
+          <Quote class="w-4 h-4" />
+        </button>
+        <button
+          @click="editor.chain().focus().toggleTaskList().run()"
+          :class="{ active: editor.isActive('taskList') }"
+          class="mobile-toolbar__btn"
+        >
+          <ListChecks class="w-4 h-4" />
+        </button>
+      </div>
+
       <!-- ═══ Bottom: Toolbar with Ground Glass ═══ -->
+    <!-- Attachment previews -->
+    <div v-if="pendingAttachments.length > 0" class="attachment-strip">
+      <div v-for="att in pendingAttachments" :key="att.id" class="attachment-thumb">
+        <img :src="att.preview" :alt="att.filename" />
+        <button class="attachment-remove" @click="removeAttachment(att.id)">
+          <X class="w-3 h-3" />
+        </button>
+      </div>
+    </div>
       <div
         class="input-toolbar"
         :style="glassStyle"
@@ -64,9 +137,20 @@
               <Eye class="w-3.5 h-3.5 sm:mr-1" />
               <span class="hidden sm:inline">Preview</span>
             </UiGlassButton>
+            <UiGlassButton
+              pill
+              size="sm"
+              @click="openFilePicker"
+              title="Attach image"
+            >
+              <ImagePlus class="w-3.5 h-3.5 sm:mr-1" />
+              <span class="hidden sm:inline">Image</span>
+            </UiGlassButton>
             <span class="text-nanna-text-muted hidden sm:inline">&middot;</span>
             <span class="hidden md:inline">
               <kbd class="px-1 py-0.5 rounded bg-white/[0.04] text-[10px]">Ctrl+Enter</kbd> send
+              <span class="text-nanna-text-muted ml-1">&middot;</span>
+              <kbd class="px-1 py-0.5 rounded bg-white/[0.04] text-[10px] ml-1">/</kbd> commands
             </span>
           </div>
 
@@ -106,8 +190,18 @@ import { useEditor, EditorContent } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
+import TaskList from '@tiptap/extension-task-list'
+import TaskItem from '@tiptap/extension-task-item'
+import Image from '@tiptap/extension-image'
+import Typography from '@tiptap/extension-typography'
 import { MonacoCodeBlock } from '~/extensions/MonacoCodeBlock'
-import { Send, Eye, X, Square } from 'lucide-vue-next'
+import { SlashCommands } from '~/extensions/SlashCommands'
+import FloatingToolbar from '~/components/FloatingToolbar.vue'
+import {
+  Send, Eye, X, Square, ImagePlus,
+  Bold, Italic, Strikethrough, Code,
+  Heading2, List, Quote, ListChecks,
+} from 'lucide-vue-next'
 import { useSplatter } from '~/composables/useSplatter'
 import { useGroundGlass } from '~/composables/useGroundGlass'
 
@@ -127,6 +221,67 @@ const emit = defineEmits<{
 
 const isFocused = ref(false)
 const showPreview = ref(false)
+
+interface ImageAttachment {
+  id: string
+  filename: string
+  content_type: string
+  data: string
+  preview: string
+}
+
+const pendingAttachments = ref<ImageAttachment[]>([])
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024
+
+function addImageFile(file: File) {
+  if (file.size > MAX_IMAGE_SIZE) {
+    console.warn('Image too large (max 5MB)')
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    const dataUrl = reader.result as string
+    const base64 = dataUrl.split(',')[1]
+    pendingAttachments.value.push({
+      id: crypto.randomUUID(),
+      filename: file.name,
+      content_type: file.type,
+      data: base64,
+      preview: dataUrl,
+    })
+  }
+  reader.readAsDataURL(file)
+}
+
+function removeAttachment(id: string) {
+  pendingAttachments.value = pendingAttachments.value.filter(a => a.id !== id)
+}
+
+function openFilePicker() {
+  const inp = document.createElement('input')
+  inp.type = 'file'
+  inp.accept = 'image/png,image/jpeg,image/gif,image/webp'
+  inp.multiple = true
+  inp.onchange = () => {
+    if (inp.files) {
+      for (const file of inp.files) {
+        addImageFile(file)
+      }
+    }
+  }
+  inp.click()
+}
+
+function getAttachments() {
+  const atts = pendingAttachments.value.map(a => ({
+    filename: a.filename,
+    content_type: a.content_type,
+    data: a.data,
+  }))
+  pendingAttachments.value = []
+  return atts
+}
+
 
 // Splatter for the editor area (focus-driven)
 const {
@@ -165,14 +320,12 @@ function handleToolbarLeave() {
   if (ready.value) glassLeave()
 }
 
-// Initialize Tiptap editor with Monaco code blocks
+// Initialize Tiptap editor with all extensions
 const editor = useEditor({
   content: props.modelValue,
   extensions: [
     StarterKit.configure({
       codeBlock: false,
-      heading: false,
-      horizontalRule: false,
     }),
     MonacoCodeBlock,
     Link.configure({
@@ -182,13 +335,48 @@ const editor = useEditor({
       },
     }),
     Placeholder.configure({
-      placeholder: props.placeholder || 'Type a message... (Ctrl+Enter to send)',
+      placeholder: props.placeholder || 'Type a message... (Ctrl+Enter to send, / for commands)',
       emptyEditorClass: 'is-empty',
     }),
+    TaskList,
+    TaskItem.configure({
+      nested: true,
+    }),
+    Image.configure({
+      inline: true,
+      allowBase64: true,
+    }),
+    Typography,
+    SlashCommands,
   ],
   editorProps: {
     attributes: {
       class: 'prose prose-invert prose-sm max-w-none focus:outline-none',
+    },
+    handlePaste: (view, event) => {
+      const items = event.clipboardData?.items
+      if (!items) return false
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          event.preventDefault()
+          const file = item.getAsFile()
+          if (file) addImageFile(file)
+          return true
+        }
+      }
+      return false
+    },
+    handleDrop: (view, event) => {
+      const files = event.dataTransfer?.files
+      if (!files) return false
+      for (const file of files) {
+        if (file.type.startsWith('image/')) {
+          event.preventDefault()
+          addImageFile(file)
+          return true
+        }
+      }
+      return false
     },
     handleKeyDown: (view, event) => {
       if (event.key === 'p' && (event.ctrlKey || event.metaKey)) {
@@ -231,26 +419,53 @@ function jsonToMarkdown(doc: any): string {
     switch (node.type) {
       case 'paragraph':
         return nodeContentToText(node)
-      case 'monacoCodeBlock':
+      case 'heading': {
+        const level = node.attrs?.level || 1
+        return '#'.repeat(level) + ' ' + nodeContentToText(node)
+      }
+      case 'monacoCodeBlock': {
         const lang = node.attrs?.language || ''
         const code = node.content?.[0]?.text || node.attrs?.content || ''
         return '```' + lang + '\n' + code + '\n```'
+      }
       case 'bulletList':
         return node.content?.map((item: any) => '- ' + nodeContentToText(item.content?.[0])).join('\n') || ''
       case 'orderedList':
         return node.content?.map((item: any, i: number) => `${i + 1}. ` + nodeContentToText(item.content?.[0])).join('\n') || ''
+      case 'taskList':
+        return node.content?.map((item: any) => {
+          const checked = item.attrs?.checked ? 'x' : ' '
+          return `- [${checked}] ` + nodeContentToText(item.content?.[0])
+        }).join('\n') || ''
       case 'blockquote':
         return node.content?.map((p: any) => '> ' + nodeContentToText(p)).join('\n') || ''
+      case 'horizontalRule':
+        return '---'
+      case 'image':
+        return `![${node.attrs?.alt || ''}](${node.attrs?.src || ''})`
       default:
         return nodeContentToText(node)
     }
-  }).join('\n\n').trim()
+  }).reduce((acc: string, block: string, i: number, arr: string[]) => {
+    if (i === 0) return block
+    const prev = arr[i - 1]
+    const isCodeBlock = block.startsWith('```')
+    const prevIsCodeBlock = prev.endsWith('```')
+    if (isCodeBlock || prevIsCodeBlock) {
+      return acc + '\n' + block
+    }
+    return acc + '\n\n' + block
+  }, '').trim()
 }
 
 function nodeContentToText(node: any): string {
   if (!node?.content) return ''
 
   return node.content.map((item: any) => {
+    if (item.type === 'image') {
+      return `![${item.attrs?.alt || ''}](${item.attrs?.src || ''})`
+    }
+
     let text = item.text || ''
 
     if (item.marks) {
@@ -261,6 +476,9 @@ function nodeContentToText(node: any): string {
             break
           case 'italic':
             text = `*${text}*`
+            break
+          case 'strike':
+            text = `~~${text}~~`
             break
           case 'code':
             text = '`' + text + '`'
@@ -292,7 +510,7 @@ function focus() {
   editor.value?.commands.focus()
 }
 
-defineExpose({ focus })
+defineExpose({ focus, getAttachments })
 
 watch(() => props.modelValue, (newValue) => {
   if (!editor.value) return
@@ -332,6 +550,49 @@ onBeforeUnmount(() => {
 }
 .input-card--focused .input-editor-zone__splatter {
   opacity: 1;
+}
+
+/* ═══ Mobile formatting toolbar ═══ */
+.mobile-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0.375rem 0.5rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  background: rgba(15, 23, 42, 0.3);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-toolbar__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.375rem;
+  color: rgba(203, 213, 225, 0.7);
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.mobile-toolbar__btn:hover,
+.mobile-toolbar__btn:active {
+  background: rgba(99, 102, 241, 0.15);
+  color: #e2e8f0;
+}
+
+.mobile-toolbar__btn.active {
+  background: rgba(99, 102, 241, 0.25);
+  color: rgba(165, 180, 252, 1);
+}
+
+.mobile-toolbar__divider {
+  width: 1px;
+  height: 1.25rem;
+  margin: 0 0.25rem;
+  background: rgba(71, 85, 105, 0.4);
+  flex-shrink: 0;
 }
 
 /* ═══ Toolbar (ground glass) ═══ */
@@ -436,6 +697,19 @@ onBeforeUnmount(() => {
   @apply italic;
 }
 
+/* Headings */
+.chat-editor h1 {
+  @apply text-xl font-bold text-nanna-text mt-2 mb-1;
+}
+
+.chat-editor h2 {
+  @apply text-lg font-semibold text-nanna-text mt-2 mb-1;
+}
+
+.chat-editor h3 {
+  @apply text-base font-semibold text-nanna-text mt-1.5 mb-1;
+}
+
 /* Lists */
 .chat-editor ul {
   @apply list-disc list-inside my-1;
@@ -449,14 +723,74 @@ onBeforeUnmount(() => {
   @apply text-nanna-text;
 }
 
+/* Task lists */
+.chat-editor ul[data-type="taskList"] {
+  @apply list-none pl-0 my-1;
+}
+
+.chat-editor ul[data-type="taskList"] li {
+  @apply flex items-start gap-2;
+}
+
+.chat-editor ul[data-type="taskList"] li label {
+  @apply flex items-center;
+}
+
+.chat-editor ul[data-type="taskList"] li label input[type="checkbox"] {
+  @apply w-3.5 h-3.5 rounded border-nanna-primary/40 bg-transparent mt-0.5;
+  accent-color: rgba(99, 102, 241, 0.8);
+}
+
+.chat-editor ul[data-type="taskList"] li div {
+  @apply flex-1;
+}
+
 /* Blockquotes */
 .chat-editor blockquote {
   @apply border-l-2 border-nanna-accent/50 pl-3 my-2 text-nanna-text-muted italic;
 }
 
+/* Horizontal rules */
+.chat-editor hr {
+  @apply border-nanna-primary/20 my-3;
+}
+
+/* Images */
+.chat-editor img {
+  @apply max-w-full rounded-lg my-2;
+  max-height: 200px;
+}
+
 /* Links */
 .chat-editor a {
   @apply text-nanna-accent hover:underline;
+}
+
+/* Strikethrough */
+.chat-editor s {
+  @apply text-nanna-text-muted;
+}
+
+/* ═══ Drag handles for blocks ═══ */
+.chat-editor .ProseMirror > * {
+  position: relative;
+}
+
+.chat-editor .ProseMirror > *:not(p:first-child)::before {
+  content: '⠿';
+  position: absolute;
+  left: -1.25rem;
+  top: 0.125rem;
+  font-size: 0.75rem;
+  color: transparent;
+  cursor: grab;
+  user-select: none;
+  transition: color 0.15s ease;
+  line-height: 1.5;
+}
+
+.chat-editor .ProseMirror > *:not(p:first-child):hover::before {
+  color: rgba(148, 163, 184, 0.35);
 }
 
 /* Scrollbar */
@@ -475,4 +809,50 @@ onBeforeUnmount(() => {
 .chat-editor::-webkit-scrollbar-thumb:hover {
   @apply bg-nanna-primary/30;
 }
+
+/* === Attachment strip === */
+.attachment-strip {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  overflow-x: auto;
+}
+
+.attachment-thumb {
+  position: relative;
+  flex-shrink: 0;
+  width: 4rem;
+  height: 4rem;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.attachment-remove {
+  position: absolute;
+  top: 0.125rem;
+  right: 0.125rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.7);
+  color: rgba(248, 113, 113, 0.9);
+  transition: all 0.15s ease;
+}
+
+.attachment-remove:hover {
+  background: rgba(220, 38, 38, 0.8);
+  color: white;
+}
+
 </style>

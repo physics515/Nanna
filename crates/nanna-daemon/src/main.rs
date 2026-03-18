@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 //! Nanna Daemon - Main entry point
 //!
 //! Usage:
@@ -12,6 +14,8 @@
 use clap::{Parser, Subcommand};
 use nanna_daemon::server::DaemonBuilder;
 use nanna_daemon::service::ServiceStatus;
+#[cfg(not(windows))]
+use nanna_daemon::service::{ServiceConfig, ServiceManager};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::{error, info};
@@ -276,33 +280,31 @@ fn stop_service(cli: &Cli) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
 fn restart_service(_cli: &Cli) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        if windows_service::query_service_status() == ServiceStatus::Running {
-            println!("Stopping daemon...");
-            windows_service::stop_service()?;
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        println!("Starting daemon...");
-        windows_service::start_service()?;
-        println!("Daemon restarted");
-        Ok(())
+    if windows_service::query_service_status() == ServiceStatus::Running {
+        println!("Stopping daemon...");
+        windows_service::stop_service()?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    
-    #[cfg(not(windows))]
-    {
-        let manager = get_service_manager(cli);
-        if manager.status() == ServiceStatus::Running {
-            println!("Stopping daemon...");
-            manager.stop()?;
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        println!("Starting daemon...");
-        manager.start()?;
-        println!("Daemon restarted");
-        Ok(())
+    println!("Starting daemon...");
+    windows_service::start_service()?;
+    println!("Daemon restarted");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restart_service(cli: &Cli) -> Result<(), String> {
+    let manager = get_service_manager(cli);
+    if manager.status() == ServiceStatus::Running {
+        println!("Stopping daemon...");
+        manager.stop()?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
+    println!("Starting daemon...");
+    manager.start()?;
+    println!("Daemon restarted");
+    Ok(())
 }
 
 fn show_status(cli: &Cli) -> Result<(), String> {

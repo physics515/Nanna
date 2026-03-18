@@ -149,7 +149,6 @@ impl Browser for CdpBrowser {
 /// CDP page wrapper
 pub struct CdpPage {
     page: Page,
-    #[allow(dead_code)]
     timeout_ms: u64,
 }
 

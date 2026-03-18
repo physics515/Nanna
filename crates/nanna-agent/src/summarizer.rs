@@ -1,4 +1,3 @@
-#![allow(clippy::module_name_repetitions)]
 
 use crate::chunker::analyze_content;
 use serde::{Deserialize, Serialize};

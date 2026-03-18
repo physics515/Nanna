@@ -7,12 +7,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[allow(unused_imports)]
-use std::sync::Arc;
+
 use tokio::fs;
 use tokio::sync::RwLock;
-#[allow(unused_imports)]
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Configuration for a workspace
 #[derive(Debug, Clone, Serialize, Deserialize)]

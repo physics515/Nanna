@@ -68,6 +68,15 @@ impl MemoryStorage for TursoMemoryStorage {
             session_id: None,
             metadata: None,
             tags: tags.to_vec(),
+            workspace_id: None,
+            expires_at: None,
+            fsrs_stability: 1.0,
+            fsrs_difficulty: 5.0,
+            fsrs_last_access: 0,
+            fsrs_access_count: 0,
+            fsrs_importance: 1.0,
+            fsrs_storage_strength: 0.1,
+            fsrs_generation: 0,
         };
 
         self.storage

@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 // Tracing available for future use
-#[allow(unused_imports)]
 use tracing::debug;
 
 /// Browser manager that maintains a browser instance for tool use.

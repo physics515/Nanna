@@ -46,6 +46,18 @@ pub struct Memory {
     pub updated_at: String,
     pub metadata: Option<serde_json::Value>,
     pub tags: Vec<String>,
+    /// Workspace scope (None = global)
+    pub workspace_id: Option<String>,
+    /// Expiration epoch seconds (None = never)
+    pub expires_at: Option<i64>,
+    /// FSRS cognitive state fields
+    pub fsrs_stability: f32,
+    pub fsrs_difficulty: f32,
+    pub fsrs_last_access: i64,
+    pub fsrs_access_count: i64,
+    pub fsrs_importance: f32,
+    pub fsrs_storage_strength: f32,
+    pub fsrs_generation: i64,
 }
 
 /// Cron job model
@@ -85,6 +97,18 @@ pub struct NewMemory {
     pub session_id: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub tags: Vec<String>,
+    /// Workspace scope (None = global)
+    pub workspace_id: Option<String>,
+    /// Expiration epoch seconds (None = never)
+    pub expires_at: Option<i64>,
+    /// FSRS cognitive state fields
+    pub fsrs_stability: f32,
+    pub fsrs_difficulty: f32,
+    pub fsrs_last_access: i64,
+    pub fsrs_access_count: i64,
+    pub fsrs_importance: f32,
+    pub fsrs_storage_strength: f32,
+    pub fsrs_generation: i64,
 }
 
 /// New cron job input
@@ -121,4 +145,15 @@ pub struct NewJobRun {
     pub output: Option<String>,
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
+}
+
+/// Registered workspace
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRecord {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub active: bool,
+    pub created_at: String,
+    pub last_accessed: String,
 }

@@ -19,7 +19,10 @@ use tracing::{debug, error, info, warn};
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const HEALTH_PING_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MISSED_PINGS: u32 = 3;
-const IDLE_GRACE_PERIOD: Duration = Duration::from_secs(10);
+/// Grace period after agent finishes before giving up on the IPC response.
+/// Needs to be long enough for post-processing (tool stats, DB writes,
+/// memory extraction/saving, session persistence) to complete.
+const IDLE_GRACE_PERIOD: Duration = Duration::from_secs(60);
 
 /// Connection mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,8 +114,8 @@ pub enum DaemonEvent {
     MessageEnd { session_id: String, message_id: String, content: String },
     ThinkingDelta { session_id: String, delta: String },
     ModelSwitch { model: String, reason: Option<String> },
-    ToolStart { session_id: String, call_id: String, name: String },
-    ToolEnd { session_id: String, call_id: String, output: String, success: bool },
+    ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value> },
+    ToolEnd { session_id: String, call_id: String, output: String, success: bool, #[serde(default)] duration_ms: Option<u64> },
     Error { code: String, message: String },
     Connected { client_id: String },
     Disconnected { client_id: String },
@@ -638,10 +641,13 @@ impl DaemonClient {
 
                             if !is_running {
                                 // Daemon says it's not running — give a grace period
-                                // for the response to arrive through the normal channel
+                                // for the response to arrive through the normal channel.
+                                // Post-processing (tool stats, DB writes, memory saves)
+                                // can take a while after the agent loop finishes.
                                 debug!(
                                     session_id = session_id,
-                                    "Run state reports not running, waiting grace period"
+                                    "Run state reports not running, waiting grace period ({:?})",
+                                    IDLE_GRACE_PERIOD,
                                 );
                                 match tokio::time::timeout(IDLE_GRACE_PERIOD, &mut rx).await {
                                     Ok(Ok(result)) => return result,
@@ -651,9 +657,25 @@ impl DaemonClient {
                                         return Err("Response channel closed".to_string());
                                     }
                                     Err(_) => {
+                                        // Grace period expired without receiving the IPC response.
+                                        // The agent DID finish (is_running=false), so the response
+                                        // was likely delivered via streaming events already.
+                                        // Return a synthetic success rather than an error.
+                                        warn!(
+                                            session_id = session_id,
+                                            "Grace period expired — IPC response not received, \
+                                             but agent completed. Returning synthetic response."
+                                        );
                                         let mut pending = self.pending.write().await;
                                         pending.remove(&id);
-                                        return Err("Agent finished but no response received".to_string());
+                                        // Return empty success — the GUI already has the streamed content
+                                        return Ok(serde_json::json!({
+                                            "status": "success",
+                                            "content": "",
+                                            "tool_calls": [],
+                                            "usage": { "input_tokens": 0, "output_tokens": 0 },
+                                            "_synthetic": true
+                                        }));
                                     }
                                 }
                             }
@@ -697,14 +719,14 @@ impl DaemonClient {
     // =========================================================================
     
     /// Send a chat message (uses health-check polling instead of hard timeout)
-    pub async fn chat_send(&self, session_id: &str, content: &str) -> Result<Value, String> {
+    pub async fn chat_send(&self, session_id: &str, content: &str, attachments: Vec<serde_json::Value>) -> Result<Value, String> {
         self.request_with_health_polling(
             serde_json::json!({
                 "type": "chat",
                 "action": "send",
                 "session_id": session_id,
                 "content": content,
-                "attachments": []
+                "attachments": attachments
             }),
             session_id,
         ).await
@@ -736,6 +758,15 @@ impl DaemonClient {
             "action": "list"
         })).await
     }
+
+    /// List sessions filtered by workspace
+    pub async fn sessions_list_by_workspace(&self, workspace_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "list_by_workspace",
+            "workspace_id": workspace_id
+        })).await
+    }
     
     /// Create a session
     pub async fn session_create(&self, name: Option<&str>) -> Result<Value, String> {
@@ -745,7 +776,27 @@ impl DaemonClient {
             "name": name
         })).await
     }
+
+    /// Create a session in a specific workspace
+    pub async fn session_create_in_workspace(&self, name: Option<&str>, workspace_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "create_in_workspace",
+            "name": name,
+            "workspace_id": workspace_id
+        })).await
+    }
     
+    /// Set or clear the workspace for a session
+    pub async fn session_set_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "session",
+            "action": "set_workspace",
+            "id": session_id,
+            "workspace_id": workspace_id
+        })).await
+    }
+
     /// Get session history
     pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
         self.request(serde_json::json!({

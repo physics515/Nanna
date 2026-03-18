@@ -54,9 +54,37 @@ const emit = defineEmits<{
 .sheet-content {
   position: fixed;
   z-index: 50;
-  background: #0f172a;
+  background: #1e293b;
   padding: 1.5rem;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  isolation: isolate;
+}
+
+/* Mesh gradient layer (matches .app-shell::before) */
+.sheet-content::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  background:
+    radial-gradient(at 0% 0%, rgba(139, 92, 246, 0.25), transparent 50%),
+    radial-gradient(at 100% 100%, rgba(34, 197, 94, 0.15), transparent 50%),
+    radial-gradient(at 85% 5%, rgba(251, 191, 36, 0.10), transparent 40%),
+    radial-gradient(at 50% 50%, rgba(139, 92, 246, 0.05), transparent 60%);
+}
+
+/* Grain noise layer (matches .app-shell::after) */
+.sheet-content::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.45;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='200'%20height='200'%3E%3Cfilter%20id='n'%3E%3CfeTurbulence%20type='fractalNoise'%20baseFrequency='0.45'%20numOctaves='3'%20stitchTiles='stitch'/%3E%3C/filter%3E%3Crect%20width='100%25'%20height='100%25'%20filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
 }
 
 /* Left */
@@ -79,7 +107,7 @@ const emit = defineEmits<{
   inset: 0 0 0 auto;
   height: 100%;
   width: 75%;
-  max-width: 24rem;
+  max-width: 48rem;
   border-left: 1px solid rgba(255, 255, 255, 0.04);
 }
 .sheet-right[data-state="open"] {

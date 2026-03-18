@@ -12,73 +12,80 @@ const PROVIDER: &str = "telegram";
 
 /// Telegram Update object (simplified)
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
     pub edited_message: Option<TelegramMessage>,
-    pub callback_query: Option<CallbackQuery>,
+#[serde(rename = "callback_query")]
+    pub _callback_query: Option<CallbackQuery>,
     pub message_reaction: Option<MessageReactionUpdate>,
 }
 
 /// Telegram message reaction update
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct MessageReactionUpdate {
     pub message_id: i64,
     pub chat: TelegramChat,
-    pub user: Option<TelegramUser>,
-    pub date: i64,
-    pub old_reaction: Vec<ReactionType>,
+#[serde(rename = "user")]
+    pub _user: Option<TelegramUser>,
+#[serde(rename = "date")]
+    pub _date: i64,
+#[serde(rename = "old_reaction")]
+    pub _old_reaction: Vec<ReactionType>,
     pub new_reaction: Vec<ReactionType>,
 }
 
 /// Reaction type (emoji or custom)
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)]
 pub enum ReactionType {
     Emoji { emoji: String },
-    CustomEmoji { custom_emoji_id: String },
+    CustomEmoji { _custom_emoji_id: String },
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TelegramMessage {
     pub message_id: i64,
     pub from: Option<TelegramUser>,
     pub chat: TelegramChat,
-    pub date: i64,
+#[serde(rename = "date")]
+    pub _date: i64,
     pub text: Option<String>,
-    pub reply_to_message: Option<Box<Self>>,
+#[serde(rename = "reply_to_message")]
+    pub _reply_to_message: Option<Box<Self>>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TelegramUser {
     pub id: i64,
-    pub first_name: String,
-    pub last_name: Option<String>,
+#[serde(rename = "first_name")]
+    pub _first_name: String,
+#[serde(rename = "last_name")]
+    pub _last_name: Option<String>,
     pub username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TelegramChat {
     pub id: i64,
     #[serde(rename = "type")]
-    pub chat_type: String,
-    pub title: Option<String>,
-    pub username: Option<String>,
+    pub _chat_type: String,
+#[serde(rename = "title")]
+    pub _title: Option<String>,
+#[serde(rename = "username")]
+    pub _username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct CallbackQuery {
-    pub id: String,
-    pub from: TelegramUser,
-    pub message: Option<TelegramMessage>,
-    pub data: Option<String>,
+#[serde(rename = "id")]
+    pub _id: String,
+#[serde(rename = "from")]
+    pub _from: TelegramUser,
+#[serde(rename = "message")]
+    pub _message: Option<TelegramMessage>,
+#[serde(rename = "data")]
+    pub _data: Option<String>,
 }
 
 /// Telegram API response wrapper

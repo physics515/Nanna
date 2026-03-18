@@ -1,6 +1,6 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, Message, NewCronJob, NewJobRun, NewMemory, NewMessage, Session, StorageError};
+use crate::{CronJob, JobRun, Memory, Message, NewCronJob, NewJobRun, NewMemory, NewMessage, Session, StorageError, WorkspaceRecord};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -272,6 +272,49 @@ pub struct MemoryRepository {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Helper to decode FSRS columns from row index 9..17
+/// Expected column order after the base 9:
+/// 9=workspace_id, 10=expires_at, 11=fsrs_stability, 12=fsrs_difficulty,
+/// 13=fsrs_last_access, 14=fsrs_access_count, 15=fsrs_importance,
+/// 16=fsrs_storage_strength, 17=fsrs_generation
+fn decode_memory_row(
+    row: &turso::Row,
+    embedding: Option<Vec<f32>>,
+    metadata_str: Option<String>,
+    tags: Vec<String>,
+) -> Result<Memory, turso::Error> {
+    Ok(Memory {
+        id: row.get(0)?,
+        memory_id: row.get(1)?,
+        content: row.get(2)?,
+        embedding,
+        embedding_model: row.get(4)?,
+        session_id: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+        tags,
+        workspace_id: row.get(9)?,
+        expires_at: row.get(10)?,
+        fsrs_stability: row.get::<f64>(11)? as f32,
+        fsrs_difficulty: row.get::<f64>(12)? as f32,
+        fsrs_last_access: row.get(13)?,
+        fsrs_access_count: row.get(14)?,
+        fsrs_importance: row.get::<f64>(15)? as f32,
+        fsrs_storage_strength: row.get::<f64>(16)? as f32,
+        fsrs_generation: row.get(17)?,
+    })
+}
+
+fn decode_embedding(bytes: Option<Vec<u8>>) -> Option<Vec<f32>> {
+    bytes.map(|bytes| {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    })
+}
+
 impl MemoryRepository {
     pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
@@ -289,8 +332,11 @@ impl MemoryRepository {
         let memory_id = mem.memory_id.clone();
 
         conn.execute(
-            "INSERT INTO memories (memory_id, content, embedding, embedding_model, session_id, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO memories (memory_id, content, embedding, embedding_model, session_id, metadata,
+                                   workspace_id, expires_at,
+                                   fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
+                                   fsrs_importance, fsrs_storage_strength, fsrs_generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             turso::params![
                 mem.memory_id.as_str(),
                 mem.content.as_str(),
@@ -298,6 +344,15 @@ impl MemoryRepository {
                 mem.embedding_model.as_deref(),
                 mem.session_id.as_deref(),
                 metadata_json.as_deref(),
+                mem.workspace_id.as_deref(),
+                mem.expires_at,
+                mem.fsrs_stability as f64,
+                mem.fsrs_difficulty as f64,
+                mem.fsrs_last_access,
+                mem.fsrs_access_count,
+                mem.fsrs_importance as f64,
+                mem.fsrs_storage_strength as f64,
+                mem.fsrs_generation,
             ],
         )
         .await?;
@@ -320,22 +375,18 @@ impl MemoryRepository {
 
         let mut rows = conn
             .query(
-                "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata
+                "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
+                        workspace_id, expires_at,
+                        fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
+                        fsrs_importance, fsrs_storage_strength, fsrs_generation
                  FROM memories WHERE memory_id = ?1",
                 turso::params![memory_id],
             )
             .await?;
 
         if let Some(row) = rows.next().await? {
-            // Deserialize embedding
             let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
-            let embedding: Option<Vec<f32>> = embedding_bytes.map(|bytes| {
-                bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
-            });
-
+            let embedding = decode_embedding(embedding_bytes);
             let metadata_str: Option<String> = row.get(8)?;
 
             // Get tags
@@ -351,18 +402,7 @@ impl MemoryRepository {
                 tags.push(tag_row.get(0)?);
             }
 
-            Ok(Memory {
-                id: row.get(0)?,
-                memory_id: row.get(1)?,
-                content: row.get(2)?,
-                embedding,
-                embedding_model: row.get(4)?,
-                session_id: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
-                tags,
-            })
+            Ok(decode_memory_row(&row, embedding, metadata_str, tags)?)
         } else {
             Err(StorageError::NotFound(format!("Memory: {memory_id}")))
         }
@@ -373,7 +413,10 @@ impl MemoryRepository {
 
         let mut rows = conn
             .query(
-                "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata
+                "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
+                        workspace_id, expires_at,
+                        fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
+                        fsrs_importance, fsrs_storage_strength, fsrs_generation
                  FROM memories ORDER BY updated_at DESC LIMIT ?1",
                 turso::params![limit],
             )
@@ -382,30 +425,123 @@ impl MemoryRepository {
         let mut memories = Vec::new();
         while let Some(row) = rows.next().await? {
             let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
-            let embedding: Option<Vec<f32>> = embedding_bytes.map(|bytes| {
-                bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
-            });
-
+            let embedding = decode_embedding(embedding_bytes);
             let metadata_str: Option<String> = row.get(8)?;
-
-            memories.push(Memory {
-                id: row.get(0)?,
-                memory_id: row.get(1)?,
-                content: row.get(2)?,
-                embedding,
-                embedding_model: row.get(4)?,
-                session_id: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
-                tags: Vec::new(),
-            });
+            memories.push(decode_memory_row(&row, embedding, metadata_str, Vec::new())?);
         }
 
         Ok(memories)
+    }
+
+    /// Load ALL entries efficiently (no limit) — for populating the in-memory cache on startup.
+    pub async fn bulk_load(&self) -> Result<Vec<Memory>, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
+                        workspace_id, expires_at,
+                        fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
+                        fsrs_importance, fsrs_storage_strength, fsrs_generation
+                 FROM memories ORDER BY id ASC",
+                (),
+            )
+            .await?;
+
+        let mut memories = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
+            let embedding = decode_embedding(embedding_bytes);
+            let metadata_str: Option<String> = row.get(8)?;
+            memories.push(decode_memory_row(&row, embedding, metadata_str, Vec::new())?);
+        }
+
+        Ok(memories)
+    }
+
+    /// Count total memories in the database.
+    pub async fn count(&self) -> Result<i64, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM memories", ())
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get(0)?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Update FSRS state for a memory entry identified by memory_id.
+    pub async fn update_fsrs(
+        &self,
+        memory_id: &str,
+        stability: f32,
+        difficulty: f32,
+        last_access: i64,
+        access_count: i64,
+        importance: f32,
+        storage_strength: f32,
+        generation: i64,
+    ) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().await;
+        let result = conn
+            .execute(
+                "UPDATE memories SET
+                    fsrs_stability = ?1, fsrs_difficulty = ?2, fsrs_last_access = ?3,
+                    fsrs_access_count = ?4, fsrs_importance = ?5,
+                    fsrs_storage_strength = ?6, fsrs_generation = ?7,
+                    updated_at = datetime('now')
+                 WHERE memory_id = ?8",
+                turso::params![
+                    stability as f64,
+                    difficulty as f64,
+                    last_access,
+                    access_count,
+                    importance as f64,
+                    storage_strength as f64,
+                    generation,
+                    memory_id,
+                ],
+            )
+            .await?;
+        Ok(result > 0)
+    }
+
+    /// Update content text for a memory entry.
+    pub async fn update_content(&self, memory_id: &str, content: &str) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().await;
+        let result = conn
+            .execute(
+                "UPDATE memories SET content = ?1, updated_at = datetime('now') WHERE memory_id = ?2",
+                turso::params![content, memory_id],
+            )
+            .await?;
+        Ok(result > 0)
+    }
+
+    /// Delete multiple memories by their memory_ids.
+    pub async fn bulk_delete(&self, ids: &[&str]) -> Result<u64, StorageError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        let mut deleted = 0u64;
+        for id in ids {
+            // Delete tags first
+            conn.execute(
+                "DELETE FROM memory_tags WHERE memory_id = ?1",
+                turso::params![*id],
+            ).await?;
+            let n = conn
+                .execute(
+                    "DELETE FROM memories WHERE memory_id = ?1",
+                    turso::params![*id],
+                )
+                .await?;
+            deleted += n as u64;
+        }
+        Ok(deleted)
     }
 
     pub async fn delete(&self, memory_id: &str) -> Result<bool, StorageError> {
@@ -810,5 +946,128 @@ impl JobRunRepository {
             .await?;
 
         Ok(result as i64)
+    }
+}
+
+// ═══ Workspace Repository ═══
+
+pub struct WorkspaceRepository {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl WorkspaceRepository {
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    /// List all registered workspaces
+    pub async fn list(&self) -> Result<Vec<WorkspaceRecord>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT id, name, path, active, created_at, last_accessed FROM workspaces ORDER BY last_accessed DESC",
+                turso::params![],
+            )
+            .await?;
+
+        let mut workspaces = Vec::new();
+        while let Some(row) = rows.next().await? {
+            workspaces.push(WorkspaceRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                active: row.get::<i64>(3)? != 0,
+                created_at: row.get(4)?,
+                last_accessed: row.get(5)?,
+            });
+        }
+        Ok(workspaces)
+    }
+
+    /// Get a workspace by ID
+    pub async fn get(&self, id: &str) -> Result<Option<WorkspaceRecord>, StorageError> {
+        let conn = self.conn.lock().await;
+        let id = id.to_string();
+        let mut rows = conn
+            .query(
+                "SELECT id, name, path, active, created_at, last_accessed FROM workspaces WHERE id = ?1",
+                turso::params![id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Some(WorkspaceRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                active: row.get::<i64>(3)? != 0,
+                created_at: row.get(4)?,
+                last_accessed: row.get(5)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert or update a workspace (upsert by path)
+    pub async fn upsert(&self, record: &WorkspaceRecord) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        let id = record.id.clone();
+        let name = record.name.clone();
+        let path = record.path.clone();
+        let active = record.active as i64;
+        conn.execute(
+            "INSERT INTO workspaces (id, name, path, active, last_accessed)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               path = excluded.path,
+               active = excluded.active,
+               last_accessed = datetime('now')",
+            turso::params![id, name, path, active],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a workspace by ID
+    pub async fn delete(&self, id: &str) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().await;
+        let id = id.to_string();
+        let affected = conn
+            .execute(
+                "DELETE FROM workspaces WHERE id = ?1",
+                turso::params![id],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Clear the active flag on all workspaces
+    pub async fn clear_active(&self) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE workspaces SET active = 0",
+            turso::params![],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Set a workspace as active (clears others first)
+    pub async fn set_active(&self, id: &str) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().await;
+        // Clear all
+        conn.execute("UPDATE workspaces SET active = 0", turso::params![])
+            .await?;
+        // Set this one
+        let id = id.to_string();
+        let affected = conn
+            .execute(
+                "UPDATE workspaces SET active = 1, last_accessed = datetime('now') WHERE id = ?1",
+                turso::params![id],
+            )
+            .await?;
+        Ok(affected > 0)
     }
 }

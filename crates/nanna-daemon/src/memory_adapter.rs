@@ -2,10 +2,9 @@
 
 use async_trait::async_trait;
 use nanna_memory::MemoryService;
-use nanna_tools::builtin::memory::{MemoryResult, MemoryStorage};
+use nanna_tools::{MemoryResult, MemoryStorage};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::warn;
 
 /// Adapter that implements MemoryStorage using the full MemoryService
 pub struct MemoryServiceAdapter {

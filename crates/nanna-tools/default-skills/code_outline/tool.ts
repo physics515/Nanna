@@ -9,9 +9,11 @@ export default {
     required: ["path"]
   },
   execute: function(input) {
-    var content = Nanna.readFile(input.path);
+    var filePath = input.path || input.file_path || input.filePath || input.file;
+    if (!filePath) throw "Missing required parameter: path";
+    var content = Nanna.readFile(filePath);
     var lines = content.split("\n");
-    var ext = input.path.split(".").pop().toLowerCase();
+    var ext = filePath.split(".").pop().toLowerCase();
 
     var patterns = getPatterns(ext);
     var outline = [];

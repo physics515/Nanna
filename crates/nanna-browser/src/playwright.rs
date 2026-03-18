@@ -134,7 +134,6 @@ impl Browser for PlaywrightBrowser {
 /// Playwright page wrapper
 pub struct PlaywrightPage {
     page: playwright_rs::Page,
-    #[allow(dead_code)]
     timeout_ms: u64,
 }
 

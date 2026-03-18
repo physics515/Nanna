@@ -297,7 +297,6 @@ impl GpuVectorStore {
 /// Handles vector stores too large for a single GPU buffer by batching searches.
 pub struct BatchedSearch {
     batch_size: usize,
-    max_buffer_size: u64,
 }
 
 impl BatchedSearch {
@@ -320,7 +319,6 @@ impl BatchedSearch {
 
         Self {
             batch_size,
-            max_buffer_size,
         }
     }
 

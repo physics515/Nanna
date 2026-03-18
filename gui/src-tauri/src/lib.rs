@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 //! Nanna GUI - Tauri backend
 //!
 //! IPC bridge between the frontend and nanna-core with agentic tool loop.
@@ -1032,8 +1034,6 @@ pub struct AppConfig {
 /// Pending tool call being assembled from stream
 #[derive(Debug, Clone)]
 struct PendingToolCall {
-    #[allow(dead_code)]
-    index: usize,
     id: String,
     name: String,
     input_json: String,
@@ -1113,44 +1113,6 @@ fn create_llm_client_for_model(model_id: &str, config: &Config, ollama_host: &st
     }
 }
 
-/// Select the best available model from priority list, skipping rate-limited ones
-#[allow(dead_code)]
-fn select_best_model(
-    priority: &[String],
-    rate_limited: &HashMap<String, i64>,
-    config: &Config,
-) -> Option<String> {
-    let now = chrono::Utc::now().timestamp();
-    
-    for model_id in priority {
-        // Check if rate limited and cooldown hasn't expired
-        if let Some(&cooldown_until) = rate_limited.get(model_id) {
-            if now < cooldown_until {
-                debug!("Skipping rate-limited model: {} (cooldown until {})", model_id, cooldown_until);
-                continue;
-            }
-        }
-        
-        // Check if we have credentials for this model
-        let (provider, _) = parse_model_id(model_id);
-        let has_credentials = match provider.as_str() {
-            "anthropic" => config.llm.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok(),
-            "openai" => config.llm.openai_api_key.is_some() || std::env::var("OPENAI_API_KEY").is_ok(),
-            "openrouter" => config.llm.openrouter_api_key.is_some() || std::env::var("OPENROUTER_API_KEY").is_ok(),
-            "github" => config.llm.github_token.is_some() || std::env::var("GITHUB_TOKEN").is_ok(),
-            "claude-proxy" => std::env::var("CLAUDE_PROXY_ENABLED").is_ok(), // Enabled via env var
-            "ollama" => true, // Always available (local)
-            _ => false,
-        };
-        
-        if has_credentials {
-            return Some(model_id.clone());
-        }
-    }
-    
-    None
-}
-
 /// Check if an error message indicates a rate limit or recoverable error
 fn is_rate_limit_error(error_msg: &str) -> bool {
     let lower = error_msg.to_lowercase();
@@ -1197,13 +1159,14 @@ async fn send_message_daemon(
     state: &AppState,
     session_id: String,
     message: String,
+    attachments: Vec<serde_json::Value>,
 ) -> Result<ChatMessage, String> {
     use tracing::info;
     
     info!("send_message_daemon: session={}, message={}", session_id, &message[..message.len().min(50)]);
     
     // Send to daemon via backend client
-    let result = match state.backend.chat_send(&session_id, &message).await {
+    let result = match state.backend.chat_send(&session_id, &message, attachments).await {
         Ok(r) => {
             info!("Daemon response received: {:?}", r);
             r
@@ -1262,6 +1225,7 @@ async fn send_message(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
     message: String,
+    attachments: Option<Vec<serde_json::Value>>,
 ) -> Result<ChatMessage, String> {
     info!("🚀 send_message called! session={}, message_len={}", session_id, message.len());
     
@@ -1270,7 +1234,7 @@ async fn send_message(
     // Check if we're in daemon mode - if so, route through daemon
     if state_guard.backend.is_daemon_mode().await {
         info!("Routing message to daemon (daemon mode active)");
-        return send_message_daemon(&app, &state_guard, session_id, message).await;
+        return send_message_daemon(&app, &state_guard, session_id, message, attachments.unwrap_or_default()).await;
     }
 
     // Otherwise, continue with embedded mode (existing code)
@@ -1946,7 +1910,6 @@ async fn run_agent_loop(
                     if let Some(buffer) = tool_input_buffers.remove(&index) {
                         if let Some((id, name)) = tool_info.remove(&index) {
                             pending_tool_calls.push(PendingToolCall {
-                                index,
                                 id,
                                 name,
                                 input_json: buffer,
@@ -2242,7 +2205,10 @@ async fn create_session(
 
     // Route through daemon if available
     if state_guard.backend.is_daemon_mode().await {
-        let result = state_guard.backend.session_create(Some(&session_name)).await?;
+        let result = state_guard.backend.session_create_in_workspace(
+            Some(&session_name),
+            workspace_id.as_deref(),
+        ).await?;
         // Daemon returns { "session": { ... } }
         let session = result.get("session")
             .ok_or("Invalid daemon response: missing 'session' field")?;
@@ -2264,7 +2230,10 @@ async fn create_session(
                 .unwrap_or("")
                 .to_string(),
             message_count: 0,
-            workspace_id,
+            workspace_id: session.get("workspace_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or(workspace_id),
             workspace_name: None,
         });
     }
@@ -2315,8 +2284,16 @@ async fn list_sessions(
     if state_guard.backend.is_daemon_mode().await {
         let mut all_sessions: Vec<SessionInfo> = Vec::new();
         
-        // Get daemon sessions (new sessions created in daemon mode)
-        if let Ok(result) = state_guard.backend.sessions_list().await {
+        // Get daemon sessions:
+        // - workspace_id = None → show ALL sessions (global view)
+        // - workspace_id = Some(id) → show only that workspace's sessions
+        let result = if let Some(ref ws_id) = workspace_id {
+            state_guard.backend.sessions_list_by_workspace(Some(ws_id.as_str())).await
+        } else {
+            // Global: fetch ALL sessions (no workspace filter)
+            state_guard.backend.sessions_list().await
+        };
+        if let Ok(result) = result {
             if let Some(sessions_array) = result.get("sessions").and_then(|v| v.as_array()) {
                 for s in sessions_array {
                     if let (Some(id), Some(name)) = (
@@ -2339,7 +2316,12 @@ async fn list_sessions(
         
         // Also get sessions from local SQLite (old sessions from embedded mode)
         // This ensures backward compatibility during daemon transition
-        if let Ok(sqlite_sessions) = state_guard.storage.sessions().list_by_workspace(workspace_id.as_deref(), 100).await {
+        let sqlite_result = if workspace_id.is_some() {
+            state_guard.storage.sessions().list_by_workspace(workspace_id.as_deref(), 100).await
+        } else {
+            state_guard.storage.list_gui_sessions(100).await
+        };
+        if let Ok(sqlite_sessions) = sqlite_result {
             let daemon_ids: std::collections::HashSet<_> = all_sessions.iter().map(|s| s.id.clone()).collect();
             
             for session in sqlite_sessions {
@@ -2366,13 +2348,20 @@ async fn list_sessions(
     }
 
     // Embedded mode: use direct storage access
-    // Filter sessions by workspace context
-    // Both cases use list_by_workspace - None means "workspace_id IS NULL" (global only)
-    let sessions = state_guard
-        .storage
-        .list_gui_sessions_by_workspace(workspace_id.as_deref(), 100)
-        .await
-        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+    // workspace_id = None → show ALL sessions (global view)
+    // workspace_id = Some(id) → show only that workspace's sessions
+    let sessions = if let Some(ref ws_id) = workspace_id {
+        state_guard.storage
+            .list_gui_sessions_by_workspace(Some(ws_id.as_str()), 100)
+            .await
+            .map_err(|e| format!("Failed to list sessions: {}", e))?
+    } else {
+        // Global: list ALL sessions regardless of workspace
+        state_guard.storage
+            .list_gui_sessions(100)
+            .await
+            .map_err(|e| format!("Failed to list sessions: {}", e))?
+    };
 
     // Build workspace name lookup
     let registry = state_guard.workspaces.read().await;
@@ -2735,6 +2724,37 @@ async fn rename_session(
     Ok(())
 }
 
+/// Set or clear the workspace for a session
+#[tauri::command]
+async fn set_session_workspace(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    session_id: String,
+    workspace_id: Option<String>,
+) -> Result<(), String> {
+    let state_guard = state.read().await;
+
+    // Route through daemon if available
+    if state_guard.backend.is_daemon_mode().await {
+        let result = state_guard.backend.session_set_workspace(
+            &session_id,
+            workspace_id.as_deref(),
+        ).await?;
+        if result.get("error").is_some() {
+            return Err(result["message"].as_str().unwrap_or("Unknown error").to_string());
+        }
+        return Ok(());
+    }
+
+    // Embedded mode: update storage directly
+    state_guard
+        .storage
+        .set_session_workspace(&session_id, workspace_id.as_deref())
+        .await
+        .map_err(|e| format!("Failed to set session workspace: {}", e))?;
+
+    Ok(())
+}
+
 /// Get application config
 #[tauri::command]
 async fn get_config(state: State<'_, Arc<RwLock<AppState>>>) -> Result<AppConfig, String> {
@@ -3005,6 +3025,8 @@ pub struct ExtendedSettings {
 
     // Memory & Scheduling
     pub dreaming_enabled: bool,
+    pub max_compression_ratio: f32,
+    pub min_remaining_memories: usize,
     pub scheduler_enabled: bool,
     pub heartbeat_enabled: bool,
     pub heartbeat_interval_seconds: u64,
@@ -3141,6 +3163,8 @@ async fn get_extended_settings(
         
         // Memory & Scheduling settings
         dreaming_enabled,
+        max_compression_ratio: state_guard.config.memory.max_compression_ratio,
+        min_remaining_memories: state_guard.config.memory.min_remaining_memories,
         scheduler_enabled,
         heartbeat_enabled,
         heartbeat_interval_seconds,
@@ -3156,6 +3180,34 @@ async fn set_dreaming_enabled(
     let state_guard = state.read().await;
     *state_guard.dreaming_enabled.write().await = enabled;
     info!("Dreaming enabled: {}", enabled);
+    Ok(())
+}
+
+/// Set max compression ratio for memory consolidation
+#[tauri::command]
+async fn set_max_compression_ratio(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    ratio: f32,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    let clamped = ratio.clamp(0.1, 0.9);
+    state_guard.config.memory.max_compression_ratio = clamped;
+    state_guard.config.save().map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Max compression ratio set: {}", clamped);
+    Ok(())
+}
+
+/// Set minimum remaining memories floor for consolidation
+#[tauri::command]
+async fn set_min_remaining_memories(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    count: usize,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    let clamped = count.max(5);
+    state_guard.config.memory.min_remaining_memories = clamped;
+    state_guard.config.save().map_err(|e| format!("Failed to save config: {}", e))?;
+    info!("Min remaining memories set: {}", clamped);
     Ok(())
 }
 
@@ -4031,6 +4083,59 @@ async fn get_openrouter_models(
         let b_priority = priority_prefixes.iter().position(|p| b.id.starts_with(p)).unwrap_or(999);
         a_priority.cmp(&b_priority).then_with(|| a.id.cmp(&b.id))
     });
+
+    Ok(result)
+}
+
+/// Fetch available embedding models from OpenRouter's dedicated embeddings endpoint
+#[tauri::command]
+async fn get_openrouter_embedding_models(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<ModelInfo>, String> {
+    let state_guard = state.read().await;
+
+    let api_key = state_guard.config.llm.openrouter_api_key.clone()
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .ok_or("No OpenRouter API key configured")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://openrouter.ai/api/v1/embeddings/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenRouter embedding models: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenRouter embeddings API error {}: {}", status, body));
+    }
+
+    #[derive(Deserialize)]
+    struct OpenRouterModelsResponse {
+        data: Vec<OpenRouterEmbeddingModel>,
+    }
+
+    #[derive(Deserialize)]
+    struct OpenRouterEmbeddingModel {
+        id: String,
+        name: Option<String>,
+    }
+
+    let models: OpenRouterModelsResponse = response.json().await
+        .map_err(|e| format!("Failed to parse OpenRouter embeddings response: {}", e))?;
+
+    let result: Vec<ModelInfo> = models.data.into_iter()
+        .map(|m| ModelInfo {
+            name: m.name.unwrap_or_else(|| m.id.clone()),
+            id: m.id,
+        })
+        .collect();
 
     Ok(result)
 }
@@ -4972,6 +5077,166 @@ async fn set_summarization_model_priority(
 }
 
 // =============================================================================
+// OCR Configuration Commands
+// =============================================================================
+
+/// Get OCR model priority list (vision-capable models used for text extraction)
+#[tauri::command]
+async fn get_ocr_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.memory.ocr_model_priority.clone())
+}
+
+/// Set OCR model priority list
+#[tauri::command]
+async fn set_ocr_model_priority(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    priority: Vec<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.memory.ocr_model_priority = priority.clone();
+
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    info!("OCR model priority set: {:?}", priority);
+    Ok(())
+}
+
+/// Get whether embedded OCR (ocrs) is enabled
+#[tauri::command]
+async fn get_use_embedded_ocr(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<bool, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.memory.use_embedded_ocr)
+}
+
+/// Set whether embedded OCR (ocrs) is enabled
+#[tauri::command]
+async fn set_use_embedded_ocr(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.memory.use_embedded_ocr = enabled;
+
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    info!("Embedded OCR (ocrs) set to: {}", enabled);
+    Ok(())
+}
+
+// =============================================================================
+// Model Routing Commands
+// =============================================================================
+
+/// Get model routing configuration
+#[tauri::command]
+async fn get_model_routing(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.llm.model_routing.clone())
+}
+
+/// Set model routing configuration
+/// Each entry is "model:tier" where tier is simple|medium|complex
+#[tauri::command]
+async fn set_model_routing(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    routes: Vec<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.model_routing = routes.clone();
+
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    // Propagate to running daemon
+    if state_guard.backend.is_daemon_mode().await {
+        let _ = state_guard.backend.config_set(
+            "llm.model_routing",
+            serde_json::to_value(&routes).unwrap_or_default(),
+        ).await;
+    }
+
+    info!("Model routing set: {:?}", routes);
+    Ok(())
+}
+
+/// Get routing_first_turn_primary setting
+#[tauri::command]
+async fn get_routing_first_turn_primary(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<bool, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.llm.routing_first_turn_primary)
+}
+
+/// Set routing_first_turn_primary setting
+#[tauri::command]
+async fn set_routing_first_turn_primary(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.routing_first_turn_primary = enabled;
+
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    // Propagate to running daemon
+    if state_guard.backend.is_daemon_mode().await {
+        let _ = state_guard.backend.config_set(
+            "llm.routing_first_turn_primary",
+            serde_json::Value::Bool(enabled),
+        ).await;
+    }
+
+    info!("Routing first turn primary set: {}", enabled);
+    Ok(())
+}
+
+/// Get sub-agent model
+#[tauri::command]
+async fn get_sub_agent_model(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Option<String>, String> {
+    let state_guard = state.read().await;
+    Ok(state_guard.config.llm.sub_agent_model.clone())
+}
+
+/// Set sub-agent model (None = use primary model)
+#[tauri::command]
+async fn set_sub_agent_model(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    model: Option<String>,
+) -> Result<(), String> {
+    let mut state_guard = state.write().await;
+    // Treat empty string as None
+    let model = model.filter(|m| !m.is_empty());
+    state_guard.config.llm.sub_agent_model = model.clone();
+
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    // Propagate to running daemon
+    if state_guard.backend.is_daemon_mode().await {
+        let _ = state_guard.backend.config_set(
+            "llm.sub_agent_model",
+            model.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+        ).await;
+    }
+
+    info!("Sub-agent model set: {:?}", state_guard.config.llm.sub_agent_model);
+    Ok(())
+}
+
+// =============================================================================
 // Model Status Commands
 // =============================================================================
 
@@ -5027,14 +5292,13 @@ async fn get_model_stats(
     let state_guard = state.read().await;
 
     // Try daemon mode first
-    if let Some(ref backend) = state_guard.backend {
-        let status = backend.status().await;
-        if status.connected {
-            return backend.daemon_request(serde_json::json!({
-                "type": "system",
-                "action": "model_stats"
-            })).await;
-        }
+    let backend = &state_guard.backend;
+    let status = backend.status().await;
+    if status.connected {
+        return backend.daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "model_stats"
+        })).await;
     }
 
     // Embedded mode: no model stats tracker available
@@ -5042,6 +5306,146 @@ async fn get_model_stats(
         "models": [],
         "note": "Model stats are only available in daemon mode"
     }))
+}
+
+/// Get per-tool performance statistics
+#[tauri::command]
+async fn get_tool_stats(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+
+    let backend = &state_guard.backend;
+    let status = backend.status().await;
+    if status.connected {
+        let result = backend.daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "tool_stats"
+        })).await;
+        info!("📊 get_tool_stats: daemon responded with {} tools",
+            result.as_ref().ok()
+                .and_then(|v| v.get("tools"))
+                .and_then(|v| v.as_array())
+                .map_or(0, |a| a.len()));
+        return result;
+    }
+
+    warn!("📊 get_tool_stats: NOT CONNECTED (mode={:?}, daemon_state={})",
+        status.mode, status.daemon_state);
+    Ok(serde_json::json!({
+        "tools": [],
+        "note": "Tool stats are only available in daemon mode"
+    }))
+}
+
+/// Get global tool + session dashboard stats
+#[tauri::command]
+async fn get_global_stats(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+
+    let backend = &state_guard.backend;
+    let status = backend.status().await;
+    if status.connected {
+        let result = backend.daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "global_stats"
+        })).await;
+        info!("📊 get_global_stats: daemon responded, total_calls={}",
+            result.as_ref().ok()
+                .and_then(|v| v.get("total_calls"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0));
+        return result;
+    }
+
+    warn!("📊 get_global_stats: NOT CONNECTED (mode={:?}, daemon_state={})",
+        status.mode, status.daemon_state);
+    Ok(serde_json::json!({
+        "total_calls": 0,
+        "avg_latency_ms": 0,
+        "success_rate": 1.0,
+        "slowest_tools": [],
+        "most_used_tools": [],
+        "most_failed_tools": [],
+        "session_totals": {
+            "total_iterations": 0,
+            "total_tool_calls": 0,
+            "total_tool_time_ms": 0,
+            "total_llm_time_ms": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0
+        },
+        "note": "Global stats are only available in daemon mode"
+    }))
+}
+
+/// Get hourly tool stats time-series for graphs
+#[tauri::command]
+async fn get_tool_stats_hourly(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    tool_name: Option<String>,
+    hours: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    let backend = &state_guard.backend;
+    let status = backend.status().await;
+    if status.connected {
+        return backend.daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "tool_stats_hourly",
+            "tool_name": tool_name,
+            "hours": hours.unwrap_or(24)
+        })).await;
+    }
+    warn!("📊 get_tool_stats_hourly: NOT CONNECTED (mode={:?}, daemon_state={})",
+        status.mode, status.daemon_state);
+    Ok(serde_json::json!({ "buckets": [] }))
+}
+
+/// Get daily tool stats time-series for graphs
+#[tauri::command]
+async fn get_tool_stats_daily(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    tool_name: Option<String>,
+    days: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    let backend = &state_guard.backend;
+    let status = backend.status().await;
+    if status.connected {
+        return backend.daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "tool_stats_daily",
+            "tool_name": tool_name,
+            "days": days.unwrap_or(30)
+        })).await;
+    }
+    warn!("📊 get_tool_stats_daily: NOT CONNECTED (mode={:?}, daemon_state={})",
+        status.mode, status.daemon_state);
+    Ok(serde_json::json!({ "buckets": [] }))
+}
+
+/// Get recent tool call log entries
+#[tauri::command]
+async fn get_tool_call_log(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    tool_name: Option<String>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let state_guard = state.read().await;
+    let backend = &state_guard.backend;
+    let status = backend.status().await;
+    if status.connected {
+        return backend.daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "tool_call_log",
+            "tool_name": tool_name,
+            "limit": limit.unwrap_or(50)
+        })).await;
+    }
+    Ok(serde_json::json!({ "entries": [] }))
 }
 
 // =============================================================================
@@ -5409,9 +5813,24 @@ async fn open_workspace(
     registry.set_active(&id);
     
     let ws = registry.get(&id).unwrap();
+    let info = WorkspaceInfo::from(ws);
     info!("Opened workspace: {} at {:?}", ws.name, path);
     
-    Ok(WorkspaceInfo::from(ws))
+    // Persist to database
+    drop(registry);
+    let record = nanna_storage::WorkspaceRecord {
+        id: info.id.clone(),
+        name: info.name.clone(),
+        path: info.path.clone(),
+        active: true,
+        created_at: String::new(),
+        last_accessed: String::new(),
+    };
+    if let Err(e) = state_guard.storage.workspaces().upsert(&record).await {
+        warn!("Failed to persist workspace to DB: {}", e);
+    }
+    
+    Ok(info)
 }
 
 /// Set active workspace
@@ -5425,6 +5844,11 @@ async fn set_active_workspace(
     
     if registry.set_active(&id) {
         info!("Activated workspace: {}", id);
+        drop(registry);
+        // Persist active state to DB
+        if let Err(e) = state_guard.storage.workspaces().set_active(&id).await {
+            warn!("Failed to persist active workspace to DB: {}", e);
+        }
         Ok(())
     } else {
         Err(format!("Workspace not found: {}", id))
@@ -5439,7 +5863,12 @@ async fn clear_active_workspace(
     let state_guard = state.read().await;
     let mut registry = state_guard.workspaces.write().await;
     registry.clear_active();
+    drop(registry);
     info!("Cleared active workspace, now in global mode");
+    // Persist to DB
+    if let Err(e) = state_guard.storage.workspaces().clear_active().await {
+        warn!("Failed to persist cleared workspace to DB: {}", e);
+    }
     Ok(())
 }
 
@@ -5527,6 +5956,11 @@ async fn close_workspace(
     
     if registry.remove(&id).is_some() {
         info!("Closed workspace: {}", id);
+        drop(registry);
+        // Remove from DB
+        if let Err(e) = state_guard.storage.workspaces().delete(&id).await {
+            warn!("Failed to remove workspace from DB: {}", e);
+        }
         Ok(())
     } else {
         Err(format!("Workspace not found: {}", id))
@@ -8074,7 +8508,7 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
     info!("Backend initialized (embedded mode ready, daemon will be attempted on startup)");
 
     Ok(AppState {
-        storage,
+        storage: storage.clone(),
         llm,
         tools,
         config,
@@ -8099,8 +8533,40 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         active_model: Arc::new(RwLock::new(initial_active_model)),
         // Rate limited models (empty at startup)
         rate_limited_models: Arc::new(RwLock::new(HashMap::new())),
-        // Workspace registry (empty at startup, populated as workspaces are opened)
-        workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
+        // Workspace registry (restored from database)
+        workspaces: {
+            let mut registry = WorkspaceRegistry::new();
+            match storage.workspaces().list().await {
+                Ok(records) if !records.is_empty() => {
+                    let mut active_id = None;
+                    for record in &records {
+                        let path = std::path::PathBuf::from(&record.path);
+                        if path.exists() {
+                            let mut ws = Workspace::new(&path);
+                            ws.id = record.id.clone();
+                            if let Err(e) = ws.load_context().await {
+                                warn!("Failed to load workspace context for {}: {}", record.path, e);
+                            }
+                            registry.register(ws);
+                            if record.active {
+                                active_id = Some(record.id.clone());
+                            }
+                        } else {
+                            warn!("Persisted workspace path no longer exists: {}", record.path);
+                        }
+                    }
+                    if let Some(id) = active_id {
+                        registry.set_active(&id);
+                    }
+                    info!("Restored {} workspaces from database", records.len());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to load workspaces from database: {}", e);
+                }
+            }
+            Arc::new(RwLock::new(registry))
+        },
         // User tool authoring manager
         user_tools: user_tool_manager,
         // Backend (initialized above with embedded mode)
@@ -8172,6 +8638,7 @@ pub fn run() {
             clear_all_sessions,
             archive_and_delete_session,
             rename_session,
+            set_session_workspace,
             get_config,
             set_model,
             set_api_key,
@@ -8196,6 +8663,8 @@ pub fn run() {
             apply_memory_updates,
             // Memory & scheduling settings
             set_dreaming_enabled,
+            set_max_compression_ratio,
+            set_min_remaining_memories,
             set_scheduler_enabled,
             set_heartbeat_enabled,
             set_heartbeat_interval,
@@ -8209,6 +8678,7 @@ pub fn run() {
             get_anthropic_models,
             get_openai_models,
             get_openrouter_models,
+            get_openrouter_embedding_models,
             get_github_models,
             get_claude_proxy_models,
             set_claude_proxy,
@@ -8256,9 +8726,26 @@ pub fn run() {
             set_embedding_model_priority,
             get_summarization_model_priority,
             set_summarization_model_priority,
+            // OCR settings
+            get_ocr_model_priority,
+            set_ocr_model_priority,
+            get_use_embedded_ocr,
+            set_use_embedded_ocr,
+            // Model routing
+            get_model_routing,
+            set_model_routing,
+            get_routing_first_turn_primary,
+            set_routing_first_turn_primary,
+            get_sub_agent_model,
+            set_sub_agent_model,
             // Model status
             get_model_status,
             get_model_stats,
+            get_tool_stats,
+            get_global_stats,
+            get_tool_stats_hourly,
+            get_tool_stats_daily,
+            get_tool_call_log,
             spawn_sub_session,
             list_sub_sessions,
             kill_sub_session,

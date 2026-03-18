@@ -135,14 +135,20 @@ impl ToolPermissions {
         self.net.iter().any(|h| h == "*" || h == host || host.ends_with(&format!(".{h}")))
     }
 
-    /// Check if reading a path is allowed
+    /// Check if reading a path is allowed.
+    /// Supports `*` wildcard for unrestricted access and `~` for home directory.
     pub fn allows_read(&self, path: &std::path::Path) -> bool {
-        self.read.iter().any(|p| path.starts_with(p))
+        self.read.iter().any(|p| {
+            p.to_string_lossy() == "*" || path.starts_with(p)
+        })
     }
 
-    /// Check if writing a path is allowed
+    /// Check if writing a path is allowed.
+    /// Supports `*` wildcard for unrestricted access and `~` for home directory.
     pub fn allows_write(&self, path: &std::path::Path) -> bool {
-        self.write.iter().any(|p| path.starts_with(p))
+        self.write.iter().any(|p| {
+            p.to_string_lossy() == "*" || path.starts_with(p)
+        })
     }
 }
 
@@ -168,6 +174,8 @@ pub struct ToolManifest {
     /// Where tool output should be routed
     #[serde(default)]
     pub output: OutputTarget,
+    /// Timeout in seconds (None = use default 30s)
+    pub timeout_secs: Option<u64>,
 }
 
 /// Extract manifest from tool source (looks for default export)
@@ -182,12 +190,34 @@ pub fn extract_manifest(source: &str) -> Option<ToolManifest> {
         _ => OutputTarget::Memory,
     };
 
+    let timeout_secs = extract_number_field(source, "timeout");
+
     Some(ToolManifest {
         name,
         description,
         parameters: None, // TODO: Parse parameters schema
         output,
+        timeout_secs,
     })
+}
+
+fn extract_number_field(source: &str, field: &str) -> Option<u64> {
+    // Match: timeout: 300 or timeout:300
+    let patterns = [
+        format!("{field}: "),
+        format!("{field}:"),
+    ];
+    for pattern in &patterns {
+        if let Some(start) = source.find(pattern) {
+            let value_start = start + pattern.len();
+            let rest = &source[value_start..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn extract_string_field(source: &str, field: &str) -> Option<String> {

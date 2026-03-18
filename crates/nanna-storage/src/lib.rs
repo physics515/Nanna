@@ -30,6 +30,8 @@ pub enum StorageError {
     Migration(String),
 }
 
+
+
 /// Storage configuration
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -150,6 +152,11 @@ impl Storage {
     #[must_use] 
     pub fn job_runs(&self) -> JobRunRepository {
         JobRunRepository::new(self.conn.clone())
+    }
+
+    #[must_use]
+    pub fn workspaces(&self) -> WorkspaceRepository {
+        WorkspaceRepository::new(self.conn.clone())
     }
 
     // =========================================================================
@@ -530,4 +537,266 @@ impl Storage {
         ).await?;
         Ok(())
     }
+
+    // =========================================================================
+    // Tool Stats
+    // =========================================================================
+
+    /// Log a single tool call (time-series data for graphs).
+    pub async fn log_tool_call(
+        &self,
+        tool_name: &str,
+        success: bool,
+        duration_ms: u64,
+        output_size: usize,
+        error_message: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO tool_call_log (tool_name, success, duration_ms, output_size, error_message, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            turso::params![
+                tool_name,
+                success as i64,
+                duration_ms as i64,
+                output_size as i64,
+                error_message.unwrap_or(""),
+                session_id.unwrap_or("")
+            ],
+        ).await?;
+
+        // Also update hourly aggregate
+        let hour = chrono::Utc::now().format("%Y-%m-%dT%H:00:00").to_string();
+        conn.execute(
+            "INSERT INTO tool_stats_hourly (tool_name, hour, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
+             ON CONFLICT(tool_name, hour) DO UPDATE SET
+                call_count = call_count + 1,
+                success_count = success_count + ?3,
+                failure_count = failure_count + ?4,
+                total_duration_ms = total_duration_ms + ?5,
+                avg_duration_ms = (total_duration_ms + ?5) / (call_count + 1),
+                p95_duration_ms = MAX(p95_duration_ms, ?5)",
+            turso::params![
+                tool_name,
+                hour,
+                success as i64,
+                (!success) as i64,
+                duration_ms as i64
+            ],
+        ).await?;
+
+        // Also update daily aggregate
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT INTO tool_stats_daily (tool_name, day, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
+             ON CONFLICT(tool_name, day) DO UPDATE SET
+                call_count = call_count + 1,
+                success_count = success_count + ?3,
+                failure_count = failure_count + ?4,
+                total_duration_ms = total_duration_ms + ?5,
+                avg_duration_ms = (total_duration_ms + ?5) / (call_count + 1),
+                p95_duration_ms = MAX(p95_duration_ms, ?5)",
+            turso::params![
+                tool_name,
+                day,
+                success as i64,
+                (!success) as i64,
+                duration_ms as i64
+            ],
+        ).await?;
+
+        Ok(())
+    }
+
+    /// Get hourly tool stats for a given time range (for graphs).
+    /// Returns data for the last `hours` hours.
+    pub async fn get_tool_stats_hourly(
+        &self,
+        tool_name: Option<&str>,
+        hours: u32,
+    ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
+        let conn = self.conn.lock().await;
+        let since = chrono::Utc::now() - chrono::Duration::hours(i64::from(hours));
+        let since_str = since.format("%Y-%m-%dT%H:00:00").to_string();
+
+        let mut rows = if let Some(name) = tool_name {
+            conn.query(
+                "SELECT tool_name, hour, call_count, success_count, failure_count, 
+                        total_duration_ms, avg_duration_ms, p95_duration_ms
+                 FROM tool_stats_hourly
+                 WHERE tool_name = ?1 AND hour >= ?2
+                 ORDER BY hour ASC",
+                turso::params![name, since_str],
+            ).await?
+        } else {
+            conn.query(
+                "SELECT 'all' as tool_name, hour, 
+                        CAST(SUM(call_count) AS INTEGER),
+                        CAST(SUM(success_count) AS INTEGER),
+                        CAST(SUM(failure_count) AS INTEGER),
+                        CAST(SUM(total_duration_ms) AS INTEGER),
+                        CAST(AVG(avg_duration_ms) AS INTEGER),
+                        CAST(MAX(p95_duration_ms) AS INTEGER)
+                 FROM tool_stats_hourly
+                 WHERE hour >= ?1
+                 GROUP BY hour
+                 ORDER BY hour ASC",
+                turso::params![since_str],
+            ).await?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ToolStatsTimeBucket {
+                tool_name: row.get::<String>(0)?,
+                period: row.get::<String>(1)?,
+                call_count: row.get::<i64>(2)? as u64,
+                success_count: row.get::<i64>(3)? as u64,
+                failure_count: row.get::<i64>(4)? as u64,
+                total_duration_ms: row.get::<i64>(5)? as u64,
+                avg_duration_ms: row.get::<i64>(6)? as u64,
+                p95_duration_ms: row.get::<i64>(7)? as u64,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Get daily tool stats for a given time range (for long-term graphs).
+    /// Returns data for the last `days` days.
+    pub async fn get_tool_stats_daily(
+        &self,
+        tool_name: Option<&str>,
+        days: u32,
+    ) -> Result<Vec<ToolStatsTimeBucket>, StorageError> {
+        let conn = self.conn.lock().await;
+        let since = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+        let since_str = since.format("%Y-%m-%d").to_string();
+
+        let mut rows = if let Some(name) = tool_name {
+            conn.query(
+                "SELECT tool_name, day, call_count, success_count, failure_count,
+                        total_duration_ms, avg_duration_ms, p95_duration_ms
+                 FROM tool_stats_daily
+                 WHERE tool_name = ?1 AND day >= ?2
+                 ORDER BY day ASC",
+                turso::params![name, since_str],
+            ).await?
+        } else {
+            conn.query(
+                "SELECT 'all' as tool_name, day,
+                        CAST(SUM(call_count) AS INTEGER),
+                        CAST(SUM(success_count) AS INTEGER),
+                        CAST(SUM(failure_count) AS INTEGER),
+                        CAST(SUM(total_duration_ms) AS INTEGER),
+                        CAST(AVG(avg_duration_ms) AS INTEGER),
+                        CAST(MAX(p95_duration_ms) AS INTEGER)
+                 FROM tool_stats_daily
+                 WHERE day >= ?1
+                 GROUP BY day
+                 ORDER BY day ASC",
+                turso::params![since_str],
+            ).await?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ToolStatsTimeBucket {
+                tool_name: row.get::<String>(0)?,
+                period: row.get::<String>(1)?,
+                call_count: row.get::<i64>(2)? as u64,
+                success_count: row.get::<i64>(3)? as u64,
+                failure_count: row.get::<i64>(4)? as u64,
+                total_duration_ms: row.get::<i64>(5)? as u64,
+                avg_duration_ms: row.get::<i64>(6)? as u64,
+                p95_duration_ms: row.get::<i64>(7)? as u64,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Get recent tool call log entries (for detail views).
+    pub async fn get_tool_call_log(
+        &self,
+        tool_name: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ToolCallLogEntry>, StorageError> {
+        let conn = self.conn.lock().await;
+
+        let mut rows = if let Some(name) = tool_name {
+            conn.query(
+                "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
+                 FROM tool_call_log
+                 WHERE tool_name = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                turso::params![name, limit as i64],
+            ).await?
+        } else {
+            conn.query(
+                "SELECT tool_name, success, duration_ms, output_size, error_message, session_id, created_at
+                 FROM tool_call_log
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+                turso::params![limit as i64],
+            ).await?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ToolCallLogEntry {
+                tool_name: row.get::<String>(0)?,
+                success: row.get::<i64>(1)? != 0,
+                duration_ms: row.get::<i64>(2)? as u64,
+                output_size: row.get::<i64>(3)? as u64,
+                error_message: {
+                    let s: String = row.get::<String>(4)?;
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                session_id: {
+                    let s: String = row.get::<String>(5)?;
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                created_at: row.get::<String>(6)?,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Prune old tool call logs (keep last N days).
+    pub async fn prune_tool_call_log(&self, keep_days: u32) -> Result<u64, StorageError> {
+        let conn = self.conn.lock().await;
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(keep_days));
+        let cutoff_str = cutoff.to_rfc3339();
+        conn.execute(
+            "DELETE FROM tool_call_log WHERE created_at < ?1",
+            turso::params![cutoff_str],
+        ).await?;
+        // Return approximate count (turso doesn't give affected rows easily)
+        Ok(0)
+    }
+}
+
+/// Time-bucketed tool statistics (hourly or daily).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolStatsTimeBucket {
+    pub tool_name: String,
+    pub period: String,
+    pub call_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_duration_ms: u64,
+    pub avg_duration_ms: u64,
+    pub p95_duration_ms: u64,
+}
+
+/// A single tool call log entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallLogEntry {
+    pub tool_name: String,
+    pub success: bool,
+    pub duration_ms: u64,
+    pub output_size: u64,
+    pub error_message: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: String,
 }

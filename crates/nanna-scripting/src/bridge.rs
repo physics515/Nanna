@@ -31,6 +31,8 @@ pub struct NannaBridge {
     tool_definitions: Option<Value>,
     /// Service functions callable via `Nanna.service(name, params)`
     services: Arc<HashMap<String, ServiceFn>>,
+    /// Default working directory for exec commands (overrides home dir fallback)
+    default_workdir: Option<PathBuf>,
 }
 
 impl NannaBridge {
@@ -45,7 +47,16 @@ impl NannaBridge {
             logs: Arc::new(RwLock::new(Vec::new())),
             tool_definitions: None,
             services: Arc::new(HashMap::new()),
+            default_workdir: None,
         }
+    }
+
+    /// Set the default working directory for exec commands.
+    /// When set, this overrides the home directory fallback.
+    #[must_use]
+    pub fn with_default_workdir(mut self, workdir: impl Into<PathBuf>) -> Self {
+        self.default_workdir = Some(workdir.into());
+        self
     }
 
     /// Set tool definitions for `Nanna.listTools()`
@@ -55,10 +66,11 @@ impl NannaBridge {
         self
     }
 
-    /// Resolve a path: expand `~` to home directory, resolve relative paths against home dir.
+    /// Resolve a path: expand `~` to home directory, resolve relative paths against
+    /// the default working directory (if set) or home dir.
     /// Works on Windows, macOS, Linux, Android, and iOS.
-    /// Falls back to the raw path if home directory cannot be determined.
-    fn resolve_path(path: &str) -> PathBuf {
+    /// Falls back to the raw path if no base directory can be determined.
+    fn resolve_path_with_workdir(path: &str, default_workdir: Option<&Path>) -> PathBuf {
         let path = path.trim();
         
         // Expand ~ or ~/ (but not ~username which we don't support)
@@ -73,12 +85,20 @@ impl NannaBridge {
         
         let p = Path::new(path);
         if p.is_relative() && !path.is_empty() {
-            // Resolve relative to home dir rather than daemon cwd
+            // Resolve relative to workspace working directory, then home dir
+            if let Some(wd) = default_workdir {
+                return wd.join(p);
+            }
             if let Some(home) = Self::home_dir() {
                 return home.join(p);
             }
         }
         p.to_path_buf()
+    }
+
+    /// Resolve a path using the instance's default working directory.
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        Self::resolve_path_with_workdir(path, self.default_workdir.as_deref())
     }
 
     /// Get the user's home directory, cross-platform.
@@ -138,7 +158,9 @@ impl NannaBridge {
         cmd.arg(shell_arg).arg(command);
 
         if let Some(wd) = workdir {
-            cmd.current_dir(Self::resolve_path(wd));
+            cmd.current_dir(self.resolve_path(wd));
+        } else if let Some(ref wd) = self.default_workdir {
+            cmd.current_dir(wd);
         } else if let Some(home) = Self::home_dir() {
             cmd.current_dir(home);
         }
@@ -244,7 +266,7 @@ impl NannaBridge {
 
     /// Read a file (if permitted)
     pub async fn read_file(&self, path: &str) -> Result<String> {
-        let path = Self::resolve_path(path);
+        let path = self.resolve_path(path);
         
         if !self.permissions.allows_read(&path) {
             return Err(ScriptError::Permission(format!(
@@ -260,7 +282,7 @@ impl NannaBridge {
 
     /// Write a file (if permitted)
     pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        let path = Self::resolve_path(path);
+        let path = self.resolve_path(path);
         
         if !self.permissions.allows_write(&path) {
             return Err(ScriptError::Permission(format!(
@@ -302,7 +324,7 @@ impl NannaBridge {
 
     /// List directory contents (if permitted)
     pub async fn list_dir(&self, path: &str, recursive: bool) -> Result<Vec<DirEntry>> {
-        let path = Self::resolve_path(path);
+        let path = self.resolve_path(path);
 
         if !self.permissions.allows_read(&path) {
             return Err(ScriptError::Permission(format!(
@@ -375,7 +397,7 @@ impl NannaBridge {
 
     /// Get file/directory metadata (if permitted)
     pub async fn stat(&self, path: &str) -> Result<FileStat> {
-        let path = Self::resolve_path(path);
+        let path = self.resolve_path(path);
 
         if !self.permissions.allows_read(&path) {
             return Err(ScriptError::Permission(format!(

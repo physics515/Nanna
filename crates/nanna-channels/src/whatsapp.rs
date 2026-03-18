@@ -84,8 +84,8 @@ impl WhatsAppChannel {
                     error: WhatsAppError {
                         message: format!("HTTP {status}"),
                         code: status.as_u16() as i32,
-                        error_subcode: None,
-                        fbtrace_id: None,
+                        _error_subcode: None,
+                        _fbtrace_id: None,
                     },
                 });
 
@@ -638,12 +638,13 @@ struct WhatsAppErrorResponse {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)] // WhatsApp API response - subcode/trace_id unused (only message/code needed)
 struct WhatsAppError {
     message: String,
     code: i32,
-    error_subcode: Option<i32>,
-    fbtrace_id: Option<String>,
+    #[serde(rename = "error_subcode")]
+    _error_subcode: Option<i32>,
+    #[serde(rename = "fbtrace_id")]
+    _fbtrace_id: Option<String>,
 }
 
 #[cfg(test)]

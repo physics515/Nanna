@@ -19,6 +19,8 @@ pub struct ToolRegistry {
     aliases: RwLock<HashSet<String>>,
     /// Reverse map: alias name → canonical target name
     alias_targets: RwLock<HashMap<String, String>>,
+    /// Default working directory for tool execution (set from active workspace)
+    default_workdir: RwLock<Option<std::path::PathBuf>>,
 }
 
 impl ToolRegistry {
@@ -28,7 +30,19 @@ impl ToolRegistry {
             tools: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashSet::new()),
             alias_targets: RwLock::new(HashMap::new()),
+            default_workdir: RwLock::new(None),
         }
+    }
+
+    /// Set the default working directory for tool execution.
+    /// Called when the active workspace changes.
+    pub async fn set_default_workdir(&self, workdir: Option<std::path::PathBuf>) {
+        *self.default_workdir.write().await = workdir;
+    }
+
+    /// Get the current default working directory.
+    pub async fn default_workdir(&self) -> Option<std::path::PathBuf> {
+        self.default_workdir.read().await.clone()
     }
 
     /// Register a tool
@@ -267,12 +281,18 @@ impl ToolRegistry {
 
         let output_target = tool.output_target();
         let start = std::time::Instant::now();
-        
+
+        // Normalize camelCase parameter keys to snake_case.
+        // Weaker models (OpenRouter free, small Ollama) often send "filePath"
+        // instead of "file_path", etc. We add snake_case aliases without
+        // removing the originals so either convention works.
+        let parameters = normalize_param_keys(call.parameters.clone());
+
         // Execute with timeout if specified
         let result = if let Some(timeout_secs) = tool.timeout_secs() {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
-                tool.execute(call.parameters.clone()),
+                tool.execute(parameters.clone()),
             )
             .await
             {
@@ -287,7 +307,7 @@ impl ToolRegistry {
                 }
             }
         } else {
-            match tool.execute(call.parameters.clone()).await {
+            match tool.execute(parameters.clone()).await {
                 Ok(result) => result,
                 Err(e) => {
                     warn!("Tool {} execution error: {}", call.name, e);
@@ -456,6 +476,44 @@ fn normalized_similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Find the largest byte index <= max_bytes that is a valid char boundary.
+/// Convert a camelCase string to snake_case.
+fn camel_to_snake(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(ch.to_lowercase().next().unwrap_or(ch));
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Normalize parameter keys from camelCase to snake_case.
+///
+/// Adds snake_case aliases for any camelCase keys without removing originals.
+/// Example: `{"filePath": "x"}` → `{"filePath": "x", "file_path": "x"}`
+fn normalize_param_keys(mut params: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
+    let aliases: Vec<(String, serde_json::Value)> = params
+        .iter()
+        .filter_map(|(k, v)| {
+            let snake = camel_to_snake(k);
+            if snake != *k && !params.contains_key(&snake) {
+                Some((snake, v.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (key, val) in aliases {
+        params.insert(key, val);
+    }
+    params
+}
+
 fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     if s.len() <= max_bytes {
         return s.len();

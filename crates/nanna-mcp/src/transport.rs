@@ -63,7 +63,6 @@ pub mod stdio {
         /// # Errors
         ///
         /// Returns error if process fails to spawn
-        #[allow(clippy::unused_async)] // Async for API consistency
         pub async fn spawn_with_env(
             program: &str,
             args: &[&str],

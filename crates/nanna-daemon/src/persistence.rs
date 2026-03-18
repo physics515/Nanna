@@ -19,6 +19,8 @@ pub struct PersistedSession {
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<SessionMessage>,
     pub metadata: HashMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 impl From<&Session> for PersistedSession {
@@ -30,6 +32,7 @@ impl From<&Session> for PersistedSession {
             updated_at: session.updated_at,
             messages: session.messages.clone(),
             metadata: session.metadata.clone(),
+            workspace_id: session.workspace_id.clone(),
         }
     }
 }
@@ -45,8 +48,24 @@ impl From<PersistedSession> for Session {
             subscribers: Default::default(),
             owner: None,
             metadata: persisted.metadata,
+            workspace_id: persisted.workspace_id,
         }
     }
+}
+
+/// Persisted workspace entry (just the path — context is reloaded from disk)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWorkspace {
+    pub id: String,
+    pub path: String,
+    pub active: bool,
+}
+
+/// Workspace persistence state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWorkspaceState {
+    pub version: u32,
+    pub workspaces: Vec<PersistedWorkspace>,
 }
 
 /// Complete daemon state for persistence
@@ -178,6 +197,49 @@ impl PersistenceManager {
                 Ok((sessions, state.default_session_id))
             }
         }
+    }
+    
+    // ═══ Workspace Persistence ═══
+    
+    fn workspaces_path(&self) -> PathBuf {
+        self.data_dir.join("workspaces.json")
+    }
+    
+    /// Save registered workspace paths to disk
+    pub async fn save_workspaces(&self, entries: &[PersistedWorkspace]) -> Result<(), String> {
+        self.ensure_dir().await.map_err(|e| e.to_string())?;
+        
+        let state = PersistedWorkspaceState {
+            version: 1,
+            workspaces: entries.to_vec(),
+        };
+        
+        let json = serde_json::to_string_pretty(&state)
+            .map_err(|e| format!("Failed to serialize workspaces: {}", e))?;
+        
+        let path = self.workspaces_path();
+        fs::write(&path, json).await
+            .map_err(|e| format!("Failed to write workspaces file: {}", e))?;
+        
+        debug!("Saved {} workspaces to {:?}", entries.len(), path);
+        Ok(())
+    }
+    
+    /// Load workspace paths from disk
+    pub async fn load_workspaces(&self) -> Result<Vec<PersistedWorkspace>, String> {
+        let path = self.workspaces_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        
+        let json = fs::read_to_string(&path).await
+            .map_err(|e| format!("Failed to read workspaces file: {}", e))?;
+        
+        let state: PersistedWorkspaceState = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse workspaces file: {}", e))?;
+        
+        info!("Loaded {} workspaces from {:?}", state.workspaces.len(), path);
+        Ok(state.workspaces)
     }
     
     /// Auto-save sessions periodically (call this from a background task)

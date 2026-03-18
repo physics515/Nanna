@@ -1,70 +1,49 @@
 <template>
-  <div :class="['tool-call-card', statusClass]">
-    <div class="flex items-center justify-between mb-2">
-      <div class="flex items-center gap-2">
-        <span class="tool-type-icon" :title="toolCategory">{{ toolIcon }}</span>
-        <span class="tool-name">{{ toolCall.name }}</span>
-        <span v-if="status === 'started'" class="running-indicator" />
-      </div>
-      <div class="flex items-center gap-2 text-xs">
-        <span v-if="toolCall.duration_ms" class="duration-badge">
-          {{ formatDuration(toolCall.duration_ms) }}
-        </span>
-        <span :class="statusBadgeClass">
-          <span class="status-dot" />
-          {{ statusText }}
-        </span>
-      </div>
-    </div>
-    
-    <!-- Progress bar for running tools -->
-    <div v-if="status === 'started'" class="progress-bar">
-      <div class="progress-bar-inner" />
-    </div>
-    
-    <!-- Input -->
-    <div class="tool-section">
-      <button 
-        @click="showInput = !showInput" 
-        class="tool-section-header"
-      >
-        <span class="flex items-center gap-1">
-          <span class="text-xs">📥</span>
-          Input
-        </span>
-        <span class="chevron" :class="{ 'rotate-90': showInput }">›</span>
-      </button>
-      <Transition name="expand">
-        <pre v-if="showInput" class="tool-code">{{ formatJson(toolCall.input) }}</pre>
-      </Transition>
-    </div>
-    
-    <!-- Output -->
-    <div v-if="toolCall.output || status === 'started'" class="tool-section">
-      <button 
-        @click="showOutput = !showOutput" 
-        class="tool-section-header"
-      >
-        <span class="flex items-center gap-1">
-          <span class="text-xs">📤</span>
-          Output
-        </span>
-        <span class="chevron" :class="{ 'rotate-90': showOutput }">›</span>
-      </button>
-      <Transition name="expand">
-        <div v-if="showOutput">
-          <pre v-if="toolCall.output" class="tool-code tool-output" :class="{ 'output-error': status === 'error' }">{{ truncateOutput(toolCall.output) }}</pre>
-          <div v-else class="tool-code flex items-center gap-2 text-nanna-text-dim">
-            <span class="animate-pulse">Waiting for result...</span>
-          </div>
+  <div
+    class="tool-card"
+    :class="statusClass"
+    :style="{ background: splatterBg }"
+    @mouseenter="onEnter"
+    @mouseleave="onLeave"
+  >
+    <!-- Collapsed header (always visible) -->
+    <button class="tool-header" @click="expanded = !expanded">
+      <span class="tool-icon">{{ toolIcon }}</span>
+      <span class="tool-name">{{ toolCall.name }}</span>
+      <span v-if="inputSummary" class="tool-input-summary">{{ inputSummary }}</span>
+      <span class="tool-spacer" />
+      <span v-if="status === 'started'" class="tool-running-dot" />
+      <span v-if="toolCall.duration_ms" class="tool-duration">{{ formatDuration(toolCall.duration_ms) }}</span>
+      <span :class="['tool-status', `tool-status--${status}`]">
+        {{ status === 'started' ? '⟳' : status === 'completed' ? '✓' : '✗' }}
+      </span>
+      <svg class="tool-chevron" :class="{ 'tool-chevron--open': expanded }" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 2l3 3-3 3" />
+      </svg>
+    </button>
+
+    <!-- Expanded detail -->
+    <Transition name="tool-expand">
+      <div v-if="expanded" class="tool-detail">
+        <!-- Input -->
+        <div class="tool-section">
+          <div class="tool-section-label">📥 Input</div>
+          <pre class="tool-code">{{ formatJson(toolCall.input) }}</pre>
         </div>
-      </Transition>
-    </div>
+        <!-- Output -->
+        <div v-if="toolCall.output || status === 'started'" class="tool-section">
+          <div class="tool-section-label">📤 Output</div>
+          <pre v-if="toolCall.output" class="tool-code" :class="{ 'tool-code--error': status === 'error' }">{{ truncateOutput(toolCall.output) }}</pre>
+          <div v-else class="tool-code tool-code--waiting">Waiting for result...</div>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { useSplatter } from '~/composables/useSplatter'
 
 interface ToolCallInfo {
   id: string
@@ -80,59 +59,55 @@ const props = defineProps<{
   status: 'started' | 'completed' | 'error'
 }>()
 
-const showInput = ref(false)
-const showOutput = ref(true)
+const expanded = ref(false)
 
-// Tool category mapping for icons
-const toolCategories: Record<string, { icon: string; category: string }> = {
-  // File operations
-  read_file: { icon: '📄', category: 'File' },
-  write_file: { icon: '✏️', category: 'File' },
-  list_dir: { icon: '📁', category: 'File' },
-  // Execution
-  exec: { icon: '⚡', category: 'Shell' },
-  // Web
-  web_fetch: { icon: '🌐', category: 'Web' },
-  web_search: { icon: '🔍', category: 'Search' },
-  // Browser
-  browser: { icon: '🖥️', category: 'Browser' },
-  // Memory
-  memory_search: { icon: '🧠', category: 'Memory' },
-  memory_get: { icon: '📚', category: 'Memory' },
-  // Default
-  echo: { icon: '💬', category: 'Debug' },
-}
-
-const toolIcon = computed(() => {
-  const name = props.toolCall.name.toLowerCase()
-  return toolCategories[name]?.icon || '🔧'
-})
-
-const toolCategory = computed(() => {
-  const name = props.toolCall.name.toLowerCase()
-  return toolCategories[name]?.category || 'Tool'
-})
-
-const statusText = computed(() => {
+// Splatter mesh colors based on status
+const statusColors = computed<[string, string, string]>(() => {
   switch (props.status) {
-    case 'started': return 'Running'
-    case 'completed': return 'Done'
-    case 'error': return 'Failed'
-    default: return ''
+    case 'started': return ['251,191,36', '234,179,8', '245,158,11'] // amber
+    case 'error': return ['239,68,68', '220,38,38', '248,113,113'] // red
+    default: return ['139,92,246', '99,102,241', '167,139,250'] // violet/indigo
   }
 })
 
-const statusClass = computed(() => ({
-  'tool-running': props.status === 'started',
-  'tool-success': props.status === 'completed',
-  'tool-error': props.status === 'error',
-}))
+const { splatterBg, onEnter, onLeave } = useSplatter({
+  colors: statusColors,
+  opacityRanges: [[0.06, 0.08], [0.04, 0.06], [0.02, 0.04]],
+  sizes: ['70%', '65%', '55%'],
+})
 
-const statusBadgeClass = computed(() => ({
-  'status-badge': true,
-  'status-running': props.status === 'started',
-  'status-success': props.status === 'completed',
-  'status-error': props.status === 'error',
+const toolIcons: Record<string, string> = {
+  read_file: '📄', write_file: '✏️', list_dir: '📁', explore: '🗂️',
+  exec: '⚡', bash: '⚡',
+  web_fetch: '🌐', web_search: '🔍', web_search_batch: '🔍',
+  browser_action: '🖥️', browser_screenshot: '📸', browser_extract: '🖥️', browser_evaluate: '🖥️',
+  remember: '🧠', recall: '🧠', reflect: '🧠', recall_messages: '🧠',
+  discover_tools: '🔧', create_tool: '🔧',
+  remind: '⏰', cancel_reminder: '⏰', list_reminders: '⏰',
+  todo: '✅', task: '📋',
+  code_outline: '📊', code_search: '🔎', project_structure: '🏗️',
+  read_pdf: '📕', ocr: '👁️', analyze_image: '🖼️', describe_image: '🖼️',
+  text_to_speech: '🔊', transcribe: '🎙️',
+  screenshot: '📸', status: 'ℹ️', echo: '💬', wonder: '💭',
+}
+
+const toolIcon = computed(() => toolIcons[props.toolCall.name] || '🔧')
+
+const inputSummary = computed(() => {
+  const input = props.toolCall.input
+  if (!input || typeof input !== 'object') return ''
+  // Show the most relevant parameter as a brief summary
+  const path = input.file_path || input.filePath || input.path || input.command || input.query || input.url
+  if (path) {
+    const s = String(path)
+    return s.length > 60 ? '…' + s.slice(-55) : s
+  }
+  return ''
+})
+
+const statusClass = computed(() => ({
+  'tool-card--running': props.status === 'started',
+  'tool-card--error': props.status === 'error',
 }))
 
 function formatDuration(ms: number): string {
@@ -142,221 +117,163 @@ function formatDuration(ms: number): string {
 }
 
 function formatJson(obj: any): string {
-  try {
-    return JSON.stringify(obj, null, 2)
-  } catch {
-    return String(obj)
-  }
+  try { return JSON.stringify(obj, null, 2) } catch { return String(obj) }
 }
 
 function truncateOutput(output: string): string {
-  const maxLength = 2000
-  if (output.length > maxLength) {
-    return output.substring(0, maxLength) + '\n... (truncated)'
-  }
-  return output
+  return output.length > 2000 ? output.substring(0, 2000) + '\n... (truncated)' : output
 }
 </script>
 
 <style scoped>
-.tool-call-card {
-  background: rgba(15, 23, 42, 0.5);
+.tool-card {
+  position: relative;
   border-radius: 0.5rem;
-  padding: 0.75rem;
-  margin: 0.5rem 0;
-  border-left: 3px solid rgba(139, 92, 246, 0.3);
-  border: 1px solid rgba(71, 85, 105, 0.15);
-  border-left: 3px solid rgba(139, 92, 246, 0.3);
-  font-size: 0.875rem;
-  transition: all 0.2s ease;
+  overflow: hidden;
+  transition: box-shadow 0.15s ease;
+}
+.tool-card:hover {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 }
 
-.tool-running {
-  border-left-color: rgba(251, 191, 36, 0.5);
+.tool-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 10px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  color: #e2e8f0;
+  outline: none;
+  text-align: left;
 }
 
-.tool-success {
-  border-left-color: var(--color-nanna-success);
-}
-
-.tool-error {
-  border-left-color: var(--color-nanna-error);
-  box-shadow: 0 0 0 1px var(--color-nanna-error) inset;
-}
-
-.tool-type-icon {
-  font-size: 1.1rem;
-  filter: drop-shadow(0 0 2px currentColor);
+.tool-icon {
+  font-size: 13px;
+  flex-shrink: 0;
 }
 
 .tool-name {
-  font-family: var(--font-mono);
+  font-family: var(--font-mono, monospace);
   font-weight: 600;
-  color: var(--color-nanna-secondary);
+  color: #c4b5fd;
+  flex-shrink: 0;
 }
 
-.running-indicator {
-  width: 8px;
-  height: 8px;
-  background: var(--color-nanna-warning);
+.tool-input-summary {
+  color: rgba(148, 163, 184, 0.6);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tool-spacer {
+  flex: 1;
+}
+
+.tool-running-dot {
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  animation: blink 1s infinite;
+  background: #fbbf24;
+  animation: tool-blink 1s infinite;
+  flex-shrink: 0;
 }
 
-@keyframes blink {
+@keyframes tool-blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
 
-.duration-badge {
-  padding: 0.125rem 0.375rem;
-  background: var(--color-nanna-bg-surface);
-  border-radius: 0.25rem;
-  color: var(--color-nanna-text-dim);
-  font-family: var(--font-mono);
+.tool-duration {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.5);
+  flex-shrink: 0;
 }
 
-.status-badge {
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-  padding: 0.125rem 0.5rem;
-  border-radius: 9999px;
-  font-size: 0.7rem;
-  font-weight: 500;
+.tool-status {
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.tool-status--completed { color: #34d399; }
+.tool-status--error { color: #fb7185; }
+.tool-status--started { color: #fbbf24; animation: tool-spin 1s linear infinite; }
+
+@keyframes tool-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
-.status-running {
-  background: var(--color-nanna-warning);
-  background: linear-gradient(90deg, var(--color-nanna-warning), #f59e0b);
-  color: #000;
+.tool-chevron {
+  width: 8px;
+  height: 8px;
+  color: rgba(148, 163, 184, 0.4);
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
 }
-
-.status-success {
-  background: var(--color-nanna-success);
-  background: linear-gradient(90deg, var(--color-nanna-success), #10b981);
-  color: #000;
-}
-
-.status-error {
-  background: var(--color-nanna-error);
-  background: linear-gradient(90deg, var(--color-nanna-error), #ef4444);
-  color: #fff;
-}
-
-.status-dot {
-  width: 6px;
-  height: 6px;
-  background: currentColor;
-  border-radius: 50%;
-}
-
-.status-running .status-dot {
-  animation: pulse-dot 1s infinite;
-}
-
-@keyframes pulse-dot {
-  0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.5); }
-}
-
-.progress-bar {
-  height: 2px;
-  background: var(--color-nanna-bg-surface);
-  border-radius: 1px;
-  overflow: hidden;
-  margin: 0.5rem 0;
-}
-
-.progress-bar-inner {
-  height: 100%;
-  width: 30%;
-  background: var(--color-nanna-warning);
-  border-radius: 1px;
-  animation: progress 1.5s ease-in-out infinite;
-}
-
-@keyframes progress {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(400%); }
-}
-
-.tool-section {
-  margin-top: 0.5rem;
-}
-
-.tool-section-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: 0.375rem 0.5rem;
-  background: var(--color-nanna-bg-surface);
-  border-radius: 0.25rem;
-  color: var(--color-nanna-text-muted);
-  font-size: 0.75rem;
-  cursor: pointer;
-  transition: all 0.2s;
-  border: 1px solid transparent;
-}
-
-.tool-section-header:hover {
-  background: var(--color-nanna-bg-deep);
-  border-color: var(--color-nanna-primary);
-}
-
-.chevron {
-  transition: transform 0.2s;
-  font-size: 1rem;
-  line-height: 1;
-}
-
-.rotate-90 {
+.tool-chevron--open {
   transform: rotate(90deg);
 }
 
+/* Expanded detail */
+.tool-detail {
+  padding: 0 10px 8px;
+}
+
+.tool-section {
+  margin-top: 6px;
+}
+
+.tool-section-label {
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.5);
+  margin-bottom: 2px;
+}
+
 .tool-code {
-  margin-top: 0.25rem;
-  padding: 0.5rem;
-  background: var(--color-nanna-bg-deep);
-  border-radius: 0.25rem;
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  color: var(--color-nanna-text);
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: #cbd5e1;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-all;
   max-height: 200px;
   overflow-y: auto;
-  border: 1px solid var(--color-nanna-primary);
 }
 
-.tool-output {
-  color: var(--color-nanna-accent);
-  border-color: var(--color-nanna-accent);
+.tool-code--error {
+  color: #fca5a5;
 }
 
-.output-error {
-  color: var(--color-nanna-error);
-  border-color: var(--color-nanna-error);
-  background: linear-gradient(135deg, var(--color-nanna-bg-deep), rgba(239, 68, 68, 0.1));
+.tool-code--waiting {
+  color: rgba(148, 163, 184, 0.5);
+  font-style: italic;
 }
 
-.expand-enter-active,
-.expand-leave-active {
-  transition: all 0.2s ease;
+/* Expand transition */
+.tool-expand-enter-active,
+.tool-expand-leave-active {
+  transition: all 0.15s ease;
   overflow: hidden;
 }
-
-.expand-enter-from,
-.expand-leave-to {
+.tool-expand-enter-from,
+.tool-expand-leave-to {
   opacity: 0;
   max-height: 0;
 }
-
-.expand-enter-to,
-.expand-leave-from {
+.tool-expand-enter-to,
+.tool-expand-leave-from {
   opacity: 1;
-  max-height: 300px;
+  max-height: 500px;
 }
 </style>

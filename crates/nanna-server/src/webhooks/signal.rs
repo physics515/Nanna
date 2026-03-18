@@ -10,119 +10,128 @@ use tracing::{debug, info, warn};
 
 /// Signal envelope from signal-cli-rest-api webhook
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalWebhook {
     pub envelope: SignalEnvelope,
     pub account: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalEnvelope {
     pub source: Option<String>,
     #[serde(rename = "sourceNumber")]
     pub source_number: Option<String>,
     #[serde(rename = "sourceUuid")]
-    pub source_uuid: Option<String>,
+    pub _source_uuid: Option<String>,
     #[serde(rename = "sourceName")]
     pub source_name: Option<String>,
     #[serde(rename = "sourceDevice")]
-    pub source_device: Option<i32>,
-    pub timestamp: i64,
+    pub _source_device: Option<i32>,
+#[serde(rename = "timestamp")]
+    pub _timestamp: i64,
     #[serde(rename = "dataMessage")]
     pub data_message: Option<SignalDataMessage>,
     #[serde(rename = "syncMessage")]
     pub sync_message: Option<SignalSyncMessage>,
     #[serde(rename = "typingMessage")]
-    pub typing_message: Option<serde_json::Value>,
+    pub _typing_message: Option<serde_json::Value>,
     #[serde(rename = "receiptMessage")]
-    pub receipt_message: Option<serde_json::Value>,
+    pub _receipt_message: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalDataMessage {
-    pub timestamp: i64,
+#[serde(rename = "timestamp")]
+    pub _timestamp: i64,
     pub message: Option<String>,
     #[serde(rename = "expiresInSeconds")]
-    pub expires_in_seconds: Option<i64>,
+    pub _expires_in_seconds: Option<i64>,
     #[serde(rename = "groupInfo")]
     pub group_info: Option<SignalGroupInfo>,
-    pub quote: Option<SignalQuote>,
-    pub mentions: Option<Vec<SignalMention>>,
-    pub attachments: Option<Vec<SignalAttachment>>,
+#[serde(rename = "quote")]
+    pub _quote: Option<SignalQuote>,
+#[serde(rename = "mentions")]
+    pub _mentions: Option<Vec<SignalMention>>,
+#[serde(rename = "attachments")]
+    pub _attachments: Option<Vec<SignalAttachment>>,
     pub reaction: Option<SignalReaction>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalSyncMessage {
     #[serde(rename = "sentMessage")]
-    pub sent_message: Option<SignalSentMessage>,
+    pub _sent_message: Option<SignalSentMessage>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalSentMessage {
-    pub destination: Option<String>,
+#[serde(rename = "destination")]
+    pub _destination: Option<String>,
     #[serde(rename = "destinationNumber")]
-    pub destination_number: Option<String>,
-    pub timestamp: i64,
-    pub message: Option<String>,
+    pub _destination_number: Option<String>,
+#[serde(rename = "timestamp")]
+    pub _timestamp: i64,
+#[serde(rename = "message")]
+    pub _message: Option<String>,
     #[serde(rename = "groupInfo")]
-    pub group_info: Option<SignalGroupInfo>,
+    pub _group_info: Option<SignalGroupInfo>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalGroupInfo {
     #[serde(rename = "groupId")]
     pub group_id: String,
     #[serde(rename = "type")]
-    pub group_type: Option<String>,
+    pub _group_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalQuote {
-    pub id: i64,
-    pub author: Option<String>,
+#[serde(rename = "id")]
+    pub _id: i64,
+#[serde(rename = "author")]
+    pub _author: Option<String>,
     #[serde(rename = "authorNumber")]
-    pub author_number: Option<String>,
-    pub text: Option<String>,
+    pub _author_number: Option<String>,
+#[serde(rename = "text")]
+    pub _text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalMention {
-    pub start: i32,
-    pub length: i32,
-    pub uuid: Option<String>,
-    pub number: Option<String>,
+#[serde(rename = "start")]
+    pub _start: i32,
+#[serde(rename = "length")]
+    pub _length: i32,
+#[serde(rename = "uuid")]
+    pub _uuid: Option<String>,
+#[serde(rename = "number")]
+    pub _number: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalAttachment {
     #[serde(rename = "contentType")]
-    pub content_type: String,
-    pub filename: Option<String>,
-    pub id: Option<String>,
-    pub size: Option<i64>,
+    pub _content_type: String,
+#[serde(rename = "filename")]
+    pub _filename: Option<String>,
+#[serde(rename = "id")]
+    pub _id: Option<String>,
+#[serde(rename = "size")]
+    pub _size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignalReaction {
-    pub emoji: String,
+#[serde(rename = "emoji")]
+    pub _emoji: String,
     #[serde(rename = "targetAuthor")]
-    pub target_author: Option<String>,
+    pub _target_author: Option<String>,
     #[serde(rename = "targetAuthorNumber")]
-    pub target_author_number: Option<String>,
+    pub _target_author_number: Option<String>,
     #[serde(rename = "targetSentTimestamp")]
-    pub target_sent_timestamp: i64,
+    pub _target_sent_timestamp: i64,
     #[serde(rename = "isRemove")]
-    pub is_remove: bool,
+    pub _is_remove: bool,
 }
 
 /// Response to send back (signal-cli-rest-api will send the message)

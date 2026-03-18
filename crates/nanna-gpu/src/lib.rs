@@ -5,7 +5,6 @@
 //!
 //! Provides GPU acceleration for embedding operations, matrix multiplication,
 //! and other compute-heavy tasks.
-#![allow(dead_code)]
 
 use bytemuck::Pod;
 use std::sync::Arc;
@@ -93,8 +92,8 @@ impl GpuContext {
 
 /// GPU buffer for compute operations
 pub struct GpuBuffer {
-    buffer: wgpu::Buffer,
-    size: u64,
+    _buffer: wgpu::Buffer,
+    _size: u64,
 }
 
 impl GpuBuffer {
@@ -107,8 +106,8 @@ impl GpuBuffer {
         });
 
         Self {
-            buffer,
-            size: std::mem::size_of_val(data) as u64,
+            _buffer: buffer,
+            _size: std::mem::size_of_val(data) as u64,
         }
     }
 
@@ -122,12 +121,12 @@ impl GpuBuffer {
             mapped_at_creation: false,
         });
 
-        Self { buffer, size }
+        Self { _buffer: buffer, _size: size }
     }
 }
 
 /// Dot product compute shader (WGSL)
-const DOT_PRODUCT_SHADER: &str = r"
+const _DOT_PRODUCT_SHADER: &str = r"
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> result: array<f32>;

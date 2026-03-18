@@ -1,5 +1,4 @@
 //! Discord webhook handler
-#![allow(dead_code)]
 
 use crate::state::AppState;
 use axum::{
@@ -22,9 +21,9 @@ pub struct InteractionType(pub u8);
 impl InteractionType {
     pub const PING: Self = Self(1);
     pub const APPLICATION_COMMAND: Self = Self(2);
-    pub const MESSAGE_COMPONENT: Self = Self(3);
-    pub const AUTOCOMPLETE: Self = Self(4);
-    pub const MODAL_SUBMIT: Self = Self(5);
+    pub const _MESSAGE_COMPONENT: Self = Self(3);
+    pub const _AUTOCOMPLETE: Self = Self(4);
+    pub const _MODAL_SUBMIT: Self = Self(5);
 }
 
 /// Discord interaction response types
@@ -35,9 +34,9 @@ pub struct InteractionResponseType(pub u8);
 impl InteractionResponseType {
     pub const PONG: Self = Self(1);
     pub const CHANNEL_MESSAGE: Self = Self(4);
-    pub const DEFERRED_CHANNEL_MESSAGE: Self = Self(5);
-    pub const DEFERRED_UPDATE_MESSAGE: Self = Self(6);
-    pub const UPDATE_MESSAGE: Self = Self(7);
+    pub const _DEFERRED_CHANNEL_MESSAGE: Self = Self(5);
+    pub const _DEFERRED_UPDATE_MESSAGE: Self = Self(6);
+    pub const _UPDATE_MESSAGE: Self = Self(7);
 }
 
 /// Discord interaction payload.
@@ -46,52 +45,69 @@ pub struct Interaction {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: InteractionType,
-    pub token: String,
-    pub guild_id: Option<String>,
+#[serde(rename = "token")]
+    pub _token: String,
+#[serde(rename = "guild_id")]
+    pub _guild_id: Option<String>,
     pub channel_id: Option<String>,
     pub member: Option<Member>,
     pub user: Option<User>,
     pub data: Option<InteractionData>,
-    pub message: Option<Message>,
+#[serde(rename = "message")]
+    pub _message: Option<Message>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct InteractionData {
-    pub id: Option<String>,
-    pub name: Option<String>,
+#[serde(rename = "id")]
+    pub _id: Option<String>,
+#[serde(rename = "name")]
+    pub _name: Option<String>,
     pub options: Option<Vec<CommandOption>>,
-    pub custom_id: Option<String>,
-    pub values: Option<Vec<String>>,
+#[serde(rename = "custom_id")]
+    pub _custom_id: Option<String>,
+#[serde(rename = "values")]
+    pub _values: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CommandOption {
-    pub name: String,
+#[serde(rename = "name")]
+    pub _name: String,
     pub value: Option<serde_json::Value>,
-    pub options: Option<Vec<Self>>,
+#[serde(rename = "options")]
+    pub _options: Option<Vec<Self>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Member {
     pub user: Option<User>,
-    pub nick: Option<String>,
-    pub roles: Vec<String>,
+#[serde(rename = "nick")]
+    pub _nick: Option<String>,
+#[serde(rename = "roles")]
+    pub _roles: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct User {
     pub id: String,
     pub username: String,
-    pub discriminator: Option<String>,
-    pub global_name: Option<String>,
+#[serde(rename = "discriminator")]
+    pub _discriminator: Option<String>,
+#[serde(rename = "global_name")]
+    pub _global_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
-    pub id: String,
-    pub content: String,
-    pub author: User,
-    pub channel_id: String,
+#[serde(rename = "id")]
+    pub _id: String,
+#[serde(rename = "content")]
+    pub _content: String,
+#[serde(rename = "author")]
+    pub _author: User,
+#[serde(rename = "channel_id")]
+    pub _channel_id: String,
 }
 
 /// Discord interaction response

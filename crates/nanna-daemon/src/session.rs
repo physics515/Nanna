@@ -74,6 +74,9 @@ pub struct Session {
     /// Session metadata
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Workspace this session belongs to (None = global)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 impl Session {
@@ -89,6 +92,7 @@ impl Session {
             subscribers: HashSet::new(),
             owner: None,
             metadata: HashMap::new(),
+            workspace_id: None,
         }
     }
     
@@ -104,7 +108,14 @@ impl Session {
             subscribers: HashSet::new(),
             owner: None,
             metadata: HashMap::new(),
+            workspace_id: None,
         }
+    }
+
+    /// Set the workspace ID for this session
+    pub fn with_workspace(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
     }
     
     /// Add a message to the session
@@ -194,6 +205,8 @@ pub struct SessionSummary {
     pub message_count: usize,
     pub subscriber_count: usize,
     pub owner: Option<ChannelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 impl From<&Session> for SessionSummary {
@@ -206,6 +219,7 @@ impl From<&Session> for SessionSummary {
             message_count: session.messages.len(),
             subscriber_count: session.subscribers.len(),
             owner: session.owner.clone(),
+            workspace_id: session.workspace_id.clone(),
         }
     }
 }
@@ -282,7 +296,13 @@ impl SessionManager {
     
     /// Create a session and return it
     pub async fn create(&self, name: Option<String>) -> Session {
-        let session = Session::new(name);
+        self.create_in_workspace(name, None).await
+    }
+
+    /// Create a new session in a specific workspace
+    pub async fn create_in_workspace(&self, name: Option<String>, workspace_id: Option<String>) -> Session {
+        let mut session = Session::new(name);
+        session.workspace_id = workspace_id;
         let id = session.id.clone();
         
         let mut sessions = self.sessions.write().await;
@@ -294,10 +314,21 @@ impl SessionManager {
             *default = Some(id.clone());
         }
         
-        info!("Created session: {}", id);
+        info!("Created session: {} (workspace: {:?})", id, session.workspace_id);
         session
     }
     
+    /// Set or clear the workspace for an existing session
+    pub async fn set_workspace(&self, session_id: &str, workspace_id: Option<String>) -> bool {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.workspace_id = workspace_id;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get a session by ID
     pub async fn get(&self, id: &str) -> Option<Session> {
         let sessions = self.sessions.read().await;

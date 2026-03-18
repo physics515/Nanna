@@ -231,23 +231,28 @@ impl Backend {
                             "delta": delta,
                         }));
                     }
-                    DaemonEvent::ToolStart { session_id, call_id, name, .. } => {
+                    DaemonEvent::ToolStart { session_id, call_id, name, input } => {
                         let _ = app.emit("tool-call", serde_json::json!({
                             "session_id": session_id,
                             "tool_call": {
                                 "id": call_id,
                                 "name": name,
+                                "input": input,
+                                "output": "",
+                                "success": false,
+                                "duration_ms": 0,
                             },
                             "status": "started",
                         }));
                     }
-                    DaemonEvent::ToolEnd { session_id, call_id, output, success, .. } => {
+                    DaemonEvent::ToolEnd { session_id, call_id, output, success, duration_ms } => {
                         let _ = app.emit("tool-call", serde_json::json!({
                             "session_id": session_id,
                             "tool_call": {
                                 "id": call_id,
                                 "output": output,
                                 "success": success,
+                                "duration_ms": duration_ms.unwrap_or(0),
                             },
                             "status": if *success { "completed" } else { "error" },
                         }));
@@ -314,9 +319,9 @@ impl Backend {
     /// Send a chat message
     /// In daemon mode: forwards to daemon
     /// In embedded mode: caller should use embedded agent
-    pub async fn chat_send(&self, session_id: &str, content: &str) -> Result<Value, String> {
+    pub async fn chat_send(&self, session_id: &str, content: &str, attachments: Vec<serde_json::Value>) -> Result<Value, String> {
         if self.is_daemon_mode().await {
-            self.daemon_client.chat_send(session_id, content).await
+            self.daemon_client.chat_send(session_id, content, attachments).await
         } else {
             Err("EMBEDDED_MODE".to_string())
         }
@@ -330,6 +335,15 @@ impl Backend {
             Err("EMBEDDED_MODE".to_string())
         }
     }
+
+    /// List sessions filtered by workspace
+    pub async fn sessions_list_by_workspace(&self, workspace_id: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.sessions_list_by_workspace(workspace_id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
     
     /// Create a session
     pub async fn session_create(&self, name: Option<&str>) -> Result<Value, String> {
@@ -339,7 +353,25 @@ impl Backend {
             Err("EMBEDDED_MODE".to_string())
         }
     }
+
+    /// Create a session in a specific workspace
+    pub async fn session_create_in_workspace(&self, name: Option<&str>, workspace_id: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.session_create_in_workspace(name, workspace_id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
     
+    /// Set or clear the workspace for a session
+    pub async fn session_set_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<Value, String> {
+        if self.is_daemon_mode().await {
+            self.daemon_client.session_set_workspace(session_id, workspace_id).await
+        } else {
+            Err("EMBEDDED_MODE".to_string())
+        }
+    }
+
     /// Get session history
     pub async fn session_history(&self, session_id: &str, limit: Option<usize>) -> Result<Value, String> {
         if self.is_daemon_mode().await {

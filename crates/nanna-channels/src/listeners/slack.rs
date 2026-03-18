@@ -29,7 +29,6 @@ pub struct SlackListener {
     /// App-level token (xapp-*)
     app_token: String,
     /// Bot user token (xoxb-*) - for API calls
-    #[allow(dead_code)]
     bot_token: String,
     /// HTTP client for API calls
     client: Client,
@@ -361,12 +360,12 @@ struct SocketModePayload {
     envelope_type: String,
     envelope_id: Option<String>,
     payload: Option<Value>,
-    #[allow(dead_code)]
-    accepts_response_payload: Option<bool>,
-    #[allow(dead_code)]
-    retry_attempt: Option<u32>,
-    #[allow(dead_code)]
-    retry_reason: Option<String>,
+    #[serde(rename = "accepts_response_payload")]
+    _accepts_response_payload: Option<bool>,
+    #[serde(rename = "retry_attempt")]
+    _retry_attempt: Option<u32>,
+    #[serde(rename = "retry_reason")]
+    _retry_reason: Option<String>,
 }
 
 #[cfg(test)]

@@ -11,8 +11,8 @@ export default {
     required: ["file_path"]
   },
   execute: function(input) {
-    // Accept both file_path (Claude Code convention) and path (legacy)
-    var filePath = input.file_path || input.path;
+    // Accept multiple parameter name variants from different models
+    var filePath = input.file_path || input.filePath || input.path || input.file || input.filename;
     if (!filePath) throw "Missing required parameter: file_path";
 
     var MAX_SIZE = 10 * 1024 * 1024;

@@ -13,13 +13,15 @@ export default {
     required: ["pattern"]
   },
   execute: function(input) {
-    var searchPath = input.path || ".";
+    var searchPattern = input.pattern || input.query || input.search || input.regex;
+    if (!searchPattern) throw "Missing required parameter: pattern";
+    var searchPath = input.path || input.dir || input.directory || ".";
     var ctx = input.context_lines !== undefined && input.context_lines !== null ? input.context_lines : 2;
     var maxResults = input.max_results || 50;
 
     var regex;
     try {
-      regex = new RegExp(input.pattern, "i");
+      regex = new RegExp(searchPattern, "i");
     } catch (e) {
       return "Error: Invalid regex pattern: " + e.message;
     }
@@ -34,8 +36,13 @@ export default {
       files.push(e);
     }
 
+    if (files.length === 0) {
+      return "No files found in \"" + searchPath + "\" (resolved from listDir). Found " + entries.length + " total entries. Try specifying an absolute path.";
+    }
+
     var results = [];
     var totalMatches = 0;
+    var readErrors = 0;
 
     for (var fi = 0; fi < files.length; fi++) {
       if (totalMatches >= maxResults) break;
@@ -44,6 +51,7 @@ export default {
       try {
         content = Nanna.readFile(files[fi].name);
       } catch (err) {
+        readErrors++;
         continue;
       }
 
@@ -66,7 +74,9 @@ export default {
     }
 
     if (results.length === 0) {
-      return "No matches found for \"" + input.pattern + "\" in " + searchPath;
+      var msg = "No matches found for \"" + searchPattern + "\" in " + searchPath + " (" + files.length + " files searched)";
+      if (readErrors > 0) msg += " (" + readErrors + " files failed to read)";
+      return msg;
     }
 
     var output = results.join("\n\n");

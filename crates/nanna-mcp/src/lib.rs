@@ -1,6 +1,5 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
 
 //! MCP (Model Context Protocol) client for Nanna
 //!

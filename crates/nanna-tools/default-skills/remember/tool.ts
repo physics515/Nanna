@@ -12,12 +12,14 @@ export default {
     required: ["content"]
   },
   execute: function(input) {
+    var memContent = input.content || input.text || input.memory || input.fact;
+    if (!memContent) throw "Missing required parameter: content";
     var params = {
-      content: input.content,
+      content: memContent,
       tags: input.tags || {},
       importance: input.importance || 1.0
     };
     var result = Nanna.service("memory.store", params);
-    return "Remembered (id: " + result.id + "): " + input.content.substring(0, 100) + (input.content.length > 100 ? "..." : "");
+    return "Remembered (id: " + result.id + "): " + memContent.substring(0, 100) + (memContent.length > 100 ? "..." : "");
   }
 }

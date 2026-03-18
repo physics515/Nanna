@@ -630,12 +630,20 @@ impl AgentContext {
     /// Truncate oldest messages to get under the hard limit.
     ///
     /// This is a last-resort measure when compression isn't enough or isn't possible.
-    /// Always keeps at least the last user message to avoid empty request errors.
+    /// Always keeps the first user message (the original request) and the most recent
+    /// messages to avoid losing the user's intent.
     /// Returns the number of messages removed.
     pub fn truncate_to_limit(&mut self) -> usize {
         let mut removed = 0;
 
-        // Keep at least 1 message (the most recent user message)
+        // Keep at least 2 messages (first user message + most recent)
+        // Remove from index 1 (after the first message) to preserve the original request
+        while self.exceeds_hard_limit() && self.messages.len() > 2 {
+            self.messages.remove(1);
+            removed += 1;
+        }
+
+        // If still over limit with only 2 messages, fall back to removing the first
         while self.exceeds_hard_limit() && self.messages.len() > 1 {
             self.messages.remove(0);
             removed += 1;
@@ -670,7 +678,8 @@ impl AgentContext {
                 match block {
                     ContentBlock::ToolResult { content, .. } => {
                         if content.len() > max_block_chars {
-                            let truncated = &content[..max_block_chars.min(content.len())];
+                            let end = content.floor_char_boundary(max_block_chars.min(content.len()));
+                            let truncated = &content[..end];
                             *content = format!(
                                 "{}\n\n[... truncated {} chars to fit context limit ...]",
                                 truncated,
@@ -685,7 +694,8 @@ impl AgentContext {
                     }
                     ContentBlock::Text { text } => {
                         if text.len() > max_block_chars {
-                            let truncated = &text[..max_block_chars.min(text.len())];
+                            let end = text.floor_char_boundary(max_block_chars.min(text.len()));
+                            let truncated = &text[..end];
                             *text = format!(
                                 "{}\n\n[... truncated {} chars to fit context limit ...]",
                                 truncated,
@@ -844,7 +854,8 @@ impl AgentContext {
                     }
                     ContentBlock::ToolResult { content, .. } => content.clone(),
                     ContentBlock::Thinking { thinking } => {
-                        format!("[Thinking: {}]", &thinking[..thinking.len().min(200)])
+                        let end = thinking.floor_char_boundary(thinking.len().min(200));
+                        format!("[Thinking: {}]", &thinking[..end])
                     }
                     ContentBlock::Image { .. } => "[Image]".to_string(),
                 };
@@ -852,7 +863,8 @@ impl AgentContext {
                 if chars_collected + block_text.len() > max_chars {
                     // Take partial if we haven't collected anything yet
                     if content.is_empty() {
-                        content.push_str(&block_text[..max_chars.min(block_text.len())]);
+                        let end = block_text.floor_char_boundary(max_chars.min(block_text.len()));
+                        content.push_str(&block_text[..end]);
                     }
                     return content;
                 }
@@ -1051,19 +1063,28 @@ impl AgentContext {
 
     /// Drop oldest messages (no LLM required) as a fallback compression strategy.
     ///
-    /// Keeps the most recent `keep_recent` messages and drops the rest,
-    /// adding a note to `consolidated_summary` about what was dropped.
+    /// Keeps the first user message (original request) and the most recent
+    /// `keep_recent` messages, dropping everything in between.
+    /// Adds a note to `consolidated_summary` about what was dropped.
     /// Returns the number of messages dropped.
     pub fn drop_oldest(&mut self, keep_recent: usize) -> usize {
-        if self.messages.len() <= keep_recent {
+        // +1 for the pinned first message
+        if self.messages.len() <= keep_recent + 1 {
             return 0;
         }
 
-        let drop_count = self.messages.len() - keep_recent;
+        // Preserve first message (the original user request) by only dropping from index 1+
+        let droppable = &self.messages[1..]; // everything after the first message
 
-        // Build a brief summary of what's being dropped
+        let drop_count = if droppable.len() > keep_recent {
+            droppable.len() - keep_recent
+        } else {
+            return 0;
+        };
+
+        // Build a brief summary of what's being dropped (from index 1..1+drop_count)
         let mut dropped_summary_parts = Vec::new();
-        for msg in &self.messages[..drop_count] {
+        for msg in &self.messages[1..1 + drop_count] {
             let role = &msg.role;
             for block in &msg.content {
                 match block {
@@ -1105,8 +1126,8 @@ impl AgentContext {
         };
         self.consolidated_summary = Some(new_summary);
 
-        // Actually remove
-        self.messages.drain(0..drop_count);
+        // Actually remove (from index 1, preserving the pinned first message)
+        self.messages.drain(1..1 + drop_count);
 
         info!(
             dropped = drop_count,
@@ -1140,9 +1161,11 @@ impl AgentContext {
             });
         }
 
-        // Split messages into old (to compress) and recent (to keep)
+        // Split messages into old (to compress) and recent (to keep).
+        // Always preserve the first message (original user request) — start compressing from index 1.
         let split_point = self.messages.len() - keep_recent;
-        let old_messages = &self.messages[..split_point];
+        let compress_start = 1.min(split_point); // skip index 0 (pinned first message)
+        let old_messages = &self.messages[compress_start..split_point];
         
         // Build a text representation of old messages
         let mut conversation_text = String::new();
@@ -1228,9 +1251,11 @@ Provide a concise summary (2-4 paragraphs max):"#,
             created_at: chrono_timestamp(),
         };
 
-        // Store summary and remove old messages
+        // Store summary and remove old compressed messages (preserve first message)
         self.summaries.push(summary.clone());
-        self.messages = self.messages.split_off(split_point);
+        let mut kept = vec![self.messages[0].clone()]; // pin first message
+        kept.extend(self.messages.split_off(split_point));
+        self.messages = kept;
 
         Ok(summary)
     }
