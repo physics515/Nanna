@@ -1,5 +1,5 @@
 # Nanna Status Report
-*Updated: 2026-03-10 (verified against codebase)*
+*Updated: 2026-03-17*
 
 ## Summary by Phase
 
@@ -18,7 +18,7 @@
 
 ---
 
-## What's Working Now (2026-03-10)
+## What's Working Now (2026-03-17)
 
 - **Desktop app** builds and runs on Windows (Tauri + Nuxt)
 - **Daemon mode** runs headless with WebSocket IPC on port 5149
@@ -32,6 +32,13 @@
 - **Prompt caching** active for Anthropic and OpenAI (50-80% input cost savings)
 - **Health HTTP endpoint** on port 5148 with PID file management
 - **Windows service runtime** (`windows_service.rs`) — can run as service, but install/uninstall management stubbed
+- **Embedded OCR** via `ocrs` crate (pure Rust, auto-downloads ONNX models, Latin script)
+- **Tiered OCR pipeline** — embedded ocrs → configurable vision model priority list
+- **OCR settings GUI** — vision-capable model filter + priority list in Settings
+- **Narration loop detection** hardened — catches phantom completion and weak model hallucination
+- **Tool result recall** fixed — tool results now properly stored in memory for recall
+- **FSRS memory persistence** — memories stored directly to SQLite, JSON auto-save removed
+- **Memory page** uses useGroundGlass() and useSplatter() composable effects
 
 ---
 
