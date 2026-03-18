@@ -11,6 +11,7 @@ tracing.workspace = true
 thiserror.workspace = true
 half.workspace = true
 uuid.workspace = true
+async-trait.workspace = true
 
 nanna-simd = { path = "../nanna-simd" }
 nanna-gpu = { path = "../nanna-gpu" }

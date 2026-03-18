@@ -81,12 +81,27 @@ impl ScriptEngine {
         tool_definitions: Option<Value>,
         services: Option<HashMap<String, ServiceFn>>,
     ) -> Result<ExecutionResult> {
+        self.execute_with_workdir(tool, input, tool_definitions, services, None).await
+    }
+
+    /// Execute a scripted tool with an optional default working directory.
+    pub async fn execute_with_workdir(
+        &self,
+        tool: &ScriptedTool,
+        input: Value,
+        tool_definitions: Option<Value>,
+        services: Option<HashMap<String, ServiceFn>>,
+        default_workdir: Option<std::path::PathBuf>,
+    ) -> Result<ExecutionResult> {
         let mut bridge = NannaBridge::new(tool.permissions.clone());
         if let Some(defs) = tool_definitions {
             bridge = bridge.with_tool_definitions(defs);
         }
         if let Some(svcs) = services {
             bridge = bridge.with_services(svcs);
+        }
+        if let Some(wd) = default_workdir {
+            bridge = bridge.with_default_workdir(wd);
         }
         let bridge = Arc::new(bridge);
         let start = std::time::Instant::now();

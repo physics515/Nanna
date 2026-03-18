@@ -8,6 +8,9 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("004_workspaces", MIGRATION_004),
     ("005_job_runs", MIGRATION_005),
     ("006_model_stats", MIGRATION_006),
+    ("007_tool_stats", MIGRATION_007),
+    ("008_workspace_registry", MIGRATION_008),
+    ("009_memory_fsrs", MIGRATION_009),
 ];
 
 const MIGRATION_001: &str = r"
@@ -184,4 +187,102 @@ CREATE TABLE IF NOT EXISTS model_request_log (
 
 CREATE INDEX IF NOT EXISTS idx_model_request_log_model ON model_request_log(model);
 CREATE INDEX IF NOT EXISTS idx_model_request_log_created ON model_request_log(created_at);
+";
+
+const MIGRATION_007: &str = r"
+-- Tool performance statistics (aggregated per tool)
+CREATE TABLE IF NOT EXISTS tool_stats (
+    tool_name TEXT PRIMARY KEY,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms INTEGER NOT NULL DEFAULT 0,
+    last_called_epoch_ms INTEGER NOT NULL DEFAULT 0,
+    -- Recent latencies stored as JSON array (ring buffer)
+    latencies_ms_json TEXT NOT NULL DEFAULT '[]',
+    -- Recent output sizes stored as JSON array (ring buffer)
+    output_sizes_json TEXT NOT NULL DEFAULT '[]',
+    -- Common errors as JSON: [{ message, count }]
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Per-invocation tool call log (time-series data for graphs)
+CREATE TABLE IF NOT EXISTS tool_call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    output_size INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    session_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_call_log_tool ON tool_call_log(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_call_log_created ON tool_call_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_call_log_tool_created ON tool_call_log(tool_name, created_at);
+
+-- Hourly aggregated tool stats (for dashboard graphs over time)
+CREATE TABLE IF NOT EXISTS tool_stats_hourly (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name TEXT NOT NULL,
+    hour TEXT NOT NULL,  -- ISO hour: '2026-03-11T15:00:00'
+    call_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms INTEGER NOT NULL DEFAULT 0,
+    avg_duration_ms INTEGER NOT NULL DEFAULT 0,
+    p95_duration_ms INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tool_name, hour)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_stats_hourly_hour ON tool_stats_hourly(hour);
+CREATE INDEX IF NOT EXISTS idx_tool_stats_hourly_tool ON tool_stats_hourly(tool_name, hour);
+
+-- Daily aggregated tool stats (for longer-term trends)
+CREATE TABLE IF NOT EXISTS tool_stats_daily (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name TEXT NOT NULL,
+    day TEXT NOT NULL,  -- ISO date: '2026-03-11'
+    call_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms INTEGER NOT NULL DEFAULT 0,
+    avg_duration_ms INTEGER NOT NULL DEFAULT 0,
+    p95_duration_ms INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(tool_name, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_stats_daily_day ON tool_stats_daily(day);
+CREATE INDEX IF NOT EXISTS idx_tool_stats_daily_tool ON tool_stats_daily(tool_name, day);
+";
+
+const MIGRATION_008: &str = r"
+-- Workspace registry: persists registered workspaces across restarts
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_accessed TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_path ON workspaces(path);
+";
+
+const MIGRATION_009: &str = r"
+-- Add FSRS cognitive state columns and workspace scope to memories
+ALTER TABLE memories ADD COLUMN workspace_id TEXT;
+ALTER TABLE memories ADD COLUMN expires_at INTEGER;
+ALTER TABLE memories ADD COLUMN fsrs_stability REAL NOT NULL DEFAULT 1.0;
+ALTER TABLE memories ADD COLUMN fsrs_difficulty REAL NOT NULL DEFAULT 5.0;
+ALTER TABLE memories ADD COLUMN fsrs_last_access INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN fsrs_access_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN fsrs_importance REAL NOT NULL DEFAULT 1.0;
+ALTER TABLE memories ADD COLUMN fsrs_storage_strength REAL NOT NULL DEFAULT 0.1;
+ALTER TABLE memories ADD COLUMN fsrs_generation INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
 ";

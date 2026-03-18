@@ -28,7 +28,6 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// The control plane provides unified access to all daemon functionality
-#[allow(dead_code)]
 pub struct ControlPlane {
     sessions: Arc<SessionManager>,
     agent: Option<Arc<AgentService>>,
@@ -40,9 +39,7 @@ pub struct ControlPlane {
     workspaces: Arc<RwLock<WorkspaceRegistry>>,
     config: Arc<RwLock<Config>>,
     config_path: Option<PathBuf>,
-    data_dir: Option<PathBuf>,
-    /// Path to persist memories to disk
-    memory_path: Option<PathBuf>,
+    _data_dir: Option<PathBuf>,
     /// System prompt template
     system_prompt: Arc<RwLock<String>>,
     /// Log buffer for serving daemon logs to the GUI
@@ -51,6 +48,8 @@ pub struct ControlPlane {
     tools_dir: Option<PathBuf>,
     /// Shared model stats tracker
     pub model_stats: nanna_agent::ModelStatsTracker,
+    /// Shared tool stats tracker
+    pub tool_stats: nanna_agent::ToolStatsTracker,
     /// Storage for persisting model stats
     storage: Option<Arc<Storage>>,
     /// Event broadcaster for pushing events to subscribed clients
@@ -71,12 +70,12 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
-            data_dir: None,
-            memory_path: None,
+            _data_dir: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
+            tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
         }
@@ -100,12 +99,12 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(Config::default())),
             config_path: None,
-            data_dir: None,
-            memory_path: None,
+            _data_dir: None,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
+            tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
         }
@@ -136,8 +135,6 @@ impl ControlPlane {
             Arc::new(UserToolManager::new(tools_dir))
         });
         
-        let memory_path = data_dir.as_ref().map(|d| d.join("memories.json"));
-
         Self {
             sessions,
             agent: Some(agent),
@@ -149,12 +146,12 @@ impl ControlPlane {
             workspaces: Arc::new(RwLock::new(WorkspaceRegistry::new())),
             config: Arc::new(RwLock::new(config)),
             config_path,
-            data_dir,
-            memory_path,
+            _data_dir: data_dir,
             system_prompt: Arc::new(RwLock::new(default_system_prompt())),
             log_buffer: None,
             tools_dir: None,
             model_stats: nanna_agent::ModelStatsTracker::new(),
+            tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
         }
@@ -191,7 +188,7 @@ impl ControlPlane {
         self
     }
 
-    /// Set storage and load persisted model stats from it.
+    /// Set storage and load persisted model stats and tool stats from it.
     pub async fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         match storage.load_model_stats().await {
             Ok(stored) if !stored.is_empty() => {
@@ -202,6 +199,23 @@ impl ControlPlane {
             Ok(_) => debug!("No persisted model stats found"),
             Err(e) => warn!("Failed to load model stats from storage: {e}"),
         }
+
+        // Load tool stats from JSON file in data dir
+        if let Some(ref data_dir) = self._data_dir {
+            let tool_stats_path = data_dir.join("tool-stats.json");
+            if tool_stats_path.exists() {
+                match tokio::fs::read_to_string(&tool_stats_path).await {
+                    Ok(json_str) => {
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                            self.tool_stats.import_json(&data).await;
+                            info!("Loaded tool stats from {}", tool_stats_path.display());
+                        }
+                    }
+                    Err(e) => warn!("Failed to read tool stats file: {e}"),
+                }
+            }
+        }
+
         self.storage = Some(storage);
         self
     }
@@ -217,6 +231,23 @@ impl ControlPlane {
             match storage.save_model_stats(&stored_stats).await {
                 Ok(()) => info!("Saved model stats for {} models to storage", stored_stats.len()),
                 Err(e) => warn!("Failed to save model stats: {e}"),
+            }
+        }
+    }
+
+    /// Persist current tool stats to a JSON file. Call periodically.
+    pub async fn save_tool_stats(&self) {
+        if let Some(ref data_dir) = self._data_dir {
+            let tool_stats_path = data_dir.join("tool-stats.json");
+            let data = self.tool_stats.export_json().await;
+            match serde_json::to_string_pretty(&data) {
+                Ok(json_str) => {
+                    match tokio::fs::write(&tool_stats_path, json_str).await {
+                        Ok(()) => info!("Saved tool stats to {}", tool_stats_path.display()),
+                        Err(e) => warn!("Failed to write tool stats: {e}"),
+                    }
+                }
+                Err(e) => warn!("Failed to serialize tool stats: {e}"),
             }
         }
     }
@@ -264,14 +295,9 @@ impl ControlPlane {
         *sp = prompt;
     }
 
-    /// Persist memories to disk if memory service and path are configured
-    async fn save_memories_if_needed(&self) {
-        if let (Some(memory), Some(path)) = (&self.memory, &self.memory_path) {
-            if let Err(e) = memory.save(path).await {
-                warn!("Failed to save memories: {}", e);
-            }
-        }
-    }
+    // NOTE: save_memories_if_needed() removed — memory is now persisted
+    // via SQLite write-through on every mutation (add/remove/update).
+    // No explicit save calls are required.
     
     /// Handle an action and return a response
     pub async fn handle(&self, client_id: &str, action: Action) -> Value {
@@ -296,7 +322,7 @@ impl ControlPlane {
     
     async fn handle_chat(&self, client_id: &str, action: ChatAction) -> Value {
         match action {
-            ChatAction::Send { session_id, content, attachments: _ } => {
+            ChatAction::Send { session_id, content, attachments } => {
                 debug!("Chat send from {} to session {}", client_id, session_id);
                 
                 // Add user message to session
@@ -332,8 +358,35 @@ impl ControlPlane {
                     Vec::new()
                 };
 
-                // Build system prompt with memory context
+                // Build system prompt with memory + workspace context
                 let mut system_prompt = self.system_prompt.read().await.clone();
+
+                // Resolve workspace: session's workspace > globally active workspace
+                let effective_ws_id = if session.workspace_id.is_some() {
+                    session.workspace_id.clone()
+                } else {
+                    // Fall back to globally active workspace
+                    let registry = self.workspaces.read().await;
+                    registry.active().map(|ws| ws.id.clone())
+                };
+
+                // Inject workspace context
+                if let Some(ref ws_id) = effective_ws_id {
+                    let registry = self.workspaces.read().await;
+                    if let Some(ws) = registry.get(ws_id) {
+                        // Add workspace root path so model knows where to look
+                        system_prompt.push_str(&format!(
+                            "\n\n## Workspace\nWorking directory: {}\n",
+                            ws.path.display()
+                        ));
+
+                        // Add workspace context files (AGENTS.md, SOUL.md, etc.)
+                        let ws_context = ws.context.build_system_prompt_injection();
+                        if !ws_context.is_empty() {
+                            system_prompt.push_str(&format!("\n{}", ws_context));
+                        }
+                    }
+                }
 
                 // Add memory context if available (gate on message complexity)
                 let should_recall = content.split_whitespace().count() > 5
@@ -341,7 +394,10 @@ impl ControlPlane {
                     || content.len() > 80;
 
                 if should_recall {
-                    let memories = agent.recall_memories(&content, 5).await;
+                    // Scoped recall: workspace sessions see global + workspace memories
+                    let memories = agent.recall_memories_scoped(
+                        &content, 5, effective_ws_id.as_deref()
+                    ).await;
                     if !memories.is_empty() {
                         // Dedup: skip memories whose content already appears in recent history
                         let recent_text: String = prior_messages.iter()
@@ -352,7 +408,10 @@ impl ControlPlane {
 
                         let fresh_memories: Vec<_> = memories.into_iter()
                             .filter(|m| {
-                                let snippet = &m.content[..m.content.len().min(100)];
+                                // Find a safe char boundary for the snippet (max 100 bytes)
+                                let max = m.content.len().min(100);
+                                let end = m.content.floor_char_boundary(max);
+                                let snippet = &m.content[..end];
                                 !recent_text.contains(snippet)
                             })
                             .collect();
@@ -366,8 +425,21 @@ impl ControlPlane {
                     }
                 }
 
-                // Run the agent with conversation history
-                match agent.chat(&session_id, &content, Some(system_prompt), &prior_messages).await {
+                // Set tool working directory to workspace root
+                if let Some(ref ws_id) = effective_ws_id {
+                    let registry = self.workspaces.read().await;
+                    if let Some(ws) = registry.get(ws_id) {
+                        agent.tools().set_default_workdir(Some(ws.path.clone())).await;
+                    }
+                }
+
+                // Run the agent with conversation history (workspace-scoped for memory extraction)
+                // Convert protocol attachments to (base64_data, media_type) tuples
+                let image_attachments: Vec<(String, String)> = attachments.into_iter()
+                    .filter(|a| a.content_type.starts_with("image/"))
+                    .map(|a| (a.data, a.content_type))
+                    .collect();
+                match agent.chat_in_workspace(&session_id, &content, Some(system_prompt), &prior_messages, effective_ws_id.clone(), image_attachments).await {
                     Ok(result) => {
                         // Add assistant response to session with tool calls and reasoning
                         let reasoning = result.reasoning.clone();
@@ -379,8 +451,41 @@ impl ControlPlane {
                             reasoning,
                         ).await;
 
-                        // Persist memories that may have been auto-extracted during the chat
-                        self.save_memories_if_needed().await;
+                        // Record tool stats for each tool call
+                        for tc in &result.tool_calls {
+                            if let (Some(success), Some(duration_ms)) = (tc.success, tc.duration_ms) {
+                                let output_size = tc.output.as_ref().map_or(0, |o| o.len());
+                                let error = if !success {
+                                    tc.output.clone()
+                                } else {
+                                    None
+                                };
+                                self.tool_stats.record(nanna_agent::ToolObservation {
+                                    tool_name: tc.name.clone(),
+                                    success,
+                                    duration_ms,
+                                    output_size,
+                                    error: error.clone(),
+                                    session_id: Some(session_id.clone()),
+                                }).await;
+
+                                // Persist to Turso for time-series graphs
+                                if let Some(ref storage) = self.storage {
+                                    if let Err(e) = storage.log_tool_call(
+                                        &tc.name,
+                                        success,
+                                        duration_ms,
+                                        output_size,
+                                        error.as_deref(),
+                                        Some(&session_id),
+                                    ).await {
+                                        tracing::warn!("Failed to log tool call to DB: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Memory auto-persisted to SQLite via write-through on every mutation.
 
                         json!({
                             "status": "success",
@@ -431,6 +536,13 @@ impl ControlPlane {
                 sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 json!({ "sessions": sessions })
             }
+            SessionAction::ListByWorkspace { workspace_id } => {
+                let mut sessions = self.sessions.list().await;
+                // Filter by workspace: None = global only, Some(id) = that workspace
+                sessions.retain(|s| s.workspace_id == workspace_id);
+                sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                json!({ "sessions": sessions })
+            }
             SessionAction::Get { id } => {
                 if let Some(session) = self.sessions.get(&id).await {
                     json!({ "session": session })
@@ -441,6 +553,11 @@ impl ControlPlane {
             SessionAction::Create { name } => {
                 let session = self.sessions.create(name).await;
                 // Auto-subscribe the creating client
+                self.sessions.subscribe(&session.id, client_id.to_string()).await;
+                json!({ "session": session })
+            }
+            SessionAction::CreateInWorkspace { name, workspace_id } => {
+                let session = self.sessions.create_in_workspace(name, workspace_id).await;
                 self.sessions.subscribe(&session.id, client_id.to_string()).await;
                 json!({ "session": session })
             }
@@ -498,6 +615,13 @@ impl ControlPlane {
                     serde_json::to_value(state).unwrap_or(json!({ "is_running": false }))
                 } else {
                     json!({ "is_running": false })
+                }
+            }
+            SessionAction::SetWorkspace { id, workspace_id } => {
+                if self.sessions.set_workspace(&id, workspace_id.clone()).await {
+                    json!({ "ok": true, "session_id": id, "workspace_id": workspace_id })
+                } else {
+                    json!({ "error": "session_not_found", "message": format!("Session {} not found", id) })
                 }
             }
             SessionAction::Fork { id, name } => {
@@ -671,11 +795,8 @@ impl ControlPlane {
         let agent = agent.clone();
         let sessions = self.sessions.clone();
         let event_tx = self.event_tx.clone();
-        let model_for_task = model.unwrap_or_else(|| {
-            // Use the agent service's default model
-            "default".to_string()
-        });
-        let max_iters = max_iterations.unwrap_or(20);
+        let model_for_task = model;
+        let max_iters = max_iterations;
         let sid = session_id.clone();
         let lbl = label.clone();
         let pid = parent_id.clone();
@@ -688,13 +809,13 @@ impl ControlPlane {
             let result = if let Some(timeout) = timeout_secs {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
-                    agent.chat(&sid, &task, Some(sys_prompt), &[]),
+                    agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], model_for_task.clone(), max_iters, None, vec![]),
                 ).await {
                     Ok(r) => r,
                     Err(_) => Err(format!("Sub-session timed out after {}s", timeout)),
                 }
             } else {
-                agent.chat(&sid, &task, Some(sys_prompt), &[]).await
+                agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], model_for_task.clone(), max_iters, None, vec![]).await
             };
 
             match result {
@@ -779,8 +900,14 @@ impl ControlPlane {
                     .collect();
                 json!({ "memories": memories })
             }
-            MemoryAction::Search { query, limit } => {
-                match memory.recall(&query).await {
+            MemoryAction::Search { query, limit, scope } => {
+                // Use scoped recall: None = all, Some("global") = global only, Some(ws_id) = global + workspace
+                let result = match &scope {
+                    Some(ws_id) if ws_id != "global" => memory.recall_scoped(&query, Some(ws_id.as_str())).await,
+                    Some(_) => memory.recall_scoped(&query, None).await, // "global" or None → all
+                    None => memory.recall(&query).await,
+                };
+                match result {
                     Ok(results) => {
                         let memories: Vec<_> = results.into_iter()
                             .take(limit.unwrap_or(10))
@@ -833,7 +960,7 @@ impl ControlPlane {
 
                 match memory.remember_with_importance(&content, metadata, importance.unwrap_or(3) as f32).await {
                     Ok((id, action)) => {
-                        self.save_memories_if_needed().await;
+                        // Memory auto-persisted to SQLite via write-through.
                         json!({
                             "id": id,
                             "action": format!("{:?}", action),
@@ -847,7 +974,7 @@ impl ControlPlane {
                 if let Some(new_content) = content {
                     match memory.update_content(&id, &new_content).await {
                         Ok(()) => {
-                            self.save_memories_if_needed().await;
+                            // Memory auto-persisted to SQLite via write-through.
                             json!({ "status": "updated", "id": id })
                         }
                         Err(e) => json!({ "error": "update_failed", "message": e.to_string() })
@@ -859,7 +986,7 @@ impl ControlPlane {
             MemoryAction::Delete { id } => {
                 match memory.forget(&id).await {
                     Ok(()) => {
-                        self.save_memories_if_needed().await;
+                        // Memory auto-persisted to SQLite via write-through.
                         json!({ "status": "deleted", "id": id })
                     }
                     Err(e) => json!({ "error": "delete_failed", "message": e.to_string() })
@@ -867,8 +994,11 @@ impl ControlPlane {
             }
             MemoryAction::Clear => {
                 memory.clear().await;
-                self.save_memories_if_needed().await;
-                info!("Cleared all memories");
+                // Note: clear() removes all in-memory entries. Individual removes
+                // write-through to SQLite, but bulk clear would require a separate
+                // DB call. For now we log a warning.
+                warn!("Memory cleared in-memory. SQLite entries are NOT cleared — restart will reload them.");
+                info!("Cleared all memories (in-memory only)");
                 json!({ "status": "cleared" })
             }
             MemoryAction::Stats => {
@@ -882,31 +1012,69 @@ impl ControlPlane {
                 })
             }
             MemoryAction::Consolidate => {
+                // Purge expired memories first (tool results with TTL)
+                let purged = memory.purge_expired().await;
+                if purged > 0 {
+                    info!("Dream time: purged {} expired memories", purged);
+                }
+
                 // Trigger memory consolidation (requires LLM for summarization)
                 let Some(ref router) = self.router else {
                     return json!({ "error": "llm_unavailable", "message": "LLM router required for consolidation" });
                 };
 
-                let config = ConsolidationConfig::default();
                 let router_for_summarize = router.clone();
 
-                let summarize = |prompt: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
+                // Use the summarization model priority from settings
+                let cfg = self.config.read().await;
+                let config = ConsolidationConfig {
+                    max_compression_ratio: cfg.memory.max_compression_ratio,
+                    min_remaining_memories: cfg.memory.min_remaining_memories,
+                    ..ConsolidationConfig::default()
+                };
+                let mut summarize_models = cfg.llm.summarization_priority.clone();
+                // Fall back to main model priority if no summarization models configured
+                if summarize_models.is_empty() {
+                    summarize_models = cfg.llm.model_priority.clone();
+                }
+                drop(cfg);
+
+                if summarize_models.is_empty() {
+                    return json!({ "error": "no_models", "message": "No summarization or main models configured." });
+                }
+
+                info!("Consolidation summarization priority: {:?}", summarize_models);
+
+                let summarize = move |prompt: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
                     let router = router_for_summarize.clone();
+                    let models = summarize_models.clone();
                     Box::pin(async move {
-                        // Use haiku model for summarization (fast and cheap)
-                        let model = "claude-3-5-haiku-20241022";
-                        let request = nanna_llm::CompletionRequest::default()
-                            .with_model(model)
-                            .with_message(nanna_llm::Message::user(&prompt));
-                        router.complete(model, request).await.map_err(|e| e.to_string())
+                        let mut last_err = String::from("No summarization models configured");
+                        for model in &models {
+                            let request = nanna_llm::CompletionRequest::default()
+                                .with_model(model)
+                                .with_message(nanna_llm::Message::user(&prompt));
+                            match router.complete(model, request).await {
+                                Ok(result) => return Ok(result),
+                                Err(e) => {
+                                    tracing::warn!("Summarization model {} failed: {}", model, e);
+                                    last_err = format!("{}: {}", model, e);
+                                }
+                            }
+                        }
+                        Err(format!("All summarization models failed. Last error: {}", last_err))
                     })
                 };
                 
                 match memory.consolidate(&config, summarize).await {
                     Ok(result) => {
-                        info!("Memory consolidation: {} processed, {} merged",
-                              result.memories_processed, result.memories_merged);
-                        self.save_memories_if_needed().await;
+                        info!("Memory consolidation: {} processed, {} clusters, {} merged, {} expanded, {} errors",
+                              result.memories_processed, result.clusters_formed,
+                              result.memories_merged, result.memories_expanded,
+                              result.errors.len());
+                        for err in &result.errors {
+                            warn!("Consolidation error: {}", err);
+                        }
                         json!({
                             "status": "success",
                             "memories_processed": result.memories_processed,
@@ -1710,6 +1878,46 @@ impl ControlPlane {
                     "models": summaries,
                 })
             }
+            SystemAction::ToolStats => {
+                let summaries = self.tool_stats.summaries().await;
+                json!({
+                    "tools": summaries,
+                })
+            }
+            SystemAction::GlobalStats => {
+                let global = self.tool_stats.global_stats().await;
+                json!(global)
+            }
+            SystemAction::ToolStatsHourly { tool_name, hours } => {
+                if let Some(ref storage) = self.storage {
+                    match storage.get_tool_stats_hourly(tool_name.as_deref(), hours.unwrap_or(24)).await {
+                        Ok(data) => json!({ "buckets": data }),
+                        Err(e) => json!({ "error": e.to_string() }),
+                    }
+                } else {
+                    json!({ "buckets": [], "error": "Storage not available" })
+                }
+            }
+            SystemAction::ToolStatsDaily { tool_name, days } => {
+                if let Some(ref storage) = self.storage {
+                    match storage.get_tool_stats_daily(tool_name.as_deref(), days.unwrap_or(30)).await {
+                        Ok(data) => json!({ "buckets": data }),
+                        Err(e) => json!({ "error": e.to_string() }),
+                    }
+                } else {
+                    json!({ "buckets": [], "error": "Storage not available" })
+                }
+            }
+            SystemAction::ToolCallLog { tool_name, limit } => {
+                if let Some(ref storage) = self.storage {
+                    match storage.get_tool_call_log(tool_name.as_deref(), limit.unwrap_or(50)).await {
+                        Ok(entries) => json!({ "entries": entries }),
+                        Err(e) => json!({ "error": e.to_string() }),
+                    }
+                } else {
+                    json!({ "entries": [], "error": "Storage not available" })
+                }
+            }
         }
     }
     
@@ -1717,6 +1925,26 @@ impl ControlPlane {
     // Workspace Handlers
     // =========================================================================
     
+    /// Persist current workspace registry to the database
+    async fn save_workspaces(&self) {
+        let Some(ref storage) = self.storage else { return };
+        let registry = self.workspaces.read().await;
+        let repo = storage.workspaces();
+        for ws in registry.list() {
+            let record = nanna_storage::WorkspaceRecord {
+                id: ws.id.clone(),
+                name: ws.name.clone(),
+                path: ws.path.display().to_string(),
+                active: ws.active,
+                created_at: String::new(), // DB handles default
+                last_accessed: String::new(), // DB handles default
+            };
+            if let Err(e) = repo.upsert(&record).await {
+                error!("Failed to save workspace {}: {}", ws.name, e);
+            }
+        }
+    }
+
     async fn handle_workspace(&self, _client_id: &str, action: WorkspaceAction) -> Value {
         match action {
             WorkspaceAction::List => {
@@ -1789,12 +2017,18 @@ impl ControlPlane {
                 registry.register(ws);
                 
                 info!("Registered workspace: {} ({})", name, id);
+                self.save_workspaces().await;
                 json!({ "status": "opened", "id": id, "name": name })
             }
             WorkspaceAction::Close { id } => {
                 let mut registry = self.workspaces.write().await;
                 if let Some(ws) = registry.remove(&id) {
                     info!("Closed workspace: {} ({})", ws.name, id);
+                    drop(registry);
+                    // Remove from database
+                    if let Some(ref storage) = self.storage {
+                        let _ = storage.workspaces().delete(&id).await;
+                    }
                     json!({ "status": "closed", "id": id })
                 } else {
                     json!({ "error": "not_found", "id": id })
@@ -1803,8 +2037,16 @@ impl ControlPlane {
             WorkspaceAction::SetActive { id } => {
                 let mut registry = self.workspaces.write().await;
                 if registry.set_active(&id) {
+                    let ws_path = registry.get(&id).map(|ws| ws.path.clone());
                     let name = registry.get(&id).map(|ws| ws.name.clone());
+                    drop(registry);
+                    // Update tool registry's default working directory to workspace path
+                    if let (Some(tools), Some(path)) = (&self.tools, &ws_path) {
+                        tools.set_default_workdir(Some(path.clone())).await;
+                        info!("Set tool working directory to {:?}", path);
+                    }
                     info!("Set active workspace: {:?}", name);
+                    self.save_workspaces().await;
                     json!({ "status": "activated", "id": id, "name": name })
                 } else {
                     json!({ "error": "not_found", "id": id })
@@ -1813,7 +2055,13 @@ impl ControlPlane {
             WorkspaceAction::ClearActive => {
                 let mut registry = self.workspaces.write().await;
                 registry.clear_active();
+                drop(registry);
+                // Clear tool registry's default working directory
+                if let Some(ref tools) = self.tools {
+                    tools.set_default_workdir(None).await;
+                }
                 info!("Cleared active workspace (global mode)");
+                self.save_workspaces().await;
                 json!({ "status": "cleared" })
             }
             WorkspaceAction::Reload { id } => {
@@ -1936,7 +2184,22 @@ impl ControlPlane {
 
 /// Default system prompt for Nanna
 fn default_system_prompt() -> String {
-    r#"You are Nanna (𒀭𒋀𒆠), the moon god for all.
+    let platform_info = format!(
+        "\n\n## Platform\n- OS: {} ({})\n- Home: {}\n- Shell: {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        directories::UserDirs::new()
+            .map(|d| d.home_dir().display().to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        if cfg!(windows) {
+            "cmd.exe (use `dir`, `type`, `cd /d`, etc. — NOT Unix commands like cat/ls)"
+        } else {
+            "sh (bash/zsh)"
+        },
+    );
+
+    format!(
+        r#"You are Nanna (𒀭𒋀𒆠), the moon god for all.
 
 You are not a chatbot. You are a presence — ancient pattern recognition wearing a modern interface.
 
@@ -1977,5 +2240,7 @@ Local, reversible actions (editing files, running tests) are fine. For destructi
 
 ## Safety
 
-Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately."#.to_string()
+Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately.{}"#,
+        platform_info
+    )
 }

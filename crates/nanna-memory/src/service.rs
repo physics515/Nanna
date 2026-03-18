@@ -11,6 +11,7 @@ use crate::{
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -116,6 +117,9 @@ pub struct MemoryService {
     pending_updates: RwLock<Vec<(String, Rating)>>,
     /// Runtime-adjustable minimum score (overrides config)
     min_score_override: RwLock<Option<f32>>,
+    /// Runtime dimension — updated atomically when probe detects a change.
+    /// This allows `probe_and_align_dimension` to work on `&self` (behind Arc).
+    runtime_dimension: AtomicUsize,
 }
 
 impl MemoryService {
@@ -123,15 +127,17 @@ impl MemoryService {
     #[must_use] 
     pub fn new(config: MemoryServiceConfig) -> Self {
         let store_config = VectorStoreConfig {
-            dimension: config.dimension,
+            dimension: std::sync::atomic::AtomicUsize::new(config.dimension),
             use_f16: true,
         };
+        let dim = config.dimension;
         Self {
             config,
             store: VectorStore::new(store_config),
             embed_fn: None,
             pending_updates: RwLock::new(Vec::new()),
             min_score_override: RwLock::new(None),
+            runtime_dimension: AtomicUsize::new(dim),
         }
     }
 
@@ -140,6 +146,94 @@ impl MemoryService {
     pub fn with_embed_fn(mut self, f: EmbedFn) -> Self {
         self.embed_fn = Some(f);
         self
+    }
+
+    /// Attach a SQLite (or other) persistence backend to the underlying store.
+    ///
+    /// Must be called before [`MemoryService::load_from_db`].
+    #[must_use]
+    pub fn with_persistence(mut self, db: Arc<dyn crate::MemoryPersistence + Send + Sync>) -> Self {
+        self.store = self.store.with_persistence(db);
+        self
+    }
+
+    /// Load all entries from the persistence backend into the in-memory cache.
+    ///
+    /// Replaces any existing in-memory entries.  Call once on startup after
+    /// attaching the persistence layer with [`MemoryService::with_persistence`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::Persistence` if the backing store fails.
+    pub async fn load_from_db(&self) -> Result<usize, MemoryError> {
+        self.store.load_from_db().await
+    }
+
+    /// Probe the actual embedding dimension and re-embed any mismatched entries.
+    ///
+    /// Generates a test embedding to detect the real model dimension. If it
+    /// differs from config, updates the runtime dimension and re-embeds all
+    /// stored entries that have the wrong dimension. This preserves memory
+    /// content across embedding model changes.
+    ///
+    /// This method takes `&self` (not `&mut self`) so it can be called on
+    /// `Arc<MemoryService>` at runtime — e.g., when an embedding provider
+    /// fallback changes the active model mid-session.
+    ///
+    /// Returns the actual dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding function is configured or the
+    /// probe embedding call fails.
+    pub async fn probe_and_align_dimension(&self) -> Result<usize, MemoryError> {
+        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
+            MemoryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "No embedding function configured",
+            ))
+        })?;
+
+        // Generate a test embedding with a short probe string
+        let test_embedding = (embed_fn)("dimension probe")
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+
+        let actual_dim = test_embedding.len();
+        let expected_dim = self.runtime_dimension.load(Ordering::Relaxed);
+        if actual_dim == expected_dim {
+            info!("Embedding dimension confirmed: {}", actual_dim);
+            return Ok(actual_dim);
+        }
+
+        warn!(
+            "Embedding model returns {} dims, expected {}. Reconfiguring and re-embedding.",
+            actual_dim, expected_dim
+        );
+        self.runtime_dimension.store(actual_dim, Ordering::Relaxed);
+        // Also update the VectorStore's dimension so add() accepts the new size
+        self.store.set_dimension(actual_dim);
+
+        // Re-embed all entries that have the wrong dimension.
+        // Clone the embed_fn Arc so we can pass it into the closure.
+        let embed_fn_clone = Arc::clone(embed_fn);
+        let re_embedded = self.store.re_embed_mismatched(actual_dim, |text| {
+            let ef = Arc::clone(&embed_fn_clone);
+            async move { (ef)(&text).await }
+        }).await;
+
+        if re_embedded > 0 {
+            info!("Re-embedded {} entries to {} dimensions", re_embedded, actual_dim);
+        }
+
+        Ok(actual_dim)
+    }
+
+    /// Get the current embedding dimension (may differ from initial config
+    /// if the embedding model changed at runtime).
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        self.runtime_dimension.load(Ordering::Relaxed)
     }
 
     /// Get FSRS parameters
@@ -223,6 +317,7 @@ impl MemoryService {
             timestamp: chrono_timestamp(),
             fsrs: FsrsState::new(),
             workspace_id: None, // smart_ingest creates global memories
+            expires_at: None,
         };
 
         self.store.add(entry).await?;
@@ -265,6 +360,15 @@ impl MemoryService {
             ))
         })?;
 
+        // Truncate oversized content to avoid embedding model context overflow
+        // Most embedding models have 8192 token context; ~4 chars/token ≈ 30k chars safe limit
+        let content = if content.len() > 30_000 {
+            warn!("Truncating oversized memory content ({} chars) to 30000", content.len());
+            &content[..30_000]
+        } else {
+            content
+        };
+
         // Generate embedding
         let embedding = (embed_fn)(content)
             .await
@@ -276,8 +380,13 @@ impl MemoryService {
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
             
+            // Don't reinforce expired or error memories — let them die
+            let skip_reinforce = existing.is_expired()
+                || existing.content.contains("Error:")
+                || existing.content.contains("Command failed");
+
             match action {
-                IngestAction::Reinforce => {
+                IngestAction::Reinforce if !skip_reinforce => {
                     // Just strengthen existing memory (testing effect)
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     // Also boost importance if new fact has higher importance
@@ -292,14 +401,17 @@ impl MemoryService {
                     info!("Reinforced: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Update => {
+                IngestAction::Update if !skip_reinforce => {
                     // Related but different - could merge, but for now treat as reinforcement
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
                     info!("Related memory exists: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Create => {
-                    // Novel content, fall through to create
+                _ => {
+                    // Novel content or skipped reinforcement — fall through to create
+                    if skip_reinforce {
+                        info!("Skipping reinforcement of expired/error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    }
                 }
             }
         }
@@ -314,10 +426,11 @@ impl MemoryService {
             id: id.clone(),
             content: content.to_string(),
             embedding,
-            metadata,
+            metadata: metadata.clone(),
             timestamp: chrono_timestamp(),
             fsrs,
             workspace_id: None, // Global memory
+            expires_at: metadata.get("expires_at").and_then(|s| s.parse::<i64>().ok()),
         };
 
         self.store.add(entry).await?;
@@ -357,9 +470,16 @@ impl MemoryService {
             
             match action {
                 IngestAction::Reinforce | IngestAction::Update => {
-                    self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
-                    info!("Reinforced (scoped): {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
-                    return Ok((existing.id.clone(), action));
+                    // Don't reinforce expired or error memories
+                    if existing.is_expired() {
+                        info!("Skipping reinforcement of expired memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    } else if existing.content.contains("Error:") || existing.content.contains("Command failed") {
+                        info!("Skipping reinforcement of error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    } else {
+                        self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                        info!("Reinforced (scoped): {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                        return Ok((existing.id.clone(), action));
+                    }
                 }
                 IngestAction::Create => {}
             }
@@ -370,6 +490,10 @@ impl MemoryService {
         let mut fsrs = FsrsState::new();
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
         
+        // Extract optional expiration from metadata
+        let expires_at = metadata.get("expires_at")
+            .and_then(|s| s.parse::<i64>().ok());
+
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
@@ -378,10 +502,15 @@ impl MemoryService {
             timestamp: chrono_timestamp(),
             fsrs,
             workspace_id,
+            expires_at,
         };
 
         self.store.add(entry).await?;
-        info!("Remembered (scoped, importance {}): {} (id: {})", importance, truncate(content, 50), id);
+        let ttl_note = expires_at.map_or(String::new(), |t| {
+            let secs = t - chrono_timestamp();
+            format!(" (expires in {}m)", secs / 60)
+        });
+        info!("Remembered (scoped, importance {}{}): {} (id: {})", importance, ttl_note, truncate(content, 50), id);
         Ok((id, IngestAction::Create))
     }
 
@@ -633,6 +762,11 @@ impl MemoryService {
         Ok(())
     }
 
+    /// Purge expired memories (call during dream time)
+    pub async fn purge_expired(&self) -> usize {
+        self.store.purge_expired().await
+    }
+
     /// Get memory count
     pub async fn count(&self) -> usize {
         self.store.len().await
@@ -733,13 +867,19 @@ impl MemoryService {
         self.store.load(path).await
     }
 
+    /// Flush all in-memory entries to the persistence backend (for JSON → SQLite migration).
+    pub async fn flush_to_db(&self) -> Result<usize, MemoryError> {
+        self.store.flush_to_db().await
+    }
+
     /// Run memory consolidation ("dreaming").
     ///
     /// This is the core of the cognitive memory model:
     /// 1. Groups memories by weight bands
-    /// 2. Clusters semantically similar memories within each band
+    /// 2. Clusters memories using a composite score (similarity + recall + importance + age)
     /// 3. Uses LLM to summarize/compress based on weight
     /// 4. Replaces clusters with consolidated memories
+    /// 5. Respects compression limits (max ratio and min remaining count)
     ///
     /// # Arguments
     /// * `config` - Consolidation parameters
@@ -758,7 +898,23 @@ impl MemoryService {
         Fut: Future<Output = Result<String, String>>,
     {
         let mut result = ConsolidationResult::default();
-        
+        let total_memories = self.count().await;
+
+        // Compute budget: how many memories we're allowed to remove
+        let max_removable = ((total_memories as f32) * config.max_compression_ratio) as usize;
+        let floor_headroom = total_memories.saturating_sub(config.min_remaining_memories);
+        let mut removal_budget = max_removable.min(floor_headroom);
+
+        info!(
+            "Consolidation starting: {} memories, removal budget {} (max_ratio={}, floor={})",
+            total_memories, removal_budget, config.max_compression_ratio, config.min_remaining_memories
+        );
+
+        if removal_budget == 0 {
+            info!("Consolidation: nothing to do (at or below floor)");
+            return Ok(result);
+        }
+
         // Get all memories grouped by weight
         let bands = self.get_consolidation_bands().await;
         
@@ -772,7 +928,7 @@ impl MemoryService {
         ];
 
         for (compression_level, memories) in band_entries {
-            if memories.is_empty() {
+            if memories.is_empty() || removal_budget == 0 {
                 continue;
             }
 
@@ -782,14 +938,14 @@ impl MemoryService {
                 continue;
             }
 
-            // Cluster similar memories
-            let clusters = cluster_memories(
-                memories,
-                config.cluster_threshold,
-                config.min_cluster_size,
-            );
+            // Cluster using composite score (similarity + recall + importance + age)
+            let clusters = cluster_memories(memories, config);
 
             for cluster_memories in clusters {
+                if removal_budget == 0 {
+                    break;
+                }
+
                 if cluster_memories.len() < config.min_cluster_size {
                     // Singleton or small cluster - process individually if Expand
                     if compression_level == CompressionLevel::Expand {
@@ -805,6 +961,14 @@ impl MemoryService {
                     continue;
                 }
 
+                // How many would this cluster merge away?
+                let would_remove = cluster_memories.len() - 1; // -1 because we create 1 new
+                if would_remove > removal_budget {
+                    // Skip this cluster — it would exceed our budget
+                    result.memories_processed += cluster_memories.len();
+                    continue;
+                }
+
                 // Create cluster and consolidate
                 let cluster = MemoryCluster::new(
                     cluster_memories.clone(),
@@ -815,19 +979,14 @@ impl MemoryService {
                 match self.consolidate_cluster(&cluster, &summarize_fn).await {
                     Ok(()) => {
                         result.clusters_formed += 1;
-                        result.memories_merged += cluster_memories.len() - 1; // -1 because we create 1 new
+                        result.memories_merged += would_remove;
                         result.memories_processed += cluster_memories.len();
+                        removal_budget = removal_budget.saturating_sub(would_remove);
                     }
                     Err(e) => {
                         result.errors.push(format!("Cluster consolidation failed: {}", e));
                         result.memories_processed += cluster_memories.len();
                     }
-                }
-
-                // Respect max memories per run
-                if result.memories_processed >= config.max_memories_per_run {
-                    info!("Consolidation hit max memories limit ({})", config.max_memories_per_run);
-                    break;
                 }
             }
         }

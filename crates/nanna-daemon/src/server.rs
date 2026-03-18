@@ -4,6 +4,7 @@
 
 use crate::agent_service::{AgentService, AgentServiceConfig};
 use crate::control::ControlPlane;
+use crate::memory_persistence::SqliteMemoryPersistence;
 use crate::health::{HealthServer, HealthState, PidFile, DEFAULT_HEALTH_PORT};
 use crate::ipc::{IpcServer, IpcServerConfig};
 use crate::llm_router::LlmRouter;
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 /// Concrete implementation of AgentSpawner that lives in the daemon
 /// where it can create Agent instances with isolated context.
 struct AgentSpawnerImpl {
-    llm: Arc<LlmClient>,
+    router: Arc<crate::llm_router::LlmRouter>,
     tools: Arc<ToolRegistry>,
     agent_config: nanna_agent::AgentConfig,
     system_prompt: String,
@@ -63,7 +64,32 @@ impl AgentSpawner for AgentSpawnerImpl {
         let mut config = self.agent_config.clone();
         config.max_iterations = Some(max_iterations);
 
-        let mut agent = Agent::new(config, self.llm.clone(), self.tools.clone())
+        // Use sub_agent_model if configured, otherwise fall back to primary model
+        if let Some(ref sub_model) = self.agent_config.sub_agent_model {
+            info!(
+                sub_agent_model = %sub_model,
+                primary_model = %config.model,
+                "Using dedicated sub-agent model instead of primary"
+            );
+            config.model = sub_model.clone();
+        }
+
+        // Select the right LLM client via the router based on the model
+        // The router dispatches to the correct provider (Anthropic, Ollama, OpenAI, etc.)
+        let model = &config.model;
+        let llm_client = self.router.client_for_model(model)
+            .ok_or_else(|| {
+                format!(
+                    "No provider available for model '{}'. Available providers: {:?}",
+                    model,
+                    self.router.available_providers()
+                )
+            })?;
+
+        // Strip provider prefix from model name for the actual API call
+        config.model = LlmRouter::strip_model_prefix(&config.model);
+
+        let mut agent = Agent::new(config, llm_client, self.tools.clone())
             .with_context(context);
 
         // Share model stats tracker with sub-agents
@@ -106,9 +132,14 @@ use std::time::Duration;
 /// Build service closures for script tools.
 ///
 /// These closures allow JS/TS tools to call back into Rust subsystems via `Nanna.service(name, params)`.
+/// Shared session history that can be updated before each agent run.
+/// This allows the `session.history` service to return messages for the current session.
+pub type SharedSessionHistory = Arc<tokio::sync::RwLock<Vec<crate::session::SessionMessage>>>;
+
 fn build_script_services(
     memory: &Option<Arc<MemoryService>>,
     spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
+    session_history: SharedSessionHistory,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{json, Value};
 
@@ -193,6 +224,28 @@ fn build_script_services(
                     })),
                     Err(e) => Err(e),
                 }
+            })
+        }));
+    }
+
+    // Session history service — returns recent messages from the current session.
+    // The SharedSessionHistory is populated before each agent run.
+    {
+        let history = session_history;
+        services.insert("session.history".to_string(), Arc::new(move |params: Value| {
+            let history = history.clone();
+            Box::pin(async move {
+                let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let history = history.read().await;
+                let start = if history.len() > limit { history.len() - limit } else { 0 };
+                let messages: Vec<Value> = history[start..].iter().map(|msg| {
+                    json!({
+                        "role": format!("{:?}", msg.role).to_lowercase(),
+                        "content": msg.content,
+                        "timestamp": msg.timestamp.to_rfc3339(),
+                    })
+                }).collect();
+                Ok(json!(messages))
             })
         }));
     }
@@ -306,14 +359,13 @@ impl Default for DaemonConfig {
 }
 
 /// The main daemon server
-#[allow(dead_code)]
 pub struct DaemonServer {
     config: DaemonConfig,
     embedding: EmbeddingConfig,
     memory_path: Option<PathBuf>,
-    brave_api_key: Option<String>,
+    _brave_api_key: Option<String>,
     sessions: Arc<SessionManager>,
-    control: Arc<ControlPlane>,
+    _control: Arc<ControlPlane>,
     ipc: Arc<IpcServer>,
     persistence: Arc<PersistenceManager>,
     shutdown_tx: broadcast::Sender<()>,
@@ -381,9 +433,9 @@ impl DaemonServer {
             config,
             embedding,
             memory_path,
-            brave_api_key,
+            _brave_api_key: brave_api_key,
             sessions,
-            control,
+            _control: control,
             ipc,
             persistence,
             shutdown_tx,
@@ -473,6 +525,40 @@ impl DaemonServer {
         // Load persisted model stats from storage
         if let Some(ref storage) = self.storage {
             control = control.with_storage(storage.clone()).await;
+        }
+
+        // Load persisted workspaces from database
+        if let Some(ref storage) = self.storage {
+            match storage.workspaces().list().await {
+                Ok(records) if !records.is_empty() => {
+                    let mut registry = control.workspaces().write().await;
+                    let mut active_id = None;
+                    for record in &records {
+                        let path = PathBuf::from(&record.path);
+                        if path.exists() {
+                            let mut ws = nanna_core::Workspace::new(&path);
+                            ws.id = record.id.clone();
+                            if let Err(e) = ws.load_context().await {
+                                warn!("Failed to load workspace context for {}: {}", record.path, e);
+                            }
+                            registry.register(ws);
+                            if record.active {
+                                active_id = Some(record.id.clone());
+                            }
+                        } else {
+                            warn!("Persisted workspace path no longer exists: {}", record.path);
+                        }
+                    }
+                    if let Some(id) = active_id {
+                        registry.set_active(&id);
+                    }
+                    info!("Restored {} workspaces from database", records.len());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to load workspaces from database: {}", e);
+                }
+            }
         }
 
         // Wire model stats tracker into the router for health-aware routing.
@@ -584,39 +670,10 @@ impl DaemonServer {
             persistence.auto_save_loop(sessions_map, default_session, save_interval, save_shutdown).await;
         });
 
-        // Spawn memory auto-save task (parallels session auto-save)
-        let mem_save_handle = if let (Some(mem_service), Some(mem_path)) = (&memory, &self.memory_path) {
-            let mem = mem_service.clone();
-            let path = mem_path.clone();
-            let save_interval = Duration::from_secs(self.config.auto_save_interval_secs);
-            let mut mem_shutdown = self.shutdown_tx.subscribe();
+        // Memory is now persisted via SQLite write-through on every mutation.
+        // The old periodic JSON auto-save timer is removed.
 
-            Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(save_interval);
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            if let Err(e) = mem.save(&path).await {
-                                error!("Memory auto-save failed: {}", e);
-                            }
-                        }
-                        _ = mem_shutdown.recv() => {
-                            // Final save on shutdown
-                            if let Err(e) = mem.save(&path).await {
-                                error!("Memory final save failed: {}", e);
-                            } else {
-                                info!("Memory final save completed");
-                            }
-                            break;
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
-        
-        // Spawn model stats auto-save task (every 5 minutes)
+        // Spawn model + tool stats auto-save task (every 5 minutes)
         let stats_control = control.clone();
         let mut stats_shutdown = self.shutdown_tx.subscribe();
         let stats_save_handle = tokio::spawn(async move {
@@ -625,11 +682,13 @@ impl DaemonServer {
                 tokio::select! {
                     _ = interval.tick() => {
                         stats_control.save_model_stats().await;
+                        stats_control.save_tool_stats().await;
                     }
                     _ = stats_shutdown.recv() => {
                         // Final save on shutdown
                         stats_control.save_model_stats().await;
-                        info!("Model stats final save completed");
+                        stats_control.save_tool_stats().await;
+                        info!("Model + tool stats final save completed");
                         break;
                     }
                 }
@@ -674,9 +733,6 @@ impl DaemonServer {
         
         // Wait for auto-save tasks to complete final saves
         let _ = tokio::time::timeout(Duration::from_secs(5), save_handle).await;
-        if let Some(handle) = mem_save_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        }
         let _ = tokio::time::timeout(Duration::from_secs(5), stats_save_handle).await;
         
         ipc_handle.abort();
@@ -775,6 +831,14 @@ impl DaemonServer {
             let resolved = nanna_tools::skills::defaults::resolve_tools_dir(config_dir)
                 .unwrap_or_else(|| self.config.data_dir.join("tools"));
 
+            // Bootstrap default skills into the tools directory if needed.
+            // In debug builds this is a no-op (tools load from source tree).
+            // In release builds, embedded skills are extracted on first run.
+            let bootstrapped = nanna_tools::skills::defaults::bootstrap_default_skills(&resolved);
+            if bootstrapped > 0 {
+                info!("Bootstrapped {} default skills into {:?}", bootstrapped, resolved);
+            }
+
             if resolved.is_dir() {
                 nanna_tools::skills::defaults::ensure_permissions(&resolved);
                 info!("Tools directory: {:?}", resolved);
@@ -788,35 +852,122 @@ impl DaemonServer {
         
         // Initialize memory service with embeddings if enabled
         let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
-            // Get embedding client based on embedding config (not LLM provider)
-            let embed_client = match self.embedding.provider.as_str() {
+            use crate::embedding_router::{EmbeddingRouter, EmbeddingProviderInfo};
+
+            // Build primary embedding client
+            let primary_client = match self.embedding.provider.as_str() {
                 "openai" => {
                     let api_key = std::env::var("OPENAI_API_KEY").ok();
                     api_key.map(|key| {
-                        info!("Using OpenAI embeddings: {}", self.embedding.model);
-                        Arc::new(nanna_llm::EmbeddingClient::openai(&key))
+                        info!("Primary embeddings: OpenAI {}", self.embedding.model);
+                        (
+                            EmbeddingProviderInfo { name: "openai".into(), model: self.embedding.model.clone() },
+                            Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&self.embedding.model)),
+                        )
                     })
                 }
-                "ollama" => {
-                    info!("Using Ollama embeddings: {} at {}", self.embedding.model, self.embedding.ollama_host);
-                    Some(Arc::new(nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
-                        .with_model(&self.embedding.model)))
+                "openrouter" => {
+                    let api_key = self.config.llm.openrouter_api_key.clone()
+                        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+                    api_key.map(|key| {
+                        info!("Primary embeddings: OpenRouter {}", self.embedding.model);
+                        (
+                            EmbeddingProviderInfo { name: "openrouter".into(), model: self.embedding.model.clone() },
+                            Arc::new(nanna_llm::EmbeddingClient::openai(&key)
+                                .with_model(&self.embedding.model)
+                                .with_base_url("https://openrouter.ai/api")),
+                        )
+                    })
                 }
-                provider => {
-                    warn!("Unknown embedding provider: {}, trying Ollama fallback", provider);
-                    Some(Arc::new(nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
-                        .with_model(&self.embedding.model)))
+                "ollama" | _ => {
+                    info!("Primary embeddings: Ollama {} at {}", self.embedding.model, self.embedding.ollama_host);
+                    Some((
+                        EmbeddingProviderInfo { name: "ollama".into(), model: self.embedding.model.clone() },
+                        Arc::new(nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                            .with_model(&self.embedding.model)),
+                    ))
                 }
             };
-            
-            match embed_client {
-                Some(embed) => {
-                    // Create embedding function that wraps the client
+
+            match primary_client {
+                Some((primary_info, primary)) => {
+                    // Build the embedding router with fallback providers
+                    let mut embed_router = EmbeddingRouter::new(primary_info.clone(), primary);
+
+                    // Add fallback providers from available credentials
+                    if primary_info.name != "openai" {
+                        if let Some(api_key) = std::env::var("OPENAI_API_KEY").ok() {
+                            let fallback_model = "text-embedding-3-small".to_string();
+                            info!("Adding OpenAI embedding fallback: {}", fallback_model);
+                            embed_router = embed_router.with_fallback(
+                                EmbeddingProviderInfo { name: "openai".into(), model: fallback_model.clone() },
+                                Arc::new(nanna_llm::EmbeddingClient::openai(&api_key).with_model(&fallback_model)),
+                            );
+                        }
+                    }
+                    if primary_info.name != "openrouter" {
+                        if let Some(api_key) = self.config.llm.openrouter_api_key.clone()
+                            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok()) {
+                            let fallback_model = "openai/text-embedding-3-small".to_string();
+                            info!("Adding OpenRouter embedding fallback: {}", fallback_model);
+                            embed_router = embed_router.with_fallback(
+                                EmbeddingProviderInfo { name: "openrouter".into(), model: fallback_model.clone() },
+                                Arc::new(nanna_llm::EmbeddingClient::openai(&api_key)
+                                    .with_model(&fallback_model)
+                                    .with_base_url("https://openrouter.ai/api")),
+                            );
+                        }
+                    }
+                    if primary_info.name != "ollama" {
+                        let fallback_model = "nomic-embed-text".to_string();
+                        info!("Adding Ollama embedding fallback: {} at {}", fallback_model, self.embedding.ollama_host);
+                        embed_router = embed_router.with_fallback(
+                            EmbeddingProviderInfo { name: "ollama".into(), model: fallback_model.clone() },
+                            Arc::new(nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                                .with_model(&fallback_model)),
+                        );
+                    }
+
+                    info!("Embedding router: {} providers configured", embed_router.provider_count());
+                    let embed_router = Arc::new(embed_router);
+
+                    // Create embedding function that routes through the EmbeddingRouter.
+                    // Tracks the router generation to detect provider switches.
+                    let router_for_fn = embed_router.clone();
+                    let last_generation = Arc::new(std::sync::atomic::AtomicU64::new(embed_router.generation()));
+                    // Placeholder for memory service — set after construction via lazy init
+                    let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
+                        Arc::new(tokio::sync::OnceCell::new());
+                    let mem_cell_for_fn = memory_for_reembed.clone();
+
                     let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
-                        let client = embed.clone();
+                        let router = router_for_fn.clone();
                         let text = text.to_string();
+                        let gen_tracker = last_generation.clone();
+                        let mem_cell = mem_cell_for_fn.clone();
                         Box::pin(async move {
-                            client.embed_one(&text).await.map_err(|e| e.to_string())
+                            let (embedding, provider_changed) = router.embed_one(&text).await?;
+
+                            // If the provider changed, check if we need to re-embed
+                            if provider_changed {
+                                let new_gen = router.generation();
+                                let old_gen = gen_tracker.swap(new_gen, std::sync::atomic::Ordering::Relaxed);
+                                if new_gen != old_gen {
+                                    // Provider switched — trigger re-embed in background
+                                    if let Some(mem) = mem_cell.get() {
+                                        let mem = mem.clone();
+                                        tokio::spawn(async move {
+                                            tracing::info!("Embedding provider changed (gen {} → {}), probing dimension and re-embedding if needed...", old_gen, new_gen);
+                                            match mem.probe_and_align_dimension().await {
+                                                Ok(dim) => tracing::info!("Dimension probe complete: {} dims", dim),
+                                                Err(e) => tracing::warn!("Dimension probe failed: {}", e),
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+
+                            Ok(embedding)
                         })
                     });
 
@@ -827,26 +978,118 @@ impl DaemonServer {
                         ..Default::default()
                     };
                     info!("Memory service using dimension {} for model {}", dimension, self.embedding.model);
-                    let memory_service = nanna_memory::MemoryService::new(config)
-                        .with_embed_fn(embed_fn);
-                    
-                    // Load existing memories from file if available
-                    if let Some(ref path) = self.memory_path {
+
+                    // Wire up SQLite persistence if storage is available.
+                    // The persistence adapter is constructed here and attached to the
+                    // MemoryService so all writes are automatically mirrored to SQLite.
+                    let memory_service = if let Some(ref storage) = self.storage {
+                        let repo = storage.memories();
+                        let db = Arc::new(SqliteMemoryPersistence::new(repo));
+                        nanna_memory::MemoryService::new(config)
+                            .with_embed_fn(embed_fn)
+                            .with_persistence(db)
+                    } else {
+                        warn!("No storage backend available — memory will NOT be persisted to SQLite");
+                        nanna_memory::MemoryService::new(config)
+                            .with_embed_fn(embed_fn)
+                    };
+
+                    // One-time migration: if memories.json exists and SQLite is empty,
+                    // load from JSON into in-memory cache then save each entry to SQLite.
+                    let json_path = self.memory_path.as_ref();
+                    let should_migrate = if let (Some(path), Some(storage)) = (json_path, &self.storage) {
                         if path.exists() {
-                            info!("Loading memories from {:?}", path);
-                            if let Err(e) = memory_service.load(path).await {
-                                warn!("Failed to load memories: {}", e);
-                            } else {
-                                let count = memory_service.count().await;
-                                info!("Loaded {} memories from disk", count);
+                            match storage.memories().count().await {
+                                Ok(0) => true,
+                                Ok(n) => {
+                                    info!("SQLite already has {} memories — skipping JSON migration", n);
+                                    false
+                                }
+                                Err(e) => {
+                                    warn!("Could not check SQLite memory count: {}", e);
+                                    false
+                                }
                             }
                         } else {
-                            info!("No existing memory file at {:?}", path);
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if should_migrate {
+                        let path = json_path.unwrap();
+                        info!("Migrating memories from {:?} to SQLite (one-time migration)", path);
+                        match memory_service.load(path).await {
+                            Ok(()) => {
+                                let count = memory_service.count().await;
+                                info!("Loaded {} memories from JSON, flushing to SQLite...", count);
+                                // Flush all entries to SQLite
+                                match memory_service.flush_to_db().await {
+                                    Ok(n) => info!("Flushed {} memories to SQLite", n),
+                                    Err(e) => warn!("Failed to flush memories to SQLite: {}", e),
+                                }
+                                // Rename the JSON file so we don't re-migrate next time
+                                let migrated_path = path.with_extension("json.migrated");
+                                if let Err(e) = tokio::fs::rename(path, &migrated_path).await {
+                                    warn!("Could not rename migrated JSON file: {}", e);
+                                } else {
+                                    info!("Renamed {:?} → {:?} (migration complete)", path, migrated_path);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("JSON migration failed: {}. Will attempt to load from SQLite.", e);
+                            }
+                        }
+                    }
+
+                    // Load from SQLite into the in-memory cache (normal startup path).
+                    // Skipped if we just migrated (the entries are already in-memory from the JSON load above).
+                    if !should_migrate {
+                        match memory_service.load_from_db().await {
+                            Ok(count) => {
+                                info!("Loaded {} memories from SQLite", count);
+                            }
+                            Err(nanna_memory::MemoryError::Persistence(ref e))
+                                if e.contains("No persistence backend") =>
+                            {
+                                // No storage configured — silently skip
+                            }
+                            Err(e) => {
+                                warn!("Failed to load memories from SQLite: {}", e);
+                            }
+                        }
+                    }
+
+                    // Probe the actual embedding dimension from the model.
+                    // If the model returns a different dimension than stored entries,
+                    // re-embeds all mismatched entries with the new model.
+                    match memory_service.probe_and_align_dimension().await {
+                        Ok(actual_dim) => {
+                            if actual_dim != dimension {
+                                info!(
+                                    "Embedding dimension corrected: {} → {} for model {}",
+                                    dimension, actual_dim, self.embedding.model
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Could not probe embedding dimension (model may be loading): {}. \
+                                 Using static dimension {}.",
+                                e, dimension
+                            );
                         }
                     }
                     
-                    info!("Memory service initialized with embeddings");
-                    Some(Arc::new(memory_service))
+                    info!("Memory service initialized with SQLite persistence and embedding router");
+                    let memory_arc = Arc::new(memory_service);
+
+                    // Wire the memory service into the embed_fn's OnceCell
+                    // so provider-switch re-embedding can find it
+                    let _ = memory_for_reembed.set(memory_arc.clone());
+
+                    Some(memory_arc)
                 }
                 None => {
                     warn!("Memory service disabled: no embedding provider available");
@@ -859,12 +1102,15 @@ impl DaemonServer {
             None
         };
 
+        // Shared session history for the recall_messages tool service
+        let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
         // Build script services and load all tools from disk
         {
             let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> =
-                if let Some(primary_client) = router.primary_client() {
+                if !router.available_providers().is_empty() {
                     Some(Arc::new(AgentSpawnerImpl {
-                        llm: primary_client,
+                        router: Arc::new(router.clone()),
                         tools: tools.clone(),
                         agent_config: nanna_agent::AgentConfig {
                             model: self.config.agent.model.clone(),
@@ -874,6 +1120,7 @@ impl DaemonServer {
                             thinking_mode: self.config.agent.thinking_mode,
                             summarization_priority: self.config.agent.summarization_priority.clone(),
                             summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
+                            sub_agent_model: self.config.agent.sub_agent_model.clone(),
                             ..Default::default()
                         },
                         system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
@@ -885,7 +1132,7 @@ impl DaemonServer {
                     None
                 };
 
-            let services = build_script_services(&memory, spawner_arc);
+            let services = build_script_services(&memory, spawner_arc, session_history.clone());
 
             if let Some(ref dir) = tools_dir {
                 if dir.is_dir() {
@@ -933,7 +1180,7 @@ impl DaemonServer {
             tools.clone(),
             memory.clone(),
             event_tx,
-        ));
+        ).with_session_history(session_history));
 
         info!("Agent service initialized");
 
@@ -944,7 +1191,7 @@ impl DaemonServer {
 /// Embedding configuration for the daemon
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
-    /// Provider (ollama, openai)
+    /// Provider (ollama, openai, openrouter)
     pub provider: String,
     /// Model name
     pub model: String,
@@ -1045,8 +1292,12 @@ impl DaemonBuilder {
         // Set model routing configuration
         builder.config.agent.model_routing = config.llm.model_routing.clone();
         builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
+        builder.config.agent.sub_agent_model = config.llm.sub_agent_model.clone();
         if !config.llm.model_routing.is_empty() {
             info!("Model routing enabled: {:?}", config.llm.model_routing);
+        }
+        if let Some(ref sub_model) = config.llm.sub_agent_model {
+            info!("Sub-agent model: {}", sub_model);
         }
 
         // Set Brave API key for web search

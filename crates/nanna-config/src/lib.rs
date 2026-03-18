@@ -106,6 +106,10 @@ pub struct LlmConfig {
     pub model_routing: Vec<String>,
     /// Whether to always use the primary model for the first iteration. Default: true.
     pub routing_first_turn_primary: bool,
+    /// Model to use for sub-agent tasks (optional).
+    /// When set, sub-agents spawned via the `task` tool use this cheaper model
+    /// instead of the primary model. Format: "provider/model" e.g. "ollama/qwen3:4b"
+    pub sub_agent_model: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -128,6 +132,7 @@ impl Default for LlmConfig {
             ollama_api_key: None,
             model_routing: vec![], // Empty = disabled (always use primary model)
             routing_first_turn_primary: true,
+            sub_agent_model: None, // None = use primary model for sub-agents
         }
     }
 }
@@ -283,7 +288,40 @@ pub struct MemoryConfig {
     /// Embedding model priority list for fallback
     /// Format: ["openai/text-embedding-3-small", "ollama/nomic-embed-text"]
     pub embedding_priority: Vec<String>,
+    /// Maximum fraction of memories that can be removed in a single consolidation run (0.0-1.0).
+    /// Default: 0.50 (50%)
+    #[serde(default = "default_max_compression_ratio")]
+    pub max_compression_ratio: f32,
+    /// Minimum number of memories to retain after consolidation (hard floor).
+    /// Default: 20
+    #[serde(default = "default_min_remaining_memories")]
+    pub min_remaining_memories: usize,
+
+    // -----------------------------------------------------------------------
+    // OCR settings
+    // -----------------------------------------------------------------------
+
+    /// OCR model priority list for document text extraction.
+    ///
+    /// Format: `["ollama/llava", "anthropic/claude-opus-4-6"]`
+    ///
+    /// Models are tried in order after embedded OCR (if enabled).
+    /// Only vision-capable models should be listed here.
+    #[serde(default)]
+    pub ocr_model_priority: Vec<String>,
+
+    /// Whether to use the embedded `ocrs` pure-Rust OCR engine before
+    /// falling through to the model priority list.
+    ///
+    /// Default: `true`.  The embedded engine handles Latin-script images
+    /// offline with no API cost; disable it to force model-based OCR.
+    #[serde(default = "default_use_embedded_ocr")]
+    pub use_embedded_ocr: bool,
 }
+
+fn default_max_compression_ratio() -> f32 { 0.50 }
+fn default_min_remaining_memories() -> usize { 20 }
+fn default_use_embedded_ocr() -> bool { true }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -298,6 +336,10 @@ impl Default for MemoryConfig {
             embedding_priority: vec![
                 "openai/text-embedding-3-small".to_string(),
             ],
+            max_compression_ratio: default_max_compression_ratio(),
+            min_remaining_memories: default_min_remaining_memories(),
+            ocr_model_priority: vec![],
+            use_embedded_ocr: default_use_embedded_ocr(),
         }
     }
 }

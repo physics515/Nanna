@@ -41,6 +41,14 @@ base64-simd = "0.8"
 # For PDF parsing
 lopdf = "0.34"
 
+# Pure Rust OCR (ONNX models via RTen) — Tier 0 embedded OCR
+# rten-imageproc is a transitive dep of ocrs (not used directly)
+ocrs = "0.12"
+rten = { version = "0.24", default-features = false, features = ["rten_format"] }
+
+# Image processing (needed by ocrs for decoding input images)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+
 # For skill manifests (tool.yaml)
 serde_yaml = "0.9"
 

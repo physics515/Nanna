@@ -48,6 +48,13 @@ pub struct AgentServiceConfig {
     pub model_routing: Vec<String>,
     /// Whether to use primary model for first iteration
     pub routing_first_turn_primary: bool,
+    /// Model to use for sub-agent tasks (optional).
+    /// When set, sub-agents use this cheaper model instead of the primary.
+    pub sub_agent_model: Option<String>,
+    /// OpenRouter API key (passed to agents for summarization/extraction)
+    pub openrouter_api_key: Option<String>,
+    /// OpenAI API key (passed to agents for summarization/extraction)
+    pub openai_api_key: Option<String>,
 }
 
 impl Default for AgentServiceConfig {
@@ -57,21 +64,23 @@ impl Default for AgentServiceConfig {
             model_priority: vec![], // Dynamically built from available credentials
             max_tokens: 8192,
             temperature: 0.7,
-            max_iterations: None, // Unlimited iterations — agent stops when done
+            max_iterations: None, // Unlimited — model stops when done
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
             model_routing: vec![],
             routing_first_turn_primary: true,
+            sub_agent_model: None,
+            openrouter_api_key: None,
+            openai_api_key: None,
         }
     }
 }
 
 /// Active chat request state
 struct ActiveChat {
-    #[allow(dead_code)]
     // Used for future session tracking features
-    session_id: SessionId,
+    _session_id: SessionId,
     cancelled: bool,
     /// Shared cancellation flag passed into the agent loop for cooperative cancellation
     cancellation_flag: Arc<AtomicBool>,
@@ -128,13 +137,15 @@ pub struct AgentService {
     event_tx: broadcast::Sender<Event>,
     /// Currently active chats (session_id -> state)
     active_chats: Arc<RwLock<HashMap<SessionId, ActiveChat>>>,
-    #[allow(dead_code)]
     // Reserved for future model caching optimization
-    model_cache: Option<ModelInfoCache>,
+    _model_cache: Option<ModelInfoCache>,
     /// Cached model info for current model
     current_model_info: Arc<RwLock<Option<ModelInfo>>>,
     /// Per-session message queues for serialized chat processing
     session_queues: Arc<RwLock<HashMap<String, Arc<SessionQueue>>>>,
+    /// Shared session history for the `session.history` tool service.
+    /// Populated before each agent run with the current session's messages.
+    session_history: Option<crate::server::SharedSessionHistory>,
 }
 
 impl AgentService {
@@ -159,10 +170,22 @@ impl AgentService {
             memory,
             event_tx,
             active_chats: Arc::new(RwLock::new(HashMap::new())),
-            model_cache,
+            _model_cache: model_cache,
             current_model_info: Arc::new(RwLock::new(None)),
             session_queues: Arc::new(RwLock::new(HashMap::new())),
+            session_history: None,
         }
+    }
+
+    /// Set the shared session history for the `session.history` tool service.
+    pub fn with_session_history(mut self, history: crate::server::SharedSessionHistory) -> Self {
+        self.session_history = Some(history);
+        self
+    }
+
+    /// Get a reference to the tool registry
+    pub fn tools(&self) -> &Arc<ToolRegistry> {
+        &self.tools
     }
 
     /// Get model info for the current model, fetching if needed
@@ -230,6 +253,8 @@ impl AgentService {
             thinking_mode: config.thinking_mode,
             summarization_priority: config.summarization_priority.clone(),
             summarization_ollama_url: config.summarization_ollama_url.clone(),
+            openrouter_api_key: config.openrouter_api_key.clone(),
+            openai_api_key: config.openai_api_key.clone(),
             model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
             routing_first_turn_primary: config.routing_first_turn_primary,
             ..Default::default()
@@ -279,6 +304,34 @@ impl AgentService {
         system_prompt: Option<String>,
         history: &[SessionMessage],
     ) -> Result<ChatResult, String> {
+        self.chat_with_options(session_id, message, system_prompt, history, None, None, None, vec![]).await
+    }
+
+    /// Chat with workspace scope for memory extraction
+    pub async fn chat_in_workspace(
+        &self,
+        session_id: &str,
+        message: &str,
+        system_prompt: Option<String>,
+        history: &[SessionMessage],
+        workspace_id: Option<String>,
+        attachments: Vec<(String, String)>,
+    ) -> Result<ChatResult, String> {
+        self.chat_with_options(session_id, message, system_prompt, history, None, None, workspace_id, attachments).await
+    }
+
+    /// Chat with optional model and max_iterations overrides (used by sub-sessions).
+    pub async fn chat_with_options(
+        &self,
+        session_id: &str,
+        message: &str,
+        system_prompt: Option<String>,
+        history: &[SessionMessage],
+        model_override: Option<String>,
+        max_iterations_override: Option<usize>,
+        workspace_id: Option<String>,
+        attachments: Vec<(String, String)>,
+    ) -> Result<ChatResult, String> {
         // Acquire per-session queue slot (FIFO ordering via tokio Mutex)
         let queue = self.get_or_create_queue(session_id).await;
         queue.depth.fetch_add(1, Ordering::Relaxed);
@@ -297,7 +350,7 @@ impl AgentService {
         {
             let mut active = self.active_chats.write().await;
             active.insert(session_id.to_string(), ActiveChat {
-                session_id: session_id.to_string(),
+                _session_id: session_id.to_string(),
                 cancelled: false,
                 cancellation_flag: cancellation_flag.clone(),
                 started_at: chrono::Utc::now(),
@@ -305,6 +358,13 @@ impl AgentService {
                 active_tool_calls: active_tools.clone(),
                 completed_tool_calls: completed_tools.clone(),
             });
+        }
+
+        // Populate the shared session history for the `recall_messages` tool
+        if let Some(ref session_history) = self.session_history {
+            let mut hist = session_history.write().await;
+            hist.clear();
+            hist.extend(history.iter().cloned());
         }
 
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -319,7 +379,10 @@ impl AgentService {
         // This is rebuilt fresh on every chat() call — no persistent "last successful model"
         // state. Each invocation (including heartbeats) always starts from the top of the
         // priority list, so transient failures don't permanently shift the preferred model.
-        let base_models: Vec<String> = {
+        let base_models: Vec<String> = if let Some(ref model) = model_override {
+            // Explicit model override (e.g., from sub-session) — use only that model
+            vec![model.clone()]
+        } else {
             let config = self.config.read().await;
             if config.model_priority.is_empty() {
                 vec![config.model.clone()]
@@ -451,24 +514,95 @@ impl AgentService {
                         input: input.clone(),
                     });
                 })),
+                on_tool_end: {
+                    let event_tx_tool_end = self.event_tx.clone();
+                    let session_id_tool_end = session_id.to_string();
+                    let active_tools_for_end = active_tools.clone();
+                    let completed_tools_for_end = completed_tools.clone();
+                    Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64| {
+                        // Move from active to completed
+                        if let Ok(mut active) = active_tools_for_end.try_write() {
+                            active.retain(|t| t.call_id != call_id);
+                        }
+                        if let Ok(mut completed) = completed_tools_for_end.try_write() {
+                            completed.push(CompletedToolCallInfo {
+                                call_id: call_id.to_string(),
+                                name: name.to_string(),
+                                output: output.to_string(),
+                                success,
+                                duration_ms,
+                            });
+                        }
+                        let _ = event_tx_tool_end.send(Event::ToolEnd {
+                            session_id: session_id_tool_end.clone(),
+                            call_id: call_id.to_string(),
+                            output: output.to_string(),
+                            success,
+                            duration_ms,
+                        });
+                    }))
+                },
                 // Enable auto-extraction if memory service is available
                 auto_extract_memories: has_memory,
                 on_memory: if has_memory {
+                    let ws_id_for_memory = workspace_id.clone();
                     Some(Box::new(move |memory: nanna_agent::ExtractedMemory| {
                         let mem_service = memory_for_extraction.clone();
+                        let ws_id = ws_id_for_memory.clone();
                         Box::pin(async move {
                             if let Some(ref service) = mem_service {
                                 let mut metadata = memory.tags.unwrap_or_default();
                                 metadata.insert("category".to_string(), memory.category.clone());
-                                // Derive importance from category
-                                let importance = match memory.category.as_str() {
-                                    "tool_result" => 2.0, // Lower importance for ephemeral tool output
-                                    "preference" | "identity" => 4.0,
-                                    "fact" | "insight" => 3.5,
-                                    "context" => 3.0,
-                                    _ => 3.0,
+                                // Derive importance and TTL from category
+                                let (importance, ttl_secs): (f32, Option<i64>) = match memory.category.as_str() {
+                                    // Tool results are ephemeral — expire after 2 hours.
+                                    // They exist so compressed context can be recalled short-term,
+                                    // but don't pollute long-term semantic search.
+                                    // Purged during dream time.
+                                    "tool_result" => (1.5, Some(2 * 3600)),
+                                    "preference" | "identity" => (4.0, None),
+                                    "fact" | "insight" => (3.5, None),
+                                    "context" => (3.0, None),
+                                    _ => (3.0, None),
                                 };
-                                if let Err(e) = service.remember_with_importance(&memory.content, metadata, importance).await {
+                                
+                                // Set expiration timestamp if TTL is configured
+                                if let Some(ttl) = ttl_secs {
+                                    let expires_at = chrono::Utc::now().timestamp() + ttl;
+                                    metadata.insert("expires_at".to_string(), expires_at.to_string());
+                                }
+
+                                // Skip low-signal content: errors, tiny results, or garbled output
+                                let dominated_by_non_ascii = memory.content.chars().take(200)
+                                    .filter(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace() && !c.is_ascii_punctuation())
+                                    .count() > 40;
+
+                                if memory.content.starts_with("Error:")
+                                    || memory.content.starts_with("Execution failed:")
+                                    || memory.content.contains("Error: Execution failed")
+                                    || memory.content.contains("Command failed")
+                                    || memory.content.contains("Missing required parameter")
+                                    || memory.content.contains("cannot find the path specified")
+                                    || memory.content.contains("Parameter format not correct")
+                                    || memory.content.contains("not recognized as an internal")
+                                    || memory.content.contains("Bridge error:")
+                                    || memory.content.contains("JS execution failed")
+                                    || (memory.category == "tool_result" && memory.content.contains("Error"))
+                                    || memory.content.len() < 20
+                                    || dominated_by_non_ascii
+                                {
+                                    info!("Skipping low-signal memory [{}]: {}", memory.category, truncate(&memory.content, 50));
+                                    return;
+                                }
+
+                                // Store with workspace scope if session has a workspace
+                                if let Some(ref ws_id) = ws_id {
+                                    if let Err(e) = service.remember_scoped(&memory.content, metadata, importance, Some(ws_id.clone())).await {
+                                        warn!("Failed to auto-store scoped memory: {}", e);
+                                    } else {
+                                        info!("Auto-extracted memory [{}] (workspace: {}): {}", memory.category, ws_id, truncate(&memory.content, 50));
+                                    }
+                                } else if let Err(e) = service.remember_with_importance(&memory.content, metadata, importance).await {
                                     warn!("Failed to auto-store memory: {}", e);
                                 } else {
                                     info!("Auto-extracted memory [{}]: {}", memory.category, truncate(&memory.content, 50));
@@ -479,6 +613,8 @@ impl AgentService {
                 } else {
                     None
                 },
+                max_iterations: max_iterations_override,
+                attachments: attachments.clone(),
                 ..Default::default()
             };
 
@@ -494,25 +630,7 @@ impl AgentService {
                     }
                     queue.depth.fetch_sub(1, Ordering::Relaxed);
 
-                    // Emit tool events and populate completed_tool_calls
-                    for tc in &response.tool_calls {
-                        if let Ok(mut completed) = completed_tools.try_write() {
-                            completed.push(CompletedToolCallInfo {
-                                call_id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                output: tc.output.clone(),
-                                success: tc.success,
-                                duration_ms: tc.duration_ms,
-                            });
-                        }
-                        let _ = self.event_tx.send(Event::ToolEnd {
-                            session_id: session_id.to_string(),
-                            call_id: tc.id.clone(),
-                            output: tc.output.clone(),
-                            success: tc.success,
-                            duration_ms: tc.duration_ms,
-                        });
-                    }
+                    // Tool events already emitted in real-time via on_tool_end callback
 
                     // Emit completion event
                     let _ = self.event_tx.send(Event::MessageEnd {
@@ -544,13 +662,25 @@ impl AgentService {
                     warn!("Model {} failed: {}", model, error_str);
                     last_error = error_str.clone();
 
+                    // Rate limit? Wait before falling through to next model
+                    if Self::is_rate_limit_error(&error_str) {
+                        let retry_secs = Self::parse_retry_after(&error_str).unwrap_or(10);
+                        // Cap wait at 60s
+                        let wait_secs = retry_secs.min(60);
+                        info!("Rate limited on {}. Waiting {}s before trying next model...", model, wait_secs);
+                        let _ = self.event_tx.send(Event::Error {
+                            code: "rate_limit".to_string(),
+                            message: format!("Rate limited on {}. Waiting {}s...", model, wait_secs),
+                        });
+                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    }
+
                     // Emit error as a warning so it's visible, but continue trying
                     let _ = self.event_tx.send(Event::Error {
                         code: "model_error".to_string(),
-                        message: format!("Model {} failed: {}. Trying next model...", model, error_str),
+                        message: format!("Model {} failed: {}. Trying next model...", model, last_error),
                     });
 
-                    // Always fall back to next model in priority list
                     info!("Model {} failed, trying next model in priority list", model);
                 }
             }
@@ -572,12 +702,12 @@ impl AgentService {
     }
 
     /// Check if an error is a rate-limit / transient overload (may warrant retry with backoff)
-    #[allow(dead_code)]
     fn is_rate_limit_error(error: &str) -> bool {
         let error_lower = error.to_lowercase();
 
         // Rate limit errors
         if error_lower.contains("rate limit")
+            || error_lower.contains("rate_limit")
             || error_lower.contains("429")
             || error_lower.contains("too many requests") {
             return true;
@@ -585,20 +715,32 @@ impl AgentService {
 
         // Overloaded errors
         if error_lower.contains("overloaded")
-            || error_lower.contains("529")
-            || error_lower.contains("503")
-            || error_lower.contains("502") {
-            return true;
-        }
-
-        // Temporary server errors
-        if error_lower.contains("temporarily unavailable")
-            || error_lower.contains("service unavailable")
-            || error_lower.contains("timeout") {
+            || error_lower.contains("529") {
             return true;
         }
 
         false
+    }
+
+    /// Parse retry-after seconds from an error message.
+    /// Looks for patterns like "retry after X seconds", "try again in X", "retry-after: X"
+    fn parse_retry_after(error: &str) -> Option<u64> {
+        let lower = error.to_lowercase();
+
+        // Pattern: "try again in X seconds" / "retry after X seconds" / "wait X seconds"
+        for prefix in &["try again in ", "retry after ", "wait ", "retry-after: "] {
+            if let Some(pos) = lower.find(prefix) {
+                let after = &error[pos + prefix.len()..];
+                // Extract digits
+                let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(secs) = num_str.parse::<u64>() {
+                    return Some(secs);
+                }
+            }
+        }
+
+        // Pattern: "Please try again later" (generic — use default)
+        None
     }
     
     /// Cancel an active chat
@@ -687,6 +829,30 @@ impl AgentService {
         }
     }
     
+    /// Recall memories scoped to a workspace (workspace sees global + own, None sees all)
+    pub async fn recall_memories_scoped(&self, query: &str, limit: usize, workspace_id: Option<&str>) -> Vec<MemoryContext> {
+        if let Some(ref memory) = self.memory {
+            match memory.recall_scoped(query, workspace_id).await {
+                Ok(results) => {
+                    results.into_iter()
+                        .take(limit)
+                        .map(|r| MemoryContext {
+                            id: r.id,
+                            content: r.content,
+                            score: r.score,
+                        })
+                        .collect()
+                }
+                Err(e) => {
+                    warn!("Scoped memory recall failed: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Store a memory
     pub async fn remember(&self, content: &str, metadata: HashMap<String, String>) -> Result<String, String> {
         if let Some(ref memory) = self.memory {

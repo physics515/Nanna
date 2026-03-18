@@ -1,5 +1,6 @@
 export default {
   name: "task",
+  timeout: 300,
   description: "Delegate a sub-task to a separate agent. The sub-agent runs independently with its own context and tools, then returns the result. Useful for complex tasks that benefit from isolated execution.",
   parameters: {
     type: "object",

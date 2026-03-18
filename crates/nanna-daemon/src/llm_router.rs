@@ -101,7 +101,17 @@ pub struct LlmRouter {
     /// Model info cache
     model_cache: Option<ModelInfoCache>,
     /// Shared model stats tracker for health-aware routing (set post-init)
-    stats: tokio::sync::RwLock<Option<ModelStatsTracker>>,
+    stats: Arc<tokio::sync::RwLock<Option<ModelStatsTracker>>>,
+}
+
+impl Clone for LlmRouter {
+    fn clone(&self) -> Self {
+        Self {
+            providers: self.providers.clone(),
+            model_cache: self.model_cache.clone(),
+            stats: self.stats.clone(),
+        }
+    }
 }
 
 impl LlmRouter {
@@ -111,7 +121,7 @@ impl LlmRouter {
         Self {
             providers: HashMap::new(),
             model_cache,
-            stats: tokio::sync::RwLock::new(None),
+            stats: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 

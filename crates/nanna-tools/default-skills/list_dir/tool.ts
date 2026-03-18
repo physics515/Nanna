@@ -10,10 +10,12 @@ export default {
     required: ["path"]
   },
   execute: function(input) {
-    var entries = Nanna.listDir(input.path, input.recursive || false);
+    var dirPath = input.path || input.dir || input.directory || input.file_path || input.filePath;
+    if (!dirPath) throw "Missing required parameter: path";
+    var entries = Nanna.listDir(dirPath, input.recursive || false);
 
     if (entries.length === 0) {
-      return "Empty directory: " + input.path;
+      return "Empty directory: " + dirPath;
     }
 
     entries.sort(function(a, b) {

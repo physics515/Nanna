@@ -81,11 +81,10 @@ pub struct InMemoryStorage {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // tags stored for future filtering
 struct StoredMemory {
     id: String,
     content: String,
-    tags: Vec<String>,
+    _tags: Vec<String>,
 }
 
 #[async_trait]
@@ -96,7 +95,7 @@ impl MemoryStorage for InMemoryStorage {
         memories.push(StoredMemory {
             id: id.clone(),
             content: content.to_string(),
-            tags: tags.to_vec(),
+            _tags: tags.to_vec(),
         });
         Ok(id)
     }

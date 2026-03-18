@@ -1,5 +1,4 @@
 //! Generic webhook handler for custom integrations
-#![allow(dead_code)]
 
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
@@ -15,13 +14,15 @@ pub struct GenericWebhook {
     /// User identifier
     pub user_id: String,
     /// Optional user display name
-    pub user_name: Option<String>,
+#[serde(rename = "user_name")]
+    pub _user_name: Option<String>,
     /// Message content
     pub message: String,
     /// Optional session ID (will be generated if not provided)
     pub session_id: Option<String>,
     /// Optional metadata
-    pub metadata: Option<serde_json::Value>,
+#[serde(rename = "metadata")]
+    pub _metadata: Option<serde_json::Value>,
 }
 
 /// Generic webhook response

@@ -50,57 +50,57 @@
       </div>
 
       <!-- Messages -->
-      <div v-for="(msg, idx) in messages" :key="msg.id || idx" class="max-w-4xl mx-auto">
-        <div
-          :class="[
-            'p-3 sm:p-4 rounded-lg',
-            msg.role === 'user' ? 'message-user ml-4 sm:ml-12' : 'message-assistant mr-4 sm:mr-12'
-          ]"
-        >
-          <div class="flex items-start gap-2 sm:gap-3">
-            <UiAvatar
-              :variant="msg.role === 'user' ? 'primary' : 'accent'"
-              :fallback="msg.role === 'user' ? 'U' : '☽'"
-              size="sm"
-              class="flex-shrink-0 sm:hidden"
+      <template v-for="(msg, idx) in messages" :key="msg.id || idx">
+        <!-- Tool calls rendered BEFORE the assistant response (between user msg and response) -->
+        <div v-if="msg.role === 'assistant' && msg.tool_calls?.length" class="max-w-[1800px] mx-auto">
+          <div class="space-y-1 mx-4 sm:mx-12 my-2">
+            <ToolCallCard
+              v-for="tool in msg.tool_calls"
+              :key="tool.id"
+              :tool-call="tool"
+              :status="tool.success ? 'completed' : 'error'"
             />
-            <UiAvatar
-              :variant="msg.role === 'user' ? 'primary' : 'accent'"
-              :fallback="msg.role === 'user' ? 'U' : '☽'"
-              class="flex-shrink-0 hidden sm:flex"
-            />
-            <div class="flex-1 min-w-0">
-              <div class="text-xs text-nanna-text-dim mb-1">
-                {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
-              </div>
-              <MarkdownContent :content="msg.content" />
-
-              <!-- Reasoning/thinking block (collapsible) -->
-              <details v-if="msg.reasoning" class="mt-2 text-xs">
-                <summary class="cursor-pointer text-nanna-text-dim hover:text-nanna-text-secondary">
-                  Thinking
-                </summary>
-                <div class="mt-1 p-2 bg-nanna-bg-deep rounded whitespace-pre-wrap max-h-[200px] overflow-y-auto text-nanna-text-dim">
-                  {{ msg.reasoning }}
-                </div>
-              </details>
-
-              <!-- Tool calls for this message -->
-              <div v-if="msg.toolCalls?.length" class="mt-3 space-y-2">
-                <ToolCallCard
-                  v-for="tool in msg.toolCalls"
-                  :key="tool.id"
-                  :tool-call="tool"
-                  :status="tool.success ? 'completed' : 'error'"
-                />
-              </div>
-            </div>
           </div>
         </div>
-      </div>
+
+        <!-- Message bubble -->
+        <div class="max-w-[1800px] mx-auto" :class="msg.role === 'user' ? 'ml-4 sm:ml-12' : 'mr-4 sm:mr-12'">
+          <MessageBubble :variant="msg.role">
+            <div class="flex items-start gap-2 sm:gap-3">
+              <UiAvatar
+                :variant="msg.role === 'user' ? 'primary' : 'accent'"
+                :fallback="msg.role === 'user' ? 'U' : '☽'"
+                size="sm"
+                class="flex-shrink-0 sm:hidden"
+              />
+              <UiAvatar
+                :variant="msg.role === 'user' ? 'primary' : 'accent'"
+                :fallback="msg.role === 'user' ? 'U' : '☽'"
+                class="flex-shrink-0 hidden sm:flex"
+              />
+              <div class="flex-1 min-w-0">
+                <div class="text-xs text-nanna-text-dim mb-1">
+                  {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
+                </div>
+                <MarkdownContent :content="msg.content" />
+
+                <!-- Reasoning/thinking block (collapsible) -->
+                <details v-if="msg.reasoning" class="mt-2 text-xs">
+                  <summary class="cursor-pointer text-nanna-text-dim hover:text-nanna-text-secondary">
+                    Thinking
+                  </summary>
+                  <div class="mt-1 p-2 bg-nanna-bg-deep rounded whitespace-pre-wrap max-h-[200px] overflow-y-auto text-nanna-text-dim">
+                    {{ msg.reasoning }}
+                  </div>
+                </details>
+              </div>
+            </div>
+          </MessageBubble>
+        </div>
+      </template>
 
       <!-- Active tool calls during streaming -->
-      <div v-if="activeToolCalls.length > 0" class="max-w-4xl mx-auto mr-4 sm:mr-12">
+      <div v-if="activeToolCalls.length > 0" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
         <div class="space-y-2">
           <ToolCallCard
             v-for="tool in activeToolCalls"
@@ -112,8 +112,8 @@
       </div>
 
       <!-- Streaming indicator -->
-      <div v-if="isStreaming" class="max-w-4xl mx-auto">
-        <div class="message-assistant p-3 sm:p-4 rounded-lg mr-4 sm:mr-12">
+      <div v-if="isStreaming" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+        <MessageBubble variant="assistant">
           <div class="flex items-start gap-2 sm:gap-3">
             <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
             <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
@@ -139,56 +139,22 @@
               </div>
             </div>
           </div>
-        </div>
+        </MessageBubble>
       </div>
 
       <!-- Loading indicator (before streaming starts) -->
-      <div v-if="isLoading && !isStreaming && activeToolCalls.length === 0" class="max-w-4xl mx-auto">
+      <div v-if="isLoading && !isStreaming && activeToolCalls.length === 0" class="max-w-[1800px] mx-auto">
         <MessageSkeleton :lines="2" />
       </div>
 
       <!-- Message queue indicator -->
-      <div v-if="hasQueuedMessages" class="max-w-4xl mx-auto">
-        <div class="bg-nanna-bg-surface/60 border border-white/[0.04] rounded-xl p-3">
-          <div class="flex items-center justify-between">
-            <div class="flex items-center gap-2 text-sm text-nanna-text-muted">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                  d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
-              <span>{{ queueCount }} message{{ queueCount > 1 ? 's' : '' }} queued</span>
-            </div>
-            <button
-              @click="clearQueue"
-              class="text-xs text-nanna-text-dim hover:text-nanna-text transition-colors"
-            >
-              Clear queue
-            </button>
-          </div>
-          <!-- Queue preview -->
-          <div v-if="messageQueue.length > 0" class="mt-2 space-y-1">
-            <div
-              v-for="(qMsg, idx) in messageQueue.slice(0, 3)"
-              :key="qMsg.id"
-              class="flex items-center gap-2 text-xs"
-            >
-              <span class="text-nanna-text-dim">{{ idx + 1 }}.</span>
-              <span class="text-nanna-text truncate max-w-[200px]">{{ qMsg.content }}</span>
-              <button
-                @click="removeFromQueue(qMsg.id)"
-                class="text-nanna-text-dim hover:text-red-400 transition-colors ml-auto"
-                title="Remove from queue"
-              >
-                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <div v-if="messageQueue.length > 3" class="text-xs text-nanna-text-dim">
-              +{{ messageQueue.length - 3 }} more...
-            </div>
-          </div>
-        </div>
+      <div v-if="hasQueuedMessages" class="max-w-[1800px] mx-auto">
+        <QueueIndicator
+          :count="queueCount"
+          :messages="messageQueue"
+          @clear="clearQueue"
+          @remove="removeFromQueue"
+        />
       </div>
 
       <!-- Error message -->
@@ -206,7 +172,7 @@
 
     <!-- Input area -->
     <div class="p-3 sm:p-4">
-      <div class="max-w-4xl mx-auto">
+      <div class="max-w-[1800px] mx-auto">
         <!-- Queue mode indicator -->
         <div v-if="hasActiveWork && input.trim()" class="mb-2 text-xs text-nanna-primary flex items-center gap-1">
           <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -215,6 +181,7 @@
           Press Enter to queue this message
         </div>
         <ChatInput
+          ref="chatInputRef"
           v-model="input"
           :placeholder="hasActiveWork ? 'Type to queue a message...' : 'Type your message...'"
           :disabled="false"
@@ -235,6 +202,7 @@ import { useSessionState } from '~/composables/useSessionState'
 
 // Notifications
 const { notifyToolComplete, notifyError, notifyMessage } = useNotifications()
+const { addNotification } = useNotificationCenter()
 
 interface ToolCallInfo {
   id: string
@@ -251,7 +219,7 @@ interface Message {
   role: 'user' | 'assistant'
   content: string
   timestamp: string
-  toolCalls?: ToolCallInfo[]
+  tool_calls?: ToolCallInfo[]
   reasoning?: string
 }
 
@@ -261,6 +229,8 @@ interface SessionInfo {
   created_at: string
   updated_at: string
   message_count: number
+  workspace_id?: string
+  workspace_name?: string
 }
 
 interface AppConfig {
@@ -300,6 +270,7 @@ const route = useRoute()
 // Local state for messages (loaded from storage)
 const messages = ref<Message[]>([])
 const input = ref('')
+const chatInputRef = ref<any>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
 const currentSession = ref<SessionInfo | null>(null)
 const config = ref<AppConfig | null>(null)
@@ -330,9 +301,16 @@ const {
   clearStreamingState,
 } = useSessionState(sessionId)
 
+function truncateText(text: string, maxLen: number): string {
+  if (!text || text.length <= maxLen) return text || ''
+  return text.substring(0, maxLen) + '...'
+}
+
 let unlistenChunk: UnlistenFn | null = null
 let unlistenTool: UnlistenFn | null = null
 let unlistenThinking: UnlistenFn | null = null
+let unlistenModelStatus: UnlistenFn | null = null
+let unlistenDaemonError: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -378,7 +356,7 @@ async function processNextQueuedMessage() {
     scrollToBottom(true)
 
     // Send to backend
-    await sendMessageToBackend(next.content)
+    await sendMessageToBackend(next.content, [])
   }
 }
 
@@ -518,7 +496,7 @@ onMounted(async () => {
             role: 'assistant',
             content: finalContent || (finalThinking ? '*[thinking only — no visible response]*' : ''),
             timestamp: new Date().toISOString(),
-            toolCalls: finalToolCalls.map(t => ({
+            tool_calls: finalToolCalls.map(t => ({
               id: t.id,
               name: t.name,
               input: t.input,
@@ -565,6 +543,22 @@ onMounted(async () => {
       // Update existing tool call
       sessionState.updateToolCall(tool_call.id, { ...tool_call, status })
 
+      // Push tool errors to notification center
+      if (status === 'error' || tool_call.success === false) {
+        addNotification({
+          type: 'error',
+          title: `Tool Failed: ${tool_call.name}`,
+          summary: truncateText(tool_call.output || 'Unknown error', 120),
+          detail: tool_call.output || 'No error details available',
+          source: `tool:${tool_call.name}`,
+          sessionId: eventSessionId,
+          metadata: {
+            callId: tool_call.id,
+            toolName: tool_call.name,
+          },
+        })
+      }
+
       // Notify on tool completion if window not focused
       if (document.hidden) {
         notifyToolComplete(tool_call.name, tool_call.success)
@@ -581,6 +575,33 @@ onMounted(async () => {
     const eventSessionId = event.payload.session_id
     const sessionState = useSessionState(ref(eventSessionId))
     sessionState.streamingThinking.value += event.payload.delta
+  })
+
+  // Listen for model status changes (fallbacks)
+  unlistenModelStatus = await listen<{ active_model: string; fallback_reason?: string }>('model-status', (event) => {
+    const { active_model, fallback_reason } = event.payload
+    if (fallback_reason) {
+      addNotification({
+        type: 'warning',
+        title: `Model Fallback: ${active_model}`,
+        summary: `Switched model due to: ${truncateText(fallback_reason, 100)}`,
+        detail: `Fell back to ${active_model}.\n\nPrevious model failed: ${fallback_reason}`,
+        source: 'llm:model-routing',
+        metadata: { model: active_model, reason: fallback_reason },
+      })
+    }
+  })
+
+  // Listen for daemon-level errors
+  unlistenDaemonError = await listen<{ code?: string; message: string }>('error', (event) => {
+    addNotification({
+      type: 'error',
+      title: event.payload.code ? `Error: ${event.payload.code}` : 'Daemon Error',
+      summary: truncateText(event.payload.message, 120),
+      detail: event.payload.message,
+      source: 'daemon',
+      metadata: event.payload.code ? { code: event.payload.code } : undefined,
+    })
   })
 
   // Load initial session (listeners are already active to capture any events)
@@ -605,6 +626,8 @@ onUnmounted(() => {
   if (unlistenChunk) unlistenChunk()
   if (unlistenTool) unlistenTool()
   if (unlistenThinking) unlistenThinking()
+  if (unlistenModelStatus) unlistenModelStatus()
+  if (unlistenDaemonError) unlistenDaemonError()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null
@@ -657,6 +680,7 @@ async function sendMessage() {
   if (!input.value.trim() || !currentSession.value) return
 
   const userMessage = input.value.trim()
+  const imageAttachments = chatInputRef.value?.getAttachments?.() || []
   input.value = ''
   lastUserMessage.value = userMessage
   connectionError.value = null
@@ -680,10 +704,10 @@ async function sendMessage() {
   await nextTick()
   scrollToBottom(true)
 
-  await sendMessageToBackend(userMessage)
+  await sendMessageToBackend(userMessage, imageAttachments)
 }
 
-async function sendMessageToBackend(message: string) {
+async function sendMessageToBackend(message: string, attachments: Array<{filename: string, content_type: string, data: string}> = []) {
   // Start loading
   isLoading.value = true
   isStreaming.value = false
@@ -694,7 +718,8 @@ async function sendMessageToBackend(message: string) {
     // Send message and wait for response (streaming happens via events)
     await invoke('send_message', {
       sessionId: currentSession.value!.id,
-      message
+      message,
+      attachments
     })
   } catch (error: any) {
     console.error('Failed to send message:', error)
@@ -713,6 +738,16 @@ async function sendMessageToBackend(message: string) {
     } else {
       connectionError.value = errorMsg
     }
+
+    // Push to notification center (always, not just when hidden)
+    addNotification({
+      type: 'error',
+      title: 'Message Send Failed',
+      summary: connectionError.value || errorMsg,
+      detail: errorMsg,
+      source: 'llm:send',
+      sessionId: currentSession.value?.id,
+    })
 
     // Notify on error if window not focused
     if (document.hidden) {
@@ -790,3 +825,4 @@ function scrollToBottom(force = false) {
   })
 }
 </script>
+

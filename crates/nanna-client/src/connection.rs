@@ -384,6 +384,7 @@ impl<'a> MemoryApi<'a> {
         self.client.request(Action::Memory(MemoryAction::Search {
             query: query.to_string(),
             limit,
+            scope: None,
         })).await
     }
     

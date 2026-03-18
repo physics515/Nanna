@@ -44,7 +44,10 @@ impl ScriptedToolWrapper {
                             .unwrap_or_else(|| PathBuf::from("."));
                         let resolve = |p: &PathBuf| -> PathBuf {
                             let s = p.to_string_lossy();
-                            if s == "~" || s.starts_with("~/") {
+                            if s == "*" {
+                                // Wildcard: pass through as-is for allows_read/allows_write
+                                p.clone()
+                            } else if s == "~" || s.starts_with("~/") {
                                 home.join(s.strip_prefix("~/").unwrap_or(""))
                             } else if p.is_relative() {
                                 std::env::current_dir().unwrap_or_default().join(p)
@@ -66,6 +69,11 @@ impl ScriptedToolWrapper {
                 "Script must export default with name and description".to_string()
             )
         })?;
+
+        // Apply timeout from manifest if specified
+        if let Some(timeout_secs) = manifest.timeout_secs {
+            tool.timeout_ms = timeout_secs * 1000;
+        }
 
         info!(name = %manifest.name, path = ?path, "Loaded scripted tool");
 
@@ -162,9 +170,20 @@ impl Tool for ScriptedToolWrapper {
             None
         };
 
+        // Read default working directory from registry (set by active workspace)
+        let default_workdir = if let Some(ref weak) = self.registry {
+            if let Some(registry) = weak.upgrade() {
+                registry.default_workdir().await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let input = Value::Object(params.into_iter().collect());
 
-        let result = self.engine.execute(&self.tool, input, tool_defs, self.services.clone()).await.map_err(|e| {
+        let result = self.engine.execute_with_workdir(&self.tool, input, tool_defs, self.services.clone(), default_workdir).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
 

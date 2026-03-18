@@ -122,13 +122,13 @@ impl WebhookState {
 // =============================================================================
 
 /// Telegram Update structure (simplified)
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
     edited_message: Option<TelegramMessage>,
-    callback_query: Option<TelegramCallbackQuery>,
+#[serde(rename = "callback_query")]
+    _callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,40 +141,43 @@ struct TelegramMessage {
     entities: Vec<TelegramEntity>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TelegramUser {
     id: i64,
     first_name: String,
     last_name: Option<String>,
-    username: Option<String>,
+#[serde(rename = "username")]
+    _username: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TelegramChat {
     id: i64,
     #[serde(rename = "type")]
-    chat_type: String,
-    title: Option<String>,
+    _chat_type: String,
+#[serde(rename = "title")]
+    _title: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TelegramEntity {
     #[serde(rename = "type")]
     entity_type: String,
     offset: i64,
-    length: i64,
+#[serde(rename = "length")]
+    _length: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TelegramCallbackQuery {
-    id: String,
-    from: TelegramUser,
-    message: Option<TelegramMessage>,
-    data: Option<String>,
+#[serde(rename = "id")]
+    _id: String,
+#[serde(rename = "from")]
+    _from: TelegramUser,
+#[serde(rename = "message")]
+    _message: Option<TelegramMessage>,
+#[serde(rename = "data")]
+    _data: Option<String>,
 }
 
 /// Handle Telegram webhook
@@ -251,47 +254,49 @@ async fn telegram_webhook(
 // =============================================================================
 
 /// Discord interaction type
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DiscordInteraction {
     #[serde(rename = "type")]
     interaction_type: u8,
-    token: Option<String>,
+#[serde(rename = "token")]
+    _token: Option<String>,
     data: Option<DiscordInteractionData>,
     member: Option<DiscordMember>,
     user: Option<DiscordUser>,
     channel_id: Option<String>,
-    guild_id: Option<String>,
+#[serde(rename = "guild_id")]
+    _guild_id: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DiscordInteractionData {
     name: Option<String>,
-    options: Option<Vec<DiscordOption>>,
+#[serde(rename = "options")]
+    _options: Option<Vec<DiscordOption>>,
     custom_id: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DiscordOption {
-    name: String,
-    value: Value,
+#[serde(rename = "name")]
+    _name: String,
+#[serde(rename = "value")]
+    _value: Value,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DiscordMember {
     user: DiscordUser,
-    nick: Option<String>,
+#[serde(rename = "nick")]
+    _nick: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DiscordUser {
     id: String,
     username: String,
-    discriminator: Option<String>,
+#[serde(rename = "discriminator")]
+    _discriminator: Option<String>,
 }
 
 /// Verify Discord signature
@@ -388,14 +393,14 @@ async fn discord_webhook(
 // =============================================================================
 
 /// Slack event wrapper
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SlackEventWrapper {
     #[serde(rename = "type")]
     event_type: String,
     challenge: Option<String>,
     event: Option<SlackEvent>,
-    team_id: Option<String>,
+#[serde(rename = "team_id")]
+    _team_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -542,16 +547,15 @@ async fn whatsapp_verify(
 }
 
 /// WhatsApp webhook message structure
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct WhatsAppWebhook {
     entry: Vec<WhatsAppEntry>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct WhatsAppEntry {
-    id: String,
+#[serde(rename = "id")]
+    _id: String,
     changes: Vec<WhatsAppChange>,
 }
 
@@ -560,10 +564,10 @@ struct WhatsAppChange {
     value: WhatsAppValue,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct WhatsAppValue {
-    messaging_product: Option<String>,
+#[serde(rename = "messaging_product")]
+    _messaging_product: Option<String>,
     metadata: Option<WhatsAppMetadata>,
     contacts: Option<Vec<WhatsAppContact>>,
     messages: Option<Vec<WhatsAppMessage>>,

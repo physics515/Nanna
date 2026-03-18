@@ -12,6 +12,7 @@ mod loop_runner;
 pub mod model_stats;
 mod multi;
 pub mod prompts;
+pub mod tool_stats;
 mod registry;
 mod summarizer;
 mod supervisor;
@@ -50,6 +51,10 @@ pub use summarizer::{
 pub use model_stats::{
     ModelStatsTracker, ModelStats, ModelStatsSummary, RequestModelStats, RequestObservation,
     StorableModelStats,
+};
+pub use tool_stats::{
+    ToolStatsTracker, ToolStats, ToolStatsSummary, ToolObservation,
+    GlobalToolStats, SessionStats as ToolSessionStats, SessionTotals,
 };
 
 use serde::{Deserialize, Serialize};

@@ -155,12 +155,19 @@ export function useSessionState(sessionId: Ref<string | null>) {
     }
   }
 
-  // Update tool call
+  // Update tool call (only merge defined, non-undefined values to preserve existing fields)
   function updateToolCall(id: string, update: Partial<ToolCallInfo & { status: 'started' | 'completed' | 'error' }>) {
     if (state.value) {
       const idx = state.value.activeToolCalls.findIndex(t => t.id === id)
       if (idx !== -1) {
-        state.value.activeToolCalls[idx] = { ...state.value.activeToolCalls[idx], ...update }
+        const existing = state.value.activeToolCalls[idx]
+        const filtered: Record<string, any> = {}
+        for (const [key, value] of Object.entries(update)) {
+          if (value !== undefined) {
+            filtered[key] = value
+          }
+        }
+        state.value.activeToolCalls[idx] = { ...existing, ...filtered }
       }
     }
   }

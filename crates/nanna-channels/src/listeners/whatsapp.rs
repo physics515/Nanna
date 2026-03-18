@@ -435,35 +435,32 @@ impl Listener for WhatsAppWebListener {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // WhatsApp bridge response - is_ready/status unused (connected/authenticated are primary)
 struct BridgeStatus {
     connected: Option<bool>,
     authenticated: Option<bool>,
     #[serde(alias = "ready")]
-    is_ready: Option<bool>,
+    _is_ready: Option<bool>,
     #[serde(alias = "state")]
-    status: Option<String>,
+    _status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // WhatsApp bridge response - event_type/data unused (message field is primary)
 struct BridgeEvent {
     #[serde(alias = "type", alias = "event")]
-    event_type: Option<String>,
+    _event_type: Option<String>,
     message: Option<BridgeMessage>,
     #[serde(alias = "msg")]
-    data: Option<BridgeMessage>,
+    _data: Option<BridgeMessage>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // WhatsApp bridge response - many fields unused (extracting core content only, TODO: media/metadata)
 struct BridgeMessage {
     // Message identification
     id: Option<String>,
     #[serde(alias = "messageId", alias = "key")]
-    message_id: Option<String>,
+    _message_id: Option<String>,
     
     // Sender info (different bridges use different field names)
     from: Option<String>,
@@ -483,12 +480,12 @@ struct BridgeMessage {
     body: Option<String>,
     text: Option<String>,
     #[serde(alias = "content")]
-    message_content: Option<String>,
+    _message_content: Option<String>,
     
     // Metadata
     timestamp: Option<i64>,
     #[serde(alias = "t", alias = "messageTimestamp")]
-    unix_timestamp: Option<i64>,
+    _unix_timestamp: Option<i64>,
     
     // Reply context
     #[serde(alias = "quotedMsgId", alias = "quotedStanzaID")]
@@ -496,5 +493,5 @@ struct BridgeMessage {
     
     // Message type
     #[serde(alias = "type", alias = "messageType")]
-    message_type: Option<String>,
+    _message_type: Option<String>,
 }

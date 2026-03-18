@@ -36,7 +36,7 @@ pub use file::{ReadFileTool, WriteFileTool, ListDirTool};
 pub use memory::{InMemoryStorage, MemoryStorage, MemoryResult, StorageHandle, RememberTool, RecallTool, ReflectTool, MemoryServiceStorage, MemoryServiceAdapter};
 pub use memory_storage::{EmbedFn, TursoMemoryStorage};
 pub use ocr::{DescribeImageTool, OcrTool, OcrVisionFn};
-pub use pdf::{ReadPdfTool, PdfVisionFn};
+pub use pdf::{OcrFn as PdfOcrFn, PdfVisionFn, ReadPdfTool};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
 pub use task::TaskTool;
 pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};

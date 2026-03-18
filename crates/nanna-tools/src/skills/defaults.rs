@@ -1,7 +1,8 @@
-//! Tool directory resolution and loading helpers.
+//! Tool directory resolution, loading, and bootstrapping helpers.
 //!
 //! Tools are loaded dynamically from the filesystem at runtime.
-//! No tools are embedded at compile time.
+//! Default skills are embedded at compile time (via build.rs) and extracted
+//! to the tools directory on first run in release builds.
 //!
 //! # Resolution Order
 //!
@@ -10,6 +11,9 @@
 //! 3. Caller-provided fallback (typically `{data_dir}/tools/`)
 
 use std::path::{Path, PathBuf};
+
+// Include the build-script-generated embedded skills (all default-skills/ files).
+include!(concat!(env!("OUT_DIR"), "/embedded_skills.rs"));
 
 /// In debug builds, fall back to the source tree's default-skills directory.
 /// This is resolved at compile time relative to the nanna-tools crate.
@@ -22,8 +26,8 @@ pub const DEV_TOOLS_DIR: Option<&str> = None;
 /// Default permissions for built-in TS skills.
 /// These need broader permissions than typical user tools.
 pub const DEFAULT_PERMISSIONS_JSON: &str = r#"{
-    "read": ["~"],
-    "write": ["~"],
+    "read": ["*"],
+    "write": ["*"],
     "run": true,
     "net": ["*"],
     "env": true
@@ -69,6 +73,67 @@ pub fn resolve_tools_dir(config_tools_dir: Option<&Path>) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Bootstrap the tools directory by copying bundled default skills into it.
+///
+/// In debug builds this is a no-op (we load directly from the source tree).
+/// In release builds, default skills are embedded at compile time and extracted
+/// to the target directory on first run.
+///
+/// Returns the number of skills bootstrapped (0 if already present).
+pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
+    // Create the tools directory if it doesn't exist
+    if !tools_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(tools_dir) {
+            tracing::error!("Failed to create tools directory {:?}: {}", tools_dir, e);
+            return 0;
+        }
+        tracing::info!("Created tools directory: {:?}", tools_dir);
+    }
+
+    // In debug builds, tools are loaded directly from the source tree via DEV_TOOLS_DIR.
+    // Only bootstrap in release builds where we need to populate {data_dir}/tools/.
+    #[cfg(debug_assertions)]
+    {
+        let _ = tools_dir; // suppress unused warning
+        return 0;
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let mut count = 0;
+        for entry in DEFAULT_SKILLS {
+            let tool_dir = tools_dir.join(entry.skill_name);
+            let target = tool_dir.join(entry.file_name);
+
+            // Skip if this skill already exists (don't overwrite user modifications)
+            if target.exists() {
+                continue;
+            }
+
+            if let Err(e) = std::fs::create_dir_all(&tool_dir) {
+                tracing::warn!("Failed to create skill directory {:?}: {}", tool_dir, e);
+                continue;
+            }
+
+            if let Err(e) = std::fs::write(&target, entry.content) {
+                tracing::warn!("Failed to write {:?}: {}", target, e);
+                continue;
+            }
+
+            tracing::info!("Bootstrapped default skill: {}/{}", entry.skill_name, entry.file_name);
+            count += 1;
+        }
+
+        if count > 0 {
+            // Ensure permissions are set for newly created skills
+            ensure_permissions(tools_dir);
+            tracing::info!("Bootstrapped {} default skills into {:?}", count, tools_dir);
+        }
+
+        count
+    }
 }
 
 /// Ensure a tools directory has correct permissions.json files for all subdirectories.

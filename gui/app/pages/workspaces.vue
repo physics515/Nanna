@@ -628,8 +628,9 @@ async function openWorkspace(path: string) {
     workspaces.value = await invoke<WorkspaceInfo[]>('list_workspaces')
     console.log('Opened workspace:', ws.name)
     
-    // Sync with layout tabs - add tab for new workspace
+    // Sync with layout tabs - add tab and switch to it
     addWorkspaceTab?.(ws)
+    selectWorkspaceTab?.(ws.id)
   } catch (e) {
     console.error('Failed to open workspace:', e)
   } finally {

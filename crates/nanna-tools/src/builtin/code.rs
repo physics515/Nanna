@@ -29,6 +29,14 @@ const IGNORE_DIRS: &[&str] = &[
     "vendor",
     ".cargo",
     "coverage",
+    ".output",
+    ".cache",
+    ".parcel-cache",
+    "bower_components",
+    ".turbo",
+    "out",
+    ".vercel",
+    ".svelte-kit",
 ];
 
 /// Check if a path component should be ignored
@@ -311,6 +319,11 @@ impl Tool for CodeSearchTool {
                 Ok(c) => c,
                 Err(_) => continue, // Skip unreadable files
             };
+
+            // Skip likely minified/bundled files (any line > 500 chars)
+            if content.lines().any(|l| l.len() > 500) {
+                continue;
+            }
 
             files_searched += 1;
             let lines: Vec<&str> = content.lines().collect();

@@ -2,6 +2,7 @@
   <NuxtLayout>
     <NuxtPage />
   </NuxtLayout>
+  <UiSonnerSonner />
 </template>
 
 <style>

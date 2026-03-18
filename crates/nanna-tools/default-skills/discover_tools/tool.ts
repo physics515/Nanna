@@ -1,6 +1,6 @@
 export default {
   name: "discover_tools",
-  description: "Discover and activate additional tools. Call with a query to find specific tools, or without to list all available tools. Discovered tools become available for the rest of this conversation turn.",
+  description: "Activate tools for file access, shell commands, web browsing, code analysis, and more. Call with no arguments to see all available tools, or with a query (e.g. 'file', 'exec', 'web', 'code') to filter. Activated tools persist for the rest of this conversation. You MUST call this before using any tool beyond remember/recall/reflect.",
   output: "context",
   parameters: {
     type: "object",

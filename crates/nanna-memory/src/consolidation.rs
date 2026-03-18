@@ -1,11 +1,12 @@
 //! Memory Consolidation ("Dreaming")
 //!
 //! Periodic processing that mimics biological memory consolidation during sleep:
-//! - Groups memories by weight (retrievability × importance)
-//! - Clusters semantically similar memories
+//! - Scores memories by a composite of similarity, recall frequency, importance, and age
+//! - Clusters memories that should be merged together
 //! - Compresses low-weight memories (summarization)
 //! - Expands high-weight memories (enrichment)
 //! - Merges related memories
+//! - Respects a maximum compression ratio to avoid over-aggressive consolidation
 
 use crate::{MemoryEntry, FsrsParameters, FsrsState};
 use serde::{Deserialize, Serialize};
@@ -14,23 +15,57 @@ use std::collections::HashMap;
 /// Consolidation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationConfig {
-    /// Similarity threshold for clustering (0.0-1.0)
+    /// Minimum composite score to consider two memories for the same cluster (0.0-1.0).
+    /// This blends similarity, recall overlap, importance, and age — not just cosine similarity.
     pub cluster_threshold: f32,
-    /// Minimum cluster size to consolidate
+    /// Minimum cluster size to consolidate (singletons below this are skipped or expanded)
     pub min_cluster_size: usize,
-    /// Maximum memories to process per consolidation run
-    pub max_memories_per_run: usize,
+    /// Maximum fraction of total memories that can be removed in a single run (0.0-1.0).
+    /// E.g. 0.50 means at most 50% of memories can be merged away.
+    pub max_compression_ratio: f32,
+    /// Minimum number of memories to leave after consolidation (floor).
+    /// Consolidation stops merging once the store would drop below this count.
+    pub min_remaining_memories: usize,
     /// Weight thresholds for compression levels
     pub weight_thresholds: WeightThresholds,
+    /// Weights for the composite clustering score
+    pub clustering_weights: ClusteringWeights,
 }
 
 impl Default for ConsolidationConfig {
     fn default() -> Self {
         Self {
-            cluster_threshold: 0.75,
+            cluster_threshold: 0.45,
             min_cluster_size: 2,
-            max_memories_per_run: 100,
+            max_compression_ratio: 0.50,
+            min_remaining_memories: 20,
             weight_thresholds: WeightThresholds::default(),
+            clustering_weights: ClusteringWeights::default(),
+        }
+    }
+}
+
+/// Weights for the composite clustering score.
+/// The final score is a weighted combination of these signals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusteringWeights {
+    /// How much cosine similarity matters (semantic relatedness)
+    pub similarity: f32,
+    /// How much overlapping recall frequency matters (memories accessed together)
+    pub recall_affinity: f32,
+    /// How much similar importance levels matter (merge peers, not outliers)
+    pub importance_proximity: f32,
+    /// How much similar age matters (merge memories from the same era)
+    pub age_proximity: f32,
+}
+
+impl Default for ClusteringWeights {
+    fn default() -> Self {
+        Self {
+            similarity: 0.45,
+            recall_affinity: 0.20,
+            importance_proximity: 0.20,
+            age_proximity: 0.15,
         }
     }
 }
@@ -159,7 +194,9 @@ impl MemoryCluster {
         
         for memory in memories {
             for (i, &val) in memory.embedding.iter().enumerate() {
-                centroid[i] += val;
+                if i < dim {
+                    centroid[i] += val;
+                }
             }
         }
         
@@ -189,7 +226,7 @@ impl MemoryCluster {
         let count = self.memories.len();
         
         format!(
-            "You are consolidating {count} related memories into one.\n\n\
+            "You are consolidating {count} memories into one.\n\n\
             Instruction: {instruction}\n\n\
             Memories to consolidate:\n\n{content}\n\n\
             Consolidated memory:"
@@ -212,11 +249,57 @@ pub struct ConsolidationResult {
     pub errors: Vec<String>,
 }
 
-/// Cluster memories by semantic similarity using simple greedy clustering
+/// Compute a composite clustering score between two memories.
+///
+/// Blends semantic similarity, recall affinity, importance proximity, and age proximity.
+/// Returns a value in [0, 1] where higher means more likely to cluster together.
+pub fn composite_cluster_score(
+    a: &MemoryEntry,
+    b: &MemoryEntry,
+    weights: &ClusteringWeights,
+) -> f32 {
+    // 1. Semantic similarity (cosine)
+    let sim = cosine_similarity(&a.embedding, &b.embedding).max(0.0);
+
+    // 2. Recall affinity: memories accessed a similar number of times are "peers"
+    //    and memories both accessed recently are likely contextually related.
+    let recall_a = a.fsrs.access_count as f32;
+    let recall_b = b.fsrs.access_count as f32;
+    let max_recall = recall_a.max(recall_b).max(1.0);
+    let recall_ratio = recall_a.min(recall_b) / max_recall; // 0..1, 1 = same count
+    let recall_affinity = recall_ratio;
+
+    // 3. Importance proximity: prefer merging memories of similar importance.
+    //    Two low-importance memories should merge; a high+low pair should not.
+    let imp_diff = (a.fsrs.importance - b.fsrs.importance).abs();
+    let importance_prox = (1.0 - imp_diff / 5.0).max(0.0); // normalize: max diff ~5
+
+    // 4. Age proximity: memories from the same time period are more likely related.
+    //    Uses the gap between timestamps relative to the older memory's age.
+    let age_diff_days = (a.timestamp - b.timestamp).unsigned_abs() as f32 / 86400.0;
+    let age_prox = (-age_diff_days / 30.0).exp(); // half-life ~30 days
+
+    // Weighted sum
+    let total_weight = weights.similarity + weights.recall_affinity
+        + weights.importance_proximity + weights.age_proximity;
+    if total_weight <= 0.0 {
+        return sim; // fallback to pure similarity
+    }
+
+    (weights.similarity * sim
+        + weights.recall_affinity * recall_affinity
+        + weights.importance_proximity * importance_prox
+        + weights.age_proximity * age_prox)
+        / total_weight
+}
+
+/// Cluster memories using the composite score (not just cosine similarity).
+///
+/// Uses greedy clustering: for each unassigned memory, find all unassigned memories
+/// whose composite score exceeds the threshold and group them.
 pub fn cluster_memories(
     memories: Vec<MemoryEntry>,
-    threshold: f32,
-    _min_cluster_size: usize,
+    config: &ConsolidationConfig,
 ) -> Vec<Vec<MemoryEntry>> {
     if memories.is_empty() {
         return Vec::new();
@@ -233,14 +316,17 @@ pub fn cluster_memories(
         let mut cluster = vec![memories[i].clone()];
         assigned[i] = true;
 
-        // Find all similar memories
         for j in (i + 1)..memories.len() {
             if assigned[j] {
                 continue;
             }
 
-            let similarity = cosine_similarity(&memories[i].embedding, &memories[j].embedding);
-            if similarity >= threshold {
+            let score = composite_cluster_score(
+                &memories[i],
+                &memories[j],
+                &config.clustering_weights,
+            );
+            if score >= config.cluster_threshold {
                 cluster.push(memories[j].clone());
                 assigned[j] = true;
             }
@@ -249,7 +335,6 @@ pub fn cluster_memories(
         clusters.push(cluster);
     }
 
-    // Filter by minimum cluster size, return singletons separately
     clusters
 }
 
@@ -295,13 +380,21 @@ pub fn create_consolidated_entry(
     metadata.insert("consolidated_from".to_string(), source_ids.join(","));
     metadata.insert("consolidation_level".to_string(), format!("{:?}", cluster.compression_level));
 
-    // Create new FSRS state inheriting from cluster
+    // Create new FSRS state inheriting the best traits from the cluster
     let mut fsrs = FsrsState::new();
-    fsrs.importance = cluster.avg_weight.min(3.0);
+    // Importance: take the max (don't average away a high-importance memory)
+    fsrs.importance = cluster.memories.iter()
+        .map(|m| m.fsrs.importance)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(1.0);
     fsrs.storage_strength = cluster.memories.iter()
         .map(|m| m.fsrs.storage_strength)
         .max_by(|a, b| a.partial_cmp(b).unwrap())
         .unwrap_or(0.1);
+    // Sum access counts (consolidated memory inherits all recall history)
+    fsrs.access_count = cluster.memories.iter()
+        .map(|m| m.fsrs.access_count)
+        .sum();
     fsrs.generation = cluster.memories.iter()
         .map(|m| m.fsrs.generation)
         .max()
@@ -319,6 +412,7 @@ pub fn create_consolidated_entry(
         timestamp: now(),
         fsrs,
         workspace_id,
+        expires_at: None, // Consolidated memories don't expire
     }
 }
 
@@ -357,41 +451,93 @@ mod tests {
     }
 
     #[test]
-    fn test_clustering() {
-        // Create test memories with similar embeddings
+    fn test_composite_score_identical() {
+        let weights = ClusteringWeights::default();
+        let entry = MemoryEntry {
+            id: "1".into(),
+            content: "test".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 1000000,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+            expires_at: None,
+        };
+        let score = composite_cluster_score(&entry, &entry, &weights);
+        assert!(score > 0.9, "identical memories should score high: {}", score);
+    }
+
+    #[test]
+    fn test_composite_score_different() {
+        let weights = ClusteringWeights::default();
+        let a = MemoryEntry {
+            id: "1".into(),
+            content: "A".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState { importance: 1.0, access_count: 0, ..FsrsState::default() },
+            workspace_id: None,
+            expires_at: None,
+        };
+        let b = MemoryEntry {
+            id: "2".into(),
+            content: "B".into(),
+            embedding: vec![0.0, 1.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 86400 * 365, // 1 year apart
+            fsrs: FsrsState { importance: 5.0, access_count: 100, ..FsrsState::default() },
+            workspace_id: None,
+            expires_at: None,
+        };
+        let score = composite_cluster_score(&a, &b, &weights);
+        assert!(score < 0.3, "very different memories should score low: {}", score);
+    }
+
+    #[test]
+    fn test_clustering_with_composite() {
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.5,
+            ..Default::default()
+        };
+
         let memories = vec![
             MemoryEntry {
-                id: "1".to_string(),
-                content: "A".to_string(),
+                id: "1".into(),
+                content: "A".into(),
                 embedding: vec![1.0, 0.0, 0.0],
                 metadata: HashMap::new(),
-                timestamp: 0,
-                fsrs: FsrsState::default(),
+                timestamp: 1000,
+                fsrs: FsrsState { importance: 2.0, access_count: 5, ..FsrsState::default() },
                 workspace_id: None,
+                expires_at: None,
             },
             MemoryEntry {
-                id: "2".to_string(),
-                content: "B".to_string(),
-                embedding: vec![0.99, 0.1, 0.0], // Similar to 1
+                id: "2".into(),
+                content: "B".into(),
+                embedding: vec![0.99, 0.1, 0.0],
                 metadata: HashMap::new(),
-                timestamp: 0,
-                fsrs: FsrsState::default(),
+                timestamp: 1100,
+                fsrs: FsrsState { importance: 2.0, access_count: 4, ..FsrsState::default() },
                 workspace_id: None,
+                expires_at: None,
             },
             MemoryEntry {
-                id: "3".to_string(),
-                content: "C".to_string(),
-                embedding: vec![0.0, 1.0, 0.0], // Different
+                id: "3".into(),
+                content: "C".into(),
+                embedding: vec![0.0, 1.0, 0.0],
                 metadata: HashMap::new(),
-                timestamp: 0,
-                fsrs: FsrsState::default(),
+                timestamp: 86400 * 60,
+                fsrs: FsrsState { importance: 5.0, access_count: 0, ..FsrsState::default() },
                 workspace_id: None,
+                expires_at: None,
             },
         ];
 
-        let clusters = cluster_memories(memories, 0.9, 1);
-        
-        // Should form 2 clusters: {1,2} and {3}
+        let clusters = cluster_memories(memories, &config);
+
+        // 1 and 2 are similar in embedding, importance, age, and recall → should cluster
+        // 3 is different on every axis → separate
         assert_eq!(clusters.len(), 2);
     }
 
@@ -406,6 +552,7 @@ mod tests {
                 timestamp: 0,
                 fsrs: FsrsState::default(),
                 workspace_id: None,
+                expires_at: None,
             },
             MemoryEntry {
                 id: "2".to_string(),
@@ -415,13 +562,14 @@ mod tests {
                 timestamp: 0,
                 fsrs: FsrsState::default(),
                 workspace_id: None,
+                expires_at: None,
             },
         ];
 
         let cluster = MemoryCluster::new(memories, CompressionLevel::Compressed, &FsrsParameters::default());
         let prompt = cluster.build_consolidation_prompt();
         
-        assert!(prompt.contains("2 related memories"));
+        assert!(prompt.contains("2 memories"));
         assert!(prompt.contains("dark mode"));
         assert!(prompt.contains("dark themes"));
     }

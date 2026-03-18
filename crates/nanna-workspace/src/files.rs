@@ -8,8 +8,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-#[allow(unused_imports)]
-use tracing::{debug, warn};
+
 
 /// A single workspace file with its content
 #[derive(Debug, Clone, Serialize, Deserialize)]

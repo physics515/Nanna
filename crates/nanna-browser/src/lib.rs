@@ -252,7 +252,6 @@ pub trait Browser: Send + Sync {
 /// # Errors
 ///
 /// Returns `BrowserError::UnsupportedBrowser` if the requested backend is not compiled in.
-#[allow(unused_variables)]
 pub fn create_browser(config: BrowserConfig) -> Result<Arc<dyn Browser>, BrowserError> {
     // Playwright supports all browsers
     #[cfg(feature = "playwright")]

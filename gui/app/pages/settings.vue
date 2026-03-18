@@ -32,7 +32,7 @@
             <UiCard>
               <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
                 <Key class="w-4 h-4" />
-                API Keys
+                Providers
               </h3>
               <div class="space-y-4">
                 <!-- Anthropic (OAuth only, via claude setup-token) -->
@@ -154,6 +154,38 @@
                     <UiButton @click="saveClaudeProxyUrl" size="sm" variant="ghost">Save</UiButton>
                   </div>
                 </div>
+
+                <!-- Ollama -->
+                <div class="space-y-3 p-3 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30">
+                  <div class="flex items-center justify-between">
+                    <span class="text-sm font-medium text-nanna-text">Ollama</span>
+                    <div class="flex items-center gap-2">
+                      <span v-if="ollamaStatus === 'connected'" class="flex items-center gap-1 text-xs text-green-500">
+                        <CheckCircle class="w-3 h-3" /> {{ ollamaModels.length }} model{{ ollamaModels.length !== 1 ? 's' : '' }}
+                      </span>
+                      <span v-else-if="ollamaStatus === 'error'" class="flex items-center gap-1 text-xs text-red-400">
+                        <XCircle class="w-3 h-3" /> Offline
+                      </span>
+                      <UiButton @click="refreshOllamaModels" size="sm" variant="ghost" :disabled="loadingOllamaModels">
+                        <RefreshCw class="w-3 h-3" :class="{ 'animate-spin': loadingOllamaModels }" />
+                      </UiButton>
+                    </div>
+                  </div>
+                  <div>
+                    <label class="block text-xs text-nanna-text-dim mb-1">Server URL</label>
+                    <div class="flex gap-2">
+                      <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
+                      <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
+                    </div>
+                  </div>
+                  <div>
+                    <label class="block text-xs text-nanna-text-dim mb-1">API Key <span class="text-nanna-text-dim/60">(optional)</span></label>
+                    <div class="flex gap-2">
+                      <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="For remote/authenticated instances" class="flex-1" />
+                      <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
+                    </div>
+                  </div>
+                </div>
               </div>
             </UiCard>
 
@@ -236,37 +268,50 @@
                 </div>
               </div>
 
-              <!-- Ollama Host -->
-              <div class="mt-4 pt-4 border-t border-white/[0.04]">
-                <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama Server</label>
-                <div class="flex gap-2">
-                  <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
-                  <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
-                  <UiButton @click="refreshOllamaModels" size="sm" variant="outline" :disabled="loadingOllamaModels">
-                    <RefreshCw class="w-4 h-4" :class="{ 'animate-spin': loadingOllamaModels }" />
-                  </UiButton>
+              <!-- OCR Models -->
+              <div class="mt-6 pt-6 border-t border-white/[0.04]">
+                <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
+                  <ScanText class="w-4 h-4" />
+                  OCR Models
+                </h3>
+                <p class="text-xs text-nanna-text-dim mb-3">
+                  Used to extract text from images and scanned PDFs. Tier 0 is the built-in <code>ocrs</code> engine (offline, no API cost). Tier 1+ are vision-capable models tried in order.
+                </p>
+
+                <!-- Embedded OCR toggle -->
+                <div class="flex items-center justify-between mb-4 p-3 rounded-lg bg-white/[0.02] border border-white/[0.05]">
+                  <div>
+                    <div class="text-sm font-medium text-nanna-text">Use embedded OCR first (Tier 0)</div>
+                    <div class="text-xs text-nanna-text-dim mt-0.5">Runs offline using the <code>ocrs</code> ONNX engine — models auto-downloaded to <code>~/.cache/ocrs/</code> on first use (~50 MB). Latin script only.</div>
+                  </div>
+                  <UiSwitch
+                    :model-value="useEmbeddedOcr"
+                    @update:model-value="saveUseEmbeddedOcr"
+                  />
                 </div>
-                <div class="flex items-center gap-2 mt-1">
-                  <span v-if="ollamaStatus === 'connected'" class="flex items-center gap-1 text-xs text-green-500">
-                    <CheckCircle class="w-3 h-3" /> Connected · {{ ollamaModels.length }} model{{ ollamaModels.length !== 1 ? 's' : '' }}
-                  </span>
-                  <span v-else-if="ollamaStatus === 'error'" class="flex items-center gap-1 text-xs text-red-400">
-                    <XCircle class="w-3 h-3" /> {{ ollamaError || 'Connection failed' }}
-                  </span>
-                  <span v-else-if="ollamaStatus === 'checking'" class="text-xs text-nanna-text-dim">Checking…</span>
-                  <span v-else class="text-xs text-nanna-text-dim">Local Ollama instance for fallback models</span>
+
+                <!-- Vision model fallback list -->
+                <ModelPriorityList
+                  label="Vision Model Fallback (Tier 1+)"
+                  hint="Only vision-capable models shown. Used when embedded OCR fails or returns no text."
+                  :all-models="allOcrModels"
+                  v-model="ocrModelPriority"
+                  @update:model-value="saveOcrModelPriority"
+                />
+
+                <div v-if="allOcrModels.length === 0" class="mt-3 p-3 rounded-lg bg-nanna-warning/10 border border-nanna-warning/30">
+                  <div class="flex items-start gap-2">
+                    <AlertTriangle class="w-4 h-4 text-nanna-warning shrink-0 mt-0.5" />
+                    <p class="text-xs text-nanna-warning">No vision-capable models available. Install a vision Ollama model (e.g. llava) or set up an Anthropic/OpenAI API key.</p>
+                  </div>
+                </div>
+                <div v-else class="flex items-center gap-2 mt-3">
+                  <UiBadge v-if="useEmbeddedOcr" variant="success">✓ Embedded OCR active</UiBadge>
+                  <UiBadge v-if="ocrModelPriority.length > 0" variant="success">✓ {{ ocrModelPriority.length }} vision model{{ ocrModelPriority.length !== 1 ? 's' : '' }} in fallback chain</UiBadge>
+                  <UiBadge v-if="!useEmbeddedOcr && ocrModelPriority.length === 0" variant="warning">⚠ No OCR methods configured</UiBadge>
                 </div>
               </div>
 
-              <!-- Ollama API Key -->
-              <div class="mt-4 pt-4 border-t border-white/[0.04]">
-                <label class="block text-sm font-medium text-nanna-text-muted mb-1">Ollama API Key</label>
-                <div class="flex gap-2">
-                  <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="Optional — for remote/authenticated Ollama" class="flex-1" />
-                  <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
-                </div>
-                <p class="text-xs text-nanna-text-dim mt-1">Only needed for remote Ollama instances that require authentication</p>
-              </div>
             </UiCard>
           </div>
         </UiTabPanel>
@@ -319,46 +364,98 @@
                 <Cpu class="w-4 h-4" />
                 Model Routing
               </h3>
+              <p class="text-xs text-nanna-text-dim mb-4">
+                Route simpler tasks to cheaper models automatically. The agent classifies each iteration's complexity
+                and picks the cheapest capable model. If the routed model fails, it escalates to the primary model.
+              </p>
+
               <div class="space-y-4">
+                <!-- Sub-agent model -->
                 <div class="flex items-center justify-between">
                   <div>
-                    <div class="text-sm font-medium text-nanna-text">Primary Model</div>
-                    <div class="text-xs text-nanna-text-dim">Default model for all tasks</div>
+                    <div class="text-sm font-medium text-nanna-text">Sub-Agent Model</div>
+                    <div class="text-xs text-nanna-text-dim">Cheaper model for delegated sub-tasks</div>
                   </div>
-                  <!-- TODO: Actually fetch available models from daemon -->
-                  <UiSelect 
-                    :model-value="settings?.model ?? ''"
-                    @update:model-value="saveSetting('model', $event)"
-                    :options="primaryModelOptions"
+                  <UiSelect
+                    :model-value="subAgentModel || ''"
+                    @update:model-value="saveSubAgentModel($event)"
+                    :options="[{ value: '', label: 'Same as primary' }, ...routingModelOptions]"
                     class="w-64"
                   />
                 </div>
 
+                <!-- Enable routing -->
                 <div class="flex items-center justify-between">
                   <div>
-                    <div class="text-sm font-medium text-nanna-text">Routing Enabled</div>
-                    <div class="text-xs text-nanna-text-dim">Use cheaper models for simpler tasks</div>
+                    <div class="text-sm font-medium text-nanna-text">Enable Routing</div>
+                    <div class="text-xs text-nanna-text-dim">Use cheaper models for simpler iterations</div>
                   </div>
-                  <UiSwitch :model-value="settings?.routing_first_turn_primary ?? true" @update:model-value="saveSetting('routing_first_turn_primary', $event)" />
+                  <UiSwitch :model-value="routingEnabled" @update:model-value="toggleRouting" />
                 </div>
 
-                <!-- Dynamic list for model_routing -->
-                <div v-if="settings?.routing_first_turn_primary" class="space-y-3">
-                  <label class="block text-sm font-medium text-nanna-text">Route Priority List</label>
-                  <p class="text-xs text-nanna-text-muted mb-2">
-                    Format: <code class="bg-nanna-bg-elevated px-1 rounded">model_spec:tier</code> (e.g., <code class="bg-nanna-bg-elevated px-1 rounded">claude-haiku-3-5-20241022:simple</code>). Cheapest models first.
-                  </p>
-                  <div v-for="(route, index) in settings?.model_routing" :key="index" class="flex items-center gap-2">
-                    <UiInput v-model="settings.model_routing[index]" @update:model-value="saveSetting('model_routing', settings.model_routing); updateChanges()" placeholder="e.g., claude-haiku-3-5-20241022:simple" class="flex-1" />
-                    <UiButton @click="removeModelRoute(index)" variant="outline" size="sm">
-                      <Trash2 class="w-4 h-4" />
+                <template v-if="routingEnabled">
+                  <!-- First turn primary -->
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <div class="text-sm font-medium text-nanna-text">Primary on First Turn</div>
+                      <div class="text-xs text-nanna-text-dim">Always use primary model for the initial response</div>
+                    </div>
+                    <UiSwitch :model-value="routingFirstTurnPrimary" @update:model-value="saveRoutingFirstTurnPrimary" />
+                  </div>
+
+                  <!-- Route table -->
+                  <div class="space-y-3">
+                    <div class="flex items-center justify-between">
+                      <label class="text-sm font-medium text-nanna-text">Routes</label>
+                      <span class="text-xs text-nanna-text-dim">Cheapest first — drag to reorder</span>
+                    </div>
+
+                    <div v-if="modelRoutes.length === 0" class="p-4 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30 text-center">
+                      <p class="text-xs text-nanna-text-dim">No routes configured. Add a route to start saving on API costs.</p>
+                    </div>
+
+                    <div v-for="(route, index) in modelRoutes" :key="index" class="flex items-center gap-2 p-2 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30">
+                      <!-- Model select -->
+                      <UiSelect
+                        :model-value="route.model"
+                        @update:model-value="updateRouteModel(index, $event)"
+                        :options="routingModelOptions"
+                        placeholder="Select model..."
+                        class="flex-1"
+                      />
+                      <!-- Tier select -->
+                      <UiSelect
+                        :model-value="route.tier"
+                        @update:model-value="updateRouteTier(index, $event)"
+                        :options="[
+                          { value: 'simple', label: '⚡ Simple' },
+                          { value: 'medium', label: '⚙️ Medium' },
+                          { value: 'complex', label: '🧠 Complex' },
+                        ]"
+                        class="w-36"
+                      />
+                      <!-- Remove -->
+                      <button class="p-1.5 rounded hover:bg-nanna-error/20 text-nanna-text-muted hover:text-nanna-error transition-colors" @click="removeRoute(index)">
+                        <Trash2 class="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    <UiButton @click="addRoute" variant="outline" size="sm">
+                      <Plus class="w-4 h-4 mr-1" />
+                      Add Route
                     </UiButton>
                   </div>
-                  <UiButton @click="addModelRoute" variant="outline" size="sm">
-                    <Plus class="w-4 h-4 mr-1" />
-                    Add Route
-                  </UiButton>
-                </div>
+
+                  <!-- Complexity guide -->
+                  <div class="p-3 rounded-lg bg-nanna-bg-elevated/20 border border-nanna-border/20">
+                    <div class="text-xs font-medium text-nanna-text-muted mb-2">Complexity Tiers</div>
+                    <div class="space-y-1 text-xs text-nanna-text-dim">
+                      <div><span class="text-nanna-text">⚡ Simple</span> — tool result processing, acknowledgments, straightforward tool calls</div>
+                      <div><span class="text-nanna-text">⚙️ Medium</span> — multi-step reasoning, code generation, summarization</div>
+                      <div><span class="text-nanna-text">🧠 Complex</span> — novel problem solving, long-form analysis, ambiguous requests</div>
+                    </div>
+                  </div>
+                </template>
               </div>
             </UiCard>
 
@@ -464,6 +561,34 @@
                   </div>
                 </div>
                 
+                <!-- Consolidation Settings -->
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm font-medium text-nanna-text">Max Compression</span>
+                    <span class="text-sm text-nanna-accent font-mono">{{ ((settings?.max_compression_ratio ?? 0.5) * 100).toFixed(0) }}%</span>
+                  </div>
+                  <input 
+                    type="range" min="10" max="90" step="5"
+                    :value="(settings?.max_compression_ratio ?? 0.5) * 100"
+                    @change="setMaxCompressionRatio(Number(($event.target as HTMLInputElement).value) / 100)"
+                    class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+                  >
+                  <p class="text-xs text-nanna-text-dim mt-1">Max fraction of memories that can be merged per consolidation run</p>
+                </div>
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm font-medium text-nanna-text">Min Memories Floor</span>
+                    <span class="text-sm text-nanna-accent font-mono">{{ settings?.min_remaining_memories ?? 20 }}</span>
+                  </div>
+                  <input 
+                    type="range" min="5" max="200" step="5"
+                    :value="settings?.min_remaining_memories ?? 20"
+                    @change="setMinRemainingMemories(Number(($event.target as HTMLInputElement).value))"
+                    class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+                  >
+                  <p class="text-xs text-nanna-text-dim mt-1">Never consolidate below this many memories</p>
+                </div>
+
                 <!-- Dream Button -->
                 <UiButton @click="triggerConsolidation" :disabled="consolidating || !settings?.dreaming_enabled" class="w-full">
                   <UiSpinner v-if="consolidating" size="sm" class="mr-2" />
@@ -683,7 +808,7 @@ import {
   ArrowLeft, Key, Brain, Link, Wrench, BrainCircuit, Database, Moon,
   RefreshCw, Trash2, CheckCircle, XCircle, Save, Clock, FileDown, FileUp,
   Bot, MessageSquare, AlertTriangle, LogOut, Download, Terminal, Layers,
-  Cpu, Plus
+  Cpu, Plus, ScanText
 } from 'lucide-vue-next'
 
 interface ToolInfo {
@@ -713,6 +838,8 @@ interface ExtendedSettings {
   ollama_api_key: string
   tools: ToolInfo[]
   dreaming_enabled: boolean
+  max_compression_ratio: number
+  min_remaining_memories: number
   scheduler_enabled: boolean
   heartbeat_enabled: boolean
   heartbeat_interval_seconds: number
@@ -781,6 +908,20 @@ const chatModelPriority = ref<string[]>([])
 const embeddingModelPriority = ref<string[]>([])
 const summarizationModelPriority = ref<string[]>([])
 
+// OCR settings
+const ocrModelPriority = ref<string[]>([])
+const useEmbeddedOcr = ref(true)
+
+// Model routing state
+interface RouteEntry {
+  model: string
+  tier: string
+}
+const modelRoutes = ref<RouteEntry[]>([])
+const routingEnabled = ref(false)
+const routingFirstTurnPrimary = ref(true)
+const subAgentModel = ref<string | null>(null)
+
 // Anthropic OAuth state
 const oauthTokenInput = ref('')
 const oauthLoading = ref(false)
@@ -790,6 +931,7 @@ const oauthAction = ref<'setup' | 'import' | null>(null)
 const anthropicModels = ref<ModelInfo[]>([])
 const openaiModels = ref<ModelInfo[]>([])
 const openrouterModels = ref<ModelInfo[]>([])
+const openrouterEmbeddingModels = ref<ModelInfo[]>([])
 const githubModels = ref<ModelInfo[]>([])
 const claudeProxyModels = ref<ModelInfo[]>([])
 
@@ -868,13 +1010,10 @@ const allEmbeddingModels = computed<ModelOption[]>(() => {
     }
   }
 
-  // OpenRouter embedding models
-  if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
-    const embeddingModels = openrouterModels.value.filter(m =>
-      m.id.includes('embed') || m.id.includes('embedding')
-    )
-    for (const m of embeddingModels) {
-      models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
+  // OpenRouter embedding models (from dedicated embeddings endpoint)
+  if (settings.value?.openrouter_key_set && openrouterEmbeddingModels.value.length > 0) {
+    for (const m of openrouterEmbeddingModels.value) {
+      models.push({ id: `openrouter/${m.id}`, name: `${m.name} (OpenRouter)`, provider: 'openrouter', available: true })
     }
   }
 
@@ -929,6 +1068,86 @@ const allSummarizationModels = computed<ModelOption[]>(() => {
   if (settings.value?.github_key_set && githubModels.value.length > 0) {
     for (const m of githubModels.value) {
       models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
+    }
+  }
+
+  return models
+})
+
+// Vision-capable models for OCR
+const KNOWN_VISION_MODEL_PATTERNS = [
+  'llava', 'deepseek-ocr', 'minicpm-v', 'moondream', 'bakllava',
+  'cogvlm', 'internvl', 'qwen-vl', 'phi-3-vision', 'phi3v',
+  'gpt-4o', 'gpt-4-vision', 'gpt-4-turbo',
+  'claude-3', 'claude-opus', 'claude-sonnet', 'claude-haiku',
+]
+
+function isVisionCapable(modelId: string, provider: string): boolean {
+  const id = modelId.toLowerCase()
+  if (provider === 'anthropic') {
+    // claude-3 and above support vision
+    return id.includes('claude-3') || id.includes('claude-opus') ||
+           id.includes('claude-sonnet') || id.includes('claude-haiku')
+  }
+  if (provider === 'openai') {
+    return id.includes('gpt-4o') || id.includes('gpt-4-vision') || id.includes('gpt-4-turbo')
+  }
+  if (provider === 'ollama') {
+    return KNOWN_VISION_MODEL_PATTERNS.some(p => id.includes(p))
+  }
+  // openrouter / github / claude-proxy: pattern match
+  return KNOWN_VISION_MODEL_PATTERNS.some(p => id.includes(p))
+}
+
+const allOcrModels = computed<ModelOption[]>(() => {
+  const models: ModelOption[] = []
+
+  // Anthropic claude-3+ (vision capable)
+  const anthropicAvailable = settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in
+  if (anthropicAvailable && anthropicModels.value.length > 0) {
+    for (const m of anthropicModels.value) {
+      if (isVisionCapable(m.id, 'anthropic')) {
+        models.push({ id: m.id, name: m.name, provider: 'anthropic', available: true })
+      }
+    }
+  }
+
+  // OpenAI vision models
+  if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    for (const m of openaiModels.value) {
+      if (isVisionCapable(m.id, 'openai')) {
+        models.push({ id: m.id, name: m.name, provider: 'openai', available: true })
+      }
+    }
+  }
+
+  // Ollama vision models (local — listed after cloud for cost efficiency awareness)
+  for (const m of ollamaModels.value.filter(m => !m.is_embedding_model)) {
+    if (isVisionCapable(m.name, 'ollama')) {
+      models.push({
+        id: `ollama/${m.name}`,
+        name: `${m.name} (local)`,
+        provider: 'ollama',
+        available: ollamaStatus.value === 'connected',
+      })
+    }
+  }
+
+  // OpenRouter vision models
+  if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    for (const m of openrouterModels.value) {
+      if (isVisionCapable(m.id, 'openrouter')) {
+        models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
+      }
+    }
+  }
+
+  // GitHub vision models
+  if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    for (const m of githubModels.value) {
+      if (isVisionCapable(m.id, 'github')) {
+        models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
+      }
     }
   }
 
@@ -995,6 +1214,36 @@ async function loadSettings() {
       // Default to empty (truncate instead of summarize)
       summarizationModelPriority.value = []
     }
+    try {
+      ocrModelPriority.value = await invoke<string[]>('get_ocr_model_priority')
+    } catch {
+      ocrModelPriority.value = []
+    }
+    try {
+      useEmbeddedOcr.value = await invoke<boolean>('get_use_embedded_ocr')
+    } catch {
+      useEmbeddedOcr.value = true
+    }
+
+    // Load model routing config
+    try {
+      const routes = await invoke<string[]>('get_model_routing')
+      modelRoutes.value = routes.map(parseRouteSpec)
+      routingEnabled.value = routes.length > 0
+    } catch {
+      modelRoutes.value = []
+      routingEnabled.value = false
+    }
+    try {
+      routingFirstTurnPrimary.value = await invoke<boolean>('get_routing_first_turn_primary')
+    } catch {
+      routingFirstTurnPrimary.value = true
+    }
+    try {
+      subAgentModel.value = await invoke<string | null>('get_sub_agent_model')
+    } catch {
+      subAgentModel.value = null
+    }
 
     // Always refresh Ollama models to populate the lists
     await refreshOllamaModels()
@@ -1044,6 +1293,14 @@ async function refreshModels() {
         .catch(e => {
           console.warn('Failed to fetch OpenRouter models:', e)
           openrouterModels.value = []
+        })
+    )
+    promises.push(
+      invoke<ModelInfo[]>('get_openrouter_embedding_models')
+        .then(models => { openrouterEmbeddingModels.value = models })
+        .catch(e => {
+          console.warn('Failed to fetch OpenRouter embedding models:', e)
+          openrouterEmbeddingModels.value = []
         })
     )
   }
@@ -1141,6 +1398,112 @@ async function saveSummarizationModelPriority(priority: string[]) {
   try {
     await invoke('set_summarization_model_priority', { priority })
     showToast('Summarization model priority saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveOcrModelPriority(priority: string[]) {
+  try {
+    await invoke('set_ocr_model_priority', { priority })
+    showToast('OCR model priority saved', 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveUseEmbeddedOcr(enabled: boolean) {
+  useEmbeddedOcr.value = enabled
+  try {
+    await invoke('set_use_embedded_ocr', { enabled })
+    showToast(`Embedded OCR ${enabled ? 'enabled' : 'disabled'}`, 'success')
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+// ── Model Routing ──
+
+function parseRouteSpec(spec: string): RouteEntry {
+  // Parse "model:tier" — but handle model names with colons (e.g. "ollama/qwen3:4b")
+  // Tier is always the last segment and must be simple|medium|complex
+  const lastColon = spec.lastIndexOf(':')
+  if (lastColon > 0) {
+    const maybeTier = spec.slice(lastColon + 1).toLowerCase()
+    if (['simple', 'medium', 'complex'].includes(maybeTier)) {
+      return { model: spec.slice(0, lastColon), tier: maybeTier }
+    }
+  }
+  return { model: spec, tier: 'complex' }
+}
+
+function serializeRoutes(): string[] {
+  return modelRoutes.value
+    .filter(r => r.model)
+    .map(r => `${r.model}:${r.tier}`)
+}
+
+async function saveRoutes() {
+  try {
+    await invoke('set_model_routing', { routes: serializeRoutes() })
+  } catch (e: any) {
+    showToast(`Failed to save routing: ${e.message || e}`, 'error')
+  }
+}
+
+function toggleRouting(enabled: boolean) {
+  routingEnabled.value = enabled
+  if (!enabled) {
+    // Clear routes when disabled
+    modelRoutes.value = []
+    saveRoutes()
+  }
+}
+
+async function saveRoutingFirstTurnPrimary(enabled: boolean) {
+  routingFirstTurnPrimary.value = enabled
+  try {
+    await invoke('set_routing_first_turn_primary', { enabled })
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+function addRoute() {
+  modelRoutes.value.push({ model: '', tier: 'simple' })
+}
+
+function removeRoute(index: number) {
+  modelRoutes.value.splice(index, 1)
+  saveRoutes()
+}
+
+function updateRouteModel(index: number, model: string) {
+  modelRoutes.value[index].model = model
+  saveRoutes()
+}
+
+function updateRouteTier(index: number, tier: string) {
+  modelRoutes.value[index].tier = tier
+  saveRoutes()
+}
+
+// Available models for routing (all chat models as select options)
+const routingModelOptions = computed(() => {
+  return allChatModels.value
+    .filter(m => m.available)
+    .map(m => ({
+      value: m.id,
+      label: `${m.name} (${m.provider})`,
+    }))
+})
+
+async function saveSubAgentModel(model: string) {
+  const value = model || null
+  subAgentModel.value = value
+  try {
+    await invoke('set_sub_agent_model', { model: value })
+    showToast(value ? `Sub-agent model: ${value}` : 'Sub-agents will use primary model', 'success')
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')
   }
@@ -1352,6 +1715,24 @@ async function setSimilarityThreshold(value: number) {
 async function setDreamingEnabled(enabled: boolean) {
   try {
     await invoke('set_dreaming_enabled', { enabled })
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function setMaxCompressionRatio(value: number) {
+  try {
+    await invoke('set_max_compression_ratio', { ratio: value })
+    await loadSettings()
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function setMinRemainingMemories(value: number) {
+  try {
+    await invoke('set_min_remaining_memories', { count: value })
     await loadSettings()
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')

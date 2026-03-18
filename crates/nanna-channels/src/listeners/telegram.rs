@@ -334,13 +334,14 @@ struct TelegramMessage {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Telegram API response - chat metadata unused (only id is needed)
 struct TelegramChat {
     id: i64,
     #[serde(rename = "type")]
-    chat_type: String,
-    title: Option<String>,
-    username: Option<String>,
+    _chat_type: String,
+    #[serde(rename = "title")]
+    _title: Option<String>,
+    #[serde(rename = "username")]
+    _username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,27 +353,28 @@ struct TelegramUser {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Telegram API response - dimensions unused (only file_id needed)
 struct TelegramPhotoSize {
     file_id: String,
-    width: i32,
-    height: i32,
+    #[serde(rename = "width")]
+    _width: i32,
+    #[serde(rename = "height")]
+    _height: i32,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Telegram API response - metadata unused (TODO: implement file handling)
 struct TelegramDocument {
     file_id: String,
     file_name: Option<String>,
-    mime_type: Option<String>,
+    #[serde(rename = "mime_type")]
+    _mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Telegram API response - title unused (TODO: display audio metadata)
 struct TelegramAudio {
     file_id: String,
     duration: i32,
-    title: Option<String>,
+    #[serde(rename = "title")]
+    _title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,12 +384,13 @@ struct TelegramVoice {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Telegram API response - dimensions unused (only file_id needed)
 struct TelegramVideo {
     file_id: String,
     duration: i32,
-    width: i32,
-    height: i32,
+    #[serde(rename = "width")]
+    _width: i32,
+    #[serde(rename = "height")]
+    _height: i32,
 }
 
 #[derive(Debug, Deserialize)]

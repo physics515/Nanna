@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 //! Nanna Client - Library for connecting to the daemon
 //!
 //! Provides a high-level async API for interacting with nanna-daemon.

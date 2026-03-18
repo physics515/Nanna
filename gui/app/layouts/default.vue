@@ -71,9 +71,6 @@
           :order="1"
           class="chat-panel"
         >
-          <!-- Workspace Switcher -->
-          <WorkspaceSwitcher />
-
           <!-- Header -->
           <div style="padding: 0.25rem 0.75rem; display: flex; align-items: center; justify-content: space-between;">
             <span style="font-size: 0.7rem; font-weight: 500; color: rgba(196,205,214,0.5); text-transform: uppercase; letter-spacing: 0.06em;">Chats</span>
@@ -149,7 +146,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, provide } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3 } from 'lucide-vue-next'
+import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity } from 'lucide-vue-next'
 
 const navItems = [
   { to: '/memory', label: 'Memory', icon: Brain },
@@ -160,6 +157,7 @@ const navItems = [
   { to: '/tools', label: 'Tools', icon: Wrench },
   { to: '/scheduler', label: 'Scheduler', icon: Clock },
   { to: '/model-stats', label: 'Model Stats', icon: BarChart3 },
+  { to: '/tool-stats', label: 'Tool Stats', icon: Activity },
 ]
 
 interface SessionInfo {
@@ -239,15 +237,15 @@ function selectWorkspaceTab(workspaceId: string) {
   if (!ws) {
     loadOpenWorkspaces().then(() => {
       const found = openWorkspaces.value.find(w => w.id === workspaceId)
-      if (found) currentTab.value = { type: 'workspace', workspaceId }
+      if (found) selectTab({ type: 'workspace', workspaceId })
     })
   } else {
-    currentTab.value = { type: 'workspace', workspaceId }
+    selectTab({ type: 'workspace', workspaceId })
   }
 }
 
 function selectGlobalTab() {
-  currentTab.value = { type: 'global' }
+  selectTab({ type: 'global' })
 }
 
 provide('currentSessionId', currentSessionId)
@@ -276,6 +274,9 @@ onMounted(async () => {
   await loadOpenWorkspaces()
   await loadSessions()
   await loadConfig()
+
+  // Sync restored workspace state with daemon
+  syncDaemonWorkspace(currentTab.value)
 
   const urlSessionId = route.query.session as string | undefined
   if (urlSessionId && sessions.value.some(s => s.id === urlSessionId)) {
@@ -352,19 +353,39 @@ async function loadOpenWorkspaces() {
   try {
     const allWorkspaces = await invoke<WorkspaceInfo[]>('list_workspaces')
     const savedIds = openWorkspaces.value.map(w => w.id)
-    openWorkspaces.value = allWorkspaces.filter(ws => savedIds.includes(ws.id))
+    
+    if (savedIds.length > 0) {
+      // Restore from localStorage (match IDs with backend)
+      openWorkspaces.value = allWorkspaces.filter(ws => savedIds.includes(ws.id))
+    } else {
+      // No localStorage tabs — restore all registered workspaces from DB
+      openWorkspaces.value = allWorkspaces
+    }
+    
+    // If current tab points to a workspace that no longer exists, fall back to global
     if (currentTab.value?.type === 'workspace') {
       if (!openWorkspaces.value.some(w => w.id === currentTab.value.workspaceId)) {
         currentTab.value = { type: 'global' }
       }
     }
+    
+    // Auto-select active workspace if no current tab is set and one is active
+    if (currentTab.value?.type === 'global') {
+      const activeWs = allWorkspaces.find(ws => ws.active)
+      if (activeWs && openWorkspaces.value.some(w => w.id === activeWs.id)) {
+        currentTab.value = { type: 'workspace', workspaceId: activeWs.id }
+      }
+    }
+    
     saveTabsToStorage()
   } catch (e) { console.error('Failed to load workspaces:', e); openWorkspaces.value = [] }
 }
 
 async function loadSessions() {
   try {
-    const workspaceId = currentTab.value?.type === 'workspace' ? currentTab.value.workspaceId ?? null : null
+    // Global = show ALL sessions (workspaceId = null → list_sessions returns all)
+    // Workspace = show only that workspace's sessions (workspaceId = id)
+    const workspaceId = currentTab.value?.type === 'workspace' ? (currentTab.value.workspaceId ?? null) : null
     sessions.value = await invoke<SessionInfo[]>('list_sessions', { workspaceId })
     if (sessions.value[0] && !currentSessionId.value) currentSessionId.value = sessions.value[0].id
   } catch (e) { console.error('Failed to load sessions:', e) }
@@ -377,12 +398,29 @@ async function loadConfig() {
   } catch (e) { console.error('Failed to load config:', e) }
 }
 
-function selectTab(tab: Tab) { currentTab.value = tab }
+function selectTab(tab: Tab) {
+  currentTab.value = tab
+  // Sync active workspace on daemon for tool working directory + context
+  syncDaemonWorkspace(tab)
+}
+
+async function syncDaemonWorkspace(tab: Tab) {
+  try {
+    if (tab.type === 'workspace' && tab.workspaceId) {
+      await invoke('set_active_workspace', { id: tab.workspaceId })
+    } else {
+      await invoke('clear_active_workspace')
+    }
+  } catch (e) {
+    console.error('Failed to sync workspace with daemon:', e)
+  }
+}
 
 function openWorkspaceTab(ws: WorkspaceInfo) {
   if (!openWorkspaces.value.some(w => w.id === ws.id)) openWorkspaces.value.push(ws)
   currentTab.value = { type: 'workspace', workspaceId: ws.id }
   saveTabsToStorage()
+  syncDaemonWorkspace(currentTab.value)
 }
 
 function closeWorkspaceTab(workspaceId: string) {

@@ -222,6 +222,7 @@ pub fn embedding_dimension_for_model(model: &str) -> Option<usize> {
 }
 
 /// File-based cache for model information
+#[derive(Clone)]
 pub struct ModelInfoCache {
     cache_dir: std::path::PathBuf,
 }
@@ -1494,6 +1495,17 @@ impl LlmClient {
             body["tools"] = tools;
         }
 
+        // Enable thinking separation for models that support it (qwen3, deepseek-r1, etc.)
+        // This makes Ollama return thinking in a separate `thinking` field instead of
+        // embedding <think>...</think> tags inside `content`.
+        let model_lower = request.model.to_lowercase();
+        if model_lower.contains("qwen3")
+            || model_lower.contains("deepseek-r1")
+            || model_lower.contains("qwq")
+        {
+            body["think"] = serde_json::json!(true);
+        }
+
         let response = self.apply_ollama_auth(self
             .http
             .post(format!("{}/api/chat", self.base_url))
@@ -2022,6 +2034,13 @@ impl EmbeddingClient {
         self
     }
 
+    /// Override the base URL (e.g. for OpenRouter-compatible embedding endpoints).
+    #[must_use]
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
     /// Get embeddings for a batch of texts.
     ///
     /// # Errors
@@ -2075,47 +2094,80 @@ impl EmbeddingClient {
     }
 
     async fn embed_ollama(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, LlmError> {
-        // Ollama embedding API only supports one text at a time
-        #[derive(Serialize)]
-        struct OllamaEmbedRequest<'a> {
-            model: &'a str,
-            prompt: &'a str,
-        }
-
-        #[derive(Deserialize)]
-        struct OllamaEmbedResponse {
-            embedding: Vec<f32>,
-        }
-
         let mut results = Vec::with_capacity(texts.len());
 
         for text in texts {
-            let mut req = self
-                .http
-                .post(format!("{}/api/embeddings", self.base_url))
-                .header("Content-Type", "application/json");
-            if !self.api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            let embedding = self.embed_ollama_one(text).await?;
+            if embedding.is_empty() {
+                return Err(LlmError::Api {
+                    status: 500,
+                    message: format!(
+                        "Ollama returned empty embedding for model '{}'. Is the model pulled?",
+                        self.model
+                    ),
+                });
             }
-            let response = req
-                .json(&OllamaEmbedRequest {
-                    model: &self.model,
-                    prompt: text,
-                })
-                .send()
-                .await?;
-
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let message = response.text().await.unwrap_or_default();
-                return Err(LlmError::from_api_response(status, message));
-            }
-
-            let result: OllamaEmbedResponse = response.json().await?;
-            results.push(result.embedding);
+            results.push(embedding);
         }
 
         Ok(results)
+    }
+
+    /// Embed a single text via Ollama, trying new API then legacy.
+    async fn embed_ollama_one(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+        #[derive(Serialize)]
+        struct NewReq<'a> { model: &'a str, input: &'a str }
+        #[derive(Serialize)]
+        struct LegacyReq<'a> { model: &'a str, prompt: &'a str }
+        #[derive(Deserialize)]
+        struct NewResp { #[serde(default)] embeddings: Vec<Vec<f32>> }
+        #[derive(Deserialize)]
+        struct LegacyResp { #[serde(default)] embedding: Vec<f32> }
+
+        // Try new API: POST /api/embed { model, input }
+        let mut req = self
+            .http
+            .post(format!("{}/api/embed", self.base_url))
+            .header("Content-Type", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let response = req
+            .json(&NewReq { model: &self.model, input: text })
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            if let Ok(resp) = response.json::<NewResp>().await {
+                if let Some(emb) = resp.embeddings.into_iter().next() {
+                    if !emb.is_empty() {
+                        return Ok(emb);
+                    }
+                }
+            }
+        }
+
+        // Fall back to legacy API: POST /api/embeddings { model, prompt }
+        let mut req = self
+            .http
+            .post(format!("{}/api/embeddings", self.base_url))
+            .header("Content-Type", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let response = req
+            .json(&LegacyReq { model: &self.model, prompt: text })
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::from_api_response(status, message));
+        }
+
+        let result: LegacyResp = response.json().await?;
+        Ok(result.embedding)
     }
 
     /// Get embedding for a single text.
@@ -2266,7 +2318,6 @@ struct MessageStartData {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields populated by serde for future use
 struct ContentBlockData {
     #[serde(rename = "type")]
     block_type: String,
@@ -2788,8 +2839,12 @@ impl LlmClient {
             // Ollama streams NDJSON: one JSON per line
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
+            let mut thinking_block_started = false;
             let mut text_block_started = false;
             let mut tool_block_count = 0usize;
+            // Ollama thinking uses block index 0 (same as Anthropic);
+            // text starts at index 1 when thinking is present, or 0 otherwise.
+            let mut next_block_index = 0usize;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -2825,42 +2880,72 @@ impl LlmClient {
                     let done = obj["done"].as_bool().unwrap_or(false);
 
                     // Stream thinking content (qwen3 and other thinking models)
-                    // Ollama returns thinking tokens in message.thinking
+                    // Ollama returns thinking tokens in message.thinking.
+                    // Emit proper ContentBlockStart/Stop to match Anthropic's block structure.
                     if let Some(thinking) = obj["message"]["thinking"].as_str() {
                         if !thinking.is_empty() {
-                            yield Ok(StreamEvent::ThinkingDelta { index: 0, thinking: thinking.to_string() });
+                            if !thinking_block_started {
+                                thinking_block_started = true;
+                                yield Ok(StreamEvent::ContentBlockStart {
+                                    index: next_block_index,
+                                    content_type: "thinking".to_string(),
+                                    tool_id: None,
+                                    tool_name: None,
+                                });
+                            }
+                            yield Ok(StreamEvent::ThinkingDelta { index: next_block_index, thinking: thinking.to_string() });
                         }
                     }
 
-                    // Stream text content
+                    // Stream text content.
+                    // When text starts arriving and thinking was active, close the thinking block first.
                     if let Some(content) = obj["message"]["content"].as_str() {
                         if !content.is_empty() {
+                            // Close thinking block when transitioning to text
+                            if thinking_block_started {
+                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                                thinking_block_started = false;
+                                next_block_index += 1;
+                            }
                             if !text_block_started {
                                 text_block_started = true;
                                 yield Ok(StreamEvent::ContentBlockStart {
-                                    index: 0,
+                                    index: next_block_index,
                                     content_type: "text".to_string(),
                                     tool_id: None,
                                     tool_name: None,
                                 });
                             }
-                            yield Ok(StreamEvent::TextDelta { index: 0, text: content.to_string() });
+                            yield Ok(StreamEvent::TextDelta { index: next_block_index, text: content.to_string() });
                         }
                     }
 
-                    // Tool calls appear in the final message when done=true
-                    if done {
-                        if let Some(tool_calls) = obj["message"]["tool_calls"].as_array() {
-                            if text_block_started {
-                                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                                text_block_started = false;
+                    // Tool calls: Ollama emits these in a message with done=false,
+                    // followed by a separate done=true message with empty content.
+                    // Process tool_calls from ANY message, not just the done message.
+                    if let Some(tool_calls) = obj["message"]["tool_calls"].as_array() {
+                        if !tool_calls.is_empty() {
+                            // Close any open thinking/text blocks before tool calls
+                            if thinking_block_started {
+                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                                thinking_block_started = false;
+                                next_block_index += 1;
                             }
+                            if text_block_started {
+                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                                text_block_started = false;
+                                next_block_index += 1;
+                            }
+
                             for tc in tool_calls {
                                 tool_block_count += 1;
-                                let block_idx = tool_block_count;
+                                let block_idx = next_block_index;
+                                next_block_index += 1;
                                 let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                                 let args = tc["function"]["arguments"].to_string();
-                                let id = format!("toolu_{:08x}", block_idx);
+                                let id = tc["id"].as_str()
+                                    .map(String::from)
+                                    .unwrap_or_else(|| format!("toolu_{:08x}", tool_block_count));
                                 yield Ok(StreamEvent::ContentBlockStart {
                                     index: block_idx,
                                     content_type: "tool_use".to_string(),
@@ -2874,6 +2959,18 @@ impl LlmClient {
                                 yield Ok(StreamEvent::ContentBlockStop { index: block_idx });
                             }
                         }
+                    }
+
+                    if done {
+                        // Close any remaining open blocks
+                        if thinking_block_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                            next_block_index += 1;
+                        }
+                        if text_block_started {
+                            yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                            // next_block_index not needed after this
+                        }
 
                         // Emit output token count
                         if let Some(eval_count) = obj["eval_count"].as_u64() {
@@ -2883,10 +2980,6 @@ impl LlmClient {
                             });
                         }
 
-                        // Close remaining blocks and stop
-                        if text_block_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                        }
                         let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
                         yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
                         return;
@@ -2895,8 +2988,11 @@ impl LlmClient {
             }
 
             // If we get here without done=true, close gracefully
+            if thinking_block_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+            }
             if text_block_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
             }
             yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
@@ -2961,10 +3057,10 @@ impl LlmClient {
             }
 
             #[derive(Deserialize, Debug)]
-            #[allow(dead_code)] // API response struct - role field unused but part of OpenAI spec
             struct ChunkDelta {
                 content: Option<String>,
-                role: Option<String>,
+    #[serde(rename = "role")]
+                _role: Option<String>,
                 tool_calls: Option<Vec<ToolCallDelta>>,
             }
 
@@ -3291,24 +3387,68 @@ impl LlmClient {
                     }
                 }
                 Provider::Ollama => {
-                    // TODO: Implement Ollama streaming (for now, use non-streaming fallback)
-                    match self.complete_ollama(&request).await {
-                        Ok(text) => {
-                            yield StreamEvent::ContentBlockStart {
-                                index: 0,
-                                content_type: "text".to_string(),
-                                tool_id: None,
-                                tool_name: None,
-                            };
-                            yield StreamEvent::TextDelta {
-                                index: 0,
-                                text,
-                            };
-                            yield StreamEvent::ContentBlockStop { index: 0 };
-                            yield StreamEvent::MessageStop { stop_reason: "end_turn".to_string() };
-                        }
-                        Err(e) => {
-                            yield StreamEvent::Error { message: e.to_string() };
+                    // Ollama streaming: build AnthropicRequest and delegate to stream_anthropic
+                    // which already handles Ollama NDJSON streaming via stream_anthropic_via_ollama
+                    let system_msg = request
+                        .messages
+                        .iter()
+                        .find(|m| m.role == Role::System)
+                        .map(|m| m.content.clone());
+
+                    let messages: Vec<AnthropicMessage> = request
+                        .messages
+                        .iter()
+                        .filter(|m| m.role != Role::System)
+                        .map(|m| AnthropicMessage {
+                            role: match m.role {
+                                Role::User | Role::System => "user",
+                                Role::Assistant => "assistant",
+                            }.to_string(),
+                            content: vec![ContentBlock::Text { text: m.content.clone() }],
+                        })
+                        .collect();
+
+                    let mut all_messages = messages;
+                    all_messages.extend(request.anthropic_messages.clone());
+
+                    let tools = if request.tools.is_empty() {
+                        None
+                    } else {
+                        Some(request.tools.iter().filter_map(|v| {
+                            serde_json::from_value::<ToolDefinition>(v.clone()).ok()
+                        }).collect())
+                    };
+
+                    let anthropic_request = AnthropicRequest {
+                        model: request.model.clone(),
+                        messages: all_messages,
+                        max_tokens: request.max_tokens.unwrap_or(4096),
+                        temperature: request.temperature,
+                        system: system_msg,
+                        tools,
+                        stream: Some(true),
+                        thinking: None,
+                        cache_control: None,
+                    };
+
+                    let raw_stream = self.stream_anthropic(&anthropic_request);
+                    tokio::pin!(raw_stream);
+
+                    while let Some(result) = raw_stream.next().await {
+                        match result {
+                            Ok(event) => yield event,
+                            Err(e) => {
+                                if e.should_fallback() {
+                                    yield StreamEvent::RecoverableError {
+                                        error: e,
+                                        partial_text: String::new(),
+                                        partial_tool_calls: Vec::new(),
+                                    };
+                                } else {
+                                    yield StreamEvent::Error { message: e.to_string() };
+                                }
+                                return;
+                            }
                         }
                     }
                 }
@@ -3509,21 +3649,60 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
 }
 
 /// Convert an Ollama /api/chat response JSON to AnthropicResponse
+/// Extract content inside `<think>...</think>` tags.
+fn extract_think_content(text: &str) -> Option<String> {
+    let start = text.find("<think>")?;
+    let end = text.find("</think>")?;
+    if end > start + 7 {
+        Some(text[start + 7..end].trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Strip all `<think>...</think>` blocks from text, returning the remaining content.
+fn strip_think_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</think>") {
+            remaining = &remaining[start + end + 8..];
+        } else {
+            // Unclosed <think> tag — discard the rest (model is still thinking)
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result.trim().to_string()
+}
+
 fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
     let message = &response["message"];
     let mut content = Vec::new();
 
-    // Thinking content (qwen3 and other thinking models)
+    // Thinking content (qwen3 and other thinking models — Ollama separates this
+    // into a `thinking` field when `think: true` is set in the request)
     if let Some(thinking) = message["thinking"].as_str() {
         if !thinking.is_empty() {
             content.push(ContentBlock::Thinking { thinking: thinking.to_string() });
         }
     }
 
-    // Text content
-    if let Some(text) = message["content"].as_str() {
+    // Text content — strip embedded <think>...</think> tags (fallback for when
+    // Ollama doesn't separate thinking, e.g. older versions or models that embed tags)
+    if let Some(raw_text) = message["content"].as_str() {
+        // Extract thinking from tags if we didn't get it from the dedicated field
+        if !content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
+            if let Some(thinking) = extract_think_content(raw_text) {
+                if !thinking.is_empty() {
+                    content.push(ContentBlock::Thinking { thinking });
+                }
+            }
+        }
+        let text = strip_think_tags(raw_text);
         if !text.is_empty() {
-            content.push(ContentBlock::Text { text: text.to_string() });
+            content.push(ContentBlock::Text { text });
         }
     }
 
@@ -3586,7 +3765,8 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
     let sse = match serde_json::from_str::<AnthropicSSE>(data) {
         Ok(sse) => sse,
         Err(e) => {
-            debug!(error = %e, data_prefix = &data[..data.len().min(120)], "Skipping unrecognised SSE event");
+            let end = data.floor_char_boundary(data.len().min(120));
+            debug!(error = %e, data_prefix = &data[..end], "Skipping unrecognised SSE event");
             return None;
         }
     };

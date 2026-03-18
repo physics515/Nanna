@@ -337,16 +337,14 @@ impl Listener for SignalListener {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - account field unused but part of spec
 struct SignalEnvelope {
     envelope: SignalEnvelopeInner,
-    #[serde(default)]
-    account: Option<String>,
+    #[serde(default, rename = "account")]
+    _account: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - sync/receipt messages unused (data_message is primary)
 struct SignalEnvelopeInner {
     source_number: Option<String>,
     source_uuid: Option<String>,
@@ -354,63 +352,69 @@ struct SignalEnvelopeInner {
     timestamp: i64,
     #[serde(default)]
     data_message: Option<SignalDataMessage>,
-    #[serde(default)]
-    sync_message: Option<serde_json::Value>,
-    #[serde(default)]
-    receipt_message: Option<serde_json::Value>,
+    #[serde(default, rename = "sync_message")]
+    _sync_message: Option<serde_json::Value>,
+    #[serde(default, rename = "receipt_message")]
+    _receipt_message: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - attachments/reactions/timestamp unused (TODO: implement media handling)
 struct SignalDataMessage {
     message: Option<String>,
-    timestamp: Option<i64>,
+    #[serde(rename = "timestamp")]
+    _timestamp: Option<i64>,
     #[serde(default)]
     group_info: Option<SignalGroupInfo>,
     #[serde(default)]
     quote: Option<SignalQuote>,
-    #[serde(default)]
-    attachments: Option<Vec<SignalAttachment>>,
-    #[serde(default)]
-    reaction: Option<SignalReactionInfo>,
+    #[serde(default, rename = "attachments")]
+    _attachments: Option<Vec<SignalAttachment>>,
+    #[serde(default, rename = "reaction")]
+    _reaction: Option<SignalReactionInfo>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - group_type unused
 struct SignalGroupInfo {
     group_id: String,
     #[serde(rename = "type")]
-    group_type: Option<String>,
+    _group_type: Option<String>,
     group_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - quote details unused (TODO: implement quote display)
 struct SignalQuote {
     id: i64,
-    author: Option<String>,
-    text: Option<String>,
+    #[serde(rename = "author")]
+    _author: Option<String>,
+    #[serde(rename = "text")]
+    _text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - attachment metadata unused (TODO: implement media handling)
 struct SignalAttachment {
-    content_type: Option<String>,
-    filename: Option<String>,
-    id: Option<String>,
-    size: Option<i64>,
+    #[serde(rename = "content_type")]
+    _content_type: Option<String>,
+    #[serde(rename = "filename")]
+    _filename: Option<String>,
+    #[serde(rename = "id")]
+    _id: Option<String>,
+    #[serde(rename = "size")]
+    _size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // signald API response - reaction details unused (TODO: implement reactions)
 struct SignalReactionInfo {
-    emoji: String,
-    target_author: Option<String>,
-    target_sent_timestamp: Option<i64>,
-    is_remove: Option<bool>,
+    #[serde(rename = "emoji")]
+    _emoji: String,
+    #[serde(rename = "target_author")]
+    _target_author: Option<String>,
+    #[serde(rename = "target_sent_timestamp")]
+    _target_sent_timestamp: Option<i64>,
+    #[serde(rename = "is_remove")]
+    _is_remove: Option<bool>,
 }
