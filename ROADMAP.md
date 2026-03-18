@@ -20,6 +20,11 @@
 - [x] Browser tools (screenshot, extract, action, evaluate)
 - [x] Vision tools (analyze_image)
 - [x] OCR tools (extract text from images, describe image contents)
+  - [x] **Embedded OCR engine** — `ocrs` crate (pure Rust, ONNX models via RTen, auto-downloads ~50MB models, Latin script) (2026-03-17)
+  - [x] **Tiered OCR pipeline** — embedded ocrs first, then vision model priority list fallback (2026-03-17)
+  - [x] **OCR model priority config** — `ocr_model_priority` + `use_embedded_ocr` toggle in config (2026-03-17)
+  - [x] **OCR settings GUI** — vision-capable model filter, embedded OCR toggle, priority list in Settings (2026-03-17)
+  - [x] **PDF OCR fallback** — ReadPdfTool accepts OcrFn callback for pages with empty text extraction (2026-03-17)
 - [x] Audio tools (TTS, transcription)
 - [x] PDF tools (read text, extract images, analyze embedded images)
 - [x] Authoring tools (runtime tool creation) â€" `nanna-scripting` crate
@@ -124,6 +129,11 @@ CRT glow effects, scanlines optional, monospace fonts (JetBrains Mono / Fira Cod
 - [x] **Configurable consolidation limits** - `max_compression_ratio` (max fraction removable per run) and `min_remaining_memories` (hard floor) replace old `max_memories_per_run`; exposed in GUI Memory settings as sliders (2026-03-17)
 - [x] **Summarization model priority for consolidation** - consolidation uses `summarization_priority` from config, tries each model in order, falls back to `model_priority`; no more hardcoded model (2026-03-17)
 - [x] **Agent API key passthrough** - `openrouter_api_key` and `openai_api_key` wired through `AgentServiceConfig` → `AgentConfig` → `create_client_for_model()` so extraction/summarization works with all providers (2026-03-17)
+- [x] **Narration loop detection hardening** — expanded phrase list, lowered thresholds (4+ total hits OR 2+ distinct repeated), added phantom completion detection (model claims file writes without tool calls), improved nudge message (2026-03-17)
+- [x] **Tool result memory storage fix** — removed `[Tool:` prefix filter that silently discarded all tool result chunks in agent_service, fixing recall of read_file/code_search results (2026-03-17)
+- [x] **FSRS fields on NewMemory** — added missing FSRS fields (stability, difficulty, importance, etc.) to memory_storage.rs initializer (2026-03-17)
+- [x] **Memory persistence to SQLite** — removed JSON auto-save, dead `memory_path` field from ControlPlane (2026-03-17)
+- [x] **code_search diagnostics** — reports file count and read error count when returning no matches (2026-03-17)
 
 ### Settings Overhaul âœ…
 - [x] **Tabbed settings UI** - organize settings into logical tabs (Models, Agent, Memory, Tools, Scheduler, Data)
@@ -1062,6 +1072,12 @@ Requires a local model (7B+) running on GPU. A 4070 Ti Super (16GB) handles this
 | 109 | Configurable consolidation limits (GUI sliders) | âœ… Done (2026-03-17) |
 | 110 | Summarization model priority for consolidation | âœ… Done (2026-03-17) |
 | 111 | Agent API key passthrough (OpenRouter/OpenAI) | âœ… Done (2026-03-17) |
+| 112 | Embedded OCR (ocrs) + tiered OCR pipeline | âœ… Done (2026-03-17) |
+| 113 | OCR model priority config + GUI settings | âœ… Done (2026-03-17) |
+| 114 | Narration loop detection hardening | âœ… Done (2026-03-17) |
+| 115 | Tool result memory storage fix ([Tool: filter) | âœ… Done (2026-03-17) |
+| 116 | FSRS fields + SQLite memory persistence | âœ… Done (2026-03-17) |
+| 117 | code_search diagnostics (file count, read errors) | âœ… Done (2026-03-17) |
 
 ---
 
