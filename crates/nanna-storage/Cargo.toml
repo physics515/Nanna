@@ -12,5 +12,14 @@ thiserror.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
-# Turso - Rust-native SQLite
-turso = "0.4"
+# Turso — pure-Rust, SQLite-compatible embedded DB (the ONLY database).
+# Pinned exactly: turso is pre-1.0, so a minor/patch bump can break the build.
+turso = "=0.4.4"
+
+# Transitive-version pin (not imported directly). `turso_core` depends on aegis
+# with a caret (`0.9`), which floats to 0.9.8+ whose build.rs mandates a C build
+# via clang-cl — unavailable on a stock Windows MSVC toolchain. aegis 0.9.7 keeps
+# the pure-Rust path (matches Tiger Style "prefer pure-Rust, no-C where avoidable")
+# and builds with MSVC alone. Cargo.lock is untracked here, so this constraint is
+# the only durable lever. Revisit once the dev env ships LLVM/clang-cl.
+aegis = "=0.9.7"

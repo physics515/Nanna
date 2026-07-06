@@ -562,6 +562,7 @@ impl Default for MessageQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChannelId;
 
     #[test]
     fn test_rate_limiter() {
