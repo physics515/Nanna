@@ -266,8 +266,9 @@ pub fn composite_cluster_score(
     let recall_a = a.fsrs.access_count as f32;
     let recall_b = b.fsrs.access_count as f32;
     let max_recall = recall_a.max(recall_b).max(1.0);
-    let recall_ratio = recall_a.min(recall_b) / max_recall; // 0..1, 1 = same count
-    let recall_affinity = recall_ratio;
+    // Equal access counts are peers (affinity 1), including two never-accessed
+    // memories — `min/max` wrongly scored (0,0) as 0. Divergence lowers affinity.
+    let recall_affinity = 1.0 - (recall_a - recall_b).abs() / max_recall; // 0..1
 
     // 3. Importance proximity: prefer merging memories of similar importance.
     //    Two low-importance memories should merge; a high+low pair should not.
