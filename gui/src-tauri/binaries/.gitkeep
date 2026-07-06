@@ -1,0 +1,4 @@
+# Tauri sidecar binaries live here (nanna-daemon-<target-triple>[.exe]).
+# They are build artifacts, produced by `pnpm build:daemon` (scripts/build-daemon.js)
+# which runs `cargo build -p nanna-daemon` and copies the binary into this directory.
+# The binaries themselves are gitignored; this file just keeps the directory present.
