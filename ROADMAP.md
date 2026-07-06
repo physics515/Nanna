@@ -1,10 +1,11 @@
 # Nanna — Roadmap
 
 > The single master roadmap **and status source of truth** for Nanna — there is no separate
-> `STATUS.md`, `planning/`, or `docs/`. The daily dev routine reads this file, picks the **single
-> next unimplemented item**, builds it with tests, ticks the box, and appends a dated note.
-> Shipped capability is *described* in [`README.md`](README.md); here it is only tracked.
-> Edit surgically; never rewrite wholesale.
+> `STATUS.md`, `planning/`, or `docs/`. The **daily dev routine** (`.claude/skills/daily-dev`, run under
+> `/loop`) reads this file, picks the **single next unimplemented item**, builds it **Tiger-Style** (see
+> *Engineering doctrine*) with tests + benchmarks (see *Performance & Benchmarking*), ticks the box, and
+> appends a dated note. Shipped capability is *described* in [`README.md`](README.md); here it is only
+> tracked. Edit surgically; never rewrite wholesale.
 
 **Last updated:** 2026-07-06 (local-first direction pivot) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
@@ -230,6 +231,73 @@ that harness is the first performance work, and a prerequisite for honestly clai
 
 ---
 
+## Engineering doctrine — Tiger Style (adopted going forward)
+
+All new code follows **Tiger Style** (TigerBeetle's safety-and-performance engineering doctrine),
+adapted to Rust and to a local-first, single-GPU agent. It is adopted *because* Nanna runs advanced
+work on a **small resource budget** — correctness and performance must be designed in, not bolted on.
+The daily dev routine (`.claude/skills/daily-dev`) enforces these on every change.
+
+**Safety & control flow**
+- **Bound everything.** Every loop, queue, cache, retry, and context window has an explicit maximum —
+  no unbounded growth (agent iteration caps, queue sizes, KV-cache length, memory floors are explicit).
+- No unbounded recursion — iterate with a fixed bound.
+- Explicit, shallow control flow: **push `if`s up, push `for`s down** (branch in parents; keep leaf
+  functions branch-free and pure). Smallest possible scope; declare variables next to first use;
+  positive-space conditions (`if idx < len`). Prefer explicitly-sized ints over `usize` where width is semantic.
+
+**Assertions (Rust form)**
+- **≥ 2 assertions per non-trivial function** — check arguments, returns, pre/postconditions, invariants.
+- `debug_assert!` for hot-path invariants (compiled out in release); `assert!` for cheap always-on checks
+  and anything guarding a memory/VRAM/security bound. Assert in pairs across paths (before-write AND
+  after-read); assert positive **and** negative space; split compound assertions (`assert!(a); assert!(b);`).
+- Assertions catch **programmer** errors (panic on the impossible); `Result`/`?` handle **expected**
+  operational failures. Never conflate the two.
+
+**Errors**
+- Handle every error; never silently drop a `Result`. **No `.unwrap()`/`.expect()`/`panic!` on
+  production paths** (tests + startup invariants excepted). `thiserror` for libraries, `anyhow` at the
+  app edge. Enforce with clippy `unwrap_used`/`expect_used` in touched crates.
+
+**Functions & simplicity**
+- **≤ ~70 lines per function** (one screen); split anything longer. Few parameters; use an options
+  struct when two args could be transposed. Centralize control flow + state mutation in parents; keep
+  helpers pure. Simpler return types reduce call-site branching: prefer `()` > `bool` > `T` > `Option<T>` > `Result<T>`.
+- **Zero technical debt** — solve it right at design/implementation time; never punt to production.
+  Simplicity is earned over multiple passes, not the first draft.
+
+**Performance (design-first — this is the benchmark gate's twin)**
+- Do the **napkin math up front** against the four scarce resources — for Nanna, in order:
+  **VRAM → token/latency budget → RAM → CPU/GPU compute** — *before* writing code. "Roughly right"
+  early beats profiling later. Optimize the scarcest resource first (on one GPU, usually VRAM).
+- **Batch** GPU dispatches, DB writes, embeddings, and tool calls to amortize fixed costs (recall the
+  ~750µs wgpu dispatch floor). Give the GPU/CPU large predictable chunks; avoid zig-zag. Extract hot
+  loops into standalone functions over primitives (no `self`) so they're auditable.
+- Every perf-affecting change is **benchmark-gated** (see *Performance & Benchmarking*) — no regression past budget.
+
+**Naming & off-by-one**
+- `snake_case`; no abbreviations; units/qualifiers last, sorted by significance (`latency_ms_max`,
+  `vram_bytes_max`); nouns over adjectives; related names equal length (`source`/`target`) so derived
+  names align; infuse meaning into names. Distinguish **index / count / size**; show rounding intent
+  in division (`div_ceil`, `checked_div`).
+
+**Tooling & dependencies**
+- `cargo fmt` + `cargo clippy --all-targets` (pedantic + nursery) **clean before every commit** —
+  warnings are errors in spirit. Descriptive commit messages (they are the permanent `git blame` record).
+- **Dependency discipline** (our adaptation of zero-deps): justify every new dependency; prefer
+  pure-Rust, no-C where avoidable (already: Turso not libsqlite3, wgpu not CUDA). CI bans `rusqlite`/`libsql`/`sqlx`.
+
+**Deliberately NOT adopted verbatim** (Tiger Style targets a zero-alloc database in Zig; Nanna is an
+async Tokio app — honesty matters):
+- *Full static allocation / no allocation after startup* — impractical for an async agent. Adopt the
+  spirit: bound + preallocate hot paths, cap growth, avoid per-token/per-event allocation churn.
+- *Zero external dependencies* — impossible (Tokio, Burn, wgpu…). Replaced by dependency discipline above.
+- Zig mechanics (`zig fmt`, 4-space, Zig scripts) → Rust equivalents (`cargo fmt`/rustfmt defaults, 100-col).
+
+Source: TigerBeetle `docs/TIGER_STYLE.md`.
+
+---
+
 ## Phases
 
 ### P1 — Core Infrastructure ✅
@@ -319,15 +387,25 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
 ### P9 — Multi-Device Swarm (Tor P2P) 🌱 (not started)
 Personal device mesh over Tor hidden services — zero-config, encrypted, no port forwarding. Every
 daemon gets a persistent Ed25519 identity + `.onion` address; peers invoke each other's tools
-(`remote:phone:camera_snap`). ~3,600 LOC / ~2–3 weeks estimated. New crates:
-- [ ] **`nanna-identity`** (~500 LOC) — Ed25519 keypair, v3 onion derivation, fingerprint
-      (`XXXX-XXXX-XXXX-XXXX`), encrypted-at-rest `~/.nanna/identity.json` (Argon2 KDF + AES-256-GCM, zeroized).
-- [ ] **`nanna-tor`** (~800 LOC) — embedded `arti` client (~30s bootstrap) with system-Tor fallback,
-      hidden-service publishing, outbound `.onion` HTTP, bootstrap progress. Gate behind a feature flag (+10–20MB).
-- [ ] **`nanna-mesh`** (~1,500 LOC) — QR/`nanna://pair` discovery (peers in `~/.nanna/peers.toml`),
-      signed JSON tool_request/response protocol over Tor, default-deny trust model (`ToolPolicy`,
-      require_approval, per-peer rate limit), audit log, relay wiring remote tools into the local registry.
-- [ ] **GUI** — peer management page, identity management (view/rotate/export), Tor status widget.
+(`remote:phone:camera_snap`). **Tor communication is built on [`onyums`](https://github.com/basic-automation/onyums)**
+(arti-backed axum-over-Tor, MIT — same ecosystem as the `arti-axum` repo): it bundles the Tor client,
+serves an axum `Router` as a **v3 hidden service**, derives a stable `.onion` from the identity key,
+and ships TLS, QR address output, abuse defense, and client authorization out of the box — so we do
+**not** hand-roll arti / `tor-hsservice`. New crates:
+- [ ] **`nanna-identity`** — Ed25519 keypair custody + fingerprint (`XXXX-XXXX-XXXX-XXXX`),
+      encrypted-at-rest `~/.nanna/identity.json` (Argon2 KDF + AES-256-GCM, zeroized). The stable `.onion`
+      is derived from this key by onyums (`tor_hscrypto`).
+- [ ] **`nanna-tor`** (thin, onyums-backed) — expose the daemon's axum surface as a Tor v3 hidden
+      service via `OnionService::builder().router(app).nickname(..).serve()`; report bootstrap/reachability
+      from onyums `status_events()`; TLS `Upgrade`/`Strict`; outbound `.onion` requests via onyums'
+      re-exported `arti_client`. Feature-flagged (arti adds ~10–20MB). Far smaller than hand-rolling arti.
+- [ ] **`nanna-mesh`** — QR / `nanna://pair` discovery (peers in `~/.nanna/peers.toml`) via onyums'
+      `OnionAddress::qr_terminal()` / `qr_svg()`; signed JSON tool_request/response protocol; default-deny
+      trust model (`ToolPolicy`, require_approval, per-peer rate limit) that leans on onyums' built-in
+      **abuse defense** (proof-of-work / rate-limit / WAF "Skin") and **v3 client authorization**
+      (restricted discovery) for the transport-level allowlist; audit log; relay wiring remote tools into the local registry.
+- [ ] **GUI** — peer management page, identity management (view/rotate/export), Tor status widget
+      (onyums `status()` / `status_events()`), QR pairing.
 - [ ] **Claude Code / external-agent bridge** — HTTP/SSE transport on the MCP server + peer-tool registration + auth.
 - [ ] Key rotation announcement, identity backup (BIP-39?), Tor-state caching, mobile (arti on Android) investigation.
 
@@ -602,10 +680,14 @@ From `physics515/DSP` (Rust, nightly, pins `turso` 0.6 + `wgpu` 27). Real worksp
   `power_law_retrievability()` are the natural keep-mask: high weight → keep detail, low → decimate.
 
 ### P9 dependency pins (when P9 starts)
-`ed25519-dalek` 2.1, `arti-client`/`arti-hyper`/`tor-rtcompat`/`tor-hsservice` 0.26, `aes-gcm` 0.10,
-`argon2` 0.5, `zeroize` 1, `sha2` 0.10, `base64` 0.22, `qrcode` 0.14, `image` 0.25, `axum` 0.8, `hyper` 1,
-`thiserror` 2. Tor latency ~500ms–2s/request; embedded arti bootstrap ~15–60s. Replay defense: reject
-requests older than 5 min. One identity per device (not shared) — compromise of one doesn't compromise all.
+**Tor: [`onyums`](https://github.com/basic-automation/onyums)** (arti-backed axum-over-Tor). It
+re-exports `arti_client` / `tor_hsservice` / `tor_hscrypto` and bundles TLS + QR + abuse defense +
+v3 client auth — so we do **not** pin `arti-*` / `tor-hsservice` / `qrcode` directly; take them via
+onyums to avoid version skew. Identity/crypto pins: `ed25519-dalek` 2.1, `aes-gcm` 0.10, `argon2` 0.5,
+`zeroize` 1, `sha2` 0.10, `base64` 0.22. Plus `axum` 0.8 (match onyums' axum), `image` 0.25, `thiserror` 2.
+Tor latency ~500ms–2s/request; arti bootstrap ~15–60s (onyums `status_events()` reports progress).
+Replay defense: reject requests older than 5 min. One identity per device (not shared) — compromise
+of one doesn't compromise all.
 
 ### Historical (superseded designs — do not resurrect as fact)
 - **Stop button:** early design used a global `CancellationToken` + `cancel_message` Tauri command;
