@@ -156,7 +156,10 @@ impl CronExpr {
                 parts.push(format!("at minute {m}"));
             }
         } else {
-            let mins: Vec<_> = self.minutes.iter().copied().collect();
+            // `minutes` is a HashSet (unordered) — sort before differencing so the
+            // reported step is deterministic and actually the smallest interval.
+            let mut mins: Vec<_> = self.minutes.iter().copied().collect();
+            mins.sort_unstable();
             if is_step(&mins) {
                 parts.push(format!("every {} minutes", mins[1] - mins[0]));
             }
