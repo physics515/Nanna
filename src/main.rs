@@ -747,6 +747,9 @@ async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<
         webhook: WebhookConfig::default(),
         use_script_tools: config.tools.use_script_tools,
         tools_dir: config.tools.tools_dir.clone(),
+        // Legacy single-binary path: channels are not started here (matches the
+        // field's Default). The daemon path wires channel config separately.
+        channels: None,
     };
 
     info!("Initializing daemon server...");

@@ -771,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn test_vector_store() {
         let config = VectorStoreConfig {
-            dimension: 8,
+            dimension: std::sync::atomic::AtomicUsize::new(8),
             use_f16: false,
         };
         let store = VectorStore::new(config);
@@ -784,6 +784,7 @@ mod tests {
             timestamp: 0,
             fsrs: FsrsState::default(),
             workspace_id: None,
+            expires_at: None,
         };
 
         store.add(entry).await.unwrap();
