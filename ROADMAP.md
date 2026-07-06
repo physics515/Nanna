@@ -7,7 +7,7 @@
 > appends a dated note. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-06 (local-first direction pivot) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-06 (P11 path-traversal fixes + Turso dep-guard + build-green repairs) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -426,11 +426,18 @@ Concrete, actionable items with `file:line` anchors. **This is the near-term bac
 routine should drain first.**
 
 **Security (do first):**
-- [ ] **User-tool path traversal** — `UserToolManager::save_tool` joins `{name}.json` unsanitized; a
+- [x] **User-tool path traversal** — `UserToolManager::save_tool` joins `{name}.json` unsanitized; a
       name like `../../etc/cron.d/evil` escapes the tools dir. Enforce `^[a-z][a-z0-9_]{0,63}$` in
       `create_tool` + `CreateToolTool` (same validation skills already use).
-- [ ] **Workspace file traversal** — `save_workspace_file` joins the `file` param unvalidated
+      *(2026-07-06) `validate_tool_name` added at the `create_tool` chokepoint in both the daemon
+      (`user_tools.rs`) and GUI (`tool_authoring.rs`) copies — covers `CreateToolTool` (agent path) too.
+      Unit tests reject `../`, separators, non-lowercase-leading, and >64-char names.*
+- [x] **Workspace file traversal** — `save_workspace_file` joins the `file` param unvalidated
       (`../../etc/passwd` escapes). Canonicalize and assert containment before writing.
+      *(2026-07-06) `validate_context_filename` guards `Workspace::save_context_file` (the chokepoint the
+      unguarded GUI-embedded path used; the daemon path already allowlisted). Accepts only a single
+      normal component (no `/`, `\`, `.`/`..`, root/drive), bounded 128 bytes; postcondition
+      `debug_assert!`s the path stays inside `.nanna`. Tests cover traversal + legit writes.*
 - [ ] **Discord webhook signature** (`webhook.rs:306`) trusts any non-empty header — add Ed25519 (`ed25519-dalek`).
 - [ ] **Slack webhook signature** (`webhook.rs:438`) is a placeholder — add HMAC (`ring`/`hmac`).
 - [ ] Harden `delete_skill`'s `remove_dir_all` (symlink check / soft-delete); stronger user-script sandboxing.
@@ -451,6 +458,8 @@ routine should drain first.**
 - [ ] Tool-manager consistency: `update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap); `create_user_tool` swallows registration errors in `if let Ok`; no duplicate-name check; `enabled:false` tools still execute; no `ToolRegistry::unregister` (deleted tools stay callable until restart); non-string enums dropped in `parse_params_from_schema`.
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
+- [ ] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
+- [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
 
 **Architecture debt:**
 - [ ] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
@@ -468,6 +477,8 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 - [ ] **Crate `nanna-infer` on Burn** — `burn = { version = "0.21", default-features = false, features = ["std","ndarray","wgpu","fusion","autotune","store"] }`. Model code generic over `B: Backend`.
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
 - [ ] **First model: a Hermes-class function-calling small model** — a from-scratch Burn decoder (start from laurelane's Qwen2.5 / LFM2 modules: RmsNorm + GQA + RoPE + SwiGLU, tied lm_head) sized for one GPU (1.5–3B). Prove tool-calling quality is good enough to run the loop.
+      - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
+      - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
 - [ ] **Fast decode** — per-layer KV cache (+ conv-state cache for hybrid models like LFM2); on-device `argmax` so only the winning index syncs to CPU; sampling (temp/top-p) beyond greedy; **streaming tokens** to Tauri events + channels; cooperative interrupt check between tokens (cancellation).
@@ -486,7 +497,12 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 **Turso-only cleanup (do first — pure hygiene, no engine change):**
 - [ ] Rename `SqliteMemoryPersistence` → `TursoMemoryPersistence` (`nanna-daemon/src/memory_persistence.rs`; refs in `server.rs`); align with the already-correct `TursoMemoryStorage`.
 - [ ] Purge the word "SQLite" from code comments, log/`warn!` strings, and doc-comments (storage lib.rs/Cargo.toml; daemon persistence/session/control/server; memory service/lib; GUI `sqlite_*` var names) → "Turso"/"the database". **Do not** change SQL, `.db` files, or `datetime('now')`/`AUTOINCREMENT`/`json_*`.
-- [ ] Delete stale `crates/nanna-daemon/src/server.rs.bak`. Pin `turso` precisely (0.x is pre-1.0). Add a CI guard that fails if `rusqlite`/`libsql`/`sqlx` ever enters the dep tree. (Note: a transitive `libsqlite3-sys` comes from RustPython in `nanna-scripting`, separate concern.)
+- [x] Delete stale `crates/nanna-daemon/src/server.rs.bak`. Pin `turso` precisely (0.x is pre-1.0). Add a CI guard that fails if `rusqlite`/`libsql`/`sqlx` ever enters the dep tree. (Note: a transitive `libsqlite3-sys` comes from RustPython in `nanna-scripting`, separate concern.)
+      *(2026-07-06) `server.rs.bak` already absent. `turso` pinned `=0.4.4` in `nanna-storage`. The
+      CI guard is a `cargo test` (`nanna-storage/tests/dep_guard.rs`) that scans `Cargo.lock` and fails
+      if `rusqlite`/`libsql`/`sqlx` appear (no external CI needed). Also pinned `aegis = "=0.9.7"`
+      (transitive via `turso_core`) — 0.9.8+ mandates a clang-cl C build; 0.9.7 keeps the pure-Rust path,
+      matching the "prefer pure-Rust, no-C where avoidable" doctrine and keeping stock-MSVC builds green.*
 
 **Best-in-class dreaming:**
 - [ ] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
@@ -554,13 +570,13 @@ keep the phases readable; promote individual items into a phase when they become
 
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
 
-1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: rename `SqliteMemoryPersistence`, purge "SQLite" strings, delete `server.rs.bak`, add the CI dep-guard.
+1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: rename `SqliteMemoryPersistence`, purge "SQLite" strings, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: rename `SqliteMemoryPersistence` + purge "SQLite" strings.
 2. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 3. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 4. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
 5. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
 6. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
-7. **Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.
+7. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
 8. **End-to-end daemon test** (P8) — the daemon/embedded/reconnect story is still unverified.
 
 ---
