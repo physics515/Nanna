@@ -220,8 +220,15 @@ impl Workspace {
     /// # Errors
     /// Returns `WorkspaceError::Io` if file cannot be written.
     pub async fn save_context_file(&self, filename: &str, content: &str) -> Result<(), WorkspaceError> {
-        self.ensure_nanna_folder().await?;
-        let path = self.nanna_folder().join(filename);
+        validate_context_filename(filename)?;
+        let folder = self.ensure_nanna_folder().await?;
+        let path = folder.join(filename);
+        // Postcondition: a validated single-component name stays inside .nanna.
+        debug_assert!(
+            path.parent() == Some(folder.as_path()),
+            "validated filename escaped .nanna folder: {}",
+            path.display()
+        );
         fs::write(&path, content).await?;
         info!("Saved workspace file: {:?}", path);
         Ok(())
@@ -301,6 +308,55 @@ impl Workspace {
         
         Ok(content)
     }
+}
+
+/// Maximum length of a workspace context filename, in bytes.
+///
+/// Bounded per Tiger Style: every input has an explicit ceiling. 128 comfortably
+/// fits the standard files (`AGENTS.md`, …) while rejecting pathological input.
+const CONTEXT_FILENAME_LEN_MAX: usize = 128;
+
+/// Compile-time invariant: the cap must stay large enough for the standard files.
+const _: () = assert!(CONTEXT_FILENAME_LEN_MAX >= 16);
+
+/// Validate that `filename` is a safe, single-component filename that cannot
+/// escape the workspace `.nanna` folder.
+///
+/// This is the security guard for path traversal: the daemon path already
+/// allowlists the seven standard files, but the embedded (in-process GUI) path
+/// calls [`Workspace::save_context_file`] directly with an unvalidated name, so
+/// the guard lives on the chokepoint itself for defense in depth.
+///
+/// Accepts only a single normal path component with no separators, no `.`/`..`,
+/// and no root/drive prefix. Backslash is rejected explicitly because it is not
+/// a path separator on Unix (so a store written on Unix cannot smuggle a
+/// Windows-traversing name into a later Windows read).
+///
+/// # Errors
+/// Returns [`WorkspaceError::Invalid`] if the name is empty, too long, or is not
+/// a single safe filename component.
+fn validate_context_filename(filename: &str) -> Result<(), WorkspaceError> {
+    if filename.is_empty() || filename.len() > CONTEXT_FILENAME_LEN_MAX {
+        return Err(WorkspaceError::Invalid(format!(
+            "context filename must be 1..={CONTEXT_FILENAME_LEN_MAX} bytes: {filename:?}"
+        )));
+    }
+    if filename.contains('/') || filename.contains('\\') {
+        return Err(WorkspaceError::Invalid(format!(
+            "context filename must not contain path separators: {filename:?}"
+        )));
+    }
+    // Must resolve to exactly one Normal component (rejects `..`, `.`, absolute
+    // and drive-prefixed paths).
+    let mut components = Path::new(filename).components();
+    let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single_normal {
+        return Err(WorkspaceError::Invalid(format!(
+            "context filename must be a single path component: {filename:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Read a file if it exists, return None if it doesn't
@@ -570,6 +626,62 @@ mod tests {
         registry.set_active(&id2);
         assert!(!registry.get(&id1).unwrap().active);
         assert!(registry.get(&id2).unwrap().active);
+    }
+
+    #[test]
+    fn test_validate_context_filename_accepts_standard_files() {
+        for f in [
+            AGENTS_FILE,
+            SOUL_FILE,
+            USER_FILE,
+            TOOLS_FILE,
+            MEMORY_FILE,
+            IDENTITY_FILE,
+            HEARTBEAT_FILE,
+            "notes.md",
+            "a",
+        ] {
+            assert!(validate_context_filename(f).is_ok(), "should accept {f:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_context_filename_rejects_traversal() {
+        for bad in [
+            "",
+            "../evil",
+            "../../etc/passwd",
+            "..",
+            ".",
+            "sub/dir.md",
+            "sub\\dir.md",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "..\\..\\windows",
+        ] {
+            assert!(
+                validate_context_filename(bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        // Over the length cap.
+        let too_long = "a".repeat(CONTEXT_FILENAME_LEN_MAX + 1);
+        assert!(validate_context_filename(&too_long).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_save_context_file_rejects_traversal() {
+        let dir = tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        // A traversal name must be refused and must not create a file outside .nanna.
+        let err = ws.save_context_file("../escaped.md", "pwned").await;
+        assert!(err.is_err());
+        assert!(!dir.path().join("escaped.md").exists());
+
+        // A legitimate name still works.
+        ws.save_context_file(AGENTS_FILE, "hello").await.unwrap();
+        let written = dir.path().join(NANNA_FOLDER).join(AGENTS_FILE);
+        assert_eq!(std::fs::read_to_string(written).unwrap(), "hello");
     }
 
     #[tokio::test]

@@ -118,6 +118,10 @@ impl UserToolManager {
         parameters: Option<Value>,
         permissions: Option<UserToolPermissions>,
     ) -> Result<UserToolMeta, String> {
+        // Security: the name becomes `{name}.json` on disk, so it must be a safe
+        // single filename component — reject path traversal before anything else.
+        validate_tool_name(&name)?;
+
         // Validate the source compiles
         let _test_tool = ScriptedTool::new(&name, &source);
         
@@ -321,6 +325,39 @@ impl Tool for UserToolWrapper {
     }
 }
 
+/// Maximum length of a user-tool name, in bytes.
+const TOOL_NAME_LEN_MAX: usize = 64;
+
+/// Validate a user-tool name against `^[a-z][a-z0-9_]{0,63}$`.
+///
+/// Security guard: the name is used to build the on-disk file `{name}.json`, so
+/// an unsanitized name like `../../etc/cron.d/evil` would escape the tools dir.
+/// The pattern permits only lowercase ASCII letters, digits, and underscore, and
+/// requires a leading letter — none of which can form a path separator, `.`, or
+/// `..`, and the length is bounded per Tiger Style.
+///
+/// # Errors
+/// Returns a human-readable message if the name is empty, too long, or contains
+/// a disallowed character.
+fn validate_tool_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > TOOL_NAME_LEN_MAX {
+        return Err(format!(
+            "tool name must be 1..={TOOL_NAME_LEN_MAX} chars, got {} ({name:?})",
+            name.len()
+        ));
+    }
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !first_ok || !rest_ok {
+        return Err(format!(
+            "tool name must match ^[a-z][a-z0-9_]{{0,63}}$ (lowercase letter first, then \
+             lowercase/digit/underscore): {name:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Parse parameters from a JSON Schema value
 fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     let mut params = Vec::new();
@@ -363,4 +400,51 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     }
     
     params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_tool_name_accepts_valid() {
+        for good in ["a", "my_tool", "tool2", "read_file", "x_1_2_3"] {
+            assert!(validate_tool_name(good).is_ok(), "should accept {good:?}");
+        }
+    }
+
+    #[test]
+    fn validate_tool_name_rejects_traversal_and_bad_chars() {
+        for bad in [
+            "",
+            "../../etc/cron.d/evil",
+            "../evil",
+            "a/b",
+            "a\\b",
+            "Tool",      // uppercase leading
+            "1tool",     // digit leading
+            "_tool",     // underscore leading
+            "my-tool",   // hyphen
+            "my tool",   // space
+            "tool.json", // dot
+            "..",
+        ] {
+            assert!(validate_tool_name(bad).is_err(), "should reject {bad:?}");
+        }
+        let too_long = "a".repeat(TOOL_NAME_LEN_MAX + 1);
+        assert!(validate_tool_name(&too_long).is_err());
+    }
+
+    #[tokio::test]
+    async fn create_tool_rejects_traversal_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        let src = "export default { name: \"x\", description: \"d\", execute() { return \"ok\"; } }";
+        let res = mgr
+            .create_tool("../escaped".to_string(), "d".to_string(), src.to_string(), None, None, None)
+            .await;
+        assert!(res.is_err());
+        // Nothing must have been written outside the tools dir.
+        assert!(!dir.path().parent().unwrap().join("escaped.json").exists());
+    }
 }
