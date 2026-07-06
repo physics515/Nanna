@@ -9,7 +9,11 @@ The single source of truth is [`ROADMAP.md`](../../../ROADMAP.md). This routine 
 at a time**, to the standard set by two governing sections in that file: **Engineering doctrine —
 Tiger Style** and **Performance & Benchmarking**. Modeled on the Utter/DSP daily dev routine.
 
-**How to run:** `/loop /daily-dev` for a continuous loop, or `/daily-dev` for a single pass.
+**How to run:**
+- **Interactive** — `/loop /daily-dev` (continuous) or `/daily-dev` (single pass), with you driving.
+- **Autonomous nightly** — the `nanna-dev-routine` scheduled task runs this same discipline unattended,
+  **worktree-isolated off `origin/master`** (so the working-tree WIP is never touched), looping ≥4h and
+  delivering the run as **one pull request** — it **never pushes `master`**.
 
 ## Prime directive
 
@@ -80,7 +84,10 @@ cargo build                     # release if perf-relevant
   no WIP leaked in.
 - One focused commit; descriptive message (it's the permanent `git blame` record); cite the benchmark
   artifact/number if perf-affecting. Co-author trailer per repo convention.
-- Push to `master` following the established flow (this is a solo repo) unless the user asked for review.
+- **Delivery depends on mode.** *Autonomous nightly routine:* commit increments on the worktree's
+  branch and open **one pull request** to `master` as the last act — **never push `master`**, never
+  merge. *Interactive, you driving:* pushing to `master` is fine for this solo repo when you say so;
+  otherwise open a PR.
 
 ### 7 — Loop or stop
 - Under `/loop`: return to step 1 for the next single item.
