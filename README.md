@@ -2,13 +2,22 @@
 
 > *As the moon illuminates what the sun cannot see, so shall I illuminate what you cannot reach.*
 
-A high-performance, always-on **personal AI presence** written in Rust. Named for the Sumerian moon
-god, patron deity of Ur. Nanna runs as a headless daemon, remembers across time with a cognitive
-(FSRS-6) memory, reaches you on any channel (GUI, CLI, Telegram, Discord, Slack, Signal, WhatsApp),
-and is extensible with JS/TS tools and MCP servers.
+A high-performance, always-on **personal AI presence** written in Rust — one that runs **entirely on
+your own machine**. Named for the Sumerian moon god, patron deity of Ur. Nanna runs as a headless
+daemon, thinks with a **small open model on a single consumer GPU**, remembers across time with a
+cognitive (FSRS-6) memory, reaches you on any channel (GUI, CLI, Telegram, Discord, Slack, Signal,
+WhatsApp), and is extensible with JS/TS tools and MCP servers.
+
+> **Local-first by default.** The local model *is* the agent — it runs the whole loop (reasoning,
+> tools, memory) offline and private, on one GPU. Nanna *can* reach out to cloud APIs
+> (Anthropic / OpenAI / OpenRouter) when it chooses to, but that's optional augmentation, never a
+> requirement. Think *the open-source clawdbot — a Hermes-class agent you actually own.* The native
+> local model runner (built on **Burn**) and the DSP-backed **dreaming** memory that is Nanna's moat
+> are in active development — see [`ROADMAP.md`](ROADMAP.md) **P12 / P13**.
 
 **Status:** v0.1.0 · Rust 2024 (rustc 1.85+) · phases 1–5 & 7 complete, 10 mostly complete, 6 & 8
-partial. See [`ROADMAP.md`](ROADMAP.md) for the full status source of truth.
+partial; local model runner (P12) + memory/dreaming overhaul (P13) in progress. See
+[`ROADMAP.md`](ROADMAP.md) for the full status source of truth.
 
 Nanna is not a chatbot. It's a *presence*.
 
@@ -22,17 +31,21 @@ Nanna is not a chatbot. It's a *presence*.
 ## What works today
 
 - **Headless daemon + attachable GUI.** Runs as a Windows service / systemd / launchd unit with
-  WebSocket IPC, PID lockfile, and health endpoints; persists sessions to SQLite. The Tauri GUI
-  attaches as a client with auto-reconnect, and falls back to an embedded in-process backend when no
-  daemon is running.
+  WebSocket IPC, PID lockfile, and health endpoints; persists sessions to **Turso** (embedded,
+  SQLite-compatible, pure-Rust). The Tauri GUI attaches as a client with auto-reconnect, and falls back
+  to an embedded in-process backend when no daemon is running.
 - **Agentic chat.** Streaming responses, tool calling, interleaved thinking modes, and tiered context
   compression (summarization, CDC dedup, proactive drop). Multi-agent swarm with parallel task
   decomposition and Erlang/OTP-style supervisors.
-- **Cognitive memory.** FSRS-6 spaced-repetition memory with semantic recall (recall reinforces via
-  the testing effect), consolidation ("dreaming"), duplicate detection, and importance scoring —
-  persisted to SQLite.
-- **Multi-provider LLM.** Anthropic, OpenAI, OpenRouter, and Ollama, with complexity-based model
-  routing across providers and native prompt caching (50–80% input-token savings).
+- **Cognitive memory + dreaming (the moat).** FSRS-6 spaced-repetition memory with semantic recall
+  (recall reinforces via the testing effect), **dreaming** (LLM consolidation that clusters and
+  summarizes memories by cognitive weight), duplicate detection, and importance scoring — persisted to
+  **Turso**. The dreaming system is being made the centerpiece: idle-gated multi-phase cycles + a
+  DSP-backed event timeline where time-series compression *is* the act of forgetting (ROADMAP P13).
+- **LLM routing — local-first, cloud-optional.** Today: Anthropic, OpenAI, OpenRouter, and Ollama with
+  complexity-based routing and native prompt caching (50–80% input-token savings). Next: a **native
+  local runner on Burn** (`nanna-infer`) that executes a small open model on one GPU as the default,
+  zero-cost tier, with cloud APIs as opt-in escalation (ROADMAP P12).
 - **Tools & MCP.** Every tool is a filesystem JS/TS skill (39 default skills) run by the Boa engine:
   files, shell, web fetch/search, browser control, vision, tiered OCR (pure-Rust `ocrs` → vision-model
   fallback), audio (TTS/transcription), PDF, memory, scheduling. Plus MCP client integration.
@@ -46,17 +59,20 @@ Nanna is not a chatbot. It's a *presence*.
 
 ## Architecture
 
-17 workspace crates plus the Tauri app, layered bottom-up by dependency:
+17 workspace crates today (plus two planned for the local-first pivot, marked `*`) and the Tauri app,
+layered bottom-up by dependency:
 
 ```
 nanna/
 ├── src/main.rs              # Entry point + CLI (chat / server / daemon)
 ├── crates/
 │   ├── nanna-simd/          # SIMD vector ops (AVX-512/AVX2/NEON) — the default fast path
-│   ├── nanna-gpu/           # GPU compute (wgpu) — engages only above ~50k vectors
-│   ├── nanna-memory/        # Vector store + FSRS-6 cognitive memory + consolidation
-│   ├── nanna-storage/       # SQLite / Turso persistence
-│   ├── nanna-llm/           # LLM clients: Anthropic, OpenAI, OpenRouter, Ollama (+ OAuth)
+│   ├── nanna-gpu/           # GPU compute (wgpu) — vector search + DSP/inference kernels
+│   ├── nanna-infer/*        # Burn local model runner (wgpu + ndarray, single-GPU) — planned
+│   ├── nanna-memory/        # Vector store + FSRS-6 cognitive memory + dreaming (the moat)
+│   ├── nanna-timeline/*     # DSP-backed event timeline + compression-as-dreaming — planned
+│   ├── nanna-storage/       # Turso persistence (embedded, SQLite-compatible) — the only DB
+│   ├── nanna-llm/           # Inference routing: local (nanna-infer) first, cloud APIs optional
 │   ├── nanna-tools/         # Tool system (filesystem JS/TS skills)
 │   ├── nanna-scripting/     # Boa (JS) + Deno (V8/TS) engines; embedded Python
 │   ├── nanna-workspace/     # Workspace detection + .nanna/ context files
@@ -71,6 +87,8 @@ nanna/
 │   └── nanna-core/          # Orchestration, scheduler/cron, workspace registry
 └── gui/                     # Tauri 2 backend (src-tauri/) + Nuxt 4 frontend
 ```
+
+`*` = planned crate for the local-first direction (not in the tree yet).
 
 **Channels as control-plane clients.** The daemon owns *all* state — sessions, memory, config, tools,
 scheduler, workspace registry, keyring, channel manager. Every channel, the GUI included, reaches it
@@ -88,6 +106,10 @@ channel — multiple clients (phone + desktop) can attach to one daemon and shar
 
 ## Performance
 
+- **Local inference on Burn (in development, ROADMAP P12).** `nanna-infer` runs a small open model on
+  your GPU via **wgpu** (Vulkan/DX12/Metal — no CUDA toolchain) with an **ndarray** CPU fallback: one
+  binary, backend chosen at runtime by a cheap GPU probe. Sized for a single 16 GB consumer card
+  (1.5–3B models; opt-in f16 to ~halve VRAM), with an on-device KV cache and streaming decode.
 - **SIMD is the workhorse.** `nanna-simd` runs AVX-512/AVX2 (and NEON on ARM) cosine similarity — a
   single 768-dim comparison in ~0.1µs, scaling linearly. This is the default path for vector search.
 - **GPU is for scale only.** `nanna-gpu` (wgpu) carries a ~750µs fixed per-dispatch overhead, so it is
@@ -96,12 +118,23 @@ channel — multiple clients (phone + desktop) can attach to one daemon and shar
   `cargo bench --bench gpu_vs_simd -p nanna-gpu`.
 - **Zero-copy hot paths** and **fat LTO** release builds (`codegen-units = 1`, `panic = "abort"`, stripped).
 
+**Benchmark-gated.** Because Nanna targets one consumer GPU and a small model, performance is a *gate*,
+not an afterthought: changes ship only when a reproducible benchmark holds or improves the budget, and
+every claim here should link to an artifact. The governing metric is **task success at budget** — how
+much of the agent-eval suite the local model solves within the reference GPU's VRAM ceiling and a p95
+latency target (reference: RTX 4070 Ti SUPER 16 GB). Existing benches:
+`cargo bench --bench gpu_vs_simd -p nanna-gpu`. See
+[**ROADMAP → Performance & Benchmarking**](ROADMAP.md#performance--benchmarking-governing-concern) for
+the full suite, per-tier budgets, and harness.
+
 ---
 
 ## Quick start
 
 ```bash
-export ANTHROPIC_API_KEY=your-key-here
+# Today Nanna needs a model backend: a cloud key (below) or a local Ollama server.
+# The native local runner — no key, no Ollama — is landing in ROADMAP P12.
+export ANTHROPIC_API_KEY=your-key-here   # optional once the local Burn runner ships
 
 # Interactive CLI
 cargo run -- chat
@@ -174,21 +207,29 @@ Config lives at `~/.config/nanna/config.toml` (or `%APPDATA%\nanna\` on Windows)
 name = "Nanna"
 
 [llm]
-provider = "anthropic"          # anthropic | openai | openrouter | ollama
+# "local" (the Burn runner) is the default, top-priority tier once P12 ships; cloud is opt-in escalation.
+provider = "local"              # local | anthropic | openai | openrouter | ollama
 model = "claude-sonnet-4-20250514"
+
+# Local model runner (Burn) — ROADMAP P12
+[infer]
+model = "..."                   # HuggingFace repo of a small open model (e.g. a Hermes / Qwen / LFM2 variant)
+device = "auto"                 # auto | gpu | cpu  (auto = GPU if present, else CPU)
+f16 = false                     # opt-in half-precision to ~halve VRAM
 
 [server]
 enabled = true
 port = 3000
 ```
 
-Environment variables:
+Environment variables — **all cloud keys are optional**, used only when the agent escalates to a cloud
+provider (a fully-local run needs none):
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Anthropic models (required for the default provider) |
-| `OPENAI_API_KEY` | OpenAI models + embeddings (enables semantic search) |
-| `OPENROUTER_API_KEY` | OpenRouter models |
+| `ANTHROPIC_API_KEY` | Anthropic models (optional — cloud escalation) |
+| `OPENAI_API_KEY` | OpenAI models + embeddings (optional; local embeddings via `nanna-infer` land in P12) |
+| `OPENROUTER_API_KEY` | OpenRouter models (optional) |
 | `BRAVE_API_KEY` | Enables the `web_search` tool |
 | `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` | Channel listeners |
 
