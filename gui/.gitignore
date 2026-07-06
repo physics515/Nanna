@@ -22,3 +22,8 @@ logs
 .env
 .env.*
 !.env.example
+
+# Tauri sidecar binaries — build artifacts produced by `pnpm build:daemon`
+# (scripts/build-daemon.js compiles nanna-daemon and copies it here)
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
