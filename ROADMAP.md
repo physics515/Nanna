@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-06 (P11 path-traversal fixes + Turso dep-guard + build-green repairs) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-07 (webhook signature verification + deps/Cargo.lock + de-flaked credential test + true memory merge + Turso rename) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -135,10 +135,10 @@ and `datetime('now')`/`AUTOINCREMENT`/`json_*` usage are all Turso-supported and
 a fixed hourly cron over an O(N²) clusterer with no timeline/DSP layer, and the richer feedback-driven
 `DreamingService`/`DreamingRuntime` is dead code (P13); the daemon + embedded-fallback + reconnection
 path has **no end-to-end test**; **MCP server mode** is claimed complete but `nanna-server/src/mcp.rs`
-does not exist (unverified — see P3); channel webhook **signature verification is a placeholder**
-(Discord/Slack); several daemon control actions return `not_implemented`; and there is real
-**security/correctness debt** (user-tool path traversal, workspace file traversal, non-atomic memory
-writes) tracked below.
+does not exist (unverified — see P3); several daemon control actions return `not_implemented`; and
+there is remaining **security/correctness debt** tracked below. *(Fixed 2026-07: Discord/Slack webhook
+signature verification is now real Ed25519/HMAC, not a placeholder; user-tool + workspace path traversal
+closed; the Update-band ingest now truly merges instead of accreting near-duplicates.)*
 
 ---
 
