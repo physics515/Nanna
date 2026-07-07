@@ -64,11 +64,19 @@ impl From<keyring::Error> for CredentialError {
 // Secure Keyring Storage
 // =============================================================================
 
-/// Cross-platform credential store using OS keyring
+/// Cross-platform credential store using the OS keyring, with a file fallback.
 #[derive(Debug, Clone, Default)]
 pub struct SecureStore {
     /// Fallback to file storage if keyring unavailable
     pub allow_file_fallback: bool,
+    /// Bypass the keyring entirely and use only the file store.
+    ///
+    /// Intended for headless/service contexts (and tests) where the OS keyring
+    /// is inaccessible or non-deterministic — a keyring `set` can report success
+    /// while a later `get` fails against a locked or absent secret service.
+    file_only: bool,
+    /// Override directory for the file store (default: platform data dir).
+    file_dir: Option<PathBuf>,
 }
 
 impl SecureStore {
@@ -77,19 +85,42 @@ impl SecureStore {
     pub fn new() -> Self {
         Self {
             allow_file_fallback: true,
+            file_only: false,
+            file_dir: None,
         }
     }
-    
+
     /// Create without file fallback (keyring-only)
     #[must_use]
     pub fn keyring_only() -> Self {
         Self {
             allow_file_fallback: false,
+            file_only: false,
+            file_dir: None,
         }
     }
-    
+
+    /// Create a file-only store rooted at `dir` (bypasses the OS keyring).
+    ///
+    /// Deterministic and self-contained: every `set`/`get`/`delete` reads and
+    /// writes `dir/credentials.json` only. Used for headless deployments and for
+    /// tests, so credential round-trips never depend on an interactive keyring.
+    #[must_use]
+    pub const fn file_only_at(dir: PathBuf) -> Self {
+        Self {
+            allow_file_fallback: true,
+            file_only: true,
+            file_dir: Some(dir),
+        }
+    }
+
     /// Get a credential from the keyring
     pub fn get(&self, key: &str) -> Result<String, CredentialError> {
+        debug_assert!(!key.is_empty(), "credential key must not be empty");
+        // File-only stores never touch the keyring.
+        if self.file_only {
+            return self.get_from_file(key);
+        }
         let entry = Entry::new(KEYRING_SERVICE, key)?;
         match entry.get_password() {
             Ok(value) => {
@@ -118,6 +149,11 @@ impl SecureStore {
     
     /// Store a credential in the keyring
     pub fn set(&self, key: &str, value: &str) -> Result<(), CredentialError> {
+        debug_assert!(!key.is_empty(), "credential key must not be empty");
+        // File-only stores never touch the keyring.
+        if self.file_only {
+            return self.set_to_file(key, value);
+        }
         let entry = Entry::new(KEYRING_SERVICE, key)?;
         match entry.set_password(value) {
             Ok(()) => {
@@ -138,6 +174,11 @@ impl SecureStore {
     
     /// Delete a credential from the keyring
     pub fn delete(&self, key: &str) -> Result<(), CredentialError> {
+        debug_assert!(!key.is_empty(), "credential key must not be empty");
+        // File-only stores never touch the keyring.
+        if self.file_only {
+            return self.delete_from_file(key);
+        }
         let entry = Entry::new(KEYRING_SERVICE, key)?;
         match entry.delete_credential() {
             Ok(()) => {
@@ -191,16 +232,19 @@ impl SecureStore {
     // File Fallback (for systems without keyring support)
     // =========================================================================
     
-    fn credentials_file_path() -> Result<PathBuf, CredentialError> {
+    fn credentials_file_path(&self) -> Result<PathBuf, CredentialError> {
+        if let Some(dir) = &self.file_dir {
+            return Ok(dir.join("credentials.json"));
+        }
         let data_dir = directories::ProjectDirs::from("com", "nanna", "nanna")
             .ok_or(CredentialError::NoHomeDir)?
             .data_dir()
             .to_path_buf();
         Ok(data_dir.join("credentials.json"))
     }
-    
-    fn load_file_credentials() -> Result<HashMap<String, String>, CredentialError> {
-        let path = Self::credentials_file_path()?;
+
+    fn load_file_credentials(&self) -> Result<HashMap<String, String>, CredentialError> {
+        let path = self.credentials_file_path()?;
         if !path.exists() {
             return Ok(HashMap::new());
         }
@@ -208,9 +252,9 @@ impl SecureStore {
         let creds: HashMap<String, String> = serde_json::from_str(&content)?;
         Ok(creds)
     }
-    
-    fn save_file_credentials(creds: &HashMap<String, String>) -> Result<(), CredentialError> {
-        let path = Self::credentials_file_path()?;
+
+    fn save_file_credentials(&self, creds: &HashMap<String, String>) -> Result<(), CredentialError> {
+        let path = self.credentials_file_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -230,22 +274,22 @@ impl SecureStore {
     }
     
     fn get_from_file(&self, key: &str) -> Result<String, CredentialError> {
-        let creds = Self::load_file_credentials()?;
+        let creds = self.load_file_credentials()?;
         creds.get(key).cloned().ok_or(CredentialError::NotFound)
     }
-    
+
     fn set_to_file(&self, key: &str, value: &str) -> Result<(), CredentialError> {
-        let mut creds = Self::load_file_credentials()?;
+        let mut creds = self.load_file_credentials()?;
         creds.insert(key.to_string(), value.to_string());
-        Self::save_file_credentials(&creds)?;
+        self.save_file_credentials(&creds)?;
         info!("Stored credential '{}' in file fallback", key);
         Ok(())
     }
-    
+
     fn delete_from_file(&self, key: &str) -> Result<(), CredentialError> {
-        let mut creds = Self::load_file_credentials()?;
+        let mut creds = self.load_file_credentials()?;
         if creds.remove(key).is_some() {
-            Self::save_file_credentials(&creds)?;
+            self.save_file_credentials(&creds)?;
             Ok(())
         } else {
             Err(CredentialError::NotFound)
@@ -741,29 +785,41 @@ mod tests {
     }
     
     #[test]
-    fn test_secure_store_file_fallback() {
-        // This test will use file fallback if keyring is unavailable
-        let store = SecureStore::new();
-        
-        // Try to set and get (may use file fallback)
+    fn test_secure_store_file_only_roundtrip() {
+        // File-only store: deterministic, no dependency on an interactive keyring.
+        let temp_dir = TempDir::new().unwrap();
+        let store = SecureStore::file_only_at(temp_dir.path().to_path_buf());
+
         let key = "test_key_nanna_unit_test";
         let value = "test_value_12345";
-        
-        // Clean up first
-        let _ = store.delete(key);
-        
-        // Set
-        let result = store.set(key, value);
-        if result.is_ok() {
-            // Get
-            let retrieved = store.get(key);
-            assert!(retrieved.is_ok());
-            assert_eq!(retrieved.unwrap(), value);
-            
-            // Delete
-            let _ = store.delete(key);
-        }
-        // If set fails, keyring is unavailable and file fallback also failed
-        // which is fine for CI environments
+
+        // Absent before any write.
+        assert!(matches!(store.get(key), Err(CredentialError::NotFound)));
+
+        // Set then get round-trips exactly.
+        store.set(key, value).unwrap();
+        assert_eq!(store.get(key).unwrap(), value);
+
+        // Overwrite updates the stored value.
+        store.set(key, "updated_value").unwrap();
+        assert_eq!(store.get(key).unwrap(), "updated_value");
+
+        // Delete removes it; a second delete reports NotFound.
+        store.delete(key).unwrap();
+        assert!(matches!(store.get(key), Err(CredentialError::NotFound)));
+        assert!(matches!(store.delete(key), Err(CredentialError::NotFound)));
+    }
+
+    #[test]
+    fn test_secure_store_file_only_isolated_dirs() {
+        // Two stores rooted at different dirs never see each other's secrets.
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let store_a = SecureStore::file_only_at(dir_a.path().to_path_buf());
+        let store_b = SecureStore::file_only_at(dir_b.path().to_path_buf());
+
+        store_a.set("shared_key", "in_a").unwrap();
+        assert_eq!(store_a.get("shared_key").unwrap(), "in_a");
+        assert!(matches!(store_b.get("shared_key"), Err(CredentialError::NotFound)));
     }
 }

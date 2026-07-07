@@ -326,7 +326,12 @@ routine should drain first.**
 - [ ] Tool-manager consistency: `update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap); `create_user_tool` swallows registration errors in `if let Ok`; no duplicate-name check; `enabled:false` tools still execute; no `ToolRegistry::unregister` (deleted tools stay callable until restart); non-string enums dropped in `parse_params_from_schema`.
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
-- [ ] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
+- [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
+      *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
+      rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file
+      helpers became `&self` methods honoring `file_dir`. Tests rewritten deterministically (`file_only_at`
+      + `TempDir`): round-trip, overwrite, delete/not-found, and cross-dir isolation. Also usable for
+      headless/service deployments where the OS keyring is inaccessible.*
 - [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
 
 **Architecture debt:**
