@@ -281,9 +281,14 @@ summarization, progressive distillation (rolling summary every N turns), tool-re
 CDC message-level dedup, per-model stats tracker + persistence + stats-informed routing. Open:
 - [ ] **LLMLingua-style prompt compression** (needs local GPU model, e.g. Phi-3/Qwen2 via Ollama; perplexity token scoring, selective).
 - [ ] **Structured tool output schemas** — audit tool verbosity, optional `output_schema` on `ToolDefinition`, JSON output mode.
-- [ ] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
+- [~] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
       multipliers (3.5 code / 4 English / 2 CJK); account for per-message framing (~100 tok) and
       truncation-marker text. Current heuristic causes ~20–30% overflow/underutilization.
+      *(2026-07-07) First pass in `nanna-llm`: `estimate_tokens` is now character-class aware
+      (ASCII ~4 chars/token via `div_ceil`; wide/CJK ~1 token/char — fixes the byte-`len()/4`
+      CJK under-count that was the main overflow source), and `estimate_request_tokens` adds
+      `MESSAGE_FRAMING_TOKENS` (4) per message. Tests cover ASCII/CJK/mixed + framing. Still TODO:
+      a real tiktoken path and code-vs-English (3.5) differentiation.*
 - [ ] Streaming cache tracking (`loop_runner.rs:834`) — parse usage from `message_start` for accurate cache stats.
 
 ### P11 — Correctness, Security & Architecture Debt 🚧 (new — cross-cutting)
