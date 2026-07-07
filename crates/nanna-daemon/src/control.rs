@@ -792,10 +792,9 @@ impl ControlPlane {
                     let msg_count = self.sessions.get(&info.session_id).await
                         .map(|s| s.messages.len())
                         .unwrap_or(0);
-                    let mailbox_count = self.sessions.drain_mailbox(&info.session_id).await.len();
-                    // Put them back (we just wanted the count)
-                    // Note: drain was destructive, but for status we want peek behavior
-                    // TODO: add a peek_mailbox method
+                    // Non-destructive peek: a status check must never consume the
+                    // session's pending inter-session messages.
+                    let mailbox_count = self.sessions.peek_mailbox(&info.session_id).await.len();
                     json!({
                         "session_id": info.session_id,
                         "parent_id": info.parent_id,

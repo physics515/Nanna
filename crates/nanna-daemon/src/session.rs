@@ -945,8 +945,16 @@ impl SessionManager {
     pub async fn drain_mailbox(&self, session_id: &str) -> Vec<MailboxMessage> {
         let mut mailboxes = self.mailboxes.write().await;
         mailboxes.get_mut(session_id)
-            .map(|mb| std::mem::take(mb))
+            .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Peek at a session's mailbox **without** consuming it (returns a clone).
+    /// Used for status/inspection so checking a mailbox never eats pending
+    /// inter-session messages the way `drain_mailbox` does.
+    pub async fn peek_mailbox(&self, session_id: &str) -> Vec<MailboxMessage> {
+        let mailboxes = self.mailboxes.read().await;
+        mailboxes.get(session_id).cloned().unwrap_or_default()
     }
 
     /// Clean up completed/failed/killed sub-sessions older than the given duration
@@ -977,7 +985,48 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    #[tokio::test]
+    async fn test_peek_mailbox_is_non_destructive() {
+        let manager = SessionManager::new();
+        let info = SubSessionInfo {
+            session_id: "sub-1".to_string(),
+            parent_id: None,
+            label: None,
+            task: "t".to_string(),
+            state: SubSessionState::Running,
+            spawned_at: Utc::now(),
+            finished_at: None,
+            model: None,
+            result: None,
+            error: None,
+            cancellation_flag: None,
+        };
+        manager.register_sub_session(info).await;
+
+        assert!(
+            manager
+                .send_to_mailbox("sub-1", "parent", "hi".to_string())
+                .await
+        );
+        assert!(
+            manager
+                .send_to_mailbox("sub-1", "parent", "again".to_string())
+                .await
+        );
+
+        // Peeking twice returns the same messages without consuming them.
+        assert_eq!(manager.peek_mailbox("sub-1").await.len(), 2);
+        assert_eq!(manager.peek_mailbox("sub-1").await.len(), 2);
+
+        // Draining consumes; a subsequent peek is empty.
+        assert_eq!(manager.drain_mailbox("sub-1").await.len(), 2);
+        assert_eq!(manager.peek_mailbox("sub-1").await.len(), 0);
+
+        // Peeking an unknown session yields an empty vec (no panic).
+        assert!(manager.peek_mailbox("nope").await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_session_manager() {
         let manager = SessionManager::new();
