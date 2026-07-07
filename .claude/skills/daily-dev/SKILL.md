@@ -80,7 +80,22 @@ cargo build                     # release if perf-relevant
 ```
 - If perf-affecting: run the relevant bench (`cargo bench --bench <name> -p <crate>`), compare to
   `bench/BASELINE.md`, and **reject regressions past budget**. Update the baseline if it legitimately improved.
-- If it changes user-facing behavior, run the app path or a smoke test to confirm it actually works.
+- **GUI / runtime verification — drive the real app over WebDriver (grant-free, PRIMARY).** For any
+  increment touching the Tauri UI, a Tauri `invoke` command, a Pinia store, or persistence: **`cargo
+  tauri build`** (from `gui/`), then drive the *built* app with the shared harness
+  `C:\Users\physi\.claude\scheduled-tasks\_shared\tauri-webdriver.ps1` (same one Utter/Laurelane use):
+  `ensure` → `start -App '<exe>'` → `exec -Script '<js>'` / `shot -Out '<scratch>\x.png'` → **always
+  `stop`**. Point `-App` at the fresh `D:\Development\Cargo Target\release\nanna-gui.exe` (or the
+  installed `%LOCALAPPDATA%\Nanna\Nanna.exe`) — **NOT `pnpm dev`** (a browser shell where `invoke()`
+  fails). Call backend commands directly from JS via `return window.__TAURI_INTERNALS__.invoke('<cmd>',
+  {..})` to prove the live path, assert DOM/store state, and screenshot as evidence. This needs **no
+  computer-use grant and works every run** — it is the reason a run CAN honestly verify the GUI.
+  (`tauri-driver` + `msedgedriver` are installed on PATH under `~/.cargo/bin`; the harness's `ensure`
+  auto-matches msedgedriver to the live WebView2 Runtime — `cargo install tauri-driver` if missing.)
+- **Fallback only:** `mcp__computer-use__*` — use only for a native OS dialog WebDriver can't reach; it
+  needs a live `request_access` approval that does **not** persist across runs, so prefer WebDriver unattended.
+- If the frontend changed, also do one **non-CI dev-serve check**: `pnpm tauri dev` once, confirm
+  `http://localhost:3000` serves a real 200 `__nuxt` shell (catches Nuxt boot-loops the built app hides), then kill it cleanly.
 
 ### 5 — Update the roadmap (surgically)
 - Tick the item `[x]` and append a short dated note: `(2026-07-06) what shipped + the key number/decision`.
