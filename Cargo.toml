@@ -28,8 +28,8 @@ clap = { version = "4", features = ["derive"] }
 uuid.workspace = true
 toml.workspace = true
 serde_json.workspace = true
-dialoguer = { version = "0.11", features = ["password"] }
-console = "0.15"
+dialoguer = { version = "0.12", features = ["password"] }
+console = "0.16"
 chrono.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
@@ -91,7 +91,7 @@ thiserror = "2"
 anyhow = "1.0"
 
 # Async channels
-flume = "0.11"
+flume = "0.12"
 
 # Memory/embeddings
 half = "2.4"  # f16 support
