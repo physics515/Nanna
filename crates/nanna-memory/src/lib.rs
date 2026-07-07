@@ -506,6 +506,57 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Replace an entry's content **and** embedding in place (merge/dreaming path).
+    ///
+    /// Keeps the entry's ID and FSRS history; the caller reinforces FSRS
+    /// separately. Persists the full updated entry (upsert) so the durable
+    /// content and embedding never diverge from the in-memory cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DimensionMismatch` if `embedding` has the wrong dimension, or
+    /// `NotFound` if no entry has the given `id`.
+    pub async fn update_content_and_embedding(
+        &self,
+        id: &str,
+        content: &str,
+        mut embedding: Vec<f32>,
+    ) -> Result<(), MemoryError> {
+        debug_assert!(!id.is_empty(), "memory id must not be empty");
+        debug_assert!(!content.is_empty(), "merged content must not be empty");
+        if embedding.len() != self.config.get_dimension() {
+            return Err(MemoryError::DimensionMismatch {
+                expected: self.config.get_dimension(),
+                got: embedding.len(),
+            });
+        }
+
+        // Normalize for cosine similarity, matching `add`.
+        normalize_f32(&mut embedding);
+
+        // Update the in-memory entry, snapshot it, then release the lock.
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        entry.content = content.to_string();
+        entry.embedding = embedding;
+        let snapshot = entry.clone();
+        drop(entries);
+
+        // Write-through the whole entry (content + embedding stay consistent).
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_entry(&snapshot).await
+        {
+            warn!("Failed to persist merged memory {}: {}", id, e);
+            // Non-fatal: in-memory cache already updated.
+        }
+
+        debug_assert_eq!(snapshot.id, id, "merged entry id must be unchanged");
+        Ok(())
+    }
+
     /// Get all entries (for consolidation)
     pub async fn all_entries(&self) -> Vec<MemoryEntry> {
         self.entries.read().await.clone()

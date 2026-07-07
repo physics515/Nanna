@@ -314,7 +314,11 @@ routine should drain first.**
 **Correctness bugs:**
 - [ ] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama).
 - [ ] **Atomic memory persistence** — `save_memories` writes in place; a crash mid-write corrupts the store. Use `tempfile` → write → `fs::rename`.
-- [ ] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
+- [x] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
+      *(2026-07-07) `smart_ingest`'s `Update` band (0.75–0.92 sim) now folds the incoming content into the
+      existing memory (pure `merge_memory_content`: superset-dedup, else bounded append ≤4096 B) and
+      reinforces FSRS, instead of creating a near-duplicate. New `VectorStore::update_content_and_embedding`
+      re-embeds + upserts the whole entry (content and embedding stay consistent). See also P13 true-merge.*
 - [ ] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through.
 - [ ] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
 - [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
@@ -380,7 +384,11 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 **Best-in-class dreaming:**
 - [ ] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
 - [ ] **Idle-gated, multi-phase dream cycle** (like sleep, not a fixed hourly cron): track last-activity; after N min idle (or memory-pressure) run phases — (a) purge-expired + testing-effect flush, (b) **true merge/dedup**, (c) cluster-consolidate by FSRS weight band, (d) expand high-weight, (e) DSP timeline compression (below). Emit progress events.
-- [ ] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
+- [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
+      *(2026-07-07) Done for the ingest path: `merge_memory_content` + `update_content_and_embedding` fold
+      related-but-distinct content into the existing memory (bounded, superset-dedup) and reinforce FSRS.
+      Next: apply the same merge in the batch dreaming/consolidation clusterer and in the other two ingest
+      variants (`service.rs:404`, `:472`), which still treat `Update` as reinforce-only.*
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
