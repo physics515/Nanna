@@ -77,7 +77,7 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
     // Parse timestamp from created_at ISO string (fallback: 0)
     let timestamp = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
         .or_else(|_| {
-            // Try the database `datetime('now')` format 'YYYY-MM-DD HH:MM:SS'
+            // Try Turso datetime format 'YYYY-MM-DD HH:MM:SS'
             chrono::NaiveDateTime::parse_from_str(&mem.created_at, "%Y-%m-%d %H:%M:%S")
                 .map(|ndt| ndt.and_utc().fixed_offset())
                 .map_err(|e| e)

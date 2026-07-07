@@ -36,6 +36,75 @@ pub mod stdio {
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, error, trace, warn};
 
+    /// Server → client notification categories from the MCP spec that we recognize.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ServerNotification {
+        /// `notifications/message` — a structured log record emitted by the server.
+        LogMessage,
+        /// `notifications/progress` — progress update for an in-flight request.
+        Progress,
+        /// A `.../list_changed` notification (tools/resources/prompts) — a cache signal.
+        ListChanged,
+        /// `notifications/cancelled` — the server cancelled a request.
+        Cancelled,
+        /// Anything not specifically handled.
+        Other,
+    }
+
+    /// Classify an MCP notification by its JSON-RPC `method`. Pure.
+    fn classify_server_notification(method: &str) -> ServerNotification {
+        match method {
+            "notifications/message" => ServerNotification::LogMessage,
+            "notifications/progress" => ServerNotification::Progress,
+            "notifications/cancelled" => ServerNotification::Cancelled,
+            m if m.ends_with("/list_changed") => ServerNotification::ListChanged,
+            _ => ServerNotification::Other,
+        }
+    }
+
+    /// Whether an MCP log `level` (RFC 5424 severity keyword) is warning-or-worse
+    /// and should surface at a higher tracing level. Pure.
+    fn mcp_level_is_severe(level: &str) -> bool {
+        matches!(
+            level,
+            "warning" | "error" | "critical" | "alert" | "emergency"
+        )
+    }
+
+    /// Route a parsed server notification to the appropriate tracing level.
+    /// (Previously such notifications were parsed and then dropped.)
+    fn handle_server_notification(notif: &JsonRpcNotification) {
+        match classify_server_notification(&notif.method) {
+            ServerNotification::LogMessage => {
+                let level = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("level"))
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("info");
+                if mcp_level_is_severe(level) {
+                    warn!(method = notif.method, level, "MCP server log");
+                } else {
+                    debug!(method = notif.method, level, "MCP server log");
+                }
+            }
+            ServerNotification::ListChanged => {
+                // Tools/resources/prompts changed server-side; a future cache layer
+                // invalidates here. Surface it for observability meanwhile.
+                debug!(method = notif.method, "MCP server list changed");
+            }
+            ServerNotification::Progress => {
+                debug!(method = notif.method, "MCP progress notification");
+            }
+            ServerNotification::Cancelled => {
+                debug!(method = notif.method, "MCP server cancelled a request");
+            }
+            ServerNotification::Other => {
+                debug!(method = notif.method, "Unhandled MCP notification");
+            }
+        }
+    }
+
     /// Stdio transport - spawns a process and communicates via stdin/stdout
     pub struct StdioTransport {
         /// Child process
@@ -143,8 +212,7 @@ pub mod stdio {
                                         // Might be a notification, try to parse that
                                         match serde_json::from_str::<JsonRpcNotification>(&line) {
                                             Ok(notif) => {
-                                                debug!(method = notif.method, "Received notification from server");
-                                                // TODO: Handle server notifications (logging, etc.)
+                                                handle_server_notification(&notif);
                                             }
                                             Err(_) => {
                                                 warn!(error = %e, line, "Failed to parse response");
@@ -221,8 +289,61 @@ pub mod stdio {
             
             let mut child = self.child.lock().await;
             let _ = child.kill().await;
-            
+
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            classify_server_notification, handle_server_notification, mcp_level_is_severe,
+            JsonRpcNotification, ServerNotification,
+        };
+
+        #[test]
+        fn classifies_known_notifications() {
+            assert_eq!(
+                classify_server_notification("notifications/message"),
+                ServerNotification::LogMessage
+            );
+            assert_eq!(
+                classify_server_notification("notifications/progress"),
+                ServerNotification::Progress
+            );
+            assert_eq!(
+                classify_server_notification("notifications/cancelled"),
+                ServerNotification::Cancelled
+            );
+            assert_eq!(
+                classify_server_notification("notifications/tools/list_changed"),
+                ServerNotification::ListChanged
+            );
+            assert_eq!(
+                classify_server_notification("notifications/resources/list_changed"),
+                ServerNotification::ListChanged
+            );
+            assert_eq!(
+                classify_server_notification("something/else"),
+                ServerNotification::Other
+            );
+        }
+
+        #[test]
+        fn severity_mapping_is_correct() {
+            for severe in ["warning", "error", "critical", "alert", "emergency"] {
+                assert!(mcp_level_is_severe(severe), "{severe} should be severe");
+            }
+            for benign in ["debug", "info", "notice", "unknown"] {
+                assert!(!mcp_level_is_severe(benign), "{benign} should not be severe");
+            }
+        }
+
+        #[test]
+        fn handle_notification_does_not_panic_on_missing_params() {
+            // A log-message notification without params must not panic (defaults to info).
+            let notif = JsonRpcNotification::new("notifications/message", None);
+            handle_server_notification(&notif);
         }
     }
 }

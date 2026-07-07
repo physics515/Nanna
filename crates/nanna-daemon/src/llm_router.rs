@@ -387,3 +387,67 @@ impl Default for LlmRouter {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderId;
+
+    #[test]
+    fn from_model_infers_provider_by_prefix() {
+        // Bare model names route by family prefix (this is exactly what the GUI's
+        // parse_model_id historically got wrong for OpenAI models).
+        assert_eq!(ProviderId::from_model("gpt-4o"), ProviderId::OpenAI);
+        assert_eq!(ProviderId::from_model("gpt-5"), ProviderId::OpenAI);
+        assert_eq!(ProviderId::from_model("o1-preview"), ProviderId::OpenAI);
+        assert_eq!(ProviderId::from_model("o3-mini"), ProviderId::OpenAI);
+        assert_eq!(
+            ProviderId::from_model("claude-opus-4"),
+            ProviderId::Anthropic
+        );
+        // Case-insensitive.
+        assert_eq!(
+            ProviderId::from_model("Claude-Sonnet-4"),
+            ProviderId::Anthropic
+        );
+    }
+
+    #[test]
+    fn from_model_recognizes_explicit_and_tagged_prefixes() {
+        assert_eq!(
+            ProviderId::from_model("openrouter/meta-llama/llama-3"),
+            ProviderId::OpenRouter
+        );
+        assert_eq!(
+            ProviderId::from_model("github/gpt-4o"),
+            ProviderId::GitHubModels
+        );
+        assert_eq!(ProviderId::from_model("ollama/qwen3"), ProviderId::Ollama);
+        // A `:tag` (with no known prefix) is a local Ollama model.
+        assert_eq!(
+            ProviderId::from_model("deepseek-r1:14b"),
+            ProviderId::Ollama
+        );
+        assert_eq!(
+            ProviderId::from_model("llama3.2:latest"),
+            ProviderId::Ollama
+        );
+        // Unknown, prefix-less models fall back to Anthropic.
+        assert_eq!(
+            ProviderId::from_model("some-unknown-model"),
+            ProviderId::Anthropic
+        );
+    }
+
+    #[test]
+    fn strip_prefix_removes_only_routing_prefixes() {
+        assert_eq!(
+            ProviderId::strip_prefix("ollama/deepseek-r1:14b"),
+            "deepseek-r1:14b"
+        );
+        assert_eq!(ProviderId::strip_prefix("openrouter/x/y"), "x/y");
+        assert_eq!(ProviderId::strip_prefix("github/gpt-4o"), "gpt-4o");
+        // Family-named models keep their name (the family IS the model id).
+        assert_eq!(ProviderId::strip_prefix("gpt-4o"), "gpt-4o");
+        assert_eq!(ProviderId::strip_prefix("claude-opus-4"), "claude-opus-4");
+    }
+}

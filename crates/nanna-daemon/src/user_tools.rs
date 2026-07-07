@@ -399,6 +399,19 @@ fn validate_tool_name(name: &str) -> Result<(), String> {
 }
 
 /// Parse parameters from a JSON Schema value
+/// Convert a JSON Schema `enum` entry to its string form. Preserves non-string
+/// scalars (numbers, booleans, null) that the previous `as_str`-only path silently
+/// dropped — e.g. `"enum": [1, 2, 3]` or `[true, false]` now survive.
+fn enum_value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     let mut params = Vec::new();
     
@@ -426,7 +439,7 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
             
             let enum_values = prop.get("enum")
                 .and_then(|e| e.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+                .map(|arr| arr.iter().map(enum_value_to_string).collect());
             
             params.push(ToolParameter {
                 name: name.clone(),
@@ -486,5 +499,28 @@ mod tests {
         assert!(res.is_err());
         // Nothing must have been written outside the tools dir.
         assert!(!dir.path().parent().unwrap().join("escaped.json").exists());
+    }
+
+    #[test]
+    fn parse_params_preserves_non_string_enums() {
+        // Integer/boolean enum values must survive schema parsing (were dropped).
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "retries": { "type": "integer", "enum": [0, 1, 5] },
+                "verbose": { "type": "boolean", "enum": [true, false] }
+            }
+        });
+        let params = parse_params_from_schema(&schema);
+        let retries = params.iter().find(|p| p.name == "retries").unwrap();
+        assert_eq!(
+            retries.enum_values.as_deref(),
+            Some(&["0".to_string(), "1".to_string(), "5".to_string()][..])
+        );
+        let verbose = params.iter().find(|p| p.name == "verbose").unwrap();
+        assert_eq!(
+            verbose.enum_values.as_deref(),
+            Some(&["true".to_string(), "false".to_string()][..])
+        );
     }
 }

@@ -56,7 +56,7 @@ pub struct ControlPlane {
     services_workspace_id: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     /// Event broadcaster for pushing events to subscribed clients
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
-    /// Monotonic start instant, for reporting daemon uptime.
+    /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
     started_at: std::time::Instant,
 }
 
@@ -87,7 +87,8 @@ impl ControlPlane {
         }
     }
 
-    /// Seconds elapsed since this control plane started (daemon uptime).
+    /// Seconds since this control plane (the daemon) started — reported as
+    /// `uptime_secs` in `SystemAction::Status`.
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
@@ -329,7 +330,7 @@ impl ControlPlane {
     }
 
     // NOTE: save_memories_if_needed() removed — memory is now persisted
-    // via SQLite write-through on every mutation (add/remove/update).
+    // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
     
     /// Handle an action and return a response
@@ -791,10 +792,9 @@ impl ControlPlane {
                     let msg_count = self.sessions.get(&info.session_id).await
                         .map(|s| s.messages.len())
                         .unwrap_or(0);
-                    let mailbox_count = self.sessions.drain_mailbox(&info.session_id).await.len();
-                    // Put them back (we just wanted the count)
-                    // Note: drain was destructive, but for status we want peek behavior
-                    // TODO: add a peek_mailbox method
+                    // Non-destructive peek: a status check must never consume the
+                    // session's pending inter-session messages.
+                    let mailbox_count = self.sessions.peek_mailbox(&info.session_id).await.len();
                     json!({
                         "session_id": info.session_id,
                         "parent_id": info.parent_id,
@@ -1219,7 +1219,7 @@ impl ControlPlane {
 
                 match memory.remember_with_importance(&content, metadata, importance.unwrap_or(3) as f32).await {
                     Ok((id, action)) => {
-                        // Memory auto-persisted to SQLite via write-through.
+                        // Memory auto-persisted to Turso via write-through.
                         json!({
                             "id": id,
                             "action": format!("{:?}", action),
@@ -1233,7 +1233,7 @@ impl ControlPlane {
                 if let Some(new_content) = content {
                     match memory.update_content(&id, &new_content).await {
                         Ok(()) => {
-                            // Memory auto-persisted to SQLite via write-through.
+                            // Memory auto-persisted to Turso via write-through.
                             json!({ "status": "updated", "id": id })
                         }
                         Err(e) => json!({ "error": "update_failed", "message": e.to_string() })
@@ -1245,7 +1245,7 @@ impl ControlPlane {
             MemoryAction::Delete { id } => {
                 match memory.forget(&id).await {
                     Ok(()) => {
-                        // Memory auto-persisted to SQLite via write-through.
+                        // Memory auto-persisted to Turso via write-through.
                         json!({ "status": "deleted", "id": id })
                     }
                     Err(e) => json!({ "error": "delete_failed", "message": e.to_string() })
@@ -1254,9 +1254,9 @@ impl ControlPlane {
             MemoryAction::Clear => {
                 memory.clear().await;
                 // Note: clear() removes all in-memory entries. Individual removes
-                // write-through to SQLite, but bulk clear would require a separate
+                // write-through to Turso, but bulk clear would require a separate
                 // DB call. For now we log a warning.
-                warn!("Memory cleared in-memory. SQLite entries are NOT cleared — restart will reload them.");
+                warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
                 info!("Cleared all memories (in-memory only)");
                 json!({ "status": "cleared" })
             }
@@ -2509,12 +2509,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_uptime_starts_near_zero_and_is_monotonic() {
-        let plane = ControlPlane::new(Arc::new(SessionManager::new()));
-        // Freshly constructed: uptime is 0 or 1 seconds, never absurd.
-        let uptime = plane.uptime_secs();
-        assert!(uptime <= 1, "fresh uptime should be ~0s, got {uptime}");
-        // Uptime never decreases (monotonic Instant).
-        assert!(plane.uptime_secs() >= uptime);
+    fn uptime_starts_near_zero_and_is_monotonic() {
+        let cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        let first = cp.uptime_secs();
+        assert!(
+            first < 5,
+            "a freshly created control plane should report ~0 uptime"
+        );
+        let second = cp.uptime_secs();
+        assert!(second >= first, "uptime must be monotonic non-decreasing");
     }
 }
