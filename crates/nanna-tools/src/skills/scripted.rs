@@ -258,6 +258,19 @@ impl Tool for ScriptedToolWrapper {
 }
 
 /// Parse parameters from a JSON Schema value
+/// Convert a JSON Schema `enum` entry to its string form. Preserves non-string
+/// scalars (numbers, booleans, null) that the previous `as_str`-only path silently
+/// dropped — e.g. `"enum": [1, 2, 3]` or `[true, false]` now survive.
+fn enum_value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     let mut params = Vec::new();
     
@@ -283,10 +296,10 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
                 .unwrap_or("")
                 .to_string();
             
-            // Extract enum values if present
+            // Extract enum values if present (preserving non-string scalars)
             let enum_values = prop.get("enum")
                 .and_then(|e| e.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+                .map(|arr| arr.iter().map(enum_value_to_string).collect());
             
             params.push(ToolParameter {
                 name: name.clone(),
@@ -320,8 +333,43 @@ mod tests {
         
         let tool = ScriptedToolWrapper::from_source("greet", source).unwrap();
         let def = tool.definition();
-        
+
         assert_eq!(def.name, "greet");
         assert_eq!(def.description, "Greet someone");
+    }
+
+    #[test]
+    fn test_parse_params_preserves_non_string_enums() {
+        // enum values of mixed scalar types must all survive (previously the
+        // non-string ones were silently dropped).
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "level": { "type": "integer", "enum": [1, 2, 3] },
+                "flag": { "type": "boolean", "enum": [true, false] },
+                "mode": { "type": "string", "enum": ["fast", "slow"] }
+            },
+            "required": ["level"]
+        });
+        let params = parse_params_from_schema(&schema);
+
+        let level = params.iter().find(|p| p.name == "level").unwrap();
+        assert_eq!(
+            level.enum_values.as_deref(),
+            Some(&["1".to_string(), "2".to_string(), "3".to_string()][..])
+        );
+        assert!(level.required);
+
+        let flag = params.iter().find(|p| p.name == "flag").unwrap();
+        assert_eq!(
+            flag.enum_values.as_deref(),
+            Some(&["true".to_string(), "false".to_string()][..])
+        );
+
+        let mode = params.iter().find(|p| p.name == "mode").unwrap();
+        assert_eq!(
+            mode.enum_values.as_deref(),
+            Some(&["fast".to_string(), "slow".to_string()][..])
+        );
     }
 }
