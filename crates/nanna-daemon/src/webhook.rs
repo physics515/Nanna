@@ -299,17 +299,53 @@ struct DiscordUser {
     _discriminator: Option<String>,
 }
 
-/// Verify Discord signature
+/// Verify a Discord interaction request signature (Ed25519).
+///
+/// Discord signs `timestamp || body` with its application's Ed25519 key and
+/// sends the hex-encoded public key (config), signature (`X-Signature-Ed25519`),
+/// and timestamp (`X-Signature-Timestamp`). We reconstruct the signed message
+/// and verify it with the configured public key. Any decode failure or length
+/// mismatch is a rejection — never a trusted pass.
 fn verify_discord_signature(
     public_key: &str,
     signature: &str,
     timestamp: &str,
-    _body: &[u8],
+    body: &[u8],
 ) -> bool {
-    // For full verification, we'd use ed25519-dalek
-    // For now, we'll trust the signature if we receive valid headers
-    // TODO: Implement proper Ed25519 verification
-    !public_key.is_empty() && !signature.is_empty() && !timestamp.is_empty()
+    use ed25519_dalek::{Signature, VerifyingKey, SIGNATURE_LENGTH};
+
+    // Guard: all inputs must be present (an empty field can never verify).
+    if public_key.is_empty() || signature.is_empty() || timestamp.is_empty() {
+        return false;
+    }
+
+    // Public key: 32 hex-encoded bytes.
+    let Ok(key_bytes) = hex::decode(public_key) else {
+        return false;
+    };
+    let Ok(key_array) = <[u8; 32]>::try_from(key_bytes) else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&key_array) else {
+        return false;
+    };
+
+    // Signature: 64 hex-encoded bytes.
+    let Ok(sig_bytes) = hex::decode(signature) else {
+        return false;
+    };
+    let Ok(sig_array) = <[u8; SIGNATURE_LENGTH]>::try_from(sig_bytes) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_array);
+
+    // Signed message is the concatenation of timestamp and raw body.
+    let mut message = Vec::with_capacity(timestamp.len() + body.len());
+    message.extend_from_slice(timestamp.as_bytes());
+    message.extend_from_slice(body);
+
+    // `verify_strict` is constant-time and rejects malleable signatures.
+    verifying_key.verify_strict(&message, &sig).is_ok()
 }
 
 /// Handle Discord interactions webhook
@@ -413,36 +449,59 @@ struct SlackEvent {
     ts: Option<String>,
 }
 
-/// Verify Slack signature
+/// Verify a Slack request signature (HMAC-SHA256).
+///
+/// Slack signs `v0:{timestamp}:{body}` with the app's signing secret and sends
+/// the hex digest as `v0={hex}` in `X-Slack-Signature`, plus the unix timestamp
+/// in `X-Slack-Request-Timestamp`. We recompute the digest and compare in
+/// constant time (`Mac::verify_slice`). A stale timestamp (replay guard, ±5 min)
+/// or any decode failure is a rejection — never a trusted pass.
 fn verify_slack_signature(
     signing_secret: &str,
     signature: &str,
     timestamp: &str,
     body: &[u8],
 ) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use std::time::{SystemTime, UNIX_EPOCH};
-    
-    // Check timestamp is recent (within 5 minutes)
-    if let Ok(ts) = timestamp.parse::<u64>() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        
-        if now.abs_diff(ts) > 300 {
-            return false;
-        }
-    } else {
+
+    // Guard: required inputs must be present.
+    if signing_secret.is_empty() || signature.is_empty() {
         return false;
     }
-    
-    // Build the signature base string
-    let _sig_basestring = format!("v0:{}:{}", timestamp, String::from_utf8_lossy(body));
-    
-    // Compute HMAC-SHA256
-    // TODO: Use proper HMAC implementation (ring or hmac crate)
-    // For now, we trust if we have the required headers
-    !signing_secret.is_empty() && !signature.is_empty()
+
+    // Replay guard: the timestamp must parse and be within 5 minutes of now.
+    let Ok(ts) = timestamp.parse::<u64>() else {
+        return false;
+    };
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now_secs.abs_diff(ts) > 300 {
+        return false;
+    }
+
+    // Slack signatures are `v0=<hex>`; strip the version prefix and decode.
+    let Some(hex_digest) = signature.strip_prefix("v0=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_digest) else {
+        return false;
+    };
+
+    // Recompute HMAC-SHA256 over `v0:{timestamp}:{body}`.
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(signing_secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(b"v0:");
+    mac.update(timestamp.as_bytes());
+    mac.update(b":");
+    mac.update(body);
+
+    // Constant-time comparison against the provided digest.
+    mac.verify_slice(&expected).is_ok()
 }
 
 /// Handle Slack events webhook
@@ -888,8 +947,81 @@ mod tests {
         let payload = json!({
             "content": "Simple content"
         });
-        
+
         let msg = extract_generic_message(&payload).unwrap();
         assert_eq!(msg.content, "Simple content");
+    }
+
+    #[test]
+    fn test_discord_signature_valid_and_rejects_tampering() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Deterministic key so the test is reproducible (no RNG dependency).
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+        let timestamp = "1700000000";
+        let body = br#"{"type":1}"#;
+        let mut message = Vec::new();
+        message.extend_from_slice(timestamp.as_bytes());
+        message.extend_from_slice(body);
+        let signature_hex = hex::encode(signing_key.sign(&message).to_bytes());
+
+        // A genuine signature verifies.
+        assert!(verify_discord_signature(&public_key_hex, &signature_hex, timestamp, body));
+
+        // Tampered body, timestamp, or signature is rejected.
+        assert!(!verify_discord_signature(&public_key_hex, &signature_hex, timestamp, br#"{"type":2}"#));
+        assert!(!verify_discord_signature(&public_key_hex, &signature_hex, "1700000001", body));
+        assert!(!verify_discord_signature(&public_key_hex, &"0".repeat(128), timestamp, body));
+
+        // Empty or malformed inputs are rejected, never trusted.
+        assert!(!verify_discord_signature("", &signature_hex, timestamp, body));
+        assert!(!verify_discord_signature(&public_key_hex, "", timestamp, body));
+        assert!(!verify_discord_signature(&public_key_hex, "not-hex!!", timestamp, body));
+        assert!(!verify_discord_signature("zz", &signature_hex, timestamp, body));
+    }
+
+    #[test]
+    fn test_slack_signature_valid_and_rejects_tampering() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let secret = "8f742231b10e8888abcd99yyyzzz85a5";
+        // Fresh timestamp so the ±5-minute replay guard passes.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let timestamp = now_secs.to_string();
+        let body = b"token=xyz&team_id=T1&event=hello";
+
+        let sign = |secret: &str, ts: &str, body: &[u8]| -> String {
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+            mac.update(b"v0:");
+            mac.update(ts.as_bytes());
+            mac.update(b":");
+            mac.update(body);
+            format!("v0={}", hex::encode(mac.finalize().into_bytes()))
+        };
+        let signature = sign(secret, &timestamp, body);
+
+        // A genuine signature verifies.
+        assert!(verify_slack_signature(secret, &signature, &timestamp, body));
+
+        // Wrong secret, tampered body, or missing `v0=` prefix is rejected.
+        assert!(!verify_slack_signature("wrong-secret", &signature, &timestamp, body));
+        assert!(!verify_slack_signature(secret, &signature, &timestamp, b"token=xyz&tampered"));
+        assert!(!verify_slack_signature(secret, &hex::encode([0u8; 32]), &timestamp, body));
+
+        // A stale timestamp is rejected even with a valid digest (replay guard).
+        let stale = (now_secs - 10_000).to_string();
+        let stale_sig = sign(secret, &stale, body);
+        assert!(!verify_slack_signature(secret, &stale_sig, &stale, body));
+
+        // Empty inputs are rejected, never trusted.
+        assert!(!verify_slack_signature("", &signature, &timestamp, body));
+        assert!(!verify_slack_signature(secret, "", &timestamp, body));
     }
 }

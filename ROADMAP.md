@@ -299,8 +299,15 @@ routine should drain first.**
       unguarded GUI-embedded path used; the daemon path already allowlisted). Accepts only a single
       normal component (no `/`, `\`, `.`/`..`, root/drive), bounded 128 bytes; postcondition
       `debug_assert!`s the path stays inside `.nanna`. Tests cover traversal + legit writes.*
-- [ ] **Discord webhook signature** (`webhook.rs:306`) trusts any non-empty header — add Ed25519 (`ed25519-dalek`).
-- [ ] **Slack webhook signature** (`webhook.rs:438`) is a placeholder — add HMAC (`ring`/`hmac`).
+- [x] **Discord webhook signature** (`webhook.rs:306`) trusts any non-empty header — add Ed25519 (`ed25519-dalek`).
+      *(2026-07-07) `verify_discord_signature` now decodes the hex pubkey/signature and verifies `timestamp‖body`
+      with `VerifyingKey::verify_strict` (constant-time, non-malleable). Any decode/length failure rejects.
+      Tests cover valid, tampered-body, wrong-timestamp, and malformed-input cases.*
+- [x] **Slack webhook signature** (`webhook.rs:438`) is a placeholder — add HMAC (`ring`/`hmac`).
+      *(2026-07-07) `verify_slack_signature` recomputes `HMAC-SHA256("v0:{ts}:{body}")` and compares with
+      `Mac::verify_slice` (constant-time); keeps the ±5-min replay guard, requires the `v0=` prefix. Tests
+      cover valid, wrong-secret, tampered-body, stale-timestamp (replay), and empty-input cases. Deps
+      `ed25519-dalek`/`hmac`/`sha2`/`hex` added to `nanna-daemon` matching `nanna-server`'s pinned reqs.*
 - [ ] Harden `delete_skill`'s `remove_dir_all` (symlink check / soft-delete); stronger user-script sandboxing.
 - [ ] Harden memory extraction against prompt injection (raw conversation is embedded in the extraction prompt).
 
