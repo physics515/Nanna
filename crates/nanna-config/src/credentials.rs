@@ -69,6 +69,10 @@ impl From<keyring::Error> for CredentialError {
 pub struct SecureStore {
     /// Fallback to file storage if keyring unavailable
     pub allow_file_fallback: bool,
+    /// When set, bypass the OS keyring entirely and back the store with a JSON
+    /// file under this directory. Makes `set`/`get`/`delete` deterministic for
+    /// headless environments and unit tests (no interactive keyring dependency).
+    file_store_dir: Option<PathBuf>,
 }
 
 impl SecureStore {
@@ -77,19 +81,41 @@ impl SecureStore {
     pub fn new() -> Self {
         Self {
             allow_file_fallback: true,
+            file_store_dir: None,
         }
     }
-    
+
     /// Create without file fallback (keyring-only)
     #[must_use]
     pub fn keyring_only() -> Self {
         Self {
             allow_file_fallback: false,
+            file_store_dir: None,
         }
     }
-    
+
+    /// Create a deterministic, file-backed store rooted at `dir`.
+    ///
+    /// Bypasses the OS keyring so `set` then `get` always round-trip through the
+    /// same JSON file — used for tests and headless (no-keyring) deployments.
+    #[must_use]
+    pub fn with_file_store(dir: PathBuf) -> Self {
+        Self {
+            allow_file_fallback: true,
+            file_store_dir: Some(dir),
+        }
+    }
+
     /// Get a credential from the keyring
+    ///
+    /// # Panics
+    /// Panics if `key` is empty (a programmer error).
     pub fn get(&self, key: &str) -> Result<String, CredentialError> {
+        assert!(!key.is_empty(), "credential key must not be empty");
+        // Deterministic file-backed store (tests / headless): never touch the keyring.
+        if self.file_store_dir.is_some() {
+            return self.get_from_file(key);
+        }
         let entry = Entry::new(KEYRING_SERVICE, key)?;
         match entry.get_password() {
             Ok(value) => {
@@ -115,9 +141,17 @@ impl SecureStore {
             }
         }
     }
-    
+
     /// Store a credential in the keyring
+    ///
+    /// # Panics
+    /// Panics if `key` is empty (a programmer error).
     pub fn set(&self, key: &str, value: &str) -> Result<(), CredentialError> {
+        assert!(!key.is_empty(), "credential key must not be empty");
+        // Deterministic file-backed store (tests / headless): never touch the keyring.
+        if self.file_store_dir.is_some() {
+            return self.set_to_file(key, value);
+        }
         let entry = Entry::new(KEYRING_SERVICE, key)?;
         match entry.set_password(value) {
             Ok(()) => {
@@ -135,9 +169,17 @@ impl SecureStore {
             }
         }
     }
-    
+
     /// Delete a credential from the keyring
+    ///
+    /// # Panics
+    /// Panics if `key` is empty (a programmer error).
     pub fn delete(&self, key: &str) -> Result<(), CredentialError> {
+        assert!(!key.is_empty(), "credential key must not be empty");
+        // Deterministic file-backed store (tests / headless): never touch the keyring.
+        if self.file_store_dir.is_some() {
+            return self.delete_from_file(key);
+        }
         let entry = Entry::new(KEYRING_SERVICE, key)?;
         match entry.delete_credential() {
             Ok(()) => {
@@ -159,12 +201,12 @@ impl SecureStore {
             Err(e) => Err(e.into()),
         }
     }
-    
+
     /// Check if a credential exists
     pub fn exists(&self, key: &str) -> bool {
         self.get(key).is_ok()
     }
-    
+
     /// List all stored credential keys (keyring doesn't support listing, so we check known keys)
     pub fn list_keys(&self) -> Vec<String> {
         let known_keys = [
@@ -179,28 +221,31 @@ impl SecureStore {
             keys::WHATSAPP_ACCESS_TOKEN,
             keys::ELEVENLABS_API_KEY,
         ];
-        
+
         known_keys
             .iter()
             .filter(|k| self.exists(k))
             .map(|k| k.to_string())
             .collect()
     }
-    
+
     // =========================================================================
     // File Fallback (for systems without keyring support)
     // =========================================================================
-    
-    fn credentials_file_path() -> Result<PathBuf, CredentialError> {
+
+    fn credentials_file_path(&self) -> Result<PathBuf, CredentialError> {
+        if let Some(ref dir) = self.file_store_dir {
+            return Ok(dir.join("credentials.json"));
+        }
         let data_dir = directories::ProjectDirs::from("com", "nanna", "nanna")
             .ok_or(CredentialError::NoHomeDir)?
             .data_dir()
             .to_path_buf();
         Ok(data_dir.join("credentials.json"))
     }
-    
-    fn load_file_credentials() -> Result<HashMap<String, String>, CredentialError> {
-        let path = Self::credentials_file_path()?;
+
+    fn load_file_credentials(&self) -> Result<HashMap<String, String>, CredentialError> {
+        let path = self.credentials_file_path()?;
         if !path.exists() {
             return Ok(HashMap::new());
         }
@@ -208,15 +253,18 @@ impl SecureStore {
         let creds: HashMap<String, String> = serde_json::from_str(&content)?;
         Ok(creds)
     }
-    
-    fn save_file_credentials(creds: &HashMap<String, String>) -> Result<(), CredentialError> {
-        let path = Self::credentials_file_path()?;
+
+    fn save_file_credentials(
+        &self,
+        creds: &HashMap<String, String>,
+    ) -> Result<(), CredentialError> {
+        let path = self.credentials_file_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(creds)?;
         std::fs::write(&path, content)?;
-        
+
         // Set restrictive permissions on Unix
         #[cfg(unix)]
         {
@@ -225,27 +273,27 @@ impl SecureStore {
             perms.set_mode(0o600);
             std::fs::set_permissions(&path, perms)?;
         }
-        
+
         Ok(())
     }
-    
+
     fn get_from_file(&self, key: &str) -> Result<String, CredentialError> {
-        let creds = Self::load_file_credentials()?;
+        let creds = self.load_file_credentials()?;
         creds.get(key).cloned().ok_or(CredentialError::NotFound)
     }
-    
+
     fn set_to_file(&self, key: &str, value: &str) -> Result<(), CredentialError> {
-        let mut creds = Self::load_file_credentials()?;
+        let mut creds = self.load_file_credentials()?;
         creds.insert(key.to_string(), value.to_string());
-        Self::save_file_credentials(&creds)?;
+        self.save_file_credentials(&creds)?;
         info!("Stored credential '{}' in file fallback", key);
         Ok(())
     }
-    
+
     fn delete_from_file(&self, key: &str) -> Result<(), CredentialError> {
-        let mut creds = Self::load_file_credentials()?;
+        let mut creds = self.load_file_credentials()?;
         if creds.remove(key).is_some() {
-            Self::save_file_credentials(&creds)?;
+            self.save_file_credentials(&creds)?;
             Ok(())
         } else {
             Err(CredentialError::NotFound)
@@ -418,7 +466,10 @@ impl ClaudeCredentialManager {
 
     /// Get path to Claude credentials file
     fn credentials_path(&self) -> Result<PathBuf, CredentialError> {
-        Ok(self.get_home_dir()?.join(".claude").join(".credentials.json"))
+        Ok(self
+            .get_home_dir()?
+            .join(".claude")
+            .join(".credentials.json"))
     }
 
     /// Load credentials from all available sources
@@ -515,23 +566,27 @@ impl ClaudeCredentialManager {
     /// Save credentials to keyring
     pub fn save_to_keyring(&self, credential: &OAuthCredential) -> Result<(), CredentialError> {
         let entry = Entry::new("Claude Code-credentials", "Claude Code")?;
-        
+
         let data = ClaudeCredentialsFile {
             claude_ai_oauth: Some(credential.clone().into()),
         };
         let json = serde_json::to_string(&data)?;
-        
+
         entry.set_password(&json)?;
         info!("Saved Claude credentials to keyring");
         Ok(())
     }
 
     /// Save credentials back to the source they were loaded from
-    pub fn save(&self, credential: &OAuthCredential, source: CredentialSource) -> Result<(), CredentialError> {
+    pub fn save(
+        &self,
+        credential: &OAuthCredential,
+        source: CredentialSource,
+    ) -> Result<(), CredentialError> {
         match source {
             CredentialSource::File => self.save_to_file(credential),
-            CredentialSource::MacOsKeychain 
-            | CredentialSource::WindowsCredentialManager 
+            CredentialSource::MacOsKeychain
+            | CredentialSource::WindowsCredentialManager
             | CredentialSource::LinuxSecretService => {
                 // Try keyring first, fall back to file
                 if self.save_to_keyring(credential).is_err() {
@@ -549,10 +604,9 @@ impl ClaudeCredentialManager {
         &self,
         credential: &OAuthCredential,
     ) -> Result<OAuthCredential, CredentialError> {
-        let refresh_token = credential
-            .refresh_token
-            .as_ref()
-            .ok_or_else(|| CredentialError::RefreshFailed("No refresh token available".to_string()))?;
+        let refresh_token = credential.refresh_token.as_ref().ok_or_else(|| {
+            CredentialError::RefreshFailed("No refresh token available".to_string())
+        })?;
 
         const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 
@@ -596,15 +650,19 @@ impl ClaudeCredentialManager {
             .map_err(|e| CredentialError::RefreshFailed(e.to_string()))?;
 
         // Calculate new expiry
-        let expires_at = token_resp.expires_in.map(|secs| {
-            chrono::Utc::now().timestamp_millis() + secs * 1000
-        });
+        let expires_at = token_resp
+            .expires_in
+            .map(|secs| chrono::Utc::now().timestamp_millis() + secs * 1000);
 
         let new_credential = OAuthCredential {
             access_token: token_resp.access_token,
-            refresh_token: token_resp.refresh_token.or_else(|| credential.refresh_token.clone()),
+            refresh_token: token_resp
+                .refresh_token
+                .or_else(|| credential.refresh_token.clone()),
             expires_at,
-            subscription_type: token_resp.subscription_type.or_else(|| credential.subscription_type.clone()),
+            subscription_type: token_resp
+                .subscription_type
+                .or_else(|| credential.subscription_type.clone()),
             account_id: credential.account_id.clone(),
             organization_id: credential.organization_id.clone(),
         };
@@ -645,7 +703,11 @@ impl ClaudeCredentialManager {
 
     /// Check if Claude CLI is installed and available
     pub fn is_claude_cli_available() -> bool {
-        let cmd = if cfg!(windows) { "claude.cmd" } else { "claude" };
+        let cmd = if cfg!(windows) {
+            "claude.cmd"
+        } else {
+            "claude"
+        };
 
         std::process::Command::new(cmd)
             .arg("--version")
@@ -662,12 +724,18 @@ impl ClaudeCredentialManager {
     /// # Errors
     /// Returns error if the CLI is not available or the command fails.
     pub fn run_setup_token() -> Result<(), CredentialError> {
-        let cmd = if cfg!(windows) { "claude.cmd" } else { "claude" };
+        let cmd = if cfg!(windows) {
+            "claude.cmd"
+        } else {
+            "claude"
+        };
 
         let status = std::process::Command::new(cmd)
             .arg("setup-token")
             .status()
-            .map_err(|e| CredentialError::RefreshFailed(format!("Failed to run claude setup-token: {}", e)))?;
+            .map_err(|e| {
+                CredentialError::RefreshFailed(format!("Failed to run claude setup-token: {}", e))
+            })?;
 
         if status.success() {
             Ok(())
@@ -739,31 +807,40 @@ mod tests {
         assert_eq!(loaded.expires_at, Some(1234567890000));
         assert_eq!(loaded.subscription_type, Some("pro".to_string()));
     }
-    
+
     #[test]
     fn test_secure_store_file_fallback() {
-        // This test will use file fallback if keyring is unavailable
-        let store = SecureStore::new();
-        
-        // Try to set and get (may use file fallback)
+        // Use an explicit file-backed store so the test is deterministic and does
+        // NOT depend on an interactive OS keyring (headless CI/unattended runs).
+        let temp_dir = TempDir::new().unwrap();
+        let store = SecureStore::with_file_store(temp_dir.path().to_path_buf());
+
         let key = "test_key_nanna_unit_test";
         let value = "test_value_12345";
-        
-        // Clean up first
-        let _ = store.delete(key);
-        
-        // Set
-        let result = store.set(key, value);
-        if result.is_ok() {
-            // Get
-            let retrieved = store.get(key);
-            assert!(retrieved.is_ok());
-            assert_eq!(retrieved.unwrap(), value);
-            
-            // Delete
-            let _ = store.delete(key);
-        }
-        // If set fails, keyring is unavailable and file fallback also failed
-        // which is fine for CI environments
+
+        // set → get must round-trip through the same file store.
+        store.set(key, value).unwrap();
+        let retrieved = store.get(key).unwrap();
+        assert_eq!(retrieved, value);
+
+        // delete removes it; a subsequent get reports NotFound (negative space).
+        store.delete(key).unwrap();
+        assert!(matches!(store.get(key), Err(CredentialError::NotFound)));
+    }
+
+    #[test]
+    fn test_secure_store_file_store_isolated_from_keyring() {
+        // Two independent file stores must not see each other's entries.
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let store_a = SecureStore::with_file_store(dir_a.path().to_path_buf());
+        let store_b = SecureStore::with_file_store(dir_b.path().to_path_buf());
+
+        store_a.set("shared_key", "value_a").unwrap();
+        assert!(matches!(
+            store_b.get("shared_key"),
+            Err(CredentialError::NotFound)
+        ));
+        assert_eq!(store_a.get("shared_key").unwrap(), "value_a");
     }
 }
