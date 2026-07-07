@@ -2207,8 +2207,18 @@ impl EmbeddingClient {
 /// A streaming event from the Anthropic API
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// Start of a new message
-    MessageStart { id: String, model: String },
+    /// Start of a new message. Anthropic reports prompt-side token usage here
+    /// (including prompt-cache hits/writes); other providers report zeros.
+    MessageStart {
+        id: String,
+        model: String,
+        /// Non-cached prompt tokens billed for this message.
+        input_tokens: u32,
+        /// Prompt tokens served from the cache (a read, cheaper).
+        cache_read_tokens: u32,
+        /// Prompt tokens written into the cache (a creation, one-time cost).
+        cache_creation_tokens: u32,
+    },
     /// Start of a content block
     ContentBlockStart { 
         index: usize, 
@@ -2337,6 +2347,22 @@ enum AnthropicSSE {
 struct MessageStartData {
     id: String,
     model: String,
+    #[serde(default)]
+    usage: Option<MessageStartUsage>,
+}
+
+/// Prompt-side token usage reported in the Anthropic `message_start` event.
+/// Field names mirror the wire JSON keys, so the shared `_input_tokens` suffix
+/// is required (not a naming smell).
+#[derive(Debug, Deserialize, Default)]
+#[allow(clippy::struct_field_names)]
+struct MessageStartUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3795,10 +3821,16 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
         }
     };
     match sse {
-        AnthropicSSE::MessageStart { message } => Some(StreamEvent::MessageStart {
-            id: message.id,
-            model: message.model,
-        }),
+        AnthropicSSE::MessageStart { message } => {
+            let usage = message.usage.unwrap_or_default();
+            Some(StreamEvent::MessageStart {
+                id: message.id,
+                model: message.model,
+                input_tokens: usage.input_tokens,
+                cache_read_tokens: usage.cache_read_input_tokens,
+                cache_creation_tokens: usage.cache_creation_input_tokens,
+            })
+        }
         AnthropicSSE::ContentBlockStart { index, content_block } => {
             Some(StreamEvent::ContentBlockStart {
                 index,
@@ -3926,5 +3958,42 @@ mod tests {
         let result = parse_sse_event(event);
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), StreamEvent::SignatureDelta { index: 0, .. }));
+    }
+
+    #[test]
+    fn test_parse_sse_event_message_start_carries_usage() {
+        // message_start reports prompt-side usage incl. cache read/write — the
+        // streaming path must surface these for accurate cache-cost tracking.
+        let event = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":34}}}";
+        let result = parse_sse_event(event).expect("message_start should parse");
+        match result {
+            StreamEvent::MessageStart {
+                input_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, 12);
+                assert_eq!(cache_read_tokens, 900);
+                assert_eq!(cache_creation_tokens, 34);
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_event_message_start_without_usage_is_zero() {
+        // Missing usage (or a non-Anthropic shape) must default to zeros, not fail.
+        let event = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}";
+        let result = parse_sse_event(event).expect("message_start should parse");
+        assert!(matches!(
+            result,
+            StreamEvent::MessageStart {
+                input_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                ..
+            }
+        ));
     }
 }

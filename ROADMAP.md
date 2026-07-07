@@ -281,7 +281,8 @@ CDC message-level dedup, per-model stats tracker + persistence + stats-informed 
 - [ ] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
       multipliers (3.5 code / 4 English / 2 CJK); account for per-message framing (~100 tok) and
       truncation-marker text. Current heuristic causes ~20–30% overflow/underutilization.
-- [ ] Streaming cache tracking (`loop_runner.rs:834`) — parse usage from `message_start` for accurate cache stats.
+- [x] Streaming cache tracking (`loop_runner.rs:834`) — parse usage from `message_start` for accurate cache stats.
+      *(2026-07-06) `StreamEvent::MessageStart` now carries `input_tokens`/`cache_read_tokens`/`cache_creation_tokens` (parsed from the Anthropic `message_start` usage object; zero for providers that don't report it); the streaming loop captures them into `LlmResult` instead of the old `input_tokens: 100` + zero-cache placeholders. 2 tests on `parse_sse_event` (with/without usage).*
 
 ### P11 — Correctness, Security & Architecture Debt 🚧 (new — cross-cutting)
 Concrete, actionable items with `file:line` anchors. **This is the near-term backlog the daily
