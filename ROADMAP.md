@@ -344,6 +344,16 @@ consumer GPU** as the default, first-class inference backend — no Ollama, no c
 local model runs the whole agent loop. Blueprint proven in `physics515/laurelane` (Burn 0.21, from-scratch
 Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 
+> **Runner extracted → [`physics515/Mummu`](https://github.com/physics515/Mummu).** The generic Burn
+> runner (dual wgpu+ndarray backend, from-scratch Qwen2.5/LFM2.5/MiniLM, safetensors weight loading, KV
+> cache, on-GPU argmax, streaming, f16, parity gate, model management) now lives in the shared **Mummu**
+> repo, which Laurelane and Nanna both consume — **runner increments land in Mummu, not here.**
+> `nanna-infer` becomes a **thin consumer**: this phase now tracks only the Nanna-side integration —
+> wire Mummu as `Provider::Local` (the top-priority tier in the P10 router), stream its tokens to
+> channels + Tauri, and back the memory `embed_fn` + dreaming `summarize_fn` with Mummu embeddings. The
+> generic runner items below are the **Mummu contract** (built + tracked there); keep them here only as
+> the integration checklist.
+
 - [ ] **Crate `nanna-infer` on Burn** — `burn = { version = "0.21", default-features = false, features = ["std","ndarray","wgpu","fusion","autotune","store"] }`. Model code generic over `B: Backend`.
       - [ ] *(research 2026-07-06)* Latest **stable Burn is 0.20** (released 2026-01-15), which adds **CubeK** — high-perf multi-platform kernels via CubeCL (CUDA/ROCm/Metal/WebGPU/Vulkan). Confirm `0.21` exists on crates.io / matches laurelane before pinning; else pin `0.20` + adopt CubeK. Sources: [phoronix](https://www.phoronix.com/news/Burn-0.20-Released), [tracel-ai/burn](https://github.com/tracel-ai/burn).
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
