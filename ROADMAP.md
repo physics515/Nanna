@@ -388,7 +388,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [ ] **Single-GPU DSP kernels** — implement FFT/wavelet/convolution as wgpu compute shaders in `nanna-gpu` (alongside `CosineSimilaritySearch`), with a CPU fallback in `nanna-simd`. No external DSP service.
 - [ ] **Decision — Turso-only vs DSP `.dspseg`:** DSP normally keeps measurements in `.dspseg` files *outside* libSQL. To stay Turso-only, lift DSP's *pure algorithms* (`simplify_with_aggressiveness`, `splimes`) and store reduced points in Turso BLOBs, rather than depending on DSP's `SegmentStore`/`Database`. (Revisit if the timeline outgrows Turso.)
 - [ ] **Make it demoable** — GUI dream-log + a salience **spectrogram/waterfall** over time (consolidation lineage `consolidated_from`/`generation` already exists). This is the "unique sauce" screen.
-- [ ] Also from backlog: HNSW persistent vector index (avoid full `bulk_load` into RAM); emotional valence; memory-graph edges; dedup-before-store; extraction filtering (<50 chars).
+- [ ] Also from backlog: HNSW persistent vector index (avoid full `bulk_load` into RAM); emotional valence; memory-graph edges; dedup-before-store; ~~extraction filtering (<50 chars)~~ **(done 2026-07-06 — `is_storable_memory` drops sub-50-char extractions in `loop_runner::extract_memories`; 2 tests)**.
 
 ---
 
