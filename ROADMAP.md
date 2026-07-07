@@ -423,8 +423,11 @@ keep the phases readable; promote individual items into a phase when they become
 - **Memory:** HNSW/IVF indexing for large stores; persistent vector index (Turso, avoid full reload);
   f16 embedding compression + GC via "dreaming"; memory graphs (relationships); emotional valence;
   importance decay; active forgetting; narratives; per-query similarity threshold; export/import to
-  Markdown; embedding-dimension migration + re-embed on provider change; extraction filtering (<50 chars);
-  dedup-before-storage; background consolidation with progress events; memory categories/tags.
+  Markdown; embedding-dimension migration + re-embed on provider change; ~~extraction filtering~~ /
+  ~~dedup-before-storage~~ **(2026-07-07: `filter_extracted_memories` drops empty/whitespace + exact
+  dupes within an extraction batch, order-preserving; deliberately NO length threshold so short facts
+  survive — cross-batch dedup stays with `smart_ingest` similarity bands)**; background consolidation with
+  progress events; memory categories/tags.
 - **LLM providers:** add Google Gemini, Mistral, Grok (xAI); custom OpenAI-compatible endpoints; model
   capability matrix (skip incompatible models in fallback); model-discovery cache (5-min TTL); typed
   errors instead of string matching; respect `retry-after` headers; OAuth refresh retry; provider

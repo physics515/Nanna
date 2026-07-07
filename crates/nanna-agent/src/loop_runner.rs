@@ -2751,13 +2751,7 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
 
                 match serde_json::from_str::<Vec<ExtractedMemoryRaw>>(json_str) {
                     Ok(parsed) => {
-                        for raw in parsed {
-                            memories.push(ExtractedMemory {
-                                content: raw.content,
-                                category: raw.category,
-                                tags: None,
-                            });
-                        }
+                        memories.extend(filter_extracted_memories(parsed));
                     }
                     Err(e) => {
                         warn!("Memory extraction JSON parse failed: {} — raw response: {}", e, &json_str[..json_str.len().min(200)]);
@@ -2769,6 +2763,38 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
         info!("Extracted {} memories from conversation", memories.len());
         Ok(memories)
     }
+}
+
+/// Filter raw extraction results before storing: drop empty/whitespace-only
+/// fragments and exact duplicates within the batch (case-insensitive, trimmed),
+/// preserving first-seen order.
+///
+/// A length threshold is deliberately NOT applied — short facts ("User's name is
+/// Bob") are exactly what a personal memory must keep. Cross-batch dedup against
+/// existing memories happens downstream via `smart_ingest`'s similarity bands.
+fn filter_extracted_memories(raw: Vec<ExtractedMemoryRaw>) -> Vec<ExtractedMemory> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        let content = r.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        // Dedup on a normalized key, but store the original trimmed content.
+        if !seen.insert(content.to_lowercase()) {
+            continue;
+        }
+        out.push(ExtractedMemory {
+            content: content.to_string(),
+            category: r.category,
+            tags: None,
+        });
+    }
+    debug_assert!(
+        out.len() <= seen.len(),
+        "kept more memories than unique keys"
+    );
+    out
 }
 
 /// A memory extracted from conversation
@@ -2931,4 +2957,44 @@ fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 /// Check if a tool name is a write-type tool whose content should be stripped from context.
 fn is_write_tool(name: &str) -> bool {
     matches!(name, "write_file" | "write" | "Write" | "create_tool")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(content: &str) -> ExtractedMemoryRaw {
+        ExtractedMemoryRaw {
+            content: content.to_string(),
+            category: "fact".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_filter_extracted_memories_drops_empty_and_dupes() {
+        let input = vec![
+            raw("User's name is Bob"),     // short but meaningful — kept
+            raw("  "),                     // whitespace-only — dropped
+            raw(""),                       // empty — dropped
+            raw("user's name is bob"),     // case-insensitive dup of #1 — dropped
+            raw("  User's name is Bob  "), // trimmed dup of #1 — dropped
+            raw("Bob likes coffee"),       // distinct — kept
+        ];
+
+        let out = filter_extracted_memories(input);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "User's name is Bob");
+        assert_eq!(out[1].content, "Bob likes coffee");
+        // Trimming is applied to stored content.
+        assert!(!out[0].content.starts_with(' '));
+    }
+
+    #[test]
+    fn test_filter_extracted_memories_preserves_order_and_empty_input() {
+        assert!(filter_extracted_memories(Vec::new()).is_empty());
+
+        let out = filter_extracted_memories(vec![raw("first"), raw("second"), raw("third")]);
+        let contents: Vec<&str> = out.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["first", "second", "third"]);
+    }
 }
