@@ -1374,6 +1374,10 @@ impl Agent {
         let mut response_text = String::new();
         let mut content_blocks = Vec::new();
         let mut output_tokens = 0u32;
+        // Prompt-side usage arrives in the `message_start` event (Anthropic).
+        let mut input_tokens = 0u32;
+        let mut cache_read_tokens = 0u32;
+        let mut cache_creation_tokens = 0u32;
         let mut pending_error_tool_results: Vec<ContentBlock> = Vec::new();
 
         let mut current_tool_id = String::new();
@@ -1569,21 +1573,29 @@ impl Agent {
                 StreamEvent::SignatureDelta { signature, .. } => {
                     current_thinking_signature.push_str(&signature);
                 }
+                StreamEvent::MessageStart {
+                    input_tokens: msg_input,
+                    cache_read_tokens: msg_cache_read,
+                    cache_creation_tokens: msg_cache_creation,
+                    ..
+                } => {
+                    // Prompt-side usage (incl. cache hits/writes) is reported here.
+                    input_tokens = msg_input;
+                    cache_read_tokens = msg_cache_read;
+                    cache_creation_tokens = msg_cache_creation;
+                }
                 _ => {}
             }
         }
 
-        // Note: streaming doesn't easily provide cache token breakdowns
-        // (they come in message_start which we currently parse as MessageStart{id, model}).
-        // TODO: Parse usage from message_start event for accurate cache tracking in streaming mode.
         Ok(LlmResult {
             text: response_text,
             tool_uses,
             content_blocks,
-            input_tokens: 100, // Placeholder for streaming
+            input_tokens,
             output_tokens,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
+            cache_read_tokens,
+            cache_creation_tokens,
             error_tool_results: pending_error_tool_results,
         })
     }
