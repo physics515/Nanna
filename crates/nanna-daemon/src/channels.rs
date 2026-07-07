@@ -10,7 +10,6 @@ use nanna_channels::{
     TelegramListener,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
@@ -60,8 +59,6 @@ pub struct ChannelManager {
     router: Arc<RwLock<MessageRouter>>,
     /// Control plane reference for processing messages
     control: Arc<ControlPlane>,
-    /// Map of channel IDs to session IDs
-    channel_sessions: RwLock<HashMap<String, String>>,
     /// Shutdown signal
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
@@ -73,7 +70,6 @@ impl ChannelManager {
             listener_manager: RwLock::new(ListenerManager::new(1000)),
             router: Arc::new(RwLock::new(MessageRouter::new())),
             control,
-            channel_sessions: RwLock::new(HashMap::new()),
             shutdown_tx: None,
         }
     }

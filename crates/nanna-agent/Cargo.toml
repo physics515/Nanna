@@ -18,6 +18,8 @@ async-trait.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+base64 = "0.22"
 nanna-storage = { path = "../nanna-storage" }
 
 nanna-llm = { path = "../nanna-llm" }

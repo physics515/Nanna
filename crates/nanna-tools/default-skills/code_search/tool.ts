@@ -1,5 +1,7 @@
 export default {
   name: "code_search",
+  version: "0.1.0",
+  output: "context",
   description: "Search for a pattern across files in a directory. Returns matching lines with context. Supports regex patterns and file type filtering.",
   parameters: {
     type: "object",

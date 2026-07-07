@@ -42,6 +42,9 @@ mod boa_impl;
 #[cfg(feature = "deno")]
 mod deno_impl;
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub use engine::{ScriptEngine, EngineKind, ExecutionResult};
 pub use tool::{ScriptedTool, ToolManifest, ToolPermissions, OutputTarget, extract_manifest};
 pub use bridge::{NannaBridge, ServiceFn};

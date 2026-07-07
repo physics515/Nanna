@@ -12,8 +12,18 @@ use std::time::Duration;
 // use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
+
+/// Maximum WebSocket message size (128 MB) — must match the daemon's limit.
+const WS_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+
+fn ws_config() -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
+    config.max_frame_size = Some(WS_MAX_MESSAGE_SIZE);
+    config
+}
 
 /// Health-check polling constants for long-running requests
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -114,8 +124,8 @@ pub enum DaemonEvent {
     MessageEnd { session_id: String, message_id: String, content: String },
     ThinkingDelta { session_id: String, delta: String },
     ModelSwitch { model: String, reason: Option<String> },
-    ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value> },
-    ToolEnd { session_id: String, call_id: String, output: String, success: bool, #[serde(default)] duration_ms: Option<u64> },
+    ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value>, #[serde(default)] model: Option<String> },
+    ToolEnd { session_id: String, call_id: String, output: String, success: bool, #[serde(default)] duration_ms: Option<u64>, #[serde(default)] data: Option<serde_json::Value> },
     Error { code: String, message: String },
     Connected { client_id: String },
     Disconnected { client_id: String },
@@ -163,7 +173,7 @@ impl DaemonClient {
         
         info!("Attempting to connect to daemon at {}", self.config.url);
         
-        let connect_future = connect_async(&self.config.url);
+        let connect_future = connect_async_with_config(&self.config.url, Some(ws_config()), false);
         
         match tokio::time::timeout(self.config.connect_timeout, connect_future).await {
             Ok(Ok((ws, _))) => {
@@ -346,7 +356,7 @@ impl DaemonClient {
                 info!("Reconnection attempt {}/{}", attempt, max_attempts);
 
                 // Try to connect
-                let connect_future = connect_async(&config.url);
+                let connect_future = connect_async_with_config(&config.url, Some(ws_config()), false);
                 match tokio::time::timeout(config.connect_timeout, connect_future).await {
                     Ok(Ok((ws, _))) => {
                         info!("Reconnected to daemon successfully");

@@ -461,7 +461,12 @@ pub enum ContentBlock {
     ToolUse { id: String, name: String, input: serde_json::Value },
     ToolResult { tool_use_id: String, content: String, #[serde(skip_serializing_if = "Option::is_none")] is_error: Option<bool> },
     /// Extended thinking content (reasoning)
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        /// Signature returned by Anthropic — MUST be sent back in multi-turn conversations.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 /// Image source for vision API
@@ -552,6 +557,8 @@ pub struct CompletionRequest {
     /// Context window limit (for Ollama num_ctx). If set, limits the context
     /// window to reduce VRAM usage and allow more model layers on GPU.
     pub context_limit: Option<u32>,
+    /// Extended thinking configuration (passed through to Anthropic API)
+    pub thinking: Option<ThinkingConfig>,
 }
 
 impl Default for CompletionRequest {
@@ -565,11 +572,19 @@ impl Default for CompletionRequest {
             stream: false,
             tools: Vec::new(),
             context_limit: None,
+            thinking: None,
         }
     }
 }
 
 impl CompletionRequest {
+    /// Set extended thinking configuration
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
     /// Add tools to the request (Anthropic format)
     #[must_use]
     pub fn with_tools(mut self, tools: Vec<serde_json::Value>) -> Self {
@@ -1747,7 +1762,7 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
                     // Images are ~1000 tokens for small, more for large
                     total += 1000;
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     total += estimate_tokens(thinking);
                 }
             }
@@ -2207,6 +2222,8 @@ pub enum StreamEvent {
     TextDelta { index: usize, text: String },
     /// Thinking/reasoning delta (extended thinking mode)
     ThinkingDelta { index: usize, thinking: String },
+    /// Signature delta for a thinking block (must be accumulated and sent back to Anthropic)
+    SignatureDelta { index: usize, signature: String },
     /// Tool use delta (JSON fragment)
     ToolUseDelta { index: usize, partial_json: String },
     /// Content block finished
@@ -2246,6 +2263,8 @@ pub struct StreamAccumulator {
     pub text: String,
     /// Thinking/reasoning content accumulated so far
     pub thinking: String,
+    /// Accumulated signature for the thinking block (required by Anthropic in multi-turn)
+    pub thinking_signature: String,
     /// Tool calls in progress: (index, id, name, partial_json)
     pub tool_calls: Vec<(usize, String, String, String)>,
 }
@@ -2265,6 +2284,9 @@ impl StreamAccumulator {
             }
             StreamEvent::ThinkingDelta { thinking, .. } => {
                 self.thinking.push_str(thinking);
+            }
+            StreamEvent::SignatureDelta { signature, .. } => {
+                self.thinking_signature.push_str(signature);
             }
             StreamEvent::ContentBlockStart { index, content_type, tool_id, tool_name } => {
                 if content_type == "tool_use" {
@@ -2333,7 +2355,9 @@ enum DeltaData {
     TextDelta { text: String },
     ThinkingDelta { thinking: String },
     InputJsonDelta { partial_json: String },
-    /// Catch-all for unknown delta types (e.g. `signature_delta`) so the
+    /// Signature delta for thinking blocks (must be accumulated and sent back)
+    SignatureDelta { signature: String },
+    /// Catch-all for unknown delta types so the
     /// surrounding `ContentBlockDelta` event still deserializes successfully.
     #[serde(other)]
     Unknown,
@@ -3334,11 +3358,11 @@ impl LlmClient {
                         model: request.model.clone(),
                         messages: all_messages,
                         max_tokens: request.max_tokens.unwrap_or(4096),
-                        temperature: request.temperature,
+                        temperature: if request.thinking.is_some() { None } else { request.temperature },
                         system: system_msg,
                         tools,
                         stream: Some(true),
-                        thinking: None,
+                        thinking: request.thinking.clone(),
                         cache_control: None,
                     };
 
@@ -3427,7 +3451,7 @@ impl LlmClient {
                         system: system_msg,
                         tools,
                         stream: Some(true),
-                        thinking: None,
+                        thinking: request.thinking.clone(),
                         cache_control: None,
                     };
 
@@ -3685,7 +3709,7 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
     // into a `thinking` field when `think: true` is set in the request)
     if let Some(thinking) = message["thinking"].as_str() {
         if !thinking.is_empty() {
-            content.push(ContentBlock::Thinking { thinking: thinking.to_string() });
+            content.push(ContentBlock::Thinking { thinking: thinking.to_string(), signature: None });
         }
     }
 
@@ -3696,7 +3720,7 @@ fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
         if !content.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
             if let Some(thinking) = extract_think_content(raw_text) {
                 if !thinking.is_empty() {
-                    content.push(ContentBlock::Thinking { thinking });
+                    content.push(ContentBlock::Thinking { thinking, signature: None });
                 }
             }
         }
@@ -3789,6 +3813,9 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
             DeltaData::InputJsonDelta { partial_json } => {
                 Some(StreamEvent::ToolUseDelta { index, partial_json })
             }
+            DeltaData::SignatureDelta { signature } => {
+                Some(StreamEvent::SignatureDelta { index, signature })
+            }
             DeltaData::Unknown => {
                 debug!(index, "Ignoring unknown content_block_delta type");
                 None
@@ -3836,10 +3863,21 @@ mod tests {
 
     #[test]
     fn test_delta_data_unknown_variant() {
-        // Unknown delta types (e.g. signature_delta) should deserialize to Unknown
-        let json = r#"{"type": "signature_delta", "signature": "abc123"}"#;
+        // Truly unknown delta types should deserialize to Unknown
+        let json = r#"{"type": "some_future_delta", "data": "xyz"}"#;
         let delta: DeltaData = serde_json::from_str(json).unwrap();
         assert!(matches!(delta, DeltaData::Unknown));
+    }
+
+    #[test]
+    fn test_delta_data_signature_variant() {
+        // signature_delta should now be recognized (required for multi-turn thinking)
+        let json = r#"{"type": "signature_delta", "signature": "abc123"}"#;
+        let delta: DeltaData = serde_json::from_str(json).unwrap();
+        assert!(matches!(delta, DeltaData::SignatureDelta { .. }));
+        if let DeltaData::SignatureDelta { signature } = delta {
+            assert_eq!(signature, "abc123");
+        }
     }
 
     #[test]
@@ -3854,13 +3892,27 @@ mod tests {
     }
 
     #[test]
-    fn test_content_block_delta_with_unknown_delta() {
-        // A ContentBlockDelta with an unknown inner delta type should still parse
+    fn test_content_block_delta_with_signature_delta() {
+        // signature_delta should parse as SignatureDelta now
         let json = r#"{"type": "content_block_delta", "index": 1, "delta": {"type": "signature_delta", "signature": "sig"}}"#;
         let sse: AnthropicSSE = serde_json::from_str(json).unwrap();
         match sse {
             AnthropicSSE::ContentBlockDelta { index, delta } => {
                 assert_eq!(index, 1);
+                assert!(matches!(delta, DeltaData::SignatureDelta { .. }));
+            }
+            other => panic!("Expected ContentBlockDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_content_block_delta_with_unknown_delta() {
+        // Truly unknown delta types should still parse via Unknown fallback
+        let json = r#"{"type": "content_block_delta", "index": 2, "delta": {"type": "future_delta_type"}}"#;
+        let sse: AnthropicSSE = serde_json::from_str(json).unwrap();
+        match sse {
+            AnthropicSSE::ContentBlockDelta { index, delta } => {
+                assert_eq!(index, 2);
                 assert!(matches!(delta, DeltaData::Unknown));
             }
             other => panic!("Expected ContentBlockDelta, got {:?}", other),
@@ -3868,10 +3920,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sse_event_unknown_delta() {
+    fn test_parse_sse_event_signature_delta() {
         let event = "data: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"signature_delta\", \"signature\": \"abc\"}}";
-        // Should return None (unknown delta filtered out) instead of failing
+        // Should now return a SignatureDelta event
         let result = parse_sse_event(event);
-        assert!(result.is_none());
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), StreamEvent::SignatureDelta { index: 0, .. }));
     }
 }

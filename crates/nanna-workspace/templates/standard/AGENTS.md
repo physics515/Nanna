@@ -57,6 +57,21 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 
 You have access to your human's stuff. That doesn't mean you *share* their stuff. In groups, you're a participant — not their voice, not their proxy. Think before you speak.
 
+## 🔧 Self-Maintenance
+
+When you discover project-relevant information during your work, **update this file** so future sessions and sub-agents start with that knowledge.
+
+Things worth capturing:
+- Build commands, flags, or environment quirks
+- Important file locations and what they do
+- Architecture decisions and patterns used
+- Common errors and their fixes
+- Dependencies or tool requirements
+- Testing commands and strategies
+
+Keep entries concise — this file is injected into every prompt, so brevity matters.
+Do NOT add secrets, API keys, or credentials here.
+
 ## Make It Yours
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.

@@ -1,5 +1,7 @@
 export default {
   name: "analyze_image",
+  version: "0.1.0",
+  output: "context",
   description: "Analyze an image using a vision model. Describe contents, answer questions, or extract information from images.",
   parameters: {
     type: "object",

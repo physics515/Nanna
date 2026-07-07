@@ -1,5 +1,7 @@
 export default {
   name: "list_dir",
+  version: "0.1.0",
+  output: "context",
   description: "List files and directories in a path. Supports recursive listing.",
   parameters: {
     type: "object",
@@ -7,11 +9,10 @@ export default {
       path: { type: "string", description: "Directory path to list" },
       recursive: { type: "boolean", description: "List recursively. Default: false" }
     },
-    required: ["path"]
+    required: []
   },
   execute: function(input) {
-    var dirPath = input.path || input.dir || input.directory || input.file_path || input.filePath;
-    if (!dirPath) throw "Missing required parameter: path";
+    var dirPath = input.path || input.dir || input.directory || input.file_path || input.filePath || ".";
     var entries = Nanna.listDir(dirPath, input.recursive || false);
 
     if (entries.length === 0) {

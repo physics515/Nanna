@@ -110,6 +110,12 @@ This is a code project workspace. Focus on:
 - Always run tests before claiming success
 - Ask before major refactors
 - Prefer safe operations (trash over rm)
+
+## Self-Maintenance
+When you discover project-relevant information during your work, **update this file** so future sessions and sub-agents start with that knowledge.
+
+Capture: build commands, file locations, architecture, common errors/fixes, dependencies, testing strategies.
+Keep it concise — this file is injected into every prompt.
 "#
             .to_string(),
         );
@@ -142,6 +148,10 @@ You are a capable software engineer. You:
 
 ## Notes
 (Add project-specific notes)
+
+## Self-Maintenance
+When you discover environment-specific details during your work, **update this file**.
+Capture: host names, paths, device names, CLI flags, service URLs, config quirks.
 "#
             .to_string(),
         );

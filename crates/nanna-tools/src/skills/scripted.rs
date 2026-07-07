@@ -181,9 +181,20 @@ impl Tool for ScriptedToolWrapper {
             None
         };
 
+        // Read session ID from registry
+        let session_id = if let Some(ref weak) = self.registry {
+            if let Some(registry) = weak.upgrade() {
+                registry.session_id().await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let input = Value::Object(params.into_iter().collect());
 
-        let result = self.engine.execute_with_workdir(&self.tool, input, tool_defs, self.services.clone(), default_workdir).await.map_err(|e| {
+        let result = self.engine.execute_with_workdir_and_session(&self.tool, input, tool_defs, self.services.clone(), default_workdir, session_id).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
 
@@ -195,7 +206,7 @@ impl Tool for ScriptedToolWrapper {
             "Script executed"
         );
 
-        // Check for structured result: { content: "...", data: {...} }
+        // Check for structured result: { content: "...", success: bool, data: {...} }
         if let Value::Object(ref obj) = result.value {
             if let Some(content_val) = obj.get("content") {
                 let content = match content_val {
@@ -203,7 +214,15 @@ impl Tool for ScriptedToolWrapper {
                     Value::Null => String::new(),
                     other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
                 };
-                let mut tool_result = ToolResult::success(content);
+                // Respect explicit success field if present
+                let is_success = obj.get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or_else(|| !content.starts_with("Error:"));
+                let mut tool_result = if is_success {
+                    ToolResult::success(content)
+                } else {
+                    ToolResult::error(content)
+                };
                 if let Some(data) = obj.get("data") {
                     tool_result = tool_result.with_data(data.clone());
                 }
@@ -213,12 +232,17 @@ impl Tool for ScriptedToolWrapper {
 
         // Fallback: plain string/null/other
         let content = match result.value {
-            Value::String(s) => s,
+            Value::String(ref s) => s.clone(),
             Value::Null => String::new(),
-            other => serde_json::to_string_pretty(&other).unwrap_or_else(|_| other.to_string()),
+            ref other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
         };
 
-        Ok(ToolResult::success(content))
+        // Detect error strings from tools that return plain strings
+        if content.starts_with("Error:") {
+            Ok(ToolResult::error(content))
+        } else {
+            Ok(ToolResult::success(content))
+        }
     }
 
     fn output_target(&self) -> OutputTarget {

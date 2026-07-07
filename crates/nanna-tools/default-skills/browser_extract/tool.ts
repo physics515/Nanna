@@ -1,5 +1,7 @@
 export default {
   name: "browser_extract",
+  version: "0.1.0",
+  output: "context",
   description: "Extract structured data from a web page using CSS selectors or by rendering JavaScript-heavy pages.",
   parameters: {
     type: "object",

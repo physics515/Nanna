@@ -1,5 +1,7 @@
 export default {
   name: "read_pdf",
+  version: "0.1.0",
+  output: "context",
   description: "Extract text from a PDF file. Returns the text content of the document.",
   parameters: {
     type: "object",

@@ -112,6 +112,8 @@ pub struct SpawnResult {
     pub input_tokens: u32,
     /// Output tokens consumed
     pub output_tokens: u32,
+    /// Model used for the sub-agent
+    pub model: String,
 }
 
 /// Trait for spawning sub-agents. Implemented in the daemon where Agent is available.
@@ -119,12 +121,27 @@ pub struct SpawnResult {
 #[async_trait]
 pub trait AgentSpawner: Send + Sync {
     /// Spawn a sub-agent with the given prompt and constraints.
+    /// `max_iterations`: None = unlimited (agent stops when done).
     async fn spawn(
         &self,
         prompt: &str,
         description: &str,
-        max_iterations: usize,
+        max_iterations: Option<usize>,
     ) -> Result<SpawnResult, String>;
+}
+
+/// Trait for sub-agent ↔ parent communication. Implemented in the daemon.
+/// Allows sub-agents to ask questions to their parent and receive answers.
+#[async_trait]
+pub trait ParentChannel: Send + Sync {
+    /// Send a question to the parent agent and wait for a reply.
+    /// Returns the parent's response, or an error on timeout/failure.
+    async fn ask_parent(
+        &self,
+        sub_session_id: &str,
+        question: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String>;
 }
 
 /// Helper for creating tool results

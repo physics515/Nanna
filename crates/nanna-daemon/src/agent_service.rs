@@ -9,7 +9,7 @@ use nanna_agent::{Agent, AgentConfig, ModelTier, RunOptions, ThinkingMode};
 use nanna_llm::{AnthropicMessage, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
 use nanna_tools::ToolRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -87,6 +87,8 @@ struct ActiveChat {
     started_at: chrono::DateTime<chrono::Utc>,
     /// Accumulated streamed text (shared with on_text callback)
     accumulated_text: Arc<tokio::sync::RwLock<String>>,
+    /// Accumulated thinking/reasoning text (shared with on_thinking callback)
+    accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
     /// Tool calls currently in progress
     active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
     /// Tool calls completed during this run (before final message)
@@ -102,7 +104,7 @@ pub struct ActiveToolCallInfo {
 }
 
 /// Info about a tool call that completed during the current run
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletedToolCallInfo {
     pub call_id: String,
     pub name: String,
@@ -116,6 +118,7 @@ pub struct CompletedToolCallInfo {
 pub struct RunStateSnapshot {
     pub is_running: bool,
     pub accumulated_text: String,
+    pub accumulated_thinking: String,
     pub active_tool_calls: Vec<ActiveToolCallInfo>,
     pub completed_tool_calls: Vec<CompletedToolCallInfo>,
     pub started_at: Option<String>,
@@ -143,9 +146,13 @@ pub struct AgentService {
     current_model_info: Arc<RwLock<Option<ModelInfo>>>,
     /// Per-session message queues for serialized chat processing
     session_queues: Arc<RwLock<HashMap<String, Arc<SessionQueue>>>>,
+    /// Directory for per-iteration checkpoint files (legacy, kept for migration)
+    checkpoint_dir: std::path::PathBuf,
     /// Shared session history for the `session.history` tool service.
     /// Populated before each agent run with the current session's messages.
     session_history: Option<crate::server::SharedSessionHistory>,
+    /// Database storage for checkpoint persistence
+    storage: Option<Arc<nanna_storage::Storage>>,
 }
 
 impl AgentService {
@@ -157,10 +164,30 @@ impl AgentService {
         memory: Option<Arc<MemoryService>>,
         event_tx: broadcast::Sender<Event>,
     ) -> Self {
+        Self::with_data_dir(config, router, tools, memory, event_tx, None)
+    }
+
+    /// Create a new agent service with a specific data directory for checkpoints.
+    pub fn with_data_dir(
+        config: AgentServiceConfig,
+        router: Arc<LlmRouter>,
+        tools: Arc<ToolRegistry>,
+        memory: Option<Arc<MemoryService>>,
+        event_tx: broadcast::Sender<Event>,
+        data_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         // Initialize model info cache in default location
         let model_cache = ModelInfoCache::default_location();
         if model_cache.is_none() {
             warn!("Could not determine cache directory for model info");
+        }
+
+        // Set up checkpoint directory
+        let checkpoint_dir = data_dir
+            .unwrap_or_else(|| std::env::temp_dir())
+            .join("checkpoints");
+        if let Err(e) = std::fs::create_dir_all(&checkpoint_dir) {
+            warn!("Failed to create checkpoint directory {:?}: {}", checkpoint_dir, e);
         }
 
         Self {
@@ -173,8 +200,16 @@ impl AgentService {
             _model_cache: model_cache,
             current_model_info: Arc::new(RwLock::new(None)),
             session_queues: Arc::new(RwLock::new(HashMap::new())),
+            checkpoint_dir,
             session_history: None,
+            storage: None,
         }
+    }
+
+    /// Set the database storage for checkpoint persistence.
+    pub fn with_storage(mut self, storage: Arc<nanna_storage::Storage>) -> Self {
+        self.storage = Some(storage);
+        self
     }
 
     /// Set the shared session history for the `session.history` tool service.
@@ -303,8 +338,8 @@ impl AgentService {
         message: &str,
         system_prompt: Option<String>,
         history: &[SessionMessage],
-    ) -> Result<ChatResult, String> {
-        self.chat_with_options(session_id, message, system_prompt, history, None, None, None, vec![]).await
+    ) -> Result<ChatResult, ChatError> {
+        self.chat_with_options(session_id, message, system_prompt, history, None, None, None, vec![], false).await
     }
 
     /// Chat with workspace scope for memory extraction
@@ -316,8 +351,8 @@ impl AgentService {
         history: &[SessionMessage],
         workspace_id: Option<String>,
         attachments: Vec<(String, String)>,
-    ) -> Result<ChatResult, String> {
-        self.chat_with_options(session_id, message, system_prompt, history, None, None, workspace_id, attachments).await
+    ) -> Result<ChatResult, ChatError> {
+        self.chat_with_options(session_id, message, system_prompt, history, None, None, workspace_id, attachments, false).await
     }
 
     /// Chat with optional model and max_iterations overrides (used by sub-sessions).
@@ -331,7 +366,8 @@ impl AgentService {
         max_iterations_override: Option<usize>,
         workspace_id: Option<String>,
         attachments: Vec<(String, String)>,
-    ) -> Result<ChatResult, String> {
+        is_sub_agent: bool,
+    ) -> Result<ChatResult, ChatError> {
         // Acquire per-session queue slot (FIFO ordering via tokio Mutex)
         let queue = self.get_or_create_queue(session_id).await;
         queue.depth.fetch_add(1, Ordering::Relaxed);
@@ -342,6 +378,7 @@ impl AgentService {
 
         // Create shared state buffers for run state tracking
         let accumulated = Arc::new(tokio::sync::RwLock::new(String::new()));
+        let accumulated_thinking = Arc::new(tokio::sync::RwLock::new(String::new()));
         let active_tools = Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new()));
         let completed_tools = Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new()));
         let cancellation_flag = Arc::new(AtomicBool::new(false));
@@ -355,6 +392,7 @@ impl AgentService {
                 cancellation_flag: cancellation_flag.clone(),
                 started_at: chrono::Utc::now(),
                 accumulated_text: accumulated.clone(),
+                accumulated_thinking: accumulated_thinking.clone(),
                 active_tool_calls: active_tools.clone(),
                 completed_tool_calls: completed_tools.clone(),
             });
@@ -396,8 +434,18 @@ impl AgentService {
 
         let mut last_error = String::from("No models available");
         let mut tried_models = Vec::new();
+        let mut rate_limited_providers = HashSet::new();
 
         for model in &models_to_try {
+            // Skip models whose provider was already rate-limited (shared bucket).
+            // e.g., if Opus was rate-limited, skip Haiku (both Anthropic).
+            let provider = crate::llm_router::ProviderId::from_model(model);
+            if rate_limited_providers.contains(&provider) {
+                info!("Skipping {} — provider {:?} is rate-limited", model, provider);
+                tried_models.push(format!("{} (skipped: provider rate-limited)", model));
+                continue;
+            }
+
             tried_models.push(model.clone());
             info!("Trying model: {} (attempt {})", model, tried_models.len());
 
@@ -492,13 +540,20 @@ impl AgentService {
                         delta: chunk.to_string(),
                     });
                 })),
-                on_thinking: Some(Box::new(move |chunk: &str| {
-                    let _ = event_tx_thinking.send(Event::ThinkingDelta {
-                        session_id: session_id_thinking.clone(),
-                        delta: chunk.to_string(),
-                    });
+                on_thinking: Some(Box::new({
+                    let accumulated_thinking = accumulated_thinking.clone();
+                    move |chunk: &str| {
+                        // Accumulate thinking for run state recovery
+                        if let Ok(mut buf) = accumulated_thinking.try_write() {
+                            buf.push_str(chunk);
+                        }
+                        let _ = event_tx_thinking.send(Event::ThinkingDelta {
+                            session_id: session_id_thinking.clone(),
+                            delta: chunk.to_string(),
+                        });
+                    }
                 })),
-                on_tool_start: Some(Box::new(move |call_id: &str, name: &str, input: &serde_json::Value| {
+                on_tool_start: Some(Box::new(move |call_id: &str, name: &str, input: &serde_json::Value, model: Option<&str>| {
                     // Track active tool calls for run state recovery
                     if let Ok(mut tools) = active_tools_for_cb.try_write() {
                         tools.push(ActiveToolCallInfo {
@@ -512,6 +567,7 @@ impl AgentService {
                         call_id: call_id.to_string(),
                         name: name.to_string(),
                         input: input.clone(),
+                        model: model.map(|m| m.to_string()),
                     });
                 })),
                 on_tool_end: {
@@ -519,7 +575,7 @@ impl AgentService {
                     let session_id_tool_end = session_id.to_string();
                     let active_tools_for_end = active_tools.clone();
                     let completed_tools_for_end = completed_tools.clone();
-                    Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64| {
+                    Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64, data: Option<&serde_json::Value>| {
                         // Move from active to completed
                         if let Ok(mut active) = active_tools_for_end.try_write() {
                             active.retain(|t| t.call_id != call_id);
@@ -539,6 +595,7 @@ impl AgentService {
                             output: output.to_string(),
                             success,
                             duration_ms,
+                            data: data.cloned(),
                         });
                     }))
                 },
@@ -615,6 +672,47 @@ impl AgentService {
                 },
                 max_iterations: max_iterations_override,
                 attachments: attachments.clone(),
+                is_sub_agent,
+                all_tools_active: is_sub_agent,
+                on_checkpoint: {
+                    let checkpoint_session_id = session_id.to_string();
+                    let checkpoint_accumulated = accumulated.clone();
+                    let checkpoint_completed = completed_tools.clone();
+                    let checkpoint_storage = self.storage.clone();
+                    Some(Box::new(move |messages: &[nanna_llm::AnthropicMessage], iteration: usize| {
+                        // Snapshot accumulated text + tool calls to a checkpoint.
+                        // This runs synchronously in the agent loop — keep it fast.
+                        let text = checkpoint_accumulated.try_read()
+                            .map(|t| t.clone())
+                            .unwrap_or_default();
+                        let tools: Vec<CompletedToolCallInfo> = checkpoint_completed.try_read()
+                            .map(|t| t.clone())
+                            .unwrap_or_default();
+
+                        let checkpoint = serde_json::json!({
+                            "session_id": checkpoint_session_id,
+                            "iteration": iteration,
+                            "accumulated_text": text,
+                            "tool_calls": tools,
+                            "message_count": messages.len(),
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+
+                        // Write checkpoint to database (best-effort, fire-and-forget)
+                        if let Some(ref storage) = checkpoint_storage {
+                            if let Ok(json) = serde_json::to_string(&checkpoint) {
+                                let storage = storage.clone();
+                                let sid = checkpoint_session_id.clone();
+                                // Spawn async write — sync callback can't await
+                                let _ = tokio::task::spawn(async move {
+                                    if let Err(e) = storage.save_checkpoint(&sid, &json).await {
+                                        tracing::warn!("Failed to save checkpoint: {}", e);
+                                    }
+                                });
+                            }
+                        }
+                    }))
+                },
                 ..Default::default()
             };
 
@@ -641,6 +739,15 @@ impl AgentService {
 
                     info!("Success with model: {}", model);
 
+                    // Clean up checkpoint — run completed successfully
+                    if let Some(ref storage) = self.storage {
+                        let storage = storage.clone();
+                        let sid = session_id.to_string();
+                        tokio::spawn(async move {
+                            let _ = storage.delete_checkpoint(&sid).await;
+                        });
+                    }
+
                     return Ok(ChatResult {
                         message_id,
                         content: response.text,
@@ -655,6 +762,7 @@ impl AgentService {
                         input_tokens: response.input_tokens,
                         output_tokens: response.output_tokens,
                         reasoning: response.reasoning.map(|r| r.content),
+                        partial: false,
                     });
                 }
                 Err(e) => {
@@ -662,17 +770,32 @@ impl AgentService {
                     warn!("Model {} failed: {}", model, error_str);
                     last_error = error_str.clone();
 
-                    // Rate limit? Wait before falling through to next model
+                    // Rate limit? Wait before falling through, and record the
+                    // provider so we can skip other models on the same provider
+                    // (they share the same rate limit bucket).
                     if Self::is_rate_limit_error(&error_str) {
+                        let provider = crate::llm_router::ProviderId::from_model(model);
+                        rate_limited_providers.insert(provider);
                         let retry_secs = Self::parse_retry_after(&error_str).unwrap_or(10);
                         // Cap wait at 60s
                         let wait_secs = retry_secs.min(60);
-                        info!("Rate limited on {}. Waiting {}s before trying next model...", model, wait_secs);
+                        info!("Rate limited on {} (provider {:?}). Waiting {}s before trying next model...", model, provider, wait_secs);
                         let _ = self.event_tx.send(Event::Error {
                             code: "rate_limit".to_string(),
                             message: format!("Rate limited on {}. Waiting {}s...", model, wait_secs),
                         });
                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    }
+
+                    // Context length exceeded? The agent's internal retry already
+                    // tried to truncate. If it still failed, skip to the next model
+                    // but log it clearly — trying a *smaller* model won't help.
+                    if Self::is_context_length_error(&error_str) {
+                        warn!(
+                            "Context length exceeded on {} even after emergency truncation. \
+                             History may be too large for this model's context window.",
+                            model
+                        );
                     }
 
                     // Emit error as a warning so it's visible, but continue trying
@@ -693,12 +816,68 @@ impl AgentService {
         }
         queue.depth.fetch_sub(1, Ordering::Relaxed);
 
+        // Collect any accumulated text from the failed run
+        let partial_text = accumulated.read().await.clone();
+        let partial_thinking = accumulated_thinking.read().await.clone();
+        let completed = completed_tools.read().await.clone();
+
+        let error_msg = format!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error);
+
         // All models failed
         let _ = self.event_tx.send(Event::Error {
             code: "all_models_exhausted".to_string(),
-            message: format!("All models failed. Tried: {:?}. Last error: {}", tried_models, last_error),
+            message: error_msg.clone(),
         });
-        Err(format!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error))
+
+        // If there was accumulated work, return it as a partial result so the caller
+        // can persist it. This prevents losing hours of streamed agent work.
+        let partial_result = if !partial_text.is_empty() || !completed.is_empty() {
+            let tool_records: Vec<ToolCallRecord> = completed.into_iter().map(|tc| ToolCallRecord {
+                id: tc.call_id,
+                name: tc.name,
+                input: serde_json::Value::Null,
+                output: Some(tc.output),
+                success: Some(tc.success),
+                duration_ms: Some(tc.duration_ms),
+            }).collect();
+
+            info!(
+                text_len = partial_text.len(),
+                tool_calls = tool_records.len(),
+                "Preserving partial result from failed run"
+            );
+
+            Some(ChatResult {
+                message_id: message_id.clone(),
+                content: format!(
+                    "{}\n\n---\n⚠️ *This response is incomplete — the run failed after producing the above. Error: {}*",
+                    partial_text, last_error
+                ),
+                tool_calls: tool_records,
+                input_tokens: 0,
+                output_tokens: 0,
+                reasoning: if partial_thinking.is_empty() { None } else { Some(partial_thinking) },
+                partial: true,
+            })
+        } else {
+            None
+        };
+
+        Err(ChatError {
+            message: error_msg,
+            partial_result,
+        })
+    }
+
+    /// Check if an error indicates the context length was exceeded (400-class, not retryable
+    /// on the same model without reducing context).
+    fn is_context_length_error(error: &str) -> bool {
+        let lower = error.to_lowercase();
+        lower.contains("context_length_exceeded")
+            || lower.contains("maximum context length")
+            || lower.contains("reduce the length")
+            || lower.contains("prompt is too long")
+            || lower.contains("too many tokens")
     }
 
     /// Check if an error is a rate-limit / transient overload (may warrant retry with backoff)
@@ -755,6 +934,77 @@ impl AgentService {
         }
     }
     
+    /// Check if a checkpoint exists for a session (indicates a crashed run).
+    /// Note: This only checks legacy file-based checkpoints. DB checkpoints are
+    /// checked at startup via `list_checkpoints()` which is async.
+    pub fn has_checkpoint(&self, session_id: &str) -> bool {
+        // Legacy fallback: check file
+        let path = self.checkpoint_dir.join(format!("checkpoint-{}.json", session_id));
+        path.exists()
+    }
+
+    /// Recover a crashed run from raw checkpoint JSON data (from DB or file).
+    pub fn recover_checkpoint_from_data(&self, data: &str) -> Option<ChatResult> {
+        let checkpoint: serde_json::Value = serde_json::from_str(data).ok()?;
+
+        let text = checkpoint.get("accumulated_text")?.as_str()?.to_string();
+        let iteration = checkpoint.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+        let timestamp = checkpoint.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+        if text.is_empty() {
+            return None;
+        }
+
+        let tool_calls: Vec<ToolCallRecord> = checkpoint.get("tool_calls")
+            .and_then(|v| serde_json::from_value::<Vec<CompletedToolCallInfo>>(v.clone()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc: CompletedToolCallInfo| ToolCallRecord {
+                id: tc.call_id,
+                name: tc.name,
+                input: serde_json::Value::Null,
+                output: Some(tc.output),
+                success: Some(tc.success),
+                duration_ms: Some(tc.duration_ms),
+            })
+            .collect();
+
+        info!(
+            iteration = iteration,
+            text_len = text.len(),
+            tool_calls = tool_calls.len(),
+            checkpoint_time = timestamp,
+            "Recovered checkpoint from crashed run"
+        );
+
+        Some(ChatResult {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            content: format!(
+                "{}\n\n---\n⚠️ *This response was recovered from iteration {} of a crashed run (checkpoint: {}). The run did not complete normally.*",
+                text, iteration, timestamp
+            ),
+            tool_calls,
+            input_tokens: 0,
+            output_tokens: 0,
+            reasoning: None,
+            partial: true,
+        })
+    }
+
+    /// Recover a crashed run from its checkpoint (legacy file-based only).
+    /// DB-based checkpoints are recovered at startup via async code in server.rs.
+    /// Returns the partial content and tool calls, or None if no checkpoint exists.
+    /// The checkpoint file is consumed (deleted) after recovery.
+    pub fn recover_checkpoint(&self, session_id: &str) -> Option<ChatResult> {
+        // Legacy file-based checkpoint
+        let path = self.checkpoint_dir.join(format!("checkpoint-{}.json", session_id));
+        let data = std::fs::read_to_string(&path).ok();
+        if data.is_some() {
+            let _ = std::fs::remove_file(&path);
+        }
+        self.recover_checkpoint_from_data(&data?)
+    }
+
     /// Check if a chat is active
     pub async fn is_active(&self, session_id: &str) -> bool {
         let active = self.active_chats.read().await;
@@ -785,6 +1035,7 @@ impl AgentService {
             Some(chat) => RunStateSnapshot {
                 is_running: true,
                 accumulated_text: chat.accumulated_text.read().await.clone(),
+                accumulated_thinking: chat.accumulated_thinking.read().await.clone(),
                 active_tool_calls: chat.active_tool_calls.read().await.clone(),
                 completed_tool_calls: chat.completed_tool_calls.read().await.clone(),
                 started_at: Some(chat.started_at.to_rfc3339()),
@@ -795,6 +1046,7 @@ impl AgentService {
             None => RunStateSnapshot {
                 is_running: false,
                 accumulated_text: String::new(),
+                accumulated_thinking: String::new(),
                 active_tool_calls: vec![],
                 completed_tool_calls: vec![],
                 started_at: None,
@@ -875,6 +1127,18 @@ pub struct ChatResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub reasoning: Option<String>,
+    /// If true, this result is partial (the run failed but work was done).
+    /// The caller should still persist the content to avoid losing streamed work.
+    pub partial: bool,
+}
+
+/// Error from a chat completion that includes any partial work done before failure.
+#[derive(Debug, Clone)]
+pub struct ChatError {
+    pub message: String,
+    /// Partial result with accumulated text from the failed run (if any work was done).
+    /// Callers should persist this to avoid losing streamed work.
+    pub partial_result: Option<ChatResult>,
 }
 
 /// Memory context for injection

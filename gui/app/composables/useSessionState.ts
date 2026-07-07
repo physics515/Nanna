@@ -18,6 +18,8 @@ interface ToolCallInfo {
   success: boolean
   duration_ms: number
   status?: 'started' | 'completed' | 'error'
+  model?: string
+  data?: Record<string, any>
 }
 
 interface QueuedMessage {

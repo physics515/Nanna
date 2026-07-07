@@ -1,5 +1,7 @@
 export default {
   name: "describe_image",
+  version: "0.1.0",
+  output: "context",
   description: "Get a concise description of an image. Useful for accessibility, captioning, or quick understanding of visual content.",
   parameters: {
     type: "object",

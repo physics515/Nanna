@@ -1,5 +1,6 @@
 //! Built-in tools
 
+mod ask_parent;
 mod audio;
 mod authoring;
 mod browser;
@@ -38,6 +39,7 @@ pub use memory_storage::{EmbedFn, TursoMemoryStorage};
 pub use ocr::{DescribeImageTool, OcrTool, OcrVisionFn};
 pub use pdf::{OcrFn as PdfOcrFn, PdfVisionFn, ReadPdfTool};
 pub use schedule::{ReminderStore, SchedulerState, RemindTool, ListRemindersTool, CancelReminderTool};
+pub use ask_parent::AskParentTool;
 pub use task::TaskTool;
 pub use vision::{AnalyzeImageTool, ScreenshotTool, VisionFn};
 pub use web::{WebSearchTool, WebSearchBatchTool, WebFetchTool};

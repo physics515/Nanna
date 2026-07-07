@@ -11,6 +11,7 @@
       <span class="tool-icon">{{ toolIcon }}</span>
       <span class="tool-name">{{ toolCall.name }}</span>
       <span v-if="inputSummary" class="tool-input-summary">{{ inputSummary }}</span>
+      <span v-if="modelBadge" class="tool-model-badge">{{ modelBadge }}</span>
       <span class="tool-spacer" />
       <span v-if="status === 'started'" class="tool-running-dot" />
       <span v-if="toolCall.duration_ms" class="tool-duration">{{ formatDuration(toolCall.duration_ms) }}</span>
@@ -36,6 +37,11 @@
           <pre v-if="toolCall.output" class="tool-code" :class="{ 'tool-code--error': status === 'error' }">{{ truncateOutput(toolCall.output) }}</pre>
           <div v-else class="tool-code tool-code--waiting">Waiting for result...</div>
         </div>
+        <!-- Written content (for write_file) -->
+        <div v-if="writtenContent" class="tool-section">
+          <div class="tool-section-label">📝 Written Content</div>
+          <pre class="tool-code tool-code--written">{{ writtenContent }}</pre>
+        </div>
       </div>
     </Transition>
   </div>
@@ -52,6 +58,8 @@ interface ToolCallInfo {
   output: string
   success: boolean
   duration_ms: number
+  model?: string
+  data?: Record<string, any>
 }
 
 const props = defineProps<{
@@ -105,6 +113,35 @@ const inputSummary = computed(() => {
   return ''
 })
 
+// Written content from write_file tool (available via data.written)
+const writtenContent = computed(() => {
+  if (!props.toolCall.data?.written) return ''
+  return props.toolCall.data.written
+})
+
+// Show routed model as badge (from event metadata or task output)
+const modelBadge = computed(() => {
+  // Direct model from ToolStart event (set by model routing)
+  if (props.toolCall.model) {
+    let m = props.toolCall.model
+    if (m.includes('/')) m = m.split('/').pop() || m
+    m = m.replace(/-\d{8}$/, '')
+    return m
+  }
+  // Fallback: extract from task tool output
+  if (props.toolCall.name === 'task') {
+    const output = props.toolCall.output || ''
+    const match = output.match(/model:\s*([^\s,\-]+[^\s,]*)/)
+    if (match) {
+      let m = match[1]
+      if (m.includes('/')) m = m.split('/').pop() || m
+      m = m.replace(/-\d{8}$/, '')
+      return m
+    }
+  }
+  return ''
+})
+
 const statusClass = computed(() => ({
   'tool-card--running': props.status === 'started',
   'tool-card--error': props.status === 'error',
@@ -121,7 +158,7 @@ function formatJson(obj: any): string {
 }
 
 function truncateOutput(output: string): string {
-  return output.length > 2000 ? output.substring(0, 2000) + '\n... (truncated)' : output
+  return output
 }
 </script>
 
@@ -171,6 +208,17 @@ function truncateOutput(output: string): string {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+.tool-model-badge {
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  color: rgba(139, 92, 246, 0.8);
+  background: rgba(139, 92, 246, 0.1);
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .tool-spacer {
@@ -253,6 +301,12 @@ function truncateOutput(output: string): string {
 
 .tool-code--error {
   color: #fca5a5;
+}
+
+.tool-code--written {
+  max-height: 400px;
+  color: #a5f3a5;
+  border-left: 2px solid rgba(74, 222, 128, 0.3);
 }
 
 .tool-code--waiting {

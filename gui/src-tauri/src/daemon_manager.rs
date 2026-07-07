@@ -49,7 +49,7 @@ impl Default for DaemonManagerConfig {
             max_restarts: 3,
             restart_delay: Duration::from_secs(2),
             health_check_interval: Duration::from_secs(30),
-            startup_timeout: Duration::from_secs(10),
+            startup_timeout: Duration::from_secs(30),
         }
     }
 }

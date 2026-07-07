@@ -167,6 +167,8 @@ pub enum OutputTarget {
 pub struct ToolManifest {
     /// Tool name
     pub name: String,
+    /// Semantic version string (e.g. "0.1.0")
+    pub version: Option<String>,
     /// Tool description
     pub description: Option<String>,
     /// Input parameter schema (JSON Schema)
@@ -184,6 +186,7 @@ pub fn extract_manifest(source: &str) -> Option<ToolManifest> {
     // export default { name: "...", description: "...", ... }
     
     let name = extract_string_field(source, "name")?;
+    let version = extract_string_field(source, "version");
     let description = extract_string_field(source, "description");
     let output = match extract_string_field(source, "output").as_deref() {
         Some("context") => OutputTarget::Context,
@@ -194,6 +197,7 @@ pub fn extract_manifest(source: &str) -> Option<ToolManifest> {
 
     Some(ToolManifest {
         name,
+        version,
         description,
         parameters: None, // TODO: Parse parameters schema
         output,
@@ -259,7 +263,26 @@ mod tests {
 
         let manifest = extract_manifest(source).unwrap();
         assert_eq!(manifest.name, "greet");
+        assert_eq!(manifest.version, None);
         assert_eq!(manifest.description, Some("Greet someone by name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_manifest_with_version() {
+        let source = r#"
+            export default {
+                name: "exec",
+                version: "0.1.0",
+                description: "Run a command",
+                execute({ command }) {
+                    return "done";
+                }
+            }
+        "#;
+
+        let manifest = extract_manifest(source).unwrap();
+        assert_eq!(manifest.name, "exec");
+        assert_eq!(manifest.version, Some("0.1.0".to_string()));
     }
 
     #[test]

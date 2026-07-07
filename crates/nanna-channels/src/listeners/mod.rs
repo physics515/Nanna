@@ -11,12 +11,14 @@
 //! - `SignalListener` - signal-cli-rest-api (SSE or polling)
 //! - `WhatsAppWebListener` - WhatsApp Web bridge (WebSocket, SSE, or polling)
 
+pub mod circuit_breaker;
 pub mod discord;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod whatsapp;
 
+pub use circuit_breaker::{CircuitBreaker, BreakerAction};
 pub use discord::DiscordListener;
 pub use signal::{SignalListener, ReceiveMode as SignalReceiveMode};
 pub use slack::SlackListener;

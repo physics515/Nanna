@@ -1,5 +1,7 @@
 export default {
   name: "code_outline",
+  version: "0.1.0",
+  output: "context",
   description: "Generate a structural outline of a source file showing functions, classes, structs, and other definitions. Useful for understanding file structure without reading the entire file.",
   parameters: {
     type: "object",

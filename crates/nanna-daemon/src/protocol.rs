@@ -470,8 +470,8 @@ pub enum Event {
     ThinkingDelta { session_id: String, delta: String },
 
     // Tool events
-    ToolStart { session_id: String, call_id: String, name: String, input: Value },
-    ToolEnd { session_id: String, call_id: String, output: String, success: bool, duration_ms: u64 },
+    ToolStart { session_id: String, call_id: String, name: String, input: Value, #[serde(skip_serializing_if = "Option::is_none")] model: Option<String> },
+    ToolEnd { session_id: String, call_id: String, output: String, success: bool, duration_ms: u64, #[serde(skip_serializing_if = "Option::is_none")] data: Option<Value> },
     
     // Session events
     SessionCreated { id: String, name: Option<String> },
@@ -512,6 +512,13 @@ pub enum Event {
         session_id: String,
         parent_id: Option<String>,
         label: Option<String>,
+    },
+    /// A sub-agent is asking its parent a question and waiting for a reply
+    SubSessionQuestion {
+        session_id: String,
+        parent_id: Option<String>,
+        label: Option<String>,
+        question: String,
     },
 
     // Model events

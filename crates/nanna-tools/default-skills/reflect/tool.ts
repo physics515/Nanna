@@ -1,5 +1,6 @@
 export default {
   name: "reflect",
+  version: "0.1.0",
   description: "Review and manage stored memories. List recent memories, delete specific ones, or get an overview of what has been remembered.",
   output: "context",
   parameters: {

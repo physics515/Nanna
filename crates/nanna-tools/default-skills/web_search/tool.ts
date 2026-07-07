@@ -1,5 +1,7 @@
 export default {
   name: "web_search",
+  version: "0.1.0",
+  output: "context",
   description: "Search the web using Brave Search API. Returns titles, URLs, and descriptions of search results.",
   parameters: {
     type: "object",

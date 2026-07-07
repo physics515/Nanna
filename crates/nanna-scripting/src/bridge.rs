@@ -8,6 +8,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+
+use std::sync::Mutex as StdMutex;
+use std::collections::HashSet as StdHashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -33,7 +36,15 @@ pub struct NannaBridge {
     services: Arc<HashMap<String, ServiceFn>>,
     /// Default working directory for exec commands (overrides home dir fallback)
     default_workdir: Option<PathBuf>,
+    /// Current session ID for session-scoped operations
+    session_id: Option<String>,
 }
+
+
+/// Global advisory lock set for file writes.
+/// Prevents concurrent sub-agents from writing to the same file simultaneously.
+static FILE_WRITE_LOCKS: std::sync::LazyLock<StdMutex<StdHashSet<std::path::PathBuf>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(StdHashSet::new()));
 
 impl NannaBridge {
     /// Create a new bridge with the given permissions
@@ -48,6 +59,7 @@ impl NannaBridge {
             tool_definitions: None,
             services: Arc::new(HashMap::new()),
             default_workdir: None,
+            session_id: None,
         }
     }
 
@@ -57,6 +69,23 @@ impl NannaBridge {
     pub fn with_default_workdir(mut self, workdir: impl Into<PathBuf>) -> Self {
         self.default_workdir = Some(workdir.into());
         self
+    }
+
+    /// Set the session ID for session-scoped operations.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Get the current session ID.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Get the default working directory as a string.
+    pub fn workdir(&self) -> Option<&str> {
+        self.default_workdir.as_ref().and_then(|p| p.to_str())
     }
 
     /// Set tool definitions for `Nanna.listTools()`
@@ -130,7 +159,14 @@ impl NannaBridge {
     }
 
     /// Execute a shell command (if permitted)
+    ///
+    /// `timeout_secs`: optional override for the execution timeout (default: 30s).
     pub async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecResponse> {
+        self.exec_with_timeout(command, workdir, None).await
+    }
+
+    /// Execute a shell command with an optional timeout override.
+    pub async fn exec_with_timeout(&self, command: &str, workdir: Option<&str>, timeout_secs: Option<u64>) -> Result<ExecResponse> {
         tracing::debug!(target: "bridge", "exec called: command={}, run_permission={}", command, self.permissions.run);
         
         if !self.permissions.run {
@@ -147,15 +183,81 @@ impl NannaBridge {
             ));
         }
 
-        // Determine shell based on OS
-        let (shell, shell_arg) = if cfg!(windows) {
-            ("cmd", "/C")
-        } else {
-            ("sh", "-c")
-        };
+        // Determine shell based on OS.
+        // On Windows, route commands to the appropriate shell:
+        // - PowerShell syntax → powershell.exe (avoids cmd.exe mangling $, |, quotes)
+        // - Python one-liners → python directly (cmd.exe breaks -c quoting)
+        // - Everything else → cmd /S /C (the /S flag preserves inner quoting better)
+        let mut cmd = if cfg!(windows) {
+            let trimmed = command.trim_start();
 
-        let mut cmd = tokio::process::Command::new(shell);
-        cmd.arg(shell_arg).arg(command);
+            let is_powershell = trimmed.starts_with("powershell")
+                || trimmed.starts_with("pwsh")
+                || trimmed.contains("$env:")
+                || trimmed.contains("Get-")
+                || trimmed.contains("Set-")
+                || trimmed.contains("New-")
+                || trimmed.contains("Remove-")
+                || trimmed.contains("Select-")
+                || trimmed.contains("Where-Object")
+                || trimmed.contains("ForEach-Object")
+                || (trimmed.contains('$') && trimmed.contains('|'));
+
+            // Detect python/python3 -c "..." one-liners
+            // Compound commands (&&, ||) are also supported — we split and run
+            // only the python portion directly, but if the whole thing is just
+            // python -c "...", route it directly to avoid cmd.exe quote mangling.
+            let is_python_c = (trimmed.starts_with("python3 -c") || trimmed.starts_with("python -c"))
+                && !trimmed.contains("&&")
+                && !trimmed.contains("||");
+
+            if is_powershell {
+                let mut c = tokio::process::Command::new("powershell.exe");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                c
+            } else if is_python_c {
+                // Parse: "python[3] -c 'code'" or 'python[3] -c "code"'
+                // Route directly to python.exe to avoid cmd.exe quote mangling.
+                let (exe, rest) = if trimmed.starts_with("python3") {
+                    ("python3", trimmed.strip_prefix("python3 -c").unwrap_or("").trim())
+                } else {
+                    ("python", trimmed.strip_prefix("python -c").unwrap_or("").trim())
+                };
+                // Strip outer quotes if present
+                let code = if (rest.starts_with('"') && rest.ends_with('"'))
+                    || (rest.starts_with('\'') && rest.ends_with('\''))
+                {
+                    &rest[1..rest.len() - 1]
+                } else {
+                    rest
+                };
+                let mut c = tokio::process::Command::new(exe);
+                c.args(["-c", code]);
+                c
+            } else {
+                // For compound commands (&&, ||) containing special characters
+                // that cmd.exe mangles, prefer PowerShell
+                let has_problematic_chars = trimmed.contains('\'')
+                    || trimmed.contains('`')
+                    || (trimmed.contains('"') && trimmed.matches('"').count() > 2);
+                
+                // Route compound commands with python to PowerShell too
+                let has_python = trimmed.contains("python -c") || trimmed.contains("python3 -c");
+                if (has_problematic_chars || has_python) && (trimmed.contains('\'') || trimmed.contains("||")) {
+                    let mut c = tokio::process::Command::new("powershell.exe");
+                    c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                    c
+                } else {
+                    let mut c = tokio::process::Command::new("cmd");
+                    c.args(["/S", "/C", command]);
+                    c
+                }
+            }
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", command]);
+            c
+        };
 
         if let Some(wd) = workdir {
             cmd.current_dir(self.resolve_path(wd));
@@ -168,16 +270,51 @@ impl NannaBridge {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        // Tell well-behaved tools to skip color output.
+        // We also strip ANSI escapes from the output as a fallback.
+        cmd.env("NO_COLOR", "1");
+        cmd.env("TERM", "dumb");
+
+        // Smart default timeout: longer for known slow commands.
+        // Git, cargo, npm, pip, and build tools regularly exceed 30s on large repos.
+        let timeout = timeout_secs.unwrap_or_else(|| {
+            let cmd_lower = command.to_lowercase();
+            if cmd_lower.starts_with("git ")
+                || cmd_lower.starts_with("cargo ")
+                || cmd_lower.starts_with("npm ")
+                || cmd_lower.starts_with("pnpm ")
+                || cmd_lower.starts_with("yarn ")
+                || cmd_lower.starts_with("pip ")
+                || cmd_lower.starts_with("make ")
+                || cmd_lower.starts_with("cmake ")
+                || cmd_lower.starts_with("dotnet ")
+                || cmd_lower.starts_with("mvn ")
+                || cmd_lower.starts_with("gradle ")
+                || cmd_lower.contains("cargo ")
+                || cmd_lower.contains("git checkout")
+                || cmd_lower.contains("git clone")
+                || cmd_lower.contains("git fetch")
+                || cmd_lower.contains("git pull")
+                || cmd_lower.contains("cargo build")
+                || cmd_lower.contains("cargo check")
+                || cmd_lower.contains("cargo clippy")
+                || cmd_lower.contains("cargo test")
+            {
+                120 // 2 minutes for build/VCS tools
+            } else {
+                30 // default
+            }
+        });
         let output = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(timeout),
             cmd.output(),
         )
         .await
-        .map_err(|_| ScriptError::Timeout(30_000))?
+        .map_err(|_| ScriptError::Timeout(timeout * 1000))?
         .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = strip_ansi_escapes(&String::from_utf8_lossy(&output.stdout));
+        let stderr = strip_ansi_escapes(&String::from_utf8_lossy(&output.stderr));
 
         Ok(ExecResponse {
             success: output.status.success(),
@@ -282,6 +419,28 @@ impl NannaBridge {
 
     /// Write a file (if permitted)
     pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
+        // Advisory file lock: prevent concurrent writes to the same path
+        let canonical = self.resolve_path(path).canonicalize().unwrap_or_else(|_| self.resolve_path(path));
+        {
+            let mut locks = FILE_WRITE_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            if locks.contains(&canonical) {
+                return Err(ScriptError::Bridge(
+                    format!("File is being written by another agent: {}", path)
+                ));
+            }
+            locks.insert(canonical.clone());
+        }
+        // Ensure lock is released even on error
+        struct FileGuard(std::path::PathBuf);
+        impl Drop for FileGuard {
+            fn drop(&mut self) {
+                if let Ok(mut locks) = FILE_WRITE_LOCKS.lock() {
+                    locks.remove(&self.0);
+                }
+            }
+        }
+        let _guard = FileGuard(canonical);
+
         let path = self.resolve_path(path);
         
         if !self.permissions.allows_write(&path) {
@@ -538,6 +697,33 @@ pub struct LogEntry {
     pub level: LogLevel,
     pub message: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Strip ANSI escape sequences from text.
+/// Tools like cargo, git, and npm emit color codes that break text matching
+/// (e.g., `findstr "error:"` fails because the actual text is `\x1b[31merror\x1b[0m:`).
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip CSI sequence: ESC [ ... <final byte>
+            if let Some(next) = chars.next() {
+                if next == '[' {
+                    // Consume until we hit a letter (the terminator)
+                    for seq_char in chars.by_ref() {
+                        if seq_char.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                // else: other escape (ESC without [) — just skip the ESC and next char
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 #[cfg(test)]

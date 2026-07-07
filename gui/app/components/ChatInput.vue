@@ -29,72 +29,82 @@
         <!-- Splatter layer -->
         <span class="input-editor-zone__splatter" :style="{ background: splatterBg }" />
 
-        <!-- Floating toolbar (appears on text selection) -->
-        <FloatingToolbar :editor="editor" v-if="editor" />
-
-        <!-- Editor content -->
-        <EditorContent
-          :editor="editor"
+        <!-- Rich text editor (extracted Tiptap core) -->
+        <RichTextEditor
+          ref="richEditorRef"
+          :model-value="modelValue"
+          :editable="!disabled"
+          :placeholder="placeholder || 'Type a message... (Ctrl+Enter to send, / for commands)'"
+          floating-toolbar
+          slash-commands
+          images
+          editor-class="prose prose-invert prose-sm max-w-none focus:outline-none"
           class="chat-editor"
           :class="{ 'opacity-50 cursor-not-allowed': disabled }"
+          @update:model-value="emit('update:modelValue', $event)"
+          @focus="isFocused = true; splatterEnter()"
+          @blur="isFocused = false; splatterLeave()"
+          @keydown="handleKeyDown"
+          @image-paste="addImageFile"
+          @image-drop="addImageFile"
         />
       </div>
 
       <!-- ═══ Mobile formatting toolbar ═══ -->
-      <div v-if="isFocused && editor" class="mobile-toolbar sm:hidden">
+      <div v-if="isFocused && tiptapEditor" class="mobile-toolbar sm:hidden">
         <button
-          @click="editor.chain().focus().toggleBold().run()"
-          :class="{ active: editor.isActive('bold') }"
+          @click="tiptapEditor.chain().focus().toggleBold().run()"
+          :class="{ active: tiptapEditor.isActive('bold') }"
           class="mobile-toolbar__btn"
         >
           <Bold class="w-4 h-4" />
         </button>
         <button
-          @click="editor.chain().focus().toggleItalic().run()"
-          :class="{ active: editor.isActive('italic') }"
+          @click="tiptapEditor.chain().focus().toggleItalic().run()"
+          :class="{ active: tiptapEditor.isActive('italic') }"
           class="mobile-toolbar__btn"
         >
           <Italic class="w-4 h-4" />
         </button>
         <button
-          @click="editor.chain().focus().toggleStrike().run()"
-          :class="{ active: editor.isActive('strike') }"
+          @click="tiptapEditor.chain().focus().toggleStrike().run()"
+          :class="{ active: tiptapEditor.isActive('strike') }"
           class="mobile-toolbar__btn"
         >
           <Strikethrough class="w-4 h-4" />
         </button>
         <button
-          @click="editor.chain().focus().toggleCode().run()"
-          :class="{ active: editor.isActive('code') }"
+          @click="tiptapEditor.chain().focus().toggleCode().run()"
+          :class="{ active: tiptapEditor.isActive('code') }"
           class="mobile-toolbar__btn"
         >
           <Code class="w-4 h-4" />
         </button>
         <span class="mobile-toolbar__divider" />
         <button
-          @click="editor.chain().focus().toggleHeading({ level: 2 }).run()"
-          :class="{ active: editor.isActive('heading') }"
+          @click="tiptapEditor.chain().focus().toggleHeading({ level: 2 }).run()"
+          :class="{ active: tiptapEditor.isActive('heading') }"
           class="mobile-toolbar__btn"
         >
           <Heading2 class="w-4 h-4" />
         </button>
         <button
-          @click="editor.chain().focus().toggleBulletList().run()"
-          :class="{ active: editor.isActive('bulletList') }"
+          @click="tiptapEditor.chain().focus().toggleBulletList().run()"
+          :class="{ active: tiptapEditor.isActive('bulletList') }"
           class="mobile-toolbar__btn"
         >
           <List class="w-4 h-4" />
         </button>
         <button
-          @click="editor.chain().focus().toggleBlockquote().run()"
-          :class="{ active: editor.isActive('blockquote') }"
+          @click="tiptapEditor.chain().focus().toggleBlockquote().run()"
+          :class="{ active: tiptapEditor.isActive('blockquote') }"
           class="mobile-toolbar__btn"
         >
           <Quote class="w-4 h-4" />
         </button>
         <button
-          @click="editor.chain().focus().toggleTaskList().run()"
-          :class="{ active: editor.isActive('taskList') }"
+          @click="tiptapEditor.chain().focus().toggleTaskList().run()"
+          :class="{ active: tiptapEditor.isActive('taskList') }"
           class="mobile-toolbar__btn"
         >
           <ListChecks class="w-4 h-4" />
@@ -186,17 +196,6 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
-import { useEditor, EditorContent } from '@tiptap/vue-3'
-import StarterKit from '@tiptap/starter-kit'
-import Placeholder from '@tiptap/extension-placeholder'
-import Link from '@tiptap/extension-link'
-import TaskList from '@tiptap/extension-task-list'
-import TaskItem from '@tiptap/extension-task-item'
-import Image from '@tiptap/extension-image'
-import Typography from '@tiptap/extension-typography'
-import { MonacoCodeBlock } from '~/extensions/MonacoCodeBlock'
-import { SlashCommands } from '~/extensions/SlashCommands'
-import FloatingToolbar from '~/components/FloatingToolbar.vue'
 import {
   Send, Eye, X, Square, ImagePlus,
   Bold, Italic, Strikethrough, Code,
@@ -320,209 +319,35 @@ function handleToolbarLeave() {
   if (ready.value) glassLeave()
 }
 
-// Initialize Tiptap editor with all extensions
-const editor = useEditor({
-  content: props.modelValue,
-  extensions: [
-    StarterKit.configure({
-      codeBlock: false,
-    }),
-    MonacoCodeBlock,
-    Link.configure({
-      openOnClick: false,
-      HTMLAttributes: {
-        class: 'text-nanna-accent hover:underline',
-      },
-    }),
-    Placeholder.configure({
-      placeholder: props.placeholder || 'Type a message... (Ctrl+Enter to send, / for commands)',
-      emptyEditorClass: 'is-empty',
-    }),
-    TaskList,
-    TaskItem.configure({
-      nested: true,
-    }),
-    Image.configure({
-      inline: true,
-      allowBase64: true,
-    }),
-    Typography,
-    SlashCommands,
-  ],
-  editorProps: {
-    attributes: {
-      class: 'prose prose-invert prose-sm max-w-none focus:outline-none',
-    },
-    handlePaste: (view, event) => {
-      const items = event.clipboardData?.items
-      if (!items) return false
-      for (const item of items) {
-        if (item.type.startsWith('image/')) {
-          event.preventDefault()
-          const file = item.getAsFile()
-          if (file) addImageFile(file)
-          return true
-        }
-      }
-      return false
-    },
-    handleDrop: (view, event) => {
-      const files = event.dataTransfer?.files
-      if (!files) return false
-      for (const file of files) {
-        if (file.type.startsWith('image/')) {
-          event.preventDefault()
-          addImageFile(file)
-          return true
-        }
-      }
-      return false
-    },
-    handleKeyDown: (view, event) => {
-      if (event.key === 'p' && (event.ctrlKey || event.metaKey)) {
-        event.preventDefault()
-        showPreview.value = !showPreview.value
-        return true
-      }
-      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-        event.preventDefault()
-        submit()
-        return true
-      }
-      return false
-    },
-  },
-  onUpdate: ({ editor }) => {
-    const text = getMarkdownContent(editor)
-    emit('update:modelValue', text)
-  },
-  onFocus: () => {
-    isFocused.value = true
-    splatterEnter()
-  },
-  onBlur: () => {
-    isFocused.value = false
-    splatterLeave()
-  },
-})
+// ── RichTextEditor ref ──
+const richEditorRef = ref<any>(null)
+const tiptapEditor = computed(() => richEditorRef.value?.editor)
 
-function getMarkdownContent(editorInstance: any): string {
-  if (!editorInstance) return ''
-  const json = editorInstance.getJSON()
-  return jsonToMarkdown(json)
+const isEmpty = computed(() => richEditorRef.value?.isEmpty ?? true)
+
+function handleKeyDown(event: KeyboardEvent) {
+  if (event.key === 'p' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault()
+    showPreview.value = !showPreview.value
+  }
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault()
+    submit()
+  }
 }
-
-function jsonToMarkdown(doc: any): string {
-  if (!doc.content) return ''
-
-  return doc.content.map((node: any) => {
-    switch (node.type) {
-      case 'paragraph':
-        return nodeContentToText(node)
-      case 'heading': {
-        const level = node.attrs?.level || 1
-        return '#'.repeat(level) + ' ' + nodeContentToText(node)
-      }
-      case 'monacoCodeBlock': {
-        const lang = node.attrs?.language || ''
-        const code = node.content?.[0]?.text || node.attrs?.content || ''
-        return '```' + lang + '\n' + code + '\n```'
-      }
-      case 'bulletList':
-        return node.content?.map((item: any) => '- ' + nodeContentToText(item.content?.[0])).join('\n') || ''
-      case 'orderedList':
-        return node.content?.map((item: any, i: number) => `${i + 1}. ` + nodeContentToText(item.content?.[0])).join('\n') || ''
-      case 'taskList':
-        return node.content?.map((item: any) => {
-          const checked = item.attrs?.checked ? 'x' : ' '
-          return `- [${checked}] ` + nodeContentToText(item.content?.[0])
-        }).join('\n') || ''
-      case 'blockquote':
-        return node.content?.map((p: any) => '> ' + nodeContentToText(p)).join('\n') || ''
-      case 'horizontalRule':
-        return '---'
-      case 'image':
-        return `![${node.attrs?.alt || ''}](${node.attrs?.src || ''})`
-      default:
-        return nodeContentToText(node)
-    }
-  }).reduce((acc: string, block: string, i: number, arr: string[]) => {
-    if (i === 0) return block
-    const prev = arr[i - 1]
-    const isCodeBlock = block.startsWith('```')
-    const prevIsCodeBlock = prev.endsWith('```')
-    if (isCodeBlock || prevIsCodeBlock) {
-      return acc + '\n' + block
-    }
-    return acc + '\n\n' + block
-  }, '').trim()
-}
-
-function nodeContentToText(node: any): string {
-  if (!node?.content) return ''
-
-  return node.content.map((item: any) => {
-    if (item.type === 'image') {
-      return `![${item.attrs?.alt || ''}](${item.attrs?.src || ''})`
-    }
-
-    let text = item.text || ''
-
-    if (item.marks) {
-      for (const mark of item.marks) {
-        switch (mark.type) {
-          case 'bold':
-            text = `**${text}**`
-            break
-          case 'italic':
-            text = `*${text}*`
-            break
-          case 'strike':
-            text = `~~${text}~~`
-            break
-          case 'code':
-            text = '`' + text + '`'
-            break
-          case 'link':
-            text = `[${text}](${mark.attrs?.href || ''})`
-            break
-        }
-      }
-    }
-
-    return text
-  }).join('')
-}
-
-const isEmpty = computed(() => {
-  if (!editor.value) return true
-  return editor.value.isEmpty
-})
 
 function submit() {
   if (isEmpty.value || props.disabled) return
   emit('submit')
-  editor.value?.commands.clearContent()
+  richEditorRef.value?.clear()
   showPreview.value = false
 }
 
 function focus() {
-  editor.value?.commands.focus()
+  richEditorRef.value?.focus()
 }
 
 defineExpose({ focus, getAttachments })
-
-watch(() => props.modelValue, (newValue) => {
-  if (!editor.value) return
-  const currentContent = getMarkdownContent(editor.value)
-  if (newValue !== currentContent && newValue === '') {
-    editor.value.commands.clearContent()
-  }
-})
-
-onBeforeUnmount(() => {
-  editor.value?.destroy()
-})
 </script>
 
 <style>
@@ -660,123 +485,24 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(71, 85, 105, 0.2);
 }
 
-/* ═══ Tiptap editor styles ═══ */
+/* ═══ Chat-specific editor overrides (base styles live in RichTextEditor) ═══ */
 .chat-editor {
   position: relative;
   z-index: 1;
   @apply min-h-[60px] max-h-[400px] overflow-y-auto;
 }
 
-.chat-editor .ProseMirror {
-  @apply px-4 py-3 text-sm text-nanna-text;
+.chat-editor :deep(.rich-text-editor__content .ProseMirror) {
+  @apply px-4 py-3;
   min-height: 60px;
 }
 
-.chat-editor .ProseMirror:focus {
-  @apply outline-none;
-}
-
-/* Placeholder */
-.chat-editor .ProseMirror p.is-empty:first-child::before {
-  @apply text-nanna-text-dim pointer-events-none float-left h-0;
-  content: attr(data-placeholder);
-}
-
-/* Inline code */
-.chat-editor code {
-  @apply px-1.5 py-0.5 rounded bg-nanna-bg-elevated text-nanna-accent font-mono text-xs;
-}
-
-/* Bold */
-.chat-editor strong {
-  @apply font-bold text-nanna-text;
-}
-
-/* Italic */
-.chat-editor em {
-  @apply italic;
-}
-
-/* Headings */
-.chat-editor h1 {
-  @apply text-xl font-bold text-nanna-text mt-2 mb-1;
-}
-
-.chat-editor h2 {
-  @apply text-lg font-semibold text-nanna-text mt-2 mb-1;
-}
-
-.chat-editor h3 {
-  @apply text-base font-semibold text-nanna-text mt-1.5 mb-1;
-}
-
-/* Lists */
-.chat-editor ul {
-  @apply list-disc list-inside my-1;
-}
-
-.chat-editor ol {
-  @apply list-decimal list-inside my-1;
-}
-
-.chat-editor li {
-  @apply text-nanna-text;
-}
-
-/* Task lists */
-.chat-editor ul[data-type="taskList"] {
-  @apply list-none pl-0 my-1;
-}
-
-.chat-editor ul[data-type="taskList"] li {
-  @apply flex items-start gap-2;
-}
-
-.chat-editor ul[data-type="taskList"] li label {
-  @apply flex items-center;
-}
-
-.chat-editor ul[data-type="taskList"] li label input[type="checkbox"] {
-  @apply w-3.5 h-3.5 rounded border-nanna-primary/40 bg-transparent mt-0.5;
-  accent-color: rgba(99, 102, 241, 0.8);
-}
-
-.chat-editor ul[data-type="taskList"] li div {
-  @apply flex-1;
-}
-
-/* Blockquotes */
-.chat-editor blockquote {
-  @apply border-l-2 border-nanna-accent/50 pl-3 my-2 text-nanna-text-muted italic;
-}
-
-/* Horizontal rules */
-.chat-editor hr {
-  @apply border-nanna-primary/20 my-3;
-}
-
-/* Images */
-.chat-editor img {
-  @apply max-w-full rounded-lg my-2;
-  max-height: 200px;
-}
-
-/* Links */
-.chat-editor a {
-  @apply text-nanna-accent hover:underline;
-}
-
-/* Strikethrough */
-.chat-editor s {
-  @apply text-nanna-text-muted;
-}
-
 /* ═══ Drag handles for blocks ═══ */
-.chat-editor .ProseMirror > * {
+.chat-editor :deep(.ProseMirror > *) {
   position: relative;
 }
 
-.chat-editor .ProseMirror > *:not(p:first-child)::before {
+.chat-editor :deep(.ProseMirror > *:not(p:first-child)::before) {
   content: '⠿';
   position: absolute;
   left: -1.25rem;
@@ -789,25 +515,8 @@ onBeforeUnmount(() => {
   line-height: 1.5;
 }
 
-.chat-editor .ProseMirror > *:not(p:first-child):hover::before {
+.chat-editor :deep(.ProseMirror > *:not(p:first-child):hover::before) {
   color: rgba(148, 163, 184, 0.35);
-}
-
-/* Scrollbar */
-.chat-editor::-webkit-scrollbar {
-  @apply w-2;
-}
-
-.chat-editor::-webkit-scrollbar-track {
-  @apply bg-transparent;
-}
-
-.chat-editor::-webkit-scrollbar-thumb {
-  @apply bg-nanna-primary/20 rounded-full;
-}
-
-.chat-editor::-webkit-scrollbar-thumb:hover {
-  @apply bg-nanna-primary/30;
 }
 
 /* === Attachment strip === */

@@ -52,6 +52,8 @@ pub struct ControlPlane {
     pub tool_stats: nanna_agent::ToolStatsTracker,
     /// Storage for persisting model stats
     storage: Option<Arc<Storage>>,
+    /// Shared workspace ID for script services (updated before each agent run)
+    services_workspace_id: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     /// Event broadcaster for pushing events to subscribed clients
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
 }
@@ -78,6 +80,7 @@ impl ControlPlane {
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
+            services_workspace_id: None,
         }
     }
 
@@ -107,6 +110,7 @@ impl ControlPlane {
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
+            services_workspace_id: None,
         }
     }
 
@@ -154,6 +158,7 @@ impl ControlPlane {
             tool_stats: nanna_agent::ToolStatsTracker::new(),
             storage: None,
             event_tx: None,
+            services_workspace_id: None,
         }
     }
 
@@ -166,6 +171,12 @@ impl ControlPlane {
     /// Set the event broadcaster for pushing events to clients
     pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Set the shared workspace ID for script services
+    pub fn with_workspace_id(mut self, ws_id: Arc<tokio::sync::RwLock<Option<String>>>) -> Self {
+        self.services_workspace_id = Some(ws_id);
         self
     }
 
@@ -200,7 +211,16 @@ impl ControlPlane {
             Err(e) => warn!("Failed to load model stats from storage: {e}"),
         }
 
-        // Load tool stats from JSON file in data dir
+        // Load tool stats from database
+        match storage.load_tool_stats_aggregated().await {
+            Ok(data) => {
+                self.tool_stats.import_json(&data).await;
+                info!("Loaded tool stats from database");
+            }
+            Err(e) => warn!("Failed to load tool stats from database: {e}"),
+        }
+
+        // One-time migration: if tool-stats.json exists, migrate and rename it
         if let Some(ref data_dir) = self._data_dir {
             let tool_stats_path = data_dir.join("tool-stats.json");
             if tool_stats_path.exists() {
@@ -208,10 +228,18 @@ impl ControlPlane {
                     Ok(json_str) => {
                         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&json_str) {
                             self.tool_stats.import_json(&data).await;
-                            info!("Loaded tool stats from {}", tool_stats_path.display());
+                            // Save to DB
+                            if let Err(e) = storage.save_tool_stats_aggregated(&data).await {
+                                warn!("Failed to migrate tool stats to DB: {e}");
+                            } else {
+                                info!("Migrated tool stats from JSON to database");
+                                // Rename the file
+                                let migrated = data_dir.join("tool-stats.json.migrated");
+                                let _ = tokio::fs::rename(&tool_stats_path, &migrated).await;
+                            }
                         }
                     }
-                    Err(e) => warn!("Failed to read tool stats file: {e}"),
+                    Err(e) => warn!("Failed to read legacy tool stats file: {e}"),
                 }
             }
         }
@@ -235,19 +263,13 @@ impl ControlPlane {
         }
     }
 
-    /// Persist current tool stats to a JSON file. Call periodically.
+    /// Persist current tool stats to the database. Call periodically.
     pub async fn save_tool_stats(&self) {
-        if let Some(ref data_dir) = self._data_dir {
-            let tool_stats_path = data_dir.join("tool-stats.json");
+        if let Some(ref storage) = self.storage {
             let data = self.tool_stats.export_json().await;
-            match serde_json::to_string_pretty(&data) {
-                Ok(json_str) => {
-                    match tokio::fs::write(&tool_stats_path, json_str).await {
-                        Ok(()) => info!("Saved tool stats to {}", tool_stats_path.display()),
-                        Err(e) => warn!("Failed to write tool stats: {e}"),
-                    }
-                }
-                Err(e) => warn!("Failed to serialize tool stats: {e}"),
+            match storage.save_tool_stats_aggregated(&data).await {
+                Ok(()) => info!("Saved tool stats to database"),
+                Err(e) => warn!("Failed to save tool stats to database: {e}"),
             }
         }
     }
@@ -333,6 +355,16 @@ impl ControlPlane {
                         "message": format!("Session {} not found", session_id)
                     }),
                 };
+
+                // Auto-remember user message as semantic memory
+                if let Some(ref memory) = self.memory {
+                    if content.split_whitespace().count() >= 3 {
+                        let meta = std::collections::HashMap::new();
+                        if let Err(e) = memory.remember_with_importance(&content, meta, 1.0).await {
+                            debug!("Failed to auto-remember user message: {}", e);
+                        }
+                    }
+                }
                 
                 // Check if agent is available
                 let Some(ref agent) = self.agent else {
@@ -370,14 +402,26 @@ impl ControlPlane {
                     registry.active().map(|ws| ws.id.clone())
                 };
 
-                // Inject workspace context
+                // Inject workspace context (reload from disk so edits within the session are picked up)
                 if let Some(ref ws_id) = effective_ws_id {
+                    {
+                        let mut registry = self.workspaces.write().await;
+                        if let Some(ws) = registry.get_mut(ws_id) {
+                            if let Err(e) = ws.load_context().await {
+                                warn!("Failed to reload workspace context: {}", e);
+                            }
+                        }
+                    }
                     let registry = self.workspaces.read().await;
                     if let Some(ws) = registry.get(ws_id) {
-                        // Add workspace root path so model knows where to look
+                        // Add workspace root path prominently so model knows where to look
+                        let ws_path = ws.path.display();
                         system_prompt.push_str(&format!(
-                            "\n\n## Workspace\nWorking directory: {}\n",
-                            ws.path.display()
+                            "\n\n## Active Workspace\n\
+                            **Root directory: {ws_path}**\n\
+                            All file operations and commands MUST use this directory as the base.\n\
+                            Use relative paths (resolved against {ws_path}) or absolute paths within it.\n\
+                            Do NOT search in home directory or other locations unless explicitly asked.\n"
                         ));
 
                         // Add workspace context files (AGENTS.md, SOUL.md, etc.)
@@ -425,6 +469,11 @@ impl ControlPlane {
                     }
                 }
 
+                // Update workspace ID for script services (memory scoping)
+                if let Some(ref ws_arc) = self.services_workspace_id {
+                    *ws_arc.write().await = effective_ws_id.clone();
+                }
+
                 // Set tool working directory to workspace root
                 if let Some(ref ws_id) = effective_ws_id {
                     let registry = self.workspaces.read().await;
@@ -432,6 +481,9 @@ impl ControlPlane {
                         agent.tools().set_default_workdir(Some(ws.path.clone())).await;
                     }
                 }
+
+                // Set session ID so tools can scope per-session state
+                agent.tools().set_session_id(Some(session_id.clone())).await;
 
                 // Run the agent with conversation history (workspace-scoped for memory extraction)
                 // Convert protocol attachments to (base64_data, media_type) tuples
@@ -485,7 +537,15 @@ impl ControlPlane {
                             }
                         }
 
-                        // Memory auto-persisted to SQLite via write-through on every mutation.
+                        // Auto-remember assistant response as semantic memory
+                        if let Some(ref memory) = self.memory {
+                            if result.content.split_whitespace().count() >= 3 {
+                                let meta = std::collections::HashMap::new();
+                                if let Err(e) = memory.remember_with_importance(&result.content, meta, 1.0).await {
+                                    debug!("Failed to auto-remember assistant response: {}", e);
+                                }
+                            }
+                        }
 
                         json!({
                             "status": "success",
@@ -500,10 +560,34 @@ impl ControlPlane {
                         })
                     }
                     Err(e) => {
-                        json!({
-                            "error": "chat_failed",
-                            "message": e
-                        })
+                        // If there's a partial result (agent did work before failing),
+                        // persist it so the user doesn't lose hours of streamed work
+                        if let Some(partial) = e.partial_result {
+                            warn!(
+                                "Chat failed but {} chars of work were done — persisting partial result",
+                                partial.content.len()
+                            );
+                            let reasoning = partial.reasoning.clone();
+                            self.sessions.add_full_message(
+                                &session_id,
+                                MessageRole::Assistant,
+                                &partial.content,
+                                partial.tool_calls.clone(),
+                                reasoning,
+                            ).await;
+
+                            json!({
+                                "error": "chat_failed",
+                                "message": e.message,
+                                "partial_content": partial.content,
+                                "partial": true
+                            })
+                        } else {
+                            json!({
+                                "error": "chat_failed",
+                                "message": e.message
+                            })
+                        }
                     }
                 }
             }
@@ -785,37 +869,80 @@ impl ControlPlane {
             task: task.clone(),
         });
 
-        // Build system prompt
+        // Build system prompt (include workspace context so sub-agents know the codebase)
         let sys_prompt = system_prompt.unwrap_or_else(|| {
             let base = self.system_prompt.blocking_read().clone();
-            format!("{}\n\nYou are a sub-agent. Your task: {}", base, task)
+
+            // Inject workspace context so sub-agents see AGENTS.md, SOUL.md, etc.
+            let ws_context = {
+                let registry = self.workspaces.blocking_read();
+                registry.active()
+                    .map(|ws| {
+                        let mut ctx = String::new();
+                        let ws_path = ws.path.display();
+                        ctx.push_str(&format!(
+                            "\n\n## Active Workspace\n\
+                            **Root directory: {ws_path}**\n\
+                            All file operations and commands MUST use this directory as the base.\n"
+                        ));
+                        let injection = ws.context.build_system_prompt_injection();
+                        if !injection.is_empty() {
+                            ctx.push_str(&format!("\n{injection}"));
+                        }
+                        ctx
+                    })
+                    .unwrap_or_default()
+            };
+
+            format!("{base}{ws_context}\n\nYou are a sub-agent. All tools are pre-activated — use them directly (no need to call discover_tools). Execute the task immediately and return results when done.\n\nYour task: {task}")
         });
 
         // Spawn the agent in a background task
         let agent = agent.clone();
         let sessions = self.sessions.clone();
         let event_tx = self.event_tx.clone();
+        let workspaces = self.workspaces.clone();
         let model_for_task = model;
         let max_iters = max_iterations;
         let sid = session_id.clone();
         let lbl = label.clone();
         let pid = parent_id.clone();
+        let task_for_extraction = task.clone();
+
+        // Snapshot the parent's workdir so the sub-agent can restore it.
+        // The shared ToolRegistry has a single workdir that can be overwritten
+        // by concurrent sessions, so we capture it here and re-set it inside
+        // the spawned task to avoid races.
+        let parent_workdir = agent.tools().default_workdir().await;
 
         tokio::spawn(async move {
             // Mark as running
             sessions.set_sub_session_state(&sid, SubSessionState::Running).await;
 
+            // Set session ID so tools can scope per-session state
+            agent.tools().set_session_id(Some(sid.clone())).await;
+
+            // Set per-session workdir for the sub-agent from the parent's snapshot.
+            // This avoids races with the global default_workdir which can be
+            // overwritten by concurrent sessions.
+            if let Some(ref wd) = parent_workdir {
+                agent.tools().set_session_workdir(&sid, wd.clone()).await;
+            }
+
             // Apply timeout if specified
             let result = if let Some(timeout) = timeout_secs {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
-                    agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], model_for_task.clone(), max_iters, None, vec![]),
+                    agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], model_for_task.clone(), max_iters, None, vec![], true),
                 ).await {
                     Ok(r) => r,
-                    Err(_) => Err(format!("Sub-session timed out after {}s", timeout)),
+                    Err(_) => Err(crate::agent_service::ChatError {
+                        message: format!("Sub-session timed out after {}s", timeout),
+                        partial_result: None,
+                    }),
                 }
             } else {
-                agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], model_for_task.clone(), max_iters, None, vec![]).await
+                agent.chat_with_options(&sid, &task, Some(sys_prompt), &[], model_for_task.clone(), max_iters, None, vec![], true).await
             };
 
             match result {
@@ -826,19 +953,140 @@ impl ControlPlane {
                             session_id: sid.clone(),
                             parent_id: pid.clone(),
                             label: lbl.clone(),
-                            result: chat_result.content,
+                            result: chat_result.content.clone(),
                         });
                     }
                     info!("Sub-session {} completed", sid);
+
+                    // Extract project knowledge and update AGENTS.md + TOOLS.md
+                    let ws_info = {
+                        let reg = workspaces.read().await;
+                        reg.active().map(|ws| (
+                            ws.path.clone(),
+                            ws.context.agents.clone(),
+                            ws.context.tools.clone(),
+                        ))
+                    };
+                    if let Some((ws_path, current_agents, current_tools)) = ws_info {
+                        let result_text = chat_result.content;
+                        let extraction_task = task_for_extraction.clone();
+                        let agent_for_extract = agent.clone();
+                        tokio::spawn(async move {
+                            // Trim result to last 2000 chars to keep extraction prompt small
+                            let result_tail: String = if result_text.len() > 2000 {
+                                result_text[result_text.len() - 2000..].to_string()
+                            } else {
+                                result_text.clone()
+                            };
+                            let extraction_prompt = format!(
+                                "A sub-agent just completed a task. Extract NEW knowledge into two categories.\n\n\
+                                Task: {}\n\n\
+                                Result (tail):\n{}\n\n\
+                                Current AGENTS.md:\n{}\n\n\
+                                Current TOOLS.md:\n{}\n\n\
+                                Respond in this EXACT format (include both headers even if empty):\n\
+                                \n\
+                                AGENTS:\n\
+                                (bullet points about project knowledge: build commands, file locations, architecture, \
+                                gotchas, conventions, error fixes. Or write NONE)\n\
+                                \n\
+                                TOOLS:\n\
+                                (bullet points about tool/environment specifics: host names, paths, device names, \
+                                CLI flags, environment variables, service URLs, config details. Or write NONE)\n\
+                                \n\
+                                Rules: be concise, no duplicates of existing content, bullet points only.",
+                                extraction_task,
+                                result_tail,
+                                current_agents.as_deref().unwrap_or("(empty)"),
+                                current_tools.as_deref().unwrap_or("(empty)")
+                            );
+                            let extract_sid = format!("_extract_{}", uuid::Uuid::new_v4());
+                            match agent_for_extract.chat(
+                                &extract_sid,
+                                &extraction_prompt,
+                                Some("You are a concise knowledge extractor. Follow the output format exactly.".to_string()),
+                                &[],
+                            ).await {
+                                Ok(resp) => {
+                                    let content = resp.content.trim();
+                                    if content.len() > 4000 || content.is_empty() {
+                                        return; // Sanity guard
+                                    }
+
+                                    // Parse the two sections
+                                    let (agents_section, tools_section) = {
+                                        let upper = content.to_uppercase();
+                                        let agents_start = upper.find("AGENTS:");
+                                        let tools_start = upper.find("TOOLS:");
+
+                                        let agents_part = match (agents_start, tools_start) {
+                                            (Some(a), Some(t)) if a < t => {
+                                                Some(content[a + "AGENTS:".len()..t].trim())
+                                            }
+                                            (Some(a), None) => {
+                                                Some(content[a + "AGENTS:".len()..].trim())
+                                            }
+                                            _ => None,
+                                        };
+                                        let tools_part = match tools_start {
+                                            Some(t) => Some(content[t + "TOOLS:".len()..].trim()),
+                                            None => None,
+                                        };
+                                        (agents_part, tools_part)
+                                    };
+
+                                    // Update AGENTS.md if there's new content
+                                    if let Some(agents_new) = agents_section {
+                                        if !agents_new.eq_ignore_ascii_case("NONE") && !agents_new.is_empty() && agents_new.len() < 2000 {
+                                            let agents_path = ws_path.join(".nanna").join("AGENTS.md");
+                                            if let Ok(existing) = tokio::fs::read_to_string(&agents_path).await {
+                                                let updated = format!("{}\n\n### Learned\n{}\n", existing.trim_end(), agents_new);
+                                                if let Err(e) = tokio::fs::write(&agents_path, updated).await {
+                                                    warn!("Failed to update AGENTS.md: {e}");
+                                                } else {
+                                                    info!("Updated AGENTS.md with knowledge from sub-agent task");
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Update TOOLS.md if there's new content
+                                    if let Some(tools_new) = tools_section {
+                                        if !tools_new.eq_ignore_ascii_case("NONE") && !tools_new.is_empty() && tools_new.len() < 2000 {
+                                            let tools_path = ws_path.join(".nanna").join("TOOLS.md");
+                                            if let Ok(existing) = tokio::fs::read_to_string(&tools_path).await {
+                                                let updated = format!("{}\n\n### Learned\n{}\n", existing.trim_end(), tools_new);
+                                                if let Err(e) = tokio::fs::write(&tools_path, updated).await {
+                                                    warn!("Failed to update TOOLS.md: {e}");
+                                                } else {
+                                                    info!("Updated TOOLS.md with knowledge from sub-agent task");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Knowledge extraction skipped (LLM error): {}", e.message);
+                                }
+                            }
+                        });
+                    }
                 }
                 Err(e) => {
-                    sessions.set_sub_session_error(&sid, e.clone()).await;
+                    // If there's partial work, persist it as the sub-session result
+                    let error_msg = if let Some(ref partial) = e.partial_result {
+                        sessions.set_sub_session_result(&sid, partial.content.clone()).await;
+                        format!("{} (partial result preserved)", e.message)
+                    } else {
+                        e.message.clone()
+                    };
+                    sessions.set_sub_session_error(&sid, error_msg.clone()).await;
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(Event::SubSessionFailed {
                             session_id: sid.clone(),
                             parent_id: pid.clone(),
                             label: lbl.clone(),
-                            error: e,
+                            error: error_msg,
                         });
                     }
                     warn!("Sub-session {} failed", sid);

@@ -1,458 +1,470 @@
 <template>
-  <div class="flex flex-col h-full">
+  <div class="h-full flex flex-col relative overflow-hidden">
+
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
-      <div class="flex items-center justify-between gap-3">
+    <header class="relative z-10 px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04]">
+      <div class="flex items-center justify-between">
         <div>
-          <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Workspaces</h2>
-          <p class="text-xs sm:text-sm text-nanna-text-muted">
-            Project directories with AGENTS.md, SOUL.md, and other context files
+          <h2 class="text-base sm:text-lg font-semibold text-white/90">Workspaces</h2>
+          <p class="text-xs sm:text-sm text-white/30">
+            {{ workspaces.length }} workspace{{ workspaces.length !== 1 ? 's' : '' }} registered
           </p>
         </div>
-        <div class="flex gap-2">
-          <UiButton @click="showCreateDialog = true" variant="default" size="sm">
-            <FolderPlus class="w-4 h-4 mr-1" />
+        <div class="flex items-center gap-2">
+          <UiGlassButton pill size="xs" color="accent" @click="showCreateDialog = true">
+            <FolderPlus class="w-3.5 h-3.5" />
             Create
-          </UiButton>
-          <UiButton @click="openFolderDialog" variant="secondary" size="sm">
-            <FolderOpen class="w-4 h-4 mr-1" />
+          </UiGlassButton>
+          <UiGlassButton pill size="xs" @click="openFolderDialog">
+            <FolderOpen class="w-3.5 h-3.5" />
             Open
-          </UiButton>
-          <UiButton @click="refreshWorkspaces" variant="ghost" size="sm" :disabled="isLoading">
-            <RefreshCw :class="['w-4 h-4', isLoading && 'animate-spin']" />
-          </UiButton>
+          </UiGlassButton>
+          <UiGlassButton pill size="xs" :disabled="isLoading" @click="refreshWorkspaces">
+            <RefreshCw :class="['w-3.5 h-3.5', isLoading && 'animate-spin']" />
+          </UiGlassButton>
         </div>
       </div>
     </header>
 
     <!-- Content -->
-    <div class="flex-1 overflow-y-auto p-4 sm:p-6">
-      <div class="max-w-4xl mx-auto space-y-6">
-        
+    <div class="relative z-10 flex-1 overflow-y-auto p-4 sm:p-6">
+      <div class="max-w-4xl mx-auto space-y-4">
+
         <!-- Active Workspace Banner -->
-        <div v-if="activeWorkspace" class="p-4 rounded-xl bg-gradient-to-r from-nanna-accent/20 to-nanna-primary/20 border border-nanna-accent/30">
-          <div class="flex items-center justify-between">
-            <div class="flex items-center gap-3">
-              <div class="w-10 h-10 rounded-lg bg-nanna-accent/30 flex items-center justify-center">
-                <FolderCheck class="w-5 h-5 text-nanna-accent" />
+        <UiGroundGlass v-if="activeWorkspace" class="active-banner">
+          <div class="relative z-10 p-4">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-lg bg-white/[0.06] flex items-center justify-center">
+                  <FolderCheck class="w-5 h-5 text-cyan-300/80" />
+                </div>
+                <div>
+                  <div class="text-[10px] uppercase tracking-wider text-white/30">Active Workspace</div>
+                  <div class="font-semibold text-cyan-300/90">{{ activeWorkspace.name }}</div>
+                </div>
               </div>
-              <div>
-                <div class="text-sm text-nanna-text-muted">Active Workspace</div>
-                <div class="font-semibold text-nanna-text">{{ activeWorkspace.name }}</div>
+              <div class="flex items-center gap-2">
+                <UiGlassButton pill size="xs" @click="reloadActiveWorkspace">
+                  <RefreshCw class="w-3.5 h-3.5" />
+                </UiGlassButton>
+                <UiGlassButton pill size="xs" @click="viewWorkspaceDetails(activeWorkspace)">
+                  View Details
+                </UiGlassButton>
               </div>
             </div>
-            <div class="flex items-center gap-2">
-              <UiButton @click="reloadActiveWorkspace" variant="ghost" size="sm" title="Reload context">
-                <RefreshCw class="w-4 h-4" />
-              </UiButton>
-              <UiButton @click="viewWorkspaceDetails(activeWorkspace)" variant="secondary" size="sm">
-                View Details
-              </UiButton>
+
+            <!-- Context file indicators -->
+            <div class="flex gap-1.5 mt-3 flex-wrap items-center">
+              <span
+                v-for="file in contextFiles"
+                :key="file.key"
+                :class="[
+                  'text-[10px] px-2 py-0.5 rounded-full',
+                  activeWorkspace[file.key]
+                    ? 'bg-white/[0.08] text-white/60'
+                    : 'bg-white/[0.03] text-white/20'
+                ]"
+              >
+                {{ activeWorkspace[file.key] ? '✓' : '○' }} {{ file.name }}
+              </span>
+
+              <button
+                v-if="!activeWorkspace.has_soul || !activeWorkspace.has_user"
+                @click="repairWorkspace(activeWorkspace)"
+                class="ml-auto text-[10px] text-amber-300/60 hover:text-amber-300/90 transition-colors flex items-center gap-1"
+              >
+                <Wrench class="w-3 h-3" />
+                Add missing files
+              </button>
+
+              <span v-else class="text-[10px] text-white/20 ml-auto">
+                {{ activeWorkspace.context_chars.toLocaleString() }} chars
+              </span>
             </div>
           </div>
-          
-          <!-- Context indicators -->
-          <div class="flex gap-2 mt-3 flex-wrap">
-            <UiBadge v-if="activeWorkspace.has_soul" variant="accent">SOUL.md</UiBadge>
-            <UiBadge v-else variant="secondary" class="opacity-50">○ SOUL.md</UiBadge>
-            <UiBadge v-if="activeWorkspace.has_user" variant="secondary">USER.md</UiBadge>
-            <UiBadge v-else variant="secondary" class="opacity-50">○ USER.md</UiBadge>
-            <UiBadge v-if="activeWorkspace.has_agents" variant="secondary">AGENTS.md</UiBadge>
-            <UiBadge v-if="activeWorkspace.has_memory" variant="secondary">MEMORY.md</UiBadge>
-            
-            <!-- Repair button if missing files -->
-            <UiButton 
-              v-if="!activeWorkspace.has_soul || !activeWorkspace.has_user"
-              @click="repairWorkspace(activeWorkspace)"
-              variant="ghost"
-              size="sm"
-              class="ml-auto text-nanna-warning"
-            >
-              <Wrench class="w-3 h-3 mr-1" />
-              Add missing files
-            </UiButton>
-            
-            <span v-else class="text-xs text-nanna-text-dim ml-auto">
-              {{ activeWorkspace.context_chars.toLocaleString() }} chars
-            </span>
-          </div>
-        </div>
+        </UiGroundGlass>
 
         <!-- Empty State -->
-        <div v-if="workspaces.length === 0 && !isLoading" class="text-center py-12">
-          <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-nanna-bg-elevated flex items-center justify-center">
-            <FolderPlus class="w-8 h-8 text-nanna-text-dim" />
-          </div>
-          <h3 class="text-lg font-semibold text-nanna-text mb-2">No workspaces open</h3>
-          <p class="text-sm text-nanna-text-muted mb-4 max-w-md mx-auto">
-            Create a new workspace or open an existing folder containing workspace files.
-          </p>
-          <div class="flex gap-3 justify-center">
-            <UiButton @click="showCreateDialog = true">
-              <FolderPlus class="w-4 h-4 mr-2" />
-              Create Workspace
-            </UiButton>
-            <UiButton @click="openFolderDialog" variant="secondary">
-              <FolderOpen class="w-4 h-4 mr-2" />
-              Open Existing
-            </UiButton>
+        <div v-if="workspaces.length === 0 && !isLoading" class="flex items-center justify-center min-h-[400px]">
+          <div class="text-center max-w-md px-4">
+            <div class="text-5xl sm:text-6xl mb-4">📂</div>
+            <h3 class="text-lg sm:text-xl font-semibold text-white/80 mb-2">No workspaces open</h3>
+            <p class="text-sm text-white/30 mb-6">
+              Create a new workspace or open an existing folder containing workspace files.
+            </p>
+            <div class="flex gap-3 justify-center">
+              <UiGlassButton pill size="sm" color="accent" @click="showCreateDialog = true">
+                <FolderPlus class="w-4 h-4" />
+                Create Workspace
+              </UiGlassButton>
+              <UiGlassButton pill size="sm" @click="openFolderDialog">
+                <FolderOpen class="w-4 h-4" />
+                Open Existing
+              </UiGlassButton>
+            </div>
           </div>
         </div>
 
         <!-- Workspace List -->
-        <div v-else class="space-y-3">
-          <h3 class="text-sm font-medium text-nanna-text-muted mb-2">
-            {{ workspaces.length + 1 }} Option{{ workspaces.length !== 0 ? 's' : '' }}
-          </h3>
-          
+        <div v-else class="space-y-2">
+
           <!-- Global Option -->
-          <UiCard
-            :class="[
-              'cursor-pointer transition-all hover:border-nanna-primary/40',
-              !activeWorkspace && 'border-nanna-primary/50 bg-nanna-primary/5'
-            ]"
+          <UiGroundGlass
+            :class="['ws-card', { 'ws-card--active': !activeWorkspace }]"
             @click="clearActiveWorkspace"
           >
-            <div class="flex items-center gap-3">
-              <!-- Icon -->
+            <div class="relative z-10 flex items-center gap-3 p-3 cursor-pointer">
               <div :class="[
-                'w-10 h-10 rounded-lg flex items-center justify-center shrink-0',
-                !activeWorkspace ? 'bg-nanna-primary/30' : 'bg-nanna-bg-elevated'
+                'w-9 h-9 rounded-lg flex items-center justify-center shrink-0',
+                !activeWorkspace ? 'bg-purple-500/20' : 'bg-white/[0.04]'
               ]">
-                <Globe :class="['w-5 h-5', !activeWorkspace ? 'text-nanna-primary' : 'text-nanna-text-muted']" />
+                <Globe :class="['w-5 h-5', !activeWorkspace ? 'text-purple-400/80' : 'text-white/30']" />
               </div>
-              
-              <!-- Info -->
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
-                  <span class="font-medium text-nanna-text">Global</span>
-                  <UiBadge v-if="!activeWorkspace" variant="default" class="shrink-0">Active</UiBadge>
+                  <span class="font-medium text-white/90">Global</span>
+                  <span v-if="!activeWorkspace" class="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300/80">
+                    Active
+                  </span>
                 </div>
-                <div class="text-xs text-nanna-text-dim">No workspace context • Uses global memory only</div>
+                <div class="text-xs text-white/25">No workspace context · Uses global memory only</div>
               </div>
             </div>
-          </UiCard>
-          
+          </UiGroundGlass>
+
           <!-- Workspace Cards -->
-          <UiCard
+          <UiGroundGlass
             v-for="ws in workspaces"
             :key="ws.id"
-            :class="[
-              'cursor-pointer transition-all hover:border-nanna-primary/40',
-              ws.active && 'border-nanna-accent/50 bg-nanna-accent/5'
-            ]"
+            :class="['ws-card', { 'ws-card--active': ws.active }]"
             @click="selectWorkspace(ws)"
           >
-            <div class="flex items-center gap-3">
+            <div class="relative z-10 flex items-center gap-3 p-3 cursor-pointer">
               <!-- Icon -->
               <div :class="[
-                'w-10 h-10 rounded-lg flex items-center justify-center shrink-0',
-                ws.active ? 'bg-nanna-accent/30' : 'bg-nanna-bg-elevated'
+                'w-9 h-9 rounded-lg flex items-center justify-center shrink-0',
+                ws.active ? 'bg-cyan-400/15' : 'bg-white/[0.04]'
               ]">
-                <Folder :class="['w-5 h-5', ws.active ? 'text-nanna-accent' : 'text-nanna-text-muted']" />
+                <Folder :class="['w-5 h-5', ws.active ? 'text-cyan-300/80' : 'text-white/30']" />
               </div>
-              
+
               <!-- Info -->
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
-                  <span class="font-medium text-nanna-text truncate">{{ ws.name }}</span>
-                  <UiBadge v-if="ws.active" variant="accent" class="shrink-0">Active</UiBadge>
-                  <UiBadge v-if="!ws.has_soul && !ws.has_agents" variant="warning" class="shrink-0">
+                  <span class="font-medium text-white/90 truncate">{{ ws.name }}</span>
+                  <span v-if="ws.active" class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-400/15 text-cyan-300/80">
+                    Active
+                  </span>
+                  <span v-if="!ws.has_soul && !ws.has_agents" class="text-[10px] px-2 py-0.5 rounded-full bg-amber-400/15 text-amber-300/70">
                     Incomplete
-                  </UiBadge>
+                  </span>
                 </div>
-                <div class="text-xs text-nanna-text-dim truncate">{{ ws.path }}</div>
+                <div class="text-xs text-white/25 truncate">{{ ws.path }}</div>
               </div>
-              
-              <!-- Context files -->
+
+              <!-- Context file dots -->
               <div class="hidden sm:flex gap-1 shrink-0">
-                <span 
-                  v-for="file in contextFiles" 
+                <span
+                  v-for="file in contextFiles"
                   :key="file.key"
                   :class="[
-                    'text-xs px-1.5 py-0.5 rounded',
-                    ws[file.key] ? 'bg-nanna-success/20 text-nanna-success' : 'bg-nanna-bg-elevated/30 text-nanna-text-dim'
+                    'text-[10px] px-1.5 py-0.5 rounded',
+                    ws[file.key] ? 'bg-emerald-400/15 text-emerald-300/60' : 'bg-white/[0.03] text-white/15'
                   ]"
                   :title="file.name"
                 >
                   {{ file.short }}
                 </span>
               </div>
-              
+
               <!-- Actions -->
-              <div class="flex gap-1 shrink-0">
-                <UiButton 
-                  v-if="!ws.active" 
-                  @click.stop="setActive(ws)" 
-                  variant="ghost" 
-                  size="sm"
+              <div class="flex gap-1 shrink-0" @click.stop>
+                <button
+                  v-if="!ws.active"
+                  @click="setActive(ws)"
+                  class="p-1.5 rounded-md text-white/20 hover:text-white/60 hover:bg-white/[0.04] transition-all"
                   title="Set as active"
                 >
                   <Play class="w-4 h-4" />
-                </UiButton>
-                <UiButton 
-                  @click.stop="closeWorkspace(ws)" 
-                  variant="ghost" 
-                  size="sm"
+                </button>
+                <button
+                  @click="closeWorkspace(ws)"
+                  class="p-1.5 rounded-md text-white/20 hover:text-red-400/60 hover:bg-white/[0.04] transition-all"
                   title="Close workspace"
-                  class="hover:text-nanna-error"
                 >
                   <X class="w-4 h-4" />
-                </UiButton>
+                </button>
               </div>
             </div>
-          </UiCard>
+          </UiGroundGlass>
         </div>
 
         <!-- Workspace Files Reference -->
-        <UiCard class="mt-8">
-          <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
-            <FileText class="w-4 h-4" />
-            Workspace Files Reference
-          </h3>
-          <div class="grid gap-2 text-sm">
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
-              <code class="text-nanna-accent shrink-0">SOUL.md</code>
-              <span class="text-nanna-text-muted">Agent personality, identity, voice</span>
-            </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
-              <code class="text-nanna-accent shrink-0">USER.md</code>
-              <span class="text-nanna-text-muted">Info about the user (name, preferences)</span>
-            </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
-              <code class="text-nanna-accent shrink-0">AGENTS.md</code>
-              <span class="text-nanna-text-muted">How the agent should behave in this workspace</span>
-            </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
-              <code class="text-nanna-accent shrink-0">TOOLS.md</code>
-              <span class="text-nanna-text-muted">Tool-specific notes and configurations</span>
-            </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
-              <code class="text-nanna-accent shrink-0">MEMORY.md</code>
-              <span class="text-nanna-text-muted">Long-term curated memories</span>
-            </div>
-            <div class="flex items-start gap-2 p-2 rounded bg-nanna-bg-elevated/40">
-              <code class="text-nanna-accent shrink-0">memory/</code>
-              <span class="text-nanna-text-muted">Daily notes (YYYY-MM-DD.md files)</span>
+        <UiGroundGlass class="mt-6">
+          <div class="relative z-10 p-4">
+            <h3 class="text-xs font-semibold text-purple-300/70 mb-3 flex items-center gap-2 uppercase tracking-wider">
+              <FileText class="w-3.5 h-3.5" />
+              Workspace Files Reference
+            </h3>
+            <div class="grid gap-1.5 text-sm">
+              <div
+                v-for="ref in fileReference"
+                :key="ref.name"
+                class="flex items-start gap-3 px-3 py-2 rounded-lg bg-white/[0.03]"
+              >
+                <code class="text-cyan-300/70 text-xs shrink-0 mt-0.5">{{ ref.name }}</code>
+                <span class="text-white/35 text-xs">{{ ref.desc }}</span>
+              </div>
             </div>
           </div>
-        </UiCard>
+        </UiGroundGlass>
 
       </div>
     </div>
 
-    <!-- Create Workspace Dialog -->
+    <!-- ═══ Create Workspace Dialog ═══ -->
     <Teleport to="body">
-      <div v-if="showCreateDialog" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" @click.self="showCreateDialog = false">
-        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-lg overflow-hidden border border-white/[0.06] shadow-2xl">
-          <!-- Dialog Header -->
-          <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
-            <div class="flex items-center gap-3">
-              <FolderPlus class="w-5 h-5 text-nanna-accent" />
-              <h3 class="font-semibold text-nanna-text">Create Workspace</h3>
-            </div>
-            <UiButton @click="showCreateDialog = false" variant="ghost" size="sm">
-              <X class="w-4 h-4" />
-            </UiButton>
-          </div>
-          
-          <!-- Dialog Content -->
-          <div class="p-4 space-y-4">
-            <!-- Folder Selection -->
-            <div>
-              <label class="text-sm font-medium text-nanna-text mb-2 block">Location</label>
-              <div class="flex gap-2">
-                <input 
-                  v-model="createPath"
-                  type="text"
-                  class="flex-1 px-3 py-2 rounded-lg bg-nanna-bg-elevated/30 border border-white/[0.06] text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
-                  placeholder="Select a folder..."
-                  readonly
-                />
-                <UiButton @click="selectCreateFolder" variant="secondary" size="sm">
-                  Browse
-                </UiButton>
+      <Transition name="dialog">
+        <div v-if="showCreateDialog" class="fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="showCreateDialog = false">
+          <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <UiGroundGlass class="dialog-panel relative w-full max-w-lg">
+            <div class="relative z-10">
+              <!-- Header -->
+              <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
+                <div class="flex items-center gap-3">
+                  <FolderPlus class="w-5 h-5 text-cyan-300/70" />
+                  <h3 class="font-semibold text-white/90">Create Workspace</h3>
+                </div>
+                <button @click="showCreateDialog = false" class="text-white/20 hover:text-white/60 transition-colors">
+                  <X class="w-4 h-4" />
+                </button>
               </div>
-              <p v-if="createValidity && createValidity.exists && createValidity.is_valid" class="text-xs text-nanna-warning mt-1">
-                ⚠️ This folder already has workspace files. Missing files will be added.
-              </p>
-            </div>
-            
-            <!-- File Selection -->
-            <div>
-              <label class="text-sm font-medium text-nanna-text mb-2 block">Files to create</label>
-              <div class="space-y-2">
-                <label 
-                  v-for="file in availableFiles" 
-                  :key="file.name"
-                  class="flex items-center gap-3 p-2 rounded-lg hover:bg-white/[0.06] cursor-pointer"
-                >
-                  <input 
-                    type="checkbox" 
-                    v-model="createFiles"
-                    :value="file.name"
-                    :disabled="createValidity && createValidity[file.existsKey]"
-                    class="rounded border-nanna-primary/30"
-                  />
-                  <div class="flex-1">
-                    <code class="text-nanna-accent text-sm">{{ file.name }}</code>
-                    <span v-if="createValidity && createValidity[file.existsKey]" class="text-xs text-nanna-success ml-2">
-                      ✓ exists
-                    </span>
-                  </div>
-                  <span class="text-xs text-nanna-text-dim">{{ file.desc }}</span>
-                </label>
-              </div>
-            </div>
-          </div>
-          
-          <!-- Dialog Footer -->
-          <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
-            <UiButton @click="showCreateDialog = false" variant="ghost" size="sm">
-              Cancel
-            </UiButton>
-            <UiButton 
-              @click="createWorkspace" 
-              :disabled="!createPath || createFiles.length === 0"
-              size="sm"
-            >
-              <FolderPlus class="w-4 h-4 mr-1" />
-              Create
-            </UiButton>
-          </div>
-        </div>
-      </div>
-    </Teleport>
 
-    <!-- Workspace Details Modal -->
-    <Teleport to="body">
-      <div v-if="selectedWorkspace" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" @click.self="selectedWorkspace = null">
-        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-2xl max-h-[80vh] overflow-hidden border border-white/[0.06] shadow-2xl">
-          <!-- Modal Header -->
-          <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
-            <div class="flex items-center gap-3">
-              <FolderCheck class="w-5 h-5 text-nanna-accent" />
-              <h3 class="font-semibold text-nanna-text">{{ selectedWorkspace.name }}</h3>
-            </div>
-            <UiButton @click="selectedWorkspace = null" variant="ghost" size="sm">
-              <X class="w-4 h-4" />
-            </UiButton>
-          </div>
-          
-          <!-- Modal Content -->
-          <div class="p-4 overflow-y-auto max-h-[60vh] space-y-4">
-            <!-- Path -->
-            <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
-              <div class="text-xs text-nanna-text-muted mb-1">Path</div>
-              <code class="text-sm text-nanna-text break-all">{{ selectedWorkspace.path }}</code>
-            </div>
-            
-            <!-- Context Files Status -->
-            <div>
-              <div class="text-sm font-medium text-nanna-text mb-2">Context Files</div>
-              <div class="grid grid-cols-2 gap-2">
-                <div 
-                  v-for="file in detailFiles"
-                  :key="file.key"
-                  :class="['p-2 rounded flex items-center justify-between', selectedWorkspace[file.key] ? 'bg-nanna-success/10' : 'bg-nanna-bg-elevated/30']"
-                >
-                  <span :class="selectedWorkspace[file.key] ? 'text-nanna-success' : 'text-nanna-text-dim'">
-                    {{ selectedWorkspace[file.key] ? '✓' : '○' }} {{ file.name }}
-                  </span>
-                  <UiButton 
-                    v-if="!selectedWorkspace[file.key]"
-                    @click="createSingleFile(selectedWorkspace, file.name)"
-                    variant="ghost"
-                    size="sm"
-                    class="h-6 px-2 text-xs"
-                  >
-                    Create
-                  </UiButton>
+              <!-- Content -->
+              <div class="p-4 space-y-4">
+                <!-- Folder Selection -->
+                <div>
+                  <label class="text-xs font-medium text-white/50 mb-2 block">Location</label>
+                  <div class="flex gap-2">
+                    <UiGlassInput
+                      v-model="createPath"
+                      placeholder="Select a folder..."
+                      mono
+                      disabled
+                      class="flex-1"
+                    />
+                    <UiGlassButton pill size="xs" @click="selectCreateFolder">
+                      Browse
+                    </UiGlassButton>
+                  </div>
+                  <p v-if="createValidity && createValidity.exists && createValidity.is_valid" class="text-[11px] text-amber-300/60 mt-1.5">
+                    ⚠️ This folder already has workspace files. Missing files will be added.
+                  </p>
+                </div>
+
+                <!-- File Selection -->
+                <div>
+                  <label class="text-xs font-medium text-white/50 mb-2 block">Files to create</label>
+                  <div class="space-y-1">
+                    <label
+                      v-for="file in availableFiles"
+                      :key="file.name"
+                      class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/[0.04] cursor-pointer transition-colors"
+                    >
+                      <input
+                        type="checkbox"
+                        v-model="createFiles"
+                        :value="file.name"
+                        :disabled="createValidity && createValidity[file.existsKey]"
+                        class="rounded border-white/20 bg-transparent"
+                      />
+                      <div class="flex-1">
+                        <code class="text-cyan-300/70 text-xs">{{ file.name }}</code>
+                        <span v-if="createValidity && createValidity[file.existsKey]" class="text-[10px] text-emerald-300/60 ml-2">
+                          ✓ exists
+                        </span>
+                      </div>
+                      <span class="text-[11px] text-white/25">{{ file.desc }}</span>
+                    </label>
+                  </div>
                 </div>
               </div>
-            </div>
-            
-            <!-- Stats -->
-            <div class="flex gap-4 text-sm">
-              <div>
-                <span class="text-nanna-text-muted">Total context:</span>
-                <span class="text-nanna-text ml-1 font-mono">{{ selectedWorkspace.context_chars.toLocaleString() }} chars</span>
+
+              <!-- Footer -->
+              <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
+                <UiGlassButton pill size="xs" @click="showCreateDialog = false">
+                  Cancel
+                </UiGlassButton>
+                <UiGlassButton
+                  pill
+                  size="xs"
+                  color="accent"
+                  :disabled="!createPath || createFiles.length === 0"
+                  @click="createWorkspace"
+                >
+                  <FolderPlus class="w-3.5 h-3.5" />
+                  Create
+                </UiGlassButton>
               </div>
-              <div>
-                <span class="text-nanna-text-muted">~Tokens:</span>
-                <span class="text-nanna-text ml-1 font-mono">{{ Math.round(selectedWorkspace.context_chars / 4).toLocaleString() }}</span>
-              </div>
             </div>
-          </div>
-          
-          <!-- Modal Footer -->
-          <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
-            <UiButton @click="reloadWorkspaceById(selectedWorkspace.id)" variant="secondary" size="sm">
-              <RefreshCw class="w-4 h-4 mr-1" />
-              Reload
-            </UiButton>
-            <UiButton v-if="!selectedWorkspace.active" @click="setActiveAndClose(selectedWorkspace)" variant="default" size="sm">
-              <Play class="w-4 h-4 mr-1" />
-              Set Active
-            </UiButton>
-          </div>
+          </UiGroundGlass>
         </div>
-      </div>
+      </Transition>
     </Teleport>
 
-    <!-- Repair Dialog -->
+    <!-- ═══ Workspace Details Dialog ═══ -->
     <Teleport to="body">
-      <div v-if="showRepairDialog" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" @click.self="showRepairDialog = false">
-        <div class="bg-nanna-bg-surface rounded-xl w-full max-w-lg overflow-hidden border border-white/[0.06] shadow-2xl">
-          <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
-            <div class="flex items-center gap-3">
-              <Wrench class="w-5 h-5 text-nanna-warning" />
-              <h3 class="font-semibold text-nanna-text">Add Missing Files</h3>
+      <Transition name="dialog">
+        <div v-if="selectedWorkspace" class="fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="selectedWorkspace = null">
+          <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <UiGroundGlass class="dialog-panel relative w-full max-w-2xl max-h-[80vh] overflow-hidden">
+            <div class="relative z-10">
+              <!-- Header -->
+              <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
+                <div class="flex items-center gap-3">
+                  <FolderCheck class="w-5 h-5 text-cyan-300/70" />
+                  <h3 class="font-semibold text-white/90">{{ selectedWorkspace.name }}</h3>
+                </div>
+                <button @click="selectedWorkspace = null" class="text-white/20 hover:text-white/60 transition-colors">
+                  <X class="w-4 h-4" />
+                </button>
+              </div>
+
+              <!-- Content -->
+              <div class="p-4 overflow-y-auto max-h-[60vh] space-y-4">
+                <!-- Path -->
+                <div class="px-3 py-2.5 rounded-lg bg-white/[0.03]">
+                  <div class="text-[10px] text-white/25 mb-0.5">Path</div>
+                  <code class="text-xs text-white/60 break-all">{{ selectedWorkspace.path }}</code>
+                </div>
+
+                <!-- Context Files Status -->
+                <div>
+                  <div class="text-xs font-medium text-white/50 mb-2">Context Files</div>
+                  <div class="grid grid-cols-2 gap-1.5">
+                    <div
+                      v-for="file in detailFiles"
+                      :key="file.key"
+                      :class="[
+                        'flex items-center justify-between px-3 py-2 rounded-lg',
+                        selectedWorkspace[file.key] ? 'bg-emerald-400/[0.06]' : 'bg-white/[0.03]'
+                      ]"
+                    >
+                      <span :class="selectedWorkspace[file.key] ? 'text-emerald-300/60 text-xs' : 'text-white/20 text-xs'">
+                        {{ selectedWorkspace[file.key] ? '✓' : '○' }} {{ file.name }}
+                      </span>
+                      <UiGlassButton
+                        v-if="!selectedWorkspace[file.key]"
+                        pill
+                        size="xs"
+                        @click="createSingleFile(selectedWorkspace, file.name)"
+                        class="!py-0.5 !px-2 !text-[10px]"
+                      >
+                        Create
+                      </UiGlassButton>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Stats -->
+                <div class="flex gap-6 text-xs text-white/30">
+                  <div>
+                    <span class="text-white/20">Total context:</span>
+                    <span class="text-white/50 ml-1 font-mono">{{ selectedWorkspace.context_chars.toLocaleString() }} chars</span>
+                  </div>
+                  <div>
+                    <span class="text-white/20">~Tokens:</span>
+                    <span class="text-white/50 ml-1 font-mono">{{ Math.round(selectedWorkspace.context_chars / 4).toLocaleString() }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Footer -->
+              <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
+                <UiGlassButton pill size="xs" @click="reloadWorkspaceById(selectedWorkspace.id)">
+                  <RefreshCw class="w-3.5 h-3.5" />
+                  Reload
+                </UiGlassButton>
+                <UiGlassButton
+                  v-if="!selectedWorkspace.active"
+                  pill
+                  size="xs"
+                  color="accent"
+                  @click="setActiveAndClose(selectedWorkspace)"
+                >
+                  <Play class="w-3.5 h-3.5" />
+                  Set Active
+                </UiGlassButton>
+              </div>
             </div>
-            <UiButton @click="showRepairDialog = false" variant="ghost" size="sm">
-              <X class="w-4 h-4" />
-            </UiButton>
-          </div>
-          
-          <div class="p-4 space-y-4">
-            <p class="text-sm text-nanna-text-muted">
-              The workspace <strong class="text-nanna-text">{{ repairTarget?.name }}</strong> is missing some files. 
-              Select which files to create with default templates:
-            </p>
-            
-            <div class="space-y-2">
-              <label 
-                v-for="file in missingFilesForRepair" 
-                :key="file.name"
-                class="flex items-center gap-3 p-2 rounded-lg hover:bg-white/[0.06] cursor-pointer"
-              >
-                <input 
-                  type="checkbox" 
-                  v-model="repairFiles"
-                  :value="file.name"
-                  class="rounded border-nanna-primary/30"
-                />
-                <code class="text-nanna-accent text-sm">{{ file.name }}</code>
-                <span class="text-xs text-nanna-text-dim">{{ file.desc }}</span>
-              </label>
-            </div>
-          </div>
-          
-          <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
-            <UiButton @click="showRepairDialog = false" variant="ghost" size="sm">
-              Cancel
-            </UiButton>
-            <UiButton 
-              @click="executeRepair" 
-              :disabled="repairFiles.length === 0"
-              size="sm"
-            >
-              <Wrench class="w-4 h-4 mr-1" />
-              Create Files
-            </UiButton>
-          </div>
+          </UiGroundGlass>
         </div>
-      </div>
+      </Transition>
+    </Teleport>
+
+    <!-- ═══ Repair Dialog ═══ -->
+    <Teleport to="body">
+      <Transition name="dialog">
+        <div v-if="showRepairDialog" class="fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="showRepairDialog = false">
+          <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <UiGroundGlass class="dialog-panel relative w-full max-w-lg">
+            <div class="relative z-10">
+              <!-- Header -->
+              <div class="flex items-center justify-between p-4 border-b border-white/[0.04]">
+                <div class="flex items-center gap-3">
+                  <Wrench class="w-5 h-5 text-amber-300/70" />
+                  <h3 class="font-semibold text-white/90">Add Missing Files</h3>
+                </div>
+                <button @click="showRepairDialog = false" class="text-white/20 hover:text-white/60 transition-colors">
+                  <X class="w-4 h-4" />
+                </button>
+              </div>
+
+              <!-- Content -->
+              <div class="p-4 space-y-4">
+                <p class="text-xs text-white/40">
+                  The workspace <strong class="text-white/70">{{ repairTarget?.name }}</strong> is missing some files.
+                  Select which files to create with default templates:
+                </p>
+
+                <div class="space-y-1">
+                  <label
+                    v-for="file in missingFilesForRepair"
+                    :key="file.name"
+                    class="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/[0.04] cursor-pointer transition-colors"
+                  >
+                    <input
+                      type="checkbox"
+                      v-model="repairFiles"
+                      :value="file.name"
+                      class="rounded border-white/20 bg-transparent"
+                    />
+                    <code class="text-cyan-300/70 text-xs">{{ file.name }}</code>
+                    <span class="text-[11px] text-white/25">{{ file.desc }}</span>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Footer -->
+              <div class="flex justify-end gap-2 p-4 border-t border-white/[0.04]">
+                <UiGlassButton pill size="xs" @click="showRepairDialog = false">
+                  Cancel
+                </UiGlassButton>
+                <UiGlassButton
+                  pill
+                  size="xs"
+                  color="accent"
+                  :disabled="repairFiles.length === 0"
+                  @click="executeRepair"
+                >
+                  <Wrench class="w-3.5 h-3.5" />
+                  Create Files
+                </UiGlassButton>
+              </div>
+            </div>
+          </UiGroundGlass>
+        </div>
+      </Transition>
     </Teleport>
   </div>
 </template>
@@ -461,7 +473,7 @@
 import { ref, computed, onMounted, watch, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import { 
+import {
   Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
 } from 'lucide-vue-next'
 
@@ -532,6 +544,15 @@ const availableFiles = [
   { name: 'MEMORY.md', desc: 'Long-term memory', existsKey: 'has_memory' },
 ]
 
+const fileReference = [
+  { name: 'SOUL.md', desc: 'Agent personality, identity, voice' },
+  { name: 'USER.md', desc: 'Info about the user (name, preferences)' },
+  { name: 'AGENTS.md', desc: 'How the agent should behave in this workspace' },
+  { name: 'TOOLS.md', desc: 'Tool-specific notes and configurations' },
+  { name: 'MEMORY.md', desc: 'Long-term curated memories' },
+  { name: 'memory/', desc: 'Daily notes (YYYY-MM-DD.md files)' },
+]
+
 const missingFilesForRepair = computed(() => {
   if (!repairTarget.value) return []
   return availableFiles.filter(f => {
@@ -549,7 +570,6 @@ watch(createPath, async (path) => {
   if (path) {
     try {
       createValidity.value = await invoke<WorkspaceValidity>('check_workspace_validity', { path })
-      // Uncheck files that already exist
       createFiles.value = createFiles.value.filter(f => {
         const file = availableFiles.find(af => af.name === f)
         if (!file) return true
@@ -585,18 +605,15 @@ async function openFolderDialog() {
       multiple: false,
       title: 'Select Workspace Folder',
     })
-    
+
     if (selected && typeof selected === 'string') {
-      // Check if it's a valid workspace
       const validity = await invoke<WorkspaceValidity>('check_workspace_validity', { path: selected })
-      
+
       if (!validity.is_valid) {
-        // Not a workspace - offer to create one
         createPath.value = selected
         createValidity.value = validity
         showCreateDialog.value = true
       } else {
-        // Valid workspace - open it
         await openWorkspace(selected)
       }
     }
@@ -612,7 +629,7 @@ async function selectCreateFolder() {
       multiple: false,
       title: 'Select Folder for Workspace',
     })
-    
+
     if (selected && typeof selected === 'string') {
       createPath.value = selected
     }
@@ -626,9 +643,6 @@ async function openWorkspace(path: string) {
   try {
     const ws = await invoke<WorkspaceInfo>('open_workspace', { path })
     workspaces.value = await invoke<WorkspaceInfo[]>('list_workspaces')
-    console.log('Opened workspace:', ws.name)
-    
-    // Sync with layout tabs - add tab and switch to it
     addWorkspaceTab?.(ws)
     selectWorkspaceTab?.(ws.id)
   } catch (e) {
@@ -640,19 +654,14 @@ async function openWorkspace(path: string) {
 
 async function createWorkspace() {
   if (!createPath.value || createFiles.value.length === 0) return
-  
+
   isLoading.value = true
   try {
-    // Initialize workspace with selected files
-    await invoke('init_workspace', { 
-      path: createPath.value, 
-      files: createFiles.value 
+    await invoke('init_workspace', {
+      path: createPath.value,
+      files: createFiles.value
     })
-    
-    // Open the workspace
     await openWorkspace(createPath.value)
-    
-    // Reset and close dialog
     showCreateDialog.value = false
     createPath.value = ''
     createFiles.value = ['SOUL.md', 'USER.md', 'AGENTS.md']
@@ -672,8 +681,6 @@ async function setActive(ws: WorkspaceInfo) {
   try {
     await invoke('set_active_workspace', { id: ws.id })
     await loadWorkspaces()
-    
-    // Sync with layout tabs - add tab and select it
     addWorkspaceTab?.(ws)
     selectWorkspaceTab?.(ws.id)
   } catch (e) {
@@ -685,8 +692,6 @@ async function clearActiveWorkspace() {
   try {
     await invoke('clear_active_workspace')
     await loadWorkspaces()
-    
-    // Sync with layout tabs - switch to global
     selectGlobalTab?.()
   } catch (e) {
     console.error('Failed to clear active workspace:', e)
@@ -717,7 +722,6 @@ async function reloadWorkspaceById(id: string) {
   try {
     await invoke('reload_workspace', { id })
     await loadWorkspaces()
-    // Update selected workspace if it was being viewed
     if (selectedWorkspace.value?.id === id) {
       selectedWorkspace.value = workspaces.value.find(w => w.id === id) || null
     }
@@ -732,25 +736,20 @@ function viewWorkspaceDetails(ws: WorkspaceInfo) {
 
 function repairWorkspace(ws: WorkspaceInfo) {
   repairTarget.value = ws
-  // Pre-select all missing files
   repairFiles.value = missingFilesForRepair.value.map(f => f.name)
   showRepairDialog.value = true
 }
 
 async function executeRepair() {
   if (!repairTarget.value || repairFiles.value.length === 0) return
-  
+
   isLoading.value = true
   try {
     await invoke('init_workspace', {
       path: repairTarget.value.path,
       files: repairFiles.value,
     })
-    
-    // Reload the workspace
     await reloadWorkspaceById(repairTarget.value.id)
-    
-    // Close dialog
     showRepairDialog.value = false
     repairTarget.value = null
     repairFiles.value = []
@@ -768,10 +767,7 @@ async function createSingleFile(ws: WorkspaceInfo, filename: string) {
       path: ws.path,
       files: [filename],
     })
-    
     await reloadWorkspaceById(ws.id)
-    
-    // Update the selected workspace view
     if (selectedWorkspace.value?.id === ws.id) {
       selectedWorkspace.value = workspaces.value.find(w => w.id === ws.id) || null
     }
@@ -784,19 +780,40 @@ async function createSingleFile(ws: WorkspaceInfo, filename: string) {
 </script>
 
 <style scoped>
-.expand-enter-active,
-.expand-leave-active {
-  transition: all 0.2s ease;
-  overflow: hidden;
+/* ═══ Workspace cards ═══ */
+.ws-card {
+  transition: border-color 0.15s ease;
 }
-.expand-enter-from,
-.expand-leave-to {
+.ws-card:hover {
+  border-color: rgba(139, 92, 246, 0.25);
+}
+.ws-card--active {
+  border-color: rgba(139, 92, 246, 0.3);
+}
+
+/* ═══ Active workspace banner ═══ */
+.active-banner {
+  border-color: rgba(34, 211, 238, 0.15);
+}
+
+/* ═══ Dialog panels ═══ */
+.dialog-panel {
+  border-radius: 1rem;
+}
+
+/* ═══ Dialog transitions ═══ */
+.dialog-enter-active {
+  transition: all 0.15s ease-out;
+}
+.dialog-leave-active {
+  transition: all 0.1s ease-in;
+}
+.dialog-enter-from {
   opacity: 0;
-  max-height: 0;
+  transform: scale(0.97) translateY(4px);
 }
-.expand-enter-to,
-.expand-leave-from {
-  opacity: 1;
-  max-height: 500px;
+.dialog-leave-to {
+  opacity: 0;
+  transform: scale(0.97);
 }
 </style>

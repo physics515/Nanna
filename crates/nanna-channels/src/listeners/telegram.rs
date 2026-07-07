@@ -3,7 +3,9 @@
 //! Connects to Telegram's getUpdates API and pushes incoming messages
 //! to the message router.
 
+use super::circuit_breaker::{BreakerAction, CircuitBreaker};
 use super::{Listener, ListenerError, ListenerHandle};
+use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -12,11 +14,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const LONG_POLL_TIMEOUT: u64 = 30;
-const MAX_RETRY_DELAY: u64 = 60;
 
 /// Telegram long-polling listener
 pub struct TelegramListener {
@@ -26,6 +27,8 @@ pub struct TelegramListener {
     offset: AtomicI64,
     /// Allowed chat IDs (empty = allow all)
     allowed_chats: Vec<i64>,
+    /// Optional status manager for reporting connection state to the UI
+    status_manager: Option<Arc<StatusManager>>,
 }
 
 impl TelegramListener {
@@ -41,6 +44,7 @@ impl TelegramListener {
             bot_token: bot_token.into(),
             offset: AtomicI64::new(0),
             allowed_chats: Vec::new(),
+            status_manager: None,
         }
     }
 
@@ -55,6 +59,13 @@ impl TelegramListener {
     #[must_use]
     pub fn with_offset(self, offset: i64) -> Self {
         self.offset.store(offset, Ordering::SeqCst);
+        self
+    }
+
+    /// Attach a status manager for reporting connection state to the UI
+    #[must_use]
+    pub fn with_status_manager(mut self, manager: Arc<StatusManager>) -> Self {
+        self.status_manager = Some(manager);
         self
     }
 
@@ -223,7 +234,10 @@ impl TelegramListener {
     ) {
         info!("Telegram listener started");
 
-        let mut retry_delay = Duration::from_secs(1);
+        let mut cb = CircuitBreaker::new("telegram");
+        if let Some(sm) = &self.status_manager {
+            cb = cb.with_status_manager(Arc::clone(sm));
+        }
 
         loop {
             tokio::select! {
@@ -234,7 +248,7 @@ impl TelegramListener {
                 result = self.get_updates() => {
                     match result {
                         Ok(updates) => {
-                            retry_delay = Duration::from_secs(1); // Reset on success
+                            cb.record_success().await;
 
                             for update in updates {
                                 // Update offset to acknowledge this update
@@ -250,15 +264,18 @@ impl TelegramListener {
                                 }
                             }
                         }
-                        Err(ListenerError::Auth(e)) => {
-                            error!("Telegram auth failed: {e}");
-                            // Don't retry auth errors
-                            break;
+                        Err(ListenerError::Auth(ref e)) => {
+                            if cb.record_auth_failure(e).await == BreakerAction::Stop {
+                                break;
+                            }
+                            cb.backoff().await;
                         }
                         Err(e) => {
-                            warn!("Telegram poll error: {e}, retrying in {:?}", retry_delay);
-                            tokio::time::sleep(retry_delay).await;
-                            retry_delay = (retry_delay * 2).min(Duration::from_secs(MAX_RETRY_DELAY));
+                            let detail = e.to_string();
+                            if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                                break;
+                            }
+                            cb.backoff().await;
                         }
                     }
                 }

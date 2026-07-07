@@ -93,6 +93,19 @@ impl ScriptEngine {
         services: Option<HashMap<String, ServiceFn>>,
         default_workdir: Option<std::path::PathBuf>,
     ) -> Result<ExecutionResult> {
+        self.execute_with_workdir_and_session(tool, input, tool_definitions, services, default_workdir, None).await
+    }
+
+    /// Execute a scripted tool with optional working directory and session ID.
+    pub async fn execute_with_workdir_and_session(
+        &self,
+        tool: &ScriptedTool,
+        input: Value,
+        tool_definitions: Option<Value>,
+        services: Option<HashMap<String, ServiceFn>>,
+        default_workdir: Option<std::path::PathBuf>,
+        session_id: Option<String>,
+    ) -> Result<ExecutionResult> {
         let mut bridge = NannaBridge::new(tool.permissions.clone());
         if let Some(defs) = tool_definitions {
             bridge = bridge.with_tool_definitions(defs);
@@ -102,6 +115,9 @@ impl ScriptEngine {
         }
         if let Some(wd) = default_workdir {
             bridge = bridge.with_default_workdir(wd);
+        }
+        if let Some(sid) = session_id {
+            bridge = bridge.with_session_id(sid);
         }
         let bridge = Arc::new(bridge);
         let start = std::time::Instant::now();

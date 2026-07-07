@@ -1,5 +1,7 @@
 export default {
   name: "ocr",
+  version: "0.1.0",
+  output: "context",
   description: "Extract text from an image using optical character recognition. Works on screenshots, photos of documents, handwriting, etc.",
   parameters: {
     type: "object",

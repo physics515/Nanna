@@ -1,12 +1,15 @@
 export default {
   name: "web_search_batch",
+  version: "0.1.0",
+  output: "context",
   description: "Search the web for multiple queries at once. Returns grouped results for each query. Useful for research tasks requiring multiple searches.",
   parameters: {
     type: "object",
     properties: {
       queries: {
         type: "array",
-        description: "Array of search queries (max 5)"
+        output: "context",
+  description: "Array of search queries (max 5)"
       },
       results_per_query: { type: "integer", description: "Number of results per query. Default: 3" }
     },

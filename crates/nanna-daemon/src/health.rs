@@ -298,8 +298,44 @@ impl HealthServer {
         
         info!("Health server listening on http://{}", addr);
         
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = Self::bind_with_retry(addr).await?;
         axum::serve(listener, self.router()).await
+    }
+
+    /// Bind with retry for Windows port conflicts.
+    /// On Unix, uses SO_REUSEADDR. On Windows, retries with delay.
+    async fn bind_with_retry(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener, std::io::Error> {
+        #[cfg(unix)]
+        {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(addr),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_reuse_address(true)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&addr.into())?;
+            socket.listen(128)?;
+            return tokio::net::TcpListener::from_std(socket.into());
+        }
+
+        #[cfg(windows)]
+        {
+            for attempt in 0..5 {
+                match tokio::net::TcpListener::bind(addr).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(e) if attempt < 4 => {
+                        tracing::warn!("Health bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            unreachable!()
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        tokio::net::TcpListener::bind(addr).await
     }
     
     /// Spawn the health server as a background task

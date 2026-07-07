@@ -1,5 +1,6 @@
 export default {
   name: "text_to_speech",
+  version: "0.1.0",
   description: "Convert text to speech audio using a TTS service. Returns the audio as a base64-encoded string.",
   parameters: {
     type: "object",

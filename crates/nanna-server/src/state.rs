@@ -38,6 +38,7 @@ pub struct AppState {
     pub agents: Arc<RwLock<HashMap<String, Arc<RwLock<Agent>>>>>,
     pub webhook_secret: Option<String>,
     pub discord_public_key: Option<String>,
+    pub slack_signing_secret: Option<String>,
     pub default_model: String,
     /// Telegram channel for proactive sends
     pub telegram: Option<Arc<TelegramChannel>>,
@@ -62,6 +63,7 @@ pub struct AppStateBuilder {
     tools: Option<Arc<ToolRegistry>>,
     webhook_secret: Option<String>,
     discord_public_key: Option<String>,
+    slack_signing_secret: Option<String>,
     default_model: String,
     telegram_token: Option<String>,
     discord_bot_token: Option<String>,
@@ -89,6 +91,7 @@ impl AppStateBuilder {
             tools: None,
             webhook_secret: None,
             discord_public_key: None,
+            slack_signing_secret: None,
             default_model: "claude-sonnet-4-20250514".to_string(),
             telegram_token: None,
             discord_bot_token: None,
@@ -153,6 +156,13 @@ impl AppStateBuilder {
     #[must_use]
     pub fn discord_public_key(mut self, key: Option<String>) -> Self {
         self.discord_public_key = key;
+        self
+    }
+
+    /// Set the Slack signing secret for HMAC verification.
+    #[must_use]
+    pub fn slack_signing_secret(mut self, secret: Option<String>) -> Self {
+        self.slack_signing_secret = secret;
         self
     }
 
@@ -275,6 +285,7 @@ impl AppStateBuilder {
             agents: Arc::new(RwLock::new(HashMap::new())),
             webhook_secret: self.webhook_secret,
             discord_public_key: self.discord_public_key,
+            slack_signing_secret: self.slack_signing_secret,
             default_model: self.default_model,
             telegram,
             discord,

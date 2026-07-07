@@ -1,5 +1,6 @@
 export default {
   name: "list_user_tools",
+  version: "0.1.0",
   description: "List all user-created tools showing their names, descriptions, and status.",
   parameters: {
     type: "object",

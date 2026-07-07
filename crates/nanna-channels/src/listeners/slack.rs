@@ -3,7 +3,9 @@
 //! Connects to Slack's Socket Mode WebSocket API for real-time events.
 //! Requires an app token (xapp-*) in addition to the bot token.
 
+use super::circuit_breaker::{BreakerAction, CircuitBreaker};
 use super::{Listener, ListenerError, ListenerHandle};
+use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -22,7 +24,6 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 
 const SLACK_API_BASE: &str = "https://slack.com/api";
-const MAX_RETRY_DELAY: u64 = 120;
 
 /// Slack Socket Mode listener
 pub struct SlackListener {
@@ -36,6 +37,8 @@ pub struct SlackListener {
     self_id: Arc<RwLock<Option<String>>>,
     /// Allowed channel IDs (empty = allow all)
     allowed_channels: Vec<String>,
+    /// Optional status manager for reporting connection state to the UI
+    status_manager: Option<Arc<StatusManager>>,
 }
 
 impl SlackListener {
@@ -55,6 +58,7 @@ impl SlackListener {
             client,
             self_id: Arc::new(RwLock::new(None)),
             allowed_channels: Vec::new(),
+            status_manager: None,
         }
     }
 
@@ -62,6 +66,13 @@ impl SlackListener {
     #[must_use]
     pub fn with_allowed_channels(mut self, channels: Vec<String>) -> Self {
         self.allowed_channels = channels;
+        self
+    }
+
+    /// Attach a status manager for reporting connection state to the UI
+    #[must_use]
+    pub fn with_status_manager(mut self, manager: Arc<StatusManager>) -> Self {
+        self.status_manager = Some(manager);
         self
     }
 
@@ -89,9 +100,12 @@ impl SlackListener {
             .map_err(|e| ListenerError::Api(format!("Failed to parse response: {e}")))?;
 
         if !body.ok {
-            return Err(ListenerError::Api(
-                body.error.unwrap_or_else(|| "Unknown error".to_string()),
-            ));
+            let err = body.error.unwrap_or_else(|| "Unknown error".to_string());
+            // Slack returns specific error codes for auth issues
+            if err == "invalid_auth" || err == "not_authed" || err == "account_inactive" || err == "token_revoked" {
+                return Err(ListenerError::Auth(err));
+            }
+            return Err(ListenerError::Api(err));
         }
 
         body.url.ok_or_else(|| ListenerError::Api("No URL in response".to_string()))
@@ -195,7 +209,10 @@ impl SlackListener {
             debug!("Slack bot user ID: {}", id);
         }
 
-        let mut retry_delay = Duration::from_secs(1);
+        let mut cb = CircuitBreaker::new("slack");
+        if let Some(sm) = &self.status_manager {
+            cb = cb.with_status_manager(Arc::clone(sm));
+        }
 
         loop {
             // Check for shutdown
@@ -204,13 +221,24 @@ impl SlackListener {
                 break;
             }
 
+            cb.report_connecting().await;
+
             // Get WebSocket URL
             let ws_url = match self.get_ws_url().await {
                 Ok(url) => url,
+                Err(ListenerError::Auth(ref e)) => {
+                    if cb.record_auth_failure(e).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
+                    continue;
+                }
                 Err(e) => {
-                    warn!("Failed to get Slack WebSocket URL: {}, retrying in {:?}", e, retry_delay);
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(MAX_RETRY_DELAY));
+                    let detail = e.to_string();
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
                     continue;
                 }
             };
@@ -220,14 +248,16 @@ impl SlackListener {
             let (ws_stream, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = match connect_async(&ws_url).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!("Slack Socket Mode connection failed: {}, retrying in {:?}", e, retry_delay);
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(MAX_RETRY_DELAY));
+                    let detail = format!("WebSocket connect failed: {}", e);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
                     continue;
                 }
             };
 
-            retry_delay = Duration::from_secs(1);
+            cb.record_success().await;
             let (mut write, mut read) = ws_stream.split();
 
             info!("Slack Socket Mode connected");
@@ -326,6 +356,9 @@ impl SlackListener {
                     }
                 }
             }
+
+            // Backoff before reconnecting (no-op if counters are zero)
+            cb.backoff().await;
         }
 
         info!("Slack Socket Mode listener stopped");

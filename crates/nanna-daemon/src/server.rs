@@ -3,6 +3,7 @@
 //! Combines IPC server, control plane, sessions, persistence, and all subsystems.
 
 use crate::agent_service::{AgentService, AgentServiceConfig};
+use nanna_agent::ThinkingMode;
 use crate::control::ControlPlane;
 use crate::memory_persistence::SqliteMemoryPersistence;
 use crate::health::{HealthServer, HealthState, PidFile, DEFAULT_HEALTH_PORT};
@@ -18,7 +19,7 @@ use nanna_config::credentials::{self, SecureStore};
 use nanna_llm::LlmClient;
 use nanna_memory::MemoryService;
 use nanna_tools::{
-    ToolRegistry, AgentSpawner, SpawnResult,
+    ToolRegistry, AgentSpawner, ParentChannel, SpawnResult,
 };
 use nanna_scripting::ServiceFn;
 use async_trait::async_trait;
@@ -44,11 +45,11 @@ impl AgentSpawner for AgentSpawnerImpl {
         &self,
         prompt: &str,
         description: &str,
-        max_iterations: usize,
+        max_iterations: Option<usize>,
     ) -> Result<SpawnResult, String> {
         use nanna_agent::{Agent, AgentContext, RunOptions};
 
-        info!(description = description, max_iterations = max_iterations, "Spawning sub-agent");
+        info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
 
         // Create isolated context with system prompt + workspace only
         let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
@@ -62,9 +63,9 @@ impl AgentSpawner for AgentSpawnerImpl {
             context.workspace_context = Some(ws_ctx.clone());
         }
 
-        // Configure agent with overridden max_iterations
+        // Configure agent — sub-agents are full agents, no artificial iteration cap
         let mut config = self.agent_config.clone();
-        config.max_iterations = Some(max_iterations);
+        config.max_iterations = max_iterations;
 
         // Use sub_agent_model if configured, otherwise fall back to primary model
         if let Some(ref sub_model) = self.agent_config.sub_agent_model {
@@ -79,6 +80,7 @@ impl AgentSpawner for AgentSpawnerImpl {
         // Select the right LLM client via the router based on the model
         // The router dispatches to the correct provider (Anthropic, Ollama, OpenAI, etc.)
         let model = &config.model;
+        let model_display = model.clone(); // Preserve full model name for reporting
         let llm_client = self.router.client_for_model(model)
             .ok_or_else(|| {
                 format!(
@@ -100,7 +102,9 @@ impl AgentSpawner for AgentSpawnerImpl {
         }
 
         let options = RunOptions {
-            max_iterations: Some(max_iterations),
+            max_iterations,
+            is_sub_agent: true,
+            all_tools_active: true,
             ..Default::default()
         };
 
@@ -124,7 +128,114 @@ impl AgentSpawner for AgentSpawnerImpl {
             tool_calls: result.tool_calls.len(),
             input_tokens: result.input_tokens,
             output_tokens: result.output_tokens,
+            model: model_display,
         })
+    }
+}
+
+/// Concrete implementation of ParentChannel that lives in the daemon.
+/// Allows sub-agents to ask their parent questions.
+///
+/// Instead of blocking on mailbox polling, this makes a lightweight LLM call
+/// with the parent session's conversation context to answer the sub-agent's
+/// question directly. This avoids deadlocks (parent is blocked on the task
+/// tool while the sub-agent waits for a reply).
+struct ParentChannelImpl {
+    sessions: Arc<SessionManager>,
+    event_tx: Option<tokio::sync::broadcast::Sender<crate::protocol::Event>>,
+    router: Arc<crate::llm_router::LlmRouter>,
+    /// Model to use for answering sub-agent questions (e.g. cheap/fast model)
+    model: String,
+}
+
+#[async_trait]
+impl ParentChannel for ParentChannelImpl {
+    async fn ask_parent(
+        &self,
+        sub_session_id: &str,
+        question: &str,
+        _timeout_secs: u64,
+    ) -> Result<String, String> {
+        // Look up the sub-session to find its parent and task context
+        let sub_info = self.sessions.get_sub_session(sub_session_id).await
+            .ok_or_else(|| format!("Sub-session '{}' not found — ask_parent is only available to sub-agents", sub_session_id))?;
+
+        let parent_id = sub_info.parent_id.clone()
+            .ok_or_else(|| "This sub-agent has no parent session".to_string())?;
+
+        let label = sub_info.label.clone();
+        let task = sub_info.task.clone();
+
+        // Emit event for GUI visibility
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(crate::protocol::Event::SubSessionQuestion {
+                session_id: sub_session_id.to_string(),
+                parent_id: Some(parent_id.clone()),
+                label: label.clone(),
+                question: question.to_string(),
+            });
+        }
+
+        tracing::info!(
+            sub_session = sub_session_id,
+            parent = %parent_id,
+            label = ?label,
+            "Sub-agent asking parent: {}",
+            question.chars().take(100).collect::<String>()
+        );
+
+        // Load parent session's recent conversation for context
+        let parent_session = self.sessions.get(&parent_id).await
+            .ok_or_else(|| format!("Parent session '{}' not found", parent_id))?;
+
+        let recent_messages: Vec<String> = parent_session.messages.iter()
+            .rev()
+            .take(20) // Last 20 messages for context
+            .rev()
+            .map(|m| format!("[{}]: {}", m.role.as_db_str(), m.content.chars().take(500).collect::<String>()))
+            .collect();
+
+        let context = recent_messages.join("\n");
+
+        // Build a focused prompt to answer the sub-agent's question
+        let prompt = format!(
+            "You are answering a question from a sub-agent that was delegated a task.\n\n\
+             ## Sub-agent task\n{}\n\n\
+             ## Recent conversation context (parent session)\n{}\n\n\
+             ## Sub-agent's question\n{}\n\n\
+             Answer concisely and directly. Provide only the information the sub-agent needs \
+             to continue its work. If you don't have enough context to answer, say so clearly.",
+            task,
+            if context.is_empty() { "(no prior conversation)".to_string() } else { context },
+            question
+        );
+
+        // Make a lightweight LLM call to answer the question using parent context
+        let model = &self.model;
+        let llm_client = self.router.client_for_model(model)
+            .ok_or_else(|| format!("No provider for model '{}'", model))?;
+
+        let stripped_model = crate::llm_router::LlmRouter::strip_model_prefix(model);
+        let request = nanna_llm::CompletionRequest {
+            model: stripped_model,
+            messages: vec![
+                nanna_llm::Message::system("You are a helpful assistant answering questions from sub-agents. Be concise and precise."),
+                nanna_llm::Message::user(&prompt),
+            ],
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+
+        let answer = llm_client.complete(&request).await
+            .map_err(|e| format!("LLM call failed: {}", e))?;
+
+        tracing::info!(
+            sub_session = sub_session_id,
+            answer_len = answer.len(),
+            "Parent answered sub-agent question"
+        );
+
+        Ok(answer)
     }
 }
 
@@ -142,6 +253,7 @@ fn build_script_services(
     memory: &Option<Arc<MemoryService>>,
     spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
     session_history: SharedSessionHistory,
+    workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{json, Value};
 
@@ -150,8 +262,10 @@ fn build_script_services(
     // Memory services
     if let Some(mem) = memory {
         let mem_store = mem.clone();
+        let ws_store = workspace_id.clone();
         services.insert("memory.store".to_string(), Arc::new(move |params: Value| {
             let mem = mem_store.clone();
+            let ws = ws_store.clone();
             Box::pin(async move {
                 let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let tags: HashMap<String, String> = params.get("tags")
@@ -159,7 +273,8 @@ fn build_script_services(
                     .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
                     .unwrap_or_default();
                 let importance = params.get("importance").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-                match mem.remember_with_importance(&content, tags, importance).await {
+                let workspace = ws.read().await.clone();
+                match mem.remember_scoped(&content, tags, importance, workspace).await {
                     Ok((id, _)) => Ok(json!({"id": id})),
                     Err(e) => Err(e.to_string()),
                 }
@@ -167,18 +282,52 @@ fn build_script_services(
         }));
 
         let mem_search = mem.clone();
+        let ws_search = workspace_id.clone();
         services.insert("memory.search".to_string(), Arc::new(move |params: Value| {
             let mem = mem_search.clone();
+            let ws = ws_search.clone();
             Box::pin(async move {
                 let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-                match mem.recall(&query).await {
+                let workspace = ws.read().await;
+                match mem.recall_scoped(&query, workspace.as_deref()).await {
                     Ok(results) => {
                         let items: Vec<Value> = results.into_iter().take(limit).map(|r| {
                             json!({"id": r.id, "content": r.content, "score": r.score})
                         }).collect();
                         Ok(Value::Array(items))
                     }
+                    Err(e) => {
+                        // If embedding is not configured, return empty results
+                        // instead of an error so the agent can continue gracefully
+                        let msg = e.to_string();
+                        if msg.contains("embedding") || msg.contains("No embedding function") {
+                            tracing::debug!("Memory search skipped: {}", msg);
+                            Ok(Value::Array(vec![]))
+                        } else {
+                            Err(msg)
+                        }
+                    }
+                }
+            })
+        }));
+
+        // Alias: some tool scripts may call memory.embed instead of memory.store
+        let mem_embed = mem.clone();
+        let ws_embed = workspace_id.clone();
+        services.insert("memory.embed".to_string(), Arc::new(move |params: Value| {
+            let mem = mem_embed.clone();
+            let ws = ws_embed.clone();
+            Box::pin(async move {
+                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tags: HashMap<String, String> = params.get("tags")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                    .unwrap_or_default();
+                let importance = params.get("importance").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let workspace = ws.read().await.clone();
+                match mem.remember_scoped(&content, tags, importance, workspace).await {
+                    Ok((id, _)) => Ok(json!({"id": id})),
                     Err(e) => Err(e.to_string()),
                 }
             })
@@ -217,14 +366,47 @@ fn build_script_services(
             Box::pin(async move {
                 let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("sub-task").to_string();
-                let max_iterations = params.get("max_iterations").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                let max_iterations = params.get("max_iterations").and_then(|v| v.as_u64()).map(|v| v as usize);
                 match spawner.spawn(&prompt, &description, max_iterations).await {
                     Ok(result) => Ok(json!({
                         "text": result.text,
                         "iterations": result.iterations,
                         "tool_calls": result.tool_calls,
+                        "model": result.model,
                     })),
                     Err(e) => Err(e),
+                }
+            })
+        }));
+    }
+
+    // Embedded Python interpreter (no system Python required)
+    {
+        use nanna_scripting::python::PythonEngine;
+        let python_engine = Arc::new(PythonEngine::new());
+        services.insert("python.exec".to_string(), Arc::new(move |params: Value| {
+            let engine = python_engine.clone();
+            Box::pin(async move {
+                let code = params.get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let timeout = params.get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
+                let workdir = params.get("workdir")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                match engine.execute(&code, workdir.as_deref(), timeout).await {
+                    Ok(result) => Ok(json!({
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "success": result.success,
+                        "error": result.error,
+                        "duration_ms": result.duration_ms,
+                    })),
+                    Err(e) => Err(e.to_string()),
                 }
             })
         }));
@@ -450,8 +632,13 @@ impl DaemonServer {
         }
     }
     
-    /// Set the storage backend for model stats persistence.
+    /// Set the storage backend for model stats persistence and session persistence.
     pub fn set_storage(&mut self, storage: Arc<nanna_storage::Storage>) {
+        // Replace the SessionManager with one that has storage
+        let new_sessions = Arc::new(SessionManager::with_storage(storage.clone()));
+        self.sessions = new_sessions.clone();
+        // Update control plane reference
+        self._control = Arc::new(ControlPlane::new(self.sessions.clone()));
         self.storage = Some(storage);
     }
 
@@ -489,22 +676,29 @@ impl DaemonServer {
             }
         }
         
-        // Load persisted sessions
-        match self.persistence.load_sessions_with_fallback().await {
-            Ok((sessions, default_id)) => {
-                info!("Loaded {} persisted sessions", sessions.len());
-                for session in sessions {
-                    self.sessions.restore(session).await;
+        // Load sessions from SQLite database
+        {
+            let loaded = self.sessions.load_from_db().await;
+            info!("Loaded {} sessions from database", loaded);
+        }
+
+        // If no sessions loaded from DB, check for legacy sessions.json migration
+        if self.sessions.count().await == 0 {
+            if let Some((sessions, default_id)) = self.persistence.load_legacy_sessions().await {
+                if !sessions.is_empty() {
+                    info!("Migrating {} sessions from legacy sessions.json to database", sessions.len());
+                    for session in sessions {
+                        self.sessions.restore(session).await;
+                    }
+                    if let Some(id) = default_id {
+                        self.sessions.set_default(&id).await;
+                    }
+                    // Mark as migrated
+                    self.persistence.mark_sessions_migrated().await;
                 }
-                if let Some(id) = default_id {
-                    self.sessions.set_default(&id).await;
-                }
-            }
-            Err(e) => {
-                warn!("Failed to load persisted sessions: {}", e);
             }
         }
-        
+
         // Create default session if none exist
         if self.sessions.count().await == 0 {
             let default_session = self.sessions.create(Some("Main".to_string())).await;
@@ -512,7 +706,68 @@ impl DaemonServer {
         }
         
         // Initialize services
-        let (tools, memory, agent, router, tools_dir) = self.init_services().await?;
+        let (tools, memory, agent, router, tools_dir, workspace_id_for_services) = self.init_services().await?;
+
+        // Recover any orphaned checkpoints from the database.
+        if let Some(ref storage) = self.storage {
+            match storage.list_checkpoints().await {
+                Ok(checkpoint_ids) => {
+                    for session_id in checkpoint_ids {
+                        // Load checkpoint data from DB and parse it
+                        if let Ok(Some(data)) = storage.load_checkpoint(&session_id).await {
+                            if let Some(partial) = agent.recover_checkpoint_from_data(&data) {
+                                let reasoning = partial.reasoning.clone();
+                                self.sessions.add_full_message(
+                                    &session_id,
+                                    crate::session::MessageRole::Assistant,
+                                    &partial.content,
+                                    partial.tool_calls,
+                                    reasoning,
+                                ).await;
+                                info!("Recovered crashed run for session {}", session_id);
+                            }
+                        }
+                        // Clean up the checkpoint
+                        if let Err(e) = storage.delete_checkpoint(&session_id).await {
+                            warn!("Failed to delete checkpoint for session {}: {}", session_id, e);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list checkpoints: {}", e),
+            }
+
+            // Also migrate any legacy checkpoint JSON files
+            let checkpoint_dir = self.config.data_dir.join("checkpoints");
+            if checkpoint_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&checkpoint_dir) {
+                    for entry in entries.flatten() {
+                        let filename = entry.file_name();
+                        let name = filename.to_string_lossy();
+                        if name.starts_with("checkpoint-") && name.ends_with(".json") {
+                            let session_id = name
+                                .strip_prefix("checkpoint-")
+                                .and_then(|s| s.strip_suffix(".json"))
+                                .unwrap_or("");
+                            if !session_id.is_empty() {
+                                if let Some(partial) = agent.recover_checkpoint(session_id) {
+                                    let reasoning = partial.reasoning.clone();
+                                    self.sessions.add_full_message(
+                                        session_id,
+                                        crate::session::MessageRole::Assistant,
+                                        &partial.content,
+                                        partial.tool_calls,
+                                        reasoning,
+                                    ).await;
+                                    info!("Recovered crashed run from legacy checkpoint for session {}", session_id);
+                                }
+                                // Remove the legacy file
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Create control plane with all services (including router for consolidation)
         let mut control = ControlPlane::with_all_services(
@@ -523,7 +778,8 @@ impl DaemonServer {
             Some(router),
         )
         .with_tools_dir(tools_dir)
-        .with_event_tx(self.ipc.event_sender());
+        .with_event_tx(self.ipc.event_sender())
+        .with_workspace_id(workspace_id_for_services);
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
         }
@@ -737,20 +993,8 @@ impl DaemonServer {
             info!("Webhook server listening on http://{}:{}", self.config.ipc.host, self.config.webhook_port);
         }
         
-        // Spawn session auto-save task
-        let persistence = self.persistence.clone();
-        let sessions_for_save = self.sessions.clone();
-        let save_interval = Duration::from_secs(self.config.auto_save_interval_secs);
-        let save_shutdown = self.shutdown_tx.subscribe();
-
-        let save_handle = tokio::spawn(async move {
-            let sessions_map = sessions_for_save.sessions_map();
-            let default_session = sessions_for_save.default_session_id();
-            persistence.auto_save_loop(sessions_map, default_session, save_interval, save_shutdown).await;
-        });
-
-        // Memory is now persisted via SQLite write-through on every mutation.
-        // The old periodic JSON auto-save timer is removed.
+        // Sessions are now persisted via SQLite write-through on every mutation.
+        // No more periodic JSON auto-save — each create/message/delete/rename writes to DB immediately.
 
         // Spawn model + tool stats auto-save task (every 5 minutes)
         let stats_control = control.clone();
@@ -773,6 +1017,52 @@ impl DaemonServer {
                 }
             }
         });
+
+        // Spawn sub-agent check-in task: periodically check running sub-agents
+        // and drain parent mailboxes so questions don't go stale.
+        // When a sub-agent uses ask_parent, the ParentChannelImpl handles it directly
+        // via an LLM call. This task handles any orphaned mailbox messages and provides
+        // visibility into long-running sub-agents.
+        {
+            let sessions = self.sessions.clone();
+            let ipc_events = self.ipc.event_sender();
+            let mut checkin_shutdown = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                // Check every 30 seconds
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let running = sessions.list_sub_sessions(None).await;
+                            let running: Vec<_> = running.into_iter()
+                                .filter(|s| matches!(s.state, crate::session::SubSessionState::Running | crate::session::SubSessionState::Spawning))
+                                .collect();
+
+                            if running.is_empty() {
+                                continue;
+                            }
+
+                            // Check each parent's mailbox for pending questions
+                            for sub in &running {
+                                if let Some(ref parent_id) = sub.parent_id {
+                                    let messages = sessions.drain_mailbox(parent_id).await;
+                                    for msg in messages {
+                                        // Re-emit as events for any listening clients (GUI)
+                                        let _ = ipc_events.send(crate::protocol::Event::SubSessionQuestion {
+                                            session_id: sub.session_id.clone(),
+                                            parent_id: Some(parent_id.clone()),
+                                            label: sub.label.clone(),
+                                            question: msg.content,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ = checkin_shutdown.recv() => break,
+                    }
+                }
+            });
+        }
 
         info!("Daemon ready. IPC server listening on ws://{}", self.ipc.address());
         
@@ -815,8 +1105,7 @@ impl DaemonServer {
         // Explicit drop here makes the intent clear.
         drop(channel_manager);
 
-        // Wait for auto-save tasks to complete final saves
-        let _ = tokio::time::timeout(Duration::from_secs(5), save_handle).await;
+        // Wait for stats auto-save task to complete final save
         let _ = tokio::time::timeout(Duration::from_secs(5), stats_save_handle).await;
         
         ipc_handle.abort();
@@ -837,6 +1126,7 @@ impl DaemonServer {
         Arc<AgentService>,
         Arc<LlmRouter>,
         Option<PathBuf>,  // tools_dir
+        Arc<tokio::sync::RwLock<Option<String>>>,  // workspace_id for script services
     ), crate::DaemonError> {
         // Create LLM router with all available providers
         let mut router = LlmRouter::new();
@@ -905,6 +1195,7 @@ impl DaemonServer {
             ));
         }
         info!("LLM router initialized with {} providers: {:?}", available.len(), available);
+        let router = Arc::new(router);
         
         // Create empty tool registry — all tools loaded from disk
         let tools = Arc::new(ToolRegistry::new());
@@ -1190,11 +1481,22 @@ impl DaemonServer {
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
         // Build script services and load all tools from disk
+            let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> = Arc::new(tokio::sync::RwLock::new(None));
         {
             let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> =
                 if !router.available_providers().is_empty() {
+                    // Build model routing for sub-agents from the priority list.
+                    // Cheapest model (last in priority) handles Simple tasks,
+                    // most capable (first) handles Complex. This gives sub-agents
+                    // intelligent per-iteration routing while the main agent always
+                    // uses the primary model.
+                    let sub_agent_routing = build_sub_agent_routing(&self.config.agent.model_priority);
+                    if !sub_agent_routing.is_empty() {
+                        info!("Sub-agent routing: {:?}", sub_agent_routing.iter().map(|t| format!("{}:{:?}", t.model, t.tier)).collect::<Vec<_>>());
+                    }
+
                     Some(Arc::new(AgentSpawnerImpl {
-                        router: Arc::new(router.clone()),
+                        router: router.clone(),
                         tools: tools.clone(),
                         agent_config: nanna_agent::AgentConfig {
                             model: self.config.agent.model.clone(),
@@ -1205,6 +1507,10 @@ impl DaemonServer {
                             summarization_priority: self.config.agent.summarization_priority.clone(),
                             summarization_ollama_url: self.config.agent.summarization_ollama_url.clone(),
                             sub_agent_model: self.config.agent.sub_agent_model.clone(),
+                            model_routing: sub_agent_routing,
+                            routing_first_turn_primary: true,
+                            openrouter_api_key: self.config.agent.openrouter_api_key.clone(),
+                            openai_api_key: self.config.agent.openai_api_key.clone(),
                             ..Default::default()
                         },
                         system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
@@ -1216,7 +1522,7 @@ impl DaemonServer {
                     None
                 };
 
-            let services = build_script_services(&memory, spawner_arc, session_history.clone());
+            let services = build_script_services(&memory, spawner_arc, session_history.clone(), workspace_id_for_services.clone());
 
             if let Some(ref dir) = tools_dir {
                 if dir.is_dir() {
@@ -1255,20 +1561,39 @@ impl DaemonServer {
             }
         }
 
+        // Register ask_parent tool for sub-agent ↔ parent communication
+        {
+            let parent_channel: Arc<dyn ParentChannel + Send + Sync> = Arc::new(ParentChannelImpl {
+                sessions: self.sessions.clone(),
+                event_tx: Some(self.ipc.event_sender()),
+                router: router.clone(),
+                model: self.config.agent.model.clone(),
+            });
+            tools.register(nanna_tools::AskParentTool::new(
+                parent_channel,
+                tools.clone(),
+            )).await;
+            info!("Registered ask_parent tool for sub-agent communication");
+        }
+
         // Create agent service with multi-provider router
         let event_tx = self.ipc.event_sender();
-        let router = Arc::new(router);
-        let agent = Arc::new(AgentService::new(
+        let mut agent_service = AgentService::with_data_dir(
             self.config.agent.clone(),
             router.clone(),
             tools.clone(),
             memory.clone(),
             event_tx,
-        ).with_session_history(session_history));
+            Some(self.config.data_dir.clone()),
+        ).with_session_history(session_history);
+        if let Some(ref storage) = self.storage {
+            agent_service = agent_service.with_storage(storage.clone());
+        }
+        let agent = Arc::new(agent_service);
 
         info!("Agent service initialized");
 
-        Ok((tools, memory, agent, router, tools_dir))
+        Ok((tools, memory, agent, router, tools_dir, workspace_id_for_services))
     }
 }
 
@@ -1372,6 +1697,15 @@ impl DaemonBuilder {
         // Set summarization configuration
         builder.config.agent.summarization_priority = config.llm.summarization_priority.clone();
         builder.config.agent.summarization_ollama_url = config.llm.ollama_url.clone();
+
+        // Pass API keys to agent config so summarization can use OpenRouter/OpenAI
+        builder.config.agent.openrouter_api_key = config.llm.openrouter_api_key.clone();
+        builder.config.agent.openai_api_key = config.llm.openai_api_key.clone();
+
+        // Set thinking mode from config
+        if config.agent.thinking_enabled {
+            builder.config.agent.thinking_mode = ThinkingMode::Medium;
+        }
 
         // Set model routing configuration
         builder.config.agent.model_routing = config.llm.model_routing.clone();
@@ -1552,6 +1886,39 @@ impl Default for DaemonBuilder {
 /// Fields that exist in `nanna_config` but not in the daemon-local type are
 /// silently dropped — the local type only covers what `ChannelManager` actually
 /// needs at runtime.
+/// Build model routing tiers for sub-agents from the model priority list.
+///
+/// Given a priority list like ["claude-opus-4-6", "openrouter/free", "ollama/qwen3.5:9b"],
+/// assigns tiers so the cheapest model (last) handles Simple tasks, the most capable
+/// (first) handles Complex, and everything in between gets Medium.
+///
+/// With 1 model: no routing (always use that model).
+/// With 2 models: first=Complex, second=Simple.
+/// With 3+: first=Complex, last=Simple, middle=Medium.
+fn build_sub_agent_routing(model_priority: &[String]) -> Vec<nanna_agent::ModelTier> {
+    use nanna_agent::{ModelTier, TaskComplexity};
+
+    if model_priority.len() <= 1 {
+        return vec![]; // No routing with a single model
+    }
+
+    let mut tiers = Vec::new();
+
+    // Reversed: cheapest first (routing picks the first model whose tier >= complexity)
+    for (i, model) in model_priority.iter().enumerate().rev() {
+        let tier = if i == 0 {
+            TaskComplexity::Complex // Most capable
+        } else if i == model_priority.len() - 1 {
+            TaskComplexity::Simple // Cheapest
+        } else {
+            TaskComplexity::Medium
+        };
+        tiers.push(ModelTier { model: model.clone(), tier });
+    }
+
+    tiers
+}
+
 fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsConfig {
     use crate::channels::{
         DiscordConfig as DaemonDiscord, SlackConfig as DaemonSlack, TelegramConfig as DaemonTelegram,

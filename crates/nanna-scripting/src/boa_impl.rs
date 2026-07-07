@@ -232,6 +232,16 @@ fn register_nanna_bridge(context: &mut Context) -> Result<()> {
             js_string!("service"),
             2,
         )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_session_id),
+            js_string!("sessionId"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(nanna_workdir),
+            js_string!("workdir"),
+            0,
+        )
         .property(
             js_string!("platform"),
             js_string!(NannaBridge::platform()),
@@ -281,6 +291,10 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
         .filter(|v| !v.is_undefined() && !v.is_null())
         .map(|v| v.to_string(context).map(|s| s.to_std_string_escaped()))
         .transpose()?;
+    let timeout_secs = args.get(2)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .and_then(|v| v.to_number(context).ok())
+        .map(|n| n as u64);
     
     tracing::info!(target: "script", "Nanna.exec called with command: {}", command);
     
@@ -300,7 +314,7 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             .enable_all()
             .build()
             .expect("Failed to create runtime");
-        rt.block_on(bridge.exec(&command, workdir.as_deref()))
+        rt.block_on(bridge.exec_with_timeout(&command, workdir.as_deref(), timeout_secs))
     })
     .join()
     .map_err(|e| {
@@ -515,6 +529,36 @@ fn nanna_get_env(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
         Ok(None) => Ok(JsValue::null()),
         Err(e) => Err(boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))),
     }
+}
+
+fn nanna_session_id(_: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    BRIDGE.with(|cell| {
+        let borrow = cell.borrow();
+        if let Some(ref bridge) = *borrow {
+            if let Some(sid) = bridge.session_id() {
+                Ok(JsValue::from(js_string!(sid)))
+            } else {
+                Ok(JsValue::null())
+            }
+        } else {
+            Ok(JsValue::null())
+        }
+    })
+}
+
+fn nanna_workdir(_: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    BRIDGE.with(|cell| {
+        let borrow = cell.borrow();
+        if let Some(ref bridge) = *borrow {
+            if let Some(wd) = bridge.workdir() {
+                Ok(JsValue::from(js_string!(wd)))
+            } else {
+                Ok(JsValue::null())
+            }
+        } else {
+            Ok(JsValue::null())
+        }
+    })
 }
 
 fn nanna_service(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {

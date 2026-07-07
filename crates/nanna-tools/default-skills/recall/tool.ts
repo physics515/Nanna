@@ -1,5 +1,6 @@
 export default {
   name: "recall",
+  version: "0.1.0",
   description: "Search long-term memory for relevant information. Returns memories ranked by relevance to the query.",
   output: "context",
   parameters: {
@@ -11,13 +12,23 @@ export default {
     required: ["query"]
   },
   execute: function(input) {
-    var results = Nanna.service("memory.search", {
-      query: input.query,
-      limit: input.limit || 5
-    });
+    var query = input.query || input.search || input.text;
+    if (!query) {
+      return "No query provided. Usage: recall({query: \"search terms\"})";
+    }
+    var results;
+    try {
+      results = Nanna.service("memory.search", {
+        query: query,
+        limit: input.limit || 5
+      });
+    } catch (e) {
+      // Embedding model not configured — return gracefully instead of erroring
+      return "Memory search unavailable (no embedding model configured). Continuing without memory context.";
+    }
 
     if (!results || results.length === 0) {
-      return "No memories found matching: " + input.query;
+      return "No memories found matching: " + query;
     }
 
     var lines = [];

@@ -1,5 +1,6 @@
 export default {
   name: "create_tool",
+  version: "0.1.0",
   description: "Create a new user-defined tool by writing a JavaScript tool file. The tool will be saved and available for future use.",
   parameters: {
     type: "object",

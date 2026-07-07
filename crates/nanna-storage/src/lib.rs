@@ -776,6 +776,296 @@ impl Storage {
     }
 }
 
+// =========================================================================
+// Checkpoints
+// =========================================================================
+
+impl Storage {
+    /// Save a checkpoint for crash recovery.
+    pub async fn save_checkpoint(&self, session_id: &str, data: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO checkpoints (session_id, data, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(session_id) DO UPDATE SET data = ?2, updated_at = datetime('now')",
+            turso::params![session_id, data],
+        ).await?;
+        Ok(())
+    }
+
+    /// Load a checkpoint for a session.
+    pub async fn load_checkpoint(&self, session_id: &str) -> Result<Option<String>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT data FROM checkpoints WHERE session_id = ?1",
+            turso::params![session_id],
+        ).await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some(row.get::<String>(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a checkpoint after successful completion.
+    pub async fn delete_checkpoint(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1",
+            turso::params![session_id],
+        ).await?;
+        Ok(())
+    }
+
+    /// List all checkpoint session IDs (for recovery at startup).
+    pub async fn list_checkpoints(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT session_id FROM checkpoints",
+            (),
+        ).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<String>(0)?);
+        }
+        Ok(ids)
+    }
+
+    // =========================================================================
+    // Tool Stats (aggregated — replaces tool-stats.json)
+    // =========================================================================
+
+    /// Save aggregated tool stats to the tool_stats table (upsert).
+    pub async fn save_tool_stats_aggregated(&self, stats: &serde_json::Value) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        // The JSON is expected to be { "tools": { "tool_name": { stats... }, ... }, "sessions": N }
+        if let Some(tools) = stats.get("tools").and_then(|v| v.as_object()) {
+            for (tool_name, tool_data) in tools {
+                let call_count = tool_data.get("call_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let success_count = tool_data.get("success_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let failure_count = tool_data.get("failure_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let total_duration_ms = tool_data.get("total_duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let last_called_epoch_ms = tool_data.get("last_called_epoch_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let latencies = tool_data.get("latencies_ms").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+                let output_sizes = tool_data.get("output_sizes").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+                let errors = tool_data.get("errors").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+
+                conn.execute(
+                    "INSERT INTO tool_stats (tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                     ON CONFLICT(tool_name) DO UPDATE SET
+                        call_count = ?2, success_count = ?3, failure_count = ?4,
+                        total_duration_ms = ?5, last_called_epoch_ms = ?6,
+                        latencies_ms_json = ?7, output_sizes_json = ?8, errors_json = ?9,
+                        updated_at = datetime('now')",
+                    turso::params![
+                        tool_name.as_str(),
+                        call_count,
+                        success_count,
+                        failure_count,
+                        total_duration_ms,
+                        last_called_epoch_ms,
+                        latencies.as_str(),
+                        output_sizes.as_str(),
+                        errors.as_str()
+                    ],
+                ).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load aggregated tool stats from the tool_stats table (returns the JSON format ToolStatsTracker expects).
+    pub async fn load_tool_stats_aggregated(&self) -> Result<serde_json::Value, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT tool_name, call_count, success_count, failure_count, total_duration_ms, last_called_epoch_ms, latencies_ms_json, output_sizes_json, errors_json
+             FROM tool_stats",
+            (),
+        ).await?;
+
+        let mut tools = serde_json::Map::new();
+        let mut session_count: i64 = 0;
+        while let Some(row) = rows.next().await? {
+            let tool_name: String = row.get(0)?;
+            let call_count: i64 = row.get(1)?;
+            let success_count: i64 = row.get(2)?;
+            let failure_count: i64 = row.get(3)?;
+            let total_duration_ms: i64 = row.get(4)?;
+            let last_called_epoch_ms: i64 = row.get(5)?;
+            let latencies_str: String = row.get(6)?;
+            let output_sizes_str: String = row.get(7)?;
+            let errors_str: String = row.get(8)?;
+
+            let latencies: serde_json::Value = serde_json::from_str(&latencies_str).unwrap_or(serde_json::json!([]));
+            let output_sizes: serde_json::Value = serde_json::from_str(&output_sizes_str).unwrap_or(serde_json::json!([]));
+            let errors: serde_json::Value = serde_json::from_str(&errors_str).unwrap_or(serde_json::json!([]));
+
+            session_count += call_count;
+            tools.insert(tool_name, serde_json::json!({
+                "call_count": call_count,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "total_duration_ms": total_duration_ms,
+                "last_called_epoch_ms": last_called_epoch_ms,
+                "latencies_ms": latencies,
+                "output_sizes": output_sizes,
+                "errors": errors,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "tools": tools,
+            "sessions": session_count
+        }))
+    }
+
+    // =========================================================================
+    // Daemon Session Persistence (replaces sessions.json)
+    // =========================================================================
+
+    /// Create or update a daemon session in the database.
+    /// This handles the daemon's Session struct format (different from GUI sessions).
+    pub async fn upsert_daemon_session(
+        &self,
+        session_id: &str,
+        name: Option<&str>,
+        workspace_id: Option<&str>,
+        created_at: &str,
+        updated_at: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sessions (session_id, channel, name, workspace_id, created_at, updated_at, metadata)
+             VALUES (?1, 'gui', ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                name = COALESCE(?2, name),
+                workspace_id = COALESCE(?3, workspace_id),
+                updated_at = ?5,
+                metadata = COALESCE(?6, metadata)",
+            turso::params![session_id, name, workspace_id, created_at, updated_at, metadata],
+        ).await?;
+        Ok(())
+    }
+
+    /// Add a daemon message to the messages table.
+    /// Stores tool_calls, attachments, and reasoning in the metadata JSON field.
+    pub async fn add_daemon_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        role: &str,
+        content: &str,
+        created_at: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, content_type, tool_use_id, created_at, metadata)
+             VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?6)",
+            turso::params![session_id, role, content, message_id, created_at, metadata],
+        ).await?;
+        // Touch session
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
+            turso::params![created_at, session_id],
+        ).await?;
+        Ok(())
+    }
+
+    /// Load all sessions from the database (regardless of channel).
+    pub async fn list_daemon_sessions(&self) -> Result<Vec<Session>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT id, session_id, channel, user_id, created_at, updated_at, metadata, workspace_id, name
+             FROM sessions ORDER BY updated_at DESC",
+            (),
+        ).await?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let metadata_str: Option<String> = row.get(6)?;
+            sessions.push(Session {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                channel: row.get(2)?,
+                user_id: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+                workspace_id: row.get(7)?,
+                name: row.get(8)?,
+            });
+        }
+        Ok(sessions)
+    }
+
+    /// Load all messages for a daemon session, ordered by creation time.
+    pub async fn load_daemon_messages(&self, session_id: &str) -> Result<Vec<Message>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(
+            "SELECT id, session_id, role, content, content_type, tool_use_id, created_at, tokens_in, tokens_out, metadata
+             FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
+            turso::params![session_id],
+        ).await?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let metadata_str: Option<String> = row.get(9)?;
+            messages.push(Message {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                content_type: row.get(4)?,
+                tool_use_id: row.get(5)?,
+                created_at: row.get(6)?,
+                tokens_in: row.get(7)?,
+                tokens_out: row.get(8)?,
+                metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
+            });
+        }
+        Ok(messages)
+    }
+
+    /// Delete all messages for a daemon session.
+    pub async fn clear_daemon_session_messages(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            turso::params![session_id],
+        ).await?;
+        Ok(())
+    }
+
+    /// Delete a daemon session and its messages.
+    pub async fn delete_daemon_session(&self, session_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM messages WHERE session_id = ?1", turso::params![session_id]).await?;
+        conn.execute("DELETE FROM sessions WHERE session_id = ?1", turso::params![session_id]).await?;
+        Ok(())
+    }
+
+    /// Update daemon session name.
+    pub async fn rename_daemon_session(&self, session_id: &str, name: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE sessions SET name = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![name, session_id],
+        ).await?;
+        Ok(())
+    }
+
+    /// Update daemon session workspace.
+    pub async fn set_daemon_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE sessions SET workspace_id = ?1, updated_at = datetime('now') WHERE session_id = ?2",
+            turso::params![workspace_id, session_id],
+        ).await?;
+        Ok(())
+    }
+}
+
 /// Time-bucketed tool statistics (hourly or daily).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolStatsTimeBucket {

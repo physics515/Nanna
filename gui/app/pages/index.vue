@@ -1,5 +1,27 @@
 <template>
   <div class="flex flex-col h-full">
+    <!-- Empty state: no session selected -->
+    <div v-if="!currentSession" class="flex items-center justify-center h-full">
+      <div class="text-center max-w-md px-4">
+        <img src="/logo.svg" alt="Nanna" class="w-32 sm:w-40 mx-auto mb-6" />
+        <h2 class="text-lg font-semibold text-nanna-text mb-2">Start a new conversation</h2>
+        <p class="text-nanna-text-dim text-sm mb-6">
+          The moon awaits. Create a chat to begin.
+        </p>
+        <button
+          @click="createNewChat"
+          class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-nanna-primary/20 text-nanna-primary hover:bg-nanna-primary/30 transition-colors text-sm font-medium"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+          </svg>
+          New Chat
+        </button>
+      </div>
+    </div>
+
+    <!-- Chat view: session selected -->
+    <template v-else>
     <!-- Chat header -->
     <header class="px-4 sm:px-6 py-3 sm:py-4">
       <div class="flex items-center justify-between gap-2">
@@ -51,6 +73,13 @@
 
       <!-- Messages -->
       <template v-for="(msg, idx) in messages" :key="msg.id || idx">
+        <!-- Thinking block rendered as its own card (before tools and response) -->
+        <div v-if="msg.role === 'assistant' && msg.reasoning" class="max-w-[1800px] mx-auto">
+          <div class="mx-4 sm:mx-12 my-2">
+            <ThinkingCard :content="msg.reasoning" />
+          </div>
+        </div>
+
         <!-- Tool calls rendered BEFORE the assistant response (between user msg and response) -->
         <div v-if="msg.role === 'assistant' && msg.tool_calls?.length" class="max-w-[1800px] mx-auto">
           <div class="space-y-1 mx-4 sm:mx-12 my-2">
@@ -83,21 +112,18 @@
                   {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
                 </div>
                 <MarkdownContent :content="msg.content" />
-
-                <!-- Reasoning/thinking block (collapsible) -->
-                <details v-if="msg.reasoning" class="mt-2 text-xs">
-                  <summary class="cursor-pointer text-nanna-text-dim hover:text-nanna-text-secondary">
-                    Thinking
-                  </summary>
-                  <div class="mt-1 p-2 bg-nanna-bg-deep rounded whitespace-pre-wrap max-h-[200px] overflow-y-auto text-nanna-text-dim">
-                    {{ msg.reasoning }}
-                  </div>
-                </details>
               </div>
             </div>
           </MessageBubble>
         </div>
       </template>
+
+      <!-- Live thinking card during streaming -->
+      <div v-if="streamingThinking" class="max-w-[1800px] mx-auto">
+        <div class="mx-4 sm:mx-12 my-2">
+          <ThinkingCard :content="streamingThinking" :is-active="isStreaming" />
+        </div>
+      </div>
 
       <!-- Active tool calls during streaming -->
       <div v-if="activeToolCalls.length > 0" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
@@ -119,15 +145,6 @@
             <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-              <!-- Live thinking indicator -->
-              <details v-if="streamingThinking" class="mb-2 text-xs" open>
-                <summary class="cursor-pointer text-nanna-text-dim hover:text-nanna-text-secondary">
-                  Thinking...
-                </summary>
-                <div class="mt-1 p-2 bg-nanna-bg-deep rounded whitespace-pre-wrap max-h-[150px] overflow-y-auto text-nanna-text-dim">
-                  {{ streamingThinking }}
-                </div>
-              </details>
               <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
                 <MarkdownContent :content="streamingContent" />
                 <span class="cursor-blink inline-block ml-0.5">▋</span>
@@ -191,11 +208,12 @@
         />
       </div>
     </div>
+    </template>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
+import { ref, inject, watch, nextTick, onMounted, onUnmounted, computed, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit as tauriEmit, type UnlistenFn } from '@tauri-apps/api/event'
 import { useSessionState } from '~/composables/useSessionState'
@@ -256,6 +274,7 @@ interface ToolCallEvent {
 interface RunState {
   is_running: boolean
   accumulated_text: string
+  accumulated_thinking: string
   active_tool_calls: { call_id: string, name: string, started_at: string }[]
   completed_tool_calls: { call_id: string, name: string, output: string, success: boolean, duration_ms: number }[]
   started_at: string | null
@@ -374,11 +393,12 @@ async function loadSession() {
     const targetSessionId = route.query.session as string | undefined
 
     if (sessions.length > 0) {
-      // Find the session matching URL query, or fall back to first
+      // Find the session matching URL query; don't fall back to first session
+      // to avoid showing a stale chat from another workspace
       const targetSession = targetSessionId
         ? sessions.find(s => s.id === targetSessionId)
         : null
-      currentSession.value = targetSession || sessions[0] || null
+      currentSession.value = targetSession || null
 
       if (currentSession.value) {
         const sid = currentSession.value.id
@@ -390,7 +410,7 @@ async function loadSession() {
         const [historyResult, runState] = await Promise.all([
           invoke<Message[]>('get_session_history', { sessionId: sid }),
           invoke<RunState>('get_session_run_state', { sessionId: sid })
-            .catch(() => ({ is_running: false, accumulated_text: '', active_tool_calls: [], completed_tool_calls: [], started_at: null, message_count: 0 } as RunState))
+            .catch(() => ({ is_running: false, accumulated_text: '', accumulated_thinking: '', active_tool_calls: [], completed_tool_calls: [], started_at: null, message_count: 0 } as RunState))
         ])
 
         messages.value = historyResult
@@ -411,8 +431,9 @@ async function loadSession() {
 
         if (runState.is_running) {
           isLoading.value = true
-          isStreaming.value = runState.accumulated_text.length > 0
+          isStreaming.value = runState.accumulated_text.length > 0 || runState.accumulated_thinking.length > 0
           streamingContent.value = runState.accumulated_text
+          streamingThinking.value = runState.accumulated_thinking
 
           // Replace tool calls with daemon's authoritative list
           activeToolCalls.value = []
@@ -453,8 +474,8 @@ async function loadSession() {
         scrollToBottom(true)
       }
     } else {
-      // No sessions exist, create one
-      currentSession.value = await invoke<SessionInfo>('create_session', { name: null })
+      // No sessions — show empty state (user can create via sidebar or empty state button)
+      currentSession.value = null
       messages.value = []
     }
   } catch (e) {
@@ -540,6 +561,11 @@ onMounted(async () => {
       // Add new tool call
       sessionState.addToolCall({ ...tool_call, status: 'started' })
     } else {
+      // Resolve tool name: prefer event payload, fall back to existing state
+      // (ToolEnd events from daemon don't include name)
+      const existingName = sessionState.activeToolCalls.value.find(t => t.id === tool_call.id)?.name
+      const toolName = tool_call.name || existingName || 'unknown'
+
       // Update existing tool call
       sessionState.updateToolCall(tool_call.id, { ...tool_call, status })
 
@@ -547,21 +573,21 @@ onMounted(async () => {
       if (status === 'error' || tool_call.success === false) {
         addNotification({
           type: 'error',
-          title: `Tool Failed: ${tool_call.name}`,
+          title: `Tool Failed: ${toolName}`,
           summary: truncateText(tool_call.output || 'Unknown error', 120),
           detail: tool_call.output || 'No error details available',
-          source: `tool:${tool_call.name}`,
+          source: `tool:${toolName}`,
           sessionId: eventSessionId,
           metadata: {
             callId: tool_call.id,
-            toolName: tool_call.name,
+            toolName: toolName,
           },
         })
       }
 
       // Notify on tool completion if window not focused
       if (document.hidden) {
-        notifyToolComplete(tool_call.name, tool_call.success)
+        notifyToolComplete(toolName, tool_call.success)
       }
     }
 
@@ -676,6 +702,21 @@ async function stopSession() {
   }
 }
 
+// Injected from layout for workspace-aware session creation
+const currentTab = inject<Ref<{ type: string; workspaceId?: string }>>('currentTab', ref({ type: 'global' }))
+
+async function createNewChat() {
+  try {
+    const workspaceId = currentTab.value?.type === 'workspace' ? currentTab.value.workspaceId ?? null : null
+    const session = await invoke<SessionInfo>('create_session', { name: null, workspaceId })
+    currentSession.value = session
+    messages.value = []
+    navigateTo(`/?session=${session.id}`)
+  } catch (e) {
+    console.error('Failed to create new chat:', e)
+  }
+}
+
 async function sendMessage() {
   if (!input.value.trim() || !currentSession.value) return
 
@@ -707,7 +748,13 @@ async function sendMessage() {
   await sendMessageToBackend(userMessage, imageAttachments)
 }
 
+const sendInFlight = ref(false)
+
 async function sendMessageToBackend(message: string, attachments: Array<{filename: string, content_type: string, data: string}> = []) {
+  // Prevent duplicate sends (e.g. rapid clicks while WS is reconnecting)
+  if (sendInFlight.value) return
+  sendInFlight.value = true
+
   // Start loading
   isLoading.value = true
   isStreaming.value = false
@@ -753,6 +800,8 @@ async function sendMessageToBackend(message: string, attachments: Array<{filenam
     if (document.hidden) {
       notifyError('Message Failed', connectionError.value ?? undefined)
     }
+  } finally {
+    sendInFlight.value = false
   }
 
   scrollToBottom()

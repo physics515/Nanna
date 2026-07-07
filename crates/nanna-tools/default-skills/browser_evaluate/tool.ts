@@ -1,5 +1,7 @@
 export default {
   name: "browser_evaluate",
+  version: "0.1.0",
+  output: "context",
   description: "Evaluate JavaScript code in a browser page context. Useful for extracting dynamic data or manipulating page state.",
   parameters: {
     type: "object",

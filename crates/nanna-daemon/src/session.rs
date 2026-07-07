@@ -2,13 +2,16 @@
 //!
 //! Sessions represent conversations with the agent. Multiple channels
 //! can subscribe to the same session.
+//!
+//! All session and message data is persisted to SQLite via nanna-storage.
+//! The in-memory HashMap serves as a hot cache for fast access.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Unique session identifier
 pub type SessionId = String;
@@ -38,6 +41,29 @@ pub enum MessageRole {
     Assistant,
     System,
     Tool,
+}
+
+impl MessageRole {
+    /// Convert to the string format used in the database.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::System => "system",
+            Self::Tool => "tool",
+        }
+    }
+
+    /// Parse from the string format used in the database.
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "system" => Self::System,
+            "tool" => Self::Tool,
+            _ => Self::User,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +144,7 @@ impl Session {
         self
     }
     
-    /// Add a message to the session
+    /// Add a message to the session (in-memory only — use SessionManager for persistence)
     pub fn add_message(&mut self, role: MessageRole, content: impl Into<String>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         self.messages.push(SessionMessage {
@@ -134,7 +160,7 @@ impl Session {
         id
     }
 
-    /// Add a message with tool calls and reasoning to the session
+    /// Add a message with tool calls and reasoning to the session (in-memory only)
     pub fn add_full_message(
         &mut self,
         role: MessageRole,
@@ -272,7 +298,72 @@ pub struct MailboxMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Manages all sessions
+/// Serialize a SessionMessage's extra fields (tool_calls, attachments, reasoning) to JSON metadata.
+fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
+    let has_tool_calls = !msg.tool_calls.is_empty();
+    let has_attachments = !msg.attachments.is_empty();
+    let has_reasoning = msg.reasoning.is_some();
+
+    if !has_tool_calls && !has_attachments && !has_reasoning {
+        return None;
+    }
+
+    let mut meta = serde_json::Map::new();
+    if has_tool_calls {
+        meta.insert("tool_calls".to_string(), serde_json::to_value(&msg.tool_calls).unwrap_or_default());
+    }
+    if has_attachments {
+        meta.insert("attachments".to_string(), serde_json::to_value(&msg.attachments).unwrap_or_default());
+    }
+    if let Some(ref reasoning) = msg.reasoning {
+        meta.insert("reasoning".to_string(), serde_json::Value::String(reasoning.clone()));
+    }
+    Some(serde_json::Value::Object(meta).to_string())
+}
+
+/// Deserialize a DB message row back into a SessionMessage.
+fn db_message_to_session_message(
+    message_id: &str,
+    role: &str,
+    content: &str,
+    created_at: &str,
+    metadata: Option<&serde_json::Value>,
+) -> SessionMessage {
+    let tool_calls = metadata
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let attachments = metadata
+        .and_then(|m| m.get("attachments"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let reasoning = metadata
+        .and_then(|m| m.get("reasoning"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Parse timestamp, fall back to now
+    let timestamp = chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            // Try SQLite datetime format: "2026-03-31 14:09:49"
+            chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
+                .map(|ndt| ndt.and_utc())
+        })
+        .unwrap_or_else(|_| Utc::now());
+
+    SessionMessage {
+        id: message_id.to_string(),
+        role: MessageRole::from_db_str(role),
+        content: content.to_string(),
+        timestamp,
+        tool_calls,
+        attachments,
+        reasoning,
+    }
+}
+
+/// Manages all sessions with write-through to SQLite.
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SessionId, Session>>>,
     /// Default session ID (for new clients)
@@ -281,16 +372,166 @@ pub struct SessionManager {
     sub_sessions: Arc<RwLock<HashMap<SessionId, SubSessionInfo>>>,
     /// Per-session mailbox for inter-session messaging
     mailboxes: Arc<RwLock<HashMap<SessionId, Vec<MailboxMessage>>>>,
+    /// Database storage for persistence (None = in-memory only, e.g. tests)
+    storage: Option<Arc<nanna_storage::Storage>>,
 }
 
 impl SessionManager {
-    /// Create a new session manager
+    /// Create a new session manager (no persistence)
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_session: Arc::new(RwLock::new(None)),
             sub_sessions: Arc::new(RwLock::new(HashMap::new())),
             mailboxes: Arc::new(RwLock::new(HashMap::new())),
+            storage: None,
+        }
+    }
+
+    /// Create a new session manager backed by SQLite storage
+    pub fn with_storage(storage: Arc<nanna_storage::Storage>) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_session: Arc::new(RwLock::new(None)),
+            sub_sessions: Arc::new(RwLock::new(HashMap::new())),
+            mailboxes: Arc::new(RwLock::new(HashMap::new())),
+            storage: Some(storage),
+        }
+    }
+
+    /// Load all daemon sessions and their messages from SQLite into the in-memory cache.
+    /// Call this once at startup.
+    pub async fn load_from_db(&self) -> usize {
+        let Some(ref storage) = self.storage else {
+            return 0;
+        };
+
+        let db_sessions = match storage.list_daemon_sessions().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to load sessions from database: {}", e);
+                return 0;
+            }
+        };
+
+        let count = db_sessions.len();
+        let mut sessions = self.sessions.write().await;
+        let mut default = self.default_session.write().await;
+
+        for db_session in db_sessions {
+            let session_id = db_session.session_id.clone();
+
+            // Parse timestamps
+            let created_at = chrono::DateTime::parse_from_rfc3339(&db_session.created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&db_session.created_at, "%Y-%m-%d %H:%M:%S")
+                        .map(|ndt| ndt.and_utc())
+                })
+                .unwrap_or_else(|_| Utc::now());
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&db_session.updated_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&db_session.updated_at, "%Y-%m-%d %H:%M:%S")
+                        .map(|ndt| ndt.and_utc())
+                })
+                .unwrap_or_else(|_| Utc::now());
+
+            // Load messages from DB
+            let db_messages = match storage.load_daemon_messages(&session_id).await {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    warn!("Failed to load messages for session {}: {}", session_id, e);
+                    Vec::new()
+                }
+            };
+
+            let messages: Vec<SessionMessage> = db_messages.iter().map(|m| {
+                db_message_to_session_message(
+                    m.tool_use_id.as_deref().unwrap_or(&m.id.to_string()),
+                    &m.role,
+                    &m.content,
+                    &m.created_at,
+                    m.metadata.as_ref(),
+                )
+            }).collect();
+
+            let session = Session {
+                id: session_id.clone(),
+                name: db_session.name,
+                created_at,
+                updated_at,
+                messages,
+                subscribers: HashSet::new(),
+                owner: None,
+                metadata: db_session.metadata
+                    .and_then(|v| {
+                        if let serde_json::Value::Object(map) = v {
+                            Some(map.into_iter().collect())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default(),
+                workspace_id: db_session.workspace_id,
+            };
+
+            sessions.insert(session_id.clone(), session);
+
+            // First session becomes default
+            if default.is_none() {
+                *default = Some(session_id);
+            }
+        }
+
+        info!("Loaded {} sessions from database", count);
+        count
+    }
+
+    /// Persist session metadata to DB (fire-and-forget on errors)
+    async fn persist_session(&self, session: &Session) {
+        let Some(ref storage) = self.storage else {
+            warn!("persist_session called but no storage backend — session {} will not be persisted", session.id);
+            return;
+        };
+        let created = session.created_at.to_rfc3339();
+        let updated = session.updated_at.to_rfc3339();
+        let metadata = if session.metadata.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&session.metadata).ok()
+        };
+        match storage.upsert_daemon_session(
+            &session.id,
+            session.name.as_deref(),
+            session.workspace_id.as_deref(),
+            &created,
+            &updated,
+            metadata.as_deref(),
+        ).await {
+            Ok(()) => info!("Persisted session {} to database", session.id),
+            Err(e) => warn!("Failed to persist session {} to database: {}", session.id, e),
+        }
+    }
+
+    /// Persist a single message to DB
+    async fn persist_message(&self, session_id: &str, msg: &SessionMessage) {
+        let Some(ref storage) = self.storage else {
+            warn!("persist_message called but no storage backend — message {} will not be persisted", msg.id);
+            return;
+        };
+        let created = msg.timestamp.to_rfc3339();
+        let metadata = message_to_metadata(msg);
+        match storage.add_daemon_message(
+            session_id,
+            &msg.id,
+            msg.role.as_db_str(),
+            &msg.content,
+            &created,
+            metadata.as_deref(),
+        ).await {
+            Ok(()) => info!("Persisted {} message {} in session {}", msg.role.as_db_str(), msg.id, session_id),
+            Err(e) => warn!("Failed to persist message {} in session {}: {}", msg.id, session_id, e),
         }
     }
     
@@ -305,6 +546,9 @@ impl SessionManager {
         session.workspace_id = workspace_id;
         let id = session.id.clone();
         
+        // Persist to DB first
+        self.persist_session(&session).await;
+
         let mut sessions = self.sessions.write().await;
         sessions.insert(id.clone(), session.clone());
         
@@ -322,7 +566,13 @@ impl SessionManager {
     pub async fn set_workspace(&self, session_id: &str, workspace_id: Option<String>) -> bool {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            session.workspace_id = workspace_id;
+            session.workspace_id = workspace_id.clone();
+            // Persist to DB
+            if let Some(ref storage) = self.storage {
+                if let Err(e) = storage.set_daemon_session_workspace(session_id, workspace_id.as_deref()).await {
+                    warn!("Failed to persist workspace change for session {}: {}", session_id, e);
+                }
+            }
             true
         } else {
             false
@@ -361,6 +611,7 @@ impl SessionManager {
     
     /// Update a session
     pub async fn update(&self, session: Session) {
+        self.persist_session(&session).await;
         let mut sessions = self.sessions.write().await;
         sessions.insert(session.id.clone(), session);
     }
@@ -371,6 +622,12 @@ impl SessionManager {
         let removed = sessions.remove(id).is_some();
 
         if removed {
+            // Delete from DB
+            if let Some(ref storage) = self.storage {
+                if let Err(e) = storage.delete_daemon_session(id).await {
+                    warn!("Failed to delete session {} from DB: {}", id, e);
+                }
+            }
             // Clear default if it was this session
             let mut default = self.default_session.write().await;
             if default.as_deref() == Some(id) {
@@ -386,6 +643,16 @@ impl SessionManager {
     pub async fn delete_all(&self) -> usize {
         let mut sessions = self.sessions.write().await;
         let count = sessions.len();
+
+        // Delete all from DB
+        if let Some(ref storage) = self.storage {
+            for id in sessions.keys() {
+                if let Err(e) = storage.delete_daemon_session(id).await {
+                    warn!("Failed to delete session {} from DB: {}", id, e);
+                }
+            }
+        }
+
         sessions.clear();
 
         // Clear default session
@@ -400,8 +667,14 @@ impl SessionManager {
     pub async fn rename(&self, id: &str, name: String) -> bool {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(id) {
-            session.name = Some(name);
+            session.name = Some(name.clone());
             session.updated_at = Utc::now();
+            // Persist to DB
+            if let Some(ref storage) = self.storage {
+                if let Err(e) = storage.rename_daemon_session(id, &name).await {
+                    warn!("Failed to persist rename for session {}: {}", id, e);
+                }
+            }
             true
         } else {
             false
@@ -413,23 +686,35 @@ impl SessionManager {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(id) {
             session.clear();
+            // Clear from DB
+            if let Some(ref storage) = self.storage {
+                if let Err(e) = storage.clear_daemon_session_messages(id).await {
+                    warn!("Failed to clear messages for session {} in DB: {}", id, e);
+                }
+            }
             true
         } else {
             false
         }
     }
     
-    /// Add a message to a session
+    /// Add a message to a session (with write-through to DB)
     pub async fn add_message(&self, session_id: &str, role: MessageRole, content: impl Into<String>) -> Option<String> {
+        let content = content.into();
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            Some(session.add_message(role, content))
+            let msg_id = session.add_message(role, content);
+            // Persist the new message synchronously
+            if let Some(msg) = session.messages.last() {
+                self.persist_message(session_id, msg).await;
+            }
+            Some(msg_id)
         } else {
             None
         }
     }
 
-    /// Add a message with tool calls and reasoning to a session
+    /// Add a message with tool calls and reasoning to a session (with write-through to DB)
     pub async fn add_full_message(
         &self,
         session_id: &str,
@@ -438,9 +723,15 @@ impl SessionManager {
         tool_calls: Vec<ToolCallRecord>,
         reasoning: Option<String>,
     ) -> Option<String> {
+        let content = content.into();
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            Some(session.add_full_message(role, content, tool_calls, reasoning))
+            let msg_id = session.add_full_message(role, content, tool_calls, reasoning);
+            // Persist the new message synchronously
+            if let Some(msg) = session.messages.last() {
+                self.persist_message(session_id, msg).await;
+            }
+            Some(msg_id)
         } else {
             None
         }
@@ -498,9 +789,16 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
-    /// Restore a session from persistence (used during startup)
+    /// Restore a session from persistence (used during startup / migration)
     pub async fn restore(&self, session: Session) {
         let id = session.id.clone();
+        // Persist to DB if storage is available (for migration from JSON)
+        self.persist_session(&session).await;
+        // Also persist all messages
+        for msg in &session.messages {
+            self.persist_message(&id, msg).await;
+        }
+
         let mut sessions = self.sessions.write().await;
         sessions.insert(id.clone(), session);
         
@@ -520,12 +818,12 @@ impl SessionManager {
         }
     }
     
-    /// Get the internal sessions map (for persistence)
+    /// Get the internal sessions map (for legacy code that needs it)
     pub fn sessions_map(&self) -> Arc<RwLock<HashMap<SessionId, Session>>> {
         self.sessions.clone()
     }
     
-    /// Get the default session ID holder (for persistence)
+    /// Get the default session ID holder
     pub fn default_session_id(&self) -> Arc<RwLock<Option<SessionId>>> {
         self.default_session.clone()
     }
@@ -590,7 +888,6 @@ impl SessionManager {
 
     /// Resolve a sub-session target (label or ID) to a SubSessionInfo
     pub async fn resolve_sub_session(&self, target: &str) -> Option<SubSessionInfo> {
-        // Try by ID first, then by label
         let subs = self.sub_sessions.read().await;
         if let Some(info) = subs.get(target) {
             return Some(info.clone());

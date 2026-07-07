@@ -1,5 +1,7 @@
 export default {
   name: "transcribe",
+  version: "0.1.0",
+  output: "context",
   description: "Transcribe audio to text using a speech-to-text service.",
   parameters: {
     type: "object",

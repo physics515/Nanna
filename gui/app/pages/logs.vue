@@ -8,50 +8,21 @@
           <p class="text-xs sm:text-sm text-white/30 mt-0.5">Real-time daemon output and diagnostics</p>
         </div>
         <div class="flex items-center gap-2">
-          <!-- Auto-scroll button (glass pill) -->
-          <button
-            @click="toggleAutoScroll"
-            class="relative overflow-hidden px-3 py-1.5 rounded-full text-xs font-medium transition-all"
-            :class="autoScroll ? 'text-cyan-300/90' : 'text-white/40 hover:text-white/60'"
-            :style="autoScroll ? { ...btnGlassStyle, background: activeBtnBg } : btnGlassStyle"
-            @mouseenter="() => { btnGlassEnter(); if (autoScroll) activeBtnEnter() }"
-            @mouseleave="() => { btnGlassLeave(); activeBtnLeave() }"
-          >
-            <span v-if="autoScroll" class="absolute inset-0 z-0" :style="{ background: btnMeshBg }"></span>
-            <span class="relative z-10 flex items-center gap-1">
-              <ChevronDown class="w-3.5 h-3.5" />
-              {{ autoScroll ? 'Auto-scroll' : 'Manual' }}
-            </span>
-          </button>
-          <!-- Clear button (glass pill) -->
-          <button
-            @click="clearLogs"
-            class="relative overflow-hidden px-3 py-1.5 rounded-full text-xs font-medium text-white/40 hover:text-white/60 transition-all"
-            :style="btnGlassStyle"
-            @mouseenter="btnGlassEnter"
-            @mouseleave="btnGlassLeave"
-          >
-            <span class="absolute inset-0 z-0" :style="{ background: btnMeshBg }"></span>
-            <span class="relative z-10 flex items-center gap-1">
-              <Trash2 class="w-3.5 h-3.5" />
-              Clear
-            </span>
-          </button>
-          <!-- Live mode button (glass pill) -->
-          <button
-            @click="toggleLiveMode"
-            class="relative overflow-hidden px-3 py-1.5 rounded-full text-xs font-medium transition-all"
-            :class="liveMode ? 'text-emerald-300/90' : 'text-white/40 hover:text-white/60'"
-            :style="liveMode ? { ...btnGlassStyle, background: liveBtnBg } : btnGlassStyle"
-            @mouseenter="() => { btnGlassEnter(); if (liveMode) liveBtnEnter() }"
-            @mouseleave="() => { btnGlassLeave(); liveBtnLeave() }"
-          >
-            <span v-if="liveMode" class="absolute inset-0 z-0" :style="{ background: btnMeshBg }"></span>
-            <span class="relative z-10 flex items-center gap-1">
-              <Circle class="w-2.5 h-2.5" :class="liveMode ? 'fill-current' : ''" />
-              {{ liveMode ? 'Live' : 'Paused' }}
-            </span>
-          </button>
+          <!-- Auto-scroll button -->
+          <UiGlassButton pill size="xs" :color="autoScroll ? 'accent' : 'default'" @click="toggleAutoScroll">
+            <ChevronDown class="w-3.5 h-3.5" />
+            {{ autoScroll ? 'Auto-scroll' : 'Manual' }}
+          </UiGlassButton>
+          <!-- Clear button -->
+          <UiGlassButton pill size="xs" @click="clearLogs">
+            <Trash2 class="w-3.5 h-3.5" />
+            Clear
+          </UiGlassButton>
+          <!-- Live mode button -->
+          <UiGlassButton pill size="xs" :color="liveMode ? 'accent' : 'default'" @click="toggleLiveMode">
+            <Circle class="w-2.5 h-2.5" :class="liveMode ? 'fill-current' : ''" />
+            {{ liveMode ? 'Live' : 'Paused' }}
+          </UiGlassButton>
         </div>
       </div>
     </div>
@@ -122,31 +93,6 @@ import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ChevronDown, Trash2, Circle } from 'lucide-vue-next'
-import { useSplatter } from '~/composables/useSplatter'
-import { useGroundGlass } from '~/composables/useGroundGlass'
-
-// Ground glass for all buttons (pill style)
-const { meshBg: btnMeshBg, containerStyle: btnGlassStyle, onEnter: btnGlassEnter, onLeave: btnGlassLeave } = useGroundGlass({
-  opacity: 2.0,
-  sizes: ['55%', '50%', '45%'],
-  lerpSpeed: 0.008,
-  interval: 2000,
-  blur: 8,
-})
-
-// Splatter for active auto-scroll button
-const { splatterBg: activeBtnBg, onEnter: activeBtnEnter, onLeave: activeBtnLeave } = useSplatter({
-  colors: ['34,211,238', '56,189,248', '20,184,220'],
-  opacityRanges: [[0.08, 0.12], [0.06, 0.08], [0.04, 0.06]],
-  sizes: ['65%', '60%', '50%'],
-})
-
-// Splatter for active live mode button
-const { splatterBg: liveBtnBg, onEnter: liveBtnEnter, onLeave: liveBtnLeave } = useSplatter({
-  colors: ['34,197,94', '22,163,74', '74,222,128'],
-  opacityRanges: [[0.08, 0.12], [0.06, 0.08], [0.04, 0.06]],
-  sizes: ['65%', '60%', '50%'],
-})
 
 interface LogEntry {
   timestamp: string

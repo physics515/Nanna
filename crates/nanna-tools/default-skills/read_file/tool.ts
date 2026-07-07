@@ -1,10 +1,12 @@
 export default {
   name: "read_file",
+  version: "0.1.0",
+  output: "context",
   description: "Read a file from the filesystem. Returns the file contents with line numbers. Supports optional offset and limit for reading portions of large files.",
   parameters: {
     type: "object",
     properties: {
-      file_path: { type: "string", description: "The absolute path to the file to read" },
+      file_path: { type: "string", description: "Path to the file to read. Relative paths are resolved against the workspace directory." },
       offset: { type: "integer", description: "Line number to start reading from (1-indexed). Default: 1" },
       limit: { type: "integer", description: "Maximum number of lines to read. Default: all lines" }
     },

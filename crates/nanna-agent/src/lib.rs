@@ -8,6 +8,7 @@
 mod chunker;
 pub mod compressor;
 mod context;
+pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
 mod multi;

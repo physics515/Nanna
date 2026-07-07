@@ -323,14 +323,15 @@ async function close() {
   isolation: isolate;
   display: flex;
   align-items: center;
-  height: 22px;
+  height: auto;
   min-width: 160px;
-  padding: 0;
+  padding: 5px 12px;
   border: none;
-  border-radius: 6px;
+  border-radius: 0 0 10px 10px;
   background: rgba(30, 41, 59, 0.30);
   cursor: pointer;
   overflow: hidden;
+  text-align: left;
   box-shadow:
     0 1.5px 3px -1px rgba(0, 0, 0, 0.25),
     0 1px 2px -1px rgba(0, 0, 0, 0.15);
@@ -379,7 +380,7 @@ async function close() {
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 0 10px;
+  padding: 0;
   width: 100%;
 }
 

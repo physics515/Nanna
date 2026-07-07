@@ -1,40 +1,28 @@
-//! Session and state persistence
+//! Legacy persistence helpers
 //!
-//! Handles saving and loading daemon state to disk.
+//! Session and workspace persistence has been migrated to SQLite (nanna-storage).
+//! This module is kept for backward compatibility during the transition period
+//! — it can migrate old sessions.json data to the database on first run.
 
-use crate::session::{Session, SessionId, SessionMessage};
-use chrono::{DateTime, Utc};
+use crate::session::Session;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
+use chrono::{DateTime, Utc};
 
-/// Serializable session state for persistence
+/// Serializable session state (legacy JSON format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
-    pub id: SessionId,
+    pub id: String,
     pub name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub messages: Vec<SessionMessage>,
+    pub messages: Vec<crate::session::SessionMessage>,
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-}
-
-impl From<&Session> for PersistedSession {
-    fn from(session: &Session) -> Self {
-        Self {
-            id: session.id.clone(),
-            name: session.name.clone(),
-            created_at: session.created_at,
-            updated_at: session.updated_at,
-            messages: session.messages.clone(),
-            metadata: session.metadata.clone(),
-            workspace_id: session.workspace_id.clone(),
-        }
-    }
 }
 
 impl From<PersistedSession> for Session {
@@ -53,270 +41,117 @@ impl From<PersistedSession> for Session {
     }
 }
 
-/// Persisted workspace entry (just the path — context is reloaded from disk)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedWorkspace {
-    pub id: String,
-    pub path: String,
-    pub active: bool,
-}
-
-/// Workspace persistence state
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedWorkspaceState {
-    pub version: u32,
-    pub workspaces: Vec<PersistedWorkspace>,
-}
-
-/// Complete daemon state for persistence
+/// Legacy persisted state format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     pub version: u32,
     pub saved_at: DateTime<Utc>,
     pub sessions: Vec<PersistedSession>,
-    pub default_session_id: Option<SessionId>,
+    pub default_session_id: Option<String>,
 }
 
-impl Default for PersistedState {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            saved_at: Utc::now(),
-            sessions: Vec::new(),
-            default_session_id: None,
-        }
-    }
-}
-
-/// Persistence manager for daemon state
+/// Persistence manager — now only handles one-time migration from JSON to DB.
 pub struct PersistenceManager {
     data_dir: PathBuf,
 }
 
 impl PersistenceManager {
-    /// Create a new persistence manager
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
         }
     }
-    
-    /// Get the path to the sessions file
-    fn sessions_path(&self) -> PathBuf {
-        self.data_dir.join("sessions.json")
-    }
-    
-    /// Get the path to the sessions backup file
-    fn sessions_backup_path(&self) -> PathBuf {
-        self.data_dir.join("sessions.backup.json")
-    }
-    
-    /// Ensure the data directory exists
-    pub async fn ensure_dir(&self) -> Result<(), std::io::Error> {
-        fs::create_dir_all(&self.data_dir).await
-    }
-    
-    /// Save sessions to disk
-    pub async fn save_sessions(&self, sessions: &[Session], default_id: Option<&str>) -> Result<(), String> {
-        self.ensure_dir().await.map_err(|e| e.to_string())?;
-        
-        let state = PersistedState {
-            version: 1,
-            saved_at: Utc::now(),
-            sessions: sessions.iter().map(PersistedSession::from).collect(),
-            default_session_id: default_id.map(String::from),
-        };
-        
-        let json = serde_json::to_string_pretty(&state)
-            .map_err(|e| format!("Failed to serialize sessions: {}", e))?;
-        
-        let path = self.sessions_path();
-        let backup_path = self.sessions_backup_path();
-        
-        // Backup existing file
-        if path.exists() {
-            if let Err(e) = fs::copy(&path, &backup_path).await {
-                warn!("Failed to backup sessions file: {}", e);
-            }
-        }
-        
-        // Write new file
-        fs::write(&path, json).await
-            .map_err(|e| format!("Failed to write sessions file: {}", e))?;
-        
-        debug!("Saved {} sessions to {:?}", sessions.len(), path);
-        Ok(())
-    }
-    
-    /// Load sessions from disk
-    pub async fn load_sessions(&self) -> Result<(Vec<Session>, Option<SessionId>), String> {
-        let path = self.sessions_path();
-        
-        if !path.exists() {
-            debug!("No sessions file found at {:?}", path);
-            return Ok((Vec::new(), None));
-        }
-        
-        let json = fs::read_to_string(&path).await
-            .map_err(|e| format!("Failed to read sessions file: {}", e))?;
-        
-        let state: PersistedState = serde_json::from_str(&json)
-            .map_err(|e| {
-                // Try backup
-                warn!("Failed to parse sessions file, trying backup: {}", e);
-                e.to_string()
-            })?;
-        
-        let sessions: Vec<Session> = state.sessions.into_iter().map(Session::from).collect();
-        
-        info!("Loaded {} sessions from {:?}", sessions.len(), path);
-        Ok((sessions, state.default_session_id))
-    }
-    
-    /// Try to load from backup if main file fails
-    pub async fn load_sessions_with_fallback(&self) -> Result<(Vec<Session>, Option<SessionId>), String> {
-        match self.load_sessions().await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                warn!("Failed to load sessions, trying backup: {}", e);
-                
-                let backup_path = self.sessions_backup_path();
-                if !backup_path.exists() {
-                    return Err(format!("No backup file found: {}", e));
-                }
-                
-                let json = fs::read_to_string(&backup_path).await
-                    .map_err(|e| format!("Failed to read backup: {}", e))?;
-                
-                let state: PersistedState = serde_json::from_str(&json)
-                    .map_err(|e| format!("Failed to parse backup: {}", e))?;
-                
-                let sessions: Vec<Session> = state.sessions.into_iter().map(Session::from).collect();
-                
-                info!("Recovered {} sessions from backup", sessions.len());
-                Ok((sessions, state.default_session_id))
-            }
-        }
-    }
-    
-    // ═══ Workspace Persistence ═══
-    
-    fn workspaces_path(&self) -> PathBuf {
-        self.data_dir.join("workspaces.json")
-    }
-    
-    /// Save registered workspace paths to disk
-    pub async fn save_workspaces(&self, entries: &[PersistedWorkspace]) -> Result<(), String> {
-        self.ensure_dir().await.map_err(|e| e.to_string())?;
-        
-        let state = PersistedWorkspaceState {
-            version: 1,
-            workspaces: entries.to_vec(),
-        };
-        
-        let json = serde_json::to_string_pretty(&state)
-            .map_err(|e| format!("Failed to serialize workspaces: {}", e))?;
-        
-        let path = self.workspaces_path();
-        fs::write(&path, json).await
-            .map_err(|e| format!("Failed to write workspaces file: {}", e))?;
-        
-        debug!("Saved {} workspaces to {:?}", entries.len(), path);
-        Ok(())
-    }
-    
-    /// Load workspace paths from disk
-    pub async fn load_workspaces(&self) -> Result<Vec<PersistedWorkspace>, String> {
-        let path = self.workspaces_path();
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        
-        let json = fs::read_to_string(&path).await
-            .map_err(|e| format!("Failed to read workspaces file: {}", e))?;
-        
-        let state: PersistedWorkspaceState = serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse workspaces file: {}", e))?;
-        
-        info!("Loaded {} workspaces from {:?}", state.workspaces.len(), path);
-        Ok(state.workspaces)
-    }
-    
-    /// Auto-save sessions periodically (call this from a background task)
-    pub async fn auto_save_loop(
-        &self,
-        sessions: std::sync::Arc<tokio::sync::RwLock<HashMap<SessionId, Session>>>,
-        default_session: std::sync::Arc<tokio::sync::RwLock<Option<SessionId>>>,
-        interval: std::time::Duration,
-        mut shutdown: tokio::sync::broadcast::Receiver<()>,
-    ) {
-        let mut interval = tokio::time::interval(interval);
-        
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let sessions_guard = sessions.read().await;
-                    let sessions_vec: Vec<Session> = sessions_guard.values().cloned().collect();
-                    let default_id = default_session.read().await.clone();
-                    drop(sessions_guard);
-                    
-                    if let Err(e) = self.save_sessions(&sessions_vec, default_id.as_deref()).await {
-                        error!("Auto-save failed: {}", e);
-                    }
-                }
-                _ = shutdown.recv() => {
-                    info!("Auto-save loop shutting down");
-                    
-                    // Final save on shutdown
-                    let sessions_guard = sessions.read().await;
-                    let sessions_vec: Vec<Session> = sessions_guard.values().cloned().collect();
-                    let default_id = default_session.read().await.clone();
-                    drop(sessions_guard);
-                    
-                    if let Err(e) = self.save_sessions(&sessions_vec, default_id.as_deref()).await {
-                        error!("Final save failed: {}", e);
-                    } else {
-                        info!("Final save completed");
-                    }
-                    
-                    break;
-                }
-            }
-        }
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-    
-    #[tokio::test]
-    async fn test_session_persistence() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = PersistenceManager::new(temp_dir.path());
-        
-        // Create test sessions
-        let mut session1 = Session::new(Some("Test Session 1".to_string()));
-        session1.add_message(crate::session::MessageRole::User, "Hello");
-        session1.add_message(crate::session::MessageRole::Assistant, "Hi there!");
-        
-        let session2 = Session::new(Some("Test Session 2".to_string()));
-        
-        let sessions = vec![session1.clone(), session2.clone()];
-        
-        // Save
-        manager.save_sessions(&sessions, Some(&session1.id)).await.unwrap();
-        
-        // Load
-        let (loaded, default_id) = manager.load_sessions().await.unwrap();
-        
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(default_id.as_deref(), Some(session1.id.as_str()));
-        
-        // Verify first session
-        let loaded1 = loaded.iter().find(|s| s.id == session1.id).unwrap();
-        assert_eq!(loaded1.name, session1.name);
-        assert_eq!(loaded1.messages.len(), 2);
+    /// Attempt to load sessions from the legacy sessions.json file.
+    /// Returns the sessions if the file exists and is valid, or None otherwise.
+    /// After a successful migration, the file should be renamed to .migrated.
+    pub async fn load_legacy_sessions(&self) -> Option<(Vec<Session>, Option<String>)> {
+        let path = self.data_dir.join("sessions.json");
+        if !path.exists() {
+            return None;
+        }
+
+        let json = match fs::read_to_string(&path).await {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to read legacy sessions.json: {}", e);
+                return None;
+            }
+        };
+
+        let state: PersistedState = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to parse legacy sessions.json: {}", e);
+                // Try backup
+                let backup_path = self.data_dir.join("sessions.backup.json");
+                if backup_path.exists() {
+                    if let Ok(backup_json) = fs::read_to_string(&backup_path).await {
+                        match serde_json::from_str::<PersistedState>(&backup_json) {
+                            Ok(s) => {
+                                info!("Recovered {} sessions from backup", s.sessions.len());
+                                s
+                            }
+                            Err(_) => return None,
+                        }
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+        };
+
+        if state.sessions.is_empty() {
+            return None;
+        }
+
+        let sessions: Vec<Session> = state.sessions.into_iter().map(Session::from).collect();
+        info!("Found {} sessions in legacy sessions.json for migration", sessions.len());
+        Some((sessions, state.default_session_id))
+    }
+
+    /// Mark the legacy sessions.json as migrated (rename it).
+    pub async fn mark_sessions_migrated(&self) {
+        let path = self.data_dir.join("sessions.json");
+        let migrated_path = self.data_dir.join("sessions.json.migrated");
+        if path.exists() {
+            if let Err(e) = fs::rename(&path, &migrated_path).await {
+                warn!("Failed to rename sessions.json to .migrated: {}", e);
+            } else {
+                info!("Renamed sessions.json → sessions.json.migrated");
+            }
+        }
+        // Also rename backup
+        let backup = self.data_dir.join("sessions.backup.json");
+        if backup.exists() {
+            let _ = fs::rename(&backup, self.data_dir.join("sessions.backup.json.migrated")).await;
+        }
+    }
+
+    /// Load legacy tool stats from tool-stats.json (one-time migration).
+    pub async fn load_legacy_tool_stats(&self) -> Option<serde_json::Value> {
+        let path = self.data_dir.join("tool-stats.json");
+        if !path.exists() {
+            return None;
+        }
+        let json = fs::read_to_string(&path).await.ok()?;
+        let data: serde_json::Value = serde_json::from_str(&json).ok()?;
+        info!("Found legacy tool-stats.json for migration");
+        Some(data)
+    }
+
+    /// Mark the legacy tool-stats.json as migrated.
+    pub async fn mark_tool_stats_migrated(&self) {
+        let path = self.data_dir.join("tool-stats.json");
+        let migrated = self.data_dir.join("tool-stats.json.migrated");
+        if path.exists() {
+            if let Err(e) = fs::rename(&path, &migrated).await {
+                warn!("Failed to rename tool-stats.json to .migrated: {}", e);
+            } else {
+                info!("Renamed tool-stats.json → tool-stats.json.migrated");
+            }
+        }
     }
 }

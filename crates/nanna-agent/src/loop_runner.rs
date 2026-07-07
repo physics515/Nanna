@@ -170,9 +170,14 @@ pub type MemoryCallback = Box<dyn Fn(ExtractedMemory) -> std::pin::Pin<Box<dyn s
 pub type ThinkingCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Callback for tool start events (called with tool call id, name, and input)
-pub type ToolStartCallback = Box<dyn Fn(&str, &str, &Value) + Send + Sync>;
-/// Callback for tool completion: (call_id, name, output, success, duration_ms)
-pub type ToolEndCallback = Box<dyn Fn(&str, &str, &str, bool, u64) + Send + Sync>;
+/// (call_id, name, input, model)
+pub type ToolStartCallback = Box<dyn Fn(&str, &str, &Value, Option<&str>) + Send + Sync>;
+/// Callback for tool completion: (call_id, name, output, success, duration_ms, data)
+pub type ToolEndCallback = Box<dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync>;
+/// Callback for checkpointing conversation state (messages as JSON, iteration count).
+/// Fired after each agent iteration completes (assistant response + tool results stored).
+/// The daemon can persist this to recover if the process crashes mid-run.
+pub type CheckpointCallback = Box<dyn Fn(&[AnthropicMessage], usize) + Send + Sync>;
 
 /// Options for running the agent
 #[derive(Default)]
@@ -207,6 +212,15 @@ pub struct RunOptions {
     pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Image attachments for the current message: Vec<(base64_data, media_type)>
     pub attachments: Vec<(String, String)>,
+    /// Checkpoint callback: fired after each iteration with current conversation state.
+    /// Enables crash recovery by persisting intermediate state.
+    pub on_checkpoint: Option<CheckpointCallback>,
+    /// If true, this is a sub-agent run. Nudge thresholds are lowered
+    /// (start at 20 instead of 50) since sub-agents should be focused tasks.
+    pub is_sub_agent: bool,
+    /// If true, all registered tools are available from iteration 1 (skip discover_tools).
+    /// Used for sub-agents that have a specific task and shouldn't waste a turn on discovery.
+    pub all_tools_active: bool,
 }
 
 /// Response from an agent run
@@ -304,8 +318,51 @@ struct LlmResult {
 /// 1. **Repeated intent phrases**: The model keeps saying "let me X" without doing X.
 /// 2. **Phantom completion**: The model claims to have read/written/verified files
 ///    without any tool calls — it hallucinated the entire workflow.
-fn detect_narration_loop(text: &str) -> bool {
+fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     let lower = text.to_lowercase();
+
+    // If the agent has been actively making tool calls, phrases like "let me read X"
+    // are status narration (describing what it already did), not hallucination.
+    // Only trigger on strong phantom-completion signals in this case.
+    if has_tool_history {
+        const COMPLETION_CLAIMS_ACTIVE: &[&str] = &[
+            "the file is clean",
+            "the file is now",
+            "the rewrite is complete",
+            "the redesign is complete",
+            "successfully wrote",
+            "successfully updated",
+            "successfully created",
+            "successfully modified",
+            "file has been updated",
+            "file has been rewritten",
+            "file has been modified",
+            "changes are complete",
+            "changes are done",
+            "the update is complete",
+            "here's what i changed",
+            "i've rewritten",
+            "i've updated",
+            "i've modified",
+            "i've created the",
+            "i've written the",
+            "verified the",
+            "file is correct",
+            "it now uses only",
+        ];
+        const ACTION_CLAIMS_ACTIVE: &[&str] = &[
+            "let me read",
+            "let me check",
+            "let me verify",
+            "let me write",
+            "let me rewrite",
+            "now let me",
+        ];
+        let completion_hits = COMPLETION_CLAIMS_ACTIVE.iter().filter(|p| lower.contains(*p)).count();
+        let action_hits = ACTION_CLAIMS_ACTIVE.iter().filter(|p| lower.contains(*p)).count();
+        // Much higher bar: need strong phantom-completion evidence
+        return completion_hits >= 2 && action_hits >= 3;
+    }
 
     // ── Strategy 1: Repeated intent-to-act phrases ──
     // Phrases that indicate the model is *talking about* using tools
@@ -365,8 +422,11 @@ fn detect_narration_loop(text: &str) -> bool {
         .map(|p| lower.matches(p).count())
         .sum();
 
-    // If 4+ total narration phrase hits, it's narrating instead of acting
-    if total_hits >= 4 {
+    // Need a high density of narration phrases relative to text length.
+    // Short texts (< 500 chars) need 4+ hits; longer texts need proportionally more
+    // to avoid false positives on legitimate planning/thinking text.
+    let threshold = if lower.len() < 500 { 4 } else { 6 + (lower.len() / 1000) };
+    if total_hits >= threshold {
         return true;
     }
 
@@ -436,10 +496,10 @@ fn detect_repetition(text: &str) -> bool {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .filter(|l| l.len() > 20)
+        .filter(|l| l.len() > 40) // Longer minimum to avoid matching table separators and short repeated patterns
         .collect();
 
-    if lines.len() < 6 {
+    if lines.len() < 10 {
         return false;
     }
 
@@ -448,8 +508,12 @@ fn detect_repetition(text: &str) -> bool {
         *seen.entry(line).or_insert(0) += 1;
     }
 
-    // If any substantial line appears 3+ times, it's repetitive
-    seen.values().any(|&count| count >= 3)
+    // Need 4+ repetitions of the same substantial line AND it must be a significant
+    // fraction of the output (>25% of lines are duplicates) to catch real loops
+    // while allowing legitimate repeated structures in reports/tables.
+    let max_repeats = seen.values().copied().max().unwrap_or(0);
+    let total_dupes: usize = seen.values().filter(|&&c| c >= 4).map(|c| c - 1).sum();
+    max_repeats >= 4 && total_dupes > lines.len() / 4
 }
 
 /// Detect thinking spiral: the model's reasoning is going in circles without
@@ -606,6 +670,15 @@ impl Agent {
         // Add user message with optional budget awareness
         self.add_user_message_with_budget(message, &options).await;
 
+        // Pre-activate all tools for sub-agents so they don't waste a turn on discover_tools
+        if options.all_tools_active {
+            let all_names = self.tools.tool_names().await;
+            for name in all_names {
+                state.active_tools.insert(name);
+            }
+            info!(count = state.active_tools.len(), "Pre-activated all tools for sub-agent");
+        }
+
         // Agent loop
         loop {
             // Check cancellation flag
@@ -641,24 +714,49 @@ impl Agent {
             }
 
             // Progressive wrap-up nudges: gentle at first, increasingly urgent.
-            // Starts at iteration 25, then every 10 iterations with escalating tone.
-            // This helps the model stay focused without imposing a hard cap.
+            // Sub-agents get earlier nudges since they're focused tasks.
+            // Main agents get high thresholds to avoid interrupting productive coding loops.
             {
                 let i = state.iterations;
-                let nudge_msg = if i == 25 && state.wrapup_nudge_count == 0 {
-                    Some("[SYSTEM: You've made 25 tool calls. Consider whether you have enough \
-                          information to answer. If so, synthesize your response now rather than \
-                          gathering more data.]")
-                } else if i == 35 && state.wrapup_nudge_count <= 1 {
-                    Some("[SYSTEM: You've made 35 tool calls. You likely have enough information. \
-                          Stop exploring and respond to the user with what you know. \
-                          It's better to give a good answer now than a perfect answer never.]")
-                } else if i >= 45 && (i - 45) % 5 == 0 {
-                    Some("[SYSTEM: URGENT — You have made a very large number of tool calls. \
-                          STOP calling tools and respond to the user IMMEDIATELY with whatever \
-                          you have. Do NOT make any more tool calls.]")
+                let nudge_msg = if options.is_sub_agent {
+                    // Sub-agent nudge schedule: 40 → 60 → 80 → every 20 after 100
+                    // Gentle ramp — sub-agents often need many iterations for real work
+                    // (auditing files, fixing lints, etc.). Don't rush them.
+                    if i == 40 && state.wrapup_nudge_count == 0 {
+                        Some("[SYSTEM: You've made 40 tool calls. You're a sub-agent. \
+                              If you're making steady progress, keep going — take as long as you need. \
+                              If you're going in circles or repeating yourself, wrap up with what you have.]")
+                    } else if i == 60 && state.wrapup_nudge_count <= 1 {
+                        Some("[SYSTEM: 60 tool calls. If the task is nearly done, finish it. \
+                              If there's a lot remaining, consider wrapping up with a progress report \
+                              so the parent agent can spawn follow-up tasks for the rest.]")
+                    } else if i == 80 && state.wrapup_nudge_count <= 2 {
+                        Some("[SYSTEM: 80 tool calls — this is a long sub-task. Please start wrapping up. \
+                              Report what you've completed, what remains, and any issues encountered.]")
+                    } else if i >= 100 && (i - 100) % 20 == 0 {
+                        Some("[SYSTEM: This sub-task has been running for a very long time. \
+                              Please finish up and return your results now. The parent agent \
+                              can spawn follow-up tasks if more work is needed.]")
+                    } else {
+                        None
+                    }
                 } else {
-                    None
+                    // Main agent nudge schedule: 50 → 75 → every 25 after 100
+                    if i == 50 && state.wrapup_nudge_count == 0 {
+                        Some("[SYSTEM: You've made 50 tool calls — this is a long run. If you're \
+                              making steady progress, keep going. If you're going in circles, \
+                              pause and respond with what you have so far.]")
+                    } else if i == 75 && state.wrapup_nudge_count <= 1 {
+                        Some("[SYSTEM: 75 tool calls. Consider wrapping up soon. It's better to \
+                              deliver partial progress and let the user redirect than to keep \
+                              iterating indefinitely.]")
+                    } else if i >= 100 && (i - 100) % 25 == 0 {
+                        Some("[SYSTEM: You've made a very large number of tool calls. \
+                              Please wrap up and respond to the user with your progress so far. \
+                              You can continue in the next turn if needed.]")
+                    } else {
+                        None
+                    }
                 };
 
                 if let Some(msg) = nudge_msg {
@@ -690,6 +788,8 @@ impl Agent {
                 let proactive_threshold = compression_threshold * 40 / 100; // ~64K for 160K threshold
 
                 // Tier 1 (proactive): Every 5 iterations, if >40% of compression_threshold
+                // Keep at least 20 recent messages to avoid dropping tool results
+                // the agent still needs for its current task.
                 if state.iterations > 1
                     && state.iterations % 5 == 0
                     && estimated > proactive_threshold
@@ -701,7 +801,7 @@ impl Agent {
                         tier = "proactive",
                         "Tier 1: proactive compression triggered"
                     );
-                    let dropped = ctx.drop_oldest(6);
+                    let dropped = ctx.drop_oldest(20);
                     if dropped > 0 {
                         info!(dropped_messages = dropped, "Tier 1 compression complete");
                     }
@@ -715,6 +815,8 @@ impl Agent {
                             ollama_url: self.config.summarization_ollama_url.clone(),
                             summarizer_context_window: 8000,
                             max_iterations: 20,
+                            openrouter_api_key: self.config.openrouter_api_key.clone(),
+                            openai_api_key: self.config.openai_api_key.clone(),
                         };
                         info!(
                             estimated_tokens = estimated,
@@ -729,7 +831,7 @@ impl Agent {
                             Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Tier 2 summarization failed, dropping oldest");
-                                ctx.drop_oldest(6);
+                                ctx.drop_oldest(16);
                             }
                         }
                     } else {
@@ -739,7 +841,7 @@ impl Agent {
                             tier = "standard",
                             "Tier 2: no summarization models, dropping oldest"
                         );
-                        ctx.drop_oldest(6);
+                        ctx.drop_oldest(16);
                     }
                 }
 
@@ -753,6 +855,8 @@ impl Agent {
                             ollama_url: self.config.summarization_ollama_url.clone(),
                             summarizer_context_window: 8000,
                             max_iterations: 20,
+                            openrouter_api_key: self.config.openrouter_api_key.clone(),
+                            openai_api_key: self.config.openai_api_key.clone(),
                         };
                         warn!(
                             estimated_tokens = estimated,
@@ -808,6 +912,17 @@ impl Agent {
                 None
             };
 
+            // If there's already streamed text from a previous iteration, emit a
+            // space separator so the next text block doesn't merge with the last one.
+            if state.iterations > 1 && !state.final_text.is_empty()
+                && !state.final_text.ends_with(' ')
+                && !state.final_text.ends_with('\n')
+            {
+                if let Some(ref on_text) = options.on_text {
+                    on_text(" ");
+                }
+            }
+
             // Call LLM with escalation: if a routed (cheap) model fails, retry with primary
             let llm_start = std::time::Instant::now();
             let mut result = self.call_llm(&request, &options, &mut state).await;
@@ -824,8 +939,19 @@ impl Agent {
                     }
                 };
                 if should_escalate {
+                    let escalation_reason = match &result {
+                        Err(e) => format!("error: {}", e),
+                        Ok(r) => {
+                            let bad_tools: Vec<_> = r.tool_uses.iter()
+                                .filter(|(_, name, _)| name.is_empty())
+                                .map(|(id, _, _)| id.as_str())
+                                .collect();
+                            format!("malformed tool calls: {:?}", bad_tools)
+                        }
+                    };
                     warn!(
                         failed_model = %request.model,
+                        reason = %escalation_reason,
                         "⬆️ Escalating: routed model failed, retrying with primary model"
                     );
                     // Record failure on the cheap model
@@ -855,6 +981,39 @@ impl Agent {
                     escalated = true;
                 }
             }
+
+            // Handle context_length_exceeded: emergency truncate and retry once
+            let result = match result {
+                Err(ref e) if Self::is_context_length_error(&e.to_string()) => {
+                    let err_msg = e.to_string();
+                    let est_tokens = self.context.read().await.estimate_request_tokens();
+                    warn!(
+                        error = err_msg,
+                        estimated_tokens = est_tokens,
+                        "Context length exceeded — emergency truncating and retrying"
+                    );
+                    {
+                        let mut ctx = self.context.write().await;
+                        // Aggressive: drop half the messages, then truncate to hard limit
+                        let keep = ctx.messages.len() / 2;
+                        if keep > 2 {
+                            ctx.drop_oldest(keep);
+                        }
+                        ctx.truncate_to_limit();
+                        let remaining = ctx.messages.len();
+                        let est_after = ctx.estimate_request_tokens();
+                        info!(
+                            remaining_messages = remaining,
+                            estimated_tokens = est_after,
+                            "Context emergency-truncated"
+                        );
+                        // Rebuild request with trimmed context
+                        request.messages = ctx.messages_for_request();
+                    }
+                    self.call_llm(&request, &options, &mut state).await
+                }
+                other => other,
+            };
 
             let result = result?;
 
@@ -972,7 +1131,8 @@ impl Agent {
             // If no tool calls, check for narration loop before exiting
             if result.tool_uses.is_empty() {
                 // Detect narration loop: model talked about using tools but never called them
-                if detect_narration_loop(&state.final_text) && !state.narration_nudged {
+                let has_tool_history = !state.tool_records.is_empty();
+                if detect_narration_loop(&state.final_text, has_tool_history) && !state.narration_nudged {
                     warn!(
                         text_len = state.final_text.len(),
                         iteration = state.iterations,
@@ -1064,7 +1224,7 @@ impl Agent {
             }
 
             // Execute tools and continue loop
-            let mut tool_results = self.execute_tools(&result.tool_uses, &mut state, &options).await;
+            let mut tool_results = self.execute_tools(&result.tool_uses, &mut state, &options, routed_model.as_deref()).await;
             // Merge in any error results from malformed tool call JSON.
             // These tell the model its call was unparseable so it can retry.
             if !result.error_tool_results.is_empty() {
@@ -1082,6 +1242,12 @@ impl Agent {
 
             // Semantic deduplication: evict superseded tool results
             self.deduplicate_tool_results().await;
+
+            // Checkpoint: persist conversation state for crash recovery
+            if let Some(ref cb) = options.on_checkpoint {
+                let ctx = self.context.read().await;
+                cb(&ctx.messages, state.iterations);
+            }
 
             // Periodic memory extraction every 10 iterations
             if options.auto_extract_memories
@@ -1129,12 +1295,15 @@ impl Agent {
             ctx.messages.push(AnthropicMessage::user_text(msg));
         } else {
             // Build content blocks: text first, then images
+            // Resize images that exceed the provider's size limit
             let mut blocks = vec![ContentBlock::Text { text: msg }];
             for (data, media_type) in &options.attachments {
+                let (resized_data, resized_mt) =
+                    crate::image_util::fit_image_to_limit(data, media_type, &self.config.model);
                 blocks.push(ContentBlock::Image {
                     source: ImageSource::Base64 {
-                        media_type: media_type.clone(),
-                        data: data.clone(),
+                        media_type: resized_mt,
+                        data: resized_data,
                     },
                 });
             }
@@ -1211,6 +1380,8 @@ impl Agent {
         let mut current_tool_name = String::new();
         let mut current_tool_json = String::new();
         let mut current_block_type = String::new();
+        let mut current_thinking_signature = String::new();
+        let mut current_thinking_text = String::new(); // per-block thinking content
         let mut narration_check_len = 0usize; // track text length at last narration check
 
         while let Some(event) = stream.next().await {
@@ -1219,10 +1390,11 @@ impl Agent {
                     on_text(&text);
                     response_text.push_str(&text);
 
-                    // Periodically check for narration loops (every ~2000 chars of text)
-                    if response_text.len() - narration_check_len > 2000 {
+                    // Periodically check for narration loops (every ~8000 chars of text)
+                    if response_text.len() - narration_check_len > 8000 {
                         narration_check_len = response_text.len();
-                        if detect_narration_loop(&response_text) || detect_repetition(&response_text) {
+                        let has_tool_history = !state.tool_records.is_empty();
+                        if detect_narration_loop(&response_text, has_tool_history) {
                             warn!(
                                 text_len = response_text.len(),
                                 "🔄 Narration loop detected in streaming response — aborting stream"
@@ -1242,6 +1414,7 @@ impl Agent {
                     }
                     state.reasoning_content.push_str(&thinking);
                     state.current_reasoning.push_str(&thinking);
+                    current_thinking_text.push_str(&thinking);
                     // Estimate tokens (~4 chars per token)
                     state.reasoning_tokens += (thinking.len() / 4) as u32;
 
@@ -1361,7 +1534,22 @@ impl Agent {
                         }
                         current_tool_json.clear();
                     } else if current_block_type == "thinking" {
-                        // Thinking block finished - reasoning already accumulated
+                        // Thinking block finished — push to content_blocks with signature
+                        // so it's preserved in conversation history (Anthropic requires
+                        // the signature field when sending thinking blocks back in multi-turn).
+                        if !current_thinking_text.is_empty() {
+                            let sig = if current_thinking_signature.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut current_thinking_signature))
+                            };
+                            content_blocks.push(ContentBlock::Thinking {
+                                thinking: std::mem::take(&mut current_thinking_text),
+                                signature: sig,
+                            });
+                        }
+                        current_thinking_text.clear();
+                        current_thinking_signature.clear();
                     } else if !response_text.is_empty() {
                         content_blocks.push(ContentBlock::Text {
                             text: response_text.clone(),
@@ -1377,6 +1565,9 @@ impl Agent {
                     ..
                 } => {
                     output_tokens += tokens;
+                }
+                StreamEvent::SignatureDelta { signature, .. } => {
+                    current_thinking_signature.push_str(&signature);
                 }
                 _ => {}
             }
@@ -1408,7 +1599,7 @@ impl Agent {
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_uses.push((id.clone(), name.clone(), input.clone()));
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     // Capture thinking/reasoning content
                     state.reasoning_content.push_str(thinking);
                     state.current_reasoning.push_str(thinking);
@@ -1445,7 +1636,7 @@ impl Agent {
     fn strip_write_content_from_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
         blocks.iter().map(|block| {
             match block {
-                ContentBlock::ToolUse { id, name, input } if is_write_tool(name) => {
+                ContentBlock::ToolUse { id, name, input } if is_write_tool(&name) => {
                     let mut input = input.clone();
                     if let Some(obj) = input.as_object_mut() {
                         if let Some(content_val) = obj.get("content") {
@@ -1475,33 +1666,52 @@ impl Agent {
         tool_uses: &[(String, String, Value)],
         state: &mut RunState,
         options: &RunOptions,
+        routed_model: Option<&str>,
     ) -> Vec<ContentBlock> {
         let mut tool_results = Vec::new();
 
+        // Finalize any pending reasoning block before tool execution
+        if let Some((_, name, _)) = tool_uses.first() {
+            state.finalize_reasoning_block(Some(name.clone()));
+        }
+
+        // Phase 1: Fire all on_tool_start callbacks and build tool calls
+        let mut tool_calls_with_meta: Vec<(String, String, Value, ToolCall)> = Vec::new();
         for (id, name, input) in tool_uses {
-            let start = std::time::Instant::now();
+            if let Some(ref cb) = options.on_tool_start {
+                cb(id, name, input, routed_model);
+            }
 
             let params: HashMap<String, Value> = input.as_object().map_or_else(HashMap::new, |obj| {
                 obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             });
 
-            let tool_call = ToolCall {
+            tool_calls_with_meta.push((id.clone(), name.clone(), input.clone(), ToolCall {
                 id: id.clone(),
                 name: name.clone(),
                 parameters: params,
-            };
+            }));
+        }
 
-            // Finalize any pending reasoning block before tool execution (interleaved reasoning)
-            state.finalize_reasoning_block(Some(name.clone()));
-
-            // Notify via callback before execution
-            if let Some(ref cb) = options.on_tool_start {
-                cb(id, name, input);
+        // Phase 2: Execute all tools in parallel
+        info!("🚀 Executing {} tools in parallel", tool_calls_with_meta.len());
+        let tool_futures: Vec<_> = tool_calls_with_meta.iter().map(|(_, name, _, call)| {
+            let name = name.clone();
+            let call = call.clone();
+            let tools = Arc::clone(&self.tools);
+            async move {
+                let start = std::time::Instant::now();
+                info!(tool = %name, "Executing tool");
+                let response = tools.execute(call).await;
+                let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                (response, duration_ms)
             }
+        }).collect();
 
-            info!(tool = %name, "Executing tool");
-            let response = self.tools.execute(tool_call).await;
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let results = futures::future::join_all(tool_futures).await;
+
+        // Phase 3: Process results sequentially (callbacks, state updates, memory)
+        for ((id, name, input, _), (response, duration_ms)) in tool_calls_with_meta.into_iter().zip(results.into_iter()) {
 
             if duration_ms > 10_000 {
                 warn!(
@@ -1545,7 +1755,7 @@ impl Agent {
                 } else {
                     response.result.error.as_deref().unwrap_or("Unknown error")
                 };
-                cb(id, name, result_content, response.result.success, duration_ms);
+                cb(&id, &name, result_content, response.result.success, duration_ms, response.result.data.as_ref());
             }
 
             // Check for activate_tools in structured data (from discover_tools)
@@ -1563,7 +1773,7 @@ impl Agent {
             }
 
             // Strip write content from stored tool call record (same as context blocks)
-            let stored_input = if is_write_tool(name) {
+            let stored_input = if is_write_tool(&name) {
                 let mut input = input.clone();
                 if let Some(obj) = input.as_object_mut() {
                     if let Some(content_val) = obj.get("content") {
@@ -1639,7 +1849,7 @@ impl Agent {
                                     result_content.len(), compressed.len()
                                 );
                                 compressed
-                            } else if let Some(summarized) = self.summarize_tool_output(name, &result_content).await {
+                            } else if let Some(summarized) = self.summarize_tool_output(&name, &result_content).await {
                                 summarized
                             } else {
                                 let end = truncate_boundary(&result_content, threshold);
@@ -1648,7 +1858,7 @@ impl Agent {
                                     &result_content[..end], result_content.len()
                                 )
                             }
-                        } else if let Some(summarized) = self.summarize_tool_output(name, &result_content).await {
+                        } else if let Some(summarized) = self.summarize_tool_output(&name, &result_content).await {
                             info!(
                                 tool = name,
                                 original_len = result_content.len(),
@@ -1727,6 +1937,22 @@ impl Agent {
         }
 
         tool_results
+    }
+
+    /// Check if an error indicates the context length was exceeded.
+    ///
+    /// Various providers return this differently:
+    /// - OpenRouter/StepFun: "context_length_exceeded" in JSON body
+    /// - OpenAI: "maximum context length" / "reduce the length"
+    /// - Anthropic: "prompt is too long"
+    fn is_context_length_error(error: &str) -> bool {
+        let lower = error.to_lowercase();
+        lower.contains("context_length_exceeded")
+            || lower.contains("maximum context length")
+            || lower.contains("reduce the length")
+            || lower.contains("prompt is too long")
+            || lower.contains("too many tokens")
+            || (lower.contains("400") && lower.contains("token"))
     }
 
     /// Create an LLM client for the specified model
@@ -2052,7 +2278,16 @@ impl Agent {
                             .collect();
                         // If response mentions any distinctive line, consider it referenced
                         lines.iter().any(|line| {
-                            let sample = if line.len() > 60 { &line[..60] } else { line };
+                            let sample = if line.len() > 60 {
+                                // Find a char boundary at or before byte 60
+                                let mut end = 60;
+                                while end > 0 && !line.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                &line[..end]
+                            } else {
+                                line
+                            };
                             response_text.contains(sample)
                         })
                     };
@@ -2201,12 +2436,35 @@ impl Agent {
             None
         };
 
+        // Get messages and ensure all images fit within provider size limits.
+        // New attachments are resized when added (line ~1143), but images already
+        // in context history (from previous turns, restored sessions, etc.) may
+        // still exceed the limit.  Resize them here at the last gate before the API.
+        let messages = {
+            let mut msgs = ctx.messages_for_request();
+            let model = &self.config.model;
+            for msg in &mut msgs {
+                for block in &mut msg.content {
+                    if let ContentBlock::Image {
+                        source: ImageSource::Base64 { media_type, data },
+                    } = block
+                    {
+                        let (new_data, new_mt) =
+                            crate::image_util::fit_image_to_limit(data, media_type, model);
+                        *data = new_data;
+                        *media_type = new_mt;
+                    }
+                }
+            }
+            msgs
+        };
+
         AnthropicRequest {
             model: self.config.model.clone(),
-            // Use messages_for_request() to include consolidated summary if present
-            messages: ctx.messages_for_request(),
+            messages,
             max_tokens: self.config.max_tokens,
-            temperature: Some(self.config.temperature),
+            // Anthropic requires temperature=1 (or None) when thinking is enabled
+            temperature: if thinking.is_some() { None } else { Some(self.config.temperature) },
             system: if system_prompt.is_empty() {
                 None
             } else {

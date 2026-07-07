@@ -8,6 +8,7 @@ default = []
 browser = ["nanna-browser"]
 vision = ["nanna-llm"]
 scripting = ["nanna-scripting"]
+python = ["nanna-scripting/python"]
 
 [dependencies]
 tokio.workspace = true

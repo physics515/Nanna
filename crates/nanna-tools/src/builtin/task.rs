@@ -9,12 +9,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Maximum iterations a sub-agent can run
-const MAX_SUB_AGENT_ITERATIONS: usize = 25;
-/// Default iterations if not specified
-const DEFAULT_SUB_AGENT_ITERATIONS: usize = 10;
-/// Timeout for sub-agent execution (5 minutes)
-const SUB_AGENT_TIMEOUT_SECS: u64 = 300;
 
 /// Tool for delegating independent sub-tasks to a fresh sub-agent.
 ///
@@ -43,7 +37,7 @@ impl Tool for TaskTool {
         )
         .string_param("prompt", "The task to perform. Be specific and self-contained.", true)
         .string_param("description", "Short description (3-5 words) for logging.", false)
-        .int_param("max_iterations", "Maximum iterations (1-25, default 10).", false)
+        .int_param("max_iterations", "Maximum iterations (None = unlimited, agent stops when done).", false)
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -57,9 +51,7 @@ impl Tool for TaskTool {
 
         let max_iterations = params.get("max_iterations")
             .and_then(Value::as_u64)
-            .map_or(DEFAULT_SUB_AGENT_ITERATIONS, |v| {
-                (v as usize).min(MAX_SUB_AGENT_ITERATIONS).max(1)
-            });
+            .map(|v| v as usize);
 
         match self.spawner.spawn(prompt, description, max_iterations).await {
             Ok(result) => {
@@ -74,6 +66,8 @@ impl Tool for TaskTool {
     }
 
     fn timeout_secs(&self) -> Option<u64> {
-        Some(SUB_AGENT_TIMEOUT_SECS)
+        // No timeout — sub-agents are full agents. The wrap-up nudges in
+        // loop_runner.rs handle graceful completion for long-running tasks.
+        None
     }
 }

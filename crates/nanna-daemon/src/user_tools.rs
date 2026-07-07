@@ -311,13 +311,53 @@ impl Tool for UserToolWrapper {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
         
-        let content = match result.value {
-            Value::String(s) => s,
-            Value::Null => String::new(),
-            other => serde_json::to_string_pretty(&other).unwrap_or_else(|_| other.to_string()),
+        // If the script returns an object with { content, success } fields,
+        // respect the success flag. This lets tools like `exec` signal failure
+        // (e.g. command exited nonzero) while still returning output for the LLM.
+        let (content, success, data) = match &result.value {
+            Value::Object(map) if map.contains_key("content") => {
+                let c = map.get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let s = map.get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                // Pass through extra fields as structured data (e.g. "written" for write_file)
+                let mut extra = serde_json::Map::new();
+                for (k, v) in map.iter() {
+                    if k != "content" && k != "success" {
+                        extra.insert(k.clone(), v.clone());
+                    }
+                }
+                let d = if extra.is_empty() { None } else { Some(Value::Object(extra)) };
+                (c, s, d)
+            }
+            Value::String(s) => {
+                // Heuristic: strings starting with "Error:" indicate tool failure.
+                // This catches tools that return error messages as plain strings
+                // without needing to update every tool script.
+                let failed = s.starts_with("Error:") || s.starts_with("Error ");
+                (s.clone(), !failed, None)
+            }
+            Value::Null => (String::new(), true, None),
+            other => (serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()), true, None),
         };
         
-        Ok(ToolResult::success(content))
+        if success {
+            let mut r = ToolResult::success(content);
+            r.data = data;
+            Ok(r)
+        } else {
+            // Return with success=false so notifications fire, but include the
+            // full output as content so the LLM can still read what happened.
+            Ok(ToolResult {
+                success: false,
+                content,
+                error: None,
+                data,
+            })
+        }
     }
 
     fn timeout_secs(&self) -> Option<u64> {

@@ -3,7 +3,9 @@
 //! Connects to Discord's Gateway API for real-time message events.
 //! Handles heartbeats, resume, and reconnection automatically.
 
+use super::circuit_breaker::{BreakerAction, CircuitBreaker};
 use super::{Listener, ListenerError, ListenerHandle};
+use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -22,7 +24,6 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
-const MAX_RETRY_DELAY: u64 = 120;
 
 /// Discord Gateway listener
 pub struct DiscordListener {
@@ -39,6 +40,8 @@ pub struct DiscordListener {
     self_id: Arc<RwLock<Option<String>>>,
     /// Allowed guild IDs (empty = allow all)
     allowed_guilds: Vec<String>,
+    /// Optional status manager for reporting connection state to the UI
+    status_manager: Option<Arc<StatusManager>>,
 }
 
 impl DiscordListener {
@@ -55,6 +58,7 @@ impl DiscordListener {
             resume_url: Arc::new(RwLock::new(None)),
             self_id: Arc::new(RwLock::new(None)),
             allowed_guilds: Vec::new(),
+            status_manager: None,
         }
     }
 
@@ -69,6 +73,13 @@ impl DiscordListener {
     #[must_use]
     pub fn with_allowed_guilds(mut self, guilds: Vec<String>) -> Self {
         self.allowed_guilds = guilds;
+        self
+    }
+
+    /// Attach a status manager for reporting connection state to the UI
+    #[must_use]
+    pub fn with_status_manager(mut self, manager: Arc<StatusManager>) -> Self {
+        self.status_manager = Some(manager);
         self
     }
 
@@ -169,7 +180,11 @@ impl DiscordListener {
     ) {
         info!("Discord Gateway listener starting");
 
-        let mut retry_delay = Duration::from_secs(1);
+        let mut cb = CircuitBreaker::new("discord");
+        if let Some(sm) = &self.status_manager {
+            cb = cb.with_status_manager(Arc::clone(sm));
+        }
+
         let mut should_resume = false;
 
         loop {
@@ -186,19 +201,21 @@ impl DiscordListener {
                 GATEWAY_URL.to_string()
             };
 
+            cb.report_connecting().await;
             info!("Connecting to Discord Gateway: {}", url);
 
             let (ws_stream, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = match connect_async(&url).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!("Discord Gateway connection failed: {}, retrying in {:?}", e, retry_delay);
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(MAX_RETRY_DELAY));
+                    let detail = format!("WebSocket connect failed: {}", e);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
                     continue;
                 }
             };
 
-            retry_delay = Duration::from_secs(1); // Reset on successful connect
             let (mut write, mut read) = ws_stream.split();
 
             // Heartbeat interval (set by Hello) - tracked for debugging
@@ -269,10 +286,12 @@ impl DiscordListener {
                                                     *self.self_id.write().await = Some(id.to_string());
                                                 }
                                             }
+                                            cb.record_success().await;
                                             info!("Discord Gateway READY");
                                         }
                                     }
                                     "RESUMED" => {
+                                        cb.record_success().await;
                                         info!("Discord Gateway RESUMED");
                                     }
                                     "MESSAGE_CREATE" => {
@@ -316,6 +335,9 @@ impl DiscordListener {
                                 should_resume = resumable;
                                 if !resumable {
                                     *self.session_id.write().await = None;
+                                    if cb.record_auth_failure("invalid session (non-resumable)").await == BreakerAction::Stop {
+                                        return;
+                                    }
                                 }
                                 break 'connection;
                             }
@@ -361,6 +383,8 @@ impl DiscordListener {
                 }
             }
 
+            // Backoff before reconnecting (no-op if counters are zero)
+            cb.backoff().await;
         }
 
         info!("Discord Gateway listener stopped");

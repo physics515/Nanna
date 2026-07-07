@@ -231,29 +231,37 @@ impl Backend {
                             "delta": delta,
                         }));
                     }
-                    DaemonEvent::ToolStart { session_id, call_id, name, input } => {
+                    DaemonEvent::ToolStart { session_id, call_id, name, input, model } => {
+                        let mut tool_call = serde_json::json!({
+                            "id": call_id,
+                            "name": name,
+                            "input": input,
+                            "output": "",
+                            "success": false,
+                            "duration_ms": 0,
+                        });
+                        if let Some(m) = &model {
+                            tool_call["model"] = serde_json::json!(m);
+                        }
                         let _ = app.emit("tool-call", serde_json::json!({
                             "session_id": session_id,
-                            "tool_call": {
-                                "id": call_id,
-                                "name": name,
-                                "input": input,
-                                "output": "",
-                                "success": false,
-                                "duration_ms": 0,
-                            },
+                            "tool_call": tool_call,
                             "status": "started",
                         }));
                     }
-                    DaemonEvent::ToolEnd { session_id, call_id, output, success, duration_ms } => {
+                    DaemonEvent::ToolEnd { session_id, call_id, output, success, duration_ms, data } => {
+                        let mut tool_call = serde_json::json!({
+                            "id": call_id,
+                            "output": output,
+                            "success": success,
+                            "duration_ms": duration_ms.unwrap_or(0),
+                        });
+                        if let Some(d) = data {
+                            tool_call["data"] = d.clone();
+                        }
                         let _ = app.emit("tool-call", serde_json::json!({
                             "session_id": session_id,
-                            "tool_call": {
-                                "id": call_id,
-                                "output": output,
-                                "success": success,
-                                "duration_ms": duration_ms.unwrap_or(0),
-                            },
+                            "tool_call": tool_call,
                             "status": if *success { "completed" } else { "error" },
                         }));
                     }

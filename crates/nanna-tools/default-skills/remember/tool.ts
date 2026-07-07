@@ -1,5 +1,6 @@
 export default {
   name: "remember",
+  version: "0.1.0",
   description: "Store information in long-term memory. Use this to save important facts, context, or information that should persist across conversations.",
   output: "context",
   parameters: {

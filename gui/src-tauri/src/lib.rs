@@ -862,7 +862,7 @@ fn estimate_request_tokens(request: &nanna_llm::CompletionRequest) -> usize {
                     20 + estimate_tokens(content)
                 }
                 nanna_llm::ContentBlock::Image { .. } => 1000, // Images ~1k tokens
-                nanna_llm::ContentBlock::Thinking { thinking } => {
+                nanna_llm::ContentBlock::Thinking { thinking, .. } => {
                     // Thinking blocks are internal reasoning
                     estimate_tokens(thinking)
                 }
@@ -954,6 +954,7 @@ pub struct AppState {
 /// Tracks the in-flight state of an embedded mode agent run
 pub struct EmbeddedRunState {
     pub accumulated_text: Arc<RwLock<String>>,
+    pub accumulated_thinking: Arc<RwLock<String>>,
     pub active_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
     pub completed_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -989,6 +990,8 @@ pub struct ToolCallInfo {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Session info for frontend
@@ -1203,6 +1206,7 @@ async fn send_message_daemon(
                     output: tc.get("output")?.as_str().unwrap_or("").to_string(),
                     success: tc.get("success")?.as_bool().unwrap_or(false),
                     duration_ms: tc.get("duration_ms")?.as_u64().unwrap_or(0),
+                    data: None,
                 })
             }).collect()
         })
@@ -1246,6 +1250,14 @@ async fn send_message(
         .add_message(&session_id, "user", &message)
         .await
         .map_err(|e| format!("Failed to store message: {}", e))?;
+
+    // Auto-remember user message as semantic memory
+    if message.split_whitespace().count() >= 3 {
+        let meta = std::collections::HashMap::new();
+        if let Err(e) = state_guard.memory.remember_with_importance(&message, meta, 1.0).await {
+            debug!("Failed to auto-remember user message: {}", e);
+        }
+    }
 
     // Get conversation history
     let history = state_guard
@@ -1341,6 +1353,11 @@ async fn send_message(
     let mut request = nanna_llm::CompletionRequest::default()
         .with_model(&state_guard.config.llm.model);
 
+    // Enable extended thinking if configured
+    if state_guard.config.agent.thinking_enabled {
+        request = request.with_thinking(nanna_llm::ThinkingConfig::new(8192));
+    }
+
     // Add system prompt - Nanna, the moon god for all (with memory context)
     let system_prompt = format!(
         r#"You are Nanna (𒀭𒋀𒆠), the moon god for all.
@@ -1398,6 +1415,9 @@ Be concise. Be useful. Be present.{}
         request = request.with_tools(tool_defs);
     }
 
+    // Set session ID so tools can scope per-session state
+    state_guard.tools.set_session_id(Some(session_id.clone())).await;
+
     // Clone what we need for the async block
     let session_id_clone = session_id.clone();
     let app_clone = app.clone();
@@ -1450,6 +1470,14 @@ Be concise. Be useful. Be present.{}
         .add_message_with_tool_calls(&session_id, "assistant", &full_response, tool_calls_json)
         .await
         .map_err(|e| format!("Failed to store response: {}", e))?;
+
+    // Auto-remember assistant response as semantic memory
+    if full_response.split_whitespace().count() >= 3 {
+        let meta = std::collections::HashMap::new();
+        if let Err(e) = state_guard.memory.remember_with_importance(&full_response, meta, 1.0).await {
+            debug!("Failed to auto-remember assistant response: {}", e);
+        }
+    }
 
     // Update session timestamp
     state_guard
@@ -1838,6 +1866,7 @@ async fn run_agent_loop(
 
     // Create shared state for run state tracking
     let accumulated_text = Arc::new(RwLock::new(String::new()));
+    let accumulated_thinking = Arc::new(RwLock::new(String::new()));
     let active_tool_calls_state = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
     let completed_tool_calls_state = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
 
@@ -1846,6 +1875,7 @@ async fn run_agent_loop(
         let mut states = embedded_run_states.write().await;
         states.insert(session_id.to_string(), EmbeddedRunState {
             accumulated_text: accumulated_text.clone(),
+            accumulated_thinking: accumulated_thinking.clone(),
             active_tool_calls: active_tool_calls_state.clone(),
             completed_tool_calls: completed_tool_calls_state.clone(),
             started_at: chrono::Utc::now(),
@@ -1854,6 +1884,24 @@ async fn run_agent_loop(
 
     for iteration in 0..max_iterations {
         debug!("Agent loop iteration {}", iteration);
+
+        // If there's already streamed text from a previous iteration, insert a
+        // space so the next text block doesn't merge with the previous one.
+        if iteration > 0 && !full_response.is_empty() && !full_response.ends_with(' ') && !full_response.ends_with('\n') {
+            full_response.push(' ');
+            // Also emit the separator to the frontend stream
+            let _ = app.emit(
+                "stream-chunk",
+                StreamChunk {
+                    session_id: session_id.to_string(),
+                    chunk: " ".to_string(),
+                    done: false,
+                },
+            );
+            if let Ok(mut buf) = accumulated_text.try_write() {
+                buf.push(' ');
+            }
+        }
 
         let mut current_text = String::new();
         let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
@@ -1898,6 +1946,20 @@ async fn run_agent_loop(
                             chunk: text,
                             done: false,
                         },
+                    );
+                }
+                StreamEvent::ThinkingDelta { thinking, .. } => {
+                    // Accumulate for run state recovery
+                    if let Ok(mut buf) = accumulated_thinking.try_write() {
+                        buf.push_str(&thinking);
+                    }
+                    // Emit thinking chunk to frontend
+                    let _ = app.emit(
+                        "thinking-chunk",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "delta": thinking,
+                        }),
                     );
                 }
                 StreamEvent::ToolUseDelta { index, partial_json } => {
@@ -2008,6 +2070,7 @@ async fn run_agent_loop(
                         output: String::new(),
                         success: false,
                         duration_ms: 0,
+                        data: None,
                     },
                     status: "started".to_string(),
                 },
@@ -2088,6 +2151,7 @@ async fn run_agent_loop(
                 output: response.result.content.clone(),
                 success: response.result.success,
                 duration_ms,
+                data: response.result.data.clone(),
             };
 
             // Emit tool completed event
@@ -2831,7 +2895,7 @@ async fn search_memory(
     limit: Option<u32>,
 ) -> Result<Vec<MemorySearchResult>, String> {
     let state_guard = state.read().await;
-    let limit = limit.unwrap_or(50) as i64;
+    let max_results = limit.unwrap_or(50) as usize;
     let query_lower = query.to_lowercase();
 
     // Get all sessions
@@ -2842,40 +2906,69 @@ async fn search_memory(
         .map_err(|e| format!("Failed to list sessions: {}", e))?;
 
     let mut results = Vec::new();
+    let is_daemon = state_guard.backend.is_daemon_mode().await;
 
     for session in &sessions {
-        let messages = state_guard
-            .storage
-            .get_session_messages(&session.session_id, 1000)
-            .await
-            .unwrap_or_default();
+        // Collect messages from daemon or local storage
+        let messages: Vec<(String, String, String, String)> = if is_daemon {
+            // Try daemon first
+            if let Ok(result) = state_guard.backend.session_history(&session.session_id, Some(1000)).await {
+                if let Some(msgs) = result.get("messages").and_then(|v| v.as_array()) {
+                    msgs.iter().filter_map(|m| {
+                        Some((
+                            m.get("id")?.as_str()?.to_string(),
+                            m.get("role")?.as_str()?.to_string(),
+                            m.get("content")?.as_str()?.to_string(),
+                            m.get("timestamp")?.as_str()?.to_string(),
+                        ))
+                    }).collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                // Fallback to local storage
+                state_guard.storage
+                    .get_session_messages(&session.session_id, 1000)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| (m.id.to_string(), m.role, m.content, m.created_at))
+                    .collect()
+            }
+        } else {
+            state_guard.storage
+                .get_session_messages(&session.session_id, 1000)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.id.to_string(), m.role, m.content, m.created_at))
+                .collect()
+        };
 
-        for msg in messages {
-            let content_lower = msg.content.to_lowercase();
+        for (msg_id, role, content, timestamp) in messages {
+            let content_lower = content.to_lowercase();
             if content_lower.contains(&query_lower) {
-                // Find match position and create snippet
                 let pos = content_lower.find(&query_lower).unwrap_or(0);
                 let start = pos.saturating_sub(50);
-                let end = (pos + query.len() + 50).min(msg.content.len());
-                let snippet = if start > 0 || end < msg.content.len() {
+                let end = (pos + query.len() + 50).min(content.len());
+                let snippet = if start > 0 || end < content.len() {
                     let prefix = if start > 0 { "..." } else { "" };
-                    let suffix = if end < msg.content.len() { "..." } else { "" };
-                    format!("{}{}{}", prefix, &msg.content[start..end], suffix)
+                    let suffix = if end < content.len() { "..." } else { "" };
+                    format!("{}{}{}", prefix, &content[start..end], suffix)
                 } else {
-                    msg.content.clone()
+                    content.clone()
                 };
 
-                // Simple relevance scoring based on match frequency
                 let matches = content_lower.matches(&query_lower).count();
-                let relevance = (matches as f32 / msg.content.len().max(1) as f32).min(1.0);
+                let relevance = (matches as f32 / content.len().max(1) as f32).min(1.0);
 
                 results.push(MemorySearchResult {
                     session_id: session.session_id.clone(),
                     session_name: Storage::get_session_name(session),
-                    message_id: msg.id.to_string(),
-                    role: msg.role.clone(),
-                    content: msg.content.clone(),
-                    timestamp: msg.created_at.clone(),
+                    message_id: msg_id,
+                    role,
+                    content,
+                    timestamp,
                     snippet,
                     relevance,
                 });
@@ -2883,9 +2976,8 @@ async fn search_memory(
         }
     }
 
-    // Sort by relevance and limit
     results.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(limit as usize);
+    results.truncate(max_results);
 
     Ok(results)
 }
@@ -2905,6 +2997,41 @@ async fn get_memory_stats(
 ) -> Result<MemoryStats, String> {
     let state_guard = state.read().await;
 
+    // In daemon mode, fetch history from daemon for each session to count messages
+    if state_guard.backend.is_daemon_mode().await {
+        let sessions = state_guard
+            .storage
+            .list_gui_sessions(10000)
+            .await
+            .map_err(|e| format!("Failed to list sessions: {}", e))?;
+
+        let mut total_messages = 0u32;
+        for session in &sessions {
+            // Try daemon first
+            if let Ok(result) = state_guard.backend.session_history(&session.session_id, Some(10000)).await {
+                if let Some(messages_array) = result.get("messages").and_then(|v| v.as_array()) {
+                    total_messages += messages_array.len() as u32;
+                    continue;
+                }
+            }
+            // Fallback to local storage
+            let count = state_guard
+                .storage
+                .count_session_messages(&session.session_id)
+                .await
+                .unwrap_or(0);
+            total_messages += count as u32;
+        }
+
+        return Ok(MemoryStats {
+            total_sessions: sessions.len() as u32,
+            total_messages,
+            oldest_session: sessions.last().map(|s| s.created_at.clone()),
+            newest_session: sessions.first().map(|s| s.created_at.clone()),
+        });
+    }
+
+    // Embedded mode: direct storage access
     let sessions = state_guard
         .storage
         .list_gui_sessions(10000)
@@ -5849,6 +5976,12 @@ async fn set_active_workspace(
         if let Err(e) = state_guard.storage.workspaces().set_active(&id).await {
             warn!("Failed to persist active workspace to DB: {}", e);
         }
+        // Notify daemon so it updates its in-memory registry and tool working directory
+        if state_guard.backend.is_daemon_mode().await {
+            if let Err(e) = state_guard.backend.workspace_set_active(&id).await {
+                warn!("Failed to notify daemon of workspace activation: {}", e);
+            }
+        }
         Ok(())
     } else {
         Err(format!("Workspace not found: {}", id))
@@ -5868,6 +6001,12 @@ async fn clear_active_workspace(
     // Persist to DB
     if let Err(e) = state_guard.storage.workspaces().clear_active().await {
         warn!("Failed to persist cleared workspace to DB: {}", e);
+    }
+    // Notify daemon so it clears its working directory
+    if state_guard.backend.is_daemon_mode().await {
+        if let Err(e) = state_guard.backend.workspace_clear_active().await {
+            warn!("Failed to notify daemon of workspace deactivation: {}", e);
+        }
     }
     Ok(())
 }
@@ -7410,12 +7549,14 @@ async fn get_session_run_state(
 
     if let Some(run_state) = run_states.get(&session_id) {
         let text = run_state.accumulated_text.read().await.clone();
+        let thinking = run_state.accumulated_thinking.read().await.clone();
         let active = run_state.active_tool_calls.read().await.clone();
         let completed = run_state.completed_tool_calls.read().await.clone();
 
         Ok(serde_json::json!({
             "is_running": true,
             "accumulated_text": text,
+            "accumulated_thinking": thinking,
             "active_tool_calls": active,
             "completed_tool_calls": completed,
             "started_at": run_state.started_at.to_rfc3339(),
@@ -7425,6 +7566,7 @@ async fn get_session_run_state(
         Ok(serde_json::json!({
             "is_running": false,
             "accumulated_text": "",
+            "accumulated_thinking": "",
             "active_tool_calls": [],
             "completed_tool_calls": [],
             "started_at": null,

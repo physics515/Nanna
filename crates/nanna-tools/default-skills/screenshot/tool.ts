@@ -1,12 +1,15 @@
 export default {
   name: "screenshot",
+  version: "0.1.0",
+  output: "context",
   description: "Take a screenshot of the current desktop or a specific window. Returns the screenshot as a base64-encoded PNG.",
   parameters: {
     type: "object",
     properties: {
       target: {
         type: "string",
-        description: "What to capture: 'desktop' for full screen, or a window title to capture specific window. Default: 'desktop'"
+        output: "context",
+  description: "What to capture: 'desktop' for full screen, or a window title to capture specific window. Default: 'desktop'"
       }
     },
     required: []

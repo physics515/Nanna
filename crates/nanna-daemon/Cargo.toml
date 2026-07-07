@@ -18,14 +18,14 @@ path = "src/lib.rs"
 # Internal crates
 nanna-core = { path = "../nanna-core" }
 nanna-agent = { path = "../nanna-agent" }
-nanna-tools = { path = "../nanna-tools", features = ["scripting"] }
+nanna-tools = { path = "../nanna-tools", features = ["scripting", "python"] }
 nanna-channels = { path = "../nanna-channels" }
 nanna-config = { path = "../nanna-config" }
 nanna-storage = { path = "../nanna-storage" }
 nanna-llm = { path = "../nanna-llm" }
 nanna-memory = { path = "../nanna-memory" }
 nanna-mcp = { path = "../nanna-mcp" }
-nanna-scripting = { path = "../nanna-scripting" }
+nanna-scripting = { path = "../nanna-scripting", features = ["python"] }
 
 # Workspace deps
 tokio.workspace = true
@@ -47,6 +47,9 @@ futures-util = "0.3"
 
 # HTTP server for health endpoint
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Socket options (SO_REUSEADDR for fast restart)
+socket2 = "0.5"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

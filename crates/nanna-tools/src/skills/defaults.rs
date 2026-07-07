@@ -15,6 +15,58 @@ use std::path::{Path, PathBuf};
 // Include the build-script-generated embedded skills (all default-skills/ files).
 include!(concat!(env!("OUT_DIR"), "/embedded_skills.rs"));
 
+/// Parse a semver version string into (major, minor, patch) tuple.
+/// Returns None if the string is not a valid semver triple.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    // Strip leading 'v' if present
+    let v = v.strip_prefix('v').unwrap_or(v);
+    // Strip pre-release/build metadata (everything after - or +)
+    let v = v.split(['-', '+']).next().unwrap_or(v);
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
+}
+
+/// Returns true if `embedded` version is strictly greater than `installed`.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn is_newer_version(embedded: &str, installed: &str) -> bool {
+    match (parse_semver(embedded), parse_semver(installed)) {
+        (Some(e), Some(i)) => e > i,
+        // If either fails to parse, don't overwrite
+        _ => false,
+    }
+}
+
+/// Extract the version field from a tool.ts source string.
+/// Looks for `version: "x.y.z"` or `version: 'x.y.z'` in the source.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn extract_version_from_source(source: &str) -> Option<String> {
+    // Reuse the same pattern as extract_string_field in nanna-scripting
+    let patterns = [
+        r#"version: ""#,
+        r#"version: '"#,
+        r#"version:""#,
+        r#"version:'"#,
+    ];
+    for pattern in &patterns {
+        if let Some(start) = source.find(pattern) {
+            let quote = if pattern.ends_with('"') { '"' } else { '\'' };
+            let value_start = start + pattern.len();
+            if let Some(end) = source[value_start..].find(quote) {
+                return Some(source[value_start..value_start + end].to_string());
+            }
+        }
+    }
+    None
+}
+
 /// In debug builds, fall back to the source tree's default-skills directory.
 /// This is resolved at compile time relative to the nanna-tools crate.
 #[cfg(debug_assertions)]
@@ -107,9 +159,39 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
             let tool_dir = tools_dir.join(entry.skill_name);
             let target = tool_dir.join(entry.file_name);
 
-            // Skip if this skill already exists (don't overwrite user modifications)
             if target.exists() {
-                continue;
+                // Only overwrite tool.ts files (not permissions.json etc.) when
+                // the embedded version is strictly newer than the installed one.
+                if entry.file_name == "tool.ts" || entry.file_name == "tool.js" {
+                    let embedded_ver = extract_version_from_source(entry.content);
+                    let installed_source = std::fs::read_to_string(&target).unwrap_or_default();
+                    let installed_ver = extract_version_from_source(&installed_source);
+
+                    match (&embedded_ver, &installed_ver) {
+                        (Some(e), Some(i)) if is_newer_version(e, i) => {
+                            tracing::info!(
+                                "Upgrading default skill {}/{}: {} → {}",
+                                entry.skill_name, entry.file_name, i, e
+                            );
+                            // Fall through to write
+                        }
+                        (Some(e), None) => {
+                            // Installed tool has no version — embedded does. Upgrade it.
+                            tracing::info!(
+                                "Upgrading unversioned skill {}/{} to {}",
+                                entry.skill_name, entry.file_name, e
+                            );
+                            // Fall through to write
+                        }
+                        _ => {
+                            // Same version, older embedded, or both unversioned — skip
+                            continue;
+                        }
+                    }
+                } else {
+                    // Non-tool files (permissions.json etc.) — don't overwrite
+                    continue;
+                }
             }
 
             if let Err(e) = std::fs::create_dir_all(&tool_dir) {
@@ -233,5 +315,46 @@ mod tests {
         let dir = tempdir().unwrap();
         let source = load_discover_tools_source(dir.path());
         assert!(source.is_none());
+    }
+
+    #[test]
+    fn test_parse_semver() {
+        assert_eq!(parse_semver("0.1.0"), Some((0, 1, 0)));
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("v1.0.0"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("1.0.0-beta.1"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("1.0.0+build.123"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("not-a-version"), None);
+        assert_eq!(parse_semver("1.0"), None);
+        assert_eq!(parse_semver(""), None);
+    }
+
+    #[test]
+    fn test_is_newer_version() {
+        assert!(is_newer_version("0.2.0", "0.1.0"));
+        assert!(is_newer_version("1.0.0", "0.9.9"));
+        assert!(is_newer_version("0.1.1", "0.1.0"));
+        assert!(!is_newer_version("0.1.0", "0.1.0")); // same = not newer
+        assert!(!is_newer_version("0.1.0", "0.2.0")); // older
+        assert!(!is_newer_version("bad", "0.1.0"));    // unparseable
+    }
+
+    #[test]
+    fn test_extract_version_from_source() {
+        let source = r#"export default {
+  name: "exec",
+  version: "0.1.0",
+  description: "Run stuff",
+}"#;
+        assert_eq!(extract_version_from_source(source), Some("0.1.0".to_string()));
+
+        let source_single = r#"export default {
+  name: 'exec',
+  version: '1.2.3',
+}"#;
+        assert_eq!(extract_version_from_source(source_single), Some("1.2.3".to_string()));
+
+        let no_version = r#"export default { name: "exec" }"#;
+        assert_eq!(extract_version_from_source(no_version), None);
     }
 }

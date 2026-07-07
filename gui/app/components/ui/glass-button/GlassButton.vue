@@ -23,17 +23,43 @@ const props = withDefaults(defineProps<{
   type: 'button',
 })
 
-// ── Mesh gradient colors per color prop ──
-const meshColors: Record<string, [string, string, string]> = {
+// ── Mesh gradient colors for splatter (non-pill solid) ──
+const splatterColors: Record<string, [string, string, string]> = {
   default: ['148, 163, 184', '100, 116, 139', '120, 140, 160'],
   accent:  ['139, 92, 246', '167, 139, 250', '139, 92, 246'],
   danger:  ['239, 68, 68', '220, 38, 38', '248, 113, 113'],
   muted:   ['100, 116, 139', '71, 85, 105', '100, 116, 139'],
 }
 
-const hasMesh = computed(() => (props.variant === 'solid' || props.pill) && !props.disabled)
+// ── Glass pill configs: points randomly fade between color and transparent ──
+const glassConfigs: Record<string, {
+  colors: [string, string, string]
+  opacityRanges: [[number, number], [number, number], [number, number]]
+}> = {
+  // default: transparent — app bg shows through the frosted glass
+  default: {
+    colors: ['0, 0, 0', '0, 0, 0', '0, 0, 0'],
+    opacityRanges: [[0, 0], [0, 0], [0, 0]],
+  },
+  accent: {
+    colors: ['139, 92, 246', '167, 139, 250', '139, 92, 246'],
+    opacityRanges: [[0, 0.35], [0, 0.25], [0, 0.30]],
+  },
+  danger: {
+    colors: ['239, 68, 68', '220, 38, 38', '248, 113, 113'],
+    opacityRanges: [[0, 0.35], [0, 0.25], [0, 0.30]],
+  },
+  muted: {
+    colors: ['100, 116, 139', '71, 85, 105', '100, 116, 139'],
+    opacityRanges: [[0, 0.25], [0, 0.20], [0, 0.20]],
+  },
+}
 
-const colors = computed(() => meshColors[props.color] || meshColors.default)
+const hasMesh = computed(() => (props.variant === 'solid' || props.pill) && !props.disabled)
+const hasGlassMesh = computed(() => props.pill && props.color !== 'default' && !props.disabled)
+
+const colors = computed(() => splatterColors[props.color] || splatterColors.default)
+const gc = glassConfigs[props.color] || glassConfigs.default
 
 // Splatter for non-pill solid buttons
 const { splatterBg, onEnter: splatterEnter, onLeave: splatterLeave } = useSplatter({
@@ -42,7 +68,8 @@ const { splatterBg, onEnter: splatterEnter, onLeave: splatterLeave } = useSplatt
 
 // Ground glass for pill buttons
 const { meshBg, containerStyle: glassStyle, onEnter: glassEnter, onLeave: glassLeave } = useGroundGlass({
-  colors,
+  colors: gc.colors,
+  opacityRanges: gc.opacityRanges,
   opacity: 2.2,
   sizes: ['55%', '50%', '45%'],
   lerpSpeed: 0.008,
@@ -92,9 +119,9 @@ function onLeave() {
       class="ui-btn__mesh"
       :style="{ background: splatterBg }"
     />
-    <!-- Ground glass mesh (pill) -->
+    <!-- Ground glass mesh (pill, non-default only) -->
     <span
-      v-if="hasMesh && props.pill"
+      v-if="hasGlassMesh"
       class="ui-btn__glass-mesh"
       :style="{ background: meshBg }"
     />
@@ -124,9 +151,9 @@ function onLeave() {
       class="ui-btn__mesh"
       :style="{ background: splatterBg }"
     />
-    <!-- Ground glass mesh (pill) -->
+    <!-- Ground glass mesh (pill, non-default only) -->
     <span
-      v-if="hasMesh && props.pill"
+      v-if="hasGlassMesh"
       class="ui-btn__glass-mesh"
       :style="{ background: meshBg }"
     />
@@ -164,7 +191,7 @@ function onLeave() {
 /* ════ Pill shape (ground glass slab) ════ */
 .ui-btn--pill {
   border-radius: 9999px;
-  background: rgba(30, 41, 59, 0.30);
+  background: transparent;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   border-left: 1px solid rgba(255, 255, 255, 0.04);
   border-bottom: 1.5px solid rgba(71, 85, 105, 0.18);

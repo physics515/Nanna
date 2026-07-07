@@ -1,5 +1,7 @@
 export default {
   name: "browser_action",
+  version: "0.1.0",
+  output: "context",
   description: "Perform an action in a browser page: click, type, scroll, or navigate. Useful for web automation and testing.",
   parameters: {
     type: "object",
@@ -7,7 +9,8 @@ export default {
       url: { type: "string", description: "URL of the page (or current page if session exists)" },
       action: {
         type: "string",
-        description: "Action: 'click', 'type', 'scroll', 'navigate', 'wait'",
+        output: "context",
+  description: "Action: 'click', 'type', 'scroll', 'navigate', 'wait'",
         enum: ["click", "type", "scroll", "navigate", "wait"]
       },
       selector: { type: "string", description: "CSS selector for the target element (for click/type)" },

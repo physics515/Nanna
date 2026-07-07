@@ -1,5 +1,7 @@
 export default {
   name: "web_fetch",
+  version: "0.1.0",
+  output: "context",
   description: "Fetch a web page and extract its text content. Strips HTML tags, scripts, and styles to return readable text.",
   parameters: {
     type: "object",

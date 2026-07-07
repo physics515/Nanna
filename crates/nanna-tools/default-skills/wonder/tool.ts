@@ -1,5 +1,6 @@
 export default {
   name: "wonder",
+  version: "0.1.0",
   description: "Generate creative prompts, questions, or ideas about a topic. Useful for brainstorming, exploration, and creative thinking.",
   parameters: {
     type: "object",

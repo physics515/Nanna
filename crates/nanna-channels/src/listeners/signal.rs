@@ -7,7 +7,9 @@
 //! - signald: Unix socket / TCP connection (default)
 //! - signal-cli-rest-api: HTTP REST API (simpler setup)
 
+use super::circuit_breaker::{BreakerAction, CircuitBreaker};
 use super::{Listener, ListenerError, ListenerHandle};
+use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -29,6 +31,8 @@ pub struct SignalListener {
     phone_number: String,
     /// Receive mode: "websocket" or "poll"
     receive_mode: ReceiveMode,
+    /// Optional status manager for reporting connection state to the UI
+    status_manager: Option<Arc<StatusManager>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +66,7 @@ impl SignalListener {
             api_url: api_url.into().trim_end_matches('/').to_string(),
             phone_number: phone_number.into(),
             receive_mode: ReceiveMode::default(),
+            status_manager: None,
         }
     }
 
@@ -69,6 +74,13 @@ impl SignalListener {
     #[must_use]
     pub fn with_receive_mode(mut self, mode: ReceiveMode) -> Self {
         self.receive_mode = mode;
+        self
+    }
+
+    /// Attach a status manager for reporting connection state to the UI
+    #[must_use]
+    pub fn with_status_manager(mut self, manager: Arc<StatusManager>) -> Self {
+        self.status_manager = Some(manager);
         self
     }
 
@@ -95,6 +107,9 @@ impl SignalListener {
 
         if !response.status().is_success() {
             let status = response.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(ListenerError::Auth(format!("HTTP {}", status)));
+            }
             let text = response.text().await.unwrap_or_default();
             return Err(ListenerError::Api(format!("HTTP {}: {}", status, text)));
         }
@@ -144,23 +159,33 @@ impl SignalListener {
         })
     }
 
+    /// Create a circuit breaker pre-configured for this listener.
+    fn make_circuit_breaker(&self) -> CircuitBreaker {
+        let mut cb = CircuitBreaker::new("signal");
+        if let Some(sm) = &self.status_manager {
+            cb = cb.with_status_manager(Arc::clone(sm));
+        }
+        cb
+    }
+
     /// Run the poll-based receiver
     async fn run_poll_receiver(
         self: Arc<Self>,
         sender: mpsc::Sender<IncomingMessage>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        let poll_interval = Duration::from_secs(1);
-        
+        let mut cb = self.make_circuit_breaker();
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("Signal poll receiver shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(poll_interval) => {
-                    match self.poll_messages().await {
+                result = self.poll_messages() => {
+                    match result {
                         Ok(envelopes) => {
+                            cb.record_success().await;
                             for envelope in envelopes {
                                 if let Some(msg) = self.parse_envelope(envelope) {
                                     debug!(msg_id = %msg.id, "Received Signal message");
@@ -170,11 +195,21 @@ impl SignalListener {
                                     }
                                 }
                             }
+                            // Small delay between polls even on success
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(ListenerError::Auth(ref e)) => {
+                            if cb.record_auth_failure(e).await == BreakerAction::Stop {
+                                break;
+                            }
+                            cb.backoff().await;
                         }
                         Err(e) => {
-                            warn!(error = %e, "Failed to poll Signal messages");
-                            // Back off on error
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            let detail = e.to_string();
+                            if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                                break;
+                            }
+                            cb.backoff().await;
                         }
                     }
                 }
@@ -194,7 +229,10 @@ impl SignalListener {
             urlencoding::encode(&self.phone_number)
         );
 
+        let mut cb = self.make_circuit_breaker();
+
         loop {
+            cb.report_connecting().await;
             info!(url = %url, "Connecting to Signal SSE stream");
 
             // Create SSE connection
@@ -206,18 +244,32 @@ impl SignalListener {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    error!(error = %e, "Failed to connect to Signal SSE");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let detail = format!("SSE connect failed: {}", e);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
                     continue;
                 }
             };
 
             if !response.status().is_success() {
-                error!(status = %response.status(), "Signal SSE connection failed");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let status = response.status();
+                if status.as_u16() == 401 || status.as_u16() == 403 {
+                    if cb.record_auth_failure(&format!("HTTP {}", status)).await == BreakerAction::Stop {
+                        break;
+                    }
+                } else {
+                    let detail = format!("SSE connection returned HTTP {}", status);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                }
+                cb.backoff().await;
                 continue;
             }
 
+            cb.record_success().await;
             info!("Connected to Signal SSE stream");
 
             // Read SSE stream
@@ -268,9 +320,12 @@ impl SignalListener {
                 }
             }
 
-            // Reconnect after stream ends
-            warn!("SSE connection lost, reconnecting in 5s...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // SSE stream lost — reconnect with backoff
+            let detail = "SSE connection lost";
+            if cb.record_conn_failure(detail).await == BreakerAction::Stop {
+                break;
+            }
+            cb.backoff().await;
         }
     }
 }

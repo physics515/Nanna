@@ -19,8 +19,13 @@ pub struct ToolRegistry {
     aliases: RwLock<HashSet<String>>,
     /// Reverse map: alias name → canonical target name
     alias_targets: RwLock<HashMap<String, String>>,
-    /// Default working directory for tool execution (set from active workspace)
+    /// Default working directory for tool execution (global fallback)
     default_workdir: RwLock<Option<std::path::PathBuf>>,
+    /// Per-session working directories (session_id → workdir).
+    /// Takes precedence over default_workdir when a session is active.
+    session_workdirs: RwLock<HashMap<String, std::path::PathBuf>>,
+    /// Current session ID (set when agent session starts)
+    session_id: RwLock<Option<String>>,
 }
 
 impl ToolRegistry {
@@ -31,18 +36,54 @@ impl ToolRegistry {
             aliases: RwLock::new(HashSet::new()),
             alias_targets: RwLock::new(HashMap::new()),
             default_workdir: RwLock::new(None),
+            session_workdirs: RwLock::new(HashMap::new()),
+            session_id: RwLock::new(None),
         }
     }
 
     /// Set the default working directory for tool execution.
     /// Called when the active workspace changes.
     pub async fn set_default_workdir(&self, workdir: Option<std::path::PathBuf>) {
+        // Also set for the current session if one is active
+        if let Some(ref sid) = *self.session_id.read().await {
+            if let Some(ref wd) = workdir {
+                self.session_workdirs.write().await.insert(sid.clone(), wd.clone());
+            }
+        }
         *self.default_workdir.write().await = workdir;
     }
 
     /// Get the current default working directory.
+    /// Returns the per-session workdir if available, otherwise the global default.
     pub async fn default_workdir(&self) -> Option<std::path::PathBuf> {
+        // Per-session workdir takes priority
+        if let Some(ref sid) = *self.session_id.read().await {
+            if let Some(wd) = self.session_workdirs.read().await.get(sid) {
+                return Some(wd.clone());
+            }
+        }
         self.default_workdir.read().await.clone()
+    }
+
+    /// Set the working directory for a specific session.
+    pub async fn set_session_workdir(&self, session_id: &str, workdir: std::path::PathBuf) {
+        self.session_workdirs.write().await.insert(session_id.to_string(), workdir);
+    }
+
+    /// Remove a session's workdir (call on session cleanup).
+    pub async fn clear_session_workdir(&self, session_id: &str) {
+        self.session_workdirs.write().await.remove(session_id);
+    }
+
+    /// Set the current session ID.
+    /// Called when an agent session starts or changes.
+    pub async fn set_session_id(&self, session_id: Option<String>) {
+        *self.session_id.write().await = session_id;
+    }
+
+    /// Get the current session ID.
+    pub async fn session_id(&self) -> Option<String> {
+        self.session_id.read().await.clone()
     }
 
     /// Register a tool

@@ -1,5 +1,6 @@
 export default {
   name: "todo",
+  version: "0.1.0",
   description: "Manage a task checklist to track progress on multi-step work. Use this to keep track of what you need to do, what you're working on, and what's done. Helps maintain focus during complex tasks.",
   output: "context",
   parameters: {
@@ -7,8 +8,8 @@ export default {
     properties: {
       action: {
         type: "string",
-        description: "Action to perform: 'add', 'done', 'update', 'remove', 'clear', or 'list'. Default: 'list'",
-        enum: ["add", "done", "update", "remove", "clear", "list"]
+        description: "Action to perform: 'add' (single task), 'create' (replace all tasks with new list), 'done', 'update', 'remove', 'clear' (completed only), 'clear_all' (remove everything), or 'list'. Default: 'list'",
+        enum: ["add", "create", "done", "update", "remove", "clear", "clear_all", "list"]
       },
       id: {
         type: "integer",
@@ -17,6 +18,10 @@ export default {
       text: {
         type: "string",
         description: "Task description (for add action) or status update (for update action)"
+      },
+      items: {
+        type: "string",
+        description: "JSON array of task descriptions for 'create' action (replaces all existing tasks). Example: '[\"task 1\", \"task 2\"]'"
       },
       status: {
         type: "string",
@@ -27,8 +32,9 @@ export default {
     required: []
   },
   execute: function(input) {
-    // Use a file in the working directory or a temp location
-    var todoFile = ".nanna-todo.json";
+    // Scope todo file per session
+    var sessionId = Nanna.sessionId();
+    var todoFile = sessionId ? ".nanna-todo-" + sessionId + ".json" : ".nanna-todo.json";
     var todos = [];
 
     // Load existing todos
@@ -51,6 +57,38 @@ export default {
     }
 
     switch (action) {
+      case "create": {
+        // Replace all tasks with a new list
+        var itemsList = [];
+        // Accept 'tasks' as alias for 'items' (common model hallucination)
+        if (!input.items && input.tasks) {
+          input.items = input.tasks;
+        }
+        if (input.items) {
+          try {
+            itemsList = JSON.parse(input.items);
+          } catch (e) {
+            // Try splitting by newline if not valid JSON
+            itemsList = input.items.split("\n").filter(function(s) { return s.trim().length > 0; });
+          }
+        } else if (input.text) {
+          itemsList = [input.text];
+        } else {
+          return "Error: 'items' (JSON array) or 'text' required for create action";
+        }
+        todos = [];
+        for (var i = 0; i < itemsList.length; i++) {
+          todos.push({
+            id: i + 1,
+            text: itemsList[i],
+            status: "pending",
+            created: new Date().toISOString()
+          });
+        }
+        Nanna.writeFile(todoFile, JSON.stringify(todos, null, 2));
+        return "Created " + todos.length + " tasks.\n\n" + formatTodos(todos);
+      }
+
       case "add": {
         if (!input.text) {
           return "Error: 'text' is required for add action";
@@ -143,6 +181,13 @@ export default {
         todos = newTodos;
         Nanna.writeFile(todoFile, JSON.stringify(todos, null, 2));
         return "Cleared " + doneCount + " completed tasks.\n\n" + formatTodos(todos);
+      }
+
+      case "clear_all": {
+        var totalCount = todos.length;
+        todos = [];
+        Nanna.writeFile(todoFile, JSON.stringify(todos, null, 2));
+        return "Cleared all " + totalCount + " tasks.\n\n📋 No tasks.";
       }
 
       case "list":

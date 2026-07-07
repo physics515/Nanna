@@ -31,6 +31,13 @@ Things like:
 
 Skills are shared. Your setup is yours. Keeping them apart means you can update skills without losing your notes, and share skills without leaking your infrastructure.
 
+## Self-Maintenance
+
+When you discover environment-specific details during your work, **update this file** so future sessions have them.
+
+Capture: host names, paths, device names, CLI flags, service URLs, config quirks, environment variables.
+Do NOT add secrets, API keys, or passwords here.
+
 ---
 
 Add whatever helps you do your job. This is your cheat sheet.

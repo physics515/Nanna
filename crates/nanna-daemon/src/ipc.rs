@@ -9,8 +9,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
 use tracing::{debug, error, info, warn};
+
+/// Maximum WebSocket message size (128 MB).
+/// Sessions with large tool outputs or long histories can exceed the
+/// default 16 MB tungstenite limit, crashing the connection.
+const WS_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Unique identifier for a connected client
 pub type ConnectionId = String;
@@ -72,6 +77,51 @@ impl IpcServer {
         }
     }
     
+    /// Bind a TCP listener, retrying on transient port conflicts.
+    ///
+    /// On Unix, sets SO_REUSEADDR so TIME_WAIT sockets don't block restart.
+    /// On Windows, SO_REUSEADDR has dangerous semantics (allows hijacking),
+    /// so we retry with a short delay instead.
+    async fn bind_with_reuse(addr: &str) -> Result<TcpListener, std::io::Error> {
+        let socket_addr: std::net::SocketAddr = addr.parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        // On Unix, use SO_REUSEADDR for fast restart
+        #[cfg(unix)]
+        {
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(socket_addr),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_reuse_address(true)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&socket_addr.into())?;
+            socket.listen(128)?;
+            return TcpListener::from_std(socket.into());
+        }
+
+        // On Windows, retry with delay if port is temporarily unavailable
+        #[cfg(windows)]
+        {
+            for attempt in 0..5 {
+                match TcpListener::bind(&socket_addr).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(e) if attempt < 4 => {
+                        warn!("IPC bind attempt {} failed ({}), retrying in 1s...", attempt + 1, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            unreachable!()
+        }
+
+        // Fallback for other platforms
+        #[cfg(not(any(unix, windows)))]
+        TcpListener::bind(&socket_addr).await
+    }
+
     /// Get the address the server will bind to
     pub fn address(&self) -> String {
         format!("{}:{}", self.config.host, self.config.port)
@@ -124,7 +174,7 @@ impl IpcServer {
     /// Run the IPC server
     pub async fn run(&self) -> Result<(), std::io::Error> {
         let addr = self.address();
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = Self::bind_with_reuse(&addr).await?;
         info!("IPC server listening on ws://{}", addr);
         
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -161,7 +211,10 @@ impl IpcServer {
     }
     
     async fn handle_connection(&self, client_id: ConnectionId, stream: TcpStream, addr: SocketAddr) {
-        let ws_stream = match accept_async(stream).await {
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(WS_MAX_MESSAGE_SIZE);
+        ws_config.max_frame_size = Some(WS_MAX_MESSAGE_SIZE);
+        let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
             Ok(ws) => ws,
             Err(e) => {
                 error!("WebSocket handshake failed for {}: {}", addr, e);

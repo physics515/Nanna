@@ -8,6 +8,7 @@ description = "JavaScript/TypeScript scripting engine for Nanna tools"
 default = ["boa"]
 boa = ["boa_engine", "boa_runtime"]
 deno = ["deno_core", "deno_ast", "deno_error"]
+python = ["rustpython-vm", "rustpython-stdlib", "rustpython-pylib"]
 full = ["boa", "deno"]
 
 [dependencies]
@@ -35,3 +36,8 @@ deno_error = { version = "0.7", optional = true }
 
 # TypeScript transpilation for Boa
 swc_core = { version = "7", features = ["ecma_parser", "ecma_transforms", "ecma_codegen", "common"], optional = true }
+
+# RustPython - Embedded Python interpreter (no system Python needed)
+rustpython-vm = { version = "0.4", default-features = false, features = ["compiler", "encodings", "freeze-stdlib"], optional = true }
+rustpython-stdlib = { version = "0.4", optional = true }
+rustpython-pylib = { version = "0.4", features = ["freeze-stdlib"], optional = true }

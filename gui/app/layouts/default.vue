@@ -326,7 +326,12 @@ watch(() => route.path, (path) => {
 watch(currentTab, async () => {
   await loadSessions()
   currentSessionId.value = sessions.value[0]?.id || null
-  if (currentSessionId.value) navigateTo(`/?session=${currentSessionId.value}`)
+  if (currentSessionId.value) {
+    navigateTo(`/?session=${currentSessionId.value}`)
+  } else {
+    // No sessions in this workspace/tab — clear stale session from URL
+    navigateTo('/')
+  }
   saveTabsToStorage()
 }, { deep: true })
 

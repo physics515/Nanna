@@ -11,6 +11,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("007_tool_stats", MIGRATION_007),
     ("008_workspace_registry", MIGRATION_008),
     ("009_memory_fsrs", MIGRATION_009),
+    ("010_checkpoints", MIGRATION_010),
 ];
 
 const MIGRATION_001: &str = r"
@@ -285,4 +286,14 @@ ALTER TABLE memories ADD COLUMN fsrs_storage_strength REAL NOT NULL DEFAULT 0.1;
 ALTER TABLE memories ADD COLUMN fsrs_generation INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
+";
+
+const MIGRATION_010: &str = r"
+-- Checkpoints for crash recovery (replaces checkpoint-{id}.json files)
+CREATE TABLE IF NOT EXISTS checkpoints (
+    session_id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,  -- JSON checkpoint payload
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 ";

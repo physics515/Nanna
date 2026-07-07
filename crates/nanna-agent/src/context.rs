@@ -44,6 +44,10 @@ pub struct ContextSummarizationConfig {
     pub summarizer_context_window: usize,
     /// Maximum iterations to prevent infinite loops
     pub max_iterations: usize,
+    /// OpenRouter API key (for "openrouter/" prefixed models)
+    pub openrouter_api_key: Option<String>,
+    /// OpenAI API key (for "openai/" prefixed models)
+    pub openai_api_key: Option<String>,
 }
 
 impl ContextSummarizationConfig {
@@ -53,6 +57,8 @@ impl ContextSummarizationConfig {
             ollama_url: Some("http://localhost:11434".to_string()),
             summarizer_context_window: 8000, // Conservative default for most local models
             max_iterations: 20,
+            openrouter_api_key: None,
+            openai_api_key: None,
         }
     }
 
@@ -339,12 +345,16 @@ impl AgentContext {
         deduped
     }
 
-    /// Estimate tokens for messages that will be sent to API (includes summary)
+    /// Estimate tokens for messages that will be sent to API (includes summary).
+    ///
+    /// Uses a conservative ratio of ~3.2 chars per token (instead of 4) because
+    /// code-heavy content, JSON, and tool calls tokenize at a higher ratio.
+    /// Over-estimating is safer than under-estimating (summarize early > 400 error).
     pub fn estimate_request_tokens(&self) -> usize {
         let summary_tokens = self
             .consolidated_summary
             .as_ref()
-            .map(|s| s.len() / 4 + 100) // ~4 chars per token + framing overhead
+            .map(|s| estimate_token_count(s.len()) + 100) // framing overhead
             .unwrap_or(0);
 
         summary_tokens + self.estimate_tokens()
@@ -585,11 +595,16 @@ impl AgentContext {
         self.trim_if_needed();
     }
 
-    /// Estimate token count (rough heuristic: ~4 chars per token)
+    /// Estimate token count using a conservative heuristic.
+    ///
+    /// Uses ~3.2 chars per token (via [`estimate_token_count`]) instead of the
+    /// commonly cited 4, because code, JSON, and tool calls tokenize at a higher
+    /// ratio. Over-estimating triggers earlier compression, which is much better
+    /// than hitting a 400 context_length_exceeded error mid-run.
     #[must_use] 
     pub fn estimate_tokens(&self) -> usize {
-        let system_tokens = self.system_prompt.len() / 4;
-        let summary_tokens: usize = self.summaries.iter().map(|s| s.summary.len() / 4).sum();
+        let system_tokens = estimate_token_count(self.system_prompt.len());
+        let summary_tokens: usize = self.summaries.iter().map(|s| estimate_token_count(s.summary.len())).sum();
         let message_tokens: usize = self
             .messages
             .iter()
@@ -597,13 +612,13 @@ impl AgentContext {
                 m.content
                     .iter()
                     .map(|c| match c {
-                        ContentBlock::Text { text } => text.len() / 4,
+                        ContentBlock::Text { text } => estimate_token_count(text.len()),
                         ContentBlock::ToolUse { input, .. } => {
-                            input.to_string().len() / 4 + 50
+                            estimate_token_count(input.to_string().len()) + 50
                         }
-                        ContentBlock::ToolResult { content, .. } => content.len() / 4 + 20,
+                        ContentBlock::ToolResult { content, .. } => estimate_token_count(content.len()) + 20,
                         ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
-                        ContentBlock::Thinking { thinking } => thinking.len() / 4,
+                        ContentBlock::Thinking { thinking, .. } => estimate_token_count(thinking.len()),
                     })
                     .sum::<usize>()
             })
@@ -853,7 +868,7 @@ impl AgentContext {
                         format!("[Tool call: {} with input: {}]", name, input)
                     }
                     ContentBlock::ToolResult { content, .. } => content.clone(),
-                    ContentBlock::Thinking { thinking } => {
+                    ContentBlock::Thinking { thinking, .. } => {
                         let end = thinking.floor_char_boundary(thinking.len().min(200));
                         format!("[Thinking: {}]", &thinking[..end])
                     }
@@ -970,7 +985,18 @@ impl AgentContext {
                     );
                 }
                 "openai" => {
-                    return Err("OpenAI summarization requires API key".to_string());
+                    if let Some(ref api_key) = config.openai_api_key {
+                        LlmClient::openai(api_key)
+                    } else {
+                        return Err("OpenAI summarization requires API key (set openai_api_key)".to_string());
+                    }
+                }
+                "openrouter" => {
+                    if let Some(ref api_key) = config.openrouter_api_key {
+                        LlmClient::openrouter(api_key)
+                    } else {
+                        return Err("OpenRouter summarization requires API key (set openrouter_api_key)".to_string());
+                    }
                 }
                 _ => {
                     return Err(format!("Unknown provider: {}", provider));
@@ -1188,7 +1214,7 @@ impl AgentContext {
                         };
                         conversation_text.push_str(&format!("[tool result]: {truncated}\n"));
                     }
-                    ContentBlock::Thinking { thinking } => {
+                    ContentBlock::Thinking { thinking, .. } => {
                         // Include reasoning in summary, truncated
                         let truncated = if thinking.len() > 200 {
                             format!("{}...", &thinking[..200])
@@ -1232,16 +1258,16 @@ Provide a concise summary (2-4 paragraphs max):"#,
         let old_tokens: usize = old_messages.iter()
             .map(|m| m.content.iter()
                 .map(|c| match c {
-                    ContentBlock::Text { text } => text.len() / 4,
-                    ContentBlock::ToolUse { input, .. } => input.to_string().len() / 4,
-                    ContentBlock::ToolResult { content, .. } => content.len() / 4,
-                    ContentBlock::Thinking { thinking } => thinking.len() / 4,
+                    ContentBlock::Text { text } => estimate_token_count(text.len()),
+                    ContentBlock::ToolUse { input, .. } => estimate_token_count(input.to_string().len()),
+                    ContentBlock::ToolResult { content, .. } => estimate_token_count(content.len()),
+                    ContentBlock::Thinking { thinking, .. } => estimate_token_count(thinking.len()),
                     ContentBlock::Image { .. } => 1000,
                 })
                 .sum::<usize>()
             )
             .sum();
-        let new_tokens = summary_text.len() / 4;
+        let new_tokens = estimate_token_count(summary_text.len());
         let tokens_saved = old_tokens.saturating_sub(new_tokens);
 
         let summary = ContextSummary {
@@ -1289,6 +1315,19 @@ impl Default for AgentContext {
     fn default() -> Self {
         Self::new(Uuid::new_v4().to_string())
     }
+}
+
+/// Conservative token count estimate from character length.
+///
+/// Uses ~3.2 chars per token (multiply by 10, divide by 32) which is more
+/// accurate for mixed content (code + prose + JSON) than the commonly cited
+/// 4 chars/token ratio. For pure English prose the real ratio is ~4, but
+/// code identifiers, JSON keys, and special characters tokenize much worse.
+/// Over-estimating by ~20% is a good trade: it triggers compression a bit
+/// earlier but avoids the catastrophic 400 context_length_exceeded error.
+fn estimate_token_count(char_len: usize) -> usize {
+    // (char_len * 10) / 32 ≈ char_len / 3.2
+    (char_len * 10 + 31) / 32 // +31 for ceiling division
 }
 
 fn chrono_timestamp() -> i64 {

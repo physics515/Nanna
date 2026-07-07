@@ -1,5 +1,6 @@
 export default {
   name: "recall_messages",
+  version: "0.1.0",
   description: "Recall recent conversation messages that may have been summarized or compressed away. Use this when you've lost track of the original user request, need to review what was discussed earlier, or want to refresh your context about the conversation. Returns the last N messages from the current session.",
   output: "context",
   parameters: {

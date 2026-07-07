@@ -12,7 +12,9 @@
 //! - WebSocket or SSE endpoint for receiving messages
 //! - POST /send - for sending messages (handled by WhatsAppWebChannel)
 
+use super::circuit_breaker::{BreakerAction, CircuitBreaker};
 use super::{Listener, ListenerError, ListenerHandle};
+use crate::status::StatusManager;
 use crate::{ChannelId, IncomingMessage, MessageContent, Sender};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -32,6 +34,8 @@ pub struct WhatsAppWebListener {
     session_id: String,
     /// Receive mode
     receive_mode: ReceiveMode,
+    /// Optional status manager for reporting connection state to the UI
+    status_manager: Option<Arc<StatusManager>>,
 }
 
 /// How to receive messages from the bridge
@@ -63,6 +67,7 @@ impl WhatsAppWebListener {
             api_url: api_url.into().trim_end_matches('/').to_string(),
             session_id: session_id.into(),
             receive_mode: ReceiveMode::default(),
+            status_manager: None,
         }
     }
 
@@ -70,6 +75,13 @@ impl WhatsAppWebListener {
     #[must_use]
     pub fn with_receive_mode(mut self, mode: ReceiveMode) -> Self {
         self.receive_mode = mode;
+        self
+    }
+
+    /// Attach a status manager for reporting connection state to the UI
+    #[must_use]
+    pub fn with_status_manager(mut self, manager: Arc<StatusManager>) -> Self {
+        self.status_manager = Some(manager);
         self
     }
 
@@ -157,6 +169,15 @@ impl WhatsAppWebListener {
         })
     }
 
+    /// Create a circuit breaker pre-configured for this listener.
+    fn make_circuit_breaker(&self) -> CircuitBreaker {
+        let mut cb = CircuitBreaker::new("whatsapp-web");
+        if let Some(sm) = &self.status_manager {
+            cb = cb.with_status_manager(Arc::clone(sm));
+        }
+        cb
+    }
+
     /// Run WebSocket receiver
     async fn run_websocket_receiver(
         self: Arc<Self>,
@@ -171,18 +192,25 @@ impl WhatsAppWebListener {
             .replace("https://", "wss://");
         let url = format!("{}/ws/{}", ws_url, self.session_id);
 
+        let mut cb = self.make_circuit_breaker();
+
         loop {
+            cb.report_connecting().await;
             info!(url = %url, "Connecting to WhatsApp Web bridge WebSocket");
 
             let ws_stream = match connect_async(&url).await {
                 Ok((stream, _)) => stream,
                 Err(e) => {
-                    error!(error = %e, "Failed to connect to WebSocket");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let detail = format!("WebSocket connect failed: {}", e);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
                     continue;
                 }
             };
 
+            cb.record_success().await;
             info!("Connected to WhatsApp Web bridge");
 
             let (_, mut read) = ws_stream.split();
@@ -232,8 +260,12 @@ impl WhatsAppWebListener {
                 }
             }
 
-            warn!("WebSocket disconnected, reconnecting in 5s...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Connection lost — reconnect with backoff
+            let detail = "WebSocket connection lost";
+            if cb.record_conn_failure(detail).await == BreakerAction::Stop {
+                break;
+            }
+            cb.backoff().await;
         }
     }
 
@@ -245,7 +277,10 @@ impl WhatsAppWebListener {
     ) {
         let url = format!("{}/api/sessions/{}/events", self.api_url, self.session_id);
 
+        let mut cb = self.make_circuit_breaker();
+
         loop {
+            cb.report_connecting().await;
             info!(url = %url, "Connecting to WhatsApp Web bridge SSE");
 
             let response = match self
@@ -257,18 +292,32 @@ impl WhatsAppWebListener {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    error!(error = %e, "Failed to connect to SSE");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let detail = format!("SSE connect failed: {}", e);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                    cb.backoff().await;
                     continue;
                 }
             };
 
             if !response.status().is_success() {
-                error!(status = %response.status(), "SSE connection failed");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let status = response.status();
+                if status.as_u16() == 401 || status.as_u16() == 403 {
+                    if cb.record_auth_failure(&format!("HTTP {}", status)).await == BreakerAction::Stop {
+                        break;
+                    }
+                } else {
+                    let detail = format!("SSE connection returned HTTP {}", status);
+                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                        break;
+                    }
+                }
+                cb.backoff().await;
                 continue;
             }
 
+            cb.record_success().await;
             info!("Connected to WhatsApp Web bridge SSE");
 
             let mut stream = response.bytes_stream();
@@ -320,8 +369,12 @@ impl WhatsAppWebListener {
                 }
             }
 
-            warn!("SSE disconnected, reconnecting in 5s...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Connection lost — reconnect with backoff
+            let detail = "SSE connection lost";
+            if cb.record_conn_failure(detail).await == BreakerAction::Stop {
+                break;
+            }
+            cb.backoff().await;
         }
     }
 
@@ -335,6 +388,8 @@ impl WhatsAppWebListener {
         let poll_interval = Duration::from_secs(2);
         let mut last_timestamp: i64 = chrono::Utc::now().timestamp();
 
+        let mut cb = self.make_circuit_breaker();
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -347,6 +402,7 @@ impl WhatsAppWebListener {
                     match self.client.get(&poll_url).send().await {
                         Ok(response) => {
                             if response.status().is_success() {
+                                cb.record_success().await;
                                 if let Ok(messages) = response.json::<Vec<BridgeMessage>>().await {
                                     for msg in messages {
                                         if let Some(ts) = msg.timestamp {
@@ -364,10 +420,27 @@ impl WhatsAppWebListener {
                                         }
                                     }
                                 }
+                            } else {
+                                let status = response.status();
+                                if status.as_u16() == 401 || status.as_u16() == 403 {
+                                    if cb.record_auth_failure(&format!("HTTP {}", status)).await == BreakerAction::Stop {
+                                        break;
+                                    }
+                                } else {
+                                    let detail = format!("Poll returned HTTP {}", status);
+                                    if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                                        break;
+                                    }
+                                }
+                                cb.backoff().await;
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, "Failed to poll messages");
+                            let detail = e.to_string();
+                            if cb.record_conn_failure(&detail).await == BreakerAction::Stop {
+                                break;
+                            }
+                            cb.backoff().await;
                         }
                     }
                 }

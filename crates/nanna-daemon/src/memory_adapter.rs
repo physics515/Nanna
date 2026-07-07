@@ -9,11 +9,16 @@ use std::sync::Arc;
 /// Adapter that implements MemoryStorage using the full MemoryService
 pub struct MemoryServiceAdapter {
     service: Arc<MemoryService>,
+    workspace_id: Option<String>,
 }
 
 impl MemoryServiceAdapter {
     pub fn new(service: Arc<MemoryService>) -> Self {
-        Self { service }
+        Self { service, workspace_id: None }
+    }
+
+    pub fn with_workspace(service: Arc<MemoryService>, workspace_id: Option<String>) -> Self {
+        Self { service, workspace_id }
     }
 }
 
@@ -25,9 +30,9 @@ impl MemoryStorage for MemoryServiceAdapter {
             metadata.insert("tags".to_string(), tags.join(","));
         }
         
-        // Use moderate importance (3.0) for explicit remember calls
+        // Use scoped remember so memories are tied to the active workspace
         self.service
-            .remember_with_importance(content, metadata, 3.0)
+            .remember_scoped(content, metadata, 3.0, self.workspace_id.clone())
             .await
             .map(|(id, _)| id)
             .map_err(|e| e.to_string())
@@ -35,7 +40,7 @@ impl MemoryStorage for MemoryServiceAdapter {
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryResult>, String> {
         self.service
-            .recall(query)
+            .recall_scoped(query, self.workspace_id.as_deref())
             .await
             .map(|results| {
                 results

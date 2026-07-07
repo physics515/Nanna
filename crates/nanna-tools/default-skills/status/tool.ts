@@ -1,5 +1,7 @@
 export default {
   name: "status",
+  version: "0.1.0",
+  output: "context",
   description: "Get system status information. Shows platform, working directory, git status, and environment overview.",
   parameters: {
     type: "object",
@@ -13,10 +15,14 @@ export default {
     lines.push("# System Status");
     lines.push("Platform: " + Nanna.platform);
 
-    // Working directory
-    var pwdResult = Nanna.exec(Nanna.platform === "win32" ? "cd" : "pwd");
-    if (pwdResult.success) {
-      lines.push("Working directory: " + pwdResult.stdout.trim());
+    // Working directory - prefer Nanna.workdir (set from active workspace)
+    if (Nanna.workdir) {
+      lines.push("Working directory: " + Nanna.workdir);
+    } else {
+      var pwdResult = Nanna.exec(Nanna.platform === "win32" ? "cd" : "pwd");
+      if (pwdResult.success) {
+        lines.push("Working directory: " + pwdResult.stdout.trim());
+      }
     }
 
     // Git status

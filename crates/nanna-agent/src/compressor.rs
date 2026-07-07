@@ -162,8 +162,20 @@ fn fallback_compress(content: &str, ratio: usize) -> Option<String> {
     if half < 100 {
         return None;
     }
-    let start = &content[..half];
-    let end = &content[content.len().saturating_sub(half)..];
+    // Snap to char boundaries to avoid panicking on multi-byte UTF-8 (e.g. tree-drawing chars)
+    let start_end = content.floor_char_boundary(half);
+    // For the tail portion, floor to previous boundary then advance past any split char
+    let tail_offset = content.len().saturating_sub(half);
+    let end_start = if content.is_char_boundary(tail_offset) {
+        tail_offset
+    } else {
+        // Find the next char boundary after tail_offset
+        (tail_offset..content.len())
+            .find(|&i| content.is_char_boundary(i))
+            .unwrap_or(content.len())
+    };
+    let start = &content[..start_end];
+    let end = &content[end_start..];
     Some(format!("{start}\n[...compressed...]\n{end}"))
 }
 

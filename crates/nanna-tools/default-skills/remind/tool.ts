@@ -1,5 +1,6 @@
 export default {
   name: "remind",
+  version: "0.1.0",
   description: "Set a reminder that will fire after a specified delay. The message will be injected into the conversation when the timer expires.",
   parameters: {
     type: "object",
