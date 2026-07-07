@@ -439,7 +439,21 @@ keep the phases readable; promote individual items into a phase when they become
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
 
 1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: rename `SqliteMemoryPersistence`, purge "SQLite" strings, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: rename `SqliteMemoryPersistence` + purge "SQLite" strings.
-2. **Bring all deps to latest + commit `Cargo.lock`** (doctrine → *Dependency freshness*) — initial sweep: `cargo upgrade --incompatible` + `cargo update` across the workspace and `pnpm update --latest` in `gui/`; fix breakage; verify green + benchmarks; commit `Cargo.lock` (un-gitignore it) for reproducible builds/benchmarks. Thereafter the nightly routine keeps everything fresh each run.
+2. **Bring all deps to latest + commit `Cargo.lock`** (doctrine → *Dependency freshness*) — `Cargo.lock`
+   un-gitignored and committed (2026-07-07); compatible deps already at latest (`cargo update` = 0 changes).
+   Low-risk majors applied green: `directories 5→6` (unified with the workspace pin), `tower-http 0.6→0.7`
+   (daemon+server), `socket2 0.5→0.6` (daemon). **Deferred majors** (each needs a real migration — build
+   green + tests + benches before landing; do one per run):
+   - [ ] `reqwest 0.12→0.13` (workspace-wide HTTP client — wide ripple)
+   - [ ] `tokio-tungstenite 0.26→0.29` (IPC/WebSocket across client/daemon/gui/mcp/channels)
+   - [ ] `deno_core 0.375→0.406` + `deno_ast 0.51→0.53` + `swc_core 7→72` (nanna-scripting — large)
+   - [ ] `rustpython-{vm,stdlib,pylib} 0.4→0.5` (nanna-scripting)
+   - [ ] `playwright-rs 0.8→0.14` + `chromiumoxide 0.8→0.9` (nanna-browser)
+   - [ ] `keyring 3→4` (nanna-config)
+   - [ ] `ed25519-dalek 2→3`, `hmac 0.12→0.13`, `sha2 0.10→0.11` (nanna-server + nanna-daemon — keep pairs aligned)
+   - [ ] `scraper 0.22→0.27`, `lopdf 0.34→0.43` (nanna-tools)
+   - [ ] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `windows-service 0.7→0.8`, `nix 0.29→0.31` (unix), `criterion 0.5→0.8` (nanna-gpu benches)
+   - [ ] GUI `pnpm update --latest` sweep in `gui/`
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
