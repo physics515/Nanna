@@ -1,4 +1,4 @@
-//! SQLite-backed MemoryPersistence adapter
+//! Turso-backed MemoryPersistence adapter
 //!
 //! Bridges `nanna_memory::MemoryPersistence` ↔ `nanna_storage::MemoryRepository`,
 //! converting between `MemoryEntry` (in-memory type) and `Memory`/`NewMemory`
@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use tracing::warn;
 
 /// Implements `MemoryPersistence` using the `MemoryRepository` from `nanna-storage`.
-pub struct SqliteMemoryPersistence {
+pub struct TursoMemoryPersistence {
     repo: MemoryRepository,
 }
 
-impl SqliteMemoryPersistence {
+impl TursoMemoryPersistence {
     pub fn new(repo: MemoryRepository) -> Self {
         Self { repo }
     }
@@ -77,7 +77,7 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
     // Parse timestamp from created_at ISO string (fallback: 0)
     let timestamp = chrono::DateTime::parse_from_rfc3339(&mem.created_at)
         .or_else(|_| {
-            // Try sqlite datetime format 'YYYY-MM-DD HH:MM:SS'
+            // Try Turso datetime format 'YYYY-MM-DD HH:MM:SS'
             chrono::NaiveDateTime::parse_from_str(&mem.created_at, "%Y-%m-%d %H:%M:%S")
                 .map(|ndt| ndt.and_utc().fixed_offset())
                 .map_err(|e| e)
@@ -112,7 +112,7 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl MemoryPersistence for SqliteMemoryPersistence {
+impl MemoryPersistence for TursoMemoryPersistence {
     async fn save_entry(&self, entry: &MemoryEntry) -> Result<(), MemoryError> {
         let new_mem = entry_to_new_memory(entry);
 

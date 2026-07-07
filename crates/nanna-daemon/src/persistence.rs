@@ -1,6 +1,6 @@
 //! Legacy persistence helpers
 //!
-//! Session and workspace persistence has been migrated to SQLite (nanna-storage).
+//! Session and workspace persistence has been migrated to Turso (nanna-storage).
 //! This module is kept for backward compatibility during the transition period
 //! — it can migrate old sessions.json data to the database on first run.
 

@@ -148,7 +148,7 @@ impl MemoryService {
         self
     }
 
-    /// Attach a SQLite (or other) persistence backend to the underlying store.
+    /// Attach a Turso (or other) persistence backend to the underlying store.
     ///
     /// Must be called before [`MemoryService::load_from_db`].
     #[must_use]
@@ -867,7 +867,7 @@ impl MemoryService {
         self.store.load(path).await
     }
 
-    /// Flush all in-memory entries to the persistence backend (for JSON → SQLite migration).
+    /// Flush all in-memory entries to the persistence backend (for JSON → Turso migration).
     pub async fn flush_to_db(&self) -> Result<usize, MemoryError> {
         self.store.flush_to_db().await
     }
