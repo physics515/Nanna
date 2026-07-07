@@ -53,7 +53,7 @@ pub enum MemoryError {
     Persistence(String),
 }
 
-/// Trait for pluggable persistence backends (SQLite, etc.)
+/// Trait for pluggable persistence backends (Turso, etc.)
 ///
 /// Implementors are responsible for durably storing and retrieving memory entries.
 /// The in-memory vector cache remains the primary store for search; this layer
@@ -161,7 +161,7 @@ pub struct VectorStore {
     entries: RwLock<Vec<MemoryEntry>>,
     gpu: Option<Arc<GpuContext>>,
     gpu_pipeline: Option<CosineSimilaritySearch>,
-    /// Optional SQLite (or other) backing store for durable persistence.
+    /// Optional Turso (or other) backing store for durable persistence.
     /// When set, writes (add/remove/update) are mirrored to the backing store.
     /// Search always operates purely in-memory.
     db: Option<Arc<dyn MemoryPersistence + Send + Sync>>,
@@ -530,10 +530,10 @@ impl VectorStore {
     ///
     /// # Deprecated
     ///
-    /// This method is retained only for one-time JSON→SQLite migration.
+    /// This method is retained only for one-time JSON→Turso migration.
     /// Use [`VectorStore::with_persistence`] and [`VectorStore::load_from_db`] instead.
     pub async fn save(&self, path: &std::path::Path) -> Result<(), MemoryError> {
-        warn!("VectorStore::save() is deprecated. Use SQLite persistence instead.");
+        warn!("VectorStore::save() is deprecated. Use Turso persistence instead.");
         let entries = self.entries.read().await;
         let json = serde_json::to_string_pretty(&*entries)?;
         tokio::fs::write(path, json).await?;
@@ -545,7 +545,7 @@ impl VectorStore {
     ///
     /// # Deprecated
     ///
-    /// This method is retained only for one-time JSON→SQLite migration.
+    /// This method is retained only for one-time JSON→Turso migration.
     /// Use [`VectorStore::with_persistence`] and [`VectorStore::load_from_db`] instead.
     ///
     /// Loads all entries regardless of embedding dimension. If the embedding
@@ -582,8 +582,8 @@ impl VectorStore {
 
     /// Flush all in-memory entries to the persistence backend.
     ///
-    /// Used during one-time JSON → SQLite migration: after `load()` populates
-    /// the in-memory cache from JSON, call this to persist every entry to SQLite.
+    /// Used during one-time JSON → Turso migration: after `load()` populates
+    /// the in-memory cache from JSON, call this to persist every entry to Turso.
     ///
     /// # Errors
     ///
@@ -605,7 +605,7 @@ impl VectorStore {
             }
         }
 
-        info!("Flushed {}/{} entries to SQLite", saved, total);
+        info!("Flushed {}/{} entries to Turso", saved, total);
         Ok(saved)
     }
 

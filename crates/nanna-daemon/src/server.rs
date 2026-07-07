@@ -5,7 +5,7 @@
 use crate::agent_service::{AgentService, AgentServiceConfig};
 use nanna_agent::ThinkingMode;
 use crate::control::ControlPlane;
-use crate::memory_persistence::SqliteMemoryPersistence;
+use crate::memory_persistence::TursoMemoryPersistence;
 use crate::health::{HealthServer, HealthState, PidFile, DEFAULT_HEALTH_PORT};
 use crate::ipc::{IpcServer, IpcServerConfig};
 use crate::llm_router::LlmRouter;
@@ -676,7 +676,7 @@ impl DaemonServer {
             }
         }
         
-        // Load sessions from SQLite database
+        // Load sessions from Turso database
         {
             let loaded = self.sessions.load_from_db().await;
             info!("Loaded {} sessions from database", loaded);
@@ -993,7 +993,7 @@ impl DaemonServer {
             info!("Webhook server listening on http://{}:{}", self.config.ipc.host, self.config.webhook_port);
         }
         
-        // Sessions are now persisted via SQLite write-through on every mutation.
+        // Sessions are now persisted via Turso write-through on every mutation.
         // No more periodic JSON auto-save — each create/message/delete/rename writes to DB immediately.
 
         // Spawn model + tool stats auto-save task (every 5 minutes)
@@ -1354,34 +1354,34 @@ impl DaemonServer {
                     };
                     info!("Memory service using dimension {} for model {}", dimension, self.embedding.model);
 
-                    // Wire up SQLite persistence if storage is available.
+                    // Wire up Turso persistence if storage is available.
                     // The persistence adapter is constructed here and attached to the
-                    // MemoryService so all writes are automatically mirrored to SQLite.
+                    // MemoryService so all writes are automatically mirrored to Turso.
                     let memory_service = if let Some(ref storage) = self.storage {
                         let repo = storage.memories();
-                        let db = Arc::new(SqliteMemoryPersistence::new(repo));
+                        let db = Arc::new(TursoMemoryPersistence::new(repo));
                         nanna_memory::MemoryService::new(config)
                             .with_embed_fn(embed_fn)
                             .with_persistence(db)
                     } else {
-                        warn!("No storage backend available — memory will NOT be persisted to SQLite");
+                        warn!("No storage backend available — memory will NOT be persisted to Turso");
                         nanna_memory::MemoryService::new(config)
                             .with_embed_fn(embed_fn)
                     };
 
-                    // One-time migration: if memories.json exists and SQLite is empty,
-                    // load from JSON into in-memory cache then save each entry to SQLite.
+                    // One-time migration: if memories.json exists and Turso is empty,
+                    // load from JSON into in-memory cache then save each entry to Turso.
                     let json_path = self.memory_path.as_ref();
                     let should_migrate = if let (Some(path), Some(storage)) = (json_path, &self.storage) {
                         if path.exists() {
                             match storage.memories().count().await {
                                 Ok(0) => true,
                                 Ok(n) => {
-                                    info!("SQLite already has {} memories — skipping JSON migration", n);
+                                    info!("Turso already has {} memories — skipping JSON migration", n);
                                     false
                                 }
                                 Err(e) => {
-                                    warn!("Could not check SQLite memory count: {}", e);
+                                    warn!("Could not check Turso memory count: {}", e);
                                     false
                                 }
                             }
@@ -1394,15 +1394,15 @@ impl DaemonServer {
 
                     if should_migrate {
                         let path = json_path.unwrap();
-                        info!("Migrating memories from {:?} to SQLite (one-time migration)", path);
+                        info!("Migrating memories from {:?} to Turso (one-time migration)", path);
                         match memory_service.load(path).await {
                             Ok(()) => {
                                 let count = memory_service.count().await;
-                                info!("Loaded {} memories from JSON, flushing to SQLite...", count);
-                                // Flush all entries to SQLite
+                                info!("Loaded {} memories from JSON, flushing to Turso...", count);
+                                // Flush all entries to Turso
                                 match memory_service.flush_to_db().await {
-                                    Ok(n) => info!("Flushed {} memories to SQLite", n),
-                                    Err(e) => warn!("Failed to flush memories to SQLite: {}", e),
+                                    Ok(n) => info!("Flushed {} memories to Turso", n),
+                                    Err(e) => warn!("Failed to flush memories to Turso: {}", e),
                                 }
                                 // Rename the JSON file so we don't re-migrate next time
                                 let migrated_path = path.with_extension("json.migrated");
@@ -1413,17 +1413,17 @@ impl DaemonServer {
                                 }
                             }
                             Err(e) => {
-                                warn!("JSON migration failed: {}. Will attempt to load from SQLite.", e);
+                                warn!("JSON migration failed: {}. Will attempt to load from Turso.", e);
                             }
                         }
                     }
 
-                    // Load from SQLite into the in-memory cache (normal startup path).
+                    // Load from Turso into the in-memory cache (normal startup path).
                     // Skipped if we just migrated (the entries are already in-memory from the JSON load above).
                     if !should_migrate {
                         match memory_service.load_from_db().await {
                             Ok(count) => {
-                                info!("Loaded {} memories from SQLite", count);
+                                info!("Loaded {} memories from Turso", count);
                             }
                             Err(nanna_memory::MemoryError::Persistence(ref e))
                                 if e.contains("No persistence backend") =>
@@ -1431,7 +1431,7 @@ impl DaemonServer {
                                 // No storage configured — silently skip
                             }
                             Err(e) => {
-                                warn!("Failed to load memories from SQLite: {}", e);
+                                warn!("Failed to load memories from Turso: {}", e);
                             }
                         }
                     }
@@ -1457,7 +1457,7 @@ impl DaemonServer {
                         }
                     }
                     
-                    info!("Memory service initialized with SQLite persistence and embedding router");
+                    info!("Memory service initialized with Turso persistence and embedding router");
                     let memory_arc = Arc::new(memory_service);
 
                     // Wire the memory service into the embed_fn's OnceCell
@@ -1851,7 +1851,7 @@ impl DaemonBuilder {
         let mut server = DaemonServer::new(self.config, self.embedding, self.memory_path, self.brave_api_key);
         server.log_buffer = self.log_buffer;
 
-        // Initialize SQLite storage for model stats persistence
+        // Initialize Turso storage for model stats persistence
         let db_path = server.config.data_dir.join("nanna.db");
         let storage_config = nanna_storage::StorageConfig {
             path: db_path.to_string_lossy().to_string(),

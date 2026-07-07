@@ -318,7 +318,7 @@ impl ControlPlane {
     }
 
     // NOTE: save_memories_if_needed() removed — memory is now persisted
-    // via SQLite write-through on every mutation (add/remove/update).
+    // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
     
     /// Handle an action and return a response
@@ -1208,7 +1208,7 @@ impl ControlPlane {
 
                 match memory.remember_with_importance(&content, metadata, importance.unwrap_or(3) as f32).await {
                     Ok((id, action)) => {
-                        // Memory auto-persisted to SQLite via write-through.
+                        // Memory auto-persisted to Turso via write-through.
                         json!({
                             "id": id,
                             "action": format!("{:?}", action),
@@ -1222,7 +1222,7 @@ impl ControlPlane {
                 if let Some(new_content) = content {
                     match memory.update_content(&id, &new_content).await {
                         Ok(()) => {
-                            // Memory auto-persisted to SQLite via write-through.
+                            // Memory auto-persisted to Turso via write-through.
                             json!({ "status": "updated", "id": id })
                         }
                         Err(e) => json!({ "error": "update_failed", "message": e.to_string() })
@@ -1234,7 +1234,7 @@ impl ControlPlane {
             MemoryAction::Delete { id } => {
                 match memory.forget(&id).await {
                     Ok(()) => {
-                        // Memory auto-persisted to SQLite via write-through.
+                        // Memory auto-persisted to Turso via write-through.
                         json!({ "status": "deleted", "id": id })
                     }
                     Err(e) => json!({ "error": "delete_failed", "message": e.to_string() })
@@ -1243,9 +1243,9 @@ impl ControlPlane {
             MemoryAction::Clear => {
                 memory.clear().await;
                 // Note: clear() removes all in-memory entries. Individual removes
-                // write-through to SQLite, but bulk clear would require a separate
+                // write-through to Turso, but bulk clear would require a separate
                 // DB call. For now we log a warning.
-                warn!("Memory cleared in-memory. SQLite entries are NOT cleared — restart will reload them.");
+                warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
                 info!("Cleared all memories (in-memory only)");
                 json!({ "status": "cleared" })
             }
