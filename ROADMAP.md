@@ -309,7 +309,7 @@ routine should drain first.**
 - [ ] Harden memory extraction against prompt injection (raw conversation is embedded in the extraction prompt).
 
 **Correctness bugs:**
-- [ ] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama).
+- [ ] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama). *(2026-07-06: the **daemon** already infers correctly via `ProviderId::from_model` — now covered by regression tests. Remaining: point the **GUI** `parse_model_id` at the same logic; needs a GUI build to verify.)*
 - [ ] **Atomic memory persistence** — `save_memories` writes in place; a crash mid-write corrupts the store. Use `tempfile` → write → `fs::rename`.
 - [x] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
       *(2026-07-06) `smart_ingest`'s `IngestAction::Update` arm now folds the new observation into the existing entry (keeps the longer/more-informative text, re-embeds via new `VectorStore::update_content_and_embedding`, reinforces FSRS) instead of creating a near-duplicate — see [P13 true-merge]. Tests: merge-no-duplicate + dimension/NotFound guards.*
