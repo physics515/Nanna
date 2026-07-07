@@ -2752,6 +2752,15 @@ Example: [{{"content": "User prefers dark mode", "category": "preference"}}]"#
                 match serde_json::from_str::<Vec<ExtractedMemoryRaw>>(json_str) {
                     Ok(parsed) => {
                         for raw in parsed {
+                            // Skip trivially short extractions — they are rarely durable
+                            // facts and only add noise + dedup churn to the store.
+                            if !is_storable_memory(&raw.content) {
+                                debug!(
+                                    "Skipping short extracted memory ({} chars)",
+                                    raw.content.trim().chars().count()
+                                );
+                                continue;
+                            }
                             memories.push(ExtractedMemory {
                                 content: raw.content,
                                 category: raw.category,
@@ -2785,6 +2794,18 @@ pub struct ExtractedMemory {
 struct ExtractedMemoryRaw {
     content: String,
     category: String,
+}
+
+/// Minimum length (in Unicode scalar values) for an extracted memory to be worth
+/// storing. Shorter fragments ("ok", "yes", a bare name) are rarely durable facts
+/// and just add noise and duplicate-detection churn to the store.
+const MIN_EXTRACTED_MEMORY_CHARS: usize = 50;
+
+/// Whether an extracted memory's content is substantial enough to persist.
+/// Trims surrounding whitespace and counts characters (not bytes) so multibyte
+/// text is judged by visible length.
+fn is_storable_memory(content: &str) -> bool {
+    content.trim().chars().count() >= MIN_EXTRACTED_MEMORY_CHARS
 }
 
 /// Internal state for a run
@@ -2931,4 +2952,31 @@ fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 /// Check if a tool name is a write-type tool whose content should be stripped from context.
 fn is_write_tool(name: &str) -> bool {
     matches!(name, "write_file" | "write" | "Write" | "create_tool")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_storable_memory_rejects_short() {
+        // Trivial fragments (below the char floor, incl. whitespace-padded) are dropped.
+        assert!(!is_storable_memory("ok"));
+        assert!(!is_storable_memory("   short note   "));
+        assert!(!is_storable_memory(""));
+        // Exactly one short of the threshold is still rejected (negative space).
+        assert!(!is_storable_memory(
+            &"a".repeat(MIN_EXTRACTED_MEMORY_CHARS - 1)
+        ));
+    }
+
+    #[test]
+    fn test_is_storable_memory_accepts_substantial() {
+        // At/above the floor is kept; multibyte text is judged by char count, not bytes.
+        assert!(is_storable_memory(&"a".repeat(MIN_EXTRACTED_MEMORY_CHARS)));
+        assert!(is_storable_memory(
+            "The user prefers dark mode and uses the daemon on port 5149 daily."
+        ));
+        assert!(is_storable_memory(&"é".repeat(MIN_EXTRACTED_MEMORY_CHARS)));
+    }
 }
