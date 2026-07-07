@@ -2747,22 +2747,7 @@ impl Agent {
 
                 match serde_json::from_str::<Vec<ExtractedMemoryRaw>>(json_str) {
                     Ok(parsed) => {
-                        for raw in parsed {
-                            // Skip trivially short extractions — they are rarely durable
-                            // facts and only add noise + dedup churn to the store.
-                            if !is_storable_memory(&raw.content) {
-                                debug!(
-                                    "Skipping short extracted memory ({} chars)",
-                                    raw.content.trim().chars().count()
-                                );
-                                continue;
-                            }
-                            memories.push(ExtractedMemory {
-                                content: raw.content,
-                                category: raw.category,
-                                tags: None,
-                            });
-                        }
+                        memories.extend(filter_extracted_memories(parsed));
                     }
                     Err(e) => {
                         warn!("Memory extraction JSON parse failed: {} — raw response: {}", e, &json_str[..json_str.len().min(200)]);
@@ -2774,6 +2759,38 @@ impl Agent {
         info!("Extracted {} memories from conversation", memories.len());
         Ok(memories)
     }
+}
+
+/// Filter raw extraction results before storing: drop empty/whitespace-only
+/// fragments and exact duplicates within the batch (case-insensitive, trimmed),
+/// preserving first-seen order.
+///
+/// A length threshold is deliberately NOT applied — short facts ("User's name is
+/// Bob") are exactly what a personal memory must keep. Cross-batch dedup against
+/// existing memories happens downstream via `smart_ingest`'s similarity bands.
+fn filter_extracted_memories(raw: Vec<ExtractedMemoryRaw>) -> Vec<ExtractedMemory> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        let content = r.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        // Dedup on a normalized key, but store the original trimmed content.
+        if !seen.insert(content.to_lowercase()) {
+            continue;
+        }
+        out.push(ExtractedMemory {
+            content: content.to_string(),
+            category: r.category,
+            tags: None,
+        });
+    }
+    debug_assert!(
+        out.len() <= seen.len(),
+        "kept more memories than unique keys"
+    );
+    out
 }
 
 /// A memory extracted from conversation
@@ -2790,18 +2807,6 @@ pub struct ExtractedMemory {
 struct ExtractedMemoryRaw {
     content: String,
     category: String,
-}
-
-/// Minimum length (in Unicode scalar values) for an extracted memory to be worth
-/// storing. Shorter fragments ("ok", "yes", a bare name) are rarely durable facts
-/// and just add noise and duplicate-detection churn to the store.
-const MIN_EXTRACTED_MEMORY_CHARS: usize = 50;
-
-/// Whether an extracted memory's content is substantial enough to persist.
-/// Trims surrounding whitespace and counts characters (not bytes) so multibyte
-/// text is judged by visible length.
-fn is_storable_memory(content: &str) -> bool {
-    content.trim().chars().count() >= MIN_EXTRACTED_MEMORY_CHARS
 }
 
 /// Marker fencing the untrusted conversation inside the memory-extraction prompt.
@@ -2988,26 +2993,39 @@ fn is_write_tool(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_is_storable_memory_rejects_short() {
-        // Trivial fragments (below the char floor, incl. whitespace-padded) are dropped.
-        assert!(!is_storable_memory("ok"));
-        assert!(!is_storable_memory("   short note   "));
-        assert!(!is_storable_memory(""));
-        // Exactly one short of the threshold is still rejected (negative space).
-        assert!(!is_storable_memory(
-            &"a".repeat(MIN_EXTRACTED_MEMORY_CHARS - 1)
-        ));
+    fn raw(content: &str) -> ExtractedMemoryRaw {
+        ExtractedMemoryRaw {
+            content: content.to_string(),
+            category: "fact".to_string(),
+        }
     }
 
     #[test]
-    fn test_is_storable_memory_accepts_substantial() {
-        // At/above the floor is kept; multibyte text is judged by char count, not bytes.
-        assert!(is_storable_memory(&"a".repeat(MIN_EXTRACTED_MEMORY_CHARS)));
-        assert!(is_storable_memory(
-            "The user prefers dark mode and uses the daemon on port 5149 daily."
-        ));
-        assert!(is_storable_memory(&"é".repeat(MIN_EXTRACTED_MEMORY_CHARS)));
+    fn test_filter_extracted_memories_drops_empty_and_dupes() {
+        let input = vec![
+            raw("User's name is Bob"),     // short but meaningful — kept
+            raw("  "),                     // whitespace-only — dropped
+            raw(""),                       // empty — dropped
+            raw("user's name is bob"),     // case-insensitive dup of #1 — dropped
+            raw("  User's name is Bob  "), // trimmed dup of #1 — dropped
+            raw("Bob likes coffee"),       // distinct — kept
+        ];
+
+        let out = filter_extracted_memories(input);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "User's name is Bob");
+        assert_eq!(out[1].content, "Bob likes coffee");
+        // Trimming is applied to stored content.
+        assert!(!out[0].content.starts_with(' '));
+    }
+
+    #[test]
+    fn test_filter_extracted_memories_preserves_order_and_empty_input() {
+        assert!(filter_extracted_memories(Vec::new()).is_empty());
+
+        let out = filter_extracted_memories(vec![raw("first"), raw("second"), raw("third")]);
+        let contents: Vec<&str> = out.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["first", "second", "third"]);
     }
 
     #[test]

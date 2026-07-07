@@ -506,30 +506,35 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Update both the content and embedding of an existing entry (used by
-    /// dreaming/merge, where the merged text needs a matching embedding).
+    /// Replace an entry's content **and** embedding in place (merge/dreaming path).
     ///
-    /// The embedding is normalized in place and must match the store dimension.
-    /// Persists the full entry write-through (content + embedding + FSRS).
+    /// Keeps the entry's ID and FSRS history; the caller reinforces FSRS
+    /// separately. Persists the full updated entry (upsert) so the durable
+    /// content and embedding never diverge from the in-memory cache.
     ///
     /// # Errors
-    /// Returns `MemoryError::DimensionMismatch` if `embedding` has the wrong
-    /// length, or `MemoryError::NotFound` if no entry has `id`.
+    ///
+    /// Returns `DimensionMismatch` if `embedding` has the wrong dimension, or
+    /// `NotFound` if no entry has the given `id`.
     pub async fn update_content_and_embedding(
         &self,
         id: &str,
         content: &str,
         mut embedding: Vec<f32>,
     ) -> Result<(), MemoryError> {
-        debug_assert!(!id.is_empty(), "id must not be empty");
+        debug_assert!(!id.is_empty(), "memory id must not be empty");
+        debug_assert!(!content.is_empty(), "merged content must not be empty");
         if embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
                 expected: self.config.get_dimension(),
                 got: embedding.len(),
             });
         }
+
+        // Normalize for cosine similarity, matching `add`.
         normalize_f32(&mut embedding);
 
+        // Update the in-memory entry, snapshot it, then release the lock.
         let mut entries = self.entries.write().await;
         let entry = entries
             .iter_mut()
@@ -537,17 +542,18 @@ impl VectorStore {
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
         entry.content = content.to_string();
         entry.embedding = embedding;
-        let updated = entry.clone();
+        let snapshot = entry.clone();
         drop(entries);
 
-        // Write-through the full entry so content and embedding stay consistent.
+        // Write-through the whole entry (content + embedding stay consistent).
         if let Some(ref db) = self.db
-            && let Err(e) = db.save_entry(&updated).await
+            && let Err(e) = db.save_entry(&snapshot).await
         {
-            warn!("Failed to persist merged entry {}: {}", id, e);
-            // Non-fatal
+            warn!("Failed to persist merged memory {}: {}", id, e);
+            // Non-fatal: in-memory cache already updated.
         }
 
+        debug_assert_eq!(snapshot.id, id, "merged entry id must be unchanged");
         Ok(())
     }
 

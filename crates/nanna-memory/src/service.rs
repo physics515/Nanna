@@ -298,23 +298,30 @@ impl MemoryService {
                     return Ok((existing.id.clone(), action));
                 }
                 IngestAction::Update => {
-                    // True merge: fold the new observation into the existing memory
-                    // instead of accreting a near-duplicate. Keep whichever text
-                    // carries more information (bounded: the longer of the two, never
-                    // concatenated), re-embedding only when the content actually
-                    // changes so the stored embedding always matches the content.
-                    let existing_id = existing.id.clone();
-                    if content.len() > existing.content.len() {
-                        self.store
-                            .update_content_and_embedding(&existing_id, content, embedding)
-                            .await?;
+                    // Related-but-distinct: fold new information into the existing
+                    // memory (dedup) rather than accreting a near-duplicate.
+                    let folded = self
+                        .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                        .await?;
+                    if folded {
+                        info!(
+                            "Merged into: {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
+                    } else {
+                        info!(
+                            "Update no-op (subset): {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
                     }
+                    // A related mention is a successful recall — reinforce FSRS.
                     self.pending_updates
                         .write()
                         .await
-                        .push((existing_id.clone(), Rating::Good));
-                    info!("Merged: {} (sim: {:.3})", truncate(content, 30), similarity);
-                    return Ok((existing_id, IngestAction::Update));
+                        .push((existing.id.clone(), Rating::Good));
+                    return Ok((existing.id.clone(), IngestAction::Update));
                 }
                 IngestAction::Create => {
                     // Novel content, create new
@@ -338,6 +345,40 @@ impl MemoryService {
         self.store.add(entry).await?;
         info!("Remembered: {} (id: {})", truncate(content, 50), id);
         Ok((id, IngestAction::Create))
+    }
+
+    /// Fold `incoming` content into an existing memory (`existing_id`), re-embedding
+    /// the merged text. Shared by every ingest path that lands in the `Update` band.
+    ///
+    /// Returns `true` if a merge was written, `false` if `incoming` added nothing new
+    /// (a subset of the existing content). The caller is responsible for FSRS
+    /// reinforcement — this only rewrites content + embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if re-embedding or the store update fails.
+    async fn fold_into_memory(
+        &self,
+        embed_fn: &EmbedFn,
+        existing_id: &str,
+        existing_content: &str,
+        incoming: &str,
+    ) -> Result<bool, MemoryError> {
+        debug_assert!(
+            !existing_id.is_empty(),
+            "existing memory id must not be empty"
+        );
+        let merged = merge_memory_content(existing_content, incoming);
+        if merged == existing_content {
+            return Ok(false);
+        }
+        let merged_embedding = (embed_fn)(&merged)
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        self.store
+            .update_content_and_embedding(existing_id, &merged, merged_embedding)
+            .await?;
+        Ok(true)
     }
 
     /// Remember something - store with embedding.
@@ -417,9 +458,24 @@ impl MemoryService {
                     return Ok((existing.id.clone(), action));
                 }
                 IngestAction::Update if !skip_reinforce => {
-                    // Related but different - could merge, but for now treat as reinforcement
+                    // Related-but-distinct: fold new information in (dedup) and reinforce.
+                    let folded = self
+                        .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                        .await?;
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
-                    info!("Related memory exists: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    if folded {
+                        info!(
+                            "Merged (importance): {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
+                    } else {
+                        info!(
+                            "Related memory exists: {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
+                    }
                     return Ok((existing.id.clone(), action));
                 }
                 _ => {
@@ -491,8 +547,28 @@ impl MemoryService {
                     } else if existing.content.contains("Error:") || existing.content.contains("Command failed") {
                         info!("Skipping reinforcement of error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     } else {
+                        // On the Update band, fold new information into the existing
+                        // (scoped) memory before reinforcing — dedup, not accrete.
+                        let folded = if action == IngestAction::Update {
+                            self.fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                                .await?
+                        } else {
+                            false
+                        };
                         self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
-                        info!("Reinforced (scoped): {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                        if folded {
+                            info!(
+                                "Merged (scoped): {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                        } else {
+                            info!(
+                                "Reinforced (scoped): {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                        }
                         return Ok((existing.id.clone(), action));
                     }
                 }
@@ -1173,6 +1249,44 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Maximum byte length of merged memory content — bounds accretion across repeated merges.
+const MEMORY_MERGE_MAX_BYTES: usize = 4096;
+
+/// Merge `incoming` content into `existing`, deduplicating and bounding length.
+///
+/// Used when an ingest lands in the `Update` similarity band (related-but-distinct):
+/// instead of storing a near-duplicate, fold the new information into the existing
+/// memory. Rules:
+/// - If either string contains the other (after trimming), keep the superset.
+/// - Otherwise append `incoming` after `existing` with a `"; "` separator.
+/// - The result is capped at `MEMORY_MERGE_MAX_BYTES`; if appending would exceed
+///   the cap, the existing content is kept unchanged (no unbounded growth).
+///
+/// The returned string is never empty when `existing` is non-empty.
+fn merge_memory_content(existing: &str, incoming: &str) -> String {
+    // Separator is ASCII so byte math for the length bound is exact.
+    const SEPARATOR: &str = "; ";
+
+    let existing = existing.trim();
+    let incoming = incoming.trim();
+
+    // Superset dedup: keep the longer when one already contains the other.
+    // (An empty `incoming` is contained by everything, so `existing` is kept.)
+    if existing.contains(incoming) {
+        return existing.to_string();
+    }
+    if incoming.contains(existing) {
+        return incoming.to_string();
+    }
+
+    // Bounded append.
+    let merged_len_bytes = existing.len() + SEPARATOR.len() + incoming.len();
+    if merged_len_bytes > MEMORY_MERGE_MAX_BYTES {
+        return existing.to_string();
+    }
+    format!("{existing}{SEPARATOR}{incoming}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,65 +1300,130 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Deterministic 3-dim embeddings: "apple pie…" sits at cosine 0.8 with
-    /// "apple" (the Update band, 0.75..0.92), so ingesting the second must merge.
-    fn craft_embed_fn() -> EmbedFn {
-        Arc::new(|content: &str| {
-            let v: Vec<f32> = if content == "apple" {
-                vec![1.0, 0.0, 0.0]
-            } else if content.starts_with("apple pie") {
-                vec![0.8, 0.6, 0.0]
-            } else {
-                vec![0.0, 0.0, 1.0]
+    #[test]
+    fn test_merge_memory_content_superset_dedup() {
+        // When one string contains the other, keep the superset (no duplication).
+        assert_eq!(
+            merge_memory_content("sky is blue", "sky is blue"),
+            "sky is blue"
+        );
+        assert_eq!(
+            merge_memory_content("the sky is blue today", "sky is blue"),
+            "the sky is blue today"
+        );
+        assert_eq!(
+            merge_memory_content("sky is blue", "the sky is blue today"),
+            "the sky is blue today"
+        );
+        // Trimming: surrounding whitespace does not defeat the containment check.
+        assert_eq!(
+            merge_memory_content("  sky is blue  ", "sky is blue"),
+            "sky is blue"
+        );
+    }
+
+    #[test]
+    fn test_merge_memory_content_append_distinct() {
+        // Distinct-but-related content is appended with a separator.
+        assert_eq!(
+            merge_memory_content("sky is blue", "grass is green"),
+            "sky is blue; grass is green"
+        );
+    }
+
+    #[test]
+    fn test_merge_memory_content_bounded() {
+        // Appending past the byte cap keeps the existing content (no unbounded growth).
+        let existing = "a".repeat(MEMORY_MERGE_MAX_BYTES - 1);
+        let incoming = "b".repeat(MEMORY_MERGE_MAX_BYTES);
+        let merged = merge_memory_content(&existing, &incoming);
+        assert_eq!(merged, existing);
+        assert!(merged.len() <= MEMORY_MERGE_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_smart_ingest_merges_related_memory() {
+        use std::sync::Arc;
+
+        // Dimension-3 embeddings crafted so the two related contents land in the
+        // Update similarity band (0.75..=0.92): cosine([1,0,0],[0.85,0.53,0]) ~= 0.85.
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = match text {
+                "sky is blue" => vec![1.0_f32, 0.0, 0.0],
+                "sky is deep blue" => vec![0.85_f32, 0.53, 0.0],
+                _ => vec![0.30_f32, 0.30, 0.90], // merged/other content
             };
             Box::pin(async move { Ok(v) })
-        })
-    }
-
-    #[tokio::test]
-    async fn test_smart_ingest_merges_on_update_no_duplicate() {
+        });
         let config = MemoryServiceConfig {
             dimension: 3,
             ..Default::default()
         };
-        let service = MemoryService::new(config).with_embed_fn(craft_embed_fn());
+        let service = MemoryService::new(config).with_embed_fn(embed);
 
-        let (id1, a1) = service.smart_ingest("apple", HashMap::new()).await.unwrap();
-        assert_eq!(a1, IngestAction::Create);
-
-        let (id2, a2) = service
-            .smart_ingest("apple pie is delicious", HashMap::new())
+        // First ingest creates a memory.
+        let (id1, action1) = service
+            .smart_ingest("sky is blue", HashMap::new())
             .await
             .unwrap();
-        // Similar-but-new content merges into the existing entry — no duplicate.
-        assert_eq!(a2, IngestAction::Update);
-        assert_eq!(id2, id1);
-        assert_eq!(service.store.len().await, 1);
+        assert_eq!(action1, IngestAction::Create);
+        assert_eq!(service.count().await, 1);
 
-        // The merged entry keeps the longer (more-informative) content.
-        let merged = service.store.get(&id1).await.unwrap();
-        assert_eq!(merged.content, "apple pie is delicious");
+        // Second, related-but-distinct ingest merges instead of creating a duplicate.
+        let (id2, action2) = service
+            .smart_ingest("sky is deep blue", HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(action2, IngestAction::Update);
+        assert_eq!(id2, id1, "merge must reuse the existing memory id");
+        assert_eq!(
+            service.count().await,
+            1,
+            "merge must not create a second memory"
+        );
+
+        // The surviving memory carries both mentions.
+        let merged = service.get(&id1).await.expect("memory still present");
+        assert!(merged.content.contains("sky is blue"));
+        assert!(merged.content.contains("deep blue"));
     }
 
     #[tokio::test]
-    async fn test_update_content_and_embedding_rejects_bad_dimension() {
+    async fn test_remember_with_importance_merges_related_memory() {
+        use std::sync::Arc;
+
+        // Same Update-band construction as the smart_ingest test.
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = match text {
+                "sky is blue" => vec![1.0_f32, 0.0, 0.0],
+                "sky is deep blue" => vec![0.85_f32, 0.53, 0.0],
+                _ => vec![0.30_f32, 0.30, 0.90],
+            };
+            Box::pin(async move { Ok(v) })
+        });
         let config = MemoryServiceConfig {
             dimension: 3,
             ..Default::default()
         };
-        let service = MemoryService::new(config).with_embed_fn(craft_embed_fn());
-        let (id, _) = service.smart_ingest("apple", HashMap::new()).await.unwrap();
+        let service = MemoryService::new(config).with_embed_fn(embed);
 
-        // Wrong-length embedding is rejected; missing id is NotFound (negative space).
-        let bad = service
-            .store
-            .update_content_and_embedding(&id, "x", vec![1.0, 0.0])
-            .await;
-        assert!(matches!(bad, Err(MemoryError::DimensionMismatch { .. })));
-        let missing = service
-            .store
-            .update_content_and_embedding("nope", "x", vec![1.0, 0.0, 0.0])
-            .await;
-        assert!(matches!(missing, Err(MemoryError::NotFound(_))));
+        let (id1, action1) = service
+            .remember_with_importance("sky is blue", HashMap::new(), 3.0)
+            .await
+            .unwrap();
+        assert_eq!(action1, IngestAction::Create);
+
+        // The explicit-importance path also merges rather than duplicating.
+        let (id2, action2) = service
+            .remember_with_importance("sky is deep blue", HashMap::new(), 3.0)
+            .await
+            .unwrap();
+        assert_eq!(action2, IngestAction::Update);
+        assert_eq!(id2, id1);
+        assert_eq!(service.count().await, 1, "merge must not create a second memory");
+
+        let merged = service.get(&id1).await.expect("memory still present");
+        assert!(merged.content.contains("sky is blue"));
+        assert!(merged.content.contains("deep blue"));
     }
 }

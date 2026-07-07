@@ -1731,24 +1731,49 @@ impl LlmClient {
 // Token Estimation
 // ============================================================================
 
-/// Estimate token count for a string (rough heuristic: ~4 chars per token)
+/// Per-message framing overhead (role markers + delimiters), in tokens.
+///
+/// Both Anthropic and `OpenAI` wrap each message in a few control tokens
+/// (`<|im_start|>role … <|im_end|>` and equivalents). Ignoring it under-counts
+/// long conversations by several hundred tokens.
+pub const MESSAGE_FRAMING_TOKENS: usize = 4;
+
+/// Estimate token count for a string.
+///
+/// Character-class aware: ASCII/Latin text tokenizes at roughly 4 chars per
+/// token, while CJK and other non-ASCII scripts are far denser. The old
+/// `bytes / 4` heuristic badly under-counted CJK — a single CJK char is 3 UTF-8
+/// bytes yet ~1 token — which caused real context overflows. We count chars by
+/// class and round the ASCII share up so short strings never estimate to zero.
 #[must_use]
 pub fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
+    let mut ascii_chars = 0usize;
+    let mut wide_chars = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_chars += 1;
+        } else {
+            wide_chars += 1;
+        }
+    }
+    // ~4 ASCII chars/token; ~1 token per wide char (a conservative middle that
+    // errs high, since over-estimating input is safer than overflowing).
+    ascii_chars.div_ceil(4) + wide_chars
 }
 
 /// Estimate total tokens for a completion request
 #[must_use]
 pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
     let mut total = 0;
-    
-    // Simple messages
+
+    // Simple messages (each carries role + delimiter framing).
     for msg in &request.messages {
-        total += estimate_tokens(&msg.content);
+        total += estimate_tokens(&msg.content) + MESSAGE_FRAMING_TOKENS;
     }
-    
+
     // Anthropic messages (can have multiple content blocks)
     for msg in &request.anthropic_messages {
+        total += MESSAGE_FRAMING_TOKENS;
         for block in &msg.content {
             match block {
                 ContentBlock::Text { text } => total += estimate_tokens(text),
@@ -3877,6 +3902,30 @@ mod tests {
         let msg = Message::user("Hello");
         assert!(matches!(msg.role, Role::User));
         assert_eq!(msg.content, "Hello");
+    }
+
+    #[test]
+    fn test_estimate_tokens_ascii_and_cjk() {
+        assert_eq!(estimate_tokens(""), 0);
+        // ASCII: ~4 chars/token, rounded up so short strings aren't zero.
+        assert_eq!(estimate_tokens("hi"), 1);
+        assert_eq!(estimate_tokens(&"a".repeat(8)), 2);
+        // CJK is denser: 4 chars ~ 4 tokens (byte-len/4 would wrongly give 3).
+        let cjk = "你好世界"; // 4 chars, 12 UTF-8 bytes
+        assert_eq!(cjk.len(), 12);
+        assert_eq!(estimate_tokens(cjk), 4);
+        // Mixed: 2 ASCII (→1) + 2 wide (→2) = 3.
+        assert_eq!(estimate_tokens("hi你好"), 3);
+    }
+
+    #[test]
+    fn test_estimate_request_tokens_adds_message_framing() {
+        // Two 8-char ASCII messages: 2 tokens content each + framing per message.
+        let request = CompletionRequest::default()
+            .with_message(Message::user("aaaaaaaa"))
+            .with_message(Message::user("bbbbbbbb"));
+        let expected = 2 * (2 + MESSAGE_FRAMING_TOKENS);
+        assert_eq!(estimate_request_tokens(&request), expected);
     }
 
     #[test]
