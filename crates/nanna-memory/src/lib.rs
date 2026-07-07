@@ -506,6 +506,51 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Update both the content and embedding of an existing entry (used by
+    /// dreaming/merge, where the merged text needs a matching embedding).
+    ///
+    /// The embedding is normalized in place and must match the store dimension.
+    /// Persists the full entry write-through (content + embedding + FSRS).
+    ///
+    /// # Errors
+    /// Returns `MemoryError::DimensionMismatch` if `embedding` has the wrong
+    /// length, or `MemoryError::NotFound` if no entry has `id`.
+    pub async fn update_content_and_embedding(
+        &self,
+        id: &str,
+        content: &str,
+        mut embedding: Vec<f32>,
+    ) -> Result<(), MemoryError> {
+        debug_assert!(!id.is_empty(), "id must not be empty");
+        if embedding.len() != self.config.get_dimension() {
+            return Err(MemoryError::DimensionMismatch {
+                expected: self.config.get_dimension(),
+                got: embedding.len(),
+            });
+        }
+        normalize_f32(&mut embedding);
+
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        entry.content = content.to_string();
+        entry.embedding = embedding;
+        let updated = entry.clone();
+        drop(entries);
+
+        // Write-through the full entry so content and embedding stay consistent.
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_entry(&updated).await
+        {
+            warn!("Failed to persist merged entry {}: {}", id, e);
+            // Non-fatal
+        }
+
+        Ok(())
+    }
+
     /// Get all entries (for consolidation)
     pub async fn all_entries(&self) -> Vec<MemoryEntry> {
         self.entries.read().await.clone()

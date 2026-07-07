@@ -298,8 +298,23 @@ impl MemoryService {
                     return Ok((existing.id.clone(), action));
                 }
                 IngestAction::Update => {
-                    // TODO: Merge content intelligently (for now, treat as create)
-                    info!("Would update: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    // True merge: fold the new observation into the existing memory
+                    // instead of accreting a near-duplicate. Keep whichever text
+                    // carries more information (bounded: the longer of the two, never
+                    // concatenated), re-embedding only when the content actually
+                    // changes so the stored embedding always matches the content.
+                    let existing_id = existing.id.clone();
+                    if content.len() > existing.content.len() {
+                        self.store
+                            .update_content_and_embedding(&existing_id, content, embedding)
+                            .await?;
+                    }
+                    self.pending_updates
+                        .write()
+                        .await
+                        .push((existing_id.clone(), Rating::Good));
+                    info!("Merged: {} (sim: {:.3})", truncate(content, 30), similarity);
+                    return Ok((existing_id, IngestAction::Update));
                 }
                 IngestAction::Create => {
                     // Novel content, create new
@@ -1165,9 +1180,71 @@ mod tests {
     #[tokio::test]
     async fn test_memory_service_no_embed() {
         let service = MemoryService::new(MemoryServiceConfig::default());
-        
+
         // Should fail without embed function
         let result = service.remember("test", HashMap::new()).await;
         assert!(result.is_err());
+    }
+
+    /// Deterministic 3-dim embeddings: "apple pie…" sits at cosine 0.8 with
+    /// "apple" (the Update band, 0.75..0.92), so ingesting the second must merge.
+    fn craft_embed_fn() -> EmbedFn {
+        Arc::new(|content: &str| {
+            let v: Vec<f32> = if content == "apple" {
+                vec![1.0, 0.0, 0.0]
+            } else if content.starts_with("apple pie") {
+                vec![0.8, 0.6, 0.0]
+            } else {
+                vec![0.0, 0.0, 1.0]
+            };
+            Box::pin(async move { Ok(v) })
+        })
+    }
+
+    #[tokio::test]
+    async fn test_smart_ingest_merges_on_update_no_duplicate() {
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(craft_embed_fn());
+
+        let (id1, a1) = service.smart_ingest("apple", HashMap::new()).await.unwrap();
+        assert_eq!(a1, IngestAction::Create);
+
+        let (id2, a2) = service
+            .smart_ingest("apple pie is delicious", HashMap::new())
+            .await
+            .unwrap();
+        // Similar-but-new content merges into the existing entry — no duplicate.
+        assert_eq!(a2, IngestAction::Update);
+        assert_eq!(id2, id1);
+        assert_eq!(service.store.len().await, 1);
+
+        // The merged entry keeps the longer (more-informative) content.
+        let merged = service.store.get(&id1).await.unwrap();
+        assert_eq!(merged.content, "apple pie is delicious");
+    }
+
+    #[tokio::test]
+    async fn test_update_content_and_embedding_rejects_bad_dimension() {
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(craft_embed_fn());
+        let (id, _) = service.smart_ingest("apple", HashMap::new()).await.unwrap();
+
+        // Wrong-length embedding is rejected; missing id is NotFound (negative space).
+        let bad = service
+            .store
+            .update_content_and_embedding(&id, "x", vec![1.0, 0.0])
+            .await;
+        assert!(matches!(bad, Err(MemoryError::DimensionMismatch { .. })));
+        let missing = service
+            .store
+            .update_content_and_embedding("nope", "x", vec![1.0, 0.0, 0.0])
+            .await;
+        assert!(matches!(missing, Err(MemoryError::NotFound(_))));
     }
 }
