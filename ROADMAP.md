@@ -2,9 +2,10 @@
 
 > The single master roadmap **and status source of truth** for Nanna — there is no separate
 > `STATUS.md`, `planning/`, or `docs/`. The **daily dev routine** (`.claude/skills/daily-dev`, run under
-> `/loop`) reads this file, picks the **single next unimplemented item**, builds it **Tiger-Style** (see
-> *Engineering doctrine*) with tests + benchmarks (see *Performance & Benchmarking*), ticks the box, and
-> appends a dated note. Shipped capability is *described* in [`README.md`](README.md); here it is only
+> `/loop`) reads this file, picks the **single next unimplemented item**, builds it **Tiger-Style**
+> with tests + benchmarks, ticks the box, and appends a dated note. The engineering doctrine, benchmark
+> methodology, dependency policy, and system reference notes live in that skill — this file stays a
+> clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
 **Last updated:** 2026-07-06 (P11 path-traversal fixes + Turso dep-guard + build-green repairs) · code snapshot through 2026-03-17
@@ -141,160 +142,20 @@ writes) tracked below.
 
 ---
 
-## Performance & Benchmarking (governing concern)
+## Performance & Benchmarking
 
-Nanna targets **one consumer GPU and a small model** — every feature competes for scarce VRAM,
-compute, tokens, and watts. Performance is therefore not a phase, it's a **gate**: borrowing DSP's
-discipline, *no change ships unless a reproducible benchmark shows it holds or improves the budget*,
-and **every performance claim in [`README.md`](README.md) must link to a benchmark artifact.** This
-section defines the objective measurements the daily dev routine uses to judge progress.
+Performance is a **gate**, not a phase (small single-GPU budget): a change ships only when a benchmark
+holds or improves the budget, and README perf claims link to an artifact. Governing metric: **task
+success @ budget** — the fraction of the agent-eval suite the local model solves within the reference
+GPU's VRAM ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). *Methodology, the six
+benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out:
 
-### Governing metric — "capability at budget"
-
-One number every sub-benchmark ladders up to:
-
-> **Task success @ budget** — the fraction of the **agent-eval suite** the *default local model*
-> completes correctly while staying inside the reference GPU's VRAM ceiling and a **p95 wall-clock
-> target per task**. Secondary: **capability density** = task-success per GB of VRAM (rewards getting
-> more agent out of a smaller model), and **cost of the escape hatch** = fraction of tasks that had to
-> escalate to a cloud API (lower = more self-sufficient locally).
-
-A faster model that fails more tasks is not an improvement; a smaller model that holds task-success is.
-
-### Reference hardware (pin the denominators)
-
-| Tier | Hardware | Purpose |
-|------|----------|---------|
-| **Reference GPU** | RTX 4070 Ti SUPER 16 GB (Vulkan/wgpu) + AMD Zen 4 (AVX-512) | primary target; the number we report |
-| **Low-VRAM GPU** | 8 GB card | budget guardrail — forces f16 + smaller tier to still pass |
-| **CPU-only** | Zen 4 / Apple Silicon (NEON) | offline, no-GPU fallback path |
-
-All reported numbers name the tier, the model + quantization, and the commit.
-
-### Harness
-
-- A **`nanna-bench` crate** (criterion 0.5 + `html_reports`, the pattern already used in `nanna-gpu`),
-  plus per-crate `benches/`. Reproducible: fixed seeds, warmup, pinned model weights, release profile
-  for reported numbers (`--profile dev` only for iteration).
-- Results land under `target/criterion/`; a committed **`bench/BASELINE.md`** (or JSON) holds the
-  reference-hardware numbers the daily routine diffs against.
-- Runtime telemetry already exists and feeds the same metrics live: `model_request_log`,
-  `tool_call_log`, `tool_stats_hourly/daily` (P95, throughput), per-model stats tracker.
-
-### Benchmark suites (each metric gets a target once a baseline exists)
-
-**1. Inference — `nanna-infer` / Burn (the new hot path)**
-- Time-to-first-token (TTFT); **prefill tok/s**; **decode tok/s**; tokens/sec vs context length.
-- Peak **VRAM**; model **load time** (cold vs warm cache); GPU (wgpu) vs CPU (ndarray); **f16 vs f32**.
-- Sweep model sizes (0.5B / 1.5B / 3B) × context (1k/8k/32k).
-- **Correctness gate:** byte-parity of logits + a short greedy sequence vs a reference (Candle/Ollama), à la laurelane — a fast model that diverges is a failed benchmark, not a win.
-
-**2. Memory & vector search**
-- Recall p50/p95 latency; local-embedding throughput (tok/s on the MiniLM path); vector-search latency
-  at N = 1k/10k/50k/100k (**reuse `gpu_vs_simd`** — the SIMD→GPU crossover is already measured at ~50k);
-  `bulk_load` startup time; RAM per 100k memories.
-
-**3. Dreaming & DSP compression (the moat — measure it, don't hand-wave)**
-- Dream-cycle wall-clock; memories/sec consolidated; clustering time (O(N²) baseline → HNSW target).
-- **Compression ratio** and **reconstruction error** of the DSP timeline; **information retention** —
-  recall quality (hit-rate / answer accuracy) on a fixed probe set *before vs after* a dream cycle. The
-  headline claim to prove: *dreaming shrinks the memory footprint while holding (or improving) recall.*
-
-**4. Agent loop — end-to-end (where the governing metric lives)**
-- Task-success rate on the **agent-eval suite**; tokens/task; **tool-call validity rate** (malformed
-  vs valid calls — critical for small models); iterations/task; wall-clock/task; tool-execution overhead.
-
-**5. Resource-budget guardrails (hard ceilings — fail CI if exceeded)**
-- Binary size; idle daemon RAM; VRAM ceiling per tier; cold-start time; tokens/turn. These are the
-  "small resource budget" contract — a change that blows a ceiling is rejected regardless of speed.
-
-**6. Efficiency (P10 tie-in)**
-- Prompt-cache hit rate; tokens saved by routing/compression/dedup; local-vs-cloud task split; $/task when cloud is used.
-
-### Regression gating & reporting
-
-- [ ] **`nanna-bench` crate** + move/extend the `nanna-gpu` benches into a unified suite.
-- [ ] Define the **agent-eval suite** (a fixed set of scored tasks) — the denominator for task-success.
-- [ ] Set **per-tier budgets** (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time) in `bench/BASELINE.md`.
-- [ ] **CI gate**: run a fast benchmark subset on every PR; fail if a budget regresses > threshold (e.g. >10% slower, or over a VRAM ceiling).
-- [ ] **Memory-retention harness**: fixed probe set + before/after-dream recall scoring.
-- [ ] **Inference parity harness**: logit/sequence parity vs reference for every Burn model port.
-- [ ] **Perf dashboard**: extend the existing model-stats/tool-stats GUI pages with live TTFT / tok-s / VRAM / cache-hit, and a per-release trend view.
-- [ ] Wire the daily dev routine to **update `bench/BASELINE.md`** after each perf-affecting change and cite artifacts in commit messages.
-
-**Current benchmarking state (honest):** only `nanna-gpu` has benches (`gpu_vs_simd`,
-`gpu_vs_simd_extended`, `gpu_vs_simd_quick`, `threshold_benchmark`; criterion, html reports) — this is
-where the GPU-vs-SIMD reversal data comes from. Runtime `model_request_log` / `tool_call_log` /
-`tool_stats_*` capture live latency/throughput/errors. There is **no** inference, memory, dreaming, or
-end-to-end benchmark, **no** CI gating, **no** eval suite, and **no** defined budgets yet — building
-that harness is the first performance work, and a prerequisite for honestly claiming P12/P13 progress.
-
----
-
-## Engineering doctrine — Tiger Style (adopted going forward)
-
-All new code follows **Tiger Style** (TigerBeetle's safety-and-performance engineering doctrine),
-adapted to Rust and to a local-first, single-GPU agent. It is adopted *because* Nanna runs advanced
-work on a **small resource budget** — correctness and performance must be designed in, not bolted on.
-The daily dev routine (`.claude/skills/daily-dev`) enforces these on every change.
-
-**Safety & control flow**
-- **Bound everything.** Every loop, queue, cache, retry, and context window has an explicit maximum —
-  no unbounded growth (agent iteration caps, queue sizes, KV-cache length, memory floors are explicit).
-- No unbounded recursion — iterate with a fixed bound.
-- Explicit, shallow control flow: **push `if`s up, push `for`s down** (branch in parents; keep leaf
-  functions branch-free and pure). Smallest possible scope; declare variables next to first use;
-  positive-space conditions (`if idx < len`). Prefer explicitly-sized ints over `usize` where width is semantic.
-
-**Assertions (Rust form)**
-- **≥ 2 assertions per non-trivial function** — check arguments, returns, pre/postconditions, invariants.
-- `debug_assert!` for hot-path invariants (compiled out in release); `assert!` for cheap always-on checks
-  and anything guarding a memory/VRAM/security bound. Assert in pairs across paths (before-write AND
-  after-read); assert positive **and** negative space; split compound assertions (`assert!(a); assert!(b);`).
-- Assertions catch **programmer** errors (panic on the impossible); `Result`/`?` handle **expected**
-  operational failures. Never conflate the two.
-
-**Errors**
-- Handle every error; never silently drop a `Result`. **No `.unwrap()`/`.expect()`/`panic!` on
-  production paths** (tests + startup invariants excepted). `thiserror` for libraries, `anyhow` at the
-  app edge. Enforce with clippy `unwrap_used`/`expect_used` in touched crates.
-
-**Functions & simplicity**
-- **≤ ~70 lines per function** (one screen); split anything longer. Few parameters; use an options
-  struct when two args could be transposed. Centralize control flow + state mutation in parents; keep
-  helpers pure. Simpler return types reduce call-site branching: prefer `()` > `bool` > `T` > `Option<T>` > `Result<T>`.
-- **Zero technical debt** — solve it right at design/implementation time; never punt to production.
-  Simplicity is earned over multiple passes, not the first draft.
-
-**Performance (design-first — this is the benchmark gate's twin)**
-- Do the **napkin math up front** against the four scarce resources — for Nanna, in order:
-  **VRAM → token/latency budget → RAM → CPU/GPU compute** — *before* writing code. "Roughly right"
-  early beats profiling later. Optimize the scarcest resource first (on one GPU, usually VRAM).
-- **Batch** GPU dispatches, DB writes, embeddings, and tool calls to amortize fixed costs (recall the
-  ~750µs wgpu dispatch floor). Give the GPU/CPU large predictable chunks; avoid zig-zag. Extract hot
-  loops into standalone functions over primitives (no `self`) so they're auditable.
-- Every perf-affecting change is **benchmark-gated** (see *Performance & Benchmarking*) — no regression past budget.
-
-**Naming & off-by-one**
-- `snake_case`; no abbreviations; units/qualifiers last, sorted by significance (`latency_ms_max`,
-  `vram_bytes_max`); nouns over adjectives; related names equal length (`source`/`target`) so derived
-  names align; infuse meaning into names. Distinguish **index / count / size**; show rounding intent
-  in division (`div_ceil`, `checked_div`).
-
-**Tooling & dependencies**
-- `cargo fmt` + `cargo clippy --all-targets` (pedantic + nursery) **clean before every commit** —
-  warnings are errors in spirit. Descriptive commit messages (they are the permanent `git blame` record).
-- **Dependency discipline** (our adaptation of zero-deps): justify every new dependency; prefer
-  pure-Rust, no-C where avoidable (already: Turso not libsqlite3, wgpu not CUDA). CI bans `rusqlite`/`libsql`/`sqlx`.
-
-**Deliberately NOT adopted verbatim** (Tiger Style targets a zero-alloc database in Zig; Nanna is an
-async Tokio app — honesty matters):
-- *Full static allocation / no allocation after startup* — impractical for an async agent. Adopt the
-  spirit: bound + preallocate hot paths, cap growth, avoid per-token/per-event allocation churn.
-- *Zero external dependencies* — impossible (Tokio, Burn, wgpu…). Replaced by dependency discipline above.
-- Zig mechanics (`zig fmt`, 4-space, Zig scripts) → Rust equivalents (`cargo fmt`/rustfmt defaults, 100-col).
-
-Source: TigerBeetle `docs/TIGER_STYLE.md`.
+- [ ] `nanna-bench` crate (criterion) — unify the existing `nanna-gpu` benches
+- [ ] Define the **agent-eval suite** (the task-success denominator)
+- [ ] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
+- [ ] CI gate — fail a PR that regresses a budget past threshold
+- [ ] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
+- [ ] Perf dashboard — live TTFT / tok-s / VRAM / cache-hit in the GUI
 
 ---
 
@@ -571,145 +432,12 @@ keep the phases readable; promote individual items into a phase when they become
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
 
 1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: rename `SqliteMemoryPersistence`, purge "SQLite" strings, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: rename `SqliteMemoryPersistence` + purge "SQLite" strings.
-2. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
-3. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
-4. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
-5. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
-6. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
-7. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
-8. **End-to-end daemon test** (P8) — the daemon/embedded/reconnect story is still unverified.
+2. **Bring all deps to latest + commit `Cargo.lock`** (doctrine → *Dependency freshness*) — initial sweep: `cargo upgrade --incompatible` + `cargo update` across the workspace and `pnpm update --latest` in `gui/`; fix breakage; verify green + benchmarks; commit `Cargo.lock` (un-gitignore it) for reproducible builds/benchmarks. Thereafter the nightly routine keeps everything fresh each run.
+3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
+4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
+5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
+6. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
+7. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
+8. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
+9. **End-to-end daemon test** (P8) — the daemon/embedded/reconnect story is still unverified.
 
----
-
-## Design decisions & reference notes
-
-Preserved from the consolidated planning docs so the rationale survives. These are *facts/decisions*, not tasks.
-
-### GPU vs SIMD — the benchmark reversal (load-bearing)
-Empirical benchmark (2026-02-07, AMD Zen 4 AVX-512 + RTX 4070 Ti SUPER, wgpu/Vulkan, 768 & 1536-dim):
-**GPU never beats SIMD up to 10,000 vectors.** 768-dim results — 100 vec: SIMD ~15µs vs GPU ~780µs
-(**52× slower**); 1,000: ~148µs vs ~3.4ms (**23×**); 5,000: ~740µs vs ~4.1ms (5.5×); 10,000: ~1.48ms
-vs ~5.22ms (3.5×). The GPU has a **~750µs fixed per-dispatch overhead** (buffer upload ~200µs +
-dispatch ~50µs + synchronous readback ~500µs), so it can't win small workloads; AVX-512 does one
-768-dim cosine sim in ~0.1µs and scales linearly. **Decision: `GPU_THRESHOLD` raised 1,000 → 50,000**
-(realistic upper bound for a personal memory store); below that, SIMD is strictly superior. The old
-"GPU wins at 512–768 dims / 10× throughput" predictions were **wrong** — do not restate them as fact.
-Bench: `cargo bench --bench gpu_vs_simd -p nanna-gpu` (use `--profile dev`; release LTO takes minutes).
-
-### Memory / FSRS lifecycle
-Five stages: **Extraction** (LLM extracts facts, importance 1–5, source STATED vs OBSERVED) →
-**Storage** (embeddings + FSRS params + workspace scope + tags) → **Recall** (semantic search that
-also records an FSRS "review" — the testing effect *strengthens* recalled memories) →
-**Consolidation/"dreaming"** (periodic clustering merges duplicates) → **Decay** (retrievability
-falls over time). FSRS state bands: Active / Dormant / Silent / Unavailable. Dedup cutoff >0.9 similarity
-(update FSRS schedule rather than create). Importance is static and feeds initial difficulty (distinct
-from decaying retrievability). Recall gating: only recall when message is non-trivial (>5 words OR contains `?` OR >80 chars);
-skip injecting a memory already present in the last 4 messages. Recall scope: workspace sessions see
-global + that workspace's memories; global sessions see all.
-
-### Context management
-Token budget (200k Claude): 10k system reserved + 8k response reserved + ~132k conversation.
-Per-tool truncation ratios: command output 20% head / 80% tail (recent output matters); web 80/20
-(intro holds content); code 40% head / 40% tail with an omitted-lines marker. Summarization: 10k-char
-threshold, hierarchical for large content, ~25% compression per level, truncation fallback if models
-fail. Budget allocation: proportional by size → +20% recency boost → 2,000-char min floor → redistribute excess.
-Per-message hard truncation 50KB; `max_block_chars` floored to 100 (Anthropic rejects empty blocks; messages sanitized before every call).
-
-### Agent loop & routing
-Iteration cap hardcoded 10 (suggest configurable, ceiling 50); preferred-model retry 3× with 15/30/45s
-backoff, fallback models 1 attempt each; suggested wall-clock timeout 5 min. `AppState` RwLock read
-lock is held for the *entire* loop, so config changes/model switches block for minutes and parallel
-sessions serialize (fix: clone-out then release). Model fallback resets to the top of `model_priority`
-every call (incl. heartbeats) — deliberate, stateless. Ollama auto-detected by a `:tag` in the model id.
-
-### Multi-agent / swarm
-Kimi-K2.5-inspired. `SwarmConfig` defaults: max_parallel 5, timeout_per_task 120s, max_retries 1.
-Sub-agent (`AgentSpawner`) limits: 5-min timeout, 25 iterations, fresh context (system + workspace only).
-ThinkingMode budgets: Instant 0 / Low 1024 / Medium 4096 / High 16384 / Maximum 32768.
-Supervisors are Erlang/OTP-style (backoff initial 1s / max 60s / ×2; health interval 30s / timeout 10s /
-healthy 2 / unhealthy 3). CDC: Gear rolling hash, ~2KB–32KB boundaries, DEDUP_THRESHOLD 0.7. SummaryCache LRU 100, in-memory.
-
-### Production defaults
-Rate-limit token buckets: Telegram 30@1/s, Discord 5@5/s, Slack 1@1/s, default 10@2/s. Backoff:
-base×2^attempts, max_retries 3, base delay 1s, cap 60s, jitter 0–500ms. Message priority Critical >
-High > Normal > Low > Bulk (BinaryHeap). Shell exec default timeout 30s. Scheduler defaults: heartbeat
-30 min, consolidation hourly, suggested job timeout 10 min, history retention 30 days.
-
-### Daemon / GUI
-Reconnect: current code fixed 10s interval, max 30 attempts (~5 min) before embedded fallback (design
-intent was 1→2→4→8→16→30s backoff). Config defaults: connect_timeout 5s, request_timeout 300s (sized
-for large summarization), sidecar port 9833, health-ping timeout 15s. Pending request is inserted into
-the map *before* send (avoids a response-before-registration race). Health monitor restarts on a single
-failed check (aggressive — a grace period of 3 is proposed).
-
-### LLM providers
-Context windows: Anthropic 200k, OpenAI 128k–200k, OpenRouter varies, Ollama 32k default. Anthropic
-credential order: OAuth token → API key → env var. OAuth uses PKCE via `claude setup-token`; can import
-from an existing Claude Code CLI install. "OAuth stealth mode" remaps tool names to Claude Code canonical
-names (`write_file`→`Write`, etc.).
-
-### Local model runner (Burn) — patterns proven in `physics515/laurelane` (P12 reference)
-laurelane runs small open models locally on **Burn 0.21** (`burn`, `burn-wgpu`, `burn-ndarray`,
-`burn-store`, `burn-fusion`, `autotune`), validated on an RTX 4070 Ti SUPER 16GB. Reusable patterns:
-- **One binary, two backends, runtime pick.** Compile both `Wgpu` (Vulkan/DX12/Metal — *no CUDA
-  toolchain*) and `NdArray<f32>` CPU. All model code is generic over `B: Backend`. A cheap
-  `wgpu::Instance::enumerate_adapters(PRIMARY)` probe (via `pollster::block_on`, cached in `OnceCell`)
-  chooses GPU-if-present else CPU. `fusion` makes `Wgpu` → `Fusion<Wgpu>` transparently.
-- **f16 path** is opt-in: `type Gpu = Wgpu<half::f16, i32>` roughly halves VRAM (~15GB→7–8GB).
-- **From-scratch decoders in Burn** (not Candle): Qwen2.5 (RmsNorm + GQA + rotate-half RoPE + SwiGLU,
-  tied lm_head, config-driven from HF `config.json`) and LFM2.5 (hybrid: GQA-attention blocks + gated
-  short-conv "LIV" blocks via depthwise causal `Conv1d`, per-head q/k RMSNorm). Plus an all-MiniLM-L6-v2
-  sentence-embedder (6-layer BERT, masked-mean pool + L2 norm) on ndarray/CPU for embeddings.
-- **Weights**: HF **safetensors** via `burn-store` `SafetensorsStore::from_file(...).with_from_adapter(
-  PyTorchToBurnAdapter.chain(CastFloatAdapter{target})).allow_partial(true).with_key_remapping(...)`.
-  HF weights are bf16 → a custom `CastFloatAdapter` (`impl ModuleAdapter`) casts to backend float.
-  `PyTorchToBurnAdapter` auto-transposes Linear + renames norm gamma/beta but **not RmsNorm** (remap by
-  hand). Load is checked: fail on `report.missing`/`errors`, warn on `unused` (signals non-tied lm_head).
-- **Decode**: HF `tokenizers` crate; ChatML template built explicitly (`<|im_start|>…`); per-layer KV
-  cache `Option<(Tensor<B,4>,Tensor<B,4>)>` (+ conv-state cache for LFM2); **on-device `logits.argmax`**
-  so only the winning index syncs to CPU; sync Burn wrapped in `spawn_blocking`; interrupt check between
-  tokens. Model+tokenizer cached for process life in `OnceCell<Mutex<Loaded>>` (Burn `Param` is Send not Sync).
-- **Weight provisioning**: stream from `huggingface.co/{repo}/resolve/main/{file}` to a `.part` then
-  rename, into a per-user cache dir; check a bundled resources dir first. (hf-hub was dropped — bad URLs.)
-- **Trust via parity**: every Burn port was gated byte-identical vs a Candle/Ollama reference
-  (single-forward top-5 logits + a short greedy sequence). Do the same for `nanna-infer`.
-
-### DSP integration for time-series / dreaming (P13 reference)
-From `physics515/DSP` (Rust, nightly, pins `turso` 0.6 + `wgpu` 27). Real workspace crates:
-`splimes` (spline interpolation), `database` (Turso control-plane + `.dspseg` columnar store +
-`compression` + pattern/event pipeline), `dsp-physical-type` (`.dspseg` format + codecs), `dsp-arrow*`,
-`dsp-server`, `dsp-tui`, `dsp-bench`. (`dsp-connector` does **not** exist yet.)
-- **Compression is lossy-analytical, not a codec.** `database::compression::algorithm::simplify_with_aggressiveness(&[Measurement], aggressiveness 0..1, base_resolution, original_resolution, Spline)`:
-  interpolate to a coarser resolution (`splimes::auto_interpolate`) then `simplify_by_slope_change` keeps
-  only points where slope **sign** changes (Douglas-Peucker-like, extrema-preserving). Time-based tiers:
-  a recent `pure_duration` stays full-fidelity; older data compressed harder (Linear/Exponential
-  aggressiveness scaling, capped ~0.95). **This is the "dreaming over a timeline" primitive.**
-- **Both `simplify_with_aggressiveness` and `simplify_by_slope_change` are self-contained pure
-  functions** over `Vec<Point>` (`Point{timestamp, value: BigDecimal}`) — liftable without adopting DSP's
-  storage. `splimes::auto_interpolate` auto-selects GPU (wgpu)/SIMD/CPU by size with graceful fallback
-  (call `prewarm_gpu()` once). This is the smallest-surface, Turso-only path.
-- **Storage tension:** DSP's `SegmentStore`/`Database` deliberately keep measurements in `.dspseg` files
-  *outside* libSQL (control plane holds only metadata). To stay **Turso-only**, use the pure algorithms +
-  store reduced points/coeffs as Turso `f32` BLOBs; don't adopt `SegmentStore`. Event-timeline types
-  (`Event{Manifestation{start,end}}`, `detect_peaks/valleys/threshold/drawdown`) exist if we later depend on `database`.
-- **FSRS as the sampling rate.** `FsrsState::weight()` (= retrievability × importance) and
-  `power_law_retrievability()` are the natural keep-mask: high weight → keep detail, low → decimate.
-
-### P9 dependency pins (when P9 starts)
-**Tor: [`onyums`](https://github.com/basic-automation/onyums)** (arti-backed axum-over-Tor). It
-re-exports `arti_client` / `tor_hsservice` / `tor_hscrypto` and bundles TLS + QR + abuse defense +
-v3 client auth — so we do **not** pin `arti-*` / `tor-hsservice` / `qrcode` directly; take them via
-onyums to avoid version skew. Identity/crypto pins: `ed25519-dalek` 2.1, `aes-gcm` 0.10, `argon2` 0.5,
-`zeroize` 1, `sha2` 0.10, `base64` 0.22. Plus `axum` 0.8 (match onyums' axum), `image` 0.25, `thiserror` 2.
-Tor latency ~500ms–2s/request; arti bootstrap ~15–60s (onyums `status_events()` reports progress).
-Replay defense: reject requests older than 5 min. One identity per device (not shared) — compromise
-of one doesn't compromise all.
-
-### Historical (superseded designs — do not resurrect as fact)
-- **Stop button:** early design used a global `CancellationToken` + `cancel_message` Tauri command;
-  the shipped design cancels **per-session** via the daemon `Cancel { session_id }` protocol (better for concurrency). `cancel_message` does not exist.
-- **GPU CUDA plan:** an early doc described CUDA `BatchProcessor`/`MemoryPool`/`auto_tune_batch_size`
-  + `GpuContext::process_vector_store` builder API. Shipped code uses **wgpu** and exports
-  `BatchedSearch`/`GpuMemoryStats`/`GpuVectorStore` — treat the CUDA API as design intent only.
-- **Tool system:** an early doc listed Rust built-in tools registered at startup; all tools were later
-  migrated to filesystem JS/TS skills — the `builtin/*.rs` paths are historical.
