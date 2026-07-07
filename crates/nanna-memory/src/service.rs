@@ -298,25 +298,20 @@ impl MemoryService {
                     return Ok((existing.id.clone(), action));
                 }
                 IngestAction::Update => {
-                    // Related-but-distinct: fold the new information into the
-                    // existing memory instead of accreting a near-duplicate.
-                    let merged = merge_memory_content(&existing.content, content);
-                    if merged == existing.content {
-                        // Incoming was a subset — nothing new to fold in.
+                    // Related-but-distinct: fold new information into the existing
+                    // memory (dedup) rather than accreting a near-duplicate.
+                    let folded = self
+                        .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                        .await?;
+                    if folded {
                         info!(
-                            "Update no-op (subset): {} (sim: {:.3})",
+                            "Merged into: {} (sim: {:.3})",
                             truncate(&existing.content, 30),
                             similarity
                         );
                     } else {
-                        let merged_embedding = (embed_fn)(&merged)
-                            .await
-                            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-                        self.store
-                            .update_content_and_embedding(&existing.id, &merged, merged_embedding)
-                            .await?;
                         info!(
-                            "Merged into: {} (sim: {:.3})",
+                            "Update no-op (subset): {} (sim: {:.3})",
                             truncate(&existing.content, 30),
                             similarity
                         );
@@ -350,6 +345,40 @@ impl MemoryService {
         self.store.add(entry).await?;
         info!("Remembered: {} (id: {})", truncate(content, 50), id);
         Ok((id, IngestAction::Create))
+    }
+
+    /// Fold `incoming` content into an existing memory (`existing_id`), re-embedding
+    /// the merged text. Shared by every ingest path that lands in the `Update` band.
+    ///
+    /// Returns `true` if a merge was written, `false` if `incoming` added nothing new
+    /// (a subset of the existing content). The caller is responsible for FSRS
+    /// reinforcement — this only rewrites content + embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if re-embedding or the store update fails.
+    async fn fold_into_memory(
+        &self,
+        embed_fn: &EmbedFn,
+        existing_id: &str,
+        existing_content: &str,
+        incoming: &str,
+    ) -> Result<bool, MemoryError> {
+        debug_assert!(
+            !existing_id.is_empty(),
+            "existing memory id must not be empty"
+        );
+        let merged = merge_memory_content(existing_content, incoming);
+        if merged == existing_content {
+            return Ok(false);
+        }
+        let merged_embedding = (embed_fn)(&merged)
+            .await
+            .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+        self.store
+            .update_content_and_embedding(existing_id, &merged, merged_embedding)
+            .await?;
+        Ok(true)
     }
 
     /// Remember something - store with embedding.
@@ -429,9 +458,24 @@ impl MemoryService {
                     return Ok((existing.id.clone(), action));
                 }
                 IngestAction::Update if !skip_reinforce => {
-                    // Related but different - could merge, but for now treat as reinforcement
+                    // Related-but-distinct: fold new information in (dedup) and reinforce.
+                    let folded = self
+                        .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                        .await?;
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
-                    info!("Related memory exists: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                    if folded {
+                        info!(
+                            "Merged (importance): {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
+                    } else {
+                        info!(
+                            "Related memory exists: {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
+                    }
                     return Ok((existing.id.clone(), action));
                 }
                 _ => {
@@ -503,8 +547,28 @@ impl MemoryService {
                     } else if existing.content.contains("Error:") || existing.content.contains("Command failed") {
                         info!("Skipping reinforcement of error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     } else {
+                        // On the Update band, fold new information into the existing
+                        // (scoped) memory before reinforcing — dedup, not accrete.
+                        let folded = if action == IngestAction::Update {
+                            self.fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                                .await?
+                        } else {
+                            false
+                        };
                         self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
-                        info!("Reinforced (scoped): {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                        if folded {
+                            info!(
+                                "Merged (scoped): {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                        } else {
+                            info!(
+                                "Reinforced (scoped): {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                        }
                         return Ok((existing.id.clone(), action));
                     }
                 }
@@ -1319,6 +1383,45 @@ mod tests {
         );
 
         // The surviving memory carries both mentions.
+        let merged = service.get(&id1).await.expect("memory still present");
+        assert!(merged.content.contains("sky is blue"));
+        assert!(merged.content.contains("deep blue"));
+    }
+
+    #[tokio::test]
+    async fn test_remember_with_importance_merges_related_memory() {
+        use std::sync::Arc;
+
+        // Same Update-band construction as the smart_ingest test.
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = match text {
+                "sky is blue" => vec![1.0_f32, 0.0, 0.0],
+                "sky is deep blue" => vec![0.85_f32, 0.53, 0.0],
+                _ => vec![0.30_f32, 0.30, 0.90],
+            };
+            Box::pin(async move { Ok(v) })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let (id1, action1) = service
+            .remember_with_importance("sky is blue", HashMap::new(), 3.0)
+            .await
+            .unwrap();
+        assert_eq!(action1, IngestAction::Create);
+
+        // The explicit-importance path also merges rather than duplicating.
+        let (id2, action2) = service
+            .remember_with_importance("sky is deep blue", HashMap::new(), 3.0)
+            .await
+            .unwrap();
+        assert_eq!(action2, IngestAction::Update);
+        assert_eq!(id2, id1);
+        assert_eq!(service.count().await, 1, "merge must not create a second memory");
+
         let merged = service.get(&id1).await.expect("memory still present");
         assert!(merged.content.contains("sky is blue"));
         assert!(merged.content.contains("deep blue"));
