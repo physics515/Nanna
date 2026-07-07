@@ -577,12 +577,24 @@ impl VectorStore {
     ///
     /// This method is retained only for one-time JSON→Turso migration.
     /// Use [`VectorStore::with_persistence`] and [`VectorStore::load_from_db`] instead.
+    ///
+    /// # Errors
+    /// Returns `MemoryError` if serialization or the file write/rename fails.
     pub async fn save(&self, path: &std::path::Path) -> Result<(), MemoryError> {
         warn!("VectorStore::save() is deprecated. Use Turso persistence instead.");
-        let entries = self.entries.read().await;
-        let json = serde_json::to_string_pretty(&*entries)?;
-        tokio::fs::write(path, json).await?;
-        info!("Saved {} entries to {:?}", entries.len(), path);
+        // Serialize under the read lock, then release it before the file IO so the
+        // lock is never held across an `.await`.
+        let (json, count) = {
+            let entries = self.entries.read().await;
+            (serde_json::to_string_pretty(&*entries)?, entries.len())
+        };
+        // Atomic write: write to a sibling temp file, then rename over the target.
+        // `fs::write` truncates in place, so a crash mid-write would leave a
+        // corrupt/empty store; rename-into-place is atomic on the same filesystem.
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, json).await?;
+        tokio::fs::rename(&tmp_path, path).await?;
+        info!("Saved {} entries to {:?}", count, path);
         Ok(())
     }
 
@@ -840,6 +852,47 @@ mod tests {
             .await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1 > 0.99);  // Should be very similar
+    }
+
+    #[tokio::test]
+    async fn test_save_is_atomic_and_roundtrips() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config);
+        store
+            .add(MemoryEntry {
+                id: "s1".to_string(),
+                content: "persist me".to_string(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                metadata: HashMap::new(),
+                timestamp: 0,
+                fsrs: FsrsState::default(),
+                workspace_id: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("nanna_mem_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memories.json");
+
+        store.save(&path).await.unwrap();
+        // Target written; the temp file was renamed away (not left behind).
+        assert!(path.exists());
+        assert!(!dir.join("memories.json.tmp").exists());
+
+        // The store round-trips through load into a fresh store.
+        let reloaded = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        });
+        reloaded.load(&path).await.unwrap();
+        assert_eq!(reloaded.len().await, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
