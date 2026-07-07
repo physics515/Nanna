@@ -299,8 +299,10 @@ routine should drain first.**
       unguarded GUI-embedded path used; the daemon path already allowlisted). Accepts only a single
       normal component (no `/`, `\`, `.`/`..`, root/drive), bounded 128 bytes; postcondition
       `debug_assert!`s the path stays inside `.nanna`. Tests cover traversal + legit writes.*
-- [ ] **Discord webhook signature** (`webhook.rs:306`) trusts any non-empty header — add Ed25519 (`ed25519-dalek`).
-- [ ] **Slack webhook signature** (`webhook.rs:438`) is a placeholder — add HMAC (`ring`/`hmac`).
+- [x] **Discord webhook signature** (`webhook.rs:306`) trusts any non-empty header — add Ed25519 (`ed25519-dalek`).
+      *(2026-07-06) `verify_discord_signature` now does real Ed25519 over `timestamp || body` (hex-decoded key/sig, strict 32/64-byte lengths, `false` on any malformed input). `ed25519-dalek 2.2` added to nanna-daemon. Tests: valid, tampered body, tampered timestamp, malformed/empty.*
+- [x] **Slack webhook signature** (`webhook.rs:438`) is a placeholder — add HMAC (`ring`/`hmac`).
+      *(2026-07-06) `verify_slack_signature` now computes HMAC-SHA256 over `v0:{ts}:{body}` and compares in constant time (`mac.verify_slice`), keeping the 5-min replay guard; `hmac 0.12`+`sha2 0.10`+`hex` added. Tests: valid, wrong-secret, missing `v0=` prefix, 10-min replay reject.*
 - [ ] Harden `delete_skill`'s `remove_dir_all` (symlink check / soft-delete); stronger user-script sandboxing.
 - [ ] Harden memory extraction against prompt injection (raw conversation is embedded in the extraction prompt).
 
