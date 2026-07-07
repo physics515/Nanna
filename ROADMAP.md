@@ -375,7 +375,9 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 *is* the act of forgetting/consolidating. All on Turso, all local.
 
 **Turso-only cleanup (do first — pure hygiene, no engine change):**
-- [ ] Rename `SqliteMemoryPersistence` → `TursoMemoryPersistence` (`nanna-daemon/src/memory_persistence.rs`; refs in `server.rs`); align with the already-correct `TursoMemoryStorage`.
+- [x] Rename `SqliteMemoryPersistence` → `TursoMemoryPersistence` (`nanna-daemon/src/memory_persistence.rs`; refs in `server.rs`); align with the already-correct `TursoMemoryStorage`.
+      *(2026-07-07) Struct renamed (all 5 refs, both files); module doc + the "sqlite datetime format"
+      comment de-SQLite'd (no SQL/`.db`/`datetime('now')` changed). Builds green.*
 - [ ] Purge the word "SQLite" from code comments, log/`warn!` strings, and doc-comments (storage lib.rs/Cargo.toml; daemon persistence/session/control/server; memory service/lib; GUI `sqlite_*` var names) → "Turso"/"the database". **Do not** change SQL, `.db` files, or `datetime('now')`/`AUTOINCREMENT`/`json_*`.
 - [x] Delete stale `crates/nanna-daemon/src/server.rs.bak`. Pin `turso` precisely (0.x is pre-1.0). Add a CI guard that fails if `rusqlite`/`libsql`/`sqlx` ever enters the dep tree. (Note: a transitive `libsqlite3-sys` comes from RustPython in `nanna-scripting`, separate concern.)
       *(2026-07-06) `server.rs.bak` already absent. `turso` pinned `=0.4.4` in `nanna-storage`. The
@@ -454,7 +456,7 @@ keep the phases readable; promote individual items into a phase when they become
 
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
 
-1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: rename `SqliteMemoryPersistence`, purge "SQLite" strings, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: rename `SqliteMemoryPersistence` + purge "SQLite" strings.
+1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: ~~rename `SqliteMemoryPersistence`~~ **(done 2026-07-07)**, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: purge remaining "SQLite" strings from comments/logs/var names across storage/daemon/memory/GUI (do NOT touch SQL, `.db`, `datetime('now')`).
 2. **Bring all deps to latest + commit `Cargo.lock`** (doctrine → *Dependency freshness*) — `Cargo.lock`
    un-gitignored and committed (2026-07-07); compatible deps already at latest (`cargo update` = 0 changes).
    Low-risk majors applied green: `directories 5→6` (unified with the workspace pin), `tower-http 0.6→0.7`

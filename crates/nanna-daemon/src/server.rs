@@ -5,7 +5,7 @@
 use crate::agent_service::{AgentService, AgentServiceConfig};
 use nanna_agent::ThinkingMode;
 use crate::control::ControlPlane;
-use crate::memory_persistence::SqliteMemoryPersistence;
+use crate::memory_persistence::TursoMemoryPersistence;
 use crate::health::{HealthServer, HealthState, PidFile, DEFAULT_HEALTH_PORT};
 use crate::ipc::{IpcServer, IpcServerConfig};
 use crate::llm_router::LlmRouter;
@@ -1359,7 +1359,7 @@ impl DaemonServer {
                     // MemoryService so all writes are automatically mirrored to SQLite.
                     let memory_service = if let Some(ref storage) = self.storage {
                         let repo = storage.memories();
-                        let db = Arc::new(SqliteMemoryPersistence::new(repo));
+                        let db = Arc::new(TursoMemoryPersistence::new(repo));
                         nanna_memory::MemoryService::new(config)
                             .with_embed_fn(embed_fn)
                             .with_persistence(db)
