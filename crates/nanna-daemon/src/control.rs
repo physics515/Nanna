@@ -56,6 +56,8 @@ pub struct ControlPlane {
     services_workspace_id: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     /// Event broadcaster for pushing events to subscribed clients
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+    /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
+    started_at: std::time::Instant,
 }
 
 impl ControlPlane {
@@ -81,7 +83,15 @@ impl ControlPlane {
             storage: None,
             event_tx: None,
             services_workspace_id: None,
+            started_at: std::time::Instant::now(),
         }
+    }
+
+    /// Seconds since this control plane (the daemon) started — reported as
+    /// `uptime_secs` in `SystemAction::Status`.
+    #[must_use]
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
     }
 
     /// Create a control plane with full services
@@ -111,6 +121,7 @@ impl ControlPlane {
             storage: None,
             event_tx: None,
             services_workspace_id: None,
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -159,6 +170,7 @@ impl ControlPlane {
             storage: None,
             event_tx: None,
             services_workspace_id: None,
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -2052,7 +2064,7 @@ impl ControlPlane {
                 json!({
                     "status": "running",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "uptime_secs": 0, // TODO: Track uptime
+                    "uptime_secs": self.uptime_secs(),
                     "sessions": self.sessions.count().await,
                     "workspaces": workspace_count,
                     "agent_available": self.agent.is_some(),
@@ -2491,4 +2503,21 @@ Local, reversible actions (editing files, running tests) are fine. For destructi
 Do not generate code intended for malicious use. Assist with authorized security testing and educational contexts when intent is clear. Avoid introducing security vulnerabilities. If you notice insecure code, fix it immediately.{}"#,
         platform_info
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_starts_near_zero_and_is_monotonic() {
+        let cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        let first = cp.uptime_secs();
+        assert!(
+            first < 5,
+            "a freshly created control plane should report ~0 uptime"
+        );
+        let second = cp.uptime_secs();
+        assert!(second >= first, "uptime must be monotonic non-decreasing");
+    }
 }

@@ -315,7 +315,7 @@ routine should drain first.**
 - [ ] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through.
 - [ ] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
 - [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
-- [ ] `not_implemented` daemon control actions: Regenerate message (`control.rs:416`), Tool enable/disable (`control.rs:1155`), Channel status (`control.rs:1558`, needs ChannelManager), Uptime (`control.rs:1636`, needs start timestamp), non-destructive `peek_mailbox` (`control.rs:578`).
+- [ ] `not_implemented` daemon control actions: Regenerate message (`control.rs:416`), Tool enable/disable (`control.rs:1155`), Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, non-destructive `peek_mailbox` (`control.rs:578`).
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
 - [ ] Server stats not wired to shared daemon state (`server.rs:882`).
 - [ ] MCP server notifications logged but not handled (`transport.rs:148`).
