@@ -149,6 +149,74 @@ pub struct AgentStats {
     pub health_checks_failed: u64,
     /// Consecutive health check failures
     pub consecutive_health_failures: u32,
+    /// Consecutive health check successes (counted only while Unhealthy, to gate recovery)
+    pub consecutive_health_successes: u32,
+}
+
+/// Outcome of folding one health-check result into an agent's health state.
+///
+/// Pure data — the async caller applies these to the live handle and emits the
+/// corresponding events, keeping the state-machine logic testable in isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthTransition {
+    state: AgentState,
+    consecutive_health_failures: u32,
+    consecutive_health_successes: u32,
+    /// The agent just recovered Unhealthy -> Running (emit `BecameHealthy`).
+    recovered: bool,
+    /// The agent just degraded Running -> Unhealthy (emit `BecameUnhealthy`).
+    became_unhealthy: bool,
+}
+
+/// Pure health-check state machine: given the current state, the check outcome,
+/// the running consecutive counters, and the thresholds, compute the next state
+/// and counters. Recovery requires `success_threshold` *consecutive* successes
+/// (not just one), and degradation requires `failure_threshold` consecutive
+/// failures. Thresholds are floored at 1 so a zero-config never traps the agent.
+fn apply_health_result(
+    state: AgentState,
+    passed: bool,
+    consecutive_health_failures: u32,
+    consecutive_health_successes: u32,
+    failure_threshold: u32,
+    success_threshold: u32,
+) -> HealthTransition {
+    if passed {
+        // Count successes only while trying to recover from Unhealthy.
+        let successes = if state == AgentState::Unhealthy {
+            consecutive_health_successes.saturating_add(1)
+        } else {
+            0
+        };
+        let recovered = state == AgentState::Unhealthy && successes >= success_threshold.max(1);
+        debug_assert!(!recovered || state == AgentState::Unhealthy);
+        HealthTransition {
+            state: if recovered {
+                AgentState::Running
+            } else {
+                state
+            },
+            consecutive_health_failures: 0,
+            consecutive_health_successes: if recovered { 0 } else { successes },
+            recovered,
+            became_unhealthy: false,
+        }
+    } else {
+        let failures = consecutive_health_failures.saturating_add(1);
+        let became_unhealthy = state == AgentState::Running && failures >= failure_threshold.max(1);
+        debug_assert!(!became_unhealthy || state == AgentState::Running);
+        HealthTransition {
+            state: if became_unhealthy {
+                AgentState::Unhealthy
+            } else {
+                state
+            },
+            consecutive_health_failures: failures,
+            consecutive_health_successes: 0,
+            recovered: false,
+            became_unhealthy,
+        }
+    }
 }
 
 /// Configuration for a supervised agent
@@ -566,43 +634,54 @@ impl Supervisor {
             }
         };
         
-        // Update stats and state
-        let mut agents = agents.write().await;
-        if let Some(handle) = agents.get_mut(agent_id) {
-            if passed {
-                handle.stats.health_checks_passed += 1;
-                handle.stats.consecutive_health_failures = 0;
-                
-                if handle.state == AgentState::Unhealthy {
-                    // TODO: Track consecutive successes before recovery
-                    // let threshold = handle.config.health_check
-                    //     .as_ref()
-                    //     .map_or(1, |hc| hc.success_threshold);
-                    
-                    // For simplicity, recover immediately on first success
-                    // (In production, track consecutive successes)
-                    handle.state = AgentState::Running;
-                    Self::emit_event_static(event_tx, agent_id, SupervisorEventType::BecameHealthy).await;
-                }
-                
-                Self::emit_event_static(event_tx, agent_id, SupervisorEventType::HealthCheckPassed).await;
-            } else {
-                handle.stats.health_checks_failed += 1;
-                handle.stats.consecutive_health_failures += 1;
-                
-                let threshold = handle.config.health_check
+        // Fold the result into the health state machine while holding the lock,
+        // then emit events after releasing it (no handle borrow across await).
+        let transition = {
+            let mut agents = agents.write().await;
+            agents.get_mut(agent_id).map(|handle| {
+                let (failure_threshold, success_threshold) = handle
+                    .config
+                    .health_check
                     .as_ref()
-                    .map_or(3, |hc| hc.failure_threshold);
-                
-                if handle.stats.consecutive_health_failures >= threshold && handle.state == AgentState::Running {
-                    handle.state = AgentState::Unhealthy;
-                    Self::emit_event_static(event_tx, agent_id, SupervisorEventType::BecameUnhealthy).await;
+                    .map_or((3, 1), |hc| (hc.failure_threshold, hc.success_threshold));
+                let t = apply_health_result(
+                    handle.state,
+                    passed,
+                    handle.stats.consecutive_health_failures,
+                    handle.stats.consecutive_health_successes,
+                    failure_threshold,
+                    success_threshold,
+                );
+                if passed {
+                    handle.stats.health_checks_passed += 1;
+                } else {
+                    handle.stats.health_checks_failed += 1;
                 }
-                
-                Self::emit_event_static(event_tx, agent_id, SupervisorEventType::HealthCheckFailed {
+                handle.state = t.state;
+                handle.stats.consecutive_health_failures = t.consecutive_health_failures;
+                handle.stats.consecutive_health_successes = t.consecutive_health_successes;
+                t
+            })
+        };
+
+        let Some(transition) = transition else { return };
+        if transition.recovered {
+            Self::emit_event_static(event_tx, agent_id, SupervisorEventType::BecameHealthy).await;
+        }
+        if transition.became_unhealthy {
+            Self::emit_event_static(event_tx, agent_id, SupervisorEventType::BecameUnhealthy).await;
+        }
+        if passed {
+            Self::emit_event_static(event_tx, agent_id, SupervisorEventType::HealthCheckPassed).await;
+        } else {
+            Self::emit_event_static(
+                event_tx,
+                agent_id,
+                SupervisorEventType::HealthCheckFailed {
                     reason: "Probe failed or timed out".to_string(),
-                }).await;
-            }
+                },
+            )
+            .await;
         }
     }
 
@@ -707,6 +786,86 @@ mod tests {
     fn test_restart_policy_defaults() {
         let policy = RestartPolicy::default();
         assert!(matches!(policy, RestartPolicy::Always));
+    }
+
+    #[test]
+    fn test_recovery_needs_consecutive_successes() {
+        // success_threshold = 2: one success is not enough to recover.
+        let t1 = apply_health_result(AgentState::Unhealthy, true, 5, 0, 3, 2);
+        assert_eq!(t1.state, AgentState::Unhealthy);
+        assert!(!t1.recovered);
+        assert_eq!(t1.consecutive_health_successes, 1);
+        assert_eq!(t1.consecutive_health_failures, 0);
+
+        // Second consecutive success crosses the threshold -> Running.
+        let t2 = apply_health_result(
+            AgentState::Unhealthy,
+            true,
+            0,
+            t1.consecutive_health_successes,
+            3,
+            2,
+        );
+        assert_eq!(t2.state, AgentState::Running);
+        assert!(t2.recovered);
+        assert_eq!(t2.consecutive_health_successes, 0);
+    }
+
+    #[test]
+    fn test_failure_resets_recovery_progress() {
+        // A failure while recovering wipes the success streak (stays Unhealthy).
+        let t = apply_health_result(AgentState::Unhealthy, false, 0, 1, 3, 2);
+        assert_eq!(t.state, AgentState::Unhealthy);
+        assert!(!t.recovered);
+        assert!(!t.became_unhealthy);
+        assert_eq!(t.consecutive_health_successes, 0);
+        assert_eq!(t.consecutive_health_failures, 1);
+    }
+
+    #[test]
+    fn test_degradation_needs_consecutive_failures() {
+        // failure_threshold = 3: first two failures do not degrade a Running agent.
+        let t1 = apply_health_result(AgentState::Running, false, 0, 0, 3, 1);
+        assert_eq!(t1.state, AgentState::Running);
+        assert!(!t1.became_unhealthy);
+        let t2 = apply_health_result(
+            AgentState::Running,
+            false,
+            t1.consecutive_health_failures,
+            0,
+            3,
+            1,
+        );
+        assert_eq!(t2.state, AgentState::Running);
+        // Third consecutive failure degrades to Unhealthy.
+        let t3 = apply_health_result(
+            AgentState::Running,
+            false,
+            t2.consecutive_health_failures,
+            0,
+            3,
+            1,
+        );
+        assert_eq!(t3.state, AgentState::Unhealthy);
+        assert!(t3.became_unhealthy);
+    }
+
+    #[test]
+    fn test_pass_while_running_is_stable() {
+        // A healthy agent stays Running and never counts recovery successes.
+        let t = apply_health_result(AgentState::Running, true, 2, 0, 3, 2);
+        assert_eq!(t.state, AgentState::Running);
+        assert!(!t.recovered);
+        assert_eq!(t.consecutive_health_failures, 0);
+        assert_eq!(t.consecutive_health_successes, 0);
+    }
+
+    #[test]
+    fn test_thresholds_floored_at_one() {
+        // A zero success_threshold must not trap the agent: recover on first success.
+        let t = apply_health_result(AgentState::Unhealthy, true, 0, 0, 0, 0);
+        assert_eq!(t.state, AgentState::Running);
+        assert!(t.recovered);
     }
 
     #[test]
