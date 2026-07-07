@@ -22,7 +22,7 @@ nanna-channels = { path = "../nanna-channels" }
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
 
 # Utilities
 uuid = { version = "1.16", features = ["v4", "serde"] }
