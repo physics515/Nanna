@@ -1,6 +1,6 @@
 ---
 name: daily-dev
-description: Nanna's daily dev routine. Reads ROADMAP.md, picks the single next unimplemented item, builds it Tiger-Style with tests + benchmarks, updates the roadmap, and commits. Depth over breadth — one item per iteration. Designed to run under /loop. Use when the user says "work the roadmap", "do the next thing", "daily dev", or runs /loop over this skill.
+description: Nanna's daily dev routine. Reads ROADMAP.md, picks the next unimplemented item, builds it Tiger-Style with tests + benchmarks, updates the roadmap, and commits — then loops to the next item and keeps going for at least 4 wall-clock hours per run. Designed to run under /loop. Use when the user says "work the roadmap", "do the next thing", "daily dev", or runs /loop over this skill.
 ---
 
 # Nanna daily dev routine
@@ -18,9 +18,11 @@ reference notes** are the appendices at the bottom of this file. Modeled on the 
 
 ## Prime directive
 
-**One roadmap item per iteration. Depth over breadth.** Finish it fully — designed, implemented,
-tested, benchmarked (if perf-affecting), roadmap updated, committed — before looking at the next.
-A half-done item is worse than no item.
+**One roadmap item at a time — and keep looping for at least 4 wall-clock hours per run.** Finish each
+item fully — designed, implemented, tested, benchmarked (if perf-affecting), roadmap updated, committed
+— before looking at the next; a half-done item is worse than no item. Then take the next one. A run is
+**not done because one item shipped** — it ends when **≥ 4 hours** of wall-clock have elapsed (or nothing
+is safely actionable). Depth over breadth *within* an item; sustained volume *across* the run.
 
 ## Hard guardrails (read every iteration)
 
@@ -95,9 +97,14 @@ cargo build                     # release if perf-relevant
   merge. *Interactive, you driving:* pushing to `master` is fine for this solo repo when you say so;
   otherwise open a PR.
 
-### 7 — Loop or stop
-- Under `/loop`: return to step 1 for the next single item.
-- Single pass: report what shipped (item, tests, bench delta, commit) and what's now next.
+### 7 — Loop until the 4-hour floor
+- Record the run's **start time** at the beginning. After each finished increment, check elapsed
+  wall-clock and **return to step 1 for the next item until ≥ 4 hours have elapsed** — do not stop after
+  a single item.
+- Stop before 4h **only** if nothing is safely actionable (all remaining items blocked / ambiguous /
+  product-level) — then report why.
+- When the floor is reached (or you stop early), report what shipped across the whole run (items, tests,
+  bench deltas, commits) and what's next. In the nightly routine this is when you open the single PR.
 
 ## Definition of done (per item)
 Designed with napkin math · implemented Tiger-Style with ≥2 assertions/fn and no prod `unwrap` ·
