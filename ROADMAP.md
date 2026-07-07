@@ -180,7 +180,11 @@ SupervisionStrategy OneForOne/OneForAll/RestForOne, HealthCheckConfig). **Shippe
       does not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement
       (stdio server, tool/resource/prompt registration, HTTP mode, tool filtering, auth, streaming).
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
-- [ ] Supervisor recovery tracking recovers on first success instead of counting consecutive successes (`supervisor.rs:577`).
+- [x] Supervisor recovery tracking recovers on first success instead of counting consecutive successes (`supervisor.rs:577`).
+      *(2026-07-07) Added `AgentStats.consecutive_health_passes` (incremented on pass, reset on fail); an
+      `Unhealthy` agent now recovers only after `success_threshold` consecutive passes. Extracted pure
+      `should_recover_to_running` / `should_mark_unhealthy` helpers (push the decision down, leaf-pure) with
+      unit tests covering threshold boundaries and state-gating.*
 
 ### P4 — GUI Application ✅
 Tauri 2 + Nuxt 4 + Tailwind 4, 80s-hacker Palenight theme. Streaming chat with markdown, session

@@ -149,6 +149,31 @@ pub struct AgentStats {
     pub health_checks_failed: u64,
     /// Consecutive health check failures
     pub consecutive_health_failures: u32,
+    /// Consecutive health check passes (for recovery threshold)
+    pub consecutive_health_passes: u32,
+}
+
+/// Whether an `Unhealthy` agent has earned recovery to `Running`.
+///
+/// Requires `success_threshold` (floored at 1) consecutive passing probes, so a
+/// single lucky probe can't flap a flaky agent back to healthy.
+fn should_recover_to_running(
+    state: AgentState,
+    consecutive_health_passes: u32,
+    success_threshold: u32,
+) -> bool {
+    state == AgentState::Unhealthy && consecutive_health_passes >= success_threshold.max(1)
+}
+
+/// Whether a `Running` agent should be demoted to `Unhealthy`.
+///
+/// Requires `failure_threshold` consecutive failing probes.
+fn should_mark_unhealthy(
+    state: AgentState,
+    consecutive_health_failures: u32,
+    failure_threshold: u32,
+) -> bool {
+    state == AgentState::Running && consecutive_health_failures >= failure_threshold
 }
 
 /// Configuration for a supervised agent
@@ -572,33 +597,45 @@ impl Supervisor {
             if passed {
                 handle.stats.health_checks_passed += 1;
                 handle.stats.consecutive_health_failures = 0;
-                
-                if handle.state == AgentState::Unhealthy {
-                    // TODO: Track consecutive successes before recovery
-                    // let threshold = handle.config.health_check
-                    //     .as_ref()
-                    //     .map_or(1, |hc| hc.success_threshold);
-                    
-                    // For simplicity, recover immediately on first success
-                    // (In production, track consecutive successes)
+                handle.stats.consecutive_health_passes =
+                    handle.stats.consecutive_health_passes.saturating_add(1);
+
+                // Recover only after `success_threshold` consecutive passes, so a
+                // single lucky probe can't flap an unhealthy agent back to Running.
+                let success_threshold = handle
+                    .config
+                    .health_check
+                    .as_ref()
+                    .map_or(1, |hc| hc.success_threshold);
+
+                if should_recover_to_running(
+                    handle.state,
+                    handle.stats.consecutive_health_passes,
+                    success_threshold,
+                ) {
                     handle.state = AgentState::Running;
                     Self::emit_event_static(event_tx, agent_id, SupervisorEventType::BecameHealthy).await;
                 }
-                
+
                 Self::emit_event_static(event_tx, agent_id, SupervisorEventType::HealthCheckPassed).await;
             } else {
                 handle.stats.health_checks_failed += 1;
                 handle.stats.consecutive_health_failures += 1;
-                
+                handle.stats.consecutive_health_passes = 0;
+
                 let threshold = handle.config.health_check
                     .as_ref()
                     .map_or(3, |hc| hc.failure_threshold);
-                
-                if handle.stats.consecutive_health_failures >= threshold && handle.state == AgentState::Running {
+
+                if should_mark_unhealthy(
+                    handle.state,
+                    handle.stats.consecutive_health_failures,
+                    threshold,
+                ) {
                     handle.state = AgentState::Unhealthy;
                     Self::emit_event_static(event_tx, agent_id, SupervisorEventType::BecameUnhealthy).await;
                 }
-                
+
                 Self::emit_event_static(event_tx, agent_id, SupervisorEventType::HealthCheckFailed {
                     reason: "Probe failed or timed out".to_string(),
                 }).await;
@@ -732,5 +769,32 @@ mod tests {
         let agents = supervisor.list_agents().await;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].0, "agent-1");
+    }
+
+    #[test]
+    fn test_recover_requires_consecutive_passes() {
+        // success_threshold = 2: one pass is not enough, two recovers.
+        assert!(!should_recover_to_running(AgentState::Unhealthy, 1, 2));
+        assert!(should_recover_to_running(AgentState::Unhealthy, 2, 2));
+        assert!(should_recover_to_running(AgentState::Unhealthy, 3, 2));
+
+        // A zero/one threshold floors at 1 (a single pass recovers).
+        assert!(should_recover_to_running(AgentState::Unhealthy, 1, 0));
+        assert!(should_recover_to_running(AgentState::Unhealthy, 1, 1));
+        assert!(!should_recover_to_running(AgentState::Unhealthy, 0, 1));
+
+        // Only an Unhealthy agent recovers — a Running one is already healthy.
+        assert!(!should_recover_to_running(AgentState::Running, 5, 1));
+        assert!(!should_recover_to_running(AgentState::Stopped, 5, 1));
+    }
+
+    #[test]
+    fn test_mark_unhealthy_requires_consecutive_failures() {
+        // failure_threshold = 3.
+        assert!(!should_mark_unhealthy(AgentState::Running, 2, 3));
+        assert!(should_mark_unhealthy(AgentState::Running, 3, 3));
+        // Only a Running agent gets demoted.
+        assert!(!should_mark_unhealthy(AgentState::Unhealthy, 5, 3));
+        assert!(!should_mark_unhealthy(AgentState::Starting, 5, 3));
     }
 }
