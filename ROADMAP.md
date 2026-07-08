@@ -161,10 +161,113 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 
 ## Phases
 
-### P1 — Core Infrastructure ✅
+### P0 - Public Preview Release
+- [ ] Decide: ship as Developer Preview 0.1.0 (compile-from-source, power users only) OR commit to non-technical public beta (requires Phase 1 completion).
+- [ ] If Developer Preview: rewrite README top section to explicitly state "experimental alpha, requires Rust + Node, requires cloud API key or Ollama, native local inference not yet included, not recommended for sensitive data."
+- [ ] Create RELEASE_NOTES.md or MILESTONE that freezes scope.
+- [ ] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases.
+- [ ] Publish signed Windows .msi/.exe installer with bundled daemon sidecar.
+- [ ] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon).
+- [ ] Publish Linux AppImage and/or .deb/.rpm.
+- [ ] App launches without terminal; daemon starts automatically.
+- [ ] Add Start Menu / tray / launch-at-login support.
+- [ ] WebView2 handling on Windows.
+- [ ] Document uninstall process.
+- [ ] Add "check for updates" or auto-update mechanism
+
+#### P0.1 - First Run UX
+- [ ] Create public facing website / Github Pages
+- [ ] Build GUI onboarding wizard (replaces CLI-centric onboarding).
+- [ ] Plain-language intro screen explaining what Nanna is.
+- [ ] Data storage location selection.
+- [ ] Backend chooser: Anthropic / OpenAI / OpenRouter / Ollama — with clear "native local model coming soon" if not implemented.
+- [ ] API key entry with validation; fix has_api_key to check all provider keys, not only Anthropic.
+- [ ] Ollama detection (is server running? is a model pulled?).
+- [ ] Memory/privacy explanation with opt-in toggle for auto-remembering.
+- [ ] Tool permission setup: ask before enabling shell/browser/file-write.
+- [ ] Daemon/embedded backend auto-start.
+- [ ] Health check screen with helpful, non-technical error messages (API key invalid, Ollama not running, port conflict, etc.).
+- [ ] Emergency stop / pause-memory button visible in main UI.
+
+#### P0.2 - Documentation
+- [ ] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
+- [ ] Move architecture/performance content to the bottom of the readme
+- [ ] Add truthful capability matrix: Desktop GUI / CLI chat / Fully local inference / Ollama backend / Cloud providers / Channels — each with Status and Requires columns.
+- [ ] Add PRIVACY.md documenting: what's stored locally, what's sent to LLM providers, OpenAI embeddings, Brave Search, channels, websites; how to disable cloud calls; how to delete/export data.
+- [ ] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
+- [ ] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
+- [ ] Add per-OS installation docs.
+- [ ] Commit LICENSE file (MIT) — appears absent despite README reference.
+- [ ] Add CONTRIBUTING.md and CODE_OF_CONDUCT.md.
+- [ ] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
+- [ ] Add GitHub repo description and topics.
+- [ ] Unify port documentation (README says 5149; CLI defaults to 9999) — pick one, update both code and docs.
+
+#### P0.3 - Stronger Public Release (can follow 0.1)
+- [ ] Local Ollama setup assistant in GUI.
+- [ ] Model/backend status dashboard.
+- [ ] Cost tracking for cloud models.
+- [ ] Backup/export/delete data UI.
+- [ ] Per-channel session isolation (critical if any channel is marketed).
+- [ ] Channel-native response formatting.
+- [ ] Log rotation + crash diagnostics export.
+- [ ] Windows service install/uninstall/start/stop actually working.
+- [ ] Code signing / notarization in CI.
+- [ ] Accessibility pass (screen reader, keyboard navigation, ARIA, color contrast).
+- [ ] Internationalization/localization framework (currently English-only).
+- [ ] Burn local runner (P12) → re-market true offline.
+- [ ] Dreaming overhaul (P13)
+- [ ] Self-update via GitHub Releases.
+- [ ] Resource cleanup verification on uninstall (daemon, config, memory DB, credentials fully removed).
+
+#### P0.3 - Code Quality & CI
+- [ ] Add GitHub Actions workflow: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, cargo test --workspace --all-features, cargo test --no-run smoke check.
+- [ ]  Add cargo audit and cargo deny to CI.
+- [ ]  Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
+- [ ]  Add Tauri packaging CI producing signed artifacts per OS.
+- [ ]  Add end-to-end daemon test: start → connect → conversation → persistence → fallback → reconnect.
+- [ ]  Add gitleaks/trufflehog secret-scan step to CI.
+- [ ]  Add coverage tracking (codecov/coveralls) if practical.
+- [ ]  Add ESLint/Prettier/Vitest/Playwright configs for frontend.
+- [ ]  Add Dependabot/Renovate config.
+- [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
+- [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
+
+### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
 vector store + conversation memory, LLM clients (Anthropic/OpenAI/OpenRouter/Ollama) with streaming +
-tool calling, agent loop with context management, scheduler (heartbeats, cron). **Shipped.**
+tool calling, agent loop with context management, scheduler (heartbeats, cron). 
+- [ ] Onboarding writes API keys to plaintext config.toml (src/onboarding.rs), even though a SecureStore using OS keyring exists. The OS keychain should be the default path; TOML config should store only non-secret settings.
+- [ ] SecureStore file fallback is plaintext JSON (mode 0600), not encrypted — the module comment misleadingly says "encrypted file storage." Fix the comment or implement real AES-GCM encryption with an OS-protected key.
+- [ ] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
+- [ ] Onboarding has_api_key only checks config.llm.api_key or ANTHROPIC_API_KEY, ignoring OpenAI/OpenRouter keys. quick_setup specifically asks for an Anthropic key despite multi-provider support — broken first-run for non-Anthropic users.
+- [ ] Tauri CSP is set to null in gui/src-tauri/tauri.conf.json — not acceptable for a desktop app rendering model output and markdown.
+- [ ] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
+- [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
+- [ ] ROADMAP explicitly lists open items: disabled tools still execute, deleted tools remain callable until restart, delete_skill needs hardening against remove_dir_all/symlink races, stronger sandboxing needed.
+- [ ] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
+- [ ] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
+- [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
+- [ ] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
+- [ ] No SECURITY.md or vulnerability disclosure process.
+- [ ] No Dependabot / cargo-audit / npm audit automation.
+- [ ] No GitHub secret scanning enabled.
+- [ ] Store all secrets in OS keychain by default; remove secret fields from config.toml.
+- [ ] Encrypt the SecureStore file fallback with AES-GCM (OS-protected key) or remove fallback; correct the misleading "encrypted" comment.
+- [ ] Set a restrictive Tauri CSP (not null).
+- [ ] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
+- [ ] Per-tool toggles visible in GUI; audit log for every tool call.
+- [ ] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
+- [ ] Harden delete_skill against remove_dir_all/symlink races.
+- [ ] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
+- [ ] Add authentication for any non-local control plane.
+- [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+- [ ] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
+- [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
+- [ ] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
+- [ ] Add SECURITY.md with vulnerability disclosure process.
+- [ ] Enable GitHub secret scanning and Dependabot.
+- [ ] Claude UI Testing automations
 
 ### P2 — Tools & Channels ✅
 File/shell/web tools, memory tools (remember/recall/reflect), scheduling, browser tools, vision
