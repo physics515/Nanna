@@ -462,7 +462,7 @@ fn verify_slack_signature(
     timestamp: &str,
     body: &[u8],
 ) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_slack_signature_valid_and_rejects_tampering() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         use std::time::{SystemTime, UNIX_EPOCH};
 
