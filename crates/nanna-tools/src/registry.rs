@@ -128,6 +128,76 @@ impl ToolRegistry {
         }
     }
 
+    /// Unregister a tool, cascading to any aliases that resolve to it.
+    ///
+    /// This is the counterpart to [`register`](Self::register) /
+    /// [`register_alias`](Self::register_alias) and is what makes a **deleted or
+    /// disabled** tool stop being callable *without* a daemon restart (previously
+    /// the registry had no removal path, so a deleted tool stayed live until the
+    /// process was restarted).
+    ///
+    /// Semantics:
+    /// - If `name` is a canonical tool, it is removed **and** every alias whose
+    ///   target is `name` is removed too — so a deleted tool can't be reached
+    ///   through a lingering alias.
+    /// - If `name` is itself an alias, only that alias entry is removed; the
+    ///   canonical target is left intact.
+    ///
+    /// Returns the number of registry entries removed (`0` if `name` was unknown).
+    pub async fn unregister(&self, name: &str) -> usize {
+        debug_assert!(!name.is_empty(), "unregister called with empty name");
+
+        let mut tools = self.tools.write().await;
+        let mut aliases = self.aliases.write().await;
+        let mut alias_targets = self.alias_targets.write().await;
+
+        // Aliases pointing at `name` cascade with the canonical delete. Bounded by
+        // the number of registered aliases (finite). Exclude `name` itself so a
+        // self-referential entry isn't double-counted.
+        let dependent_aliases: Vec<String> = alias_targets
+            .iter()
+            .filter(|(alias, target)| target.as_str() == name && alias.as_str() != name)
+            .map(|(alias, _)| alias.clone())
+            .collect();
+
+        let mut removed = 0usize;
+        for alias in &dependent_aliases {
+            if tools.remove(alias).is_some() {
+                removed += 1;
+            }
+            aliases.remove(alias);
+            alias_targets.remove(alias);
+        }
+
+        if tools.remove(name).is_some() {
+            removed += 1;
+        }
+        aliases.remove(name);
+        alias_targets.remove(name);
+
+        // Postcondition: no entry (canonical or alias) named `name` survives, and
+        // no alias still targets `name`.
+        debug_assert!(
+            !tools.contains_key(name),
+            "unregister must leave no entry named '{name}'"
+        );
+        debug_assert!(
+            !alias_targets.values().any(|t| t == name),
+            "unregister must leave no alias targeting '{name}'"
+        );
+
+        // Release the three write locks before the (non-critical) logging tail.
+        drop(tools);
+        drop(aliases);
+        drop(alias_targets);
+
+        if removed > 0 {
+            let plural = if removed == 1 { "entry" } else { "entries" };
+            info!("Unregistered tool '{name}' ({removed} {plural} removed)");
+        }
+        removed
+    }
+
     /// Get a tool by name (exact match only)
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         let tools = self.tools.read().await;
@@ -445,12 +515,6 @@ impl ToolRegistry {
         loaded
     }
 
-    /// Unregister a tool by name
-    pub async fn unregister(&self, name: &str) -> bool {
-        let mut tools = self.tools.write().await;
-        tools.remove(name).is_some()
-    }
-
     /// Check if a tool is registered
     pub async fn has(&self, name: &str) -> bool {
         let tools = self.tools.read().await;
@@ -669,6 +733,67 @@ mod tests {
 
         assert_eq!(reg.canonical_name("e").await, "echo");
         assert_eq!(reg.canonical_name("echo").await, "echo"); // non-alias returns self
+    }
+
+    // --- unregister ---
+
+    #[tokio::test]
+    async fn unregister_makes_tool_uncallable() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        assert!(reg.get("echo").await.is_some());
+
+        let removed = reg.unregister("echo").await;
+        assert_eq!(removed, 1);
+        assert!(reg.get("echo").await.is_none());
+
+        // A call to the now-deleted tool must resolve to nothing (was: still callable).
+        let call = ToolCall {
+            id: "x".into(),
+            name: "echo".into(),
+            parameters: HashMap::new(),
+        };
+        let resp = reg.execute(call).await;
+        assert!(!resp.result.success);
+    }
+
+    #[tokio::test]
+    async fn unregister_cascades_to_aliases() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.register_alias("e", "echo").await;
+        reg.register_alias("Echo2", "echo").await;
+        assert!(reg.get("e").await.is_some());
+
+        // Deleting the canonical tool removes both aliases too.
+        let removed = reg.unregister("echo").await;
+        assert_eq!(removed, 3);
+        assert!(reg.get("echo").await.is_none());
+        assert!(reg.get("e").await.is_none());
+        assert!(reg.get("Echo2").await.is_none());
+        // The alias reverse-map entry is gone, so canonical_name falls back to self.
+        assert_eq!(reg.canonical_name("e").await, "e");
+    }
+
+    #[tokio::test]
+    async fn unregister_alias_leaves_canonical() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.register_alias("e", "echo").await;
+
+        // Removing just the alias must not take down the canonical tool.
+        let removed = reg.unregister("e").await;
+        assert_eq!(removed, 1);
+        assert!(reg.get("e").await.is_none());
+        assert!(reg.get("echo").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn unregister_unknown_is_noop() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        assert_eq!(reg.unregister("does_not_exist").await, 0);
+        assert!(reg.get("echo").await.is_some());
     }
 
     // --- existing test ---

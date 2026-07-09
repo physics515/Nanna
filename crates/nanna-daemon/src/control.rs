@@ -1667,6 +1667,22 @@ impl ControlPlane {
                 
                 match user_tools.update_tool(&name, description, code, None, permissions, None).await {
                     Ok(meta) => {
+                        // Reconcile the live registry with the tool's new state so
+                        // the update takes effect without a restart: drop the old
+                        // registration, then re-register only if still enabled
+                        // (a disabled tool must stop executing).
+                        if let Some(ref tools) = self.tools {
+                            tools.unregister(&meta.name).await;
+                            if meta.enabled {
+                                match user_tools.create_tool_impl(&meta) {
+                                    Ok(tool_impl) => tools.register_boxed(tool_impl).await,
+                                    Err(e) => warn!(
+                                        "Updated tool '{}' saved but failed to re-register: {}",
+                                        meta.name, e
+                                    ),
+                                }
+                            }
+                        }
                         info!("Updated user tool: {}", name);
                         json!({
                             "status": "updated",
@@ -1689,6 +1705,12 @@ impl ControlPlane {
                 
                 match user_tools.delete_tool(&name).await {
                     Ok(()) => {
+                        // Make the deletion take effect live: a tool that's gone
+                        // from disk must also stop being callable without a daemon
+                        // restart (previously it lingered in the registry).
+                        if let Some(ref tools) = self.tools {
+                            tools.unregister(&name).await;
+                        }
                         info!("Deleted user tool: {}", name);
                         json!({ "status": "deleted", "name": name })
                     }
