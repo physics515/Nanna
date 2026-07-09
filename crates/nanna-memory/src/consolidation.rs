@@ -381,17 +381,22 @@ pub fn create_consolidated_entry(
     metadata.insert("consolidated_from".to_string(), source_ids.join(","));
     metadata.insert("consolidation_level".to_string(), format!("{:?}", cluster.compression_level));
 
-    // Create new FSRS state inheriting the best traits from the cluster
+    // Precondition: consolidation is only meaningful for a non-empty cluster.
+    debug_assert!(
+        !cluster.memories.is_empty(),
+        "create_consolidated_entry on empty cluster"
+    );
+
+    // Create new FSRS state inheriting the best traits from the cluster.
+    // Use `max_finite_or` (not `max_by(partial_cmp).unwrap()`) so a stray NaN in
+    // a stored FSRS value can't panic the dreaming cycle.
     let mut fsrs = FsrsState::new();
     // Importance: take the max (don't average away a high-importance memory)
-    fsrs.importance = cluster.memories.iter()
-        .map(|m| m.fsrs.importance)
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or(1.0);
-    fsrs.storage_strength = cluster.memories.iter()
-        .map(|m| m.fsrs.storage_strength)
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or(0.1);
+    fsrs.importance = max_finite_or(cluster.memories.iter().map(|m| m.fsrs.importance), 1.0);
+    fsrs.storage_strength = max_finite_or(
+        cluster.memories.iter().map(|m| m.fsrs.storage_strength),
+        0.1,
+    );
     // Sum access counts (consolidated memory inherits all recall history)
     fsrs.access_count = cluster.memories.iter()
         .map(|m| m.fsrs.access_count)
@@ -405,6 +410,13 @@ pub fn create_consolidated_entry(
     let workspace_id = cluster.memories.first()
         .and_then(|m| m.workspace_id.clone());
 
+    // Postcondition: the merged FSRS scalars are always finite (never NaN/inf),
+    // so downstream weight math can't be poisoned.
+    debug_assert!(
+        fsrs.importance.is_finite() && fsrs.storage_strength.is_finite(),
+        "consolidated FSRS scalars must be finite"
+    );
+
     MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         content: consolidated_content,
@@ -415,6 +427,29 @@ pub fn create_consolidated_entry(
         workspace_id,
         expires_at: None, // Consolidated memories don't expire
     }
+}
+
+/// Maximum of the finite values in `values`, or `default` when none are finite.
+///
+/// NaN-safe replacement for `values.max_by(|a, b| a.partial_cmp(b).unwrap())`,
+/// whose `unwrap` panics the moment any value is NaN. Non-finite inputs
+/// (NaN/±inf) are skipped rather than compared, so a single corrupt stored FSRS
+/// scalar can't crash the dreaming cycle.
+fn max_finite_or(values: impl Iterator<Item = f32>, default: f32) -> f32 {
+    debug_assert!(default.is_finite(), "default must be finite");
+
+    let result = values
+        .filter(|v| v.is_finite())
+        .fold(None, |acc: Option<f32>, v| {
+            Some(acc.map_or(v, |a| a.max(v)))
+        })
+        .unwrap_or(default);
+
+    debug_assert!(
+        result.is_finite(),
+        "max_finite_or must return a finite value"
+    );
+    result
 }
 
 fn now() -> i64 {
@@ -573,5 +608,80 @@ mod tests {
         assert!(prompt.contains("2 memories"));
         assert!(prompt.contains("dark mode"));
         assert!(prompt.contains("dark themes"));
+    }
+
+    fn entry_with_fsrs(id: &str, importance: f32, storage: f32, access: u32) -> MemoryEntry {
+        let fsrs = FsrsState {
+            importance,
+            storage_strength: storage,
+            access_count: access,
+            ..FsrsState::default()
+        };
+        MemoryEntry {
+            id: id.to_string(),
+            content: format!("memory {id}"),
+            embedding: vec![1.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs,
+            workspace_id: None,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn max_finite_or_skips_nan_and_inf() {
+        // A NaN or ±inf must be ignored, never compared (the old
+        // `max_by(partial_cmp).unwrap()` panicked on NaN).
+        let vals = [1.0_f32, f32::NAN, 3.5, f32::INFINITY, 2.0];
+        assert!((max_finite_or(vals.into_iter(), 1.0) - 3.5).abs() < 1e-6);
+        // All non-finite → fall back to the default.
+        let none = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        assert!((max_finite_or(none.into_iter(), 0.1) - 0.1).abs() < 1e-6);
+        // Empty → default.
+        assert!((max_finite_or(std::iter::empty(), 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn consolidated_entry_takes_max_importance_and_sums_access() {
+        let cluster = MemoryCluster {
+            memories: vec![
+                entry_with_fsrs("a", 2.0, 0.3, 4),
+                entry_with_fsrs("b", 5.0, 0.1, 7),
+            ],
+            centroid: vec![1.0, 0.0],
+            compression_level: CompressionLevel::Standard,
+            avg_weight: 0.5,
+        };
+        let out = create_consolidated_entry(&cluster, "merged".into(), vec![1.0, 0.0]);
+        assert!((out.fsrs.importance - 5.0).abs() < 1e-6, "importance = max");
+        assert!(
+            (out.fsrs.storage_strength - 0.3).abs() < 1e-6,
+            "storage = max"
+        );
+        assert_eq!(out.fsrs.access_count, 11, "access counts summed");
+        assert_eq!(
+            out.metadata.get("consolidated_from").map(String::as_str),
+            Some("a,b")
+        );
+    }
+
+    #[test]
+    fn consolidated_entry_survives_nan_fsrs() {
+        // A corrupt stored FSRS scalar must not panic dreaming; the result
+        // still has finite scalars and inherits the finite sibling's importance.
+        let cluster = MemoryCluster {
+            memories: vec![
+                entry_with_fsrs("a", f32::NAN, f32::NAN, 1),
+                entry_with_fsrs("b", 3.0, 0.2, 2),
+            ],
+            centroid: vec![1.0, 0.0],
+            compression_level: CompressionLevel::Standard,
+            avg_weight: 0.5,
+        };
+        let out = create_consolidated_entry(&cluster, "merged".into(), vec![1.0, 0.0]);
+        assert!(out.fsrs.importance.is_finite() && out.fsrs.storage_strength.is_finite());
+        assert!((out.fsrs.importance - 3.0).abs() < 1e-6);
+        assert!((out.fsrs.storage_strength - 0.2).abs() < 1e-6);
     }
 }

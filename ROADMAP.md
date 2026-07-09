@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-07 (webhook signature verification + deps/Cargo.lock + de-flaked credential test + true memory merge + Turso rename) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-09 (keyring 3→4 + cargo update · daemon rotating file logs · NaN-safe FSRS consolidation merge · per-channel Markdown down-conversion) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -254,6 +254,11 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] No GitHub secret scanning enabled.
 - [ ] Store all secrets in OS keychain by default; remove secret fields from config.toml.
 - [ ] Encrypt the SecureStore file fallback with AES-GCM (OS-protected key) or remove fallback; correct the misleading "encrypted" comment.
+      - [ ] *(research 2026-07-09)* `keyring 4` (now on the workspace) split into a `keyring-core` layer
+            exposing a pluggable `CredentialStore`/`CredentialBuilder` trait registrable via
+            `keyring::set_default_store(..)`. That's the clean seam for this item: implement an
+            encrypted-file `CredentialStore` (AES-GCM) and register it as the default when no OS keyring is
+            present, instead of the ad-hoc plaintext-JSON fallback in `credentials.rs`. Source: [keyring-core docs](https://docs.rs/keyring-core).
 - [ ] Set a restrictive Tauri CSP (not null).
 - [ ] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
 - [ ] Per-tool toggles visible in GUI; audit log for every tool call.
@@ -315,7 +320,15 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).
 - [ ] **Tool allowlists/blocklists** — `ToolPolicy` (global allow/block + per-channel + per-user for multi-user channels).
-- [ ] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
+- [x] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
+      *(2026-07-09)* New `nanna-daemon::log_file` builds a `RollingFileAppender` (DAILY rotation,
+      `filename_prefix="nanna-daemon"`, `.log` suffix, `max_log_files(7)`) wrapped in `tracing_appender::non_blocking`;
+      added as an `Option<fmt::Layer>` beside the console + in-memory-buffer layers. New `--log-dir`
+      (default `{data_dir}/logs`) and `--no-file-log` flags; the worker guard is a `main`-scoped local so it
+      flushes on normal return (a `static` guard would never drop). Pure `resolve_log_dir` + `build_appender`
+      with 4 unit tests; verified by a real `nanna-daemon run` boot writing a prefixed file. Note:
+      `tracing-appender` 0.2.5 supports only time-based rotation (no per-file size cap) — if size-bounding is
+      wanted later, use a custom writer or the `clia/tracing-appender` fork.
 - [ ] Reach **0 clippy warnings** — 3 deferred items remain: refactor `handle_daemon_command`
       (main.rs ~1442-1636, `too_many_lines`), move mid-function `use nanna_client::…` to top (main.rs ~1576,
       `items_after_statements`), drop unused `async` on `is_daemon_running` (main.rs ~1694, `unused_async`).
@@ -336,9 +349,17 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       persistence + embedded fallback + reconnection (currently untested).
 - [ ] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
-- [ ] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
+- [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
       (strip markdown for Signal, tables→text for Telegram, embeds for Discord, Block Kit for Slack).
       Bitflags exist but every channel currently receives identical raw text.
+      *(2026-07-09)* First slice shipped: added a `ChannelFeatures::MARKDOWN` flag + `supports_markdown()`,
+      a pure `nanna-channels::format` module (`format_for_channel` / `strip_markdown`), and wired it into the
+      single outbound chokepoint `MessageRouter::send`. Markdown-rendering channels (Discord/Telegram/Slack)
+      carry the flag → text passes through **unchanged** (zero regression); Signal/WhatsApp now get Markdown
+      down-converted to plain text (headers/blockquotes/fences/bold/inline-code stripped, `[label](url)` →
+      `label (url)`), so they stop showing literal `**`/backticks. Conservative on purpose: single `*`/`_`,
+      `__dunders__`, `snake_case`, and `2 * 3` survive. 7 unit tests. Remaining: tables→text, Discord embeds,
+      Slack Block Kit, and length-aware splitting on `max_message_length`.
 - [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
@@ -480,6 +501,7 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
 - [ ] **First model: a Hermes-class function-calling small model** — a from-scratch Burn decoder (start from laurelane's Qwen2.5 / LFM2 modules: RmsNorm + GQA + RoPE + SwiGLU, tied lm_head) sized for one GPU (1.5–3B). Prove tool-calling quality is good enough to run the loop.
       - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
+      - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-07)* Tool-budget evidence **validates the two-tier tool discovery design**: each tool definition costs ~50–150 tokens; keep the always-sent set **under 5–10 tools** for 7–9B models (Nanna's core-tools-vs-`discover_tools` split already does this). Add a benchmark asserting the local model's active-tool count stays within this budget, and prefer `discover_tools` activation over sending the full registry on the local path.
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
@@ -520,6 +542,13 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `update_content_and_embedding` fold related-but-distinct content into the existing memory
       (bounded, superset-dedup) and reinforce FSRS. Next: apply the same merge in the batch
       dreaming/consolidation clusterer (`cluster_memories`), which still creates consolidated copies.*
+- [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
+      `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
+      `importance`/`storage_strength` is NaN.
+      *(2026-07-09)* Replaced with a pure `max_finite_or(values, default)` that skips non-finite inputs
+      (NaN/±inf) and falls back to the default when none are finite; added pre/postcondition assertions
+      (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
+      NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
       - [ ] *(research 2026-07-06)* Use a **pure-Rust HNSW** crate (`hnsw_rs` / `instant-distance`) over a C ext — `sqlite-vec` is brute-force only; `vectorlite` shows HNSW at `ef_construction=100, M=30` scales well. Fits the Turso-only + in-RAM-cosine model (build the index in RAM, persist coeff/graph as Turso BLOBs). Sources: [vectorlite](https://github.com/1yefuwang1/vectorlite), [sqlite-vec ANN issue](https://github.com/asg017/sqlite-vec/issues/25).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
@@ -598,7 +627,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    - [ ] `deno_core 0.375→0.406` + `deno_ast 0.51→0.53` + `swc_core 7→72` (nanna-scripting — large)
    - [ ] `rustpython-{vm,stdlib,pylib} 0.4→0.5` (nanna-scripting)
    - [ ] `playwright-rs 0.8→0.14` + `chromiumoxide 0.8→0.9` (nanna-browser)
-   - [ ] `keyring 3→4` (nanna-config)
+   - [x] `keyring 3→4` (nanna-config) — *(2026-07-09)* v4 split platform stores into per-OS `*-keyring-store` crates (no longer default); added `apple-native-keyring-store` and kept the default `windows-native-keyring-store` + `zbus-secret-service-keyring-store` + `v1` compat feature, which preserves the `Entry`/`Error::NoEntry` API so `credentials.rs` compiled unchanged. Build+tests green.
    - [ ] `ed25519-dalek 2→3`, `hmac 0.12→0.13`, `sha2 0.10→0.11` (nanna-server + nanna-daemon — keep pairs aligned)
    - [ ] `scraper 0.22→0.27`, `lopdf 0.34→0.43` (nanna-tools)
    - [ ] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `windows-service 0.7→0.8`, `nix 0.29→0.31` (unix), `criterion 0.5→0.8` (nanna-gpu benches)

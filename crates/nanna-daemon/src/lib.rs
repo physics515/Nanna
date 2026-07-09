@@ -19,6 +19,7 @@ pub mod health;
 pub mod ipc;
 pub mod llm_router;
 pub mod log_buffer;
+pub mod log_file;
 pub mod memory_adapter;
 pub mod memory_persistence;
 pub mod persistence;
