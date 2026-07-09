@@ -12,6 +12,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -28,6 +29,13 @@ pub struct DreamingConfig {
     pub auto_demote_days: f32,
     /// Minimum memories before consolidation runs
     pub min_memories_for_consolidation: usize,
+    /// How long the system must be idle before a gated dream cycle may run,
+    /// in seconds. Used by [`DreamingService::dream_if_idle`] — dreaming during
+    /// active use competes with the agent for the GPU/LLM, so we wait for a lull.
+    pub idle_threshold_secs: u64,
+    /// Live memory count at/above which a gated dream cycle runs **regardless**
+    /// of idle time (memory-pressure relief). `0` disables the pressure trigger.
+    pub memory_pressure_count: usize,
 }
 
 impl Default for DreamingConfig {
@@ -38,7 +46,40 @@ impl Default for DreamingConfig {
             auto_promote_access_threshold: 5,
             auto_demote_days: 30.0,
             min_memories_for_consolidation: 10,
+            // 5 min idle before dreaming; relieve pressure past 5k live memories.
+            idle_threshold_secs: 300,
+            memory_pressure_count: 5000,
         }
+    }
+}
+
+/// Why a gated dream cycle did (or did not) run — makes the gate observable and
+/// unit-testable without an LLM in the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DreamTrigger {
+    /// Ran because the system was idle at least `idle_threshold_secs`.
+    Idle,
+    /// Ran because the live memory count reached `memory_pressure_count`
+    /// (even though the system was not idle).
+    MemoryPressure,
+    /// Skipped: not idle yet and no memory pressure.
+    Skipped,
+}
+
+/// Pure gate decision: should a dream cycle run given how long the system has
+/// been idle and how many memories are live?
+///
+/// Memory pressure takes priority so a continuously-busy system still
+/// consolidates before the store grows without bound; otherwise idle time
+/// governs. Pure (no clock/IO) so the policy is exhaustively testable.
+#[must_use]
+fn dream_trigger(idle: Duration, memory_count: usize, cfg: &DreamingConfig) -> DreamTrigger {
+    if cfg.memory_pressure_count > 0 && memory_count >= cfg.memory_pressure_count {
+        DreamTrigger::MemoryPressure
+    } else if idle >= Duration::from_secs(cfg.idle_threshold_secs) {
+        DreamTrigger::Idle
+    } else {
+        DreamTrigger::Skipped
     }
 }
 
@@ -74,6 +115,9 @@ pub struct DreamingService {
     memory: MemoryService,
     /// Pending feedback to apply (memory_id -> accumulated feedback)
     pending_feedback: RwLock<HashMap<String, Vec<MemoryFeedback>>>,
+    /// Wall-clock instant of the most recent user/agent activity. Drives the
+    /// idle gate in [`DreamingService::dream_if_idle`].
+    last_activity: RwLock<Instant>,
 }
 
 impl DreamingService {
@@ -85,7 +129,73 @@ impl DreamingService {
             config,
             memory,
             pending_feedback: RwLock::new(HashMap::new()),
+            last_activity: RwLock::new(Instant::now()),
         }
+    }
+
+    /// Mark "now" as the most recent activity, resetting the idle timer.
+    ///
+    /// Call this whenever the agent handles a message or runs a tool so a dream
+    /// cycle only fires during a genuine lull (see [`Self::dream_if_idle`]).
+    pub async fn record_activity(&self) {
+        *self.last_activity.write().await = Instant::now();
+    }
+
+    /// How long the system has been idle since the last [`Self::record_activity`].
+    #[must_use]
+    pub async fn idle_duration(&self) -> Duration {
+        self.last_activity.read().await.elapsed()
+    }
+
+    /// Run a dream cycle **only if** the idle/memory-pressure gate says so.
+    ///
+    /// Returns `Ok(Some(stats))` with the trigger reason if a cycle ran, or
+    /// `Ok(None)` if it was skipped because the system is still active and the
+    /// store isn't under pressure. This is the idle-gated entry point the
+    /// scheduler should call instead of the unconditional [`Self::dream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if a triggered consolidation fails.
+    pub async fn dream_if_idle<F, Fut>(
+        &self,
+        summarize_fn: F,
+    ) -> Result<Option<DreamingStats>, MemoryError>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let idle = self.idle_duration().await;
+        let memory_count = self.memory.stats().await.total;
+        let trigger = dream_trigger(idle, memory_count, &self.config);
+
+        // Cross-check the gate's decision against its inputs (guards against a
+        // future edit desyncing the policy from these two triggers).
+        debug_assert!(
+            trigger != DreamTrigger::Skipped
+                || (idle < Duration::from_secs(self.config.idle_threshold_secs)
+                    && (self.config.memory_pressure_count == 0
+                        || memory_count < self.config.memory_pressure_count)),
+            "Skipped must imply not-idle-yet AND below memory pressure"
+        );
+        debug_assert!(
+            trigger != DreamTrigger::MemoryPressure
+                || (self.config.memory_pressure_count > 0
+                    && memory_count >= self.config.memory_pressure_count),
+            "MemoryPressure must imply the pressure ceiling was reached"
+        );
+
+        if trigger == DreamTrigger::Skipped {
+            debug!(
+                "dream_if_idle: skipped (idle {:?} < {}s, {} memories)",
+                idle, self.config.idle_threshold_secs, memory_count
+            );
+            return Ok(None);
+        }
+
+        info!("dream_if_idle: running ({trigger:?}; idle {idle:?}, {memory_count} memories)");
+        let stats = self.dream(summarize_fn).await?;
+        Ok(Some(stats))
     }
 
     /// Set the embedding function
@@ -300,5 +410,77 @@ mod tests {
         let pending = service.pending_feedback.read().await;
         assert_eq!(pending.get("mem-1").map(|v| v.len()), Some(2));
         assert_eq!(pending.get("mem-2").map(|v| v.len()), Some(1));
+    }
+
+    fn gate_cfg(idle_secs: u64, pressure: usize) -> DreamingConfig {
+        DreamingConfig {
+            idle_threshold_secs: idle_secs,
+            memory_pressure_count: pressure,
+            ..DreamingConfig::default()
+        }
+    }
+
+    #[test]
+    fn dream_trigger_idle_boundary() {
+        let cfg = gate_cfg(300, 0);
+        // Just under the threshold → skipped.
+        assert_eq!(
+            dream_trigger(Duration::from_secs(299), 0, &cfg),
+            DreamTrigger::Skipped
+        );
+        // Exactly at the threshold → idle-triggered.
+        assert_eq!(
+            dream_trigger(Duration::from_secs(300), 0, &cfg),
+            DreamTrigger::Idle
+        );
+    }
+
+    #[test]
+    fn dream_trigger_memory_pressure_overrides_activity() {
+        let cfg = gate_cfg(300, 100);
+        // Not idle at all, but the store is at the pressure ceiling → run anyway.
+        assert_eq!(
+            dream_trigger(Duration::from_secs(0), 100, &cfg),
+            DreamTrigger::MemoryPressure
+        );
+        // Below the ceiling and not idle → skipped.
+        assert_eq!(
+            dream_trigger(Duration::from_secs(1), 99, &cfg),
+            DreamTrigger::Skipped
+        );
+    }
+
+    #[test]
+    fn dream_trigger_pressure_disabled_by_zero() {
+        let cfg = gate_cfg(300, 0);
+        // memory_pressure_count == 0 disables the pressure trigger regardless of count.
+        assert_eq!(
+            dream_trigger(Duration::from_secs(1), 1_000_000, &cfg),
+            DreamTrigger::Skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_if_idle_skips_when_active() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // High idle threshold so a freshly-created service is never "idle".
+        let service = DreamingService::new(gate_cfg(3600, 0));
+        service.record_activity().await;
+
+        let called = AtomicBool::new(false);
+        let result = service
+            .dream_if_idle(|_prompt| {
+                called.store(true, Ordering::SeqCst);
+                async { Ok(String::new()) }
+            })
+            .await
+            .expect("gate must not error");
+
+        assert!(result.is_none(), "an active service must not dream");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "summarize_fn must not be invoked when the cycle is skipped"
+        );
     }
 }
