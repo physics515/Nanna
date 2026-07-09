@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-09 (keyring 3→4 + cargo update · daemon rotating file logs · NaN-safe FSRS consolidation merge · per-channel Markdown down-conversion) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-09 (RustCrypto ed25519/hmac/sha2 majors · cascading `ToolRegistry::unregister` + live tool delete/disable · Tool Enable/Disable control actions · idle/memory-pressure dream gate · reqwest-0.13 + HNSW-crate research folded) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -553,6 +553,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
       - [ ] *(research 2026-07-06)* Use a **pure-Rust HNSW** crate (`hnsw_rs` / `instant-distance`) over a C ext — `sqlite-vec` is brute-force only; `vectorlite` shows HNSW at `ef_construction=100, M=30` scales well. Fits the Turso-only + in-RAM-cosine model (build the index in RAM, persist coeff/graph as Turso BLOBs). Sources: [vectorlite](https://github.com/1yefuwang1/vectorlite), [sqlite-vec ANN issue](https://github.com/asg017/sqlite-vec/issues/25).
+      - [ ] *(research 2026-07-09)* Crate shortlist (all pure-Rust, actively maintained early 2026): **`hnsw_rs`** — multithreaded build/search via `parking_lot`, SIMD distances through `anndists` (L1/L2/Cosine/Hamming/…), the most feature-complete; **`hnswlib-rs`** — designed for **concurrent search + concurrent mutation** with an `InMemoryVectorStore` doing **lock-free reads + parallel updates** (best fit for a live memory store that dreams while serving recalls, avoids a global rebuild); **`instant-distance`** — smallest/simplest pure-Rust HNSW if we want minimal surface. Lean `hnswlib-rs` for the online/insert-while-query case, `hnsw_rs` if we need its distance breadth. Sources: [hnsw_rs](https://crates.io/crates/hnsw_rs), [hnswlib-rs](https://github.com/jean-pierreBoth/hnswlib-rs), [instant-distance](https://lib.rs/crates/instant-distance).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
@@ -625,6 +626,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    (daemon+server), `socket2 0.5→0.6` (daemon). **Deferred majors** (each needs a real migration — build
    green + tests + benches before landing; do one per run):
    - [ ] `reqwest 0.12→0.13` (workspace-wide HTTP client — wide ripple)
+         - [ ] *(research 2026-07-09)* 0.13 migration notes: **default TLS flips native-tls → rustls**, and the rustls crypto provider defaults to **aws-lc** (not `ring`) — audit every `reqwest` dep across the workspace and pin the intended TLS feature explicitly (aws-lc pulls a C toolchain; if we want to stay pure-Rust/no-C, request `rustls-tls` with the `ring` provider or keep `native-tls`). `RequestBuilder::query()`/`form()` are now **opt-in features** (disabled by default) — grep our call sites and enable them or we lose serde-backed query/form building. Several TLS methods renamed (soft-deprecated, e.g. `use_rustls_tls()` → `tls_backend_rustls()`); `trust-dns` feature removed. Sources: [reqwest v0.13 — rustls by default](https://seanmonstar.com/blog/reqwest-v013-rustls-default/), [reqwest CHANGELOG](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md).
    - [ ] `tokio-tungstenite 0.26→0.29` (IPC/WebSocket across client/daemon/gui/mcp/channels)
    - [ ] `deno_core 0.375→0.406` + `deno_ast 0.51→0.53` + `swc_core 7→72` (nanna-scripting — large)
    - [ ] `rustpython-{vm,stdlib,pylib} 0.4→0.5` (nanna-scripting)
