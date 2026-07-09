@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-07 (webhook signature verification + deps/Cargo.lock + de-flaked credential test + true memory merge + Turso rename) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-09 (keyring 3→4 + cargo update · daemon rotating file logs · NaN-safe FSRS consolidation merge · per-channel Markdown down-conversion) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -254,6 +254,11 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] No GitHub secret scanning enabled.
 - [ ] Store all secrets in OS keychain by default; remove secret fields from config.toml.
 - [ ] Encrypt the SecureStore file fallback with AES-GCM (OS-protected key) or remove fallback; correct the misleading "encrypted" comment.
+      - [ ] *(research 2026-07-09)* `keyring 4` (now on the workspace) split into a `keyring-core` layer
+            exposing a pluggable `CredentialStore`/`CredentialBuilder` trait registrable via
+            `keyring::set_default_store(..)`. That's the clean seam for this item: implement an
+            encrypted-file `CredentialStore` (AES-GCM) and register it as the default when no OS keyring is
+            present, instead of the ad-hoc plaintext-JSON fallback in `credentials.rs`. Source: [keyring-core docs](https://docs.rs/keyring-core).
 - [ ] Set a restrictive Tauri CSP (not null).
 - [ ] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
 - [ ] Per-tool toggles visible in GUI; audit log for every tool call.
@@ -496,6 +501,7 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 - [ ] **One binary, dual backend, runtime probe** — compile BOTH `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `NdArray` CPU; a cheap `wgpu::Instance::enumerate_adapters` probe (cached in `OnceCell`) picks GPU if present, else CPU. No feature-split builds. (laurelane `use_gpu()` pattern.)
 - [ ] **First model: a Hermes-class function-calling small model** — a from-scratch Burn decoder (start from laurelane's Qwen2.5 / LFM2 modules: RmsNorm + GQA + RoPE + SwiGLU, tied lm_head) sized for one GPU (1.5–3B). Prove tool-calling quality is good enough to run the loop.
       - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
+      - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-07)* Tool-budget evidence **validates the two-tier tool discovery design**: each tool definition costs ~50–150 tokens; keep the always-sent set **under 5–10 tools** for 7–9B models (Nanna's core-tools-vs-`discover_tools` split already does this). Add a benchmark asserting the local model's active-tool count stays within this budget, and prefer `discover_tools` activation over sending the full registry on the local path.
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
