@@ -53,9 +53,9 @@ tower-http = { version = "0.7", features = ["cors", "trace"] }
 socket2 = "0.6"
 
 # Webhook signature verification (Discord Ed25519, Slack HMAC-SHA256)
-ed25519-dalek = "2.2"
-hmac = "0.12"
-sha2 = "0.10"
+ed25519-dalek = "3.0"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 
 # CLI

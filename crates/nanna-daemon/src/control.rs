@@ -319,10 +319,52 @@ impl ControlPlane {
         if let Some(ref tools) = self.tools {
             user_tools.register_with_registry(tools).await;
         }
-        
+
         Ok(count)
     }
-    
+
+    /// Reconcile the live tool registry with a user tool's current state.
+    ///
+    /// Drops any existing registration, then re-registers only if the tool is
+    /// enabled. This makes an edit / enable / disable take effect immediately
+    /// (a disabled tool stops executing; an enabled tool becomes callable)
+    /// without a daemon restart. No-op when no registry or tool manager is wired.
+    async fn reconcile_tool_registration(&self, meta: &crate::user_tools::UserToolMeta) {
+        let (Some(tools), Some(user_tools)) = (self.tools.as_ref(), self.user_tools.as_ref())
+        else {
+            return;
+        };
+        tools.unregister(&meta.name).await;
+        if meta.enabled {
+            match user_tools.create_tool_impl(meta) {
+                Ok(tool_impl) => tools.register_boxed(tool_impl).await,
+                Err(e) => warn!(
+                    "Tool '{}' saved but failed to (re)register: {}",
+                    meta.name, e
+                ),
+            }
+        }
+    }
+
+    /// Persist a user tool's enabled flag and reconcile the live registry.
+    async fn set_user_tool_enabled(&self, name: &str, enabled: bool) -> Value {
+        let Some(ref user_tools) = self.user_tools else {
+            return json!({ "error": "user_tools_unavailable", "message": "User tool manager not configured" });
+        };
+        match user_tools
+            .update_tool(name, None, None, None, None, Some(enabled))
+            .await
+        {
+            Ok(meta) => {
+                self.reconcile_tool_registration(&meta).await;
+                let status = if enabled { "enabled" } else { "disabled" };
+                info!("{} user tool: {}", status, name);
+                json!({ "status": status, "name": name })
+            }
+            Err(e) => json!({ "error": "update_failed", "message": e }),
+        }
+    }
+
     /// Set the system prompt
     pub async fn set_system_prompt(&self, prompt: String) {
         let mut sp = self.system_prompt.write().await;
@@ -1581,13 +1623,8 @@ impl ControlPlane {
                     json!({ "error": "not_found", "name": name })
                 }
             }
-            ToolAction::Enable { name } => {
-                // TODO: Implement enable/disable
-                json!({ "status": "not_implemented", "name": name })
-            }
-            ToolAction::Disable { name } => {
-                json!({ "status": "not_implemented", "name": name })
-            }
+            ToolAction::Enable { name } => self.set_user_tool_enabled(&name, true).await,
+            ToolAction::Disable { name } => self.set_user_tool_enabled(&name, false).await,
             ToolAction::Execute { name, input } => {
                 use nanna_tools::ToolCall;
                 
@@ -1667,6 +1704,9 @@ impl ControlPlane {
                 
                 match user_tools.update_tool(&name, description, code, None, permissions, None).await {
                     Ok(meta) => {
+                        // Make the edit take effect live: drop the old registration
+                        // and re-register the new source (if still enabled).
+                        self.reconcile_tool_registration(&meta).await;
                         info!("Updated user tool: {}", name);
                         json!({
                             "status": "updated",
@@ -1689,6 +1729,12 @@ impl ControlPlane {
                 
                 match user_tools.delete_tool(&name).await {
                     Ok(()) => {
+                        // Make the deletion take effect live: a tool that's gone
+                        // from disk must also stop being callable without a daemon
+                        // restart (previously it lingered in the registry).
+                        if let Some(ref tools) = self.tools {
+                            tools.unregister(&name).await;
+                        }
                         info!("Deleted user tool: {}", name);
                         json!({ "status": "deleted", "name": name })
                     }
@@ -2518,5 +2564,44 @@ mod tests {
         );
         let second = cp.uptime_secs();
         assert!(second >= first, "uptime must be monotonic non-decreasing");
+    }
+
+    #[tokio::test]
+    async fn enable_disable_reconciles_live_registry() {
+        use crate::user_tools::UserToolManager;
+        use nanna_tools::ToolRegistry;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(ToolRegistry::new());
+        let user_tools = Arc::new(UserToolManager::new(tmp.path().to_path_buf()));
+
+        let source =
+            "export default { name: \"t_demo\", description: \"demo\", execute(p) { return \"ok\"; } }";
+        user_tools
+            .create_tool("t_demo".into(), "demo".into(), source.into(), None, None, None)
+            .await
+            .expect("create tool");
+        user_tools.register_with_registry(&registry).await;
+        assert!(registry.get("t_demo").await.is_some(), "tool should start registered");
+
+        let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        cp.tools = Some(registry.clone());
+        cp.user_tools = Some(user_tools.clone());
+
+        // Disable → the tool is dropped from the live registry (stops executing).
+        let resp = cp.set_user_tool_enabled("t_demo", false).await;
+        assert_eq!(resp["status"], "disabled");
+        assert!(
+            registry.get("t_demo").await.is_none(),
+            "disabled tool must not remain callable"
+        );
+
+        // Re-enable → the tool becomes callable again without a restart.
+        let resp = cp.set_user_tool_enabled("t_demo", true).await;
+        assert_eq!(resp["status"], "enabled");
+        assert!(
+            registry.get("t_demo").await.is_some(),
+            "re-enabled tool must be registered again"
+        );
     }
 }
