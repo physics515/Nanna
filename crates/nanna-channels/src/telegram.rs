@@ -478,7 +478,8 @@ impl Channel for TelegramChannel {
                 | ChannelFeatures::POLLS
                 | ChannelFeatures::PINS
                 | ChannelFeatures::TYPING
-                | ChannelFeatures::STICKERS,
+                | ChannelFeatures::STICKERS
+                | ChannelFeatures::MARKDOWN,
             max_message_length: Some(4096),
         }
     }

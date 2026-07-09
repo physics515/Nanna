@@ -537,7 +537,8 @@ impl Channel for DiscordChannel {
                 | ChannelFeatures::IMAGES
                 | ChannelFeatures::DOCUMENTS
                 | ChannelFeatures::PINS
-                | ChannelFeatures::TYPING,
+                | ChannelFeatures::TYPING
+                | ChannelFeatures::MARKDOWN,
             max_message_length: Some(2000),
         }
     }

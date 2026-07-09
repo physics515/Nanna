@@ -15,6 +15,7 @@
 //! The `ListenerManager` coordinates inbound listeners.
 
 pub mod discord;
+pub mod format;
 pub mod listeners;
 pub mod queue;
 pub mod signal;
@@ -24,6 +25,7 @@ pub mod telegram;
 pub mod whatsapp;
 
 pub use discord::DiscordChannel;
+pub use format::{format_for_channel, strip_markdown};
 pub use listeners::{
     BreakerAction, CircuitBreaker, DiscordListener, Listener, ListenerError, ListenerHandle,
     ListenerManager, SignalListener, SignalReceiveMode, SlackListener, TelegramListener,
@@ -169,6 +171,9 @@ bitflags! {
         const TYPING     = 0b0010_0000_0000;
         const UPLOADS    = 0b0100_0000_0000;
         const STICKERS   = 0b1000_0000_0000;
+        /// The channel renders Markdown (bold/italic/code/links). When absent,
+        /// outgoing text is down-converted to plain text before sending.
+        const MARKDOWN   = 0b0001_0000_0000_0000;
     }
 }
 
@@ -252,6 +257,12 @@ impl ChannelCapabilities {
     #[must_use]
     pub const fn supports_stickers(&self) -> bool {
         self.features.contains(ChannelFeatures::STICKERS)
+    }
+
+    /// Check if the channel renders Markdown formatting.
+    #[must_use]
+    pub const fn supports_markdown(&self) -> bool {
+        self.features.contains(ChannelFeatures::MARKDOWN)
     }
 }
 
@@ -380,11 +391,15 @@ impl MessageRouter {
     ///
     /// Returns `ChannelError::NotFound` if the channel provider is not registered.
     /// May also return errors from the underlying channel implementation.
-    pub async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError> {
+    pub async fn send(&self, mut message: OutgoingMessage) -> Result<String, ChannelError> {
         let channel = self
             .channels
             .get(&message.channel.provider)
             .ok_or_else(|| ChannelError::NotFound(message.channel.provider.clone()))?;
+
+        // Adapt the payload to what this channel can render (e.g. strip Markdown
+        // for plain-text channels) before handing it to the implementation.
+        message.content = format_for_channel(message.content, &channel.capabilities());
 
         channel.send(message).await
     }

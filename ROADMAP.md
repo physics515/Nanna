@@ -344,9 +344,17 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       persistence + embedded fallback + reconnection (currently untested).
 - [ ] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
-- [ ] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
+- [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
       (strip markdown for Signal, tables→text for Telegram, embeds for Discord, Block Kit for Slack).
       Bitflags exist but every channel currently receives identical raw text.
+      *(2026-07-09)* First slice shipped: added a `ChannelFeatures::MARKDOWN` flag + `supports_markdown()`,
+      a pure `nanna-channels::format` module (`format_for_channel` / `strip_markdown`), and wired it into the
+      single outbound chokepoint `MessageRouter::send`. Markdown-rendering channels (Discord/Telegram/Slack)
+      carry the flag → text passes through **unchanged** (zero regression); Signal/WhatsApp now get Markdown
+      down-converted to plain text (headers/blockquotes/fences/bold/inline-code stripped, `[label](url)` →
+      `label (url)`), so they stop showing literal `**`/backticks. Conservative on purpose: single `*`/`_`,
+      `__dunders__`, `snake_case`, and `2 * 3` survive. 7 unit tests. Remaining: tables→text, Discord embeds,
+      Slack Block Kit, and length-aware splitting on `max_message_length`.
 - [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).

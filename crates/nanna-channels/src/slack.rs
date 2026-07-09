@@ -515,7 +515,8 @@ impl Channel for SlackChannel {
                 | ChannelFeatures::THREADS
                 | ChannelFeatures::PINS
                 | ChannelFeatures::UPLOADS
-                | ChannelFeatures::DOCUMENTS,
+                | ChannelFeatures::DOCUMENTS
+                | ChannelFeatures::MARKDOWN,
             max_message_length: Some(40000), // Slack limit
         }
     }
