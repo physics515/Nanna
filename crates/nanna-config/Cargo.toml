@@ -14,7 +14,7 @@ chrono.workspace = true
 reqwest.workspace = true
 
 # Cross-platform credential storage
-keyring = "3"
+keyring = { version = "4", features = ["apple-native-keyring-store"] }
 
 [dev-dependencies]
 tempfile = "3"

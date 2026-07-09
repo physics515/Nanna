@@ -598,7 +598,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    - [ ] `deno_core 0.375→0.406` + `deno_ast 0.51→0.53` + `swc_core 7→72` (nanna-scripting — large)
    - [ ] `rustpython-{vm,stdlib,pylib} 0.4→0.5` (nanna-scripting)
    - [ ] `playwright-rs 0.8→0.14` + `chromiumoxide 0.8→0.9` (nanna-browser)
-   - [ ] `keyring 3→4` (nanna-config)
+   - [x] `keyring 3→4` (nanna-config) — *(2026-07-09)* v4 split platform stores into per-OS `*-keyring-store` crates (no longer default); added `apple-native-keyring-store` and kept the default `windows-native-keyring-store` + `zbus-secret-service-keyring-store` + `v1` compat feature, which preserves the `Entry`/`Error::NoEntry` API so `credentials.rs` compiled unchanged. Build+tests green.
    - [ ] `ed25519-dalek 2→3`, `hmac 0.12→0.13`, `sha2 0.10→0.11` (nanna-server + nanna-daemon — keep pairs aligned)
    - [ ] `scraper 0.22→0.27`, `lopdf 0.34→0.43` (nanna-tools)
    - [ ] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `windows-service 0.7→0.8`, `nix 0.29→0.31` (unix), `criterion 0.5→0.8` (nanna-gpu benches)
