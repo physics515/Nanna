@@ -173,7 +173,7 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Add Start Menu / tray / launch-at-login support.
 - [ ] WebView2 handling on Windows.
 - [ ] Document uninstall process.
-- [ ] Add "check for updates" or auto-update mechanism
+- [ ] Add "check for updates" or auto-update mechanism 
 
 #### P0.1 - First Run UX
 - [ ] Create public facing website / Github Pages
@@ -273,6 +273,7 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Add SECURITY.md with vulnerability disclosure process.
 - [ ] Enable GitHub secret scanning and Dependabot.
 - [ ] Claude UI Testing automations
+- [ ] Implement Mummu model runner to replace the built in
 
 ### P2 — Tools & Channels ✅
 File/shell/web tools, memory tools (remember/recall/reflect), scheduling, browser tools, vision
