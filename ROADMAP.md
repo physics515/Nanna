@@ -528,6 +528,13 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `update_content_and_embedding` fold related-but-distinct content into the existing memory
       (bounded, superset-dedup) and reinforce FSRS. Next: apply the same merge in the batch
       dreaming/consolidation clusterer (`cluster_memories`), which still creates consolidated copies.*
+- [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
+      `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
+      `importance`/`storage_strength` is NaN.
+      *(2026-07-09)* Replaced with a pure `max_finite_or(values, default)` that skips non-finite inputs
+      (NaN/±inf) and falls back to the default when none are finite; added pre/postcondition assertions
+      (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
+      NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
       - [ ] *(research 2026-07-06)* Use a **pure-Rust HNSW** crate (`hnsw_rs` / `instant-distance`) over a C ext — `sqlite-vec` is brute-force only; `vectorlite` shows HNSW at `ef_construction=100, M=30` scales well. Fits the Turso-only + in-RAM-cosine model (build the index in RAM, persist coeff/graph as Turso BLOBs). Sources: [vectorlite](https://github.com/1yefuwang1/vectorlite), [sqlite-vec ANN issue](https://github.com/asg017/sqlite-vec/issues/25).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
