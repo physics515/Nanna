@@ -315,7 +315,15 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).
 - [ ] **Tool allowlists/blocklists** — `ToolPolicy` (global allow/block + per-channel + per-user for multi-user channels).
-- [ ] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
+- [x] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
+      *(2026-07-09)* New `nanna-daemon::log_file` builds a `RollingFileAppender` (DAILY rotation,
+      `filename_prefix="nanna-daemon"`, `.log` suffix, `max_log_files(7)`) wrapped in `tracing_appender::non_blocking`;
+      added as an `Option<fmt::Layer>` beside the console + in-memory-buffer layers. New `--log-dir`
+      (default `{data_dir}/logs`) and `--no-file-log` flags; the worker guard is a `main`-scoped local so it
+      flushes on normal return (a `static` guard would never drop). Pure `resolve_log_dir` + `build_appender`
+      with 4 unit tests; verified by a real `nanna-daemon run` boot writing a prefixed file. Note:
+      `tracing-appender` 0.2.5 supports only time-based rotation (no per-file size cap) — if size-bounding is
+      wanted later, use a custom writer or the `clia/tracing-appender` fork.
 - [ ] Reach **0 clippy warnings** — 3 deferred items remain: refactor `handle_daemon_command`
       (main.rs ~1442-1636, `too_many_lines`), move mid-function `use nanna_client::…` to top (main.rs ~1576,
       `items_after_statements`), drop unused `async` on `is_daemon_running` (main.rs ~1694, `unused_async`).

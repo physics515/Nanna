@@ -31,6 +31,9 @@ use nanna_daemon::windows_service;
 #[command(name = "nanna-daemon")]
 #[command(about = "Nanna AI assistant background daemon")]
 #[command(version)]
+// CLI toggles are naturally independent booleans; a bitflags/enum here would
+// only obscure the arg surface.
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -70,6 +73,15 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Directory for rotating file logs (default: `{data_dir}/logs`).
+    /// Logs roll daily; at most 7 files are kept.
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+
+    /// Disable rotating file logs (console + in-memory buffer only).
+    #[arg(long)]
+    no_file_log: bool,
 }
 
 #[derive(Subcommand)]
@@ -91,6 +103,42 @@ enum Commands {
     /// Run as Windows Service (called by SCM)
     #[cfg(windows)]
     Service,
+}
+
+/// Resolve the log directory and build a non-blocking, daily-rotating file
+/// writer for the daemon. Returns `None` when file logging is disabled
+/// (`--no-file-log`) or the appender can't be built — in both cases startup
+/// falls back to console + in-memory logging rather than aborting.
+fn file_log_writer(
+    cli: &Cli,
+) -> Option<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    if cli.no_file_log {
+        return None;
+    }
+
+    // Resolve the data dir the same way `run_daemon` does so logs land beside
+    // the daemon's data; fall back to the cwd only if that lookup fails.
+    let data_dir = nanna_config::Config::default_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let log_dir = nanna_daemon::log_file::resolve_log_dir(cli.log_dir.as_deref(), &data_dir);
+    debug_assert!(
+        !log_dir.as_os_str().is_empty(),
+        "resolved log dir must be non-empty"
+    );
+
+    match nanna_daemon::log_file::build_appender(&log_dir) {
+        Ok(appender) => {
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            Some((writer, guard))
+        }
+        Err(e) => {
+            // Non-fatal: console + in-memory logging still work.
+            eprintln!("warning: file logging disabled: {e}");
+            None
+        }
+    }
 }
 
 fn main() {
@@ -119,10 +167,25 @@ fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
 
+    // Optional rotating file log. `Option<Layer>` is itself a `Layer` (None is a
+    // no-op), so this composes cleanly whether or not file logging is enabled.
+    // The worker guard is kept as a `main`-scoped local so it drops (flushing the
+    // appender) on normal return; a `static` would never be dropped at exit.
+    let (file_layer, _file_log_guard) = match file_log_writer(&cli) {
+        Some((writer, guard)) => {
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer);
+            (Some(layer), Some(guard))
+        }
+        None => (None, None),
+    };
+
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .with(log_layer)
+        .with(file_layer)
         .init();
 
     // Store log_buffer so run_daemon can pass it to the DaemonBuilder
