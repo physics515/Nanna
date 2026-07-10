@@ -89,11 +89,16 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
     use rustpython_vm as vm;
     use rustpython_vm::compiler::Mode;
 
-    // Create a fresh interpreter with stdlib (native C-equivalent modules + frozen Python bytecode)
-    let interp = vm::Interpreter::with_init(Default::default(), |vm| {
-        vm.add_native_modules(rustpython_stdlib::get_module_inits());
-        vm.add_frozen(rustpython_pylib::FROZEN_STDLIB);
-    });
+    // Create a fresh interpreter with stdlib (native C-equivalent modules + frozen
+    // Python bytecode). rustpython 0.5 replaced `Interpreter::with_init` with a
+    // builder: stdlib module defs come from `stdlib_module_defs(&ctx)` and frozen
+    // modules are added on the builder itself.
+    let builder = vm::Interpreter::builder(Default::default());
+    let stdlib_defs = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
+    let interp = builder
+        .add_native_modules(&stdlib_defs)
+        .add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)
+        .build();
 
     // Build wrapper code that captures everything
     let wrapper = build_wrapper(code, workdir);
@@ -123,7 +128,9 @@ _nanna_json = _nj.dumps(_nanna_result)
                 if let Ok(code_obj) = vm.compile(json_code, Mode::Eval, "<nanna-eval>".to_owned()) {
                     if let Ok(val) = vm.run_code_obj(code_obj, scope) {
                         if let Ok(s) = val.str(vm) {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s.as_str()) {
+                            // rustpython 0.5: PyStr::as_str was replaced by
+                            // to_string_lossy (strings may be non-UTF-8 kinds).
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s.to_string_lossy()) {
                                 return PythonResult {
                                     stdout: parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                     stderr: parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -215,7 +222,7 @@ fn format_exception(
     let msg = obj
         .str(vm)
         .ok()
-        .map(|s| s.as_str().to_owned())
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
     if msg.is_empty() {

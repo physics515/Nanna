@@ -678,25 +678,59 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    Low-risk majors applied green: `directories 5→6` (unified with the workspace pin), `tower-http 0.6→0.7`
    (daemon+server), `socket2 0.5→0.6` (daemon). **Deferred majors** (each needs a real migration — build
    green + tests + benches before landing; do one per run):
-   - [ ] `reqwest 0.12→0.13` (workspace-wide HTTP client — wide ripple)
-         - [ ] *(research 2026-07-09)* 0.13 migration notes: **default TLS flips native-tls → rustls**, and the rustls crypto provider defaults to **aws-lc** (not `ring`) — audit every `reqwest` dep across the workspace and pin the intended TLS feature explicitly (aws-lc pulls a C toolchain; if we want to stay pure-Rust/no-C, request `rustls-tls` with the `ring` provider or keep `native-tls`). `RequestBuilder::query()`/`form()` are now **opt-in features** (disabled by default) — grep our call sites and enable them or we lose serde-backed query/form building. Several TLS methods renamed (soft-deprecated, e.g. `use_rustls_tls()` → `tls_backend_rustls()`); `trust-dns` feature removed. Sources: [reqwest v0.13 — rustls by default](https://seanmonstar.com/blog/reqwest-v013-rustls-default/), [reqwest CHANGELOG](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md).
-   - [ ] `tokio-tungstenite 0.26→0.29` (IPC/WebSocket across client/daemon/gui/mcp/channels)
-   - [ ] `deno_core 0.375→0.406` + `deno_ast 0.51→0.53` + `swc_core 7→72` (nanna-scripting — large)
-   - [ ] `rustpython-{vm,stdlib,pylib} 0.4→0.5` (nanna-scripting)
-   - [ ] `playwright-rs 0.8→0.14` + `chromiumoxide 0.8→0.9` (nanna-browser)
+   - [x] `reqwest 0.12→0.13` — *(2026-07-10, part of the big bump)* default features OFF at the
+         workspace root with `native-tls` selected explicitly (the 0.13 default flips to rustls+aws-lc,
+         whose C/asm build violates "prefer pure-Rust, no-C"); `query`/`form` opt-in features enabled
+         (call sites in channels/config/tools); `charset`/`http2`/`system-proxy` re-added. Channels + GUI
+         now inherit the workspace dep. No source changes needed.
+   - [x] `tokio-tungstenite 0.26→0.29` (client/daemon/gui/mcp/channels) — *(2026-07-10)* compiled unchanged.
+   - [x] `deno_core 0.375→0.407` + `deno_ast 0.51→0.53` (nanna-scripting) — *(2026-07-10)* compiled
+         unchanged; the direct `swc_core` dep turned out to be **dead** (nothing referenced it, no feature
+         enabled it) and conflicted with deno_ast 0.53's exact swc pins (`swc_atoms =9.0.0`) — deleted.
+         **boa_engine/boa_runtime are git-pinned to boa main** (rev `4f98f644`): released boa 0.21.1 pins
+         icu ~2.0 + an old temporal_capi, conflicting with deno_core 0.407 (v8 149 → temporal_capi ^0.2.3)
+         and turso 0.6 (icu 2.2). boa-main API drift was tiny (`JsArray::new` now fallible, 2 sites).
+         Drop back to crates.io when boa releases with icu 2.2.
+   - [x] `rustpython-{vm,stdlib,pylib} 0.4→0.5` (nanna-scripting) — *(2026-07-10)* migrated to the new
+         `Interpreter::builder` (`stdlib_module_defs(&builder.ctx)` + `add_frozen_modules(FROZEN_STDLIB)`
+         replace `with_init`/`get_module_inits`); `PyStr::as_str` → `to_string_lossy()` (2 sites).
+   - [x] `playwright-rs 0.8→0.14` + `chromiumoxide 0.8→0.9` (nanna-browser) — *(2026-07-10)* chromiumoxide
+         0.9 dropped the `tokio-runtime` feature (tokio-only now) and its `Arg` lost `From<&String>`
+         (pass owned). playwright-rs compiled unchanged.
+   - [x] `wgpu 24→30` (nanna-gpu) — *(2026-07-10)* migrated: `Instance::default()`, `request_adapter`
+         returns `Result`, `DeviceDescriptor` gained `experimental_features`/`trace` (+ single-arg
+         `request_device`), `Maintain` → `PollType::Wait{submission_index,timeout}` (poll returns Result),
+         `get_mapped_range[_mut]` return `Result`, `BufferViewMut` writes via `.slice(..).copy_from_slice`,
+         `PipelineLayoutDescriptor.bind_group_layouts` takes `Option<&_>` (+ `push_constant_ranges` →
+         `immediate_size`). **Bench-validated live on the 4070 Ti SUPER**: GPU fixed dispatch overhead
+         improved ~750µs → ~200µs; SIMD still wins ≤10k vectors (crossover unchanged, `GPU_THRESHOLD`
+         stays 50k). Note: the old "wgpu pinned for onyums/tauri/burn" constraint was consciously dropped
+         (neither onyums nor burn is in-tree yet; revisit at P9/P12 integration).
+   - [x] `wide 0.7→1.5` (nanna-simd) — *(2026-07-10)* `as_array_ref()` → `as_array()` (3 sites).
+   - [x] `turso =0.4.4 → =0.6.1` + `aegis =0.9.7 → =0.9.12` (nanna-storage) — *(2026-07-10)* **fixes the
+         daemon startup panic** (`turso_core 0.4.4 btree.rs:943 "we can't have more pages to read while
+         also have read everything"`) that killed the daemon while bulk-loading the memories table and
+         forced the GUI into embedded fallback. Root cause: 0.4.4 wrote an **inconsistent overflow chain**
+         into the memories btree, then panicked reading it back. 0.6.1 detects the same condition and
+         returns a proper `Err` ("inconsistent overflow chain observed during payload read") which the
+         existing load handler logs — **daemon reaches "Daemon ready"** (validated against a copy of the
+         real crashing DB). Consequence: memories in the corrupted table are unreadable (load as 0) and
+         will re-accumulate. aegis 0.9.12 built clean on stock MSVC (no clang-cl needed in this setup).
    - [x] `keyring 3→4` (nanna-config) — *(2026-07-09)* v4 split platform stores into per-OS `*-keyring-store` crates (no longer default); added `apple-native-keyring-store` and kept the default `windows-native-keyring-store` + `zbus-secret-service-keyring-store` + `v1` compat feature, which preserves the `Entry`/`Error::NoEntry` API so `credentials.rs` compiled unchanged. Build+tests green.
    - [x] `ed25519-dalek 2→3`, `hmac 0.12→0.13`, `sha2 0.10→0.11` (nanna-server + nanna-daemon) — *(2026-07-09)* bumped in lockstep across both crates. Only breakage: hmac 0.13's `Mac` trait no longer re-exports `new_from_slice`, so the Slack-HMAC call sites now `use hmac::KeyInit`. ed25519-dalek 3 (`from_bytes`/`verify_strict`/`Signer`) and sha2 0.11 compiled unchanged. Webhook signature tests (Slack HMAC-SHA256 + Discord Ed25519, incl. tamper/replay cases) stay green; 25 daemon lib tests pass.
    - [x] `scraper 0.22→0.27`, `lopdf 0.34→0.44` (nanna-tools) — *(2026-07-10)* both bumped, no code
          changes; markup5ever/selectors/cssparser pulled forward transitively. `nanna-tools` builds green,
          44 tests pass.
-   - [ ] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `nix 0.29→0.31` (unix)
+   - [x] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `nix 0.29→0.31` (unix), `tokio 1.52`,
+         `uuid 1.23`, `half 2.7`, `bytemuck 1.25`, `sha2 0.11` (gui) — *(2026-07-10)* all compiled unchanged.
    - [x] `windows-service 0.7→0.8` (daemon) — *(2026-07-10)* bumped, no code changes; `windows_service.rs`
          API (`service_dispatcher`/`service_control_handler`/`ServiceStatus`) unchanged. Daemon builds green,
          26 tests pass.
    - [x] `criterion 0.5→0.8` (nanna-gpu benches) — *(2026-07-10)* bumped; the four benches use
          `harness = false` (custom mains) so criterion is an unreferenced dev-dep — benches compile clean.
    - [ ] GUI `pnpm update --latest` sweep in `gui/`
-   - Pins held: `wgpu` (onyums/tauri/burn), `turso =0.4.4`, `aegis =0.9.7`.
+   - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
+     crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.

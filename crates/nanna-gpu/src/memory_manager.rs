@@ -421,7 +421,15 @@ impl DeviceExt for wgpu::Device {
             mapped_at_creation: true,
         });
 
-        buffer.slice(..).get_mapped_range_mut()[..desc.contents.len()]
+        // wgpu 30: get_mapped_range_mut returns a Result, and BufferViewMut is
+        // written via slice().copy_from_slice (no direct indexing). A buffer
+        // created with `mapped_at_creation: true` is mapped by construction —
+        // failure here is a programmer error, so the expect is an invariant assert.
+        buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("buffer created with mapped_at_creation must be mappable")
+            .slice(..desc.contents.len())
             .copy_from_slice(desc.contents);
         buffer.unmap();
 

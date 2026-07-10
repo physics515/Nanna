@@ -25,17 +25,23 @@ walkdir = "2"
 directories.workspace = true
 
 # Boa - Pure Rust JS engine (lightweight)
-boa_engine = { version = "0.21", optional = true }
-boa_runtime = { version = "0.21", optional = true }
+# Git-pinned past the 0.21.1 release: released boa pins icu ~2.0 and an older
+# temporal_capi, both of which conflict with deno_core 0.407 (v8 149 needs
+# temporal_capi ^0.2.3) and turso 0.6+ (icu 2.2). Boa main tracks current
+# icu/temporal. Pin an exact rev for reproducibility; drop back to crates.io
+# once boa releases with icu 2.2 / temporal_capi 0.2.3+.
+boa_engine = { git = "https://github.com/boa-dev/boa.git", rev = "4f98f6446812f1c5923153f8c7e1beda3a891bfe", optional = true }
+boa_runtime = { git = "https://github.com/boa-dev/boa.git", rev = "4f98f6446812f1c5923153f8c7e1beda3a891bfe", optional = true }
 
 # Deno - V8-based (full featured fallback)
-# NOTE: deno_core and boa_engine have conflicting ICU versions at latest - use one or the other
 deno_core = { version = "0.407", optional = true }
 deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
 deno_error = { version = "0.7", optional = true }
 
-# TypeScript transpilation for Boa
-swc_core = { version = "73", features = ["ecma_parser", "ecma_transforms", "ecma_codegen", "common"], optional = true }
+# NOTE: the old direct `swc_core` dep ("TypeScript transpilation for Boa") was
+# dead — nothing in this crate referenced it, no feature enabled it, and its
+# version conflicted with deno_ast 0.53's exact swc pins. TS transpilation for
+# the Deno path comes from deno_ast's own bundled swc.
 
 # RustPython - Embedded Python interpreter (no system Python needed)
 rustpython-vm = { version = "0.5", default-features = false, features = ["compiler", "encodings", "freeze-stdlib"], optional = true }
