@@ -150,6 +150,28 @@ pub struct AgentConfig {
     pub thinking_enabled: bool,
     /// Enable streaming responses
     pub streaming_enabled: bool,
+    /// Absolute cap on agent-loop iterations (tool-call rounds). `None` = unlimited
+    /// (the default) — the agent is a long-horizon worker; only Stop/cancel ends it.
+    /// A value here is a pure runaway backstop for unattended runs.
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Iteration at which the first escalating "wrap-up" soft nudge is injected.
+    /// The loop is NOT stopped — the nudge only steers a possibly-stuck model.
+    /// Default: 500.
+    #[serde(default = "default_nudge_after")]
+    pub nudge_after_iterations: usize,
+    /// After the first nudge, inject a further (more urgent) nudge every N
+    /// iterations. Default: 100.
+    #[serde(default = "default_nudge_interval")]
+    pub nudge_interval_iterations: usize,
+}
+
+fn default_nudge_after() -> usize {
+    500
+}
+
+fn default_nudge_interval() -> usize {
+    100
 }
 
 impl Default for AgentConfig {
@@ -160,6 +182,9 @@ impl Default for AgentConfig {
             personality_mode: "balanced".to_string(),
             thinking_enabled: false,
             streaming_enabled: true,
+            max_iterations: None,
+            nudge_after_iterations: default_nudge_after(),
+            nudge_interval_iterations: default_nudge_interval(),
         }
     }
 }

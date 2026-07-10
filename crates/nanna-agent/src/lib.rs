@@ -32,8 +32,9 @@ pub use registry::{
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
-    ModelTier, ReasoningBlock, ReasoningContent, RunOptions, StreamCallback, TaskComplexity,
-    ThinkingCallback, ThinkingMode, ToolCallRecord,
+    ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions, StreamCallback,
+    TaskComplexity, ThinkingCallback, ThinkingMode, ToolCallRecord, wrapup_nudge_due,
+    wrapup_nudge_message,
 };
 pub use multi::{
     AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,

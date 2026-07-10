@@ -62,8 +62,16 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     /// Temperature for sampling
     pub temperature: f32,
-    /// Maximum iterations (tool call rounds). None = unlimited.
+    /// Maximum iterations (tool call rounds). None = unlimited (the default).
+    /// This is only an absolute runaway backstop; the loop is meant to run long.
     pub max_iterations: Option<usize>,
+    /// Iteration at which the first escalating "wrap-up" soft nudge is injected.
+    /// The loop is NOT stopped — the nudge only steers a possibly-stuck model.
+    /// Default: 500.
+    pub nudge_after_iterations: usize,
+    /// After the first nudge, inject a further (more urgent) nudge every N
+    /// iterations. Default: 100.
+    pub nudge_interval_iterations: usize,
     /// Thinking mode for extended reasoning
     pub thinking_mode: ThinkingMode,
     /// Model priority list for summarization (first working model is used)
@@ -146,6 +154,8 @@ impl Default for AgentConfig {
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: None,
+            nudge_after_iterations: 500,
+            nudge_interval_iterations: 100,
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
@@ -490,6 +500,70 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     false
 }
 
+/// Escalating firmness of a wrap-up nudge. The nudge only *steers* a long-running
+/// (possibly stuck) agent — it never stops the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeLevel {
+    /// First, gentle: keep going if progressing, else pause and answer.
+    Gentle,
+    /// Firmer: consider wrapping up with a progress report.
+    Firm,
+    /// Most urgent: wrap up now and respond with what you have.
+    Urgent,
+}
+
+/// Decide whether an escalating wrap-up nudge is due on this iteration.
+///
+/// Nudges begin at `nudge_after` and repeat every `nudge_interval` iterations,
+/// escalating with each one already fired (`nudge_count`). Returns `None` when no
+/// nudge is due. This NEVER stops the loop — the agent is meant to run long; the
+/// nudge is a late "are you actually stuck?" steer. Pure (no clock/IO) so the
+/// schedule is exhaustively testable.
+#[must_use]
+pub fn wrapup_nudge_due(
+    iteration: usize,
+    nudge_after: usize,
+    nudge_interval: usize,
+    nudge_count: usize,
+) -> Option<NudgeLevel> {
+    if iteration < nudge_after {
+        return None;
+    }
+    // Guard against a 0 interval (would be div-by-zero / a nudge every iteration).
+    let interval = nudge_interval.max(1);
+    if (iteration - nudge_after) % interval != 0 {
+        return None;
+    }
+    let level = match nudge_count {
+        0 => NudgeLevel::Gentle,
+        1 => NudgeLevel::Firm,
+        _ => NudgeLevel::Urgent,
+    };
+    debug_assert!(iteration >= nudge_after, "nudge must not fire before nudge_after");
+    Some(level)
+}
+
+/// Render an escalating wrap-up nudge as an injectable `[SYSTEM: ...]` message.
+#[must_use]
+pub fn wrapup_nudge_message(level: NudgeLevel, iteration: usize) -> String {
+    match level {
+        NudgeLevel::Gentle => format!(
+            "[SYSTEM: You've made {iteration} tool calls — this is a long run. If you're \
+             making steady progress, keep going and take as long as you need. If you're going \
+             in circles or repeating the same actions, pause and respond with what you have.]"
+        ),
+        NudgeLevel::Firm => format!(
+            "[SYSTEM: {iteration} tool calls and still going. If the task is nearly done, finish \
+             it. Otherwise consider wrapping up with a progress report — you can continue in the \
+             next turn.]"
+        ),
+        NudgeLevel::Urgent => format!(
+            "[SYSTEM: You've made {iteration} tool calls — a very long run. Please wrap up now and \
+             respond to the user with your progress so far. You can pick this up again next turn.]"
+        ),
+    }
+}
+
 /// Detect repetitive text by checking if the same line appears multiple times.
 /// Returns `true` if significant repetition is found.
 fn detect_repetition(text: &str) -> bool {
@@ -713,64 +787,29 @@ impl Agent {
                 }
             }
 
-            // Progressive wrap-up nudges: gentle at first, increasingly urgent.
-            // Sub-agents get earlier nudges since they're focused tasks.
-            // Main agents get high thresholds to avoid interrupting productive coding loops.
-            {
-                let i = state.iterations;
-                let nudge_msg = if options.is_sub_agent {
-                    // Sub-agent nudge schedule: 40 → 60 → 80 → every 20 after 100
-                    // Gentle ramp — sub-agents often need many iterations for real work
-                    // (auditing files, fixing lints, etc.). Don't rush them.
-                    if i == 40 && state.wrapup_nudge_count == 0 {
-                        Some("[SYSTEM: You've made 40 tool calls. You're a sub-agent. \
-                              If you're making steady progress, keep going — take as long as you need. \
-                              If you're going in circles or repeating yourself, wrap up with what you have.]")
-                    } else if i == 60 && state.wrapup_nudge_count <= 1 {
-                        Some("[SYSTEM: 60 tool calls. If the task is nearly done, finish it. \
-                              If there's a lot remaining, consider wrapping up with a progress report \
-                              so the parent agent can spawn follow-up tasks for the rest.]")
-                    } else if i == 80 && state.wrapup_nudge_count <= 2 {
-                        Some("[SYSTEM: 80 tool calls — this is a long sub-task. Please start wrapping up. \
-                              Report what you've completed, what remains, and any issues encountered.]")
-                    } else if i >= 100 && (i - 100) % 20 == 0 {
-                        Some("[SYSTEM: This sub-task has been running for a very long time. \
-                              Please finish up and return your results now. The parent agent \
-                              can spawn follow-up tasks if more work is needed.]")
-                    } else {
-                        None
-                    }
-                } else {
-                    // Main agent nudge schedule: 50 → 75 → every 25 after 100
-                    if i == 50 && state.wrapup_nudge_count == 0 {
-                        Some("[SYSTEM: You've made 50 tool calls — this is a long run. If you're \
-                              making steady progress, keep going. If you're going in circles, \
-                              pause and respond with what you have so far.]")
-                    } else if i == 75 && state.wrapup_nudge_count <= 1 {
-                        Some("[SYSTEM: 75 tool calls. Consider wrapping up soon. It's better to \
-                              deliver partial progress and let the user redirect than to keep \
-                              iterating indefinitely.]")
-                    } else if i >= 100 && (i - 100) % 25 == 0 {
-                        Some("[SYSTEM: You've made a very large number of tool calls. \
-                              Please wrap up and respond to the user with your progress so far. \
-                              You can continue in the next turn if needed.]")
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(msg) = nudge_msg {
-                    state.wrapup_nudge_count += 1;
-                    info!(
-                        iteration = i,
-                        nudge_count = state.wrapup_nudge_count,
-                        "⏰ Injecting wrap-up nudge (level {})",
-                        state.wrapup_nudge_count
-                    );
-                    let nudge = AnthropicMessage::user_text(msg);
-                    let mut ctx = self.context.write().await;
-                    ctx.messages.push(nudge);
-                }
+            // Progressive wrap-up nudges: escalating, config-driven, and LATE. The
+            // agent is meant to run long, so nudges only begin at
+            // `nudge_after_iterations` (default 500) and repeat every
+            // `nudge_interval_iterations` (default 100). They only STEER a possibly-stuck
+            // model; they never stop the loop — termination is `max_iterations`
+            // (default unlimited) or cancellation.
+            if let Some(level) = wrapup_nudge_due(
+                state.iterations,
+                self.config.nudge_after_iterations,
+                self.config.nudge_interval_iterations,
+                state.wrapup_nudge_count,
+            ) {
+                let msg = wrapup_nudge_message(level, state.iterations);
+                state.wrapup_nudge_count += 1;
+                info!(
+                    iteration = state.iterations,
+                    nudge_count = state.wrapup_nudge_count,
+                    ?level,
+                    "⏰ Injecting wrap-up nudge"
+                );
+                let nudge = AnthropicMessage::user_text(&msg);
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(nudge);
             }
 
             debug!(
@@ -2992,6 +3031,44 @@ fn is_write_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nudge_does_not_fire_before_threshold() {
+        // Default schedule: first nudge at 500. Nothing before it.
+        for i in [0usize, 1, 10, 100, 499] {
+            assert_eq!(wrapup_nudge_due(i, 500, 100, 0), None, "iteration {i}");
+        }
+    }
+
+    #[test]
+    fn nudge_fires_at_threshold_then_every_interval_escalating() {
+        // First nudge exactly at nudge_after, gentle.
+        assert_eq!(wrapup_nudge_due(500, 500, 100, 0), Some(NudgeLevel::Gentle));
+        // Off-interval iterations in between do not fire.
+        assert_eq!(wrapup_nudge_due(550, 500, 100, 1), None);
+        assert_eq!(wrapup_nudge_due(599, 500, 100, 1), None);
+        // Next interval fires, firmer (nudge_count now 1).
+        assert_eq!(wrapup_nudge_due(600, 500, 100, 1), Some(NudgeLevel::Firm));
+        // Third and beyond are urgent.
+        assert_eq!(wrapup_nudge_due(700, 500, 100, 2), Some(NudgeLevel::Urgent));
+        assert_eq!(wrapup_nudge_due(1500, 500, 100, 9), Some(NudgeLevel::Urgent));
+    }
+
+    #[test]
+    fn nudge_interval_zero_is_guarded() {
+        // A 0 interval must not panic (div-by-zero) nor fire every iteration off-boundary.
+        assert_eq!(wrapup_nudge_due(500, 500, 0, 0), Some(NudgeLevel::Gentle));
+        assert_eq!(wrapup_nudge_due(501, 500, 0, 1), Some(NudgeLevel::Firm)); // interval floored to 1
+    }
+
+    #[test]
+    fn nudge_message_mentions_the_iteration_and_never_stops() {
+        let msg = wrapup_nudge_message(NudgeLevel::Gentle, 512);
+        assert!(msg.contains("512"));
+        // Gentle nudge invites continuing, not stopping.
+        assert!(msg.to_lowercase().contains("keep going"));
+        assert!(wrapup_nudge_message(NudgeLevel::Urgent, 999).contains("999"));
+    }
 
     fn raw(content: &str) -> ExtractedMemoryRaw {
         ExtractedMemoryRaw {
