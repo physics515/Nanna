@@ -78,7 +78,8 @@ impl Browser for CdpBrowser {
             .arg("--disable-dev-shm-usage");
 
         for arg in &self.config.args {
-            builder = builder.arg(arg);
+            // chromiumoxide 0.9: Arg is not From<&String>; pass an owned String.
+            builder = builder.arg(arg.clone());
         }
 
         let co_config = builder

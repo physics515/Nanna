@@ -44,19 +44,17 @@ impl GpuContext {
     /// Returns `GpuError::NoAdapter` if no GPU adapter is found.
     /// Returns `GpuError::DeviceCreation` if the GPU device cannot be created.
     pub async fn new() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        // wgpu 30: Instance::default() == all backends (what the old explicit
+        // InstanceDescriptor { backends: all(), .. } spelled out).
+        let instance = wgpu::Instance::default();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
-            .ok_or(GpuError::NoAdapter)?;
+            .map_err(|_| GpuError::NoAdapter)?;
 
         let adapter_info = adapter.get_info();
         info!(
@@ -65,15 +63,13 @@ impl GpuContext {
         );
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("nanna-gpu"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("nanna-gpu"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            })
             .await?;
 
         Ok(Self {
@@ -276,8 +272,8 @@ impl CosineSimilaritySearch {
 
         let pipeline_layout = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cosine_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            ..Default::default()
         });
 
         let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -413,13 +409,19 @@ impl CosineSimilaritySearch {
             let _ = tx.send(result);
         });
 
-        ctx.device.poll(wgpu::Maintain::Wait);
+        // wgpu 30: Maintain → PollType; poll now returns a Result.
+        ctx.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .map_err(|_| GpuError::BufferMapping)?;
 
         rx.await
             .map_err(|_| GpuError::BufferMapping)?
             .map_err(|_| GpuError::BufferMapping)?;
 
-        let data = buffer_slice.get_mapped_range();
+        // wgpu 30: get_mapped_range returns a Result.
+        let data = buffer_slice
+            .get_mapped_range()
+            .map_err(|_| GpuError::BufferMapping)?;
         let results: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging_buffer.unmap();
@@ -460,7 +462,15 @@ impl DeviceExt for wgpu::Device {
             mapped_at_creation: true,
         });
         
-        buffer.slice(..).get_mapped_range_mut()[..desc.contents.len()]
+        // wgpu 30: get_mapped_range_mut returns a Result, and BufferViewMut is
+        // written via slice().copy_from_slice (no direct indexing). A buffer
+        // created with `mapped_at_creation: true` is mapped by construction —
+        // failure here is a programmer error, so the expect is an invariant assert.
+        buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("buffer created with mapped_at_creation must be mappable")
+            .slice(..desc.contents.len())
             .copy_from_slice(desc.contents);
         buffer.unmap();
         

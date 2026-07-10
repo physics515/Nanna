@@ -79,8 +79,22 @@ wide = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# HTTP client
-reqwest = { version = "0.13", features = ["json", "rustls-tls", "stream", "multipart"] }
+# HTTP client. reqwest 0.13 notes: the default TLS flipped to rustls+aws-lc,
+# whose C/asm build (cmake+nasm) violates "prefer pure-Rust, no-C" — so default
+# features are off and `native-tls` (Windows SChannel / OS TLS, the 0.12
+# behavior) is selected explicitly. `query`/`form` became opt-in features;
+# `charset`/`http2`/`system-proxy` re-add the remaining defaults.
+reqwest = { version = "0.13", default-features = false, features = [
+    "native-tls",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "stream",
+    "multipart",
+    "query",
+    "form",
+] }
 
 # Logging
 tracing = "0.1"

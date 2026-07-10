@@ -420,7 +420,8 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
 
     match result {
         Ok(entries) => {
-            let js_array = boa_engine::object::builtins::JsArray::new(context);
+            // boa 1.0-dev: JsArray::new is fallible.
+            let js_array = boa_engine::object::builtins::JsArray::new(context)?;
             for entry in entries {
                 let obj = boa_engine::object::JsObject::with_object_proto(context.intrinsics());
                 obj.set(js_string!("name"), JsValue::from(js_string!(entry.name.as_str())), false, context)?;
@@ -612,7 +613,9 @@ fn json_to_js(value: &Value, context: &mut Context) -> Result<JsValue> {
         }
         Value::String(s) => Ok(JsValue::from(js_string!(s.as_str()))),
         Value::Array(arr) => {
-            let js_array = boa_engine::object::builtins::JsArray::new(context);
+            // boa 1.0-dev: JsArray::new is fallible.
+            let js_array = boa_engine::object::builtins::JsArray::new(context)
+                .map_err(|e| ScriptError::Execution(format!("Array creation failed: {e}")))?;
             for item in arr {
                 let js_item = json_to_js(item, context)?;
                 js_array.push(js_item, context)

@@ -18,7 +18,8 @@ async-trait.workspace = true
 futures = "0.3"
 
 # Browser automation via CDP (optional)
-chromiumoxide = { version = "0.9", features = ["tokio-runtime"], optional = true }
+# 0.9 is tokio-only; the old `tokio-runtime` feature no longer exists.
+chromiumoxide = { version = "0.9", optional = true }
 
 # Playwright for multi-browser support (Firefox, WebKit, Chromium)
 playwright-rs = { version = "0.14", optional = true }

@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-tungstenite = "0.29"
 
 # HTTP client for embeddings API
-reqwest = { version = "0.13", features = ["json"] }
+reqwest.workspace = true
 
 # TOML for config export/import
 toml = "1.1"

@@ -381,7 +381,7 @@ fn normalize_f32_avx2(v: &mut [f32]) {
             let offset = i * 8;
             let mut chunk = f32x8::from(&v[offset..offset + 8]);
             chunk *= inv_norm_vec;
-            v[offset..offset + 8].copy_from_slice(chunk.as_array_ref());
+            v[offset..offset + 8].copy_from_slice(chunk.as_array());
         }
 
         let remainder_start = chunks * 8;
@@ -401,7 +401,7 @@ fn add_f32_avx2(a: &mut [f32], b: &[f32]) {
         let mut va = f32x8::from(&a[offset..offset + 8]);
         let vb = f32x8::from(&b[offset..offset + 8]);
         va += vb;
-        a[offset..offset + 8].copy_from_slice(va.as_array_ref());
+        a[offset..offset + 8].copy_from_slice(va.as_array());
     }
 
     let remainder_start = chunks * 8;
@@ -420,7 +420,7 @@ fn scale_f32_avx2(v: &mut [f32], scalar: f32) {
         let offset = i * 8;
         let mut chunk = f32x8::from(&v[offset..offset + 8]);
         chunk *= scalar_vec;
-        v[offset..offset + 8].copy_from_slice(chunk.as_array_ref());
+        v[offset..offset + 8].copy_from_slice(chunk.as_array());
     }
 
     let remainder_start = chunks * 8;
