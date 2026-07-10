@@ -1199,6 +1199,34 @@ impl Agent {
                     continue;
                 }
 
+                // Detect degenerate line repetition: the model re-emitting the
+                // same substantial line(s) — a known small-model generation loop
+                if detect_repetition(&state.final_text) && !state.repetition_nudged {
+                    warn!(
+                        text_len = state.final_text.len(),
+                        iteration = state.iterations,
+                        "🔁 Repetitive output detected — injecting nudge and retrying"
+                    );
+                    state.repetition_nudged = true;
+
+                    // Store the broken response so the model sees what it did
+                    self.store_assistant_response(&result.content_blocks).await;
+
+                    let nudge = AnthropicMessage::user_text(
+                        "[SYSTEM] Your last response repeated the same line(s) over and over — \
+                         you appear to be stuck in a generation loop. Do not repeat yourself. \
+                         Take stock of what you actually know, then either call a tool to make \
+                         real progress or give your final answer in one concise pass."
+                    );
+                    {
+                        let mut ctx = self.context.write().await;
+                        ctx.messages.push(nudge);
+                    }
+
+                    // Continue the loop — the next iteration will re-call the LLM
+                    continue;
+                }
+
                 // Detect thinking spiral: model spent a lot of reasoning tokens
                 // going in circles without producing useful output
                 if !state.thinking_spiral_nudged
@@ -1433,7 +1461,8 @@ impl Agent {
                     on_text(&text);
                     response_text.push_str(&text);
 
-                    // Periodically check for narration loops (every ~8000 chars of text)
+                    // Periodically check for narration loops and degenerate
+                    // repetition (every ~8000 chars of text)
                     if response_text.len() - narration_check_len > 8000 {
                         narration_check_len = response_text.len();
                         let has_tool_history = !state.tool_records.is_empty();
@@ -1444,6 +1473,16 @@ impl Agent {
                             );
                             // Append a notice and break out of the stream
                             let notice = "\n\n[I got stuck narrating instead of acting. Let me try again with a focused approach.]";
+                            on_text(notice);
+                            response_text.push_str(notice);
+                            break;
+                        }
+                        if detect_repetition(&response_text) {
+                            warn!(
+                                text_len = response_text.len(),
+                                "🔁 Repetitive output detected in streaming response — aborting stream"
+                            );
+                            let notice = "\n\n[I got stuck repeating myself. Let me stop and take a different approach.]";
                             on_text(notice);
                             response_text.push_str(notice);
                             break;
@@ -2905,6 +2944,8 @@ struct RunState {
     model_stats: Vec<crate::model_stats::RequestModelStats>,
     /// Whether we've already injected a narration-loop nudge (only retry once)
     narration_nudged: bool,
+    /// Whether we've already injected a repetitive-output nudge (only retry once)
+    repetition_nudged: bool,
     /// Whether we've already injected a thinking-spiral nudge (only retry once)
     thinking_spiral_nudged: bool,
     /// How many wrap-up nudges have been injected (escalates over time)
@@ -2928,6 +2969,7 @@ impl RunState {
             active_tools: HashSet::new(),
             model_stats: Vec::new(),
             narration_nudged: false,
+            repetition_nudged: false,
             thinking_spiral_nudged: false,
             wrapup_nudge_count: 0,
         }
@@ -3068,6 +3110,39 @@ mod tests {
         // Gentle nudge invites continuing, not stopping.
         assert!(msg.to_lowercase().contains("keep going"));
         assert!(wrapup_nudge_message(NudgeLevel::Urgent, 999).contains("999"));
+    }
+
+    #[test]
+    fn repetition_detected_when_same_long_line_dominates() {
+        // 12 copies of the same substantial line — a degenerate generation loop.
+        let line = "I'll begin the nightly routine. Let me start by checking the lock file.";
+        let text = vec![line; 12].join("\n");
+        assert!(detect_repetition(&text));
+    }
+
+    #[test]
+    fn repetition_not_detected_in_varied_text() {
+        // 12 distinct substantial lines — a normal multi-line answer.
+        let text: String = (0..12)
+            .map(|i| format!("Step {i}: this line describes a distinct part of the work being done.\n"))
+            .collect();
+        assert!(!detect_repetition(&text));
+    }
+
+    #[test]
+    fn repetition_ignores_short_repeated_lines() {
+        // Table separators and short markers repeat legitimately and are under
+        // the 40-char floor — never flagged, regardless of count.
+        let text = vec!["| --- | --- |"; 40].join("\n");
+        assert!(!detect_repetition(&text));
+    }
+
+    #[test]
+    fn repetition_needs_enough_lines_to_judge() {
+        // Fewer than 10 substantial lines is too little signal, even if identical.
+        let line = "The same substantial line repeated a handful of times only here.";
+        let text = vec![line; 5].join("\n");
+        assert!(!detect_repetition(&text));
     }
 
     fn raw(content: &str) -> ExtractedMemoryRaw {
