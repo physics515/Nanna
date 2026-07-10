@@ -468,6 +468,12 @@ routine should drain first.**
 - [ ] `not_implemented` daemon control actions: Regenerate message (`control.rs:416`), ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
 - [ ] Server stats not wired to shared daemon state (`server.rs:882`).
+- [ ] **Double health-server bind** — the daemon starts a health server in *two* places on the same
+      `health_port`: `server.rs:873` and `health.rs:299` both log "Health server listening on …:{port}",
+      and a live `nanna-daemon run` shows the second binder fail 4× (`os error 10048`) before erroring out
+      (harmless today because the first bind wins, but it spams WARN/ERROR every boot). Pick one owner —
+      likely keep the richer `health.rs` server and drop the `server.rs` duplicate (or vice-versa) — so only
+      one binds. *(observed 2026-07-10 via a real daemon boot smoke test)*
 - [x] MCP server notifications logged but not handled (`transport.rs:148`).
       *(2026-07-06) `handle_server_notification` now classifies server notifications (`message`/`progress`/`cancelled`/`*/list_changed`) and routes them to the right tracing level — MCP `notifications/message` logs at warn when its `level` is warning-or-worse, else debug (was parsed then dropped). Pure `classify_server_notification` + `mcp_level_is_severe` with 3 tests.*
       *(2026-07-10)* **`list_changed` now invalidates the client cache.** Added a transport-agnostic
