@@ -7,19 +7,73 @@
 use crate::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
+
+/// Which MCP list a `.../list_changed` notification refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpList {
+    /// The server's tool list.
+    Tools,
+    /// The server's resource list.
+    Resources,
+    /// The server's prompt list.
+    Prompts,
+}
+
+/// Transport-agnostic "the server's list changed" flags, shared via `Arc`.
+///
+/// A transport that receives `notifications/{tools,resources,prompts}/list_changed`
+/// marks the matching flag; the client consumes (and clears) it to lazily refresh
+/// its cache on the next `list_*` call.
+#[derive(Debug, Default)]
+pub struct ListChangedFlags {
+    tools: AtomicBool,
+    resources: AtomicBool,
+    prompts: AtomicBool,
+}
+
+impl ListChangedFlags {
+    /// Mark a list dirty (called by the transport on a `list_changed` notification).
+    pub fn mark(&self, list: McpList) {
+        self.flag(list).store(true, Ordering::Release);
+    }
+
+    /// Atomically read-and-clear a list's dirty flag. Returns whether it was set.
+    pub fn take(&self, list: McpList) -> bool {
+        self.flag(list).swap(false, Ordering::AcqRel)
+    }
+
+    const fn flag(&self, list: McpList) -> &AtomicBool {
+        match list {
+            McpList::Tools => &self.tools,
+            McpList::Resources => &self.resources,
+            McpList::Prompts => &self.prompts,
+        }
+    }
+}
 
 /// Transport trait for MCP communication
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Send a request and wait for a response
     async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse>;
-    
+
     /// Send a notification (no response expected)
     async fn notify(&self, notification: JsonRpcNotification) -> Result<()>;
-    
+
     /// Close the transport
     async fn close(&self) -> Result<()>;
+
+    /// Shared list-changed flags this transport tracks, if any.
+    ///
+    /// Transports that receive server push notifications (stdio) return `Some`
+    /// so the client can lazily refresh a stale cache. Request/response
+    /// transports that never see `list_changed` return `None` (the default) and
+    /// the client simply keeps serving its cache until an explicit refresh.
+    fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+        None
+    }
 }
 
 // ============================================================================
@@ -28,7 +82,10 @@ pub trait Transport: Send + Sync {
 
 #[cfg(feature = "stdio")]
 pub mod stdio {
-    use super::{async_trait, Arc, Mutex, JsonRpcResponse, Result, McpError, JsonRpcNotification, Transport, JsonRpcRequest};
+    use super::{
+        Arc, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ListChangedFlags, McpError,
+        McpList, Mutex, Result, Transport, async_trait,
+    };
     use std::collections::HashMap;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -43,12 +100,23 @@ pub mod stdio {
         LogMessage,
         /// `notifications/progress` — progress update for an in-flight request.
         Progress,
-        /// A `.../list_changed` notification (tools/resources/prompts) — a cache signal.
-        ListChanged,
+        /// A `.../list_changed` notification — a cache signal. Carries which list
+        /// changed, or `None` if it's a `list_changed` we don't cache (e.g. roots).
+        ListChanged(Option<McpList>),
         /// `notifications/cancelled` — the server cancelled a request.
         Cancelled,
         /// Anything not specifically handled.
         Other,
+    }
+
+    /// Map a `.../list_changed` method to the cached list it refers to. Pure.
+    fn list_changed_kind(method: &str) -> Option<McpList> {
+        match method {
+            "notifications/tools/list_changed" => Some(McpList::Tools),
+            "notifications/resources/list_changed" => Some(McpList::Resources),
+            "notifications/prompts/list_changed" => Some(McpList::Prompts),
+            _ => None,
+        }
     }
 
     /// Classify an MCP notification by its JSON-RPC `method`. Pure.
@@ -57,7 +125,9 @@ pub mod stdio {
             "notifications/message" => ServerNotification::LogMessage,
             "notifications/progress" => ServerNotification::Progress,
             "notifications/cancelled" => ServerNotification::Cancelled,
-            m if m.ends_with("/list_changed") => ServerNotification::ListChanged,
+            m if m.ends_with("/list_changed") => {
+                ServerNotification::ListChanged(list_changed_kind(m))
+            }
             _ => ServerNotification::Other,
         }
     }
@@ -71,9 +141,9 @@ pub mod stdio {
         )
     }
 
-    /// Route a parsed server notification to the appropriate tracing level.
-    /// (Previously such notifications were parsed and then dropped.)
-    fn handle_server_notification(notif: &JsonRpcNotification) {
+    /// Route a parsed server notification: log records go to tracing, and a
+    /// `list_changed` marks the matching cache flag so the client refreshes lazily.
+    fn handle_server_notification(notif: &JsonRpcNotification, list_changed: &ListChangedFlags) {
         match classify_server_notification(&notif.method) {
             ServerNotification::LogMessage => {
                 let level = notif
@@ -88,10 +158,18 @@ pub mod stdio {
                     debug!(method = notif.method, level, "MCP server log");
                 }
             }
-            ServerNotification::ListChanged => {
-                // Tools/resources/prompts changed server-side; a future cache layer
-                // invalidates here. Surface it for observability meanwhile.
-                debug!(method = notif.method, "MCP server list changed");
+            ServerNotification::ListChanged(kind) => {
+                // A cached list changed server-side: mark it dirty so the next
+                // client `list_*` call refreshes instead of serving a stale cache.
+                if let Some(list) = kind {
+                    list_changed.mark(list);
+                    debug!(
+                        method = notif.method,
+                        "MCP list changed — cache marked dirty"
+                    );
+                } else {
+                    debug!(method = notif.method, "MCP list changed (uncached list)");
+                }
             }
             ServerNotification::Progress => {
                 debug!(method = notif.method, "MCP progress notification");
@@ -115,6 +193,9 @@ pub mod stdio {
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
         /// Shutdown signal
         shutdown_tx: mpsc::Sender<()>,
+        /// Per-list "server said this changed" flags, set by the reader task and
+        /// consumed by the client to refresh a stale cache lazily.
+        list_changed: Arc<ListChangedFlags>,
     }
 
     impl StdioTransport {
@@ -165,16 +246,24 @@ pub mod stdio {
             let pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+            let list_changed = Arc::new(ListChangedFlags::default());
 
             // Spawn reader task
             let pending_clone = pending.clone();
-            tokio::spawn(Self::reader_task(stdout, pending_clone, shutdown_rx));
+            let list_changed_clone = list_changed.clone();
+            tokio::spawn(Self::reader_task(
+                stdout,
+                pending_clone,
+                shutdown_rx,
+                list_changed_clone,
+            ));
 
             Ok(Self {
                 child: Arc::new(Mutex::new(child)),
                 stdin: Arc::new(Mutex::new(stdin)),
                 pending,
                 shutdown_tx,
+                list_changed,
             })
         }
 
@@ -183,6 +272,7 @@ pub mod stdio {
             stdout: ChildStdout,
             pending: Arc<Mutex<HashMap<String, oneshot::Sender<JsonRpcResponse>>>>,
             mut shutdown_rx: mpsc::Receiver<()>,
+            list_changed: Arc<ListChangedFlags>,
         ) {
             let mut reader = BufReader::new(stdout).lines();
 
@@ -212,7 +302,7 @@ pub mod stdio {
                                         // Might be a notification, try to parse that
                                         match serde_json::from_str::<JsonRpcNotification>(&line) {
                                             Ok(notif) => {
-                                                handle_server_notification(&notif);
+                                                handle_server_notification(&notif, &list_changed);
                                             }
                                             Err(_) => {
                                                 warn!(error = %e, line, "Failed to parse response");
@@ -286,11 +376,15 @@ pub mod stdio {
 
         async fn close(&self) -> Result<()> {
             let _ = self.shutdown_tx.send(()).await;
-            
+
             let mut child = self.child.lock().await;
             let _ = child.kill().await;
 
             Ok(())
+        }
+
+        fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+            Some(self.list_changed.clone())
         }
     }
 
@@ -298,7 +392,7 @@ pub mod stdio {
     mod tests {
         use super::{
             classify_server_notification, handle_server_notification, mcp_level_is_severe,
-            JsonRpcNotification, ServerNotification,
+            JsonRpcNotification, ListChangedFlags, McpList, ServerNotification,
         };
 
         #[test]
@@ -317,11 +411,20 @@ pub mod stdio {
             );
             assert_eq!(
                 classify_server_notification("notifications/tools/list_changed"),
-                ServerNotification::ListChanged
+                ServerNotification::ListChanged(Some(McpList::Tools))
             );
             assert_eq!(
                 classify_server_notification("notifications/resources/list_changed"),
-                ServerNotification::ListChanged
+                ServerNotification::ListChanged(Some(McpList::Resources))
+            );
+            assert_eq!(
+                classify_server_notification("notifications/prompts/list_changed"),
+                ServerNotification::ListChanged(Some(McpList::Prompts))
+            );
+            // A `list_changed` for a list we don't cache (e.g. roots) → no McpList.
+            assert_eq!(
+                classify_server_notification("notifications/roots/list_changed"),
+                ServerNotification::ListChanged(None)
             );
             assert_eq!(
                 classify_server_notification("something/else"),
@@ -343,7 +446,29 @@ pub mod stdio {
         fn handle_notification_does_not_panic_on_missing_params() {
             // A log-message notification without params must not panic (defaults to info).
             let notif = JsonRpcNotification::new("notifications/message", None);
-            handle_server_notification(&notif);
+            let flags = ListChangedFlags::default();
+            handle_server_notification(&notif, &flags);
+        }
+
+        #[test]
+        fn list_changed_marks_only_the_named_list() {
+            let flags = ListChangedFlags::default();
+
+            // A tools/list_changed marks tools dirty and nothing else.
+            let notif = JsonRpcNotification::new("notifications/tools/list_changed", None);
+            handle_server_notification(&notif, &flags);
+            assert!(!flags.take(McpList::Resources));
+            assert!(!flags.take(McpList::Prompts));
+            // take() is read-and-clear: the tools flag is set once, then cleared.
+            assert!(flags.take(McpList::Tools));
+            assert!(!flags.take(McpList::Tools));
+
+            // An uncached list_changed (roots) marks nothing.
+            let roots = JsonRpcNotification::new("notifications/roots/list_changed", None);
+            handle_server_notification(&roots, &flags);
+            assert!(!flags.take(McpList::Tools));
+            assert!(!flags.take(McpList::Resources));
+            assert!(!flags.take(McpList::Prompts));
         }
     }
 }
