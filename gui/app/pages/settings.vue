@@ -499,11 +499,68 @@
                     <span>8192 tokens</span>
                   </div>
                 </div>
+
+                <!-- Agent Loop (long-horizon) -->
+                <div class="p-3 rounded-lg bg-nanna-bg-elevated/40 space-y-3">
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <span class="text-sm font-medium text-nanna-text">Agent Loop</span>
+                      <p class="text-xs text-nanna-text-dim mt-0.5">
+                        Nanna can work on a problem for many iterations. It never hard-stops —
+                        Stop always ends a run — and only gets gentle "wrap up" nudges once a run gets long.
+                      </p>
+                    </div>
+                  </div>
+
+                  <!-- Unlimited backstop toggle -->
+                  <label class="flex items-center justify-between cursor-pointer">
+                    <span class="text-sm text-nanna-text">Unlimited iterations (recommended)</span>
+                    <input
+                      type="checkbox"
+                      v-model="unlimitedIterations"
+                      @change="saveIterationPolicy"
+                      class="accent-nanna-primary w-4 h-4"
+                    />
+                  </label>
+
+                  <!-- Absolute backstop (only when not unlimited) -->
+                  <div v-if="!unlimitedIterations" class="flex items-center justify-between gap-3">
+                    <span class="text-sm text-nanna-text-dim">Max iterations (safety backstop)</span>
+                    <input
+                      type="number" min="1" step="100"
+                      v-model.number="maxIterations"
+                      @change="saveIterationPolicy"
+                      class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+                    />
+                  </div>
+
+                  <!-- First nudge -->
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-sm text-nanna-text-dim">Nudge after (iterations)</span>
+                    <input
+                      type="number" min="1" step="50"
+                      v-model.number="nudgeAfterIterations"
+                      @change="saveIterationPolicy"
+                      class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+                    />
+                  </div>
+
+                  <!-- Nudge interval -->
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-sm text-nanna-text-dim">Then re-nudge every (iterations)</span>
+                    <input
+                      type="number" min="1" step="25"
+                      v-model.number="nudgeIntervalIterations"
+                      @change="saveIterationPolicy"
+                      class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+                    />
+                  </div>
+                </div>
               </div>
             </UiCard>
           </div>
         </UiTabPanel>
-        
+
         <!-- Memory Tab -->
         <UiTabPanel :active="activeTab === 'memory'">
           <div class="space-y-6">
@@ -848,6 +905,9 @@ interface ExtendedSettings {
   max_tokens?: number
   agent_name?: string
   personality_mode?: string
+  agent_max_iterations?: number | null
+  agent_nudge_after_iterations?: number
+  agent_nudge_interval_iterations?: number
 }
 
 interface CognitiveMemoryStats {
@@ -902,6 +962,12 @@ const saving = ref(false)
 const agentName = ref('Nanna')
 const personalityMode = ref('balanced')
 const maxTokens = ref(4096)
+// Agent-loop iteration policy (long-horizon worker).
+// unlimitedIterations = true means no absolute backstop (only Stop/cancel ends a run).
+const unlimitedIterations = ref(true)
+const maxIterations = ref(10000)
+const nudgeAfterIterations = ref(500)
+const nudgeIntervalIterations = ref(100)
 
 // Model priority lists (fallback chains)
 const chatModelPriority = ref<string[]>([])
@@ -1190,6 +1256,12 @@ async function loadSettings() {
     agentName.value = settings.value.agent_name || 'Nanna'
     personalityMode.value = settings.value.personality_mode || 'balanced'
     maxTokens.value = settings.value.max_tokens || 4096
+    // Agent-loop iteration policy
+    const maxIter = settings.value.agent_max_iterations
+    unlimitedIterations.value = maxIter === null || maxIter === undefined
+    if (typeof maxIter === 'number') maxIterations.value = maxIter
+    nudgeAfterIterations.value = settings.value.agent_nudge_after_iterations ?? 500
+    nudgeIntervalIterations.value = settings.value.agent_nudge_interval_iterations ?? 100
     
     // Load model priority lists
     try {
@@ -1806,6 +1878,19 @@ async function setMaxTokens(tokens: number) {
   try {
     await invoke('set_max_tokens', { tokens })
     maxTokens.value = tokens
+  } catch (e: any) {
+    showToast(`Failed: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveIterationPolicy() {
+  try {
+    await invoke('set_agent_iteration_policy', {
+      maxIterations: unlimitedIterations.value ? null : Math.max(1, Math.round(maxIterations.value)),
+      nudgeAfter: Math.max(1, Math.round(nudgeAfterIterations.value)),
+      nudgeInterval: Math.max(1, Math.round(nudgeIntervalIterations.value)),
+    })
+    showToast('Agent loop settings saved', 'success')
   } catch (e: any) {
     showToast(`Failed: ${e.message || e}`, 'error')
   }

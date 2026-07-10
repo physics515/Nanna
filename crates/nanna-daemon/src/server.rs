@@ -1707,6 +1707,12 @@ impl DaemonBuilder {
             builder.config.agent.thinking_mode = ThinkingMode::Medium;
         }
 
+        // Agent-loop iteration policy: unbounded by default (long-horizon worker),
+        // with late escalating soft nudges. All three are user-configurable.
+        builder.config.agent.max_iterations = config.agent.max_iterations;
+        builder.config.agent.nudge_after_iterations = config.agent.nudge_after_iterations;
+        builder.config.agent.nudge_interval_iterations = config.agent.nudge_interval_iterations;
+
         // Set model routing configuration
         builder.config.agent.model_routing = config.llm.model_routing.clone();
         builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;

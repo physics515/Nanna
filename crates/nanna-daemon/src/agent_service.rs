@@ -35,8 +35,12 @@ pub struct AgentServiceConfig {
     pub max_tokens: u32,
     /// Temperature for sampling
     pub temperature: f32,
-    /// Maximum tool iterations per request. None = unlimited.
+    /// Maximum tool iterations per request. None = unlimited (default).
     pub max_iterations: Option<usize>,
+    /// Iteration at which the first escalating wrap-up soft nudge is injected (default 500).
+    pub nudge_after_iterations: usize,
+    /// Interval (iterations) between escalating nudges after the first (default 100).
+    pub nudge_interval_iterations: usize,
     /// Default thinking mode
     pub thinking_mode: ThinkingMode,
     /// Model priority list for summarization
@@ -65,6 +69,8 @@ impl Default for AgentServiceConfig {
             max_tokens: 8192,
             temperature: 0.7,
             max_iterations: None, // Unlimited — model stops when done
+            nudge_after_iterations: 500,
+            nudge_interval_iterations: 100,
             thinking_mode: ThinkingMode::Instant,
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
@@ -285,6 +291,8 @@ impl AgentService {
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             max_iterations: config.max_iterations,
+            nudge_after_iterations: config.nudge_after_iterations,
+            nudge_interval_iterations: config.nudge_interval_iterations,
             thinking_mode: config.thinking_mode,
             summarization_priority: config.summarization_priority.clone(),
             summarization_ollama_url: config.summarization_ollama_url.clone(),

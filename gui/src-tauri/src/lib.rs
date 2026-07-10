@@ -32,6 +32,7 @@ use nanna_tools::{ToolCall, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -958,6 +959,32 @@ pub struct EmbeddedRunState {
     pub active_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
     pub completed_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Cooperative cancellation flag. `cancel_session` sets this; the embedded
+    /// agent loop checks it each iteration and stops. This is the ONLY thing that
+    /// ends an otherwise-unbounded run in embedded mode (besides the model finishing).
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+/// Agent-loop iteration policy (long-horizon by default). Threaded from
+/// `config.agent` into the embedded loop.
+#[derive(Clone, Copy)]
+struct IterationPolicy {
+    /// Absolute backstop. `None` = unbounded (only cancellation / the model finishing stops it).
+    max_iterations: Option<usize>,
+    /// Iteration at which the first escalating wrap-up nudge is injected.
+    nudge_after: usize,
+    /// Interval between escalating nudges after the first.
+    nudge_interval: usize,
+}
+
+impl IterationPolicy {
+    fn from_config(agent: &nanna_config::AgentConfig) -> Self {
+        Self {
+            max_iterations: agent.max_iterations,
+            nudge_after: agent.nudge_after_iterations,
+            nudge_interval: agent.nudge_interval_iterations,
+        }
+    }
 }
 
 /// Model status event for frontend
@@ -1717,6 +1744,9 @@ async fn run_agent_loop_with_fallback(
         })
     };
 
+    // Agent-loop iteration policy (unbounded by default; late soft nudges).
+    let policy = IterationPolicy::from_config(&config.agent);
+
     // Try each model in priority order
     let mut last_error = String::from("No models available");
     let mut tried_models = Vec::new();
@@ -1780,7 +1810,7 @@ async fn run_agent_loop_with_fallback(
         
         loop {
             let model_request_clone = model_request.clone();
-            match run_agent_loop(app, session_id, &llm, tools.clone(), model_request_clone, summarization_config.clone(), embedded_run_states.clone()).await {
+            match run_agent_loop(app, session_id, &llm, tools.clone(), model_request_clone, summarization_config.clone(), embedded_run_states.clone(), policy).await {
                 Ok(result) => {
                     info!("Success with model: {}", model_id);
                     return Ok(result);
@@ -1857,20 +1887,40 @@ async fn run_agent_loop(
     mut request: nanna_llm::CompletionRequest,
     summarization_config: Option<ToolSummarizationConfig>,
     embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
+    policy: IterationPolicy,
 ) -> Result<(String, Vec<ToolCallInfo>), String> {
     use futures::StreamExt;
 
     let mut full_response = String::new();
     let mut all_tool_calls = Vec::new();
-    let max_iterations = 10; // Prevent infinite loops
+    // The agent is a long-horizon worker: the loop is unbounded by default
+    // (`policy.max_iterations == None`). It ends when the model stops calling
+    // tools, when the user cancels (Stop), or — only if configured — at an
+    // absolute backstop. Escalating soft nudges (from `policy.nudge_after`) steer
+    // a possibly-stuck model without stopping it.
+    let mut wrapup_nudge_count = 0usize;
+
+    // Helper: emit the terminal stream event so the frontend always leaves the
+    // "Streaming..." state, no matter which exit path we take.
+    let emit_done = |app: &AppHandle| {
+        let _ = app.emit(
+            "stream-chunk",
+            StreamChunk {
+                session_id: session_id.to_string(),
+                chunk: String::new(),
+                done: true,
+            },
+        );
+    };
 
     // Create shared state for run state tracking
     let accumulated_text = Arc::new(RwLock::new(String::new()));
     let accumulated_thinking = Arc::new(RwLock::new(String::new()));
     let active_tool_calls_state = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
     let completed_tool_calls_state = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
 
-    // Insert embedded run state entry
+    // Insert embedded run state entry (carries the cancellation flag the Stop button trips)
     {
         let mut states = embedded_run_states.write().await;
         states.insert(session_id.to_string(), EmbeddedRunState {
@@ -1879,15 +1929,57 @@ async fn run_agent_loop(
             active_tool_calls: active_tool_calls_state.clone(),
             completed_tool_calls: completed_tool_calls_state.clone(),
             started_at: chrono::Utc::now(),
+            cancel_flag: cancel_flag.clone(),
         });
     }
 
-    for iteration in 0..max_iterations {
+    let mut iteration: usize = 0;
+    loop {
+        iteration += 1;
+
+        // Cooperative cancellation: the Stop button sets this flag. Emit the
+        // terminal event and finish gracefully with whatever we have so far.
+        if cancel_flag.load(Ordering::Relaxed) {
+            info!("Embedded agent loop cancelled by user at iteration {}", iteration);
+            if !full_response.is_empty() && !full_response.ends_with('\n') {
+                full_response.push_str("\n\n");
+            }
+            full_response.push_str("[Stopped by user]");
+            emit_done(app);
+            break;
+        }
+
+        // Absolute backstop (opt-in; default unbounded). Prevents an unattended
+        // wedged run from burning tokens forever.
+        if let Some(max) = policy.max_iterations {
+            if iteration > max {
+                warn!(iteration, max, "Embedded agent loop hit configured max_iterations backstop");
+                emit_done(app);
+                break;
+            }
+        }
+
+        // Late escalating wrap-up nudge (does NOT stop the loop — only steers).
+        if let Some(level) = nanna_agent::wrapup_nudge_due(
+            iteration,
+            policy.nudge_after,
+            policy.nudge_interval,
+            wrapup_nudge_count,
+        ) {
+            let msg = nanna_agent::wrapup_nudge_message(level, iteration);
+            wrapup_nudge_count += 1;
+            info!(iteration, nudge_count = wrapup_nudge_count, ?level, "⏰ Injecting wrap-up nudge (embedded)");
+            request = request.with_anthropic_message(AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![nanna_llm::ContentBlock::Text { text: msg }],
+            });
+        }
+
         debug!("Agent loop iteration {}", iteration);
 
         // If there's already streamed text from a previous iteration, insert a
         // space so the next text block doesn't merge with the previous one.
-        if iteration > 0 && !full_response.is_empty() && !full_response.ends_with(' ') && !full_response.ends_with('\n') {
+        if iteration > 1 && !full_response.is_empty() && !full_response.ends_with(' ') && !full_response.ends_with('\n') {
             full_response.push(' ');
             // Also emit the separator to the frontend stream
             let _ = app.emit(
@@ -3157,6 +3249,11 @@ pub struct ExtendedSettings {
     pub scheduler_enabled: bool,
     pub heartbeat_enabled: bool,
     pub heartbeat_interval_seconds: u64,
+
+    // Agent loop (long-horizon worker). `agent_max_iterations` None = unlimited.
+    pub agent_max_iterations: Option<usize>,
+    pub agent_nudge_after_iterations: usize,
+    pub agent_nudge_interval_iterations: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3295,6 +3392,11 @@ async fn get_extended_settings(
         scheduler_enabled,
         heartbeat_enabled,
         heartbeat_interval_seconds,
+
+        // Agent-loop iteration policy
+        agent_max_iterations: state_guard.config.agent.max_iterations,
+        agent_nudge_after_iterations: state_guard.config.agent.nudge_after_iterations,
+        agent_nudge_interval_iterations: state_guard.config.agent.nudge_interval_iterations,
     })
 }
 
@@ -5055,6 +5157,38 @@ async fn set_max_tokens(
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
     info!("Max tokens set to: {}", tokens);
+    Ok(())
+}
+
+/// Set the agent-loop iteration policy.
+///
+/// The loop is a long-horizon worker: `max_iterations` is an optional absolute
+/// backstop (`None`/0 = unlimited — only Stop/cancel or the model finishing ends
+/// it). Escalating soft nudges begin at `nudge_after` and repeat every
+/// `nudge_interval` iterations; they steer a possibly-stuck model but never stop it.
+#[tauri::command]
+async fn set_agent_iteration_policy(
+    state: State<'_, Arc<RwLock<AppState>>>,
+    max_iterations: Option<usize>,
+    nudge_after: usize,
+    nudge_interval: usize,
+) -> Result<(), String> {
+    // Treat 0 (or absent) max as "unlimited". Floor the nudge knobs at 1 so the
+    // schedule is always well-defined.
+    let max_iterations = max_iterations.filter(|&m| m > 0);
+    let nudge_after = nudge_after.max(1);
+    let nudge_interval = nudge_interval.max(1);
+
+    let mut state_guard = state.write().await;
+    state_guard.config.agent.max_iterations = max_iterations;
+    state_guard.config.agent.nudge_after_iterations = nudge_after;
+    state_guard.config.agent.nudge_interval_iterations = nudge_interval;
+    state_guard.config.save()
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+    info!(
+        "Agent iteration policy set: max={:?}, nudge_after={}, nudge_interval={}",
+        max_iterations, nudge_after, nudge_interval
+    );
     Ok(())
 }
 
@@ -7589,8 +7723,18 @@ async fn cancel_session(
     if state_guard.backend.is_daemon_mode().await {
         state_guard.backend.chat_cancel(&session_id).await
     } else {
-        // Embedded mode: not yet supported
-        Ok(false)
+        // Embedded mode: trip the running loop's cooperative cancellation flag.
+        // The loop checks it at the top of each iteration, emits the terminal
+        // stream event, and returns with whatever it has so far.
+        let states = state_guard.embedded_run_states.read().await;
+        if let Some(run) = states.get(&session_id) {
+            run.cancel_flag.store(true, Ordering::Relaxed);
+            info!("Embedded run for session {} flagged for cancellation", session_id);
+            Ok(true)
+        } else {
+            // No in-flight embedded run for this session.
+            Ok(false)
+        }
     }
 }
 
@@ -8858,6 +9002,7 @@ pub fn run() {
             set_thinking_enabled,
             set_streaming_enabled,
             set_max_tokens,
+            set_agent_iteration_policy,
             // Config import/export
             export_config,
             import_config,
