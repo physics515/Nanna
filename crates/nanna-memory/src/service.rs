@@ -858,6 +858,16 @@ impl MemoryService {
         self.store.purge_expired().await
     }
 
+    /// Test-only: insert a fully-formed entry straight into the store, bypassing
+    /// embedding/ingest. Lets tests seed entries with an explicit `expires_at`.
+    #[cfg(test)]
+    pub(crate) async fn insert_raw_for_test(&self, entry: crate::MemoryEntry) {
+        self.store
+            .add(entry)
+            .await
+            .expect("test insert must succeed");
+    }
+
     /// Get memory count
     pub async fn count(&self) -> usize {
         self.store.len().await
