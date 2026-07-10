@@ -33,6 +33,24 @@ fn chunk_and_hash(content: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Whether a model-produced summary is plausible enough to stand in for the
+/// original content. Small models sometimes return degenerate output — empty
+/// text, "...", or a bare title — which, if accepted, silently REPLACES real
+/// data (observed live 2026-07-10: an 80 KB tool result "summarized" to
+/// 17 chars). Reject anything too short in absolute terms or relative to the
+/// source; the caller then tries the next model or falls back to truncation,
+/// which at least preserves a real prefix of the data.
+#[must_use]
+pub fn plausible_summary(summary: &str, source_len: usize) -> bool {
+    let len = summary.trim().len();
+    if source_len < 1_000 {
+        // Tiny sources can have legitimately tiny summaries.
+        return len > 0;
+    }
+    // At least 64 chars, and at least 0.1% of the source.
+    len >= 64 && len.saturating_mul(1_000) >= source_len
+}
+
 /// Configuration for context summarization
 #[derive(Debug, Clone, Default)]
 pub struct ContextSummarizationConfig {
@@ -922,10 +940,11 @@ impl AgentContext {
     ) -> Result<String, String> {
         let (client, model_name) = Self::create_client_for_model(model_spec, config)?;
 
-        // Truncate content to fit the summarizer's context window
+        // Truncate content to fit the summarizer's context window. Cut on a
+        // char boundary — a raw byte slice panics mid-codepoint.
         let max_chars = config.summarizer_context_window * 4; // ~4 chars per token
         let truncated = if content.len() > max_chars {
-            &content[..max_chars]
+            &content[..content.floor_char_boundary(max_chars)]
         } else {
             content
         };
@@ -959,10 +978,14 @@ impl AgentContext {
             }
         }
 
-        if summary.is_empty() {
-            Err("Empty summary returned".to_string())
-        } else {
+        if plausible_summary(&summary, truncated.len()) {
             Ok(summary)
+        } else {
+            Err(format!(
+                "Implausible summary returned ({} chars for {} chars of input)",
+                summary.trim().len(),
+                truncated.len()
+            ))
         }
     }
 
@@ -1334,4 +1357,31 @@ fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implausible_summaries_are_rejected() {
+        // The live failure: 80 KB "summarized" to 17 chars.
+        assert!(!plausible_summary("Roadmap for Nanna", 80_765));
+        assert!(!plausible_summary("", 80_765));
+        assert!(!plausible_summary("   \n  ", 80_765));
+        assert!(!plausible_summary("...", 5_000));
+        // 64+ chars but under 0.1% of a very large source is still degenerate.
+        assert!(!plausible_summary(&"x".repeat(70), 200_000));
+    }
+
+    #[test]
+    fn plausible_summaries_are_accepted() {
+        // A real ~2 KB summary of an 80 KB document.
+        assert!(plausible_summary(&"a solid summary sentence. ".repeat(80), 80_765));
+        // A modest but substantial summary of a mid-size result.
+        assert!(plausible_summary(&"key fact retained here. ".repeat(4), 13_000));
+        // Tiny sources may summarize tiny — anything non-empty passes.
+        assert!(plausible_summary("ok", 500));
+        assert!(!plausible_summary("", 500));
+    }
 }

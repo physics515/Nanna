@@ -25,7 +25,9 @@ pub mod mcp;
 pub use nanna_workspace;
 pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, WorkspaceTemplate};
 
-pub use context::{AgentContext, ContextIsolation, ContextSummary, ContextSummarizationConfig};
+pub use context::{
+    AgentContext, ContextIsolation, ContextSummary, ContextSummarizationConfig, plausible_summary,
+};
 pub use registry::{
     AgentMetadata, AgentRegistry, AgentRole, AgentState as RegistryAgentState, LifecycleEvent, 
     RegisteredAgent,
