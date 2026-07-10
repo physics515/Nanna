@@ -1482,7 +1482,7 @@ impl LlmClient {
 
     /// Convert AnthropicRequest → Ollama /api/chat and execute
     async fn complete_anthropic_via_ollama(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
-        let (messages_json, tools_json) = anthropic_to_openai_request(request);
+        let (messages_json, tools_json) = anthropic_to_ollama_request(request);
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -2862,7 +2862,7 @@ impl LlmClient {
         let request = request.clone();
 
         stream! {
-            let (messages_json, tools_json) = anthropic_to_openai_request(&request);
+            let (messages_json, tools_json) = anthropic_to_ollama_request(&request);
 
             let mut body = serde_json::json!({
                 "model": request.model,
@@ -3556,9 +3556,38 @@ impl LlmClient {
 // Anthropic ↔ OpenAI/Ollama Conversion Layer
 // ============================================================================
 
+/// How to encode `tool_calls[].function.arguments` on the wire.
+///
+/// OpenAI-compatible endpoints (/v1/chat/completions) expect a JSON-encoded
+/// STRING. Ollama's native /api/chat expects a JSON OBJECT and rejects the
+/// string form at request-decode time with HTTP 400
+/// `Value looks like object, but can't find closing '}' symbol` — even when
+/// the string contains valid JSON (verified live against Ollama 0.31.2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolArgsWire {
+    /// `"arguments": "{\"path\": ...}"` — OpenAI convention
+    JsonString,
+    /// `"arguments": {"path": ...}` — Ollama native convention
+    JsonObject,
+}
+
 /// Convert an AnthropicRequest into OpenAI-compatible messages and tools JSON.
 /// Returns (messages_json_array, tools_json_array_or_none).
 fn anthropic_to_openai_request(request: &AnthropicRequest) -> (serde_json::Value, Option<serde_json::Value>) {
+    anthropic_to_wire_request(request, ToolArgsWire::JsonString)
+}
+
+/// Convert an AnthropicRequest for Ollama's NATIVE /api/chat endpoint.
+/// Identical to the OpenAI conversion except tool-call arguments stay a JSON
+/// object — the string form 400s every request that echoes tool history.
+fn anthropic_to_ollama_request(request: &AnthropicRequest) -> (serde_json::Value, Option<serde_json::Value>) {
+    anthropic_to_wire_request(request, ToolArgsWire::JsonObject)
+}
+
+fn anthropic_to_wire_request(
+    request: &AnthropicRequest,
+    args_wire: ToolArgsWire,
+) -> (serde_json::Value, Option<serde_json::Value>) {
     let mut messages = Vec::new();
 
     // System prompt → system message
@@ -3617,12 +3646,28 @@ fn anthropic_to_openai_request(request: &AnthropicRequest) -> (serde_json::Value
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
                         ContentBlock::ToolUse { id, name, input } => {
+                            let arguments = match args_wire {
+                                ToolArgsWire::JsonString => {
+                                    serde_json::Value::String(input.to_string())
+                                }
+                                // Ollama native: pass the object through. A
+                                // non-object input would 400 the whole request,
+                                // so degrade it to {} rather than lose the turn.
+                                ToolArgsWire::JsonObject if input.is_object() => input.clone(),
+                                ToolArgsWire::JsonObject => {
+                                    warn!(
+                                        tool = %name,
+                                        "tool_use input is not a JSON object; sending {{}} to Ollama"
+                                    );
+                                    serde_json::json!({})
+                                }
+                            };
                             tool_calls.push(serde_json::json!({
                                 "id": id,
                                 "type": "function",
                                 "function": {
                                     "name": name,
-                                    "arguments": input.to_string(),
+                                    "arguments": arguments,
                                 }
                             }));
                         }
@@ -3902,6 +3947,76 @@ mod tests {
         let msg = Message::user("Hello");
         assert!(matches!(msg.role, Role::User));
         assert_eq!(msg.content, "Hello");
+    }
+
+    /// Request with an echoed tool call in history — the shape that follows
+    /// every tool execution in the agent loop.
+    fn request_with_tool_history(input: serde_json::Value) -> AnthropicRequest {
+        AnthropicRequest {
+            model: "ornith:latest".to_string(),
+            messages: vec![
+                AnthropicMessage::user_text("check the lock file"),
+                AnthropicMessage::assistant(vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input,
+                }]),
+                AnthropicMessage::user(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "NO_LOCK".to_string(),
+                    is_error: None,
+                }]),
+            ],
+            max_tokens: 128,
+            temperature: None,
+            system: None,
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        }
+    }
+
+    fn first_tool_arguments(messages: &serde_json::Value) -> serde_json::Value {
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+            .and_then(|tc| tc.first())
+            .map(|tc| tc["function"]["arguments"].clone())
+            .expect("converted request must contain a tool_call")
+    }
+
+    #[test]
+    fn openai_conversion_keeps_tool_arguments_as_json_string() {
+        // OpenAI-compatible /v1/chat/completions requires the string form.
+        let request = request_with_tool_history(serde_json::json!({"path": "D:/x"}));
+        let (messages, _) = anthropic_to_openai_request(&request);
+        let args = first_tool_arguments(&messages);
+        assert_eq!(args, serde_json::json!("{\"path\":\"D:/x\"}"));
+    }
+
+    #[test]
+    fn ollama_conversion_keeps_tool_arguments_as_object() {
+        // Ollama's native /api/chat 400s on string-form arguments — even valid
+        // JSON inside a string ("Value looks like object, but can't find
+        // closing '}' symbol", verified live against Ollama 0.31.2).
+        let request = request_with_tool_history(serde_json::json!({"path": "D:/x"}));
+        let (messages, _) = anthropic_to_ollama_request(&request);
+        let args = first_tool_arguments(&messages);
+        assert_eq!(args, serde_json::json!({"path": "D:/x"}));
+    }
+
+    #[test]
+    fn ollama_conversion_degrades_non_object_input_to_empty_object() {
+        // A non-object input would 400 the whole request on the native
+        // endpoint; losing the arguments beats losing the turn.
+        let request = request_with_tool_history(serde_json::json!("not an object"));
+        let (messages, _) = anthropic_to_ollama_request(&request);
+        let args = first_tool_arguments(&messages);
+        assert_eq!(args, serde_json::json!({}));
     }
 
     #[test]
