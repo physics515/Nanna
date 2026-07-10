@@ -33,22 +33,22 @@ async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # WebSocket for daemon connection
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 
 # HTTP client for embeddings API
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 # TOML for config export/import
-toml = "0.8"
+toml = "1.1"
 
 # YAML for skill manifests
 serde_yaml = "0.9"
 
 # PKCE OAuth flow
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 urlencoding = "2.1"
-rand = "0.9"
+rand = "0.10"
 
 
 # Directories for fallback paths

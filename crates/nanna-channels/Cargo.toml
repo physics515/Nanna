@@ -12,10 +12,10 @@ thiserror.workspace = true
 flume.workspace = true
 async-trait = "0.1"
 bitflags = "2"
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 urlencoding = "2"
 chrono = { version = "0.4", features = ["serde"] }
-rand = "0.8"
+rand = "0.10"
 # WebSocket listeners
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }

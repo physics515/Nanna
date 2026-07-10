@@ -67,20 +67,20 @@ repository = "https://github.com/clawdbot/nanna"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 
 # GPU compute
-wgpu = "24"
+wgpu = "30"
 
 # SIMD - using portable_simd (nightly) or wide for stable
-wide = "0.7"
+wide = "1.5"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"] }
+reqwest = { version = "0.13", features = ["json", "rustls-tls", "stream", "multipart"] }
 
 # Logging
 tracing = "0.1"
@@ -95,18 +95,18 @@ anyhow = "1.0"
 flume = "0.12"
 
 # Memory/embeddings
-half = "2.4"  # f16 support
+half = "2.7"  # f16 support
 
 # Web server
 axum = { version = "0.8", features = ["macros"] }
 
 # Utilities
-uuid = { version = "1.16", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 
 # Config
-toml = "0.8"
+toml = "1.1"
 directories = "6"
 
 # GUI (Tauri v2)

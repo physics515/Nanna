@@ -9,7 +9,7 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 half.workspace = true
-bytemuck = { version = "1.21", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive"] }
 futures = "0.3"
 
 [[bench]]
@@ -30,5 +30,5 @@ harness = false
 
 [dev-dependencies]
 nanna-simd = { path = "../nanna-simd" }
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 criterion = { version = "0.8", features = ["html_reports"] }

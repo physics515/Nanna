@@ -43,7 +43,7 @@ chrono.workspace = true
 axum.workspace = true
 
 # IPC / WebSocket
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 
 # HTTP server for health endpoint
@@ -70,5 +70,5 @@ tempfile = "3"
 windows-service = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 libc = "0.2"

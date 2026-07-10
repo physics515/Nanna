@@ -20,7 +20,7 @@ async-trait.workspace = true
 
 # HTTP transport (optional)
 reqwest = { workspace = true, optional = true }
-tokio-tungstenite = { version = "0.26", optional = true, features = ["native-tls"] }
+tokio-tungstenite = { version = "0.29", optional = true, features = ["native-tls"] }
 
 # For stdio line reading
 futures = "0.3"
