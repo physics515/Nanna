@@ -137,6 +137,55 @@ fn rewrite_links(body: &str) -> String {
     out
 }
 
+/// Split `text` into chunks each at most `max_chars` Unicode scalar values,
+/// for channels that cap message length (`ChannelCapabilities::max_message_length`).
+///
+/// Breaks are preferred at a newline, then a space, within the leading
+/// `max_chars`-char window; a single token longer than `max_chars` is hard-split
+/// mid-word as a last resort. Chunks concatenate back to the exact input (the
+/// break character stays at the end of the preceding chunk), so no content is
+/// lost. Returns a single chunk when the text already fits.
+///
+/// # Panics
+///
+/// Panics if `max_chars` is 0 (a zero-length limit can't bound any chunk).
+#[must_use]
+pub fn split_for_length(text: &str, max_chars: usize) -> Vec<String> {
+    assert!(max_chars > 0, "max_chars must be positive");
+
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= max_chars {
+            chunks.push(chars[start..].iter().collect());
+            break;
+        }
+        // Prefer to break after the last newline, else the last space, within the
+        // window; otherwise hard-break at the char limit. `+ 1` keeps the break
+        // character at the end of this chunk so the pieces rejoin exactly.
+        let hard_end = start + max_chars;
+        let window = &chars[start..hard_end];
+        let break_at = window
+            .iter()
+            .rposition(|&c| c == '\n')
+            .or_else(|| window.iter().rposition(|&c| c == ' '))
+            .map_or(hard_end, |rel| start + rel + 1);
+        debug_assert!(break_at > start, "split must make progress");
+        chunks.push(chars[start..break_at].iter().collect());
+        start = break_at;
+    }
+
+    debug_assert!(chunks.iter().all(|c| c.chars().count() <= max_chars));
+    debug_assert!(!chunks.is_empty());
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +254,50 @@ mod tests {
         // Image passes through even on a plain channel (no text field to strip).
         let out = format_for_channel(img, &caps(false));
         assert!(matches!(out, MessageContent::Image { .. }));
+    }
+
+    #[test]
+    fn split_returns_single_chunk_when_within_limit() {
+        assert_eq!(split_for_length("hello", 10), vec!["hello".to_string()]);
+        // Exactly at the limit is still one chunk.
+        assert_eq!(split_for_length("hello", 5), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn split_breaks_at_whitespace_and_rejoins_exactly() {
+        let text = "one two three four five";
+        let parts = split_for_length(text, 8);
+        // Every part is within the limit...
+        assert!(parts.iter().all(|p| p.chars().count() <= 8));
+        // ...more than one part was produced...
+        assert!(parts.len() >= 2);
+        // ...and concatenation reproduces the input exactly (no content lost).
+        assert_eq!(parts.concat(), text);
+        // Breaks landed on spaces, so no part starts with a space.
+        assert!(parts.iter().all(|p| !p.starts_with(' ')));
+    }
+
+    #[test]
+    fn split_prefers_newline_over_space() {
+        // With a newline inside the window, the break lands there.
+        let parts = split_for_length("aa bb\ncc dd", 7);
+        assert_eq!(parts[0], "aa bb\n");
+        assert_eq!(parts.concat(), "aa bb\ncc dd");
+    }
+
+    #[test]
+    fn split_hard_breaks_an_oversized_token() {
+        // A single 10-char token with no break point, limit 4 → ceil(10/4)=3 parts.
+        let parts = split_for_length("abcdefghij", 4);
+        assert_eq!(parts, vec!["abcd", "efgh", "ij"]);
+        assert_eq!(parts.concat(), "abcdefghij");
+    }
+
+    #[test]
+    fn split_counts_unicode_scalars_not_bytes() {
+        // Four 2-byte chars; a byte-based splitter would mis-bound these.
+        let parts = split_for_length("áéíóú", 2);
+        assert!(parts.iter().all(|p| p.chars().count() <= 2));
+        assert_eq!(parts.concat(), "áéíóú");
     }
 }

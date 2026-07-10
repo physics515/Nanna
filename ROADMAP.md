@@ -359,8 +359,16 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       carry the flag → text passes through **unchanged** (zero regression); Signal/WhatsApp now get Markdown
       down-converted to plain text (headers/blockquotes/fences/bold/inline-code stripped, `[label](url)` →
       `label (url)`), so they stop showing literal `**`/backticks. Conservative on purpose: single `*`/`_`,
-      `__dunders__`, `snake_case`, and `2 * 3` survive. 7 unit tests. Remaining: tables→text, Discord embeds,
-      Slack Block Kit, and length-aware splitting on `max_message_length`.
+      `__dunders__`, `snake_case`, and `2 * 3` survive. 7 unit tests.
+      *(2026-07-10)* **Length-aware splitting shipped.** New pure `split_for_length(text, max_chars)` splits a
+      payload into chunks each ≤ `max_chars` **Unicode scalars** (not bytes), preferring a newline then a
+      space break within the window and only hard-splitting a single over-long token; chunks concatenate back
+      to the exact input (the break char stays on the preceding chunk) so no content is lost. Wired into
+      `MessageRouter::send`: when the channel sets `max_message_length` and the (already Markdown-adapted) text
+      exceeds it, the router sends the parts in order and returns the first part's id (the reply/edit anchor).
+      7 tests (within-limit passthrough, whitespace/newline break preference, oversized-token hard-split,
+      Unicode-scalar counting; + 2 router tests with a recording mock proving split vs no-split). Remaining:
+      tables→text, Discord embeds, Slack Block Kit.
 - [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
