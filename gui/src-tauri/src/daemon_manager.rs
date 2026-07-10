@@ -49,7 +49,11 @@ impl Default for DaemonManagerConfig {
             max_restarts: 3,
             restart_delay: Duration::from_secs(2),
             health_check_interval: Duration::from_secs(30),
-            startup_timeout: Duration::from_secs(30),
+            // Generous: first boot can be slow (DB open + tool discovery). The
+            // slow embedding-model probe was moved off the daemon's startup
+            // critical path, so readiness is normally a few seconds — this is
+            // purely a worst-case ceiling.
+            startup_timeout: Duration::from_secs(90),
         }
     }
 }
@@ -116,6 +120,9 @@ impl DaemonManager {
         *self.child.write().await = Some(child);
         
         // Spawn a task to log daemon output (use info level so it's visible in production)
+        // It also flips the shared state to Crashed on termination so wait_for_ready
+        // can abort immediately instead of polling out the full startup timeout.
+        let state_for_events = self.state.clone();
         tokio::spawn(async move {
             use tauri_plugin_shell::process::CommandEvent;
             while let Some(event) = rx.recv().await {
@@ -129,6 +136,13 @@ impl DaemonManager {
                         error!("daemon stderr: {}", msg);
                     }
                     CommandEvent::Terminated(payload) => {
+                        // Record the death so any in-flight ready-wait bails out now.
+                        {
+                            let mut state = state_for_events.write().await;
+                            if *state == DaemonState::Starting || *state == DaemonState::Running {
+                                *state = DaemonState::Crashed;
+                            }
+                        }
                         if let Some(code) = payload.code {
                             if code != 0 {
                                 error!("daemon terminated with exit code: {}", code);
@@ -152,7 +166,7 @@ impl DaemonManager {
         
         // Wait for daemon to be ready
         let ready = self.wait_for_ready().await;
-        
+
         if ready {
             *self.state.write().await = DaemonState::Running;
             *self.restart_count.write().await = 0;
@@ -161,6 +175,15 @@ impl DaemonManager {
         } else {
             *self.state.write().await = DaemonState::Crashed;
             error!("Daemon failed to start within timeout");
+            // Kill the spawned child: an orphaned daemon would keep running,
+            // holding the nanna.db file lock (and port 5149) — which would make
+            // the embedded fallback unable to open storage at all.
+            if let Some(child) = self.child.write().await.take() {
+                warn!("Killing unresponsive daemon child so it cannot orphan the DB lock");
+                if let Err(e) = child.kill() {
+                    warn!("Failed to kill unresponsive daemon: {}", e);
+                }
+            }
             Err("Daemon startup timeout".to_string())
         }
     }
@@ -171,6 +194,12 @@ impl DaemonManager {
         let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
         
         while tokio::time::Instant::now() < deadline {
+            // The event task flips state to Crashed when the child terminates —
+            // bail immediately instead of polling out the rest of the timeout.
+            if *self.state.read().await == DaemonState::Crashed {
+                warn!("Daemon terminated during startup; aborting ready-wait");
+                return false;
+            }
             // Try to connect
             match tokio_tungstenite::connect_async(&url).await {
                 Ok((mut ws, _)) => {

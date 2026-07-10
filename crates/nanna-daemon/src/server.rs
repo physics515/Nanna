@@ -1436,29 +1436,41 @@ impl DaemonServer {
                         }
                     }
 
-                    // Probe the actual embedding dimension from the model.
-                    // If the model returns a different dimension than stored entries,
-                    // re-embeds all mismatched entries with the new model.
-                    match memory_service.probe_and_align_dimension().await {
-                        Ok(actual_dim) => {
-                            if actual_dim != dimension {
-                                info!(
-                                    "Embedding dimension corrected: {} → {} for model {}",
-                                    dimension, actual_dim, self.embedding.model
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Could not probe embedding dimension (model may be loading): {}. \
-                                 Using static dimension {}.",
-                                e, dimension
-                            );
-                        }
-                    }
-                    
                     info!("Memory service initialized with Turso persistence and embedding router");
                     let memory_arc = Arc::new(memory_service);
+
+                    // Probe the actual embedding dimension from the model IN THE
+                    // BACKGROUND. The probe's first embed call can take ~a minute
+                    // when the local embedding model is cold (Ollama loads it on
+                    // demand), and it used to block startup past the GUI's
+                    // daemon-ready timeout — forcing an embedded fallback while an
+                    // orphaned daemon kept running. `probe_and_align_dimension`
+                    // takes `&self` on the Arc'd service specifically so it can run
+                    // at runtime; a mismatched dimension is corrected (and entries
+                    // re-embedded) as soon as the probe completes.
+                    {
+                        let memory_for_probe = memory_arc.clone();
+                        let model_name = self.embedding.model.clone();
+                        tokio::spawn(async move {
+                            match memory_for_probe.probe_and_align_dimension().await {
+                                Ok(actual_dim) => {
+                                    if actual_dim == dimension {
+                                        debug!("Embedding dimension confirmed: {actual_dim} for model {model_name}");
+                                    } else {
+                                        info!(
+                                            "Embedding dimension corrected: {dimension} → {actual_dim} for model {model_name}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Could not probe embedding dimension (model may be loading): {e}. \
+                                         Using static dimension {dimension}."
+                                    );
+                                }
+                            }
+                        });
+                    }
 
                     // Wire the memory service into the embed_fn's OnceCell
                     // so provider-switch re-embedding can find it

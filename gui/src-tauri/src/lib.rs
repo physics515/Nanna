@@ -911,7 +911,10 @@ pub enum CloseMode {
 
 /// Application state shared across commands
 pub struct AppState {
-    storage: Arc<Storage>,
+    /// Local Turso storage. `None` in daemon mode: turso enforces an exclusive
+    /// file lock on nanna.db, so the daemon owns the database and the GUI must
+    /// not open it. Session/workspace persistence goes through the daemon then.
+    storage: Option<Arc<Storage>>,
     llm: Arc<LlmClient>,
     tools: Arc<ToolRegistry>,
     config: Config,
@@ -950,6 +953,16 @@ pub struct AppState {
     backend: Arc<Backend>,
     /// Tracks in-flight agent runs for embedded mode (shared with run_agent_loop)
     embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
+}
+
+impl AppState {
+    /// Local storage, or an error suitable for returning from a tauri command.
+    /// Only embedded-mode code paths may rely on this succeeding.
+    fn storage(&self) -> Result<&Arc<Storage>, String> {
+        self.storage.as_ref().ok_or_else(|| {
+            "Local storage is not open (daemon mode — the daemon owns nanna.db)".to_string()
+        })
+    }
 }
 
 /// Tracks the in-flight state of an embedded mode agent run
@@ -1273,7 +1286,7 @@ async fn send_message(
 
     // Store user message
     let _user_msg = state_guard
-        .storage
+        .storage()?
         .add_message(&session_id, "user", &message)
         .await
         .map_err(|e| format!("Failed to store message: {}", e))?;
@@ -1288,7 +1301,7 @@ async fn send_message(
 
     // Get conversation history
     let history = state_guard
-        .storage
+        .storage()?
         .get_session_messages(&session_id, 50)
         .await
         .map_err(|e| format!("Failed to get history: {}", e))?;
@@ -1493,7 +1506,7 @@ Be concise. Be useful. Be present.{}
         Some(serde_json::to_value(&tool_calls).unwrap_or_default())
     };
     let assistant_msg = state_guard
-        .storage
+        .storage()?
         .add_message_with_tool_calls(&session_id, "assistant", &full_response, tool_calls_json)
         .await
         .map_err(|e| format!("Failed to store response: {}", e))?;
@@ -1508,7 +1521,7 @@ Be concise. Be useful. Be present.{}
 
     // Update session timestamp
     state_guard
-        .storage
+        .storage()?
         .touch_session(&session_id)
         .await
         .map_err(|e| format!("Failed to update session: {}", e))?;
@@ -2405,7 +2418,7 @@ async fn create_session(
     };
 
     let session = state_guard
-        .storage
+        .storage()?
         .create_gui_session_with_workspace(&session_name, workspace_id.as_deref())
         .await
         .map_err(|e| format!("Failed to create session: {}", e))?;
@@ -2470,12 +2483,15 @@ async fn list_sessions(
             }
         }
         
-        // Also get sessions from local SQLite (old sessions from embedded mode)
-        // This ensures backward compatibility during daemon transition
-        let sqlite_result = if workspace_id.is_some() {
-            state_guard.storage.sessions().list_by_workspace(workspace_id.as_deref(), 100).await
-        } else {
-            state_guard.storage.list_gui_sessions(100).await
+        // Also merge sessions from local SQLite when we have it open (old
+        // sessions from embedded mode). In daemon mode storage is None — the
+        // daemon owns nanna.db, so its list already covers everything.
+        let sqlite_result = match &state_guard.storage {
+            Some(storage) if workspace_id.is_some() => {
+                storage.sessions().list_by_workspace(workspace_id.as_deref(), 100).await
+            }
+            Some(storage) => storage.list_gui_sessions(100).await,
+            None => Ok(Vec::new()),
         };
         if let Ok(sqlite_sessions) = sqlite_result {
             let daemon_ids: std::collections::HashSet<_> = all_sessions.iter().map(|s| s.id.clone()).collect();
@@ -2506,14 +2522,15 @@ async fn list_sessions(
     // Embedded mode: use direct storage access
     // workspace_id = None → show ALL sessions (global view)
     // workspace_id = Some(id) → show only that workspace's sessions
+    let storage = state_guard.storage()?;
     let sessions = if let Some(ref ws_id) = workspace_id {
-        state_guard.storage
+        storage
             .list_gui_sessions_by_workspace(Some(ws_id.as_str()), 100)
             .await
             .map_err(|e| format!("Failed to list sessions: {}", e))?
     } else {
         // Global: list ALL sessions regardless of workspace
-        state_guard.storage
+        storage
             .list_gui_sessions(100)
             .await
             .map_err(|e| format!("Failed to list sessions: {}", e))?
@@ -2521,11 +2538,10 @@ async fn list_sessions(
 
     // Build workspace name lookup
     let registry = state_guard.workspaces.read().await;
-    
+
     let mut result = Vec::with_capacity(sessions.len());
     for s in sessions {
-        let count = state_guard
-            .storage
+        let count = storage
             .count_session_messages(&s.session_id)
             .await
             .unwrap_or(0);
@@ -2595,20 +2611,22 @@ async fn get_session_history(
             }
         }
 
-        // Fallback to SQLite for old sessions (from embedded mode)
-        // This maintains backward compatibility during daemon transition
-        if let Ok(messages) = state_guard.storage.get_session_messages(&session_id, 500).await {
-            return Ok(messages
-                .into_iter()
-                .map(|m| ChatMessage {
-                    id: m.id.to_string(),
-                    role: m.role,
-                    content: m.content,
-                    timestamp: m.created_at,
-                    tool_calls: parse_tool_calls_from_metadata(&m.metadata),
-                    reasoning: None,
-                })
-                .collect());
+        // Fallback to SQLite for old sessions (from embedded mode) — only
+        // possible when the GUI has the local DB open (storage is Some)
+        if let Some(storage) = &state_guard.storage {
+            if let Ok(messages) = storage.get_session_messages(&session_id, 500).await {
+                return Ok(messages
+                    .into_iter()
+                    .map(|m| ChatMessage {
+                        id: m.id.to_string(),
+                        role: m.role,
+                        content: m.content,
+                        timestamp: m.created_at,
+                        tool_calls: parse_tool_calls_from_metadata(&m.metadata),
+                        reasoning: None,
+                    })
+                    .collect());
+            }
         }
 
         // Session truly not found anywhere
@@ -2617,7 +2635,7 @@ async fn get_session_history(
 
     // Embedded mode: direct storage access
     let messages = state_guard
-        .storage
+        .storage()?
         .get_session_messages(&session_id, 500)
         .await
         .map_err(|e| format!("Failed to get history: {}", e))?;
@@ -2654,7 +2672,7 @@ async fn delete_session(
 
     // Embedded mode / fallback: direct storage access
     state_guard
-        .storage
+        .storage()?
         .delete_session(&session_id)
         .await
         .map_err(|e| format!("Failed to delete session: {}", e))?;
@@ -2670,19 +2688,23 @@ async fn clear_all_sessions(
 ) -> Result<usize, String> {
     let state_guard = state.read().await;
 
-    // Always clear local SQLite storage (GUI sessions are stored there)
-    // Use list_gui_sessions to get ALL sessions (both global and workspace-scoped)
-    let sessions = state_guard.storage.list_gui_sessions(1000)
-        .await
-        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+    // Clear local SQLite storage when we have it open (GUI sessions live there
+    // in embedded mode). Use list_gui_sessions to get ALL sessions (both
+    // global and workspace-scoped).
+    let mut local_count = 0;
+    if let Some(storage) = &state_guard.storage {
+        let sessions = storage.list_gui_sessions(1000)
+            .await
+            .map_err(|e| format!("Failed to list sessions: {}", e))?;
 
-    let local_count = sessions.len();
-    for session in sessions {
-        if let Err(e) = state_guard.storage.delete_session(&session.session_id).await {
-            warn!("Failed to delete local session {}: {}", session.session_id, e);
+        local_count = sessions.len();
+        for session in sessions {
+            if let Err(e) = storage.delete_session(&session.session_id).await {
+                warn!("Failed to delete local session {}: {}", session.session_id, e);
+            }
         }
+        info!("Cleared {} local sessions from SQLite", local_count);
     }
-    info!("Cleared {} local sessions from SQLite", local_count);
 
     // Also clear daemon sessions if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
@@ -2733,15 +2755,17 @@ async fn archive_and_delete_session(
 
     let state_guard = state.read().await;
 
-    // Get session name for context
-    let session_name = state_guard
-        .storage
-        .sessions()
-        .get(&session_id)
-        .await
-        .ok()
-        .map(|s| nanna_storage::Storage::get_session_name(&s))
-        .unwrap_or_else(|| "Unnamed chat".to_string());
+    // Get session name for context (best-effort; local storage only)
+    let session_name = match &state_guard.storage {
+        Some(storage) => storage
+            .sessions()
+            .get(&session_id)
+            .await
+            .ok()
+            .map(|s| nanna_storage::Storage::get_session_name(&s)),
+        None => None,
+    }
+    .unwrap_or_else(|| "Unnamed chat".to_string());
 
     // Check if memory is enabled
     let embedding_enabled = *state_guard.embedding_enabled.read().await;
@@ -2872,7 +2896,7 @@ async fn rename_session(
 
     // Embedded mode / fallback: direct storage access
     state_guard
-        .storage
+        .storage()?
         .rename_session(&session_id, &name)
         .await
         .map_err(|e| format!("Failed to rename session: {}", e))?;
@@ -2903,7 +2927,7 @@ async fn set_session_workspace(
 
     // Embedded mode: update storage directly
     state_guard
-        .storage
+        .storage()?
         .set_session_workspace(&session_id, workspace_id.as_deref())
         .await
         .map_err(|e| format!("Failed to set session workspace: {}", e))?;
@@ -2990,21 +3014,42 @@ async fn search_memory(
     let max_results = limit.unwrap_or(50) as usize;
     let query_lower = query.to_lowercase();
 
-    // Get all sessions
-    let sessions = state_guard
-        .storage
-        .list_gui_sessions(1000)
-        .await
-        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+    // Get all sessions as (id, name) — from local storage when we have it
+    // open, otherwise from the daemon (which owns nanna.db in daemon mode)
+    let sessions: Vec<(String, String)> = if let Some(storage) = &state_guard.storage {
+        storage
+            .list_gui_sessions(1000)
+            .await
+            .map_err(|e| format!("Failed to list sessions: {}", e))?
+            .iter()
+            .map(|s| (s.session_id.clone(), Storage::get_session_name(s)))
+            .collect()
+    } else {
+        let result = state_guard.backend.sessions_list().await
+            .map_err(|e| format!("Failed to list sessions: {}", e))?;
+        result
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        let id = s.get("id")?.as_str()?.to_string();
+                        let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string();
+                        Some((id, name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     let mut results = Vec::new();
     let is_daemon = state_guard.backend.is_daemon_mode().await;
 
-    for session in &sessions {
+    for (session_id, session_name) in &sessions {
         // Collect messages from daemon or local storage
         let messages: Vec<(String, String, String, String)> = if is_daemon {
             // Try daemon first
-            if let Ok(result) = state_guard.backend.session_history(&session.session_id, Some(1000)).await {
+            if let Ok(result) = state_guard.backend.session_history(session_id, Some(1000)).await {
                 if let Some(msgs) = result.get("messages").and_then(|v| v.as_array()) {
                     msgs.iter().filter_map(|m| {
                         Some((
@@ -3017,19 +3062,22 @@ async fn search_memory(
                 } else {
                     vec![]
                 }
-            } else {
+            } else if let Some(storage) = &state_guard.storage {
                 // Fallback to local storage
-                state_guard.storage
-                    .get_session_messages(&session.session_id, 1000)
+                storage
+                    .get_session_messages(session_id, 1000)
                     .await
                     .unwrap_or_default()
                     .into_iter()
                     .map(|m| (m.id.to_string(), m.role, m.content, m.created_at))
                     .collect()
+            } else {
+                vec![]
             }
         } else {
-            state_guard.storage
-                .get_session_messages(&session.session_id, 1000)
+            state_guard
+                .storage()?
+                .get_session_messages(session_id, 1000)
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -3055,8 +3103,8 @@ async fn search_memory(
                 let relevance = (matches as f32 / content.len().max(1) as f32).min(1.0);
 
                 results.push(MemorySearchResult {
-                    session_id: session.session_id.clone(),
-                    session_name: Storage::get_session_name(session),
+                    session_id: session_id.clone(),
+                    session_name: session_name.clone(),
                     message_id: msg_id,
                     role,
                     content,
@@ -3089,51 +3137,47 @@ async fn get_memory_stats(
 ) -> Result<MemoryStats, String> {
     let state_guard = state.read().await;
 
-    // In daemon mode, fetch history from daemon for each session to count messages
+    // In daemon mode, the daemon's session list already carries message counts
     if state_guard.backend.is_daemon_mode().await {
-        let sessions = state_guard
-            .storage
-            .list_gui_sessions(10000)
-            .await
+        let result = state_guard.backend.sessions_list().await
             .map_err(|e| format!("Failed to list sessions: {}", e))?;
+        let sessions = result
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         let mut total_messages = 0u32;
+        let mut timestamps: Vec<String> = Vec::new();
         for session in &sessions {
-            // Try daemon first
-            if let Ok(result) = state_guard.backend.session_history(&session.session_id, Some(10000)).await {
-                if let Some(messages_array) = result.get("messages").and_then(|v| v.as_array()) {
-                    total_messages += messages_array.len() as u32;
-                    continue;
-                }
+            total_messages += session
+                .get("message_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            if let Some(created) = session.get("created_at").and_then(|v| v.as_str()) {
+                timestamps.push(created.to_string());
             }
-            // Fallback to local storage
-            let count = state_guard
-                .storage
-                .count_session_messages(&session.session_id)
-                .await
-                .unwrap_or(0);
-            total_messages += count as u32;
         }
+        timestamps.sort();
 
         return Ok(MemoryStats {
             total_sessions: sessions.len() as u32,
             total_messages,
-            oldest_session: sessions.last().map(|s| s.created_at.clone()),
-            newest_session: sessions.first().map(|s| s.created_at.clone()),
+            oldest_session: timestamps.first().cloned(),
+            newest_session: timestamps.last().cloned(),
         });
     }
 
     // Embedded mode: direct storage access
-    let sessions = state_guard
-        .storage
+    let storage = state_guard.storage()?;
+    let sessions = storage
         .list_gui_sessions(10000)
         .await
         .map_err(|e| format!("Failed to list sessions: {}", e))?;
 
     let mut total_messages = 0u32;
     for session in &sessions {
-        let count = state_guard
-            .storage
+        let count = storage
             .count_session_messages(&session.session_id)
             .await
             .unwrap_or(0);
@@ -6087,8 +6131,10 @@ async fn open_workspace(
         created_at: String::new(),
         last_accessed: String::new(),
     };
-    if let Err(e) = state_guard.storage.workspaces().upsert(&record).await {
-        warn!("Failed to persist workspace to DB: {}", e);
+    if let Some(storage) = &state_guard.storage {
+        if let Err(e) = storage.workspaces().upsert(&record).await {
+            warn!("Failed to persist workspace to DB: {}", e);
+        }
     }
     
     Ok(info)
@@ -6107,8 +6153,10 @@ async fn set_active_workspace(
         info!("Activated workspace: {}", id);
         drop(registry);
         // Persist active state to DB
-        if let Err(e) = state_guard.storage.workspaces().set_active(&id).await {
-            warn!("Failed to persist active workspace to DB: {}", e);
+        if let Some(storage) = &state_guard.storage {
+            if let Err(e) = storage.workspaces().set_active(&id).await {
+                warn!("Failed to persist active workspace to DB: {}", e);
+            }
         }
         // Notify daemon so it updates its in-memory registry and tool working directory
         if state_guard.backend.is_daemon_mode().await {
@@ -6133,8 +6181,10 @@ async fn clear_active_workspace(
     drop(registry);
     info!("Cleared active workspace, now in global mode");
     // Persist to DB
-    if let Err(e) = state_guard.storage.workspaces().clear_active().await {
-        warn!("Failed to persist cleared workspace to DB: {}", e);
+    if let Some(storage) = &state_guard.storage {
+        if let Err(e) = storage.workspaces().clear_active().await {
+            warn!("Failed to persist cleared workspace to DB: {}", e);
+        }
     }
     // Notify daemon so it clears its working directory
     if state_guard.backend.is_daemon_mode().await {
@@ -6231,8 +6281,10 @@ async fn close_workspace(
         info!("Closed workspace: {}", id);
         drop(registry);
         // Remove from DB
-        if let Err(e) = state_guard.storage.workspaces().delete(&id).await {
-            warn!("Failed to remove workspace from DB: {}", e);
+        if let Some(storage) = &state_guard.storage {
+            if let Err(e) = storage.workspaces().delete(&id).await {
+                warn!("Failed to remove workspace from DB: {}", e);
+            }
         }
         Ok(())
     } else {
@@ -7678,8 +7730,10 @@ async fn get_session_run_state(
 
     // Embedded mode: check local run states
     let run_states = state.embedded_run_states.read().await;
-    let msg_count = state.storage.count_session_messages(&session_id).await
-        .unwrap_or(0) as usize;
+    let msg_count = match &state.storage {
+        Some(storage) => storage.count_session_messages(&session_id).await.unwrap_or(0) as usize,
+        None => 0,
+    };
 
     if let Some(run_state) = run_states.get(&session_id) {
         let text = run_state.accumulated_text.read().await.clone();
@@ -8106,7 +8160,10 @@ async fn validate_cron_expression(
 // App Setup
 // =============================================================================
 
-async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
+async fn setup_state(
+    backend: Arc<Backend>,
+    mode: BackendMode,
+) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
     // Load config
     let config = Config::load().unwrap_or_default().with_env_overrides();
 
@@ -8115,9 +8172,19 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         .map(|d| d.join("nanna.db").to_string_lossy().to_string())
         .unwrap_or_else(|_| "nanna.db".to_string());
 
-    // Initialize storage (Arc-wrapped for sharing with scheduler)
-    let storage_config = StorageConfig { path: db_path };
-    let storage = Arc::new(Storage::new(&storage_config).await?);
+    // Initialize storage (Arc-wrapped for sharing with scheduler). Turso holds
+    // an exclusive file lock, so in daemon mode the daemon owns nanna.db and
+    // the GUI must not open it.
+    let storage = match mode {
+        BackendMode::Embedded => {
+            let storage_config = StorageConfig { path: db_path };
+            Some(Arc::new(Storage::new(&storage_config).await?))
+        }
+        BackendMode::Daemon => {
+            info!("Daemon mode: local storage not opened (the daemon owns nanna.db)");
+            None
+        }
+    };
 
     // Initialize LLM client (check for OAuth first)
     let llm = match config.llm.provider.as_str() {
@@ -8464,13 +8531,20 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         check_interval: Duration::from_secs(30),
         default_timezone: "UTC".to_string(),
     };
-    let mut scheduler = Scheduler::new(scheduler_config)
-        .with_storage(Arc::clone(&storage));
-    
-    // Load persisted cron jobs from storage
-    match scheduler.load_jobs().await {
-        Ok(count) => info!("Loaded {} cron jobs from database", count),
-        Err(e) => warn!("Failed to load cron jobs: {}", e),
+    let mut scheduler = Scheduler::new(scheduler_config);
+
+    // Cron persistence needs the local DB; in daemon mode the scheduler still
+    // runs (the daemon has no cron runner yet) but jobs live in memory only.
+    if let Some(ref storage) = storage {
+        scheduler = scheduler.with_storage(Arc::clone(storage));
+
+        // Load persisted cron jobs from storage
+        match scheduler.load_jobs().await {
+            Ok(count) => info!("Loaded {} cron jobs from database", count),
+            Err(e) => warn!("Failed to load cron jobs: {}", e),
+        }
+    } else {
+        info!("Daemon mode: scheduler running without cron persistence");
     }
 
     // Deduplicate consolidation tasks (fix for historical duplicates)
@@ -8782,16 +8856,20 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         .cloned()
         .unwrap_or_else(|| config.llm.model.clone());
 
-    // Initialize backend with embedded mode
-    let backend = Arc::new(Backend::new());
-    let embedded = embedded::EmbeddedBackend::new(
-        llm.clone(),
-        tools.clone(),
-        memory.clone(),
-        storage.clone(),
-    ).await;
-    backend.set_embedded(embedded).await;
-    info!("Backend initialized (embedded mode ready, daemon will be attempted on startup)");
+    // Wire the embedded backend into the already-initialized Backend. Only
+    // possible when the GUI owns local storage (i.e. embedded mode).
+    if let Some(ref storage) = storage {
+        let embedded = embedded::EmbeddedBackend::new(
+            llm.clone(),
+            tools.clone(),
+            memory.clone(),
+            storage.clone(),
+        ).await;
+        backend.set_embedded(embedded).await;
+        info!("Embedded backend ready (GUI owns local storage)");
+    } else {
+        info!("Daemon mode: embedded backend not constructed");
+    }
 
     Ok(AppState {
         storage: storage.clone(),
@@ -8819,36 +8897,82 @@ async fn setup_state() -> Result<AppState, Box<dyn std::error::Error + Send + Sy
         active_model: Arc::new(RwLock::new(initial_active_model)),
         // Rate limited models (empty at startup)
         rate_limited_models: Arc::new(RwLock::new(HashMap::new())),
-        // Workspace registry (restored from database)
+        // Workspace registry (restored from local DB in embedded mode, from
+        // the daemon — which restored them from nanna.db — in daemon mode)
         workspaces: {
             let mut registry = WorkspaceRegistry::new();
-            match storage.workspaces().list().await {
-                Ok(records) if !records.is_empty() => {
-                    let mut active_id = None;
-                    for record in &records {
-                        let path = std::path::PathBuf::from(&record.path);
-                        if path.exists() {
-                            let mut ws = Workspace::new(&path);
-                            ws.id = record.id.clone();
-                            if let Err(e) = ws.load_context().await {
-                                warn!("Failed to load workspace context for {}: {}", record.path, e);
+            if let Some(ref storage) = storage {
+                match storage.workspaces().list().await {
+                    Ok(records) if !records.is_empty() => {
+                        let mut active_id = None;
+                        for record in &records {
+                            let path = std::path::PathBuf::from(&record.path);
+                            if path.exists() {
+                                let mut ws = Workspace::new(&path);
+                                ws.id = record.id.clone();
+                                if let Err(e) = ws.load_context().await {
+                                    warn!("Failed to load workspace context for {}: {}", record.path, e);
+                                }
+                                registry.register(ws);
+                                if record.active {
+                                    active_id = Some(record.id.clone());
+                                }
+                            } else {
+                                warn!("Persisted workspace path no longer exists: {}", record.path);
                             }
-                            registry.register(ws);
-                            if record.active {
-                                active_id = Some(record.id.clone());
+                        }
+                        if let Some(id) = active_id {
+                            registry.set_active(&id);
+                        }
+                        info!("Restored {} workspaces from database", records.len());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Failed to load workspaces from database: {}", e);
+                    }
+                }
+            } else {
+                match backend.workspace_list().await {
+                    Ok(result) => {
+                        let records = result
+                            .get("workspaces")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let active_id = result
+                            .get("active_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let count = records.len();
+                        for record in &records {
+                            let (Some(id), Some(path)) = (
+                                record.get("id").and_then(|v| v.as_str()),
+                                record.get("path").and_then(|v| v.as_str()),
+                            ) else {
+                                continue;
+                            };
+                            let path = std::path::PathBuf::from(path);
+                            if path.exists() {
+                                let mut ws = Workspace::new(&path);
+                                ws.id = id.to_string();
+                                if let Err(e) = ws.load_context().await {
+                                    warn!("Failed to load workspace context for {:?}: {}", path, e);
+                                }
+                                registry.register(ws);
+                            } else {
+                                warn!("Daemon workspace path no longer exists: {:?}", path);
                             }
-                        } else {
-                            warn!("Persisted workspace path no longer exists: {}", record.path);
+                        }
+                        if let Some(id) = active_id {
+                            registry.set_active(&id);
+                        }
+                        if count > 0 {
+                            info!("Restored {} workspaces from daemon", count);
                         }
                     }
-                    if let Some(id) = active_id {
-                        registry.set_active(&id);
+                    Err(e) => {
+                        warn!("Failed to load workspaces from daemon: {}", e);
                     }
-                    info!("Restored {} workspaces from database", records.len());
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to load workspaces from database: {}", e);
                 }
             }
             Arc::new(RwLock::new(registry))
@@ -8886,22 +9010,24 @@ pub fn run() {
 
             // Initialize state asynchronously
             tauri::async_runtime::spawn(async move {
-                match setup_state().await {
+                // DAEMON-FIRST: decide the backend mode BEFORE opening any local
+                // storage. Turso holds an exclusive file lock on nanna.db, so only
+                // one process may own it — if the GUI opens it first, the daemon
+                // sidecar boots storage-less (no sessions, no memory persistence).
+                // The daemon is the preferred owner; the GUI only opens storage
+                // itself when falling back to embedded mode.
+                let backend = Arc::new(Backend::new());
+                let mode = backend.init(&handle).await;
+                info!("Backend initialized in {:?} mode", mode);
+
+                match setup_state(backend, mode).await {
                     Ok(state) => {
                         // Create agent registry with shared LLM and tools
                         let agent_registry = agents::AgentRegistryState::new(
                             state.llm.clone(),
                             state.tools.clone(),
                         );
-                        
-                        // Try to initialize backend in daemon mode (non-blocking)
-                        let backend = state.backend.clone();
-                        let handle_for_backend = handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let mode = backend.init(&handle_for_backend).await;
-                            info!("Backend initialized in {:?} mode", mode);
-                        });
-                        
+
                         // Manage both states
                         handle.manage(Arc::new(RwLock::new(state)));
                         handle.manage(Arc::new(RwLock::new(agent_registry)));

@@ -134,6 +134,12 @@ impl Backend {
                     }
                     ConnectionMode::Embedded => {
                         warn!("Daemon started but client connection failed, falling back to embedded");
+                        // Stop the daemon we just started: a running-but-unreachable
+                        // daemon holds the exclusive nanna.db file lock, which would
+                        // prevent embedded mode from opening storage at all.
+                        if let Err(e) = self.daemon_manager.stop().await {
+                            warn!("Failed to stop unreachable daemon before embedded fallback: {}", e);
+                        }
                         *self.mode.write().await = BackendMode::Embedded;
                         BackendMode::Embedded
                     }
