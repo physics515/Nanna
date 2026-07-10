@@ -276,7 +276,6 @@ CREATE INDEX IF NOT EXISTS idx_workspaces_path ON workspaces(path);
 const MIGRATION_009: &str = r"
 -- Add FSRS cognitive state columns and workspace scope to memories
 ALTER TABLE memories ADD COLUMN workspace_id TEXT;
-ALTER TABLE memories ADD COLUMN expires_at INTEGER;
 ALTER TABLE memories ADD COLUMN fsrs_stability REAL NOT NULL DEFAULT 1.0;
 ALTER TABLE memories ADD COLUMN fsrs_difficulty REAL NOT NULL DEFAULT 5.0;
 ALTER TABLE memories ADD COLUMN fsrs_last_access INTEGER NOT NULL DEFAULT 0;
@@ -285,7 +284,6 @@ ALTER TABLE memories ADD COLUMN fsrs_importance REAL NOT NULL DEFAULT 1.0;
 ALTER TABLE memories ADD COLUMN fsrs_storage_strength REAL NOT NULL DEFAULT 0.1;
 ALTER TABLE memories ADD COLUMN fsrs_generation INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
 ";
 
 const MIGRATION_010: &str = r"

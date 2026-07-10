@@ -272,11 +272,11 @@ pub struct MemoryRepository {
     conn: Arc<Mutex<Connection>>,
 }
 
-/// Helper to decode FSRS columns from row index 9..17
+/// Helper to decode FSRS columns from row index 9..16
 /// Expected column order after the base 9:
-/// 9=workspace_id, 10=expires_at, 11=fsrs_stability, 12=fsrs_difficulty,
-/// 13=fsrs_last_access, 14=fsrs_access_count, 15=fsrs_importance,
-/// 16=fsrs_storage_strength, 17=fsrs_generation
+/// 9=workspace_id, 10=fsrs_stability, 11=fsrs_difficulty,
+/// 12=fsrs_last_access, 13=fsrs_access_count, 14=fsrs_importance,
+/// 15=fsrs_storage_strength, 16=fsrs_generation
 fn decode_memory_row(
     row: &turso::Row,
     embedding: Option<Vec<f32>>,
@@ -295,14 +295,13 @@ fn decode_memory_row(
         metadata: metadata_str.and_then(|s| serde_json::from_str(&s).ok()),
         tags,
         workspace_id: row.get(9)?,
-        expires_at: row.get(10)?,
-        fsrs_stability: row.get::<f64>(11)? as f32,
-        fsrs_difficulty: row.get::<f64>(12)? as f32,
-        fsrs_last_access: row.get(13)?,
-        fsrs_access_count: row.get(14)?,
-        fsrs_importance: row.get::<f64>(15)? as f32,
-        fsrs_storage_strength: row.get::<f64>(16)? as f32,
-        fsrs_generation: row.get(17)?,
+        fsrs_stability: row.get::<f64>(10)? as f32,
+        fsrs_difficulty: row.get::<f64>(11)? as f32,
+        fsrs_last_access: row.get(12)?,
+        fsrs_access_count: row.get(13)?,
+        fsrs_importance: row.get::<f64>(14)? as f32,
+        fsrs_storage_strength: row.get::<f64>(15)? as f32,
+        fsrs_generation: row.get(16)?,
     })
 }
 
@@ -333,10 +332,10 @@ impl MemoryRepository {
 
         conn.execute(
             "INSERT INTO memories (memory_id, content, embedding, embedding_model, session_id, metadata,
-                                   workspace_id, expires_at,
+                                   workspace_id,
                                    fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
                                    fsrs_importance, fsrs_storage_strength, fsrs_generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             turso::params![
                 mem.memory_id.as_str(),
                 mem.content.as_str(),
@@ -345,7 +344,6 @@ impl MemoryRepository {
                 mem.session_id.as_deref(),
                 metadata_json.as_deref(),
                 mem.workspace_id.as_deref(),
-                mem.expires_at,
                 mem.fsrs_stability as f64,
                 mem.fsrs_difficulty as f64,
                 mem.fsrs_last_access,
@@ -376,7 +374,7 @@ impl MemoryRepository {
         let mut rows = conn
             .query(
                 "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
-                        workspace_id, expires_at,
+                        workspace_id,
                         fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
                         fsrs_importance, fsrs_storage_strength, fsrs_generation
                  FROM memories WHERE memory_id = ?1",
@@ -414,7 +412,7 @@ impl MemoryRepository {
         let mut rows = conn
             .query(
                 "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
-                        workspace_id, expires_at,
+                        workspace_id,
                         fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
                         fsrs_importance, fsrs_storage_strength, fsrs_generation
                  FROM memories ORDER BY updated_at DESC LIMIT ?1",
@@ -440,7 +438,7 @@ impl MemoryRepository {
         let mut rows = conn
             .query(
                 "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
-                        workspace_id, expires_at,
+                        workspace_id,
                         fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
                         fsrs_importance, fsrs_storage_strength, fsrs_generation
                  FROM memories ORDER BY id ASC",

@@ -105,8 +105,6 @@ pub struct DreamingStats {
     pub auto_promoted: usize,
     /// Memories auto-demoted
     pub auto_demoted: usize,
-    /// Expired memories purged (durably) at the start of the cycle — phase (a).
-    pub expired_purged: usize,
     /// Total memories after dreaming
     pub total_memories: usize,
 }
@@ -257,13 +255,7 @@ impl DreamingService {
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        // Phase (a): purge expired memories (durable) before anything else, so the
-        // consolidation phases below never waste work on entries that are already
-        // gone. Complements the testing-effect FSRS flush in step 2.
-        let mut stats = DreamingStats {
-            expired_purged: self.memory.purge_expired().await,
-            ..DreamingStats::default()
-        };
+        let mut stats = DreamingStats::default();
 
         // 1. Apply pending feedback
         let pending = {
@@ -319,8 +311,7 @@ impl DreamingService {
         stats.total_memories = self.memory.count().await;
         
         info!(
-            "Dreaming complete: {} purged, {} processed, {} merged, {} expanded, {} promoted, {} demoted",
-            stats.expired_purged,
+            "Dreaming complete: {} processed, {} merged, {} expanded, {} promoted, {} demoted",
             stats.consolidation.memories_processed,
             stats.consolidation.memories_merged,
             stats.consolidation.memories_expanded,
@@ -406,41 +397,6 @@ mod tests {
         let service = DreamingService::new(DreamingConfig::default());
         let stats = service.stats().await;
         assert_eq!(stats.total, 0);
-    }
-
-    #[tokio::test]
-    async fn dream_purges_expired_as_phase_a() {
-        use crate::{FsrsState, MemoryEntry};
-        use std::collections::HashMap;
-
-        let service = DreamingService::new(DreamingConfig::default());
-
-        let mut entry = MemoryEntry {
-            id: "stale".to_string(),
-            content: "old fact".to_string(),
-            embedding: vec![0.0; 1536],
-            metadata: HashMap::new(),
-            timestamp: 0,
-            fsrs: FsrsState::default(),
-            workspace_id: None,
-            expires_at: Some(1),  // epoch second 1 → long past → expired
-        };
-        service.memory.insert_raw_for_test(entry.clone()).await;
-        entry.id = "fresh".to_string();
-        entry.expires_at = None;  // never expires → must survive
-        service.memory.insert_raw_for_test(entry).await;
-        assert_eq!(service.memory.count().await, 2);
-
-        // A full dream cycle must purge the expired entry (phase a) and record it,
-        // leaving only the live one. summarize_fn is never needed below the
-        // consolidation floor, so a panicking stub proves it isn't called here.
-        let stats = service
-            .dream(|_p| async { panic!("summarize must not run below the consolidation floor") })
-            .await
-            .expect("dream must not error");
-
-        assert_eq!(stats.expired_purged, 1);
-        assert_eq!(service.memory.count().await, 1);
     }
 
     #[tokio::test]

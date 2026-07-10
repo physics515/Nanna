@@ -339,7 +339,6 @@ impl MemoryService {
             timestamp: chrono_timestamp(),
             fsrs: FsrsState::new(),
             workspace_id: None, // smart_ingest creates global memories
-            expires_at: None,
         };
 
         self.store.add(entry).await?;
@@ -436,9 +435,8 @@ impl MemoryService {
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
             
-            // Don't reinforce expired or error memories — let them die
-            let skip_reinforce = existing.is_expired()
-                || existing.content.contains("Error:")
+            // Don't reinforce error memories — let them die
+            let skip_reinforce = existing.content.contains("Error:")
                 || existing.content.contains("Command failed");
 
             match action {
@@ -481,7 +479,7 @@ impl MemoryService {
                 _ => {
                     // Novel content or skipped reinforcement — fall through to create
                     if skip_reinforce {
-                        info!("Skipping reinforcement of expired/error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
+                        info!("Skipping reinforcement of error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     }
                 }
             }
@@ -501,7 +499,6 @@ impl MemoryService {
             timestamp: chrono_timestamp(),
             fsrs,
             workspace_id: None, // Global memory
-            expires_at: metadata.get("expires_at").and_then(|s| s.parse::<i64>().ok()),
         };
 
         self.store.add(entry).await?;
@@ -541,10 +538,8 @@ impl MemoryService {
             
             match action {
                 IngestAction::Reinforce | IngestAction::Update => {
-                    // Don't reinforce expired or error memories
-                    if existing.is_expired() {
-                        info!("Skipping reinforcement of expired memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
-                    } else if existing.content.contains("Error:") || existing.content.contains("Command failed") {
+                    // Don't reinforce error memories
+                    if existing.content.contains("Error:") || existing.content.contains("Command failed") {
                         info!("Skipping reinforcement of error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
                     } else {
                         // On the Update band, fold new information into the existing
@@ -580,10 +575,6 @@ impl MemoryService {
         let id = uuid::Uuid::new_v4().to_string();
         let mut fsrs = FsrsState::new();
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
-        
-        // Extract optional expiration from metadata
-        let expires_at = metadata.get("expires_at")
-            .and_then(|s| s.parse::<i64>().ok());
 
         let entry = MemoryEntry {
             id: id.clone(),
@@ -593,15 +584,10 @@ impl MemoryService {
             timestamp: chrono_timestamp(),
             fsrs,
             workspace_id,
-            expires_at,
         };
 
         self.store.add(entry).await?;
-        let ttl_note = expires_at.map_or(String::new(), |t| {
-            let secs = t - chrono_timestamp();
-            format!(" (expires in {}m)", secs / 60)
-        });
-        info!("Remembered (scoped, importance {}{}): {} (id: {})", importance, ttl_note, truncate(content, 50), id);
+        info!("Remembered (scoped, importance {}): {} (id: {})", importance, truncate(content, 50), id);
         Ok((id, IngestAction::Create))
     }
 
@@ -851,21 +837,6 @@ impl MemoryService {
         self.store.remove(id).await?;
         info!("Forgot memory: {}", id);
         Ok(())
-    }
-
-    /// Purge expired memories (call during dream time)
-    pub async fn purge_expired(&self) -> usize {
-        self.store.purge_expired().await
-    }
-
-    /// Test-only: insert a fully-formed entry straight into the store, bypassing
-    /// embedding/ingest. Lets tests seed entries with an explicit `expires_at`.
-    #[cfg(test)]
-    pub(crate) async fn insert_raw_for_test(&self, entry: crate::MemoryEntry) {
-        self.store
-            .add(entry)
-            .await
-            .expect("test insert must succeed");
     }
 
     /// Get memory count

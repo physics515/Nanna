@@ -86,23 +86,6 @@ pub struct MemoryEntry {
     /// Workspace ID if this memory is scoped to a workspace (None = global)
     #[serde(default)]
     pub workspace_id: Option<String>,
-    /// Optional expiration timestamp (epoch seconds). None = never expires.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<i64>,
-}
-
-impl MemoryEntry {
-    /// Check if this entry has expired
-    pub fn is_expired(&self) -> bool {
-        if let Some(expires_at) = self.expires_at {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
-            now >= expires_at
-        } else {
-            false
-        }
-    }
 }
 
 /// Vector store configuration
@@ -365,11 +348,10 @@ impl VectorStore {
                 .collect()
         };
 
-        // Pair entries with similarities, filtering out expired entries
+        // Pair entries with similarities.
         let mut scored: Vec<(MemoryEntry, f32)> = entries
             .iter()
             .zip(similarities)
-            .filter(|(entry, _)| !entry.is_expired())
             .map(|(entry, sim)| (entry.clone(), sim))
             .collect();
         drop(entries);
@@ -438,52 +420,6 @@ impl VectorStore {
         }
 
         Ok(())
-    }
-
-    /// Remove all expired entries. Returns the count of entries purged.
-    ///
-    /// Write-through: expired entries are deleted from the persistence backend as
-    /// well as the in-RAM cache, so a purge is durable and expired memories cannot
-    /// resurrect on the next `load_all`. The write lock is released before any DB
-    /// await (mirrors [`Self::remove`]) to avoid holding it across I/O.
-    pub async fn purge_expired(&self) -> usize {
-        // Phase 1 (RAM): drop expired entries, collecting their IDs for durable delete.
-        let expired_ids: Vec<String> = {
-            let mut entries = self.entries.write().await;
-            let count_before = entries.len();
-            let mut ids = Vec::new();
-            entries.retain(|e| {
-                let expired = e.is_expired();
-                if expired {
-                    ids.push(e.id.clone());
-                }
-                !expired
-            });
-            // Postconditions: nothing expired survives; the ID list matches what left.
-            debug_assert!(!entries.iter().any(MemoryEntry::is_expired));
-            debug_assert_eq!(ids.len(), count_before - entries.len());
-            drop(entries); // release the write lock before returning from the block
-            ids
-        };
-
-        let count_purged = expired_ids.len();
-        if count_purged == 0 {
-            return 0;
-        }
-
-        // Phase 2 (durable): remove each purged entry from persistence. A failed
-        // delete is non-fatal — RAM is already consistent and `is_expired()` still
-        // filters any residual persisted row on the next load.
-        if let Some(ref db) = self.db {
-            for id in &expired_ids {
-                if let Err(e) = db.remove_entry(id).await {
-                    warn!("Failed to remove expired memory entry {} from persistence: {}", id, e);
-                }
-            }
-        }
-
-        info!("Purged {} expired memory entries (durable)", count_purged);
-        count_purged
     }
 
     /// Update FSRS state for an entry.
@@ -881,7 +817,6 @@ mod tests {
             timestamp: 0,
             fsrs: FsrsState::default(),
             workspace_id: None,
-            expires_at: None,
         };
 
         store.add(entry).await.unwrap();
@@ -910,7 +845,6 @@ mod tests {
                 timestamp: 0,
                 fsrs: FsrsState::default(),
                 workspace_id: None,
-                expires_at: None,
             })
             .await
             .unwrap();
@@ -945,80 +879,5 @@ mod tests {
 
         assert_eq!(memory.len(), 3);  // Trimmed to max
         assert_eq!(memory.messages[0].role, "assistant");  // First message was trimmed
-    }
-
-    /// A `MemoryPersistence` double that only records which IDs were removed, so a
-    /// test can assert `purge_expired` deletes durably (write-through), not just in RAM.
-    struct RecordingPersistence {
-        removed_ids: std::sync::Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl MemoryPersistence for RecordingPersistence {
-        async fn save_entry(&self, _entry: &MemoryEntry) -> Result<(), MemoryError> {
-            Ok(())
-        }
-        async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
-            self.removed_ids.lock().unwrap().push(id.to_string());
-            Ok(())
-        }
-        async fn update_entry_fsrs(&self, _id: &str, _fsrs: &FsrsState) -> Result<(), MemoryError> {
-            Ok(())
-        }
-        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> {
-            Ok(())
-        }
-        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn entry_expiring_at(id: &str, expires_at: Option<i64>) -> MemoryEntry {
-        MemoryEntry {
-            id: id.to_string(),
-            content: format!("content-{}", id),
-            embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            metadata: HashMap::new(),
-            timestamp: 0,
-            fsrs: FsrsState::default(),
-            workspace_id: None,
-            expires_at,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_purge_expired_is_durable_and_selective() {
-        let db = Arc::new(RecordingPersistence {
-            removed_ids: std::sync::Mutex::new(Vec::new()),
-        });
-        let store = VectorStore::new(VectorStoreConfig {
-            dimension: std::sync::atomic::AtomicUsize::new(8),
-            use_f16: false,
-        })
-        .with_persistence(db.clone());
-
-        // Two already-expired (epoch second 1 is far in the past), one never-expiring,
-        // one expiring far in the future — only the two past ones should be purged.
-        store.add(entry_expiring_at("gone_a", Some(1))).await.unwrap();
-        store.add(entry_expiring_at("keep_forever", None)).await.unwrap();
-        store.add(entry_expiring_at("gone_b", Some(1))).await.unwrap();
-        store
-            .add(entry_expiring_at("keep_future", Some(i64::MAX)))
-            .await
-            .unwrap();
-        assert_eq!(store.len().await, 4);
-
-        let purged = store.purge_expired().await;
-        assert_eq!(purged, 2);
-        assert_eq!(store.len().await, 2);  // RAM: only the two live entries remain
-
-        // Durable: both expired IDs were removed from the persistence backend.
-        let mut removed = db.removed_ids.lock().unwrap().clone();
-        removed.sort();
-        assert_eq!(removed, vec!["gone_a".to_string(), "gone_b".to_string()]);
-
-        // Idempotent: a second purge finds nothing and touches the backend no further.
-        assert_eq!(store.purge_expired().await, 0);
-        assert_eq!(db.removed_ids.lock().unwrap().len(), 2);
     }
 }

@@ -46,7 +46,6 @@ fn entry_to_new_memory(entry: &MemoryEntry) -> NewMemory {
         metadata: metadata_value,
         tags: Vec::new(), // Tags are stored inside metadata for MemoryEntry
         workspace_id: entry.workspace_id.clone(),
-        expires_at: entry.expires_at,
         fsrs_stability: entry.fsrs.stability,
         fsrs_difficulty: entry.fsrs.difficulty,
         fsrs_last_access: entry.fsrs.last_access,
@@ -103,7 +102,6 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
         timestamp,
         fsrs,
         workspace_id: mem.workspace_id,
-        expires_at: mem.expires_at,
     })
 }
 

@@ -610,24 +610,15 @@ impl AgentService {
                             if let Some(ref service) = mem_service {
                                 let mut metadata = memory.tags.unwrap_or_default();
                                 metadata.insert("category".to_string(), memory.category.clone());
-                                // Derive importance and TTL from category
-                                let (importance, ttl_secs): (f32, Option<i64>) = match memory.category.as_str() {
-                                    // Tool results are ephemeral — expire after 2 hours.
-                                    // They exist so compressed context can be recalled short-term,
-                                    // but don't pollute long-term semantic search.
-                                    // Purged during dream time.
-                                    "tool_result" => (1.5, Some(2 * 3600)),
-                                    "preference" | "identity" => (4.0, None),
-                                    "fact" | "insight" => (3.5, None),
-                                    "context" => (3.0, None),
-                                    _ => (3.0, None),
+                                // Derive importance from category. Memories never
+                                // expire — all categories are permanent.
+                                let importance: f32 = match memory.category.as_str() {
+                                    "tool_result" => 1.5,
+                                    "preference" | "identity" => 4.0,
+                                    "fact" | "insight" => 3.5,
+                                    "context" => 3.0,
+                                    _ => 3.0,
                                 };
-                                
-                                // Set expiration timestamp if TTL is configured
-                                if let Some(ttl) = ttl_secs {
-                                    let expires_at = chrono::Utc::now().timestamp() + ttl;
-                                    metadata.insert("expires_at".to_string(), expires_at.to_string());
-                                }
 
                                 // Skip low-signal content: errors, tiny results, or garbled output
                                 let dominated_by_non_ascii = memory.content.chars().take(200)

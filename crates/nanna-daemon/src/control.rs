@@ -1313,12 +1313,6 @@ impl ControlPlane {
                 })
             }
             MemoryAction::Consolidate => {
-                // Purge expired memories first (tool results with TTL)
-                let purged = memory.purge_expired().await;
-                if purged > 0 {
-                    info!("Dream time: purged {} expired memories", purged);
-                }
-
                 // Trigger memory consolidation (requires LLM for summarization)
                 let Some(ref router) = self.router else {
                     return json!({ "error": "llm_unavailable", "message": "LLM router required for consolidation" });
