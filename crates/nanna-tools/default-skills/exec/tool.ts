@@ -2,7 +2,7 @@ export default {
   name: "exec",
   version: "0.1.0",
   output: "context",
-  description: "Execute a shell command and return its output. Use for running build commands, scripts, git operations, etc.",
+  description: "Execute a shell command in a POSIX shell (Git Bash on Windows, sh on Unix) and return its output. Use bash syntax: pipes, &&, [ -f x ], cat/grep/tail, forward-slash paths. Use for build commands, scripts, git operations, etc.",
   parameters: {
     type: "object",
     properties: {

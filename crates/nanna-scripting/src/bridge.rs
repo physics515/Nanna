@@ -46,6 +46,66 @@ pub struct NannaBridge {
 static FILE_WRITE_LOCKS: std::sync::LazyLock<StdMutex<StdHashSet<std::path::PathBuf>>> =
     std::sync::LazyLock::new(|| StdMutex::new(StdHashSet::new()));
 
+/// Which Windows shell to run a model-issued command through.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinShell {
+    /// Explicit PowerShell — `powershell`/`pwsh` prefix, `$env:`, or a `Verb-Noun` cmdlet.
+    PowerShell,
+    /// The default. Models write POSIX/bash commands (`[ -f ]`, `cat`, `tail`, `&&`,
+    /// `|`, forward-slash paths); we run those through Git Bash when available.
+    Bash,
+}
+
+/// Classify a Windows command as explicit PowerShell, else Bash (the default).
+///
+/// Pure (no IO). `trimmed` must already be left-trimmed. Only *unambiguous*
+/// PowerShell markers force PowerShell; everything else defaults to Bash, because
+/// the previous `$ && |` heuristic mis-routed ordinary bash (`cat $f | grep`) to
+/// PowerShell and broke it.
+#[cfg(windows)]
+fn classify_windows_command(trimmed: &str) -> WinShell {
+    let is_powershell = trimmed.starts_with("powershell")
+        || trimmed.starts_with("pwsh")
+        || trimmed.contains("$env:")
+        || trimmed.contains("Get-")
+        || trimmed.contains("Set-")
+        || trimmed.contains("New-")
+        || trimmed.contains("Remove-")
+        || trimmed.contains("Select-")
+        || trimmed.contains("Where-Object")
+        || trimmed.contains("ForEach-Object");
+    if is_powershell {
+        WinShell::PowerShell
+    } else {
+        WinShell::Bash
+    }
+}
+
+/// Locate Git-for-Windows `bash.exe`, cached. Explicitly **not** WSL's
+/// `C:\Windows\System32\bash.exe` (different filesystem semantics), only a real
+/// Git Bash under a `Git\bin` install. Returns `None` if Git Bash isn't installed.
+#[cfg(windows)]
+fn git_bash_path() -> Option<&'static Path> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+                if let Ok(base) = std::env::var(var) {
+                    candidates.push(PathBuf::from(base).join("Git").join("bin").join("bash.exe"));
+                }
+            }
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                candidates
+                    .push(PathBuf::from(local).join("Programs").join("Git").join("bin").join("bash.exe"));
+            }
+            candidates.into_iter().find(|p| p.is_file())
+        })
+        .as_deref()
+}
+
 impl NannaBridge {
     /// Create a new bridge with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
@@ -185,39 +245,21 @@ impl NannaBridge {
 
         // Determine shell based on OS.
         // On Windows, route commands to the appropriate shell:
-        // - PowerShell syntax → powershell.exe (avoids cmd.exe mangling $, |, quotes)
-        // - Python one-liners → python directly (cmd.exe breaks -c quoting)
-        // - Everything else → cmd /S /C (the /S flag preserves inner quoting better)
+        // - `python[3] -c "..."` one-liners → python directly (cmd/quote mangling)
+        // - explicit PowerShell (`$env:`, `Verb-Noun` cmdlets, `powershell`/`pwsh`) → powershell.exe
+        // - everything else → Git Bash (models write POSIX/bash by default), falling
+        //   back to cmd.exe only when Git Bash isn't installed.
         let mut cmd = if cfg!(windows) {
             let trimmed = command.trim_start();
 
-            let is_powershell = trimmed.starts_with("powershell")
-                || trimmed.starts_with("pwsh")
-                || trimmed.contains("$env:")
-                || trimmed.contains("Get-")
-                || trimmed.contains("Set-")
-                || trimmed.contains("New-")
-                || trimmed.contains("Remove-")
-                || trimmed.contains("Select-")
-                || trimmed.contains("Where-Object")
-                || trimmed.contains("ForEach-Object")
-                || (trimmed.contains('$') && trimmed.contains('|'));
-
-            // Detect python/python3 -c "..." one-liners
-            // Compound commands (&&, ||) are also supported — we split and run
-            // only the python portion directly, but if the whole thing is just
-            // python -c "...", route it directly to avoid cmd.exe quote mangling.
+            // Detect `python[3] -c "..."` one-liners (route directly to avoid quote
+            // mangling). Compound commands (&&, ||) are handled by the shell below.
             let is_python_c = (trimmed.starts_with("python3 -c") || trimmed.starts_with("python -c"))
                 && !trimmed.contains("&&")
                 && !trimmed.contains("||");
 
-            if is_powershell {
-                let mut c = tokio::process::Command::new("powershell.exe");
-                c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-                c
-            } else if is_python_c {
+            if is_python_c {
                 // Parse: "python[3] -c 'code'" or 'python[3] -c "code"'
-                // Route directly to python.exe to avoid cmd.exe quote mangling.
                 let (exe, rest) = if trimmed.starts_with("python3") {
                     ("python3", trimmed.strip_prefix("python3 -c").unwrap_or("").trim())
                 } else {
@@ -235,22 +277,26 @@ impl NannaBridge {
                 c.args(["-c", code]);
                 c
             } else {
-                // For compound commands (&&, ||) containing special characters
-                // that cmd.exe mangles, prefer PowerShell
-                let has_problematic_chars = trimmed.contains('\'')
-                    || trimmed.contains('`')
-                    || (trimmed.contains('"') && trimmed.matches('"').count() > 2);
-                
-                // Route compound commands with python to PowerShell too
-                let has_python = trimmed.contains("python -c") || trimmed.contains("python3 -c");
-                if (has_problematic_chars || has_python) && (trimmed.contains('\'') || trimmed.contains("||")) {
-                    let mut c = tokio::process::Command::new("powershell.exe");
-                    c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-                    c
-                } else {
-                    let mut c = tokio::process::Command::new("cmd");
-                    c.args(["/S", "/C", command]);
-                    c
+                match classify_windows_command(trimmed) {
+                    WinShell::PowerShell => {
+                        let mut c = tokio::process::Command::new("powershell.exe");
+                        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                        c
+                    }
+                    WinShell::Bash => {
+                        // The model writes POSIX/bash — run through Git Bash if present
+                        // (handles `[ -f ]`, cat, tail, &&, |, quoting, forward-slash
+                        // paths); fall back to cmd.exe only when Git Bash isn't installed.
+                        if let Some(bash) = git_bash_path() {
+                            let mut c = tokio::process::Command::new(bash);
+                            c.args(["-c", command]);
+                            c
+                        } else {
+                            let mut c = tokio::process::Command::new("cmd");
+                            c.args(["/S", "/C", command]);
+                            c
+                        }
+                    }
                 }
             }
         } else {
@@ -730,6 +776,44 @@ fn strip_ansi_escapes(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_bash_style_commands_route_to_bash() {
+        // The exact shapes the model wrote that used to fail in cmd.exe.
+        for cmd in [
+            "if [ -f \"D:/x/y.lock\" ]; then echo LOCK; cat \"D:/x/y.lock\"; else echo NO; fi",
+            "cd D:/Development/nanna && git fetch origin 2>&1 | tail -5",
+            "ls -la | head -20",
+            "cat $file | grep foo", // used to be stolen by the `$ && |` heuristic
+            "grep -r 'pattern' . && echo done",
+        ] {
+            assert_eq!(
+                classify_windows_command(cmd.trim_start()),
+                WinShell::Bash,
+                "should route to bash: {cmd}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_explicit_powershell_routes_to_powershell() {
+        for cmd in [
+            "Get-ChildItem -Path .",
+            "powershell -Command \"echo hi\"",
+            "pwsh -c ls",
+            "Write-Output $env:PATH",
+            "Get-Content foo.txt | Select-Object -First 5",
+            "Remove-Item bar -Recurse",
+        ] {
+            assert_eq!(
+                classify_windows_command(cmd.trim_start()),
+                WinShell::PowerShell,
+                "should route to powershell: {cmd}"
+            );
+        }
+    }
+
     #[test]
     fn test_permission_check() {
         let bridge = NannaBridge::new(
@@ -740,5 +824,27 @@ mod tests {
 
         assert!(bridge.permissions.allows_net("api.example.com"));
         assert!(!bridge.permissions.allows_net("evil.com"));
+    }
+
+    /// End-to-end: a POSIX/bash command with a pipe + `tail` (which used to fail in
+    /// cmd.exe with an empty error) actually runs and succeeds via Git Bash.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_exec_runs_posix_pipe_command_via_git_bash() {
+        if git_bash_path().is_none() {
+            eprintln!("skipping windows_exec_runs_posix_pipe_command_via_git_bash: Git Bash not installed");
+            return;
+        }
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        // pipe + `tail` + POSIX `printf` — none of which cmd.exe can run.
+        let out = bridge
+            .exec("printf 'a\\nb\\nc\\n' | tail -1", None)
+            .await
+            .expect("exec should not error");
+        assert!(out.success, "command should succeed, got {out:?}");
+        assert_eq!(out.stdout.trim(), "c", "stdout was {:?}", out.stdout);
     }
 }
