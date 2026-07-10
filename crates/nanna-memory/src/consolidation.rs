@@ -425,7 +425,6 @@ pub fn create_consolidated_entry(
         timestamp: now(),
         fsrs,
         workspace_id,
-        expires_at: None, // Consolidated memories don't expire
     }
 }
 
@@ -497,7 +496,6 @@ mod tests {
             timestamp: 1000000,
             fsrs: FsrsState::default(),
             workspace_id: None,
-            expires_at: None,
         };
         let score = composite_cluster_score(&entry, &entry, &weights);
         assert!(score > 0.9, "identical memories should score high: {}", score);
@@ -514,7 +512,6 @@ mod tests {
             timestamp: 0,
             fsrs: FsrsState { importance: 1.0, access_count: 0, ..FsrsState::default() },
             workspace_id: None,
-            expires_at: None,
         };
         let b = MemoryEntry {
             id: "2".into(),
@@ -524,7 +521,6 @@ mod tests {
             timestamp: 86400 * 365, // 1 year apart
             fsrs: FsrsState { importance: 5.0, access_count: 100, ..FsrsState::default() },
             workspace_id: None,
-            expires_at: None,
         };
         let score = composite_cluster_score(&a, &b, &weights);
         assert!(score < 0.3, "very different memories should score low: {}", score);
@@ -546,7 +542,6 @@ mod tests {
                 timestamp: 1000,
                 fsrs: FsrsState { importance: 2.0, access_count: 5, ..FsrsState::default() },
                 workspace_id: None,
-                expires_at: None,
             },
             MemoryEntry {
                 id: "2".into(),
@@ -556,7 +551,6 @@ mod tests {
                 timestamp: 1100,
                 fsrs: FsrsState { importance: 2.0, access_count: 4, ..FsrsState::default() },
                 workspace_id: None,
-                expires_at: None,
             },
             MemoryEntry {
                 id: "3".into(),
@@ -566,7 +560,6 @@ mod tests {
                 timestamp: 86400 * 60,
                 fsrs: FsrsState { importance: 5.0, access_count: 0, ..FsrsState::default() },
                 workspace_id: None,
-                expires_at: None,
             },
         ];
 
@@ -588,7 +581,6 @@ mod tests {
                 timestamp: 0,
                 fsrs: FsrsState::default(),
                 workspace_id: None,
-                expires_at: None,
             },
             MemoryEntry {
                 id: "2".to_string(),
@@ -598,7 +590,6 @@ mod tests {
                 timestamp: 0,
                 fsrs: FsrsState::default(),
                 workspace_id: None,
-                expires_at: None,
             },
         ];
 
@@ -625,7 +616,6 @@ mod tests {
             timestamp: 0,
             fsrs,
             workspace_id: None,
-            expires_at: None,
         }
     }
 

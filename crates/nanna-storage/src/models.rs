@@ -48,8 +48,6 @@ pub struct Memory {
     pub tags: Vec<String>,
     /// Workspace scope (None = global)
     pub workspace_id: Option<String>,
-    /// Expiration epoch seconds (None = never)
-    pub expires_at: Option<i64>,
     /// FSRS cognitive state fields
     pub fsrs_stability: f32,
     pub fsrs_difficulty: f32,
@@ -99,8 +97,6 @@ pub struct NewMemory {
     pub tags: Vec<String>,
     /// Workspace scope (None = global)
     pub workspace_id: Option<String>,
-    /// Expiration epoch seconds (None = never)
-    pub expires_at: Option<i64>,
     /// FSRS cognitive state fields
     pub fsrs_stability: f32,
     pub fsrs_difficulty: f32,
