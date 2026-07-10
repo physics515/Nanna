@@ -1,7 +1,7 @@
 //! High-level MCP client implementation
 
 use crate::{
-    protocol::{ServerInfo, ServerCapabilities, Tool, Resource, Prompt, RequestId, JsonRpcRequest, InitializeResult, InitializeParams, ClientCapabilities, RootsCapability, ClientInfo, JsonRpcNotification, ListToolsResult, CallToolResult, CallToolParams, ListResourcesResult, ReadResourceResult, ReadResourceParams, ListPromptsResult, GetPromptResult, GetPromptParams}, transport::Transport, McpError, Result,
+    protocol::{ServerInfo, ServerCapabilities, Tool, Resource, Prompt, RequestId, JsonRpcRequest, InitializeResult, InitializeParams, ClientCapabilities, RootsCapability, ClientInfo, JsonRpcNotification, ListToolsResult, CallToolResult, CallToolParams, ListResourcesResult, ReadResourceResult, ReadResourceParams, ListPromptsResult, GetPromptResult, GetPromptParams}, transport::{Transport, McpList}, McpError, Result,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -160,6 +160,15 @@ impl<T: Transport> McpClient<T> {
     // Tools
     // ========================================================================
 
+    /// Read-and-clear the transport's "server changed this list" flag, if the
+    /// transport surfaces one. `true` means the local cache for `list` is stale
+    /// and the caller should refresh before serving it.
+    fn take_list_changed(&self, list: McpList) -> bool {
+        self.transport
+            .list_changed_flags()
+            .is_some_and(|flags| flags.take(list))
+    }
+
     /// List available tools (internal, no init check)
     async fn list_tools_internal(&self) -> Result<ListToolsResult> {
         self.request("tools/list", None).await
@@ -172,6 +181,11 @@ impl<T: Transport> McpClient<T> {
     /// Returns error if not initialized or request fails
     pub async fn list_tools(&self) -> Result<Vec<Tool>> {
         self.ensure_initialized().await?;
+        // If the server pushed a tools/list_changed, the cache is stale — refresh.
+        if self.take_list_changed(McpList::Tools) {
+            debug!("MCP tools list_changed — refreshing cache");
+            return self.refresh_tools().await;
+        }
         let tools = self.tools.read().await;
         Ok(tools.clone())
     }
@@ -234,6 +248,11 @@ impl<T: Transport> McpClient<T> {
     /// Returns error if not initialized or request fails
     pub async fn list_resources(&self) -> Result<Vec<Resource>> {
         self.ensure_initialized().await?;
+        // If the server pushed a resources/list_changed, the cache is stale — refresh.
+        if self.take_list_changed(McpList::Resources) {
+            debug!("MCP resources list_changed — refreshing cache");
+            return self.refresh_resources().await;
+        }
         let resources = self.resources.read().await;
         Ok(resources.clone())
     }
@@ -285,6 +304,11 @@ impl<T: Transport> McpClient<T> {
     /// Returns error if not initialized or request fails
     pub async fn list_prompts(&self) -> Result<Vec<Prompt>> {
         self.ensure_initialized().await?;
+        // If the server pushed a prompts/list_changed, the cache is stale — refresh.
+        if self.take_list_changed(McpList::Prompts) {
+            debug!("MCP prompts list_changed — refreshing cache");
+            return self.refresh_prompts().await;
+        }
         let prompts = self.prompts.read().await;
         Ok(prompts.clone())
     }
@@ -470,9 +494,74 @@ impl McpClient<crate::HttpTransport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::JsonRpcResponse;
+    use crate::transport::ListChangedFlags;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_protocol_version() {
         assert!(!PROTOCOL_VERSION.is_empty());
+    }
+
+    /// A transport whose `tools/list` reply encodes how many times it has been
+    /// called (tool name `tool-N`), so a test can tell a cache hit (stale) from a
+    /// refresh (a new request). Surfaces a shared `ListChangedFlags` like stdio.
+    struct CountingTransport {
+        flags: Arc<ListChangedFlags>,
+        tools_list_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for CountingTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let n = self.tools_list_calls.fetch_add(1, Ordering::SeqCst);
+            let result = serde_json::json!({
+                "tools": [{ "name": format!("tool-{n}"), "inputSchema": {} }]
+            });
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+        fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+            Some(self.flags.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tools_refreshes_only_when_flag_is_dirty() {
+        let flags = Arc::new(ListChangedFlags::default());
+        let client = McpClient::new(CountingTransport {
+            flags: flags.clone(),
+            tools_list_calls: AtomicUsize::new(0),
+        });
+        *client.initialized.write().await = true;
+
+        // Prime the cache with the server's first list (tool-0).
+        let primed = client.refresh_tools().await.unwrap();
+        assert_eq!(primed[0].name, "tool-0");
+
+        // With no list_changed pending, list_tools serves the cache — no new request.
+        let cached = client.list_tools().await.unwrap();
+        assert_eq!(cached[0].name, "tool-0");
+
+        // Server announces tools/list_changed → next list_tools refreshes. This is
+        // the 2nd `tools/list` request (call index 1, since the cache hit above
+        // issued none), so the server returns tool-1.
+        flags.mark(McpList::Tools);
+        let refreshed = client.list_tools().await.unwrap();
+        assert_eq!(refreshed[0].name, "tool-1");
+
+        // Flag was consumed: a following call serves the refreshed cache, no request.
+        let after = client.list_tools().await.unwrap();
+        assert_eq!(after[0].name, "tool-1");
     }
 }

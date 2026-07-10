@@ -359,8 +359,16 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       carry the flag → text passes through **unchanged** (zero regression); Signal/WhatsApp now get Markdown
       down-converted to plain text (headers/blockquotes/fences/bold/inline-code stripped, `[label](url)` →
       `label (url)`), so they stop showing literal `**`/backticks. Conservative on purpose: single `*`/`_`,
-      `__dunders__`, `snake_case`, and `2 * 3` survive. 7 unit tests. Remaining: tables→text, Discord embeds,
-      Slack Block Kit, and length-aware splitting on `max_message_length`.
+      `__dunders__`, `snake_case`, and `2 * 3` survive. 7 unit tests.
+      *(2026-07-10)* **Length-aware splitting shipped.** New pure `split_for_length(text, max_chars)` splits a
+      payload into chunks each ≤ `max_chars` **Unicode scalars** (not bytes), preferring a newline then a
+      space break within the window and only hard-splitting a single over-long token; chunks concatenate back
+      to the exact input (the break char stays on the preceding chunk) so no content is lost. Wired into
+      `MessageRouter::send`: when the channel sets `max_message_length` and the (already Markdown-adapted) text
+      exceeds it, the router sends the parts in order and returns the first part's id (the reply/edit anchor).
+      7 tests (within-limit passthrough, whitespace/newline break preference, oversized-token hard-split,
+      Unicode-scalar counting; + 2 router tests with a recording mock proving split vs no-split). Remaining:
+      tables→text, Discord embeds, Slack Block Kit.
 - [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
@@ -460,10 +468,35 @@ routine should drain first.**
 - [ ] `not_implemented` daemon control actions: Regenerate message (`control.rs:416`), ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
 - [ ] Server stats not wired to shared daemon state (`server.rs:882`).
+- [ ] **Double health-server bind** — the daemon starts a health server in *two* places on the same
+      `health_port`: `server.rs:873` and `health.rs:299` both log "Health server listening on …:{port}",
+      and a live `nanna-daemon run` shows the second binder fail 4× (`os error 10048`) before erroring out
+      (harmless today because the first bind wins, but it spams WARN/ERROR every boot). Pick one owner —
+      likely keep the richer `health.rs` server and drop the `server.rs` duplicate (or vice-versa) — so only
+      one binds. *(observed 2026-07-10 via a real daemon boot smoke test)*
 - [x] MCP server notifications logged but not handled (`transport.rs:148`).
-      *(2026-07-06) `handle_server_notification` now classifies server notifications (`message`/`progress`/`cancelled`/`*/list_changed`) and routes them to the right tracing level — MCP `notifications/message` logs at warn when its `level` is warning-or-worse, else debug (was parsed then dropped). Pure `classify_server_notification` + `mcp_level_is_severe` with 3 tests. Next: wire `list_changed` to tool/resource cache invalidation.*
+      *(2026-07-06) `handle_server_notification` now classifies server notifications (`message`/`progress`/`cancelled`/`*/list_changed`) and routes them to the right tracing level — MCP `notifications/message` logs at warn when its `level` is warning-or-worse, else debug (was parsed then dropped). Pure `classify_server_notification` + `mcp_level_is_severe` with 3 tests.*
+      *(2026-07-10)* **`list_changed` now invalidates the client cache.** Added a transport-agnostic
+      `ListChangedFlags` (per-list `AtomicBool` for tools/resources/prompts) surfaced via a **defaulted**
+      `Transport::list_changed_flags()` — so `HttpTransport` and any other impl inherit `None` with zero
+      changes. The stdio reader task marks the matching flag on `notifications/{tools,resources,prompts}/
+      list_changed` (parsed by a pure `list_changed_kind`; a `list_changed` for an uncached list like `roots`
+      marks nothing), and `McpClient::list_{tools,resources,prompts}` read-and-clear the flag, refreshing the
+      cache before serving instead of returning stale entries. 3 tests: per-list marking + read-and-clear
+      semantics, an uncached `roots/list_changed` marks nothing, and an end-to-end client test (counting mock
+      transport) proving a dirty flag forces exactly one refresh and is then consumed. 10 nanna-mcp tests
+      pass; clippy unchanged (561); nanna-daemon builds green.*
 - [ ] JS tools don't parse parameter schemas from manifests (`scripting/tool.rs:188`).
-- [ ] Tool-manager consistency: `update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap); `create_user_tool` swallows registration errors in `if let Ok`; no duplicate-name check; ~~`enabled:false` tools still execute~~ / ~~no `ToolRegistry::unregister` (deleted tools stay callable until restart)~~ **(done 2026-07-09 — see below)**; ~~non-string enums dropped in `parse_params_from_schema`~~ **(done 2026-07-06 — `enum_value_to_string` preserves integer/boolean/null enum values in both the daemon and nanna-tools copies; tests each)**.
+- [ ] Tool-manager consistency: ~~`update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap)~~ / ~~no duplicate-name check~~ **(done 2026-07-10 — daemon `UserToolManager`, see below)**; `create_user_tool` swallows registration errors in `if let Ok`; ~~`enabled:false` tools still execute~~ / ~~no `ToolRegistry::unregister` (deleted tools stay callable until restart)~~ **(done 2026-07-09 — see below)**; ~~non-string enums dropped in `parse_params_from_schema`~~ **(done 2026-07-06 — `enum_value_to_string` preserves integer/boolean/null enum values in both the daemon and nanna-tools copies; tests each)**.
+      *(2026-07-10)* Daemon `UserToolManager` hardened: **`update_tool` now clone→validate→mutate→save→swap** —
+      it validates the new source *before* touching any field and mutates a clone, publishing to the cache
+      only after the disk write succeeds, so a bad edit or a failed write can no longer leave RAM diverged
+      from disk (the old path applied `description` before validating `source`, and mutated the live entry in
+      place). **`create_tool` now rejects duplicate names** under the write lock held across
+      dup-check→save→insert (atomic vs a racing create), instead of silently clobbering an existing tool +
+      its `.json`. 2 tests: duplicate-create rejected + original untouched; a bad-source update fails whole
+      and a fresh manager reloading from disk still sees the original. clippy unchanged (2057). Remaining
+      here: `create_user_tool`'s `if let Ok` swallow + the GUI-embedded `tool_authoring.rs` copy (needs a GUI build).
       *(2026-07-09)* Replaced the naive one-line `ToolRegistry::unregister` (removed only the primary key, so a deleted tool stayed reachable through its own alias entry) with a cascading version: deleting a canonical tool also drops every alias whose target is it and purges the `alias_targets` reverse-map; deleting an alias leaves the canonical intact. Returns the entry-count removed. Wired into the **daemon** control plane: `ToolAction::Delete` now `unregister`s the live tool (deletion takes effect without a restart), and `ToolAction::Update` reconciles the registry with the new `enabled` flag — unregister then re-register only if still enabled, so a disabled tool stops executing and an edit's new source goes live immediately. 4 registry unit tests (uncallable-after-delete, alias cascade, alias-only removal leaves canonical, unknown-name no-op). Remaining: the GUI-embedded `UserToolManager` copy (`tool_authoring.rs`) still needs the same wiring (needs a GUI build to verify).
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
@@ -538,7 +571,16 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 **Best-in-class dreaming:**
 - [ ] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
 - [~] **Idle-gated, multi-phase dream cycle** (like sleep, not a fixed hourly cron): track last-activity; after N min idle (or memory-pressure) run phases — (a) purge-expired + testing-effect flush, (b) **true merge/dedup**, (c) cluster-consolidate by FSRS weight band, (d) expand high-weight, (e) DSP timeline compression (below). Emit progress events.
-      *(2026-07-09)* **Idle gate shipped** (the trigger half). `DreamingService` now tracks `last_activity` (`record_activity()` / `idle_duration()`) and exposes `dream_if_idle()` — the gated entry point the scheduler should call instead of the unconditional `dream()`. Decision lives in a pure, exhaustively-tested `dream_trigger(idle, memory_count, cfg) -> {Idle | MemoryPressure | Skipped}`: runs after `idle_threshold_secs` (default 300s) idle **or** when live memory count hits `memory_pressure_count` (default 5000, `0` disables) — memory-pressure overrides activity so a busy system still consolidates before the store grows unbounded. 4 tests (idle boundary, pressure-overrides-activity, pressure-disabled-by-zero, and `dream_if_idle` skips + never calls `summarize_fn` when active). Remaining: the multi-phase body (purge/merge/cluster-by-band/expand/DSP) and wiring `record_activity`/`dream_if_idle` into the daemon scheduler + agent loop.
+      *(2026-07-09)* **Idle gate shipped** (the trigger half). `DreamingService` now tracks `last_activity` (`record_activity()` / `idle_duration()`) and exposes `dream_if_idle()` — the gated entry point the scheduler should call instead of the unconditional `dream()`. Decision lives in a pure, exhaustively-tested `dream_trigger(idle, memory_count, cfg) -> {Idle | MemoryPressure | Skipped}`: runs after `idle_threshold_secs` (default 300s) idle **or** when live memory count hits `memory_pressure_count` (default 5000, `0` disables) — memory-pressure overrides activity so a busy system still consolidates before the store grows unbounded. 4 tests (idle boundary, pressure-overrides-activity, pressure-disabled-by-zero, and `dream_if_idle` skips + never calls `summarize_fn` when active).
+      *(2026-07-10)* **Phase (a) shipped — durable purge-expired.** `dream()` now runs `purge_expired()`
+      as its first step (before feedback/consolidation) and records the count in a new
+      `DreamingStats.expired_purged` field (surfaced in the completion log). Also fixed a latent durability
+      bug: `VectorStore::purge_expired` dropped expired entries from RAM only, so they resurrected from
+      Turso on the next `load_all` — it now write-throughs the deletes to the persistence backend (lock
+      released before the DB awaits, mirroring `remove`), with pre/postcondition `debug_assert`s. 2 tests
+      (durable+selective+idempotent purge with a recording persistence double; `dream()` records phase-a
+      purge and leaves live entries). Remaining: the rest of the multi-phase body (merge/cluster-by-band/
+      expand/DSP) and wiring `record_activity`/`dream_if_idle` into the daemon scheduler + agent loop.
 - [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
       *(2026-07-07) Done for **all three ingest paths** (`smart_ingest`, `remember_with_importance`,
       the scoped variant) via a shared `fold_into_memory` helper: `merge_memory_content` +
@@ -555,6 +597,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
       - [ ] *(research 2026-07-06)* Use a **pure-Rust HNSW** crate (`hnsw_rs` / `instant-distance`) over a C ext — `sqlite-vec` is brute-force only; `vectorlite` shows HNSW at `ef_construction=100, M=30` scales well. Fits the Turso-only + in-RAM-cosine model (build the index in RAM, persist coeff/graph as Turso BLOBs). Sources: [vectorlite](https://github.com/1yefuwang1/vectorlite), [sqlite-vec ANN issue](https://github.com/asg017/sqlite-vec/issues/25).
       - [ ] *(research 2026-07-09)* Crate shortlist (all pure-Rust, actively maintained early 2026): **`hnsw_rs`** — multithreaded build/search via `parking_lot`, SIMD distances through `anndists` (L1/L2/Cosine/Hamming/…), the most feature-complete; **`hnswlib-rs`** — designed for **concurrent search + concurrent mutation** with an `InMemoryVectorStore` doing **lock-free reads + parallel updates** (best fit for a live memory store that dreams while serving recalls, avoids a global rebuild); **`instant-distance`** — smallest/simplest pure-Rust HNSW if we want minimal surface. Lean `hnswlib-rs` for the online/insert-while-query case, `hnsw_rs` if we need its distance breadth. Sources: [hnsw_rs](https://crates.io/crates/hnsw_rs), [hnswlib-rs](https://github.com/jean-pierreBoth/hnswlib-rs), [instant-distance](https://lib.rs/crates/instant-distance).
+      - [ ] *(research 2026-07-10)* Confirmed still current: `hnsw_rs` exposes `insert_parallel` + `parallel_search` (rayon/parking_lot) — the concrete entry points for the "batch-build the index in RAM from the whole `VectorStore`, then query candidates" approach that fits the dream-time clusterer (build once per cycle rather than incrementally). `instant-distance` builds from a `Vec<Point>` in one shot (no incremental insert) — fine for the rebuild-per-dream model, wrong for online mutation. Net: `hnsw_rs::Hnsw::insert_parallel` for the dream-time rebuild; revisit `hnswlib-rs` only if we later need insert-while-serving. Sources: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html), [instant-distance](https://github.com/djc/instant-distance).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
@@ -634,8 +677,15 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    - [ ] `playwright-rs 0.8→0.14` + `chromiumoxide 0.8→0.9` (nanna-browser)
    - [x] `keyring 3→4` (nanna-config) — *(2026-07-09)* v4 split platform stores into per-OS `*-keyring-store` crates (no longer default); added `apple-native-keyring-store` and kept the default `windows-native-keyring-store` + `zbus-secret-service-keyring-store` + `v1` compat feature, which preserves the `Entry`/`Error::NoEntry` API so `credentials.rs` compiled unchanged. Build+tests green.
    - [x] `ed25519-dalek 2→3`, `hmac 0.12→0.13`, `sha2 0.10→0.11` (nanna-server + nanna-daemon) — *(2026-07-09)* bumped in lockstep across both crates. Only breakage: hmac 0.13's `Mac` trait no longer re-exports `new_from_slice`, so the Slack-HMAC call sites now `use hmac::KeyInit`. ed25519-dalek 3 (`from_bytes`/`verify_strict`/`Signer`) and sha2 0.11 compiled unchanged. Webhook signature tests (Slack HMAC-SHA256 + Discord Ed25519, incl. tamper/replay cases) stay green; 25 daemon lib tests pass.
-   - [ ] `scraper 0.22→0.27`, `lopdf 0.34→0.43` (nanna-tools)
-   - [ ] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `windows-service 0.7→0.8`, `nix 0.29→0.31` (unix), `criterion 0.5→0.8` (nanna-gpu benches)
+   - [x] `scraper 0.22→0.27`, `lopdf 0.34→0.44` (nanna-tools) — *(2026-07-10)* both bumped, no code
+         changes; markup5ever/selectors/cssparser pulled forward transitively. `nanna-tools` builds green,
+         44 tests pass.
+   - [ ] `rand 0.8/0.9→0.10` (channels, gui), `toml 0.8→1.1` (gui), `nix 0.29→0.31` (unix)
+   - [x] `windows-service 0.7→0.8` (daemon) — *(2026-07-10)* bumped, no code changes; `windows_service.rs`
+         API (`service_dispatcher`/`service_control_handler`/`ServiceStatus`) unchanged. Daemon builds green,
+         26 tests pass.
+   - [x] `criterion 0.5→0.8` (nanna-gpu benches) — *(2026-07-10)* bumped; the four benches use
+         `harness = false` (custom mains) so criterion is an unreferenced dev-dep — benches compile clean.
    - [ ] GUI `pnpm update --latest` sweep in `gui/`
    - Pins held: `wgpu` (onyums/tauri/burn), `turso =0.4.4`, `aegis =0.9.7`.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.

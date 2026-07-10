@@ -25,7 +25,7 @@ pub mod telegram;
 pub mod whatsapp;
 
 pub use discord::DiscordChannel;
-pub use format::{format_for_channel, strip_markdown};
+pub use format::{format_for_channel, split_for_length, strip_markdown};
 pub use listeners::{
     BreakerAction, CircuitBreaker, DiscordListener, Listener, ListenerError, ListenerHandle,
     ListenerManager, SignalListener, SignalReceiveMode, SlackListener, TelegramListener,
@@ -397,9 +397,33 @@ impl MessageRouter {
             .get(&message.channel.provider)
             .ok_or_else(|| ChannelError::NotFound(message.channel.provider.clone()))?;
 
+        let caps = channel.capabilities();
+
         // Adapt the payload to what this channel can render (e.g. strip Markdown
         // for plain-text channels) before handing it to the implementation.
-        message.content = format_for_channel(message.content, &channel.capabilities());
+        message.content = format_for_channel(message.content, &caps);
+
+        // Length-aware splitting: if the channel caps message length and the text
+        // exceeds it, send the payload as an ordered sequence of parts and return
+        // the id of the first (the anchor a caller would reply/edit against).
+        if let (MessageContent::Text { text }, Some(max)) =
+            (&message.content, caps.max_message_length)
+            && text.chars().count() > max
+        {
+            let parts = split_for_length(text, max);
+            debug_assert!(
+                parts.len() >= 2,
+                "over-limit text must split into >=2 parts"
+            );
+            let mut first_id: Option<String> = None;
+            for part in parts {
+                let mut part_message = message.clone();
+                part_message.content = MessageContent::text(part);
+                let id = channel.send(part_message).await?;
+                first_id.get_or_insert(id);
+            }
+            return Ok(first_id.unwrap_or_default());
+        }
 
         channel.send(message).await
     }
@@ -414,6 +438,7 @@ impl Default for MessageRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_channel_id() {
@@ -426,5 +451,92 @@ mod tests {
     fn test_message_content() {
         let content = MessageContent::text("Hello, world!");
         assert_eq!(content.as_text(), Some("Hello, world!"));
+    }
+
+    /// A channel that records every text payload it is asked to send into a
+    /// shared vec (the test keeps a clone), with a configurable
+    /// `max_message_length`, so a test can prove the router splits.
+    struct RecordingChannel {
+        name: &'static str,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+        max_len: Option<usize>,
+    }
+
+    #[async_trait]
+    impl Channel for RecordingChannel {
+        fn provider(&self) -> &str {
+            self.name
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities {
+                features: ChannelFeatures::MARKDOWN, // keep text as-is (no strip)
+                max_message_length: self.max_len,
+            }
+        }
+        async fn send(&self, message: OutgoingMessage) -> Result<String, ChannelError> {
+            let text = message.content.as_text().unwrap_or_default().to_string();
+            // Scope the guard so it is not held across the format! below.
+            let count = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(text);
+                sent.len()
+            };
+            Ok(format!("msg-{count}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn router_splits_over_length_messages() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let channel = Box::new(RecordingChannel {
+            name: "recording",
+            sent: Arc::clone(&sent),
+            max_len: Some(10),
+        });
+        let mut router = MessageRouter::new();
+        router.register("recording", channel);
+
+        let long = "one two three four five six seven"; // 33 chars > 10
+        let id = router
+            .send(OutgoingMessage {
+                channel: ChannelId::new("recording", "chat"),
+                content: MessageContent::text(long),
+                reply_to: None,
+            })
+            .await
+            .expect("send must succeed");
+
+        // The router returns the first part's id (the anchor).
+        assert_eq!(id, "msg-1");
+
+        let parts = sent.lock().unwrap().clone(); // clone releases the guard
+        assert!(parts.len() >= 2, "long message must be split");
+        assert!(parts.iter().all(|p| p.chars().count() <= 10));
+        assert_eq!(parts.concat(), long); // no content lost across parts
+    }
+
+    #[tokio::test]
+    async fn router_does_not_split_when_within_limit() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let channel = Box::new(RecordingChannel {
+            name: "recording",
+            sent: Arc::clone(&sent),
+            max_len: Some(100),
+        });
+        let mut router = MessageRouter::new();
+        router.register("recording", channel);
+
+        router
+            .send(OutgoingMessage {
+                channel: ChannelId::new("recording", "chat"),
+                content: MessageContent::text("short message"),
+                reply_to: None,
+            })
+            .await
+            .unwrap();
+
+        let parts = sent.lock().unwrap().clone();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "short message");
     }
 }

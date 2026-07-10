@@ -34,13 +34,13 @@ glob = "0.3"
 futures = "0.3"
 
 # For HTML extraction
-scraper = "0.22"
+scraper = "0.27"
 
 # For audio encoding
 base64-simd = "0.8"
 
 # For PDF parsing
-lopdf = "0.34"
+lopdf = "0.44"
 
 # Pure Rust OCR (ONNX models via RTen) — Tier 0 embedded OCR
 # rten-imageproc is a transitive dep of ocrs (not used directly)
