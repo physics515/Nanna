@@ -143,11 +143,19 @@ impl UserToolManager {
             enabled: true,
         };
 
-        // Save to disk
+        // Hold the write lock across the duplicate check + disk write + insert so a
+        // concurrent create with the same name can't race between them and clobber
+        // an existing tool. `create` is a rare admin op, so blocking here is fine.
+        let mut tools = self.tools.write().await;
+        if tools.contains_key(&name) {
+            return Err(format!(
+                "A tool named '{name}' already exists; update or delete it first"
+            ));
+        }
         self.save_tool(&meta).map_err(|e| e.to_string())?;
-
-        // Add to in-memory cache
-        self.tools.write().await.insert(name.clone(), meta.clone());
+        tools.insert(name.clone(), meta.clone());
+        debug_assert!(tools.contains_key(&name));
+        drop(tools); // release the write lock now that the critical section is done
 
         info!("Created user tool: {}", name);
         Ok(meta)
@@ -164,35 +172,49 @@ impl UserToolManager {
         enabled: Option<bool>,
     ) -> Result<UserToolMeta, String> {
         let mut tools = self.tools.write().await;
-        let meta = tools.get_mut(name).ok_or_else(|| format!("Tool not found: {name}"))?;
+        // Mutate a *clone*, persist it, and only swap it into the cache on a
+        // successful write. Mutating the live entry in place (the old behavior)
+        // left RAM diverged from disk if source validation failed mid-way or the
+        // disk write errored.
+        let mut updated = tools
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("Tool not found: {name}"))?;
+
+        // Validate the new source BEFORE applying any field, so a bad edit is a
+        // clean no-op rather than a partial mutation.
+        if let Some(ref src) = source {
+            if extract_manifest(src).is_none() {
+                return Err(
+                    "Invalid source: must export default with name and description".to_string(),
+                );
+            }
+        }
 
         if let Some(desc) = description {
-            meta.description = desc;
+            updated.description = desc;
         }
         if let Some(src) = source {
-            // Validate new source
-            if extract_manifest(&src).is_none() {
-                return Err("Invalid source: must export default with name and description".to_string());
-            }
-            meta.source = src;
+            updated.source = src;
         }
         if let Some(params) = parameters {
-            meta.parameters = Some(params);
+            updated.parameters = Some(params);
         }
         if let Some(perms) = permissions {
-            meta.permissions = perms;
+            updated.permissions = perms;
         }
         if let Some(en) = enabled {
-            meta.enabled = en;
+            updated.enabled = en;
         }
+        updated.updated_at = chrono::Utc::now().timestamp();
+        debug_assert_eq!(updated.name, name, "update must not rename the tool");
 
-        meta.updated_at = chrono::Utc::now().timestamp();
-
-        // Save to disk
-        self.save_tool(meta).map_err(|e| e.to_string())?;
+        // Persist first; publish to the cache only after the write succeeds.
+        self.save_tool(&updated).map_err(|e| e.to_string())?;
+        tools.insert(name.to_string(), updated.clone());
 
         info!("Updated user tool: {}", name);
-        Ok(meta.clone())
+        Ok(updated)
     }
 
     /// Delete a tool
@@ -499,6 +521,87 @@ mod tests {
         assert!(res.is_err());
         // Nothing must have been written outside the tools dir.
         assert!(!dir.path().parent().unwrap().join("escaped.json").exists());
+    }
+
+    fn sample_source(name: &str) -> String {
+        format!(
+            "export default {{ name: \"{name}\", description: \"d\", execute() {{ return \"ok\"; }} }}"
+        )
+    }
+
+    #[tokio::test]
+    async fn create_tool_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+
+        mgr.create_tool(
+            "greet".to_string(),
+            "first".to_string(),
+            sample_source("greet"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first create succeeds");
+
+        // A second create with the same name must be rejected, not silently clobber.
+        let dup = mgr
+            .create_tool(
+                "greet".to_string(),
+                "second".to_string(),
+                sample_source("greet"),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(dup.is_err(), "duplicate name must be rejected");
+
+        // The original tool is untouched (description not overwritten).
+        assert_eq!(mgr.get_tool("greet").await.unwrap().description, "first");
+    }
+
+    #[tokio::test]
+    async fn update_tool_bad_source_leaves_ram_and_disk_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        mgr.create_tool(
+            "keep".to_string(),
+            "original".to_string(),
+            sample_source("keep"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An update carrying a new description AND an invalid source must fail
+        // whole — the description change must NOT leak into RAM or disk.
+        let res = mgr
+            .update_tool(
+                "keep",
+                Some("changed".to_string()),
+                Some("this is not a valid tool module".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(res.is_err(), "invalid source must fail the update");
+
+        // RAM is unchanged.
+        assert_eq!(mgr.get_tool("keep").await.unwrap().description, "original");
+
+        // Disk is unchanged: a fresh manager reloading from the same dir sees the
+        // original description (proves nothing was persisted mid-mutation).
+        let reloaded = UserToolManager::new(dir.path().to_path_buf());
+        reloaded.load_all().await.unwrap();
+        assert_eq!(
+            reloaded.get_tool("keep").await.unwrap().description,
+            "original"
+        );
     }
 
     #[test]
