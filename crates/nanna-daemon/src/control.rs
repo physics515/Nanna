@@ -656,8 +656,33 @@ impl ControlPlane {
             }
             ChatAction::Regenerate { session_id } => {
                 info!("Chat regenerate for session {}", session_id);
-                // TODO: Remove last assistant message and re-run
-                json!({ "status": "not_implemented", "session_id": session_id })
+                // Drop the stale assistant reply, recover the user message that
+                // produced it, and replay the turn through the normal send path
+                // (which re-adds the user message, rebuilds context, and runs
+                // the agent) — so regeneration reuses all of Send's logic.
+                let Some(mut session) = self.sessions.get(&session_id).await else {
+                    return json!({
+                        "error": "session_not_found",
+                        "message": format!("Session {session_id} not found")
+                    });
+                };
+                let Some(content) = session.take_last_user_turn() else {
+                    return json!({
+                        "status": "nothing_to_regenerate",
+                        "session_id": session_id,
+                        "message": "No user message to regenerate from"
+                    });
+                };
+                self.sessions.update(session).await;
+                Box::pin(self.handle_chat(
+                    client_id,
+                    ChatAction::Send {
+                        session_id,
+                        content,
+                        attachments: Vec::new(),
+                    },
+                ))
+                .await
             }
         }
     }

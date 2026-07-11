@@ -207,7 +207,28 @@ impl Session {
         self.messages.clear();
         self.updated_at = Utc::now();
     }
-    
+
+    /// Prepare the session to regenerate the last assistant response.
+    ///
+    /// Drops the most recent user message **and everything after it** (the
+    /// stale assistant reply plus any trailing tool turns), returning that user
+    /// message's content so the caller can replay the turn through the normal
+    /// send path (which re-adds the user message and runs the agent afresh).
+    ///
+    /// Returns `None` and leaves the session unchanged when there is no user
+    /// message to regenerate from.
+    pub fn take_last_user_turn(&mut self) -> Option<String> {
+        let idx = self
+            .messages
+            .iter()
+            .rposition(|m| matches!(m.role, MessageRole::User))?;
+        let content = self.messages[idx].content.clone();
+        // Remove the user message and any messages that followed it.
+        self.messages.truncate(idx);
+        self.updated_at = Utc::now();
+        Some(content)
+    }
+
     /// Get display name (name or truncated ID)
     pub fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
@@ -985,6 +1006,57 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_last_user_turn_drops_reply_and_returns_content() {
+        let mut s = Session::new(None);
+        s.add_message(MessageRole::User, "hi");
+        s.add_message(MessageRole::Assistant, "hello");
+
+        assert_eq!(s.take_last_user_turn().as_deref(), Some("hi"));
+        assert!(s.messages.is_empty(), "user msg + reply both removed");
+    }
+
+    #[test]
+    fn take_last_user_turn_preserves_prior_history() {
+        let mut s = Session::new(None);
+        s.add_message(MessageRole::User, "q1");
+        s.add_message(MessageRole::Assistant, "a1");
+        s.add_message(MessageRole::User, "q2");
+        s.add_message(MessageRole::Assistant, "a2");
+
+        assert_eq!(s.take_last_user_turn().as_deref(), Some("q2"));
+        // The earlier completed turn stays; only the latest turn is peeled off.
+        assert_eq!(s.messages.len(), 2);
+        assert!(matches!(s.messages[0].role, MessageRole::User));
+        assert_eq!(s.messages[0].content, "q1");
+        assert!(matches!(s.messages[1].role, MessageRole::Assistant));
+    }
+
+    #[test]
+    fn take_last_user_turn_drops_trailing_tool_turns() {
+        let mut s = Session::new(None);
+        s.add_message(MessageRole::System, "sys");
+        s.add_message(MessageRole::User, "do it");
+        s.add_message(MessageRole::Assistant, "working");
+        s.add_message(MessageRole::Tool, "tool output");
+
+        assert_eq!(s.take_last_user_turn().as_deref(), Some("do it"));
+        // Everything from the user message onward is gone; the system msg stays.
+        assert_eq!(s.messages.len(), 1);
+        assert!(matches!(s.messages[0].role, MessageRole::System));
+    }
+
+    #[test]
+    fn take_last_user_turn_none_when_no_user_message() {
+        let mut s = Session::new(None);
+        s.add_message(MessageRole::System, "sys");
+        s.add_message(MessageRole::Assistant, "greeting");
+        let before = s.messages.len();
+
+        assert!(s.take_last_user_turn().is_none());
+        assert_eq!(s.messages.len(), before, "session left unchanged");
+    }
 
     #[tokio::test]
     async fn test_peek_mailbox_is_non_destructive() {

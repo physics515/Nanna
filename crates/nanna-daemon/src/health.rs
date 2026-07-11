@@ -269,7 +269,21 @@ impl HealthServer {
             host: host.to_string(),
         }
     }
-    
+
+    /// Create a health server that serves an **existing** shared state handle.
+    ///
+    /// Use this (not [`Self::new`]) when the daemon keeps updating the state
+    /// (session/client counts, `last_error`) after the server is spawned: the
+    /// server then reflects those live updates instead of serving a throwaway
+    /// copy whose counters never move.
+    pub fn from_shared(state: Arc<HealthState>, host: &str, port: u16) -> Self {
+        Self {
+            state,
+            port,
+            host: host.to_string(),
+        }
+    }
+
     /// Get a reference to the state (for updating from daemon)
     pub fn state(&self) -> Arc<HealthState> {
         self.state.clone()
@@ -393,8 +407,43 @@ mod tests {
         std::fs::write(&path, "999999999").unwrap();
         
         let pid_file = PidFile::new(&temp_dir.path().to_path_buf());
-        
+
         // Should succeed because the old process doesn't exist
         assert!(pid_file.acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn from_shared_serves_live_updates() {
+        // The daemon keeps updating this handle *after* the server is built;
+        // the served `/status` must reflect those updates, not a frozen copy.
+        let shared = Arc::new(HealthState::new(true, true));
+        let server = HealthServer::from_shared(shared.clone(), "127.0.0.1", 0);
+
+        // The server serves the very same state handle.
+        assert!(Arc::ptr_eq(&shared, &server.state()));
+
+        // A later update through the daemon's handle is visible via the server.
+        shared.set_session_count(3).await;
+        shared.set_client_count(2).await;
+        shared.set_last_error(Some("boom".to_string())).await;
+
+        let Json(status) = status(State(server.state())).await;
+        assert_eq!(status.sessions, 3);
+        assert_eq!(status.clients, 2);
+        assert_eq!(status.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn new_serves_isolated_copy() {
+        // Regression guard documenting *why* the daemon must use `from_shared`:
+        // `new` wraps a fresh Arc, so an unrelated external handle can never
+        // drive the served counters (this was the old server.rs bug).
+        let server = HealthServer::new(HealthState::new(true, true), "127.0.0.1", 0);
+        let external = Arc::new(HealthState::new(true, true));
+        external.set_session_count(9).await;
+
+        assert!(!Arc::ptr_eq(&external, &server.state()));
+        let Json(status) = status(State(server.state())).await;
+        assert_eq!(status.sessions, 0);
     }
 }
