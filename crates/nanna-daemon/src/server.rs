@@ -16,7 +16,7 @@ use crate::channels::{ChannelManager, ChannelsConfig};
 use crate::webhook::{WebhookConfig, WebhookServer, DEFAULT_WEBHOOK_PORT};
 use nanna_channels::{ChannelId, IncomingMessage, MessageContent, MessageRouter as ChannelMessageRouter, Sender as ChannelSender, TelegramChannel};
 use nanna_config::credentials::{self, SecureStore};
-use nanna_llm::LlmClient;
+use nanna_llm::{LlmClient, RequestBuilder};
 use nanna_memory::MemoryService;
 use nanna_tools::{
     ToolRegistry, AgentSpawner, ParentChannel, SpawnResult,
@@ -769,6 +769,159 @@ impl DaemonServer {
             }
         }
 
+        // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
+        // is the cron runner (the GUI scheduler only runs in embedded mode).
+        // Loads persisted jobs and runs heartbeat + memory consolidation,
+        // mirroring the GUI's embedded schedule.
+        let scheduler = {
+            let scheduler_config = nanna_core::SchedulerConfig {
+                heartbeat_interval: std::time::Duration::from_secs(1800),
+                heartbeat_enabled: true,
+                heartbeat_prompt: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
+                max_concurrent: 4,
+                check_interval: std::time::Duration::from_secs(30),
+                default_timezone: "UTC".to_string(),
+            };
+            let mut scheduler = nanna_core::Scheduler::new(scheduler_config);
+            if let Some(ref storage) = self.storage {
+                scheduler = scheduler.with_storage(storage.clone());
+                match scheduler.load_jobs().await {
+                    Ok(count) => info!("Loaded {count} cron jobs from storage"),
+                    Err(e) => warn!("Failed to load cron jobs: {e}"),
+                }
+            } else {
+                info!("Scheduler running without persistence (no storage backend)");
+            }
+
+            let deduped = scheduler.deduplicate_by_name("memory_consolidation").await;
+            if deduped > 0 {
+                info!("Removed {deduped} duplicate consolidation tasks");
+            }
+            if !scheduler.has_task_named("memory_consolidation").await {
+                scheduler
+                    .add_task(nanna_core::consolidation_task(Some(
+                        std::time::Duration::from_secs(3600),
+                    )))
+                    .await;
+                info!("Scheduled memory consolidation task (every 1 hour)");
+            }
+
+            let agent_for_tasks = agent.clone();
+            let memory_for_tasks = memory.clone();
+            let router_for_tasks = router.clone();
+            let summarization_model = self
+                .config
+                .agent
+                .summarization_priority
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.config.agent.model.clone());
+            let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
+                let agent = agent_for_tasks.clone();
+                let memory = memory_for_tasks.clone();
+                let router = router_for_tasks.clone();
+                let summarization_model = summarization_model.clone();
+                Box::pin(async move {
+                    let start = std::time::Instant::now();
+                    let started_at = chrono::Utc::now();
+                    let (success, output, error) = match task.name.as_str() {
+                        "memory_consolidation" => {
+                            if let Some(ref memory) = memory {
+                                info!("Running scheduled memory consolidation...");
+                                let consolidation_config =
+                                    nanna_memory::ConsolidationConfig::default();
+                                let summarize = |prompt: String| {
+                                    let router = router.clone();
+                                    let model = summarization_model.clone();
+                                    async move {
+                                        let request = nanna_llm::CompletionRequest::default()
+                                            .with_message(nanna_llm::Message::user(&prompt));
+                                        router
+                                            .complete(&model, request)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                    }
+                                };
+                                match memory.consolidate(&consolidation_config, summarize).await {
+                                    Ok(result) => {
+                                        info!(
+                                            "Scheduled consolidation: {} processed, {} merged",
+                                            result.memories_processed, result.memories_merged
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Processed {} memories",
+                                                result.memories_processed
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("Scheduled consolidation failed: {e}");
+                                        (false, None, Some(e.to_string()))
+                                    }
+                                }
+                            } else {
+                                (true, Some("Skipped (memory service unavailable)".to_string()), None)
+                            }
+                        }
+                        _ if task.payload.is_empty() => {
+                            debug!("Skipping task with empty payload: {}", task.name);
+                            (true, Some("Skipped (empty payload)".to_string()), None)
+                        }
+                        _ => {
+                            // Heartbeat and cron jobs run as full agent prompts
+                            // (tools, memory, model fallback) in a task-scoped
+                            // session that is not persisted to the session store.
+                            let session_id = format!("scheduled-{}", task.id);
+                            match agent.chat(&session_id, &task.payload, None, &[]).await {
+                                Ok(result) => {
+                                    let heartbeat_ok = task.name == "heartbeat"
+                                        && result.content.trim().contains("HEARTBEAT_OK");
+                                    if heartbeat_ok {
+                                        debug!("Heartbeat: OK (nothing to do)");
+                                    } else {
+                                        info!(
+                                            "Scheduled task '{}' completed: {}",
+                                            task.name,
+                                            result.content.chars().take(200).collect::<String>()
+                                        );
+                                    }
+                                    if task.target_channel.is_some() {
+                                        warn!(
+                                            "Task '{}' targets a channel; channel routing from the \
+                                             daemon scheduler is not implemented yet",
+                                            task.name
+                                        );
+                                    }
+                                    (true, Some(result.content), None)
+                                }
+                                Err(e) => {
+                                    error!("Scheduled task '{}' failed: {}", task.name, e.message);
+                                    (false, None, Some(e.message))
+                                }
+                            }
+                        }
+                    };
+                    nanna_core::TaskResult {
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        success,
+                        output,
+                        error,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        started_at,
+                        finished_at: chrono::Utc::now(),
+                    }
+                })
+            });
+            scheduler = scheduler.with_executor(executor);
+            scheduler.start();
+            info!("Daemon scheduler started (heartbeat + cron runner)");
+            Arc::new(tokio::sync::RwLock::new(scheduler))
+        };
+
         // Create control plane with all services (including router for consolidation)
         let mut control = ControlPlane::with_all_services(
             self.sessions.clone(),
@@ -779,7 +932,8 @@ impl DaemonServer {
         )
         .with_tools_dir(tools_dir)
         .with_event_tx(self.ipc.event_sender())
-        .with_workspace_id(workspace_id_for_services);
+        .with_workspace_id(workspace_id_for_services)
+        .with_scheduler(scheduler);
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
         }
