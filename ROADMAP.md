@@ -728,7 +728,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
          26 tests pass.
    - [x] `criterion 0.5→0.8` (nanna-gpu benches) — *(2026-07-10)* bumped; the four benches use
          `harness = false` (custom mains) so criterion is an unreferenced dev-dep — benches compile clean.
-   - [ ] GUI `pnpm update --latest` sweep in `gui/`
+   - [~] GUI `pnpm update --latest` sweep in `gui/` — *(2026-07-11)* **safe minors/patches applied green**
+         (`@tauri-apps/{api 2.11.1, cli 2.11.4, plugin-dialog 2.7.1, plugin-notification 2.3.3, plugin-shell 2.3.5}`,
+         `nuxt 4.4.8`, `@vueuse/core 14.3.0`, `tailwindcss`/`@tailwindcss/postcss 4.3.2`, `postcss 8.5.16`,
+         `tailwind-merge 3.6.0`, `vue 3.5.39`, `@monaco-editor/loader 1.7.0`) — verified by `pnpm build`
+         (client+nitro, 3365 modules) **and** a `pnpm dev` boot serving a real 200 `__nuxt` shell on :3000.
+         **Deferred majors (each needs a code migration — do one per run, verify via `cargo tauri build`
+         + WebDriver before landing):**
+     - [ ] `@tiptap/* 2.11.5 → 3.x` — tiptap v3 **removed the `BubbleMenu` named export from
+           `@tiptap/vue-3`** (breaks `FloatingToolbar.vue`; the whole P7 editor needs the v2→v3 migration:
+           new BubbleMenu wiring, extension API changes). Largest of the batch.
+     - [ ] `vue-router 4 → 5` (major)
+     - [ ] `vue-sonner 1 → 2` (major — toast API)
+     - [ ] `marked 17 → 18` (major — chat markdown renderer; audit render output)
+     - [ ] `lucide-vue-next 0.563 → 1.0` and `@formkit/drag-and-drop 0.5 → 0.6` (0.x→1.0 / pre-1.0 minor; low risk, bundle with the next GUI pass)
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
