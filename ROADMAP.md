@@ -493,7 +493,19 @@ routine should drain first.**
       semantics, an uncached `roots/list_changed` marks nothing, and an end-to-end client test (counting mock
       transport) proving a dirty flag forces exactly one refresh and is then consumed. 10 nanna-mcp tests
       pass; clippy unchanged (561); nanna-daemon builds green.*
-- [ ] JS tools don't parse parameter schemas from manifests (`scripting/tool.rs:188`).
+- [x] JS tools don't parse parameter schemas from manifests (`scripting/tool.rs:188`).
+      *(2026-07-11)* `extract_manifest` no longer hardcodes `parameters: None` — every scripted tool was
+      shipping an **empty** parameter list to the LLM (the model had to guess arg names). New pure
+      `extract_parameters_schema(source)`: finds the balanced `{..}` after `parameters:` (string/comment-aware
+      brace matching) and normalizes the JS object literal to strict JSON (quote bare keys, single→double
+      quotes with full escape decode/re-encode, drop trailing commas + comments, UTF-8-safe), then
+      `serde_json`-parses it; returns `None` on any failure so a bad block falls back to today's behavior (no
+      regression, never guesses). Feeds the existing `parse_params_from_schema` in `scripted.rs`, so
+      `definition()` now carries real `{type,properties,required,enum,default}`. 13 unit tests (real-manifest
+      shape, trailing commas/comments, single quotes+enum, escaped quotes à la python skill, non-ASCII
+      descriptions, `}`-in-string balance, absent→None) **plus a real-data integration test that parses all
+      39 shipped default skills** (0 failures). Note: bare object *keys* must be ASCII identifiers (all
+      parameter names are); non-ASCII belongs in quoted string values, which decode correctly.
 - [ ] Tool-manager consistency: ~~`update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap)~~ / ~~no duplicate-name check~~ **(done 2026-07-10 — daemon `UserToolManager`, see below)**; `create_user_tool` swallows registration errors in `if let Ok`; ~~`enabled:false` tools still execute~~ / ~~no `ToolRegistry::unregister` (deleted tools stay callable until restart)~~ **(done 2026-07-09 — see below)**; ~~non-string enums dropped in `parse_params_from_schema`~~ **(done 2026-07-06 — `enum_value_to_string` preserves integer/boolean/null enum values in both the daemon and nanna-tools copies; tests each)**.
       *(2026-07-10)* Daemon `UserToolManager` hardened: **`update_tool` now clone→validate→mutate→save→swap** —
       it validates the new source *before* touching any field and mutates a clone, publishing to the cache
