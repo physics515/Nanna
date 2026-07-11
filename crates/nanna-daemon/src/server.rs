@@ -864,14 +864,19 @@ impl DaemonServer {
                 }
             });
             
-            let health_server = HealthServer::new(
-                HealthState::new(memory.is_some(), true),
+            // Serve the SAME state the session-count loop above updates
+            // (via `from_shared`), so `/status` reflects live counts instead of
+            // a throwaway copy stuck at zero. The server logs its own
+            // "listening" line from `run()` once the bind succeeds, so we don't
+            // pre-log here (that duplicate line falsely implied a bind before
+            // one had happened).
+            let health_server = HealthServer::from_shared(
+                health_state.clone(),
                 &self.config.ipc.host,
                 self.config.health_port,
             );
             health_server.spawn();
-            info!("Health server listening on http://{}:{}", self.config.ipc.host, self.config.health_port);
-            
+
             Some(health_state)
         } else {
             None

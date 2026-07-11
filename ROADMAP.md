@@ -468,12 +468,19 @@ routine should drain first.**
 - [ ] `not_implemented` daemon control actions: Regenerate message (`control.rs:416`), ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
 - [ ] Server stats not wired to shared daemon state (`server.rs:882`).
-- [ ] **Double health-server bind** — the daemon starts a health server in *two* places on the same
-      `health_port`: `server.rs:873` and `health.rs:299` both log "Health server listening on …:{port}",
-      and a live `nanna-daemon run` shows the second binder fail 4× (`os error 10048`) before erroring out
-      (harmless today because the first bind wins, but it spams WARN/ERROR every boot). Pick one owner —
-      likely keep the richer `health.rs` server and drop the `server.rs` duplicate (or vice-versa) — so only
-      one binds. *(observed 2026-07-10 via a real daemon boot smoke test)*
+- [x] **Double health-server bind / stale health state** — *(2026-07-11)* Re-checked against current
+      master: there is only **one** `HealthServer` construction, and a clean `nanna-daemon run` on **free**
+      ports binds exactly once with **zero** `os error 10048` (the 2026-07-10 "second binder fail 4×" was
+      port contention from leftover daemons on the reused ports, not an in-process double bind). Two real
+      residual bugs fixed instead: (1) `server.rs` logged "Health server listening" **before** the spawn,
+      duplicating `health.rs:299`'s post-bind log and implying a bind that hadn't happened — dropped. (2) The
+      served state was a **throwaway** `HealthState::new(..)` while the session-count loop updated a
+      *different* `Arc`, so `/status` reported `sessions:0` forever. Added `HealthServer::from_shared(Arc<HealthState>,..)`
+      and pass the updated handle, so `/status` now reflects live state. Verified by a real boot:
+      `/status → {"sessions":1,..,"memory_available":true,"agent_available":true}`, single "listening" log,
+      no bind retries. 2 tests (shared handle drives `/status`; `new` stays isolated). Minor remaining
+      (cosmetic): `server.rs`'s "Daemon ready. IPC server listening" also duplicates `ipc.rs`'s own post-bind
+      log — same misleading pre-bind pattern, harmless, left for an IPC-log cleanup.
 - [x] MCP server notifications logged but not handled (`transport.rs:148`).
       *(2026-07-06) `handle_server_notification` now classifies server notifications (`message`/`progress`/`cancelled`/`*/list_changed`) and routes them to the right tracing level — MCP `notifications/message` logs at warn when its `level` is warning-or-worse, else debug (was parsed then dropped). Pure `classify_server_notification` + `mcp_level_is_severe` with 3 tests.*
       *(2026-07-10)* **`list_changed` now invalidates the client cache.** Added a transport-agnostic
