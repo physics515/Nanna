@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-09 (RustCrypto ed25519/hmac/sha2 majors · cascading `ToolRegistry::unregister` + live tool delete/disable · Tool Enable/Disable control actions · idle/memory-pressure dream gate · reqwest-0.13 + HNSW-crate research folded) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-11 (deps refresh + safe GUI pnpm slice · health server live shared state + dup-log fix · scripted-tool parameter-schema parsing (all 39 skills) · `ChatAction::Regenerate` implemented · folded: workspace-`cargo test` V8 stack overflow, hnsw_rs in-search filtering) · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -519,6 +519,17 @@ routine should drain first.**
       *(2026-07-09)* Replaced the naive one-line `ToolRegistry::unregister` (removed only the primary key, so a deleted tool stayed reachable through its own alias entry) with a cascading version: deleting a canonical tool also drops every alias whose target is it and purges the `alias_targets` reverse-map; deleting an alias leaves the canonical intact. Returns the entry-count removed. Wired into the **daemon** control plane: `ToolAction::Delete` now `unregister`s the live tool (deletion takes effect without a restart), and `ToolAction::Update` reconciles the registry with the new `enabled` flag — unregister then re-register only if still enabled, so a disabled tool stops executing and an edit's new source goes live immediately. 4 registry unit tests (uncallable-after-delete, alias cascade, alias-only removal leaves canonical, unknown-name no-op). Remaining: the GUI-embedded `UserToolManager` copy (`tool_authoring.rs`) still needs the same wiring (needs a GUI build to verify).
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
+- [ ] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11)* Under
+      full-workspace feature unification the `nanna-scripting` **deno** feature (V8) is enabled, so its lib
+      tests grow from 12 (boa-only) to 20, and a V8-backed test **overflows a `tokio-rt-worker` stack** on
+      Windows (`thread 'tokio-rt-worker' has overflowed its stack`), making `cargo test --workspace` red even
+      though every crate is green with `-p`. deno_core/V8 needs a large native stack; the default tokio
+      worker stack is too small. Fix: run the affected deno tests on a runtime with a bigger
+      `thread_stack_size` (e.g. a `Builder::new_multi_thread().thread_stack_size(16<<20)` or a dedicated
+      `std::thread` with an 8–16 MB stack), or gate the V8 tests behind a non-default feature. This blocks the
+      "`cargo test` green" guardrail for the nightly routine, which currently must fall back to per-crate
+      runs. Sources: [deno#24325](https://github.com/denoland/deno/issues/24325),
+      [deno#7279](https://github.com/denoland/deno/issues/7279).
 - [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
       *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
       rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file
@@ -626,6 +637,12 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       - [ ] *(research 2026-07-06)* Use a **pure-Rust HNSW** crate (`hnsw_rs` / `instant-distance`) over a C ext — `sqlite-vec` is brute-force only; `vectorlite` shows HNSW at `ef_construction=100, M=30` scales well. Fits the Turso-only + in-RAM-cosine model (build the index in RAM, persist coeff/graph as Turso BLOBs). Sources: [vectorlite](https://github.com/1yefuwang1/vectorlite), [sqlite-vec ANN issue](https://github.com/asg017/sqlite-vec/issues/25).
       - [ ] *(research 2026-07-09)* Crate shortlist (all pure-Rust, actively maintained early 2026): **`hnsw_rs`** — multithreaded build/search via `parking_lot`, SIMD distances through `anndists` (L1/L2/Cosine/Hamming/…), the most feature-complete; **`hnswlib-rs`** — designed for **concurrent search + concurrent mutation** with an `InMemoryVectorStore` doing **lock-free reads + parallel updates** (best fit for a live memory store that dreams while serving recalls, avoids a global rebuild); **`instant-distance`** — smallest/simplest pure-Rust HNSW if we want minimal surface. Lean `hnswlib-rs` for the online/insert-while-query case, `hnsw_rs` if we need its distance breadth. Sources: [hnsw_rs](https://crates.io/crates/hnsw_rs), [hnswlib-rs](https://github.com/jean-pierreBoth/hnswlib-rs), [instant-distance](https://lib.rs/crates/instant-distance).
       - [ ] *(research 2026-07-10)* Confirmed still current: `hnsw_rs` exposes `insert_parallel` + `parallel_search` (rayon/parking_lot) — the concrete entry points for the "batch-build the index in RAM from the whole `VectorStore`, then query candidates" approach that fits the dream-time clusterer (build once per cycle rather than incrementally). `instant-distance` builds from a `Vec<Point>` in one shot (no incremental insert) — fine for the rebuild-per-dream model, wrong for online mutation. Net: `hnsw_rs::Hnsw::insert_parallel` for the dream-time rebuild; revisit `hnswlib-rs` only if we later need insert-while-serving. Sources: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html), [instant-distance](https://github.com/djc/instant-distance).
+      - [ ] *(research 2026-07-11)* `hnsw_rs` still actively maintained (crates.io updated 2026-02-28) and now
+            documents **in-search filtering** — pass either a sorted `Vec` of allowed ids or a filter closure
+            evaluated *before* an id enters the result set (not a post-filter). This is the clean primitive for
+            **workspace-scoped recall over one shared index**: keep a single HNSW of all memories and filter to
+            the active workspace's ids at query time, instead of rebuilding a per-workspace index — directly
+            useful for the P11 "tool-memory workspace scope" item too. Source: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
