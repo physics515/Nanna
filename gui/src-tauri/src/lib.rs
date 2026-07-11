@@ -6108,28 +6108,55 @@ async fn open_workspace(
 ) -> Result<WorkspaceInfo, String> {
     let state_guard = state.read().await;
     let mut registry = state_guard.workspaces.write().await;
-    
+
     let path = std::path::PathBuf::from(&path);
-    
+
     // Check if already registered
     if let Some(ws) = registry.get_by_path(&path) {
         return Ok(WorkspaceInfo::from(ws));
     }
-    
+
     // Create and load new workspace
     let mut workspace = Workspace::new(&path);
     workspace.load_context().await
         .map_err(|e| format!("Failed to load workspace: {}", e))?;
-    
+
+    // In daemon mode the daemon owns persistence (nanna.db): open the
+    // workspace there first and adopt ITS id locally, so both registries
+    // agree and the workspace survives a restart.
+    let is_daemon = state_guard.backend.is_daemon_mode().await;
+    if is_daemon {
+        let result = state_guard
+            .backend
+            .workspace_open(&path.to_string_lossy())
+            .await?;
+        if result.get("error").is_some() {
+            let msg = result
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Daemon failed to open workspace: {msg}"));
+        }
+        if let Some(daemon_id) = result.get("id").and_then(|v| v.as_str()) {
+            workspace.id = daemon_id.to_string();
+        }
+    }
+
     let id = registry.register(workspace);
     registry.set_active(&id);
-    
+
     let ws = registry.get(&id).unwrap();
     let info = WorkspaceInfo::from(ws);
     info!("Opened workspace: {} at {:?}", ws.name, path);
-    
-    // Persist to database
+
+    // Persist activation
     drop(registry);
+    if is_daemon {
+        // The daemon's open does not activate; sync it (drives tool cwd too).
+        if let Err(e) = state_guard.backend.workspace_set_active(&id).await {
+            warn!("Failed to activate workspace on daemon: {}", e);
+        }
+    }
     let record = nanna_storage::WorkspaceRecord {
         id: info.id.clone(),
         name: info.name.clone(),
@@ -6143,7 +6170,7 @@ async fn open_workspace(
             warn!("Failed to persist workspace to DB: {}", e);
         }
     }
-    
+
     Ok(info)
 }
 
@@ -7714,6 +7741,17 @@ async fn init_backend(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
     let state = state.read().await;
+    if state.backend.is_daemon_mode().await {
+        return Ok("daemon".to_string());
+    }
+    // Embedded mode with local storage open: this process holds the exclusive
+    // nanna.db lock, so a daemon spawned now would boot storage-less (no
+    // session or memory persistence) — worse than staying embedded. Switching
+    // to daemon mode requires an app restart so the daemon can own the DB.
+    if state.storage.is_some() {
+        info!("init_backend: staying embedded — local storage owns nanna.db (restart to use daemon mode)");
+        return Ok("embedded".to_string());
+    }
     let mode = state.backend.init(&app).await;
     Ok(match mode {
         BackendMode::Daemon => "daemon".to_string(),
