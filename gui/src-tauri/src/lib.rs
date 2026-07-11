@@ -680,8 +680,9 @@ async fn try_summarize_with_model(
         model_name, context_window, max_chars
     );
 
+    // Cut on a char boundary — a raw byte slice panics mid-codepoint.
     let truncated = if content.len() > max_chars {
-        &content[..max_chars]
+        &content[..content.floor_char_boundary(max_chars)]
     } else {
         content
     };
@@ -714,10 +715,16 @@ async fn try_summarize_with_model(
         }
     }
 
-    if summary.is_empty() {
-        Err("Empty summary returned".to_string())
-    } else {
+    // Reject degenerate output (empty, "...", a bare title): accepting it
+    // silently replaces real data — observed live as 80 KB → 17 chars.
+    if nanna_agent::plausible_summary(&summary, truncated.len()) {
         Ok(summary)
+    } else {
+        Err(format!(
+            "Implausible summary returned ({} chars for {} chars of input)",
+            summary.trim().len(),
+            truncated.len()
+        ))
     }
 }
 
