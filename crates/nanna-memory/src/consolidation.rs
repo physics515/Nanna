@@ -341,25 +341,19 @@ pub fn cluster_memories(
 
 /// Cosine similarity between two vectors
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    // Guards preserve this clusterer's "0.0 on mismatch/empty" contract:
+    // `nanna_simd::cosine_similarity_f32` *panics* on unequal lengths (memories
+    // from different embedding-dimension eras can co-occur during migration)
+    // and yields NaN for a zero-magnitude vector.
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
 
-    let mut dot = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot / (norm_a.sqrt() * norm_b.sqrt())
+    // Delegate to the workspace SIMD primitive (AVX-512/AVX2/NEON) — the same
+    // one the vector-search path uses — instead of a private scalar loop, since
+    // this runs O(N^2) times per band during a dream cycle.
+    let sim = nanna_simd::cosine_similarity_f32(a, b);
+    if sim.is_finite() { sim } else { 0.0 }
 }
 
 /// Create a consolidated memory entry from a cluster
@@ -483,6 +477,62 @@ mod tests {
 
         let d = vec![0.707, 0.707, 0.0];
         assert!((cosine_similarity(&a, &d) - 0.707).abs() < 0.01);
+    }
+
+    // Reference scalar implementation kept only in the test, to prove the
+    // SIMD-backed `cosine_similarity` matches it across random vectors.
+    fn cosine_reference(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let mut dot = 0.0f32;
+        let (mut na, mut nb) = (0.0f32, 0.0f32);
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        dot / (na.sqrt() * nb.sqrt())
+    }
+
+    // PRNG + norm math is test-only; precision of the f32 casts is irrelevant.
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    #[test]
+    fn cosine_matches_scalar_reference_on_embedding_sized_vectors() {
+        // Deterministic pseudo-random 768-dim pairs (typical embedding width).
+        for seed in 0..8u32 {
+            let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            let a: Vec<f32> = (0..768).map(|_| next()).collect();
+            let b: Vec<f32> = (0..768).map(|_| next()).collect();
+            let simd = cosine_similarity(&a, &b);
+            let scalar = cosine_reference(&a, &b);
+            assert!(
+                (simd - scalar).abs() < 1e-4,
+                "seed {seed}: simd {simd} vs scalar {scalar}"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_edge_cases_return_zero_not_nan() {
+        // Zero-magnitude vector: SIMD yields NaN; the guard must return 0.0.
+        let zero = vec![0.0f32; 4];
+        let v = vec![1.0f32, 2.0, 3.0, 4.0];
+        let z = cosine_similarity(&zero, &v);
+        assert!(z.is_finite() && z.abs() < 1e-6, "zero-vector → 0.0, got {z}");
+        // Length mismatch must not panic (SIMD would); return 0.0.
+        assert!(cosine_similarity(&[1.0, 2.0], &[1.0, 2.0, 3.0]).abs() < f32::EPSILON);
+        // Empty input.
+        assert!(cosine_similarity(&[], &[]).abs() < f32::EPSILON);
     }
 
     #[test]
