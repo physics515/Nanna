@@ -43,7 +43,7 @@ chrono.workspace = true
 axum.workspace = true
 
 # IPC / WebSocket
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 
 # HTTP server for health endpoint
