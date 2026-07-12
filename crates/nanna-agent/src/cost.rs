@@ -50,15 +50,17 @@ const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 ///
 /// Format: `(prefix, input, output, cache_read, cache_write)`.
 const PRICING_TABLE: &[(&str, f64, f64, f64, f64)] = &[
-    // Anthropic Claude (cache read ~0.1x input, cache write ~1.25x input).
-    ("claude-opus-4", 15.00, 75.00, 1.50, 18.75),
-    ("claude-opus", 15.00, 75.00, 1.50, 18.75),
+    // Anthropic Claude — 2026 rates (cache read = 0.1x input, cache write =
+    // 1.25x input for the 5-min TTL). Opus 4.x is $5/$25 (NOT the old Opus-3
+    // $15/$75); Haiku 4.5 is $1/$5. Source: platform.claude.com/docs pricing.
+    ("claude-opus-4", 5.00, 25.00, 0.50, 6.25),
     ("claude-sonnet", 3.00, 15.00, 0.30, 3.75),
-    ("claude-haiku", 0.80, 4.00, 0.08, 1.00),
+    ("claude-haiku", 1.00, 5.00, 0.10, 1.25),
     ("claude-3-5-sonnet", 3.00, 15.00, 0.30, 3.75),
     ("claude-3-5-haiku", 0.80, 4.00, 0.08, 1.00),
-    ("claude-3-opus", 15.00, 75.00, 1.50, 18.75),
-    ("claude", 3.00, 15.00, 0.30, 3.75), // generic Claude fallback
+    ("claude-3-opus", 15.00, 75.00, 1.50, 18.75), // legacy Opus 3
+    ("claude-opus", 5.00, 25.00, 0.50, 6.25),     // generic Opus → 4.x rate
+    ("claude", 3.00, 15.00, 0.30, 3.75),          // generic Claude → Sonnet rate
     // OpenAI GPT (cache read ~0.5x input; no separate cache-write charge).
     ("gpt-5", 1.25, 10.00, 0.625, 1.25),
     ("gpt-4o-mini", 0.15, 0.60, 0.075, 0.15),
