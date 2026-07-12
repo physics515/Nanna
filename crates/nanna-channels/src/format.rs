@@ -38,20 +38,74 @@ pub fn strip_markdown(text: &str) -> String {
     // Guard: this runs on agent output, which is already length-bounded upstream.
     debug_assert!(text.len() < 1 << 24, "strip_markdown on oversized text");
 
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = String::with_capacity(text.len());
-    for (idx, line) in text.lines().enumerate() {
-        if idx > 0 {
+    let mut i = 0;
+    while i < lines.len() {
+        // Markdown table block: a row line immediately followed by a delimiter
+        // row (`|---|---|`). Render each non-delimiter row as plain text and
+        // drop the delimiter, so channels that don't render tables get readable
+        // rows instead of literal pipes and dashes.
+        if i + 1 < lines.len() && is_table_row(lines[i]) && is_table_delimiter(lines[i + 1]) {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&strip_table_row(lines[i]));
+            i += 2; // consumed header + delimiter
+            while i < lines.len() && is_table_row(lines[i]) && !is_table_delimiter(lines[i]) {
+                out.push('\n');
+                out.push_str(&strip_table_row(lines[i]));
+                i += 1;
+            }
+            continue;
+        }
+        if i > 0 {
             out.push('\n');
         }
-        out.push_str(&strip_line(line));
+        out.push_str(&strip_line(lines[i]));
+        i += 1;
     }
     if text.ends_with('\n') {
         out.push('\n');
     }
 
-    // Postcondition: stripping only ever removes/rewrites-shorter, never grows.
-    debug_assert!(out.len() <= text.len(), "strip_markdown must not grow text");
+    // Postcondition: stripping shrinks in general, but re-joining tight table
+    // cells with " | " can add a few separator chars — cap at 2x as a
+    // runaway-growth guard.
+    debug_assert!(out.len() <= text.len() * 2 + 1, "strip_markdown grew unexpectedly");
     out
+}
+
+/// A line that looks like a Markdown table row: non-empty and contains a pipe.
+/// Only consulted when the *next* line is a delimiter row (or we're already
+/// inside a detected table), so stray prose pipes elsewhere aren't misread.
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.contains('|')
+}
+
+/// A Markdown table delimiter row (`|---|:--:|`): only pipes, dashes, colons,
+/// and spaces, with at least one dash AND one pipe. The pipe requirement rules
+/// out a bare `---` horizontal rule that merely follows a line with a pipe.
+fn is_table_delimiter(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') || !t.contains('|') {
+        return false;
+    }
+    t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Convert a table row to plain text: drop the outer pipes, trim each cell,
+/// strip inline Markdown inside cells, and join with " | ".
+fn strip_table_row(line: &str) -> String {
+    let t = line.trim();
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner
+        .split('|')
+        .map(|cell| strip_inline(cell.trim()))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Strip block- and inline-level Markdown from a single line.
@@ -243,6 +297,42 @@ mod tests {
     fn drops_code_fences_keeps_body() {
         let input = "before\n```rust\nlet x = 1;\n```\nafter";
         assert_eq!(strip_markdown(input), "before\n\nlet x = 1;\n\nafter");
+    }
+
+    #[test]
+    fn table_becomes_plain_rows_delimiter_dropped() {
+        let input = "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |";
+        // Delimiter row is dropped; each row's outer pipes go, cells joined " | ".
+        assert_eq!(strip_markdown(input), "Name | Age\nAlice | 30\nBob | 25");
+    }
+
+    #[test]
+    fn table_with_alignment_and_surrounding_text() {
+        let input = "Here:\n| A | B |\n|:--|--:|\n| 1 | 2 |\nDone";
+        assert_eq!(strip_markdown(input), "Here:\nA | B\n1 | 2\nDone");
+    }
+
+    #[test]
+    fn table_cells_get_inline_markdown_stripped() {
+        let input = "| Tool | Note |\n|---|---|\n| `read` | **fast** |";
+        assert_eq!(strip_markdown(input), "Tool | Note\nread | fast");
+    }
+
+    #[test]
+    fn prose_pipe_and_horizontal_rule_are_not_tables() {
+        // A pipe in prose with no delimiter row must survive unchanged.
+        assert_eq!(strip_markdown("choose a | b here"), "choose a | b here");
+        // A bare `---` horizontal rule after a pipe line is NOT a table
+        // delimiter (no pipe in the rule), so nothing is reformatted.
+        assert_eq!(strip_markdown("x | y\n---\nz"), "x | y\n---\nz");
+    }
+
+    #[test]
+    fn table_output_does_not_trip_growth_guard() {
+        // Tight, pipe-heavy table exercises the relaxed postcondition.
+        let input = "|a|b|c|d|\n|-|-|-|-|\n|1|2|3|4|";
+        let out = strip_markdown(input);
+        assert_eq!(out, "a | b | c | d\n1 | 2 | 3 | 4");
     }
 
     #[test]

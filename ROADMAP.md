@@ -389,8 +389,15 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       `MessageRouter::send`: when the channel sets `max_message_length` and the (already Markdown-adapted) text
       exceeds it, the router sends the parts in order and returns the first part's id (the reply/edit anchor).
       7 tests (within-limit passthrough, whitespace/newline break preference, oversized-token hard-split,
-      Unicode-scalar counting; + 2 router tests with a recording mock proving split vs no-split). Remaining:
-      tables→text, Discord embeds, Slack Block Kit.
+      Unicode-scalar counting; + 2 router tests with a recording mock proving split vs no-split).
+      *(2026-07-12)* **tables→text shipped.** `strip_markdown` is now table-aware: a row line immediately
+      followed by a delimiter row (`|---|:--:|`) starts a table block — each row drops its outer pipes, trims
+      + inline-strips each cell, and re-joins with " | "; the delimiter row is dropped. Disambiguated from
+      prose: a table delimiter must contain **both** a dash and a pipe, so a bare `---` horizontal rule after a
+      pipe line and a stray prose `a | b` are left untouched. Postcondition relaxed to ≤2x (tight tables re-add
+      a few separator chars). 5 tests (basic table, alignment colons + surrounding text, inline-markdown in
+      cells, prose-pipe/HR negatives, tight-table growth guard); 45 nanna-channels tests green. Remaining:
+      Discord embeds, Slack Block Kit.
 - [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
