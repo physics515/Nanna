@@ -555,6 +555,17 @@ routine should drain first.**
       here: `create_user_tool`'s `if let Ok` swallow + the GUI-embedded `tool_authoring.rs` copy (needs a GUI build).
       *(2026-07-09)* Replaced the naive one-line `ToolRegistry::unregister` (removed only the primary key, so a deleted tool stayed reachable through its own alias entry) with a cascading version: deleting a canonical tool also drops every alias whose target is it and purges the `alias_targets` reverse-map; deleting an alias leaves the canonical intact. Returns the entry-count removed. Wired into the **daemon** control plane: `ToolAction::Delete` now `unregister`s the live tool (deletion takes effect without a restart), and `ToolAction::Update` reconciles the registry with the new `enabled` flag — unregister then re-register only if still enabled, so a disabled tool stops executing and an edit's new source goes live immediately. 4 registry unit tests (uncallable-after-delete, alias cascade, alias-only removal leaves canonical, unknown-name no-op). Remaining: the GUI-embedded `UserToolManager` copy (`tool_authoring.rs`) still needs the same wiring (needs a GUI build to verify).
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
+      *(2026-07-12: verified the **daemon** analog `AgentService.active_chats` is NOT leaky — the only exits
+      between insert and cleanup are the success path (cleans up before returning) and the all-models-exhausted
+      path (cleans up); no early `?`/`return`/`unwrap` between them. Only an external panic in `agent.run()`
+      would leak, which async-`Drop` can't cleanly cover. The leak is GUI-embedded-only.)*
+- [x] **`parse_retry_after` non-ASCII byte-offset bug** (`agent_service.rs`) — it `find`s the prefix in the
+      **lowercased** string but sliced the **original** at that offset; a lowercase that changes byte length
+      before the prefix (e.g. `İ`→`i̇`, 2→3 bytes) shifts the offset, extracting the wrong digits or slicing
+      mid-char (panic). Fixed to slice the lowercased string (digits are ASCII, so equivalent). *(2026-07-12)*
+      Also added the first tests for the three resilience parsers (`is_rate_limit_error`,
+      `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
+      `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
 - [ ] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11)* Under
       full-workspace feature unification the `nanna-scripting` **deno** feature (V8) is enabled, so its lib
