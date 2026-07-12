@@ -338,7 +338,8 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
       already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
-      unknown/extra fields).
+      unknown/extra fields). Added `ModelStatsTracker::total_cost_usd()` (grand-total known cloud spend; sums
+      only priced models) surfaced as `total_cost_usd` on the `SystemAction::ModelStats` response; test.
 - [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).

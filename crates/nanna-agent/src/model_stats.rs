@@ -301,6 +301,20 @@ impl ModelStatsTracker {
         report
     }
 
+    /// Grand-total estimated USD spend across all **priced** models.
+    ///
+    /// Unpriced (local/unknown) models contribute nothing, matching
+    /// [`Self::cost_report`] — the total is "known cloud spend", not a claim
+    /// that local runs are free-and-therefore-$0-in-the-same-bucket.
+    pub async fn total_cost_usd(&self) -> f64 {
+        self.cost_report()
+            .await
+            .iter()
+            .filter(|c| c.priced)
+            .map(|c| c.estimated_cost_usd)
+            .sum()
+    }
+
     /// Load stats from a previous session (e.g., from disk).
     pub async fn load(&self, stats: HashMap<String, ModelStats>) {
         let mut inner = self.inner.write().await;
@@ -677,5 +691,23 @@ mod tests {
         assert_eq!(local.model, "ollama/llama3.2");
         assert!(!local.priced, "local model must be flagged unpriced");
         assert!(local.estimated_cost_usd.abs() < f64::EPSILON);
+    }
+
+    // total_cost_usd sums only priced models: Sonnet $18 + GPT-5 (1M in @ $1.25
+    // + 1M out @ $10 = $11.25) = $29.25; the local model contributes nothing.
+    #[tokio::test]
+    async fn total_cost_sums_priced_models_only() {
+        let tracker = ModelStatsTracker::new();
+        tracker
+            .record(observation_with_tokens("claude-sonnet-5", 1_000_000, 1_000_000))
+            .await;
+        tracker
+            .record(observation_with_tokens("gpt-5", 1_000_000, 1_000_000))
+            .await;
+        tracker
+            .record(observation_with_tokens("ollama/llama3.2", 9_000_000, 9_000_000))
+            .await;
+        let total = tracker.total_cost_usd().await;
+        assert!((total - 29.25).abs() < 1e-6, "got {total}");
     }
 }
