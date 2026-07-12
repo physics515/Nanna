@@ -315,8 +315,19 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
 - [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
-- [ ] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
+- [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
       session/day/month/model/tool, surface in GUI.
+      *(2026-07-12)* Core shipped in `nanna-agent::cost`: `ModelPricing` (input/output/cache-read/cache-write
+      USD-per-1M) + a reference list-price table (Jan-2026 public prices for Claude/GPT/o-series families,
+      matched by family **prefix** so dated ids like `claude-opus-4-8` resolve) + a pure `estimate_cost_usd(..)`
+      (per-class arithmetic, `debug_assert` non-negative rates, ≥0 result). Local/Ollama/unknown models return
+      `None` → reported `priced:false`, never a silent $0. Wired to the token counts the daemon now records
+      (see the model-stats fix this run): `ModelStatsTracker::cost_report() -> Vec<ModelCost>` (snapshots under
+      the read lock then prices lock-free, priciest-first) and surfaced on the live `SystemAction::ModelStats`
+      IPC response as a new `costs` array (additive, non-breaking). 5 unit tests (exact per-million arithmetic,
+      zero-cost, prefix resolution incl. most-specific-wins, local/unknown unpriced, tracker integration
+      pricing a Sonnet run at $18 + flagging a local model). Remaining: per-session/day/month aggregation +
+      per-tool cost + GUI surfacing (needs a GUI build); pricing table should become config-overridable.
 - [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).

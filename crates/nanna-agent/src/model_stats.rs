@@ -107,6 +107,18 @@ pub struct ModelStatsSummary {
     pub escalation_count: u64,
 }
 
+/// Estimated USD spend for one model over its tracked lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCost {
+    /// Model identifier.
+    pub model: String,
+    /// Estimated total spend in USD from accumulated token counts.
+    pub estimated_cost_usd: f64,
+    /// Whether pricing was known. `false` = local/unknown model (cost is 0,
+    /// not billed) — distinguishes "free" from "priced at exactly $0".
+    pub priced: bool,
+}
+
 /// Per-request stats to attach to an AgentResponse for UI display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestModelStats {
@@ -229,6 +241,61 @@ impl ModelStatsTracker {
     pub async fn all_stats(&self) -> HashMap<String, ModelStats> {
         let inner = self.inner.read().await;
         inner.models.clone()
+    }
+
+    /// Estimate accumulated USD spend per model from the tracked token counts.
+    ///
+    /// Uses [`crate::cost::default_pricing`] (reference list prices). Models
+    /// with no known pricing (local/Ollama/unknown) are reported with
+    /// `priced == false` and `estimated_cost_usd == 0.0` so callers never
+    /// silently fold an unknown cost into a total.
+    pub async fn cost_report(&self) -> Vec<ModelCost> {
+        // Snapshot (model, token counts) under the read lock, then release it
+        // before pricing lookups/arithmetic so the lock isn't held over work
+        // that doesn't touch shared state.
+        let usage: Vec<(String, u64, u64, u64, u64)> = {
+            let inner = self.inner.read().await;
+            inner
+                .models
+                .values()
+                .map(|s| {
+                    (
+                        s.model.clone(),
+                        s.total_input_tokens,
+                        s.total_output_tokens,
+                        s.total_cache_read_tokens,
+                        s.total_cache_creation_tokens,
+                    )
+                })
+                .collect()
+        };
+
+        let mut report: Vec<ModelCost> = usage
+            .into_iter()
+            .map(|(model, input, output, cache_read, cache_write)| {
+                crate::cost::default_pricing(&model).map_or_else(
+                    || ModelCost {
+                        model: model.clone(),
+                        estimated_cost_usd: 0.0,
+                        priced: false,
+                    },
+                    |pricing| ModelCost {
+                        model: model.clone(),
+                        estimated_cost_usd: crate::cost::estimate_cost_usd(
+                            input, output, cache_read, cache_write, &pricing,
+                        ),
+                        priced: true,
+                    },
+                )
+            })
+            .collect();
+        // Deterministic order for UI/tests: priciest first, then by name.
+        report.sort_by(|a, b| {
+            b.estimated_cost_usd
+                .total_cmp(&a.estimated_cost_usd)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        report
     }
 
     /// Load stats from a previous session (e.g., from disk).
@@ -540,5 +607,47 @@ mod tests {
             b.summaries().await.is_empty(),
             "a separately constructed tracker stays empty"
         );
+    }
+
+    fn observation_with_tokens(model: &str, input: u32, output: u32) -> RequestObservation {
+        RequestObservation {
+            model: model.to_string(),
+            success: true,
+            latency: Duration::from_millis(10),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tier: None,
+            escalated: false,
+        }
+    }
+
+    // cost_report turns tracked tokens into USD for priced models and flags
+    // unpriced (local) models instead of folding a bogus $0 into a total.
+    #[tokio::test]
+    async fn cost_report_prices_known_models_and_flags_unknown() {
+        let tracker = ModelStatsTracker::new();
+        // 1M input + 1M output on Sonnet-class ($3 in / $15 out) = $18.
+        tracker
+            .record(observation_with_tokens("claude-sonnet-5", 1_000_000, 1_000_000))
+            .await;
+        // A local model with tokens but no pricing.
+        tracker
+            .record(observation_with_tokens("ollama/llama3.2", 500_000, 500_000))
+            .await;
+
+        let report = tracker.cost_report().await;
+        assert_eq!(report.len(), 2);
+        // Sorted priciest-first, so the priced model leads.
+        let claude = &report[0];
+        assert_eq!(claude.model, "claude-sonnet-5");
+        assert!(claude.priced);
+        assert!((claude.estimated_cost_usd - 18.0).abs() < 1e-6, "got {}", claude.estimated_cost_usd);
+
+        let local = &report[1];
+        assert_eq!(local.model, "ollama/llama3.2");
+        assert!(!local.priced, "local model must be flagged unpriced");
+        assert!(local.estimated_cost_usd.abs() < f64::EPSILON);
     }
 }
