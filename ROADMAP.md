@@ -335,6 +335,10 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       - [ ] Add **Fable 5** (`claude-fable-5`) to the pricing table once its per-Mtok rate is published.
       - [ ] Config-overridable pricing (`[pricing]` TOML or a fetched table) so rates don't rot in-code; add a
             batch-mode (0.5x) + 1-hour-cache (2.0x) multiplier the tracker can apply.
+      *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
+      already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
+      populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
+      unknown/extra fields).
 - [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).

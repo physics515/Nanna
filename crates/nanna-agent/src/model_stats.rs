@@ -101,6 +101,9 @@ pub struct ModelStatsSummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// Tokens written to the prompt cache (billed above input; needed for
+    /// accurate cost display — was previously dropped from the summary).
+    pub total_cache_creation_tokens: u64,
     pub cache_hit_rate: f64,
     pub consecutive_failures: u32,
     pub is_healthy: bool,
@@ -372,6 +375,7 @@ impl ModelStats {
             total_input_tokens: self.total_input_tokens,
             total_output_tokens: self.total_output_tokens,
             total_cache_read_tokens: self.total_cache_read_tokens,
+            total_cache_creation_tokens: self.total_cache_creation_tokens,
             cache_hit_rate,
             consecutive_failures: self.consecutive_failures,
             is_healthy: self.consecutive_failures < UNHEALTHY_THRESHOLD,
@@ -607,6 +611,30 @@ mod tests {
             b.summaries().await.is_empty(),
             "a separately constructed tracker stays empty"
         );
+    }
+
+    // The summary must surface cache-creation tokens (record() accumulates
+    // them, but the summary previously dropped the field, hiding cache-write
+    // volume and breaking accurate cost display).
+    #[tokio::test]
+    async fn summary_surfaces_cache_creation_tokens() {
+        let tracker = ModelStatsTracker::new();
+        tracker
+            .record(RequestObservation {
+                model: "claude-sonnet-5".to_string(),
+                success: true,
+                latency: Duration::from_millis(10),
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_read_tokens: 4000,
+                cache_creation_tokens: 800,
+                tier: None,
+                escalated: false,
+            })
+            .await;
+        let s = tracker.summary("claude-sonnet-5").await.expect("summary exists");
+        assert_eq!(s.total_cache_creation_tokens, 800);
+        assert_eq!(s.total_cache_read_tokens, 4000);
     }
 
     fn observation_with_tokens(model: &str, input: u32, output: u32) -> RequestObservation {
