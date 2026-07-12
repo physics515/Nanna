@@ -481,3 +481,64 @@ impl From<StorableModelStats> for StoredModelStats {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(model: &str, success: bool) -> RequestObservation {
+        RequestObservation {
+            model: model.to_string(),
+            success,
+            latency: Duration::from_millis(10),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tier: None,
+            escalated: false,
+        }
+    }
+
+    // The daemon shares ONE tracker between the main agent, every sub-agent,
+    // and the control plane by cloning it. This is only correct if clones
+    // share underlying state — a record via one clone must be visible via
+    // another. Guards the P11 "wire shared stats tracker" fix.
+    #[tokio::test]
+    async fn clone_shares_underlying_state() {
+        let main = ModelStatsTracker::new();
+        let sub_agent = main.clone();
+        let control_plane = main.clone();
+
+        // A sub-agent records a request...
+        sub_agent.record(observation("claude-opus-4-8", true)).await;
+        // ...the main agent records another for the same model...
+        main.record(observation("claude-opus-4-8", true)).await;
+
+        // ...and the control-plane clone sees BOTH (shared Arc<RwLock<_>>).
+        let summaries = control_plane.summaries().await;
+        assert_eq!(summaries.len(), 1, "one model tracked across all clones");
+        let s = &summaries[0];
+        assert_eq!(s.model, "claude-opus-4-8");
+        assert_eq!(
+            s.total_requests, 2,
+            "both clones' records accumulate in the shared tracker"
+        );
+        assert_eq!(s.total_input_tokens, 200);
+        assert_eq!(s.total_output_tokens, 40);
+    }
+
+    // A fresh (unshared) tracker must NOT see another tracker's records —
+    // proves the sharing above comes from cloning, not global state.
+    #[tokio::test]
+    async fn independent_trackers_do_not_share() {
+        let a = ModelStatsTracker::new();
+        let b = ModelStatsTracker::new();
+        a.record(observation("gpt-5", true)).await;
+        assert_eq!(a.summaries().await.len(), 1);
+        assert!(
+            b.summaries().await.is_empty(),
+            "a separately constructed tracker stays empty"
+        );
+    }
+}

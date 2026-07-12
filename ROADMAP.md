@@ -467,7 +467,22 @@ routine should drain first.**
 - [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
 - [ ] `not_implemented` daemon control actions: ~~Regenerate message~~ **(done 2026-07-11 — `ChatAction::Regenerate` now drops the stale assistant reply via a new pure `Session::take_last_user_turn()` (removes the last user message **and** everything after it — reply + trailing tool turns — returning that user content; `None`/unchanged when there's no user message), persists the truncated session, then replays through the existing `Send` path via `Box::pin(self.handle_chat(..))` so it reuses all context/workspace/memory/agent logic with zero duplication. 4 unit tests cover reply-drop, prior-history preservation, trailing-tool-turn drop, and no-user→None. Daemon boots green; full turn execution needs a live LLM (unavailable unattended) so verified by build+boot smoke + unit tests)**, ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
-- [ ] Server stats not wired to shared daemon state (`server.rs:882`).
+- [x] Server stats not wired to shared daemon state (`server.rs:882`).
+      *(2026-07-12)* Bigger bug than the label: the daemon's **main agent was built without any stats
+      tracker** (`AgentService` → `Agent::new(..).with_context(..)`, no `with_stats`) **and** the sub-agent
+      spawner had `stats: None`, so **no live model stats were ever recorded** — `control.model_stats` only
+      ever held what `import_from_storage` loaded at boot; the model-stats dashboard never reflected fresh
+      daemon activity. Fixed by threading **one** `ModelStatsTracker` (clone shares state — `Arc<RwLock<_>>`)
+      through the whole daemon: `init_services` mints it, wires it into both `AgentService::with_stats(..)`
+      (new builder + field; applied to the `Agent` at build time) and `AgentSpawnerImpl.stats`, and returns
+      it; `run()` assigns it to `control.model_stats` **before** `with_storage` so persisted stats load into
+      the same shared tracker and the router reads it for health-aware routing. 2 unit tests
+      (`clone_shares_underlying_state`: records via sub-agent + main clones both visible via the control-plane
+      clone; `independent_trackers_do_not_share`). Verified by an isolated real boot (`nanna-daemon run
+      --port 5249 --health-port 5248 --data-dir <scratch>`): reaches "Daemon ready", "Stats-informed routing
+      enabled", `/status → {"sessions":1,"memory_available":true,"agent_available":true}`, and a heartbeat
+      agent turn ran through the shared tracker. Full-turn stat accumulation needs a sustained live LLM
+      session (heavy unattended) so covered by build+boot smoke + unit tests.
 - [x] **Double health-server bind / stale health state** — *(2026-07-11)* Re-checked against current
       master: there is only **one** `HealthServer` construction, and a clean `nanna-daemon run` on **free**
       ports binds exactly once with **zero** `os error 10048` (the 2026-07-10 "second binder fail 4×" was

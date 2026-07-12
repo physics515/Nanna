@@ -159,6 +159,10 @@ pub struct AgentService {
     session_history: Option<crate::server::SharedSessionHistory>,
     /// Database storage for checkpoint persistence
     storage: Option<Arc<nanna_storage::Storage>>,
+    /// Shared model-stats tracker. When set, every agent run records its
+    /// per-model request stats here so the control plane persists them and
+    /// the router reads them for health-aware routing. `None` = don't record.
+    model_stats: Option<nanna_agent::ModelStatsTracker>,
 }
 
 impl AgentService {
@@ -209,6 +213,7 @@ impl AgentService {
             checkpoint_dir,
             session_history: None,
             storage: None,
+            model_stats: None,
         }
     }
 
@@ -221,6 +226,15 @@ impl AgentService {
     /// Set the shared session history for the `session.history` tool service.
     pub fn with_session_history(mut self, history: crate::server::SharedSessionHistory) -> Self {
         self.session_history = Some(history);
+        self
+    }
+
+    /// Set the shared model-stats tracker. Each agent run records into it, so
+    /// the main daemon agent's request stats are captured (previously the
+    /// `Agent` was built without a tracker and no live stats were recorded).
+    #[must_use]
+    pub fn with_stats(mut self, stats: nanna_agent::ModelStatsTracker) -> Self {
+        self.model_stats = Some(stats);
         self
     }
 
@@ -513,12 +527,18 @@ impl AgentService {
                     context.messages.push(anthropic_msg);
                 }
 
-                Agent::new(
+                let mut agent = Agent::new(
                     agent_config,
                     llm_client,
                     self.tools.clone(),
                 )
-                .with_context(context)
+                .with_context(context);
+                // Record per-model request stats into the shared tracker so the
+                // control plane persists them and the router can route on them.
+                if let Some(ref tracker) = self.model_stats {
+                    agent = agent.with_stats(tracker.clone());
+                }
+                agent
             };
 
             // Create run options with streaming callbacks
