@@ -697,6 +697,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `debug_assert`s prove every cluster honors both bounds. 3 tests (count bound + lossless, byte bound +
       lossless, legacy-config deserialization defaults the caps); 34 nanna-memory tests green; nanna-core +
       nanna-daemon build green.
+      *(2026-07-13)* **Scheduled dream cycle now honors the user's memory-compression config.** The daemon's
+      automatic hourly consolidation built `ConsolidationConfig::default()` (`server.rs`), silently ignoring
+      `[memory] max_compression_ratio` / `min_remaining_memories` — while the IPC-triggered path (`control.rs`)
+      read them. Worse, `DaemonBuilder::from_nanna_config` never mapped those two settings onto `DaemonConfig`
+      at all, so the scheduled cycle always used the 0.50 / 20 defaults regardless of user config. Fixed:
+      added `memory_max_compression_ratio` / `memory_min_remaining_memories` to `DaemonConfig` (both
+      construction sites are compiler-enforced), mapped them from `config.memory.*` in `from_nanna_config` and
+      the legacy `src/main.rs` path, and routed the scheduled task through a pure, unit-tested
+      `scheduled_consolidation_config(max_ratio, min_remaining)` helper (mirrors the `control.rs` build) so
+      automatic and manual consolidation are now in lock-step. 2 tests (helper threads the values while keeping
+      the new cluster-size defaults; `DaemonConfig::default` mirrors `ConsolidationConfig::default`); 41 daemon
+      lib tests green, zero new clippy warnings (2067 baseline unchanged), real daemon boot reaches "Daemon
+      ready" + schedules the consolidation task cleanly.
 - [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
       *(2026-07-07) Done for **all three ingest paths** (`smart_ingest`, `remember_with_importance`,
       the scoped variant) via a shared `fold_into_memory` helper: `merge_memory_content` +

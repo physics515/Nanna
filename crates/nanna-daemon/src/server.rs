@@ -474,6 +474,13 @@ pub struct DaemonConfig {
     pub tools_dir: Option<PathBuf>,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
+    /// Max fraction of memories the scheduled dream cycle may merge away in one
+    /// run (mirrors `[memory] max_compression_ratio`). Threaded so automatic
+    /// consolidation honors the same user setting the IPC-triggered path does.
+    pub memory_max_compression_ratio: f32,
+    /// Floor the scheduled dream cycle leaves after consolidating (mirrors
+    /// `[memory] min_remaining_memories`).
+    pub memory_min_remaining_memories: usize,
 }
 
 /// LLM provider configuration (multi-provider)
@@ -541,7 +548,24 @@ impl Default for DaemonConfig {
             use_script_tools: true,
             tools_dir: None,
             channels: None,
+            // Mirror ConsolidationConfig::default() (== nanna-config defaults).
+            memory_max_compression_ratio: 0.50,
+            memory_min_remaining_memories: 20,
         }
+    }
+}
+
+/// Build the scheduled dream-cycle's [`ConsolidationConfig`] from the user's
+/// memory settings, keeping automatic consolidation in lock-step with the
+/// IPC-triggered path (see `control.rs`). Pure so it is unit-testable.
+fn scheduled_consolidation_config(
+    max_compression_ratio: f32,
+    min_remaining_memories: usize,
+) -> nanna_memory::ConsolidationConfig {
+    nanna_memory::ConsolidationConfig {
+        max_compression_ratio,
+        min_remaining_memories,
+        ..nanna_memory::ConsolidationConfig::default()
     }
 }
 
@@ -809,6 +833,10 @@ impl DaemonServer {
             let agent_for_tasks = agent.clone();
             let memory_for_tasks = memory.clone();
             let router_for_tasks = router.clone();
+            // Capture the user's memory-compression settings for the scheduled
+            // dream cycle (Copy scalars, moved into the executor closure).
+            let consolidation_max_ratio = self.config.memory_max_compression_ratio;
+            let consolidation_min_remaining = self.config.memory_min_remaining_memories;
             let summarization_model = self
                 .config
                 .agent
@@ -828,8 +856,10 @@ impl DaemonServer {
                         "memory_consolidation" => {
                             if let Some(ref memory) = memory {
                                 info!("Running scheduled memory consolidation...");
-                                let consolidation_config =
-                                    nanna_memory::ConsolidationConfig::default();
+                                let consolidation_config = scheduled_consolidation_config(
+                                    consolidation_max_ratio,
+                                    consolidation_min_remaining,
+                                );
                                 let summarize = |prompt: String| {
                                     let router = router.clone();
                                     let model = summarization_model.clone();
@@ -1854,6 +1884,11 @@ impl DaemonBuilder {
         builder.embedding.provider = config.memory.embedding_provider.clone();
         builder.embedding.model = config.memory.embedding_model.clone();
         builder.embedding.ollama_host = config.memory.ollama_host.clone();
+
+        // Thread the memory-compression settings so the scheduled dream cycle
+        // honors them (previously only the IPC-triggered path did).
+        builder.config.memory_max_compression_ratio = config.memory.max_compression_ratio;
+        builder.config.memory_min_remaining_memories = config.memory.min_remaining_memories;
         
         // Set data directory from Nanna config (same location as GUI)
         match nanna_config::Config::default_data_dir() {
@@ -2135,5 +2170,32 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
                 allowed_channels: vec![], // nanna_config::SlackConfig has no allowed_channels yet
             })
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_consolidation_config_threads_user_memory_settings() {
+        // The scheduled dream cycle must use the user's compression settings,
+        // not ConsolidationConfig::default(), so automatic and IPC-triggered
+        // consolidation behave identically.
+        let cfg = scheduled_consolidation_config(0.25, 100);
+        assert!((cfg.max_compression_ratio - 0.25).abs() < f32::EPSILON);
+        assert_eq!(cfg.min_remaining_memories, 100);
+        // Untouched fields keep their defaults (e.g. the cluster-size bounds).
+        let default = nanna_memory::ConsolidationConfig::default();
+        assert_eq!(cfg.max_cluster_memories, default.max_cluster_memories);
+        assert!((cfg.cluster_threshold - default.cluster_threshold).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn daemon_config_default_mirrors_consolidation_defaults() {
+        let daemon = DaemonConfig::default();
+        let cons = nanna_memory::ConsolidationConfig::default();
+        assert!((daemon.memory_max_compression_ratio - cons.max_compression_ratio).abs() < f32::EPSILON);
+        assert_eq!(daemon.memory_min_remaining_memories, cons.min_remaining_memories);
     }
 }
