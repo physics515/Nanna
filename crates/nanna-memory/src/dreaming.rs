@@ -109,13 +109,60 @@ const fn feedback_boost(feedback: MemoryFeedback) -> f32 {
     }
 }
 
-/// Cap on how many pending feedback signals are retained per memory between
-/// dream cycles. The dream loop clamps a memory's aggregate boost to ±1.0, and
-/// the smallest per-signal magnitude is 0.3, so ≥4 same-direction signals
-/// already saturate the clamp — retaining 16 preserves the applied result
-/// exactly while bounding the accumulator against a feedback flood (Tiger Style:
-/// bound everything). The distinct-memory axis is already bounded by the store.
-const MAX_PENDING_FEEDBACK_PER_MEMORY: usize = 16;
+/// Bounded per-memory tally of feedback signals pending the next dream cycle.
+///
+/// The dream loop only ever consumes the **aggregate** boost (a commutative
+/// sum), so the signals themselves never need retaining: per-variant counts are
+/// sufficient and exactly reproduce the sum. This bounds the accumulator **by
+/// construction** — a fixed 16 bytes per memory regardless of flood volume
+/// (Tiger Style: bound everything; the distinct-memory axis is bounded by the
+/// store) — with no drop policy. A retain-N cap would mis-aggregate a
+/// mixed-direction flood: N positives followed by many negatives would drop the
+/// negatives and flip the applied sign. Counters saturate at `u32::MAX`
+/// (~4.3 B same-variant signals between two dream cycles — unreachable).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FeedbackTally {
+    helpful: u32,
+    unhelpful: u32,
+    used_successfully: u32,
+    caused_error: u32,
+}
+
+impl FeedbackTally {
+    /// Count one feedback signal (saturating).
+    const fn record(&mut self, feedback: MemoryFeedback) {
+        let counter = match feedback {
+            MemoryFeedback::Helpful => &mut self.helpful,
+            MemoryFeedback::Unhelpful => &mut self.unhelpful,
+            MemoryFeedback::UsedSuccessfully => &mut self.used_successfully,
+            MemoryFeedback::CausedError => &mut self.caused_error,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Total signals tallied (for logging).
+    const fn signal_count(&self) -> u64 {
+        self.helpful as u64
+            + self.unhelpful as u64
+            + self.used_successfully as u64
+            + self.caused_error as u64
+    }
+
+    /// Aggregate boost: Σ count × per-variant boost — identical to summing the
+    /// individual signals, since the sum is commutative (fused multiply-add for
+    /// one rounding per term).
+    // Counts are exact in f32 below 2^24; beyond that the rounding error is
+    // ~1e-7 relative, absorbed by the ±1.0 clamp the dream loop applies.
+    #[allow(clippy::cast_precision_loss)]
+    const fn total_boost(&self) -> f32 {
+        let total = (self.helpful as f32).mul_add(feedback_boost(MemoryFeedback::Helpful), 0.0);
+        let total =
+            (self.unhelpful as f32).mul_add(feedback_boost(MemoryFeedback::Unhelpful), total);
+        let total = (self.used_successfully as f32)
+            .mul_add(feedback_boost(MemoryFeedback::UsedSuccessfully), total);
+        (self.caused_error as f32).mul_add(feedback_boost(MemoryFeedback::CausedError), total)
+    }
+}
 
 /// Statistics from a dreaming run
 #[derive(Debug, Clone, Default)]
@@ -134,8 +181,8 @@ pub struct DreamingStats {
 pub struct DreamingService {
     config: DreamingConfig,
     memory: MemoryService,
-    /// Pending feedback to apply (memory_id -> accumulated feedback)
-    pending_feedback: RwLock<HashMap<String, Vec<MemoryFeedback>>>,
+    /// Pending feedback to apply (memory_id -> per-variant signal tally)
+    pending_feedback: RwLock<HashMap<String, FeedbackTally>>,
     /// Wall-clock instant of the most recent user/agent activity. Drives the
     /// idle gate in [`DreamingService::dream_if_idle`].
     last_activity: RwLock<Instant>,
@@ -234,30 +281,16 @@ impl DreamingService {
 
     /// Record feedback for a memory (will be applied during dreaming).
     ///
-    /// Retains at most [`MAX_PENDING_FEEDBACK_PER_MEMORY`] signals per memory
-    /// between dream cycles; further signals are dropped once the aggregate is
-    /// already clamp-saturated, so the applied FSRS boost is unchanged.
+    /// Tallied into a fixed-size per-memory [`FeedbackTally`] — every signal
+    /// counts toward the aggregate the dream cycle applies, and the accumulator
+    /// cannot grow with flood volume.
     pub async fn record_feedback(&self, memory_id: &str, feedback: MemoryFeedback) {
         let mut pending = self.pending_feedback.write().await;
-        let signals = pending.entry(memory_id.to_string()).or_default();
-        debug_assert!(
-            signals.len() <= MAX_PENDING_FEEDBACK_PER_MEMORY,
-            "pending feedback exceeded its per-memory bound"
-        );
-        let recorded = if signals.len() >= MAX_PENDING_FEEDBACK_PER_MEMORY {
-            false
-        } else {
-            signals.push(feedback);
-            true
-        };
+        pending.entry(memory_id.to_string()).or_default().record(feedback);
         // Release the write guard before logging (nothing below touches it).
         drop(pending);
 
-        if recorded {
-            debug!("Recorded {:?} feedback for memory {}", feedback, memory_id);
-        } else {
-            debug!("Dropping {:?} feedback for {} (accumulator saturated)", feedback, memory_id);
-        }
+        debug!("Recorded {:?} feedback for memory {}", feedback, memory_id);
     }
 
     /// Apply pending feedback immediately (doesn't wait for dreaming)
@@ -297,12 +330,14 @@ impl DreamingService {
             std::mem::take(&mut *pending)
         };
 
-        for (memory_id, feedbacks) in pending {
-            // Aggregate feedback
-            let mut total_boost = 0.0_f32;
-            for feedback in feedbacks {
-                total_boost += feedback_boost(feedback);
-            }
+        for (memory_id, tally) in pending {
+            // Aggregate feedback (Σ count × per-variant boost)
+            let total_boost = tally.total_boost();
+            debug!(
+                "Applying {} tallied feedback signals to {} (boost {total_boost})",
+                tally.signal_count(),
+                memory_id
+            );
 
             // Apply aggregated feedback
             if total_boost > 0.0 {
@@ -436,28 +471,44 @@ mod tests {
         service.record_feedback("mem-2", MemoryFeedback::Unhelpful).await;
 
         let pending = service.pending_feedback.read().await;
-        assert_eq!(pending.get("mem-1").map(|v| v.len()), Some(2));
-        assert_eq!(pending.get("mem-2").map(|v| v.len()), Some(1));
+        assert_eq!(pending.get("mem-1").map(FeedbackTally::signal_count), Some(2));
+        assert_eq!(pending.get("mem-2").map(FeedbackTally::signal_count), Some(1));
     }
 
     #[tokio::test]
-    async fn pending_feedback_is_bounded_per_memory() {
+    async fn feedback_flood_is_fixed_size_and_exactly_aggregated() {
         let service = DreamingService::new(DreamingConfig::default());
 
-        // Flood one memory with far more signals than the cap.
-        for _ in 0..(MAX_PENDING_FEEDBACK_PER_MEMORY + 50) {
+        // The mixed-direction flood a retain-N cap gets WRONG: 16 positives
+        // followed by 20 strong negatives. Dropping the negatives past a cap
+        // would leave the aggregate positive; the true sum is
+        // 16(0.3) − 20(0.5) = −5.2, i.e. firmly negative.
+        for _ in 0..16 {
             service.record_feedback("hot", MemoryFeedback::Helpful).await;
         }
+        for _ in 0..20 {
+            service.record_feedback("hot", MemoryFeedback::CausedError).await;
+        }
 
-        let retained = {
+        let tally = {
             let pending = service.pending_feedback.read().await;
-            pending.get("hot").map(Vec::len)
+            *pending.get("hot").expect("tally must exist")
         };
-        assert_eq!(
-            retained,
-            Some(MAX_PENDING_FEEDBACK_PER_MEMORY),
-            "the accumulator must not grow past its per-memory bound"
-        );
+        // Every signal counted — nothing dropped…
+        assert_eq!(tally.signal_count(), 36);
+        // …the accumulator is a fixed-size tally regardless of volume…
+        assert_eq!(std::mem::size_of::<FeedbackTally>(), 16);
+        // …and the aggregate is the exact sum, with the correct (negative) sign.
+        assert!((tally.total_boost() - (-5.2)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn feedback_tally_counters_saturate_instead_of_wrapping() {
+        // A counter at u32::MAX must stay there (saturating), never wrap to 0
+        // and silently zero out billions of signals.
+        let mut tally = FeedbackTally { helpful: u32::MAX, ..FeedbackTally::default() };
+        tally.record(MemoryFeedback::Helpful);
+        assert_eq!(tally.helpful, u32::MAX);
     }
 
     #[test]
@@ -468,8 +519,26 @@ mod tests {
         assert!(feedback_boost(MemoryFeedback::UsedSuccessfully) > 0.0);
         assert!(feedback_boost(MemoryFeedback::Unhelpful) < 0.0);
         assert!(feedback_boost(MemoryFeedback::CausedError) < 0.0);
-        // Saturating the ±1.0 clamp needs ≤4 min-magnitude signals, well under the cap.
-        assert!(feedback_boost(MemoryFeedback::Helpful).abs() * 4.0 >= 1.0);
+    }
+
+    #[test]
+    fn tally_total_boost_matches_signal_by_signal_sum() {
+        // The tally must aggregate exactly like summing the individual signals
+        // (the representation swap must not change the applied result).
+        let signals = [
+            MemoryFeedback::Helpful,
+            MemoryFeedback::Helpful,
+            MemoryFeedback::CausedError,
+            MemoryFeedback::UsedSuccessfully,
+            MemoryFeedback::Unhelpful,
+        ];
+        let mut tally = FeedbackTally::default();
+        let mut reference = 0.0_f32;
+        for s in signals {
+            tally.record(s);
+            reference += feedback_boost(s);
+        }
+        assert!((tally.total_boost() - reference).abs() < 1e-6);
     }
 
     fn gate_cfg(idle_secs: u64, pressure: usize) -> DreamingConfig {
