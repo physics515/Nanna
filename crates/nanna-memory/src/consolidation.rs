@@ -20,11 +20,52 @@ use std::collections::HashMap;
 /// no content is dropped — the band is just consolidated in several passes.
 pub const DEFAULT_MAX_CLUSTER_MEMORIES: usize = 64;
 
-/// Upper bound on the total `content` bytes folded into a single consolidation
-/// prompt. Budgeted for the 8 GB local tier (~8k-token context): ~300 tok
-/// instruction/framing + ~512 tok output leaves ~7k tok of input; at ~4 bytes/
-/// token that is ~28k bytes, floored to 24k for a CJK-density margin.
-pub const DEFAULT_MAX_CLUSTER_CONTENT_BYTES: usize = 24_000;
+/// Context window (tokens) assumed when the summarizer model is unknown.
+///
+/// The safe low end (a small 8k-token local model). Callers that know the model
+/// should size the budget to it via
+/// [`ConsolidationConfig::with_summarizer_context_window`].
+pub const FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS: usize = 8_192;
+
+/// Fallback per-cluster content-byte budget when the summarizer model is unknown.
+///
+/// Derived from [`FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS`] via
+/// [`cluster_content_bytes_for_context`] — not an "8 GB tier" constant — so
+/// `default()` and the model-aware path share one formula.
+pub const DEFAULT_MAX_CLUSTER_CONTENT_BYTES: usize =
+    cluster_content_bytes_for_context(FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS);
+
+/// Convert a summarizer model's context window (in tokens) into the per-cluster
+/// content-byte budget, so the consolidation prompt built from a cluster always
+/// fits that model's window.
+///
+/// Reserves headroom for the summarization instruction/framing and the generated
+/// summary, then converts the remaining token budget to bytes at the token
+/// estimator's **worst-case density**: `nanna_llm::estimate_tokens` counts every
+/// non-ASCII char as one token, and the smallest non-ASCII UTF-8 char is 2 bytes,
+/// so content can reach at most 0.5 tokens/byte. Budgeting **2 bytes per token**
+/// therefore guarantees the concatenated content never exceeds the token budget
+/// for any script (ASCII simply under-fills — safety over utilization).
+#[must_use]
+pub const fn cluster_content_bytes_for_context(context_window_tokens: usize) -> usize {
+    /// Instruction + framing + per-memory `---` separators.
+    const PROMPT_OVERHEAD_TOKENS: usize = 512;
+    /// Room for the generated consolidated summary.
+    const OUTPUT_RESERVE_TOKENS: usize = 1024;
+    /// Worst-case bytes-per-token that cannot overflow the token budget.
+    const SAFE_BYTES_PER_TOKEN: usize = 2;
+    /// Never collapse to nothing on a tiny/misreported window.
+    const MIN_CONTENT_BYTES: usize = 2_048;
+
+    let content_tokens =
+        context_window_tokens.saturating_sub(PROMPT_OVERHEAD_TOKENS + OUTPUT_RESERVE_TOKENS);
+    let bytes = content_tokens * SAFE_BYTES_PER_TOKEN;
+    if bytes > MIN_CONTENT_BYTES {
+        bytes
+    } else {
+        MIN_CONTENT_BYTES
+    }
+}
 
 const fn default_max_cluster_memories() -> usize {
     DEFAULT_MAX_CLUSTER_MEMORIES
@@ -47,7 +88,9 @@ pub struct ConsolidationConfig {
     #[serde(default = "default_max_cluster_memories")]
     pub max_cluster_memories: usize,
     /// Maximum total `content` bytes a single cluster may hold, bounding the
-    /// consolidation prompt against a small model's context window.
+    /// consolidation prompt to fit the summarizer model's context window. Defaults
+    /// to the small-model fallback; size it to the real model with
+    /// [`ConsolidationConfig::with_summarizer_context_window`].
     #[serde(default = "default_max_cluster_content_bytes")]
     pub max_cluster_content_bytes: usize,
     /// Maximum fraction of total memories that can be removed in a single run (0.0-1.0).
@@ -74,6 +117,19 @@ impl Default for ConsolidationConfig {
             weight_thresholds: WeightThresholds::default(),
             clustering_weights: ClusteringWeights::default(),
         }
+    }
+}
+
+impl ConsolidationConfig {
+    /// Size [`Self::max_cluster_content_bytes`] to the summarizer model's context
+    /// window (in tokens) so an automatically-built consolidation prompt always
+    /// fits it — replacing the small-model fallback with the real budget. Leaves
+    /// the member-count cap ([`Self::max_cluster_memories`], a coarse safety
+    /// limit) untouched, since the byte budget is what maps to the context window.
+    #[must_use]
+    pub const fn with_summarizer_context_window(mut self, context_window_tokens: usize) -> Self {
+        self.max_cluster_content_bytes = cluster_content_bytes_for_context(context_window_tokens);
+        self
     }
 }
 
@@ -771,6 +827,55 @@ mod tests {
         let cfg: ConsolidationConfig = serde_json::from_str(legacy).expect("legacy config must load");
         assert_eq!(cfg.max_cluster_memories, DEFAULT_MAX_CLUSTER_MEMORIES);
         assert_eq!(cfg.max_cluster_content_bytes, DEFAULT_MAX_CLUSTER_CONTENT_BYTES);
+    }
+
+    #[test]
+    fn content_budget_scales_with_context_window() {
+        // Bigger context → bigger (or equal) content budget, and each budget
+        // fits the token window: at the estimator's worst-case 0.5 tok/byte the
+        // content is at most `bytes / 2` tokens, which must stay under `window`.
+        let small = cluster_content_bytes_for_context(8_192);
+        let large = cluster_content_bytes_for_context(200_000);
+        assert!(large > small, "budget must grow with the window");
+        for window in [8_192_usize, 32_000, 128_000, 200_000] {
+            let bytes = cluster_content_bytes_for_context(window);
+            let worst_case_tokens = bytes / 2; // 0.5 tok/byte upper bound
+            assert!(
+                worst_case_tokens < window,
+                "budget {bytes}B (~{worst_case_tokens} tok) must fit the {window}-tok window"
+            );
+        }
+    }
+
+    #[test]
+    fn content_budget_floors_on_tiny_window() {
+        // A tiny or misreported window must not collapse the budget to zero, or
+        // consolidation would lock up (every candidate rejected).
+        assert!(cluster_content_bytes_for_context(0) >= 2_048);
+        assert!(cluster_content_bytes_for_context(100) >= 2_048);
+    }
+
+    #[test]
+    fn with_summarizer_context_window_sizes_the_byte_budget() {
+        // The builder swaps the small-model fallback for the real model's budget
+        // and leaves the member-count cap alone.
+        let base = ConsolidationConfig::default();
+        let large = base.clone().with_summarizer_context_window(200_000);
+        assert_eq!(
+            large.max_cluster_content_bytes,
+            cluster_content_bytes_for_context(200_000)
+        );
+        assert!(large.max_cluster_content_bytes > base.max_cluster_content_bytes);
+        assert_eq!(large.max_cluster_memories, base.max_cluster_memories);
+    }
+
+    #[test]
+    fn default_content_budget_matches_fallback_window() {
+        // default() must equal the fallback-window formula (one source of truth).
+        assert_eq!(
+            DEFAULT_MAX_CLUSTER_CONTENT_BYTES,
+            cluster_content_bytes_for_context(FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS)
+        );
     }
 
     #[test]

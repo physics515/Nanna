@@ -702,14 +702,27 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       degenerate weight band of thousands of mutually-similar memories → a >250k-token prompt that overflows a
       small local model's context window (P12). Bounded at cluster *formation* (not prompt building, which
       would silently drop the omitted members' content since `consolidate_cluster` removes every cluster
-      member): two `ConsolidationConfig` fields — `max_cluster_memories` (default 64) and
-      `max_cluster_content_bytes` (default 24 000 ≈ 6k tok, budgeted for the 8 GB tier's ~8k-token context) —
-      cap each cluster; a candidate that would breach either bound stays unassigned and re-clusters on a later
-      seed, so **no content is dropped** — the band just consolidates over more passes. Both fields carry
-      `#[serde(default)]` (backward-compatible with pre-existing serialized configs) and pre/postcondition
-      `debug_assert`s prove every cluster honors both bounds. 3 tests (count bound + lossless, byte bound +
-      lossless, legacy-config deserialization defaults the caps); 34 nanna-memory tests green; nanna-core +
-      nanna-daemon build green.
+      member): two `ConsolidationConfig` fields — `max_cluster_memories` (64, a coarse safety cap) and
+      `max_cluster_content_bytes` — cap each cluster; a candidate that would breach either bound stays
+      unassigned and re-clusters on a later seed, so **no content is dropped** — the band just consolidates
+      over more passes. Both carry `#[serde(default)]`; pre/postcondition `debug_assert`s prove every cluster
+      honors both bounds.
+      *(2026-07-13, model-aware update)* The byte budget is now **sized to the summarizer model's real context
+      window**, not a fixed "8 GB tier" constant. New pure `cluster_content_bytes_for_context(tokens)` reserves
+      instruction/framing + output headroom, then converts the remaining token budget to bytes at the token
+      estimator's **worst-case density** — `nanna_llm::estimate_tokens` counts any non-ASCII char as 1 token and
+      the smallest non-ASCII UTF-8 char is 2 bytes, so **2 bytes/token provably cannot overflow the token
+      budget for any script**. `ConsolidationConfig::with_summarizer_context_window(tokens)` applies it;
+      `default()` uses the same formula at an 8k fallback (`FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS`) for
+      when the model is unknown. New `nanna_llm::model_context_window(name)` resolves the window from the
+      existing fallback table (no async fetch); both daemon paths — the scheduled task (`server.rs`) and the
+      IPC `MemoryAction::Consolidate` (`control.rs`) — size the budget to their summarizer model, so a big-context
+      model consolidates more per pass while a small one stays safe. **12 tests total** (count/byte bound +
+      lossless; budget scales with window & fits it at worst-case density; tiny-window floor; builder sizing;
+      default==fallback formula; `model_context_window` resolution; daemon threads the window). 40 nanna-memory
+      + 19 nanna-llm + 42 nanna-daemon lib tests green, zero net new clippy warnings, full workspace builds
+      green, real daemon boot reaches "Daemon ready". Remaining: the GUI-embedded consolidation still uses the
+      `default()` fallback budget (needs a GUI build to thread its model window).
       *(2026-07-13)* **Scheduled dream cycle now honors the user's memory-compression config.** The daemon's
       automatic hourly consolidation built `ConsolidationConfig::default()` (`server.rs`), silently ignoring
       `[memory] max_compression_ratio` / `min_remaining_memories` — while the IPC-triggered path (`control.rs`)

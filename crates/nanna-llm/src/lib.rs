@@ -138,6 +138,15 @@ fn current_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+/// Best-effort context window (in tokens) for a model by name.
+///
+/// From the same fallback table as [`default_model_info`]; lets non-LLM callers
+/// (e.g. memory consolidation) size token budgets without an async info fetch.
+#[must_use]
+pub fn model_context_window(model: &str) -> usize {
+    default_model_info(model, "").context_window
+}
+
 /// Default context windows for known models (fallback when API doesn't provide)
 fn default_model_info(model: &str, provider: &str) -> ModelInfo {
     let model_lower = model.to_lowercase();
@@ -4218,5 +4227,14 @@ mod tests {
         // floors at 50% of context; the threshold must still sit at/below it.
         let degenerate = model_info(4_000, 8_000);
         assert!(degenerate.compression_threshold() <= degenerate.hard_input_limit());
+    }
+
+    #[test]
+    fn model_context_window_resolves_from_the_fallback_table() {
+        // Used to size memory-consolidation budgets without an async fetch.
+        assert_eq!(model_context_window("claude-opus-4-8"), 200_000);
+        assert_eq!(model_context_window("gpt-4"), 8_000);
+        // Unknown model falls back to the conservative default window.
+        assert_eq!(model_context_window("some-unknown-model"), 32_000);
     }
 }
