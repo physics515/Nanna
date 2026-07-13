@@ -96,6 +96,27 @@ pub enum MemoryFeedback {
     CausedError,
 }
 
+/// FSRS weight adjustment for one feedback signal (positive promotes, negative
+/// demotes). Single source of truth for both the immediate ([`DreamingService::apply_feedback`])
+/// and the deferred dream-time aggregation paths, which must stay in lock-step.
+#[must_use]
+const fn feedback_boost(feedback: MemoryFeedback) -> f32 {
+    match feedback {
+        MemoryFeedback::Helpful => 0.3,
+        MemoryFeedback::UsedSuccessfully => 0.5,
+        MemoryFeedback::Unhelpful => -0.3,
+        MemoryFeedback::CausedError => -0.5,
+    }
+}
+
+/// Cap on how many pending feedback signals are retained per memory between
+/// dream cycles. The dream loop clamps a memory's aggregate boost to ±1.0, and
+/// the smallest per-signal magnitude is 0.3, so ≥4 same-direction signals
+/// already saturate the clamp — retaining 16 preserves the applied result
+/// exactly while bounding the accumulator against a feedback flood (Tiger Style:
+/// bound everything). The distinct-memory axis is already bounded by the store.
+const MAX_PENDING_FEEDBACK_PER_MEMORY: usize = 16;
+
 /// Statistics from a dreaming run
 #[derive(Debug, Clone, Default)]
 pub struct DreamingStats {
@@ -211,24 +232,37 @@ impl DreamingService {
         &self.memory
     }
 
-    /// Record feedback for a memory (will be applied during dreaming)
+    /// Record feedback for a memory (will be applied during dreaming).
+    ///
+    /// Retains at most [`MAX_PENDING_FEEDBACK_PER_MEMORY`] signals per memory
+    /// between dream cycles; further signals are dropped once the aggregate is
+    /// already clamp-saturated, so the applied FSRS boost is unchanged.
     pub async fn record_feedback(&self, memory_id: &str, feedback: MemoryFeedback) {
         let mut pending = self.pending_feedback.write().await;
-        pending
-            .entry(memory_id.to_string())
-            .or_default()
-            .push(feedback);
-        debug!("Recorded {:?} feedback for memory {}", feedback, memory_id);
+        let signals = pending.entry(memory_id.to_string()).or_default();
+        debug_assert!(
+            signals.len() <= MAX_PENDING_FEEDBACK_PER_MEMORY,
+            "pending feedback exceeded its per-memory bound"
+        );
+        let recorded = if signals.len() >= MAX_PENDING_FEEDBACK_PER_MEMORY {
+            false
+        } else {
+            signals.push(feedback);
+            true
+        };
+        // Release the write guard before logging (nothing below touches it).
+        drop(pending);
+
+        if recorded {
+            debug!("Recorded {:?} feedback for memory {}", feedback, memory_id);
+        } else {
+            debug!("Dropping {:?} feedback for {} (accumulator saturated)", feedback, memory_id);
+        }
     }
 
     /// Apply pending feedback immediately (doesn't wait for dreaming)
     pub async fn apply_feedback(&self, memory_id: &str, feedback: MemoryFeedback) -> Result<(), MemoryError> {
-        let boost = match feedback {
-            MemoryFeedback::Helpful => 0.3,
-            MemoryFeedback::UsedSuccessfully => 0.5,
-            MemoryFeedback::Unhelpful => -0.3,
-            MemoryFeedback::CausedError => -0.5,
-        };
+        let boost = feedback_boost(feedback);
 
         if boost > 0.0 {
             self.memory.promote(memory_id, boost).await?;
@@ -267,13 +301,7 @@ impl DreamingService {
             // Aggregate feedback
             let mut total_boost = 0.0_f32;
             for feedback in feedbacks {
-                let boost = match feedback {
-                    MemoryFeedback::Helpful => 0.3,
-                    MemoryFeedback::UsedSuccessfully => 0.5,
-                    MemoryFeedback::Unhelpful => -0.3,
-                    MemoryFeedback::CausedError => -0.5,
-                };
-                total_boost += boost;
+                total_boost += feedback_boost(feedback);
             }
 
             // Apply aggregated feedback
@@ -410,6 +438,38 @@ mod tests {
         let pending = service.pending_feedback.read().await;
         assert_eq!(pending.get("mem-1").map(|v| v.len()), Some(2));
         assert_eq!(pending.get("mem-2").map(|v| v.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn pending_feedback_is_bounded_per_memory() {
+        let service = DreamingService::new(DreamingConfig::default());
+
+        // Flood one memory with far more signals than the cap.
+        for _ in 0..(MAX_PENDING_FEEDBACK_PER_MEMORY + 50) {
+            service.record_feedback("hot", MemoryFeedback::Helpful).await;
+        }
+
+        let retained = {
+            let pending = service.pending_feedback.read().await;
+            pending.get("hot").map(Vec::len)
+        };
+        assert_eq!(
+            retained,
+            Some(MAX_PENDING_FEEDBACK_PER_MEMORY),
+            "the accumulator must not grow past its per-memory bound"
+        );
+    }
+
+    #[test]
+    fn feedback_boost_signs_match_semantics() {
+        // Positive signals promote, negative signals demote — the two paths that
+        // consume this table (immediate + dream-time) depend on the signs.
+        assert!(feedback_boost(MemoryFeedback::Helpful) > 0.0);
+        assert!(feedback_boost(MemoryFeedback::UsedSuccessfully) > 0.0);
+        assert!(feedback_boost(MemoryFeedback::Unhelpful) < 0.0);
+        assert!(feedback_boost(MemoryFeedback::CausedError) < 0.0);
+        // Saturating the ±1.0 clamp needs ≤4 min-magnitude signals, well under the cap.
+        assert!(feedback_boost(MemoryFeedback::Helpful).abs() * 4.0 >= 1.0);
     }
 
     fn gate_cfg(idle_secs: u64, pressure: usize) -> DreamingConfig {

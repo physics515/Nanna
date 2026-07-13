@@ -493,7 +493,20 @@ routine should drain first.**
       re-embeds + upserts the whole entry (content and embedding stay consistent). Applied to all three
       ingest paths via the shared `fold_into_memory` helper. See also P13 true-merge.*
 - [ ] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through.
-- [ ] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
+- [~] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
+      *(2026-07-13)* **Fixed the compression-threshold ↔ hard-limit inversion for small models** (a concrete
+      slice of this item). `ModelInfo::compression_threshold` was a flat 80% of context while `hard_input_limit`
+      is `max(context − max_output, 50% context)`. For a small model with a large output budget (e.g. context
+      8k / output 4k) that gave threshold **6400 > hard-limit 4000** — proactive compression *never fired before
+      the hard cap*, so the agent emergency-truncated every turn instead of compressing gracefully (the
+      local-first failure mode). Now `compression_threshold = min(80%·context, 90%·hard_limit)`, which keeps
+      the invariant `threshold ≤ hard_limit` and leaves large models unchanged (200k-context Claude stays at
+      160k). Applied to **both** budget paths: `nanna-llm::ModelInfo` (the `ModelInfo`-based
+      `configure_for_model`) and the name-based fallback `AgentContext::configure_for_model_name` in
+      `nanna-agent` (which also lacked the 50% hard-limit floor — added). `debug_assert`s guard the invariant
+      on both paths. 5 tests (small stays below cap / large unchanged / output≥context degenerate — in both
+      crates); 18 nanna-llm + 53 nanna-agent tests green, **−1 clippy warning** in each crate, full workspace
+      builds green. Remaining: the GUI-embedded `truncate_context`'s hardcoded 132k (needs a GUI build).
 - [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
 - [ ] `not_implemented` daemon control actions: ~~Regenerate message~~ **(done 2026-07-11 — `ChatAction::Regenerate` now drops the stale assistant reply via a new pure `Session::take_last_user_turn()` (removes the last user message **and** everything after it — reply + trailing tool turns — returning that user content; `None`/unchanged when there's no user message), persists the truncated session, then replays through the existing `Send` path via `Box::pin(self.handle_chat(..))` so it reuses all context/workspace/memory/agent logic with zero duplication. 4 unit tests cover reply-drop, prior-history preservation, trailing-tool-turn drop, and no-user→None. Daemon boots green; full turn execution needs a live LLM (unavailable unattended) so verified by build+boot smoke + unit tests)**, ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
@@ -625,6 +638,12 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
       - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-12)* **Qwen3.5 GGUF ships universal chat-template fixes for tool-calling** (apply to *any* Qwen3.5 GGUF), and the Qwen3-Coder tool-call parser is now fixed across llama.cpp/Ollama/LMStudio/Jan — de-risks the "reliable tool-call parsing into `ContentBlock::ToolUse`" item for the local tier. When Mummu ports a Qwen3.5-class model, lift its chat template + tool-call grammar verbatim rather than hand-rolling. 8GB tier still wants Q4_K_S/Q4_0 (drop to Q3_K_M on OOM); Qwen3-Coder-Next's ~46GB Q4 footprint keeps it a 16GB+/CPU-offload target, not an 8GB one. Sources: [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5), [Qwen3.6 VRAM table](https://knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/).
+      - [ ] *(research 2026-07-13)* **VRAM footnote for the 8GB default:** the stock Ollama pull of Qwen3.5-9B
+            **bundles a vision encoder that inflates VRAM** — for Nanna's pure-text local tier, pull the
+            **text-only GGUF (Unsloth)**; at **Q4_K_M ≈ 6 GB** it stays entirely on-GPU across all context sizes
+            through 32K (200K+ possible with minor penalty on 8 GB). Bakes into the P12 model-download UX (offer a
+            text-only variant + VRAM estimate) and the VRAM-budgeting picker. Reconfirms 8GB→Qwen3.5-9B Q4_K_M as
+            the reference default. Sources: [localllm.in 8GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025), [mayhemcode 2026 by-task](https://www.mayhemcode.com/2026/06/best-local-llms-for-4gb-6gb-and-8gb.html).
       - [ ] *(research 2026-07-07)* Tool-budget evidence **validates the two-tier tool discovery design**: each tool definition costs ~50–150 tokens; keep the always-sent set **under 5–10 tools** for 7–9B models (Nanna's core-tools-vs-`discover_tools` split already does this). Add a benchmark asserting the local model's active-tool count stays within this budget, and prefer `discover_tools` activation over sending the full registry on the local path.
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
@@ -677,6 +696,33 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       an existing dev DB keeps a harmless unused `expires_at` column (migrations run once by name; fresh DBs
       are clean). Remaining: the rest of the multi-phase body (merge/cluster-by-band/expand/DSP) and wiring
       `record_activity`/`dream_if_idle` into the daemon scheduler + agent loop.
+      *(2026-07-13)* **Phase (c) prompt bounded (Tiger-Style safety for the local summarizer).** The greedy
+      `cluster_memories` put an **unbounded** number of memories into one cluster, and
+      `build_consolidation_prompt` concatenated all of them into a single prompt handed to `summarize_fn` — a
+      degenerate weight band of thousands of mutually-similar memories → a >250k-token prompt that overflows a
+      small local model's context window (P12). Bounded at cluster *formation* (not prompt building, which
+      would silently drop the omitted members' content since `consolidate_cluster` removes every cluster
+      member): two `ConsolidationConfig` fields — `max_cluster_memories` (default 64) and
+      `max_cluster_content_bytes` (default 24 000 ≈ 6k tok, budgeted for the 8 GB tier's ~8k-token context) —
+      cap each cluster; a candidate that would breach either bound stays unassigned and re-clusters on a later
+      seed, so **no content is dropped** — the band just consolidates over more passes. Both fields carry
+      `#[serde(default)]` (backward-compatible with pre-existing serialized configs) and pre/postcondition
+      `debug_assert`s prove every cluster honors both bounds. 3 tests (count bound + lossless, byte bound +
+      lossless, legacy-config deserialization defaults the caps); 34 nanna-memory tests green; nanna-core +
+      nanna-daemon build green.
+      *(2026-07-13)* **Scheduled dream cycle now honors the user's memory-compression config.** The daemon's
+      automatic hourly consolidation built `ConsolidationConfig::default()` (`server.rs`), silently ignoring
+      `[memory] max_compression_ratio` / `min_remaining_memories` — while the IPC-triggered path (`control.rs`)
+      read them. Worse, `DaemonBuilder::from_nanna_config` never mapped those two settings onto `DaemonConfig`
+      at all, so the scheduled cycle always used the 0.50 / 20 defaults regardless of user config. Fixed:
+      added `memory_max_compression_ratio` / `memory_min_remaining_memories` to `DaemonConfig` (both
+      construction sites are compiler-enforced), mapped them from `config.memory.*` in `from_nanna_config` and
+      the legacy `src/main.rs` path, and routed the scheduled task through a pure, unit-tested
+      `scheduled_consolidation_config(max_ratio, min_remaining)` helper (mirrors the `control.rs` build) so
+      automatic and manual consolidation are now in lock-step. 2 tests (helper threads the values while keeping
+      the new cluster-size defaults; `DaemonConfig::default` mirrors `ConsolidationConfig::default`); 41 daemon
+      lib tests green, zero new clippy warnings (2067 baseline unchanged), real daemon boot reaches "Daemon
+      ready" + schedules the consolidation task cleanly.
 - [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
       *(2026-07-07) Done for **all three ingest paths** (`smart_ingest`, `remember_with_importance`,
       the scoped variant) via a shared `fold_into_memory` helper: `merge_memory_content` +
@@ -707,7 +753,28 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             **workspace-scoped recall over one shared index**: keep a single HNSW of all memories and filter to
             the active workspace's ids at query time, instead of rebuilding a per-workspace index — directly
             useful for the P11 "tool-memory workspace scope" item too. Source: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html).
+      - [ ] *(research 2026-07-13)* **`hnswlib-rs` (Jan-2026 rewrite) decouples the graph from vector storage**:
+            the `Hnsw` struct owns only the graph + an external-key→dense-`NodeId` map, while the caller supplies a
+            `VectorStore` keyed by `NodeId`; its `InMemoryVectorStore` does **lock-free reads + parallel updates**,
+            built explicitly for *concurrent search while mutating*. This is the cleaner fit than `hnsw_rs` **if**
+            we want the index to live persistently and serve recalls while dreaming inserts/mutates — the memory
+            store already separates embeddings (Turso BLOBs) from the search structure, so a `NodeId→memory-id`
+            map drops in without duplicating vectors. Decision stands: `hnsw_rs::insert_parallel` for a
+            rebuild-per-dream clusterer (simpler), `hnswlib-rs` only when we move to a long-lived insert-while-serve
+            index. Source: [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
+      *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
+      `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
+      live service path — a feedback flood between dream cycles grew it without limit (Tiger Style: bound
+      everything). Capped at `MAX_PENDING_FEEDBACK_PER_MEMORY = 16`; since the dream loop clamps a memory's
+      aggregate boost to ±1.0 and the smallest per-signal magnitude is 0.3, ≥4 same-direction signals already
+      saturate the clamp, so the cap is **lossless for the applied result** while bounding memory (the
+      distinct-memory axis is already store-bounded). Also extracted the ±0.3/0.5 boost table (duplicated
+      verbatim in `apply_feedback` and the dream-time aggregation) into one `const fn feedback_boost` so the
+      immediate and deferred paths can't drift. 2 tests (flood → accumulator stays at the cap; boost signs
+      match promote/demote semantics + clamp-saturation math); 36 nanna-memory tests green, zero new clippy
+      warnings, nanna-core + nanna-daemon build green. (Prereq for the real signal wiring, which is the
+      remaining work here.)
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 

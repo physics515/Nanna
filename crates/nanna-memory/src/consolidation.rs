@@ -12,6 +12,28 @@ use crate::{MemoryEntry, FsrsParameters, FsrsState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Upper bound on how many memories may be folded into a single consolidation
+/// cluster (and therefore a single summarization prompt). A degenerate weight
+/// band of thousands of mutually-similar memories would otherwise collapse into
+/// one cluster whose prompt overflows a small local model's context window
+/// (P12). Over-cap members stay unassigned and re-cluster among themselves, so
+/// no content is dropped — the band is just consolidated in several passes.
+pub const DEFAULT_MAX_CLUSTER_MEMORIES: usize = 64;
+
+/// Upper bound on the total `content` bytes folded into a single consolidation
+/// prompt. Budgeted for the 8 GB local tier (~8k-token context): ~300 tok
+/// instruction/framing + ~512 tok output leaves ~7k tok of input; at ~4 bytes/
+/// token that is ~28k bytes, floored to 24k for a CJK-density margin.
+pub const DEFAULT_MAX_CLUSTER_CONTENT_BYTES: usize = 24_000;
+
+const fn default_max_cluster_memories() -> usize {
+    DEFAULT_MAX_CLUSTER_MEMORIES
+}
+
+const fn default_max_cluster_content_bytes() -> usize {
+    DEFAULT_MAX_CLUSTER_CONTENT_BYTES
+}
+
 /// Consolidation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationConfig {
@@ -20,6 +42,14 @@ pub struct ConsolidationConfig {
     pub cluster_threshold: f32,
     /// Minimum cluster size to consolidate (singletons below this are skipped or expanded)
     pub min_cluster_size: usize,
+    /// Maximum number of memories a single cluster may hold, bounding the size of
+    /// the consolidation prompt handed to the (possibly small, local) summarizer.
+    #[serde(default = "default_max_cluster_memories")]
+    pub max_cluster_memories: usize,
+    /// Maximum total `content` bytes a single cluster may hold, bounding the
+    /// consolidation prompt against a small model's context window.
+    #[serde(default = "default_max_cluster_content_bytes")]
+    pub max_cluster_content_bytes: usize,
     /// Maximum fraction of total memories that can be removed in a single run (0.0-1.0).
     /// E.g. 0.50 means at most 50% of memories can be merged away.
     pub max_compression_ratio: f32,
@@ -37,6 +67,8 @@ impl Default for ConsolidationConfig {
         Self {
             cluster_threshold: 0.45,
             min_cluster_size: 2,
+            max_cluster_memories: DEFAULT_MAX_CLUSTER_MEMORIES,
+            max_cluster_content_bytes: DEFAULT_MAX_CLUSTER_CONTENT_BYTES,
             max_compression_ratio: 0.50,
             min_remaining_memories: 20,
             weight_thresholds: WeightThresholds::default(),
@@ -298,6 +330,12 @@ pub fn composite_cluster_score(
 ///
 /// Uses greedy clustering: for each unassigned memory, find all unassigned memories
 /// whose composite score exceeds the threshold and group them.
+///
+/// Each cluster is bounded by `config.max_cluster_memories` (member count) and
+/// `config.max_cluster_content_bytes` (total content) so the consolidation prompt
+/// built from it can never overflow a small local model's context window. A
+/// candidate that would breach either bound is left unassigned and re-clustered
+/// on a later seed — nothing is dropped, the band just consolidates in more passes.
 pub fn cluster_memories(
     memories: Vec<MemoryEntry>,
     config: &ConsolidationConfig,
@@ -305,6 +343,11 @@ pub fn cluster_memories(
     if memories.is_empty() {
         return Vec::new();
     }
+    // A cap of 0 would make every cluster a skipped singleton — a config bug.
+    debug_assert!(config.max_cluster_memories >= 1, "max_cluster_memories must be >= 1");
+
+    let cap_count = config.max_cluster_memories.max(1);
+    let cap_bytes = config.max_cluster_content_bytes;
 
     let mut clusters: Vec<Vec<MemoryEntry>> = Vec::new();
     let mut assigned = vec![false; memories.len()];
@@ -314,10 +357,16 @@ pub fn cluster_memories(
             continue;
         }
 
+        // The seed is always admitted (a single over-sized memory forms a lone,
+        // sub-`min_cluster_size` cluster that consolidation then skips).
         let mut cluster = vec![memories[i].clone()];
+        let mut cluster_bytes = memories[i].content.len();
         assigned[i] = true;
 
         for j in (i + 1)..memories.len() {
+            if cluster.len() >= cap_count {
+                break; // count bound reached — remaining matches seed later clusters
+            }
             if assigned[j] {
                 continue;
             }
@@ -327,14 +376,35 @@ pub fn cluster_memories(
                 &memories[j],
                 &config.clustering_weights,
             );
-            if score >= config.cluster_threshold {
-                cluster.push(memories[j].clone());
-                assigned[j] = true;
+            if score < config.cluster_threshold {
+                continue;
             }
+            // Byte bound: skip (don't consume) a candidate that would overflow the
+            // prompt budget; a smaller later candidate may still fit.
+            if cluster_bytes.saturating_add(memories[j].content.len()) > cap_bytes {
+                continue;
+            }
+
+            cluster_bytes += memories[j].content.len();
+            cluster.push(memories[j].clone());
+            assigned[j] = true;
         }
 
         clusters.push(cluster);
     }
+
+    // Postconditions: every cluster honors the count bound, and every multi-member
+    // cluster honors the byte bound (a lone seed may exceed it by itself).
+    debug_assert!(
+        clusters.iter().all(|c| c.len() <= cap_count),
+        "a cluster exceeded max_cluster_memories"
+    );
+    debug_assert!(
+        clusters.iter().all(|c| {
+            c.len() == 1 || c.iter().map(|m| m.content.len()).sum::<usize>() <= cap_bytes
+        }),
+        "a multi-member cluster exceeded max_cluster_content_bytes"
+    );
 
     clusters
 }
@@ -618,6 +688,89 @@ mod tests {
         // 1 and 2 are similar in embedding, importance, age, and recall → should cluster
         // 3 is different on every axis → separate
         assert_eq!(clusters.len(), 2);
+    }
+
+    /// A memory that clusters with every other `similar_entry` (identical
+    /// embedding/importance/recall, adjacent timestamps → composite score ≈ 1).
+    fn similar_entry(id: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 1000,
+            fsrs: FsrsState { importance: 2.0, access_count: 5, ..FsrsState::default() },
+            workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn cluster_member_count_is_bounded_and_lossless() {
+        // 25 mutually-similar memories with a cap of 10 must split into bounded
+        // clusters (10, 10, 5) with every memory preserved exactly once.
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.3,
+            max_cluster_memories: 10,
+            ..Default::default()
+        };
+        let memories: Vec<_> = (0..25).map(|i| similar_entry(&i.to_string(), "x")).collect();
+
+        let clusters = cluster_memories(memories, &config);
+
+        assert!(
+            clusters.iter().all(|c| c.len() <= 10),
+            "no cluster may exceed the member cap"
+        );
+        let total: usize = clusters.iter().map(Vec::len).sum();
+        assert_eq!(total, 25, "no memory may be dropped");
+        let mut ids: Vec<_> = clusters.iter().flatten().map(|m| m.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 25, "every memory appears exactly once");
+    }
+
+    #[test]
+    fn cluster_content_bytes_are_bounded_and_lossless() {
+        // Ten 100-byte memories with a 300-byte budget → at most 3 per cluster.
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.3,
+            max_cluster_memories: 1000,
+            max_cluster_content_bytes: 300,
+            ..Default::default()
+        };
+        let body = "a".repeat(100);
+        let memories: Vec<_> = (0..10).map(|i| similar_entry(&i.to_string(), &body)).collect();
+
+        let clusters = cluster_memories(memories, &config);
+
+        assert!(
+            clusters
+                .iter()
+                .all(|c| c.len() == 1 || c.iter().map(|m| m.content.len()).sum::<usize>() <= 300),
+            "a multi-member cluster exceeded the byte budget"
+        );
+        assert_eq!(
+            clusters.iter().map(Vec::len).sum::<usize>(),
+            10,
+            "no memory may be dropped by the byte bound"
+        );
+    }
+
+    #[test]
+    fn config_deserializes_without_new_bound_fields() {
+        // A ConsolidationConfig serialized before the bound fields existed must
+        // still load, defaulting the new caps (serde backward compatibility).
+        let legacy = r#"{
+            "cluster_threshold": 0.45,
+            "min_cluster_size": 2,
+            "max_compression_ratio": 0.5,
+            "min_remaining_memories": 20,
+            "weight_thresholds": {"essence":0.2,"compressed":0.5,"standard":0.8,"detailed":1.0},
+            "clustering_weights": {"similarity":0.45,"recall_affinity":0.2,"importance_proximity":0.2,"age_proximity":0.15}
+        }"#;
+        let cfg: ConsolidationConfig = serde_json::from_str(legacy).expect("legacy config must load");
+        assert_eq!(cfg.max_cluster_memories, DEFAULT_MAX_CLUSTER_MEMORIES);
+        assert_eq!(cfg.max_cluster_content_bytes, DEFAULT_MAX_CLUSTER_CONTENT_BYTES);
     }
 
     #[test]

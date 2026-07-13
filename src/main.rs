@@ -750,6 +750,8 @@ async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<
         // Legacy single-binary path: channels are not started here (matches the
         // field's Default). The daemon path wires channel config separately.
         channels: None,
+        memory_max_compression_ratio: config.memory.max_compression_ratio,
+        memory_min_remaining_memories: config.memory.min_remaining_memories,
     };
 
     info!("Initializing daemon server...");
