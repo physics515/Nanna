@@ -8,6 +8,7 @@
 mod chunker;
 pub mod compressor;
 mod context;
+pub mod cost;
 pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
@@ -52,9 +53,10 @@ pub use summarizer::{
     Summarizer,
     SummarizerConfig,
 };
+pub use cost::{ModelPricing, default_pricing, estimate_cost_usd};
 pub use model_stats::{
-    ModelStatsTracker, ModelStats, ModelStatsSummary, RequestModelStats, RequestObservation,
-    StorableModelStats,
+    ModelCost, ModelStatsTracker, ModelStats, ModelStatsSummary, RequestModelStats,
+    RequestObservation, StorableModelStats,
 };
 pub use tool_stats::{
     ToolStatsTracker, ToolStats, ToolStatsSummary, ToolObservation,

@@ -2198,8 +2198,14 @@ impl ControlPlane {
             }
             SystemAction::ModelStats => {
                 let summaries = self.model_stats.summaries().await;
+                // Estimated USD spend per model (reference list prices); local
+                // models come back flagged unpriced rather than as $0.
+                let costs = self.model_stats.cost_report().await;
+                let total_cost_usd = self.model_stats.total_cost_usd().await;
                 json!({
                     "models": summaries,
+                    "costs": costs,
+                    "total_cost_usd": total_cost_usd,
                 })
             }
             SystemAction::ToolStats => {

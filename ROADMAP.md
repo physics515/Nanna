@@ -315,8 +315,31 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       active_sessions, memory_entries); expose via `/metrics` on the Axum health server + a GUI event.
 - [ ] **Structured tracing spans** — hierarchy Session → Agent Loop → LLM/Tool Call, capturing
       name/duration/IO-size/success via `#[tracing::instrument]` + `info_span!`.
-- [ ] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
+- [~] **Cost tracking** — `CostTracker` (pricing table per model, `UsageRecord` per call), aggregate by
       session/day/month/model/tool, surface in GUI.
+      *(2026-07-12)* Core shipped in `nanna-agent::cost`: `ModelPricing` (input/output/cache-read/cache-write
+      USD-per-1M) + a reference list-price table (Jan-2026 public prices for Claude/GPT/o-series families,
+      matched by family **prefix** so dated ids like `claude-opus-4-8` resolve) + a pure `estimate_cost_usd(..)`
+      (per-class arithmetic, `debug_assert` non-negative rates, ≥0 result). Local/Ollama/unknown models return
+      `None` → reported `priced:false`, never a silent $0. Wired to the token counts the daemon now records
+      (see the model-stats fix this run): `ModelStatsTracker::cost_report() -> Vec<ModelCost>` (snapshots under
+      the read lock then prices lock-free, priciest-first) and surfaced on the live `SystemAction::ModelStats`
+      IPC response as a new `costs` array (additive, non-breaking). 5 unit tests (exact per-million arithmetic,
+      zero-cost, prefix resolution incl. most-specific-wins, local/unknown unpriced, tracker integration
+      pricing a Sonnet run at $18 + flagging a local model). Remaining: per-session/day/month aggregation +
+      per-tool cost + GUI surfacing (needs a GUI build); pricing table should become config-overridable.
+      *(2026-07-12, research-corrected)* Table updated to **2026 actual list prices**: Opus 4.x is **$5/$25**
+      per Mtok (was wrongly seeded with the legacy Opus-3 $15/$75), Haiku 4.5 is **$1/$5**; cache-read = 0.1x
+      input, cache-write = 1.25x input (5-min TTL). Sonnet unchanged at $3/$15. Source:
+      [Claude pricing docs](https://platform.claude.com/docs/en/about-claude/pricing).
+      - [ ] Add **Fable 5** (`claude-fable-5`) to the pricing table once its per-Mtok rate is published.
+      - [ ] Config-overridable pricing (`[pricing]` TOML or a fetched table) so rates don't rot in-code; add a
+            batch-mode (0.5x) + 1-hour-cache (2.0x) multiplier the tracker can apply.
+      *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
+      already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
+      populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
+      unknown/extra fields). Added `ModelStatsTracker::total_cost_usd()` (grand-total known cloud spend; sums
+      only priced models) surfaced as `total_cost_usd` on the `SystemAction::ModelStats` response; test.
 - [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).
@@ -367,8 +390,15 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
       `MessageRouter::send`: when the channel sets `max_message_length` and the (already Markdown-adapted) text
       exceeds it, the router sends the parts in order and returns the first part's id (the reply/edit anchor).
       7 tests (within-limit passthrough, whitespace/newline break preference, oversized-token hard-split,
-      Unicode-scalar counting; + 2 router tests with a recording mock proving split vs no-split). Remaining:
-      tables→text, Discord embeds, Slack Block Kit.
+      Unicode-scalar counting; + 2 router tests with a recording mock proving split vs no-split).
+      *(2026-07-12)* **tables→text shipped.** `strip_markdown` is now table-aware: a row line immediately
+      followed by a delimiter row (`|---|:--:|`) starts a table block — each row drops its outer pipes, trims
+      + inline-strips each cell, and re-joins with " | "; the delimiter row is dropped. Disambiguated from
+      prose: a table delimiter must contain **both** a dash and a pipe, so a bare `---` horizontal rule after a
+      pipe line and a stray prose `a | b` are left untouched. Postcondition relaxed to ≤2x (tight tables re-add
+      a few separator chars). 5 tests (basic table, alignment colons + surrounding text, inline-markdown in
+      cells, prose-pipe/HR negatives, tight-table growth guard); 45 nanna-channels tests green. Remaining:
+      Discord embeds, Slack Block Kit.
 - [ ] **Client API completeness** — add `SchedulerApi`/`WorkspaceApi`/`ChannelApi` + typed event subscription to `nanna-client`.
 - [ ] **HEARTBEAT.md execution** — parse/run a workspace file of periodic tasks (inbox, calendar,
       monitoring), `quiet_hours` config, proactive outreach, history (currently only a scheduler task type).
@@ -467,7 +497,22 @@ routine should drain first.**
 - [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
 - [ ] `not_implemented` daemon control actions: ~~Regenerate message~~ **(done 2026-07-11 — `ChatAction::Regenerate` now drops the stale assistant reply via a new pure `Session::take_last_user_turn()` (removes the last user message **and** everything after it — reply + trailing tool turns — returning that user content; `None`/unchanged when there's no user message), persists the truncated session, then replays through the existing `Send` path via `Box::pin(self.handle_chat(..))` so it reuses all context/workspace/memory/agent logic with zero duplication. 4 unit tests cover reply-drop, prior-history preservation, trailing-tool-turn drop, and no-user→None. Daemon boots green; full turn execution needs a live LLM (unavailable unattended) so verified by build+boot smoke + unit tests)**, ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
-- [ ] Server stats not wired to shared daemon state (`server.rs:882`).
+- [x] Server stats not wired to shared daemon state (`server.rs:882`).
+      *(2026-07-12)* Bigger bug than the label: the daemon's **main agent was built without any stats
+      tracker** (`AgentService` → `Agent::new(..).with_context(..)`, no `with_stats`) **and** the sub-agent
+      spawner had `stats: None`, so **no live model stats were ever recorded** — `control.model_stats` only
+      ever held what `import_from_storage` loaded at boot; the model-stats dashboard never reflected fresh
+      daemon activity. Fixed by threading **one** `ModelStatsTracker` (clone shares state — `Arc<RwLock<_>>`)
+      through the whole daemon: `init_services` mints it, wires it into both `AgentService::with_stats(..)`
+      (new builder + field; applied to the `Agent` at build time) and `AgentSpawnerImpl.stats`, and returns
+      it; `run()` assigns it to `control.model_stats` **before** `with_storage` so persisted stats load into
+      the same shared tracker and the router reads it for health-aware routing. 2 unit tests
+      (`clone_shares_underlying_state`: records via sub-agent + main clones both visible via the control-plane
+      clone; `independent_trackers_do_not_share`). Verified by an isolated real boot (`nanna-daemon run
+      --port 5249 --health-port 5248 --data-dir <scratch>`): reaches "Daemon ready", "Stats-informed routing
+      enabled", `/status → {"sessions":1,"memory_available":true,"agent_available":true}`, and a heartbeat
+      agent turn ran through the shared tracker. Full-turn stat accumulation needs a sustained live LLM
+      session (heavy unattended) so covered by build+boot smoke + unit tests.
 - [x] **Double health-server bind / stale health state** — *(2026-07-11)* Re-checked against current
       master: there is only **one** `HealthServer` construction, and a clean `nanna-daemon run` on **free**
       ports binds exactly once with **zero** `os error 10048` (the 2026-07-10 "second binder fail 4×" was
@@ -518,6 +563,17 @@ routine should drain first.**
       here: `create_user_tool`'s `if let Ok` swallow + the GUI-embedded `tool_authoring.rs` copy (needs a GUI build).
       *(2026-07-09)* Replaced the naive one-line `ToolRegistry::unregister` (removed only the primary key, so a deleted tool stayed reachable through its own alias entry) with a cascading version: deleting a canonical tool also drops every alias whose target is it and purges the `alias_targets` reverse-map; deleting an alias leaves the canonical intact. Returns the entry-count removed. Wired into the **daemon** control plane: `ToolAction::Delete` now `unregister`s the live tool (deletion takes effect without a restart), and `ToolAction::Update` reconciles the registry with the new `enabled` flag — unregister then re-register only if still enabled, so a disabled tool stops executing and an edit's new source goes live immediately. 4 registry unit tests (uncallable-after-delete, alias cascade, alias-only removal leaves canonical, unknown-name no-op). Remaining: the GUI-embedded `UserToolManager` copy (`tool_authoring.rs`) still needs the same wiring (needs a GUI build to verify).
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
+      *(2026-07-12: verified the **daemon** analog `AgentService.active_chats` is NOT leaky — the only exits
+      between insert and cleanup are the success path (cleans up before returning) and the all-models-exhausted
+      path (cleans up); no early `?`/`return`/`unwrap` between them. Only an external panic in `agent.run()`
+      would leak, which async-`Drop` can't cleanly cover. The leak is GUI-embedded-only.)*
+- [x] **`parse_retry_after` non-ASCII byte-offset bug** (`agent_service.rs`) — it `find`s the prefix in the
+      **lowercased** string but sliced the **original** at that offset; a lowercase that changes byte length
+      before the prefix (e.g. `İ`→`i̇`, 2→3 bytes) shifts the offset, extracting the wrong digits or slicing
+      mid-char (panic). Fixed to slice the lowercased string (digits are ASCII, so equivalent). *(2026-07-12)*
+      Also added the first tests for the three resilience parsers (`is_rate_limit_error`,
+      `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
+      `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
 - [ ] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11)* Under
       full-workspace feature unification the `nanna-scripting` **deno** feature (V8) is enabled, so its lib
@@ -568,6 +624,7 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
       - [ ] *(research 2026-07-06)* Evaluate **Qwen 3.5-9B** as the default single-GPU function-calling model — 2026 consensus "sweet spot" (fits ~8GB VRAM, strong tool-call reliability, GGUF Q4 doesn't degrade tool calls). Sources: [insiderllm](https://insiderllm.com/guides/function-calling-local-llms/), [unsloth tool-calling guide](https://unsloth.ai/docs/basics/tool-calling-guide-for-local-llms).
       - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
+      - [ ] *(research 2026-07-12)* **Qwen3.5 GGUF ships universal chat-template fixes for tool-calling** (apply to *any* Qwen3.5 GGUF), and the Qwen3-Coder tool-call parser is now fixed across llama.cpp/Ollama/LMStudio/Jan — de-risks the "reliable tool-call parsing into `ContentBlock::ToolUse`" item for the local tier. When Mummu ports a Qwen3.5-class model, lift its chat template + tool-call grammar verbatim rather than hand-rolling. 8GB tier still wants Q4_K_S/Q4_0 (drop to Q3_K_M on OOM); Qwen3-Coder-Next's ~46GB Q4 footprint keeps it a 16GB+/CPU-offload target, not an 8GB one. Sources: [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5), [Qwen3.6 VRAM table](https://knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/).
       - [ ] *(research 2026-07-07)* Tool-budget evidence **validates the two-tier tool discovery design**: each tool definition costs ~50–150 tokens; keep the always-sent set **under 5–10 tools** for 7–9B models (Nanna's core-tools-vs-`discover_tools` split already does this). Add a benchmark asserting the local model's active-tool count stays within this budget, and prefer `discover_tools` activation over sending the full registry on the local path.
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
@@ -634,6 +691,13 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      - *(2026-07-12, partial)* Interim: the clusterer's per-pair `cosine_similarity` (called O(N²) times per
+        band) now delegates to `nanna_simd::cosine_similarity_f32` (AVX-512/AVX2/NEON) — the same primitive the
+        vector-search path already uses — instead of a private scalar loop, removing the duplication. Guards
+        preserve the "0.0 on mismatch/empty" contract (`nanna_simd` panics on unequal lengths and NaNs on a
+        zero-magnitude vector; the clusterer's existing `.max(0.0)` already tolerated it, but the guard makes it
+        explicit). Parity test vs a scalar reference over random 768-dim vectors (<1e-4) + zero/mismatch/empty
+        edge tests. **The O(N²) structure itself is unchanged — HNSW candidate-neighbor work is still open.**
       - [ ] *(research 2026-07-06)* Use a **pure-Rust HNSW** crate (`hnsw_rs` / `instant-distance`) over a C ext — `sqlite-vec` is brute-force only; `vectorlite` shows HNSW at `ef_construction=100, M=30` scales well. Fits the Turso-only + in-RAM-cosine model (build the index in RAM, persist coeff/graph as Turso BLOBs). Sources: [vectorlite](https://github.com/1yefuwang1/vectorlite), [sqlite-vec ANN issue](https://github.com/asg017/sqlite-vec/issues/25).
       - [ ] *(research 2026-07-09)* Crate shortlist (all pure-Rust, actively maintained early 2026): **`hnsw_rs`** — multithreaded build/search via `parking_lot`, SIMD distances through `anndists` (L1/L2/Cosine/Hamming/…), the most feature-complete; **`hnswlib-rs`** — designed for **concurrent search + concurrent mutation** with an `InMemoryVectorStore` doing **lock-free reads + parallel updates** (best fit for a live memory store that dreams while serving recalls, avoids a global rebuild); **`instant-distance`** — smallest/simplest pure-Rust HNSW if we want minimal surface. Lean `hnswlib-rs` for the online/insert-while-query case, `hnsw_rs` if we need its distance breadth. Sources: [hnsw_rs](https://crates.io/crates/hnsw_rs), [hnswlib-rs](https://github.com/jean-pierreBoth/hnswlib-rs), [instant-distance](https://lib.rs/crates/instant-distance).
       - [ ] *(research 2026-07-10)* Confirmed still current: `hnsw_rs` exposes `insert_parallel` + `parallel_search` (rayon/parking_lot) — the concrete entry points for the "batch-build the index in RAM from the whole `VectorStore`, then query candidates" approach that fits the dream-time clusterer (build once per cycle rather than incrementally). `instant-distance` builds from a `Vec<Point>` in one shot (no incremental insert) — fine for the rebuild-per-dream model, wrong for online mutation. Net: `hnsw_rs::Hnsw::insert_parallel` for the dream-time rebuild; revisit `hnswlib-rs` only if we later need insert-while-serving. Sources: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html), [instant-distance](https://github.com/djc/instant-distance).

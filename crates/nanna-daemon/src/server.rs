@@ -706,7 +706,7 @@ impl DaemonServer {
         }
         
         // Initialize services
-        let (tools, memory, agent, router, tools_dir, workspace_id_for_services) = self.init_services().await?;
+        let (tools, memory, agent, router, tools_dir, workspace_id_for_services, model_stats) = self.init_services().await?;
 
         // Recover any orphaned checkpoints from the database.
         if let Some(ref storage) = self.storage {
@@ -937,6 +937,11 @@ impl DaemonServer {
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
         }
+        // Make the tracker the agent + sub-agents record into (from
+        // init_services) the canonical one the control plane owns. Must happen
+        // BEFORE with_storage, which loads persisted stats via
+        // import_from_storage — those now land in the shared tracker too.
+        control.model_stats = model_stats;
         // Load persisted model stats from storage
         if let Some(ref storage) = self.storage {
             control = control.with_storage(storage.clone()).await;
@@ -1286,6 +1291,7 @@ impl DaemonServer {
         Arc<LlmRouter>,
         Option<PathBuf>,  // tools_dir
         Arc<tokio::sync::RwLock<Option<String>>>,  // workspace_id for script services
+        nanna_agent::ModelStatsTracker,  // shared model-stats tracker
     ), crate::DaemonError> {
         // Create LLM router with all available providers
         let mut router = LlmRouter::new();
@@ -1651,6 +1657,12 @@ impl DaemonServer {
         // Shared session history for the recall_messages tool service
         let session_history: SharedSessionHistory = Arc::new(tokio::sync::RwLock::new(Vec::new()));
 
+        // One shared model-stats tracker for the whole daemon: the main agent
+        // (AgentService) and every sub-agent (AgentSpawnerImpl) record into it,
+        // and the control plane makes it canonical (persists it + feeds the
+        // router). Cloning shares state (Arc<RwLock<_>> inside).
+        let model_stats = nanna_agent::ModelStatsTracker::new();
+
         // Build script services and load all tools from disk
             let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> = Arc::new(tokio::sync::RwLock::new(None));
         {
@@ -1687,7 +1699,7 @@ impl DaemonServer {
                         system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
                         workspace_root: None,
                         workspace_context: None,
-                        stats: None, // TODO: wire shared stats tracker from daemon state
+                        stats: Some(model_stats.clone()),
                     }))
                 } else {
                     None
@@ -1756,7 +1768,8 @@ impl DaemonServer {
             memory.clone(),
             event_tx,
             Some(self.config.data_dir.clone()),
-        ).with_session_history(session_history);
+        ).with_session_history(session_history)
+        .with_stats(model_stats.clone());
         if let Some(ref storage) = self.storage {
             agent_service = agent_service.with_storage(storage.clone());
         }
@@ -1764,7 +1777,7 @@ impl DaemonServer {
 
         info!("Agent service initialized");
 
-        Ok((tools, memory, agent, router, tools_dir, workspace_id_for_services))
+        Ok((tools, memory, agent, router, tools_dir, workspace_id_for_services, model_stats))
     }
 }
 

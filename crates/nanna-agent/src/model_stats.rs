@@ -101,10 +101,25 @@ pub struct ModelStatsSummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// Tokens written to the prompt cache (billed above input; needed for
+    /// accurate cost display — was previously dropped from the summary).
+    pub total_cache_creation_tokens: u64,
     pub cache_hit_rate: f64,
     pub consecutive_failures: u32,
     pub is_healthy: bool,
     pub escalation_count: u64,
+}
+
+/// Estimated USD spend for one model over its tracked lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCost {
+    /// Model identifier.
+    pub model: String,
+    /// Estimated total spend in USD from accumulated token counts.
+    pub estimated_cost_usd: f64,
+    /// Whether pricing was known. `false` = local/unknown model (cost is 0,
+    /// not billed) — distinguishes "free" from "priced at exactly $0".
+    pub priced: bool,
 }
 
 /// Per-request stats to attach to an AgentResponse for UI display.
@@ -231,6 +246,75 @@ impl ModelStatsTracker {
         inner.models.clone()
     }
 
+    /// Estimate accumulated USD spend per model from the tracked token counts.
+    ///
+    /// Uses [`crate::cost::default_pricing`] (reference list prices). Models
+    /// with no known pricing (local/Ollama/unknown) are reported with
+    /// `priced == false` and `estimated_cost_usd == 0.0` so callers never
+    /// silently fold an unknown cost into a total.
+    pub async fn cost_report(&self) -> Vec<ModelCost> {
+        // Snapshot (model, token counts) under the read lock, then release it
+        // before pricing lookups/arithmetic so the lock isn't held over work
+        // that doesn't touch shared state.
+        let usage: Vec<(String, u64, u64, u64, u64)> = {
+            let inner = self.inner.read().await;
+            inner
+                .models
+                .values()
+                .map(|s| {
+                    (
+                        s.model.clone(),
+                        s.total_input_tokens,
+                        s.total_output_tokens,
+                        s.total_cache_read_tokens,
+                        s.total_cache_creation_tokens,
+                    )
+                })
+                .collect()
+        };
+
+        let mut report: Vec<ModelCost> = usage
+            .into_iter()
+            .map(|(model, input, output, cache_read, cache_write)| {
+                crate::cost::default_pricing(&model).map_or_else(
+                    || ModelCost {
+                        model: model.clone(),
+                        estimated_cost_usd: 0.0,
+                        priced: false,
+                    },
+                    |pricing| ModelCost {
+                        model: model.clone(),
+                        estimated_cost_usd: crate::cost::estimate_cost_usd(
+                            input, output, cache_read, cache_write, &pricing,
+                        ),
+                        priced: true,
+                    },
+                )
+            })
+            .collect();
+        // Deterministic order for UI/tests: priciest first, then by name.
+        report.sort_by(|a, b| {
+            b.estimated_cost_usd
+                .total_cmp(&a.estimated_cost_usd)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        report
+    }
+
+    /// Grand-total estimated USD spend across all **priced** models.
+    ///
+    /// Unpriced (local/unknown) models contribute nothing, matching
+    /// [`Self::cost_report`] — the total is "known cloud spend", not a claim
+    /// that local runs are free-and-therefore-$0-in-the-same-bucket.
+    pub async fn total_cost_usd(&self) -> f64 {
+        self.cost_report()
+            .await
+            .iter()
+            .filter(|c| c.priced)
+            .map(|c| c.estimated_cost_usd)
+            .sum()
+    }
+
     /// Load stats from a previous session (e.g., from disk).
     pub async fn load(&self, stats: HashMap<String, ModelStats>) {
         let mut inner = self.inner.write().await;
@@ -305,6 +389,7 @@ impl ModelStats {
             total_input_tokens: self.total_input_tokens,
             total_output_tokens: self.total_output_tokens,
             total_cache_read_tokens: self.total_cache_read_tokens,
+            total_cache_creation_tokens: self.total_cache_creation_tokens,
             cache_hit_rate,
             consecutive_failures: self.consecutive_failures,
             is_healthy: self.consecutive_failures < UNHEALTHY_THRESHOLD,
@@ -479,5 +564,150 @@ impl From<StorableModelStats> for StoredModelStats {
             latencies_ms: s.latencies_ms,
             throughput_tps: s.throughput_tps,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(model: &str, success: bool) -> RequestObservation {
+        RequestObservation {
+            model: model.to_string(),
+            success,
+            latency: Duration::from_millis(10),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tier: None,
+            escalated: false,
+        }
+    }
+
+    // The daemon shares ONE tracker between the main agent, every sub-agent,
+    // and the control plane by cloning it. This is only correct if clones
+    // share underlying state — a record via one clone must be visible via
+    // another. Guards the P11 "wire shared stats tracker" fix.
+    #[tokio::test]
+    async fn clone_shares_underlying_state() {
+        let main = ModelStatsTracker::new();
+        let sub_agent = main.clone();
+        let control_plane = main.clone();
+
+        // A sub-agent records a request...
+        sub_agent.record(observation("claude-opus-4-8", true)).await;
+        // ...the main agent records another for the same model...
+        main.record(observation("claude-opus-4-8", true)).await;
+
+        // ...and the control-plane clone sees BOTH (shared Arc<RwLock<_>>).
+        let summaries = control_plane.summaries().await;
+        assert_eq!(summaries.len(), 1, "one model tracked across all clones");
+        let s = &summaries[0];
+        assert_eq!(s.model, "claude-opus-4-8");
+        assert_eq!(
+            s.total_requests, 2,
+            "both clones' records accumulate in the shared tracker"
+        );
+        assert_eq!(s.total_input_tokens, 200);
+        assert_eq!(s.total_output_tokens, 40);
+    }
+
+    // A fresh (unshared) tracker must NOT see another tracker's records —
+    // proves the sharing above comes from cloning, not global state.
+    #[tokio::test]
+    async fn independent_trackers_do_not_share() {
+        let a = ModelStatsTracker::new();
+        let b = ModelStatsTracker::new();
+        a.record(observation("gpt-5", true)).await;
+        assert_eq!(a.summaries().await.len(), 1);
+        assert!(
+            b.summaries().await.is_empty(),
+            "a separately constructed tracker stays empty"
+        );
+    }
+
+    // The summary must surface cache-creation tokens (record() accumulates
+    // them, but the summary previously dropped the field, hiding cache-write
+    // volume and breaking accurate cost display).
+    #[tokio::test]
+    async fn summary_surfaces_cache_creation_tokens() {
+        let tracker = ModelStatsTracker::new();
+        tracker
+            .record(RequestObservation {
+                model: "claude-sonnet-5".to_string(),
+                success: true,
+                latency: Duration::from_millis(10),
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_read_tokens: 4000,
+                cache_creation_tokens: 800,
+                tier: None,
+                escalated: false,
+            })
+            .await;
+        let s = tracker.summary("claude-sonnet-5").await.expect("summary exists");
+        assert_eq!(s.total_cache_creation_tokens, 800);
+        assert_eq!(s.total_cache_read_tokens, 4000);
+    }
+
+    fn observation_with_tokens(model: &str, input: u32, output: u32) -> RequestObservation {
+        RequestObservation {
+            model: model.to_string(),
+            success: true,
+            latency: Duration::from_millis(10),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tier: None,
+            escalated: false,
+        }
+    }
+
+    // cost_report turns tracked tokens into USD for priced models and flags
+    // unpriced (local) models instead of folding a bogus $0 into a total.
+    #[tokio::test]
+    async fn cost_report_prices_known_models_and_flags_unknown() {
+        let tracker = ModelStatsTracker::new();
+        // 1M input + 1M output on Sonnet-class ($3 in / $15 out) = $18.
+        tracker
+            .record(observation_with_tokens("claude-sonnet-5", 1_000_000, 1_000_000))
+            .await;
+        // A local model with tokens but no pricing.
+        tracker
+            .record(observation_with_tokens("ollama/llama3.2", 500_000, 500_000))
+            .await;
+
+        let report = tracker.cost_report().await;
+        assert_eq!(report.len(), 2);
+        // Sorted priciest-first, so the priced model leads.
+        let claude = &report[0];
+        assert_eq!(claude.model, "claude-sonnet-5");
+        assert!(claude.priced);
+        assert!((claude.estimated_cost_usd - 18.0).abs() < 1e-6, "got {}", claude.estimated_cost_usd);
+
+        let local = &report[1];
+        assert_eq!(local.model, "ollama/llama3.2");
+        assert!(!local.priced, "local model must be flagged unpriced");
+        assert!(local.estimated_cost_usd.abs() < f64::EPSILON);
+    }
+
+    // total_cost_usd sums only priced models: Sonnet $18 + GPT-5 (1M in @ $1.25
+    // + 1M out @ $10 = $11.25) = $29.25; the local model contributes nothing.
+    #[tokio::test]
+    async fn total_cost_sums_priced_models_only() {
+        let tracker = ModelStatsTracker::new();
+        tracker
+            .record(observation_with_tokens("claude-sonnet-5", 1_000_000, 1_000_000))
+            .await;
+        tracker
+            .record(observation_with_tokens("gpt-5", 1_000_000, 1_000_000))
+            .await;
+        tracker
+            .record(observation_with_tokens("ollama/llama3.2", 9_000_000, 9_000_000))
+            .await;
+        let total = tracker.total_cost_usd().await;
+        assert!((total - 29.25).abs() < 1e-6, "got {total}");
     }
 }

@@ -159,6 +159,10 @@ pub struct AgentService {
     session_history: Option<crate::server::SharedSessionHistory>,
     /// Database storage for checkpoint persistence
     storage: Option<Arc<nanna_storage::Storage>>,
+    /// Shared model-stats tracker. When set, every agent run records its
+    /// per-model request stats here so the control plane persists them and
+    /// the router reads them for health-aware routing. `None` = don't record.
+    model_stats: Option<nanna_agent::ModelStatsTracker>,
 }
 
 impl AgentService {
@@ -209,6 +213,7 @@ impl AgentService {
             checkpoint_dir,
             session_history: None,
             storage: None,
+            model_stats: None,
         }
     }
 
@@ -221,6 +226,15 @@ impl AgentService {
     /// Set the shared session history for the `session.history` tool service.
     pub fn with_session_history(mut self, history: crate::server::SharedSessionHistory) -> Self {
         self.session_history = Some(history);
+        self
+    }
+
+    /// Set the shared model-stats tracker. Each agent run records into it, so
+    /// the main daemon agent's request stats are captured (previously the
+    /// `Agent` was built without a tracker and no live stats were recorded).
+    #[must_use]
+    pub fn with_stats(mut self, stats: nanna_agent::ModelStatsTracker) -> Self {
+        self.model_stats = Some(stats);
         self
     }
 
@@ -513,12 +527,18 @@ impl AgentService {
                     context.messages.push(anthropic_msg);
                 }
 
-                Agent::new(
+                let mut agent = Agent::new(
                     agent_config,
                     llm_client,
                     self.tools.clone(),
                 )
-                .with_context(context)
+                .with_context(context);
+                // Record per-model request stats into the shared tracker so the
+                // control plane persists them and the router can route on them.
+                if let Some(ref tracker) = self.model_stats {
+                    agent = agent.with_stats(tracker.clone());
+                }
+                agent
             };
 
             // Create run options with streaming callbacks
@@ -908,7 +928,11 @@ impl AgentService {
         // Pattern: "try again in X seconds" / "retry after X seconds" / "wait X seconds"
         for prefix in &["try again in ", "retry after ", "wait ", "retry-after: "] {
             if let Some(pos) = lower.find(prefix) {
-                let after = &error[pos + prefix.len()..];
+                // Slice `lower` (where `pos` was found), NOT `error`: lowercasing
+                // can change byte length, so `pos` may not be a char boundary in
+                // `error` — indexing it there could panic on a non-ASCII message.
+                // Digits are ASCII, so reading them from `lower` is equivalent.
+                let after = &lower[pos + prefix.len()..];
                 // Extract digits
                 let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(secs) = num_str.parse::<u64>() {
@@ -1157,5 +1181,91 @@ fn truncate(s: &str, max_len: usize) -> String {
             end -= 1;
         }
         format!("{}...", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_detection_covers_known_shapes() {
+        for s in [
+            "429 Too Many Requests",
+            "Rate limit exceeded",
+            "error: rate_limit_error",
+            "The service is Overloaded, try later",
+            "HTTP 529",
+            "TOO MANY REQUESTS",
+        ] {
+            assert!(AgentService::is_rate_limit_error(s), "should flag: {s}");
+        }
+        for s in ["400 bad request", "context_length_exceeded", "connection reset"] {
+            assert!(!AgentService::is_rate_limit_error(s), "should NOT flag: {s}");
+        }
+    }
+
+    #[test]
+    fn context_length_detection_covers_known_shapes() {
+        for s in [
+            "context_length_exceeded",
+            "This model's maximum context length is 8192 tokens",
+            "Please reduce the length of the messages",
+            "prompt is too long",
+            "too many tokens in the request",
+        ] {
+            assert!(AgentService::is_context_length_error(s), "should flag: {s}");
+        }
+        assert!(!AgentService::is_context_length_error("429 rate limit"));
+    }
+
+    #[test]
+    fn parse_retry_after_extracts_seconds() {
+        assert_eq!(
+            AgentService::parse_retry_after("Rate limited. Please try again in 30 seconds."),
+            Some(30)
+        );
+        assert_eq!(
+            AgentService::parse_retry_after("Retry after 5 seconds"),
+            Some(5)
+        );
+        assert_eq!(
+            AgentService::parse_retry_after("retry-after: 12"),
+            Some(12)
+        );
+        assert_eq!(AgentService::parse_retry_after("please WAIT 60 s"), Some(60));
+        // No number / no recognized pattern → None (caller uses a default).
+        assert_eq!(AgentService::parse_retry_after("Please try again later"), None);
+        assert_eq!(AgentService::parse_retry_after("try again in soon"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_survives_non_ascii_without_panic() {
+        // Same-byte-length non-ASCII prefix (Cyrillic).
+        let msg = "Ошибка: rate limit — please try again in 7 seconds";
+        assert_eq!(AgentService::parse_retry_after(msg), Some(7));
+        // Non-ASCII with no retry hint → None, still no panic.
+        assert_eq!(AgentService::parse_retry_after("Överbelastad 日本語"), None);
+        // 'İ' (U+0130, 2 bytes) lowercases to "i̇" (3 bytes) — GROWS. So the
+        // offset `find` returns in the lowercased string is past the matching
+        // byte in the original; slicing the original there would land mid-char
+        // (panic) or extract the wrong digits. The fix (slice the lowercased
+        // string) must still recover 42. This case is the regression guard.
+        assert_eq!(
+            AgentService::parse_retry_after("İ error: retry after 42 seconds"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        // ASCII: simple cut with ellipsis.
+        assert_eq!(truncate("hello world", 5), "hello...");
+        // Under the limit: unchanged, no ellipsis.
+        assert_eq!(truncate("hi", 5), "hi");
+        // Multi-byte: "a🚀bc" is a(1) + 🚀(4 bytes) + b + c. Cutting at byte 2
+        // lands inside the emoji, so it must back off to byte 1 (after 'a')
+        // rather than panic — result "a...".
+        assert_eq!(truncate("a🚀bc", 2), "a...");
     }
 }

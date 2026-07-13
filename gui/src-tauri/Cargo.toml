@@ -33,7 +33,7 @@ async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # WebSocket for daemon connection
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 # HTTP client for embeddings API
 reqwest.workspace = true
