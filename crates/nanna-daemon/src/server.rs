@@ -557,16 +557,20 @@ impl Default for DaemonConfig {
 
 /// Build the scheduled dream-cycle's [`ConsolidationConfig`] from the user's
 /// memory settings, keeping automatic consolidation in lock-step with the
-/// IPC-triggered path (see `control.rs`). Pure so it is unit-testable.
+/// IPC-triggered path (see `control.rs`). The per-cluster content budget is
+/// sized to the summarizer model's context window so the consolidation prompt
+/// always fits it. Pure so it is unit-testable.
 fn scheduled_consolidation_config(
     max_compression_ratio: f32,
     min_remaining_memories: usize,
+    summarizer_context_window_tokens: usize,
 ) -> nanna_memory::ConsolidationConfig {
     nanna_memory::ConsolidationConfig {
         max_compression_ratio,
         min_remaining_memories,
         ..nanna_memory::ConsolidationConfig::default()
     }
+    .with_summarizer_context_window(summarizer_context_window_tokens)
 }
 
 /// The main daemon server
@@ -859,6 +863,7 @@ impl DaemonServer {
                                 let consolidation_config = scheduled_consolidation_config(
                                     consolidation_max_ratio,
                                     consolidation_min_remaining,
+                                    nanna_llm::model_context_window(&summarization_model),
                                 );
                                 let summarize = |prompt: String| {
                                     let router = router.clone();
@@ -2182,13 +2187,27 @@ mod tests {
         // The scheduled dream cycle must use the user's compression settings,
         // not ConsolidationConfig::default(), so automatic and IPC-triggered
         // consolidation behave identically.
-        let cfg = scheduled_consolidation_config(0.25, 100);
+        let cfg = scheduled_consolidation_config(0.25, 100, 8_192);
         assert!((cfg.max_compression_ratio - 0.25).abs() < f32::EPSILON);
         assert_eq!(cfg.min_remaining_memories, 100);
-        // Untouched fields keep their defaults (e.g. the cluster-size bounds).
+        // Untouched fields keep their defaults (e.g. the member-count cap).
         let default = nanna_memory::ConsolidationConfig::default();
         assert_eq!(cfg.max_cluster_memories, default.max_cluster_memories);
         assert!((cfg.cluster_threshold - default.cluster_threshold).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn scheduled_consolidation_config_sizes_content_budget_to_the_model() {
+        // A large-context summarizer gets a proportionally larger per-cluster
+        // content budget than a small one (so big models consolidate more per
+        // pass) — the whole point of threading the model's context window.
+        let small = scheduled_consolidation_config(0.5, 20, 8_192);
+        let large = scheduled_consolidation_config(0.5, 20, 200_000);
+        assert!(large.max_cluster_content_bytes > small.max_cluster_content_bytes);
+        assert_eq!(
+            large.max_cluster_content_bytes,
+            nanna_memory::cluster_content_bytes_for_context(200_000)
+        );
     }
 
     #[test]

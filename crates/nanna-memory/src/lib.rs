@@ -15,6 +15,7 @@ pub use consolidation::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
     WeightThresholds, ClusteringWeights, MemoryCluster, cluster_memories,
     create_consolidated_entry, composite_cluster_score,
+    cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
 };
 pub use dreaming::{
     DreamingConfig, DreamingService, DreamingStats, MemoryFeedback,
