@@ -677,6 +677,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       an existing dev DB keeps a harmless unused `expires_at` column (migrations run once by name; fresh DBs
       are clean). Remaining: the rest of the multi-phase body (merge/cluster-by-band/expand/DSP) and wiring
       `record_activity`/`dream_if_idle` into the daemon scheduler + agent loop.
+      *(2026-07-13)* **Phase (c) prompt bounded (Tiger-Style safety for the local summarizer).** The greedy
+      `cluster_memories` put an **unbounded** number of memories into one cluster, and
+      `build_consolidation_prompt` concatenated all of them into a single prompt handed to `summarize_fn` — a
+      degenerate weight band of thousands of mutually-similar memories → a >250k-token prompt that overflows a
+      small local model's context window (P12). Bounded at cluster *formation* (not prompt building, which
+      would silently drop the omitted members' content since `consolidate_cluster` removes every cluster
+      member): two `ConsolidationConfig` fields — `max_cluster_memories` (default 64) and
+      `max_cluster_content_bytes` (default 24 000 ≈ 6k tok, budgeted for the 8 GB tier's ~8k-token context) —
+      cap each cluster; a candidate that would breach either bound stays unassigned and re-clusters on a later
+      seed, so **no content is dropped** — the band just consolidates over more passes. Both fields carry
+      `#[serde(default)]` (backward-compatible with pre-existing serialized configs) and pre/postcondition
+      `debug_assert`s prove every cluster honors both bounds. 3 tests (count bound + lossless, byte bound +
+      lossless, legacy-config deserialization defaults the caps); 34 nanna-memory tests green; nanna-core +
+      nanna-daemon build green.
 - [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
       *(2026-07-07) Done for **all three ingest paths** (`smart_ingest`, `remember_with_importance`,
       the scoped variant) via a shared `fold_into_memory` helper: `merge_memory_content` +
