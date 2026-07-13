@@ -493,7 +493,20 @@ routine should drain first.**
       re-embeds + upserts the whole entry (content and embedding stay consistent). Applied to all three
       ingest paths via the shared `fold_into_memory` helper. See also P13 true-merge.*
 - [ ] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through.
-- [ ] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
+- [~] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
+      *(2026-07-13)* **Fixed the compression-threshold ↔ hard-limit inversion for small models** (a concrete
+      slice of this item). `ModelInfo::compression_threshold` was a flat 80% of context while `hard_input_limit`
+      is `max(context − max_output, 50% context)`. For a small model with a large output budget (e.g. context
+      8k / output 4k) that gave threshold **6400 > hard-limit 4000** — proactive compression *never fired before
+      the hard cap*, so the agent emergency-truncated every turn instead of compressing gracefully (the
+      local-first failure mode). Now `compression_threshold = min(80%·context, 90%·hard_limit)`, which keeps
+      the invariant `threshold ≤ hard_limit` and leaves large models unchanged (200k-context Claude stays at
+      160k). Applied to **both** budget paths: `nanna-llm::ModelInfo` (the `ModelInfo`-based
+      `configure_for_model`) and the name-based fallback `AgentContext::configure_for_model_name` in
+      `nanna-agent` (which also lacked the 50% hard-limit floor — added). `debug_assert`s guard the invariant
+      on both paths. 5 tests (small stays below cap / large unchanged / output≥context degenerate — in both
+      crates); 18 nanna-llm + 53 nanna-agent tests green, **−1 clippy warning** in each crate, full workspace
+      builds green. Remaining: the GUI-embedded `truncate_context`'s hardcoded 132k (needs a GUI build).
 - [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
 - [ ] `not_implemented` daemon control actions: ~~Regenerate message~~ **(done 2026-07-11 — `ChatAction::Regenerate` now drops the stale assistant reply via a new pure `Session::take_last_user_turn()` (removes the last user message **and** everything after it — reply + trailing tool turns — returning that user content; `None`/unchanged when there's no user message), persists the truncated session, then replays through the existing `Send` path via `Box::pin(self.handle_chat(..))` so it reuses all context/workspace/memory/agent logic with zero duplication. 4 unit tests cover reply-drop, prior-history preservation, trailing-tool-turn drop, and no-user→None. Daemon boots green; full turn execution needs a live LLM (unavailable unattended) so verified by build+boot smoke + unit tests)**, ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, Channel status (`control.rs:1558`, needs ChannelManager), ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.

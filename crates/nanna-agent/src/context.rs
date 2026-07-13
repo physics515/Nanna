@@ -441,8 +441,16 @@ impl AgentContext {
             _ => (32_000, 4096),
         };
 
-        let compression_threshold = (context_window * 80) / 100;
-        let hard_limit = context_window.saturating_sub(max_output);
+        // Mirror `ModelInfo::hard_input_limit`/`compression_threshold`: floor the
+        // hard limit at 50% of context (a large `max_output` must not zero it) and
+        // keep the proactive-compression threshold *below* that cap so small models
+        // compress before slamming the hard limit (see nanna-llm::ModelInfo).
+        let hard_limit = context_window.saturating_sub(max_output).max(context_window / 2);
+        let compression_threshold = ((context_window * 80) / 100).min((hard_limit * 90) / 100);
+        debug_assert!(
+            compression_threshold <= hard_limit,
+            "compression must trigger before the hard input cap"
+        );
 
         if self.current_model.as_ref() != Some(&model.to_string()) {
             info!(
@@ -1383,5 +1391,29 @@ mod tests {
         // Tiny sources may summarize tiny — anything non-empty passes.
         assert!(plausible_summary("ok", 500));
         assert!(!plausible_summary("", 500));
+    }
+
+    #[test]
+    fn small_model_compression_threshold_stays_below_hard_limit() {
+        // gpt-4 → (context 8k, output 4k): naive 80%-of-context (6400) would
+        // exceed the hard cap, so compression must be pulled below it.
+        let mut ctx = AgentContext::new("s");
+        ctx.configure_for_model_name("gpt-4");
+        assert!(
+            ctx.compression_threshold < ctx.hard_limit,
+            "threshold {} must be below hard limit {}",
+            ctx.compression_threshold,
+            ctx.hard_limit
+        );
+    }
+
+    #[test]
+    fn large_model_compression_threshold_unchanged() {
+        // claude → (context 200k, output 8k): 80%-of-context is already smaller,
+        // so the invariant fix must not perturb the large-model threshold.
+        let mut ctx = AgentContext::new("s");
+        ctx.configure_for_model_name("claude-opus-4-8");
+        assert_eq!(ctx.compression_threshold, 160_000);
+        assert!(ctx.compression_threshold < ctx.hard_limit);
     }
 }

@@ -90,10 +90,25 @@ impl ModelInfo {
         now - self.cached_at > Self::CACHE_TTL_SECS
     }
 
-    /// Recommended compression threshold (80% of context window)
+    /// Recommended compression threshold — where the context manager should
+    /// *proactively* compress, always **below** [`Self::hard_input_limit`].
+    ///
+    /// Nominally 80% of the context window, but a small model with a large
+    /// `max_output_tokens` (e.g. context 8k / output 4k) makes 80%-of-context
+    /// *exceed* the hard input limit, so proactive compression would never fire
+    /// before the hard cap and the agent would emergency-truncate every turn.
+    /// Capping at 90% of the hard limit restores the invariant while leaving
+    /// large models (where 80%-of-context is already the smaller value) unchanged.
     #[must_use]
     pub fn compression_threshold(&self) -> usize {
-        (self.context_window * 80) / 100
+        let by_context = (self.context_window * 80) / 100;
+        let below_hard = (self.hard_input_limit() * 90) / 100;
+        let threshold = by_context.min(below_hard);
+        debug_assert!(
+            threshold <= self.hard_input_limit(),
+            "compression must trigger before the hard input cap"
+        );
+        threshold
     }
 
     /// Hard limit for input (leaves room for output).
@@ -4159,5 +4174,49 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn model_info(context_window: usize, max_output_tokens: usize) -> ModelInfo {
+        ModelInfo {
+            id: "test".into(),
+            context_window,
+            max_output_tokens,
+            supports_tools: false,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "test".into(),
+        }
+    }
+
+    #[test]
+    fn compression_threshold_stays_below_hard_limit_for_small_models() {
+        // Small model, large output budget: 80%-of-context (6400) would exceed
+        // the hard input cap (4000), so proactive compression must be pulled
+        // below it instead of never firing.
+        let small = model_info(8_000, 4_096);
+        assert!(
+            small.compression_threshold() < small.hard_input_limit(),
+            "threshold {} must be below hard limit {}",
+            small.compression_threshold(),
+            small.hard_input_limit()
+        );
+    }
+
+    #[test]
+    fn compression_threshold_unchanged_for_large_models() {
+        // Large context model: 80%-of-context is already the smaller value, so
+        // the fix must not perturb it (no regression for cloud models).
+        let large = model_info(200_000, 8_192);
+        assert_eq!(large.compression_threshold(), 160_000);
+        assert!(large.compression_threshold() < large.hard_input_limit());
+    }
+
+    #[test]
+    fn compression_threshold_holds_when_output_exceeds_context() {
+        // Degenerate provider report (max_output >= context): hard_input_limit
+        // floors at 50% of context; the threshold must still sit at/below it.
+        let degenerate = model_info(4_000, 8_000);
+        assert!(degenerate.compression_threshold() <= degenerate.hard_input_limit());
     }
 }
