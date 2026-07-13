@@ -737,6 +737,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             rebuild-per-dream clusterer (simpler), `hnswlib-rs` only when we move to a long-lived insert-while-serve
             index. Source: [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
+      *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
+      `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
+      live service path — a feedback flood between dream cycles grew it without limit (Tiger Style: bound
+      everything). Capped at `MAX_PENDING_FEEDBACK_PER_MEMORY = 16`; since the dream loop clamps a memory's
+      aggregate boost to ±1.0 and the smallest per-signal magnitude is 0.3, ≥4 same-direction signals already
+      saturate the clamp, so the cap is **lossless for the applied result** while bounding memory (the
+      distinct-memory axis is already store-bounded). Also extracted the ±0.3/0.5 boost table (duplicated
+      verbatim in `apply_feedback` and the dream-time aggregation) into one `const fn feedback_boost` so the
+      immediate and deferred paths can't drift. 2 tests (flood → accumulator stays at the cap; boost signs
+      match promote/demote semantics + clamp-saturation math); 36 nanna-memory tests green, zero new clippy
+      warnings, nanna-core + nanna-daemon build green. (Prereq for the real signal wiring, which is the
+      remaining work here.)
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 
