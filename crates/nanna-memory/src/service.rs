@@ -141,11 +141,21 @@ impl MemoryService {
         }
     }
 
-    /// Set the embedding function.
+    /// Set the embedding function (consuming builder form).
     #[must_use]
     pub fn with_embed_fn(mut self, f: EmbedFn) -> Self {
-        self.embed_fn = Some(f);
+        self.set_embed_fn(f);
         self
+    }
+
+    /// Set the embedding function in place.
+    ///
+    /// The `&mut self` form lets a caller configure a `MemoryService` reached
+    /// through a uniquely-held `Arc` (via `Arc::get_mut`) without moving it —
+    /// used by [`crate::DreamingService::with_embed_fn`].
+    pub fn set_embed_fn(&mut self, f: EmbedFn) {
+        self.embed_fn = Some(f);
+        debug_assert!(self.embed_fn.is_some(), "embed_fn must be set after assignment");
     }
 
     /// Attach a Turso (or other) persistence backend to the underlying store.

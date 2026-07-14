@@ -3,7 +3,9 @@
 //! Wires together the memory dreaming service with the LLM client and scheduler.
 
 use nanna_llm::{CompletionRequest, EmbeddingClient, LlmClient, Message, RequestBuilder, Role};
-use nanna_memory::{DreamingConfig, DreamingService, DreamingStats, EmbedFn, MemoryFeedback};
+use nanna_memory::{
+    DreamingConfig, DreamingService, DreamingStats, EmbedFn, MemoryFeedback, MemoryService,
+};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -72,9 +74,7 @@ impl DreamingRuntime {
         let embed_fn: EmbedFn = Arc::new(move |text: &str| {
             let embed = embed.clone();
             let text = text.to_string();
-            Box::pin(async move {
-                (*embed).embed_one(&text).await.map_err(|e| e.to_string())
-            })
+            Box::pin(async move { (*embed).embed_one(&text).await.map_err(|e| e.to_string()) })
         });
 
         let service = DreamingService::new(config.dreaming).with_embed_fn(embed_fn);
@@ -98,6 +98,32 @@ impl DreamingRuntime {
             llm,
             model: config.summarization_model,
         }
+    }
+
+    /// Create a dreaming runtime over an **existing, shared** memory store.
+    ///
+    /// This is the daemon-facing constructor (P13 unification): pass the live
+    /// `Arc<MemoryService>` the agent's tools already read/write so consolidation
+    /// dreams over the same store instead of a private one. The shared store must
+    /// already carry its `embed_fn`/persistence (configure it before sharing).
+    pub fn with_shared_memory(
+        config: DreamingRuntimeConfig,
+        llm: Arc<LlmClient>,
+        memory: Arc<MemoryService>,
+    ) -> Self {
+        let service = DreamingService::with_shared_memory(config.dreaming, memory);
+
+        Self {
+            service,
+            llm,
+            model: config.summarization_model,
+        }
+    }
+
+    /// Clone the shared memory-store handle this runtime dreams over.
+    #[must_use]
+    pub fn memory_arc(&self) -> Arc<MemoryService> {
+        self.service.memory_arc()
     }
 
     /// Get reference to the underlying dreaming service
@@ -159,18 +185,12 @@ impl DreamingRuntime {
     }
 
     /// Save memories to file
-    pub async fn save(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<(), nanna_memory::MemoryError> {
+    pub async fn save(&self, path: &std::path::Path) -> Result<(), nanna_memory::MemoryError> {
         self.service.save(path).await
     }
 
     /// Load memories from file
-    pub async fn load(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<(), nanna_memory::MemoryError> {
+    pub async fn load(&self, path: &std::path::Path) -> Result<(), nanna_memory::MemoryError> {
         self.service.load(path).await
     }
 }
@@ -180,11 +200,12 @@ impl DreamingRuntime {
 /// Returns a function that can be passed to the scheduler's task executor.
 pub fn create_dreaming_executor(
     runtime: Arc<DreamingRuntime>,
-) -> impl Fn(crate::ScheduledTask) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = crate::TaskResult> + Send>,
-> + Send
-       + Sync
-       + 'static {
+) -> impl Fn(
+    crate::ScheduledTask,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::TaskResult> + Send>>
++ Send
++ Sync
++ 'static {
     move |task: crate::ScheduledTask| {
         let runtime = runtime.clone();
         Box::pin(async move {

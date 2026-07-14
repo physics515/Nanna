@@ -7,8 +7,8 @@
 //! - Automatically promoted/demoted based on feedback
 
 use crate::{
-    ConsolidationConfig, ConsolidationResult, MemoryService, MemoryServiceConfig,
-    MemoryError, EmbedFn,
+    ConsolidationConfig, ConsolidationResult, EmbedFn, MemoryError, MemoryService,
+    MemoryServiceConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,7 +180,7 @@ pub struct DreamingStats {
 /// The dreaming service - manages memory consolidation and auto-feedback
 pub struct DreamingService {
     config: DreamingConfig,
-    memory: MemoryService,
+    memory: Arc<MemoryService>,
     /// Pending feedback to apply (memory_id -> per-variant signal tally)
     pending_feedback: RwLock<HashMap<String, FeedbackTally>>,
     /// Wall-clock instant of the most recent user/agent activity. Drives the
@@ -189,16 +189,48 @@ pub struct DreamingService {
 }
 
 impl DreamingService {
-    /// Create a new dreaming service
+    /// Create a new dreaming service over a **private** memory store.
+    ///
+    /// Prefer [`Self::with_shared_memory`] in the daemon so dreaming operates on
+    /// the same live store the agent's `remember`/`recall` tools use — a store
+    /// created here is isolated and will not see those memories.
     #[must_use]
     pub fn new(config: DreamingConfig) -> Self {
-        let memory = MemoryService::new(config.memory.clone());
-        Self {
+        let memory = Arc::new(MemoryService::new(config.memory.clone()));
+        Self::from_parts(config, memory)
+    }
+
+    /// Create a dreaming service that consolidates an **existing, shared**
+    /// memory store — the single source of truth for the running app.
+    ///
+    /// This is the seam that unifies the two memory stacks (P13): the daemon
+    /// hands its live `Arc<MemoryService>` here so a dream cycle merges the same
+    /// memories the agent wrote, instead of a throwaway private store. The
+    /// shared store should already carry its own `embed_fn`/persistence — do not
+    /// call [`Self::with_embed_fn`] on a service built this way.
+    #[must_use]
+    pub fn with_shared_memory(config: DreamingConfig, memory: Arc<MemoryService>) -> Self {
+        Self::from_parts(config, memory)
+    }
+
+    /// Shared field initializer for both constructors (single mutation site).
+    fn from_parts(config: DreamingConfig, memory: Arc<MemoryService>) -> Self {
+        let service = Self {
             config,
             memory,
             pending_feedback: RwLock::new(HashMap::new()),
             last_activity: RwLock::new(Instant::now()),
-        }
+        };
+        // The store handle is retained (not dropped) for the service's lifetime.
+        debug_assert!(Arc::strong_count(&service.memory) >= 1);
+        service
+    }
+
+    /// Clone the shared memory-store handle (e.g. to hand the daemon's tools the
+    /// very store this service dreams over).
+    #[must_use]
+    pub fn memory_arc(&self) -> Arc<MemoryService> {
+        Arc::clone(&self.memory)
     }
 
     /// Mark "now" as the most recent activity, resetting the idle timer.
@@ -266,10 +298,23 @@ impl DreamingService {
         Ok(Some(stats))
     }
 
-    /// Set the embedding function
+    /// Set the embedding function on the underlying memory store.
+    ///
+    /// Only valid when this service **owns** its memory store uniquely (i.e. was
+    /// built with [`Self::new`], before any [`Self::memory_arc`] clone escaped).
+    /// A service built with [`Self::with_shared_memory`] must configure its
+    /// `embed_fn` on the shared store before sharing it — setting it here would
+    /// be a no-op against a `&mut` we cannot obtain, so that is asserted against.
     #[must_use]
     pub fn with_embed_fn(mut self, f: EmbedFn) -> Self {
-        self.memory = self.memory.with_embed_fn(f);
+        match Arc::get_mut(&mut self.memory) {
+            Some(mem) => mem.set_embed_fn(f),
+            None => debug_assert!(
+                false,
+                "with_embed_fn requires unique ownership; configure the shared \
+                 store before with_shared_memory"
+            ),
+        }
         self
     }
 
@@ -286,7 +331,10 @@ impl DreamingService {
     /// cannot grow with flood volume.
     pub async fn record_feedback(&self, memory_id: &str, feedback: MemoryFeedback) {
         let mut pending = self.pending_feedback.write().await;
-        pending.entry(memory_id.to_string()).or_default().record(feedback);
+        pending
+            .entry(memory_id.to_string())
+            .or_default()
+            .record(feedback);
         // Release the write guard before logging (nothing below touches it).
         drop(pending);
 
@@ -294,7 +342,11 @@ impl DreamingService {
     }
 
     /// Apply pending feedback immediately (doesn't wait for dreaming)
-    pub async fn apply_feedback(&self, memory_id: &str, feedback: MemoryFeedback) -> Result<(), MemoryError> {
+    pub async fn apply_feedback(
+        &self,
+        memory_id: &str,
+        feedback: MemoryFeedback,
+    ) -> Result<(), MemoryError> {
         let boost = feedback_boost(feedback);
 
         if boost > 0.0 {
@@ -303,7 +355,10 @@ impl DreamingService {
             self.memory.demote(memory_id, boost.abs()).await?;
         }
 
-        info!("Applied {:?} feedback to memory {} (boost: {})", feedback, memory_id, boost);
+        info!(
+            "Applied {:?} feedback to memory {} (boost: {})",
+            feedback, memory_id, boost
+        );
         Ok(())
     }
 
@@ -347,7 +402,11 @@ impl DreamingService {
                     stats.auto_promoted += 1;
                 }
             } else if total_boost < 0.0 {
-                if let Err(e) = self.memory.demote(&memory_id, total_boost.abs().min(1.0)).await {
+                if let Err(e) = self
+                    .memory
+                    .demote(&memory_id, total_boost.abs().min(1.0))
+                    .await
+                {
                     warn!("Failed to apply feedback to {}: {}", memory_id, e);
                 } else {
                     stats.auto_demoted += 1;
@@ -361,18 +420,23 @@ impl DreamingService {
         // 3. Check if we have enough memories for consolidation
         let count = self.memory.count().await;
         if count < self.config.min_memories_for_consolidation {
-            info!("Skipping consolidation: only {} memories (need {})", 
-                count, self.config.min_memories_for_consolidation);
+            info!(
+                "Skipping consolidation: only {} memories (need {})",
+                count, self.config.min_memories_for_consolidation
+            );
             stats.total_memories = count;
             return Ok(stats);
         }
 
         // 4. Run consolidation (the actual "dreaming")
         info!("Starting memory consolidation ({} memories)...", count);
-        stats.consolidation = self.memory.consolidate(&self.config.consolidation, summarize_fn).await?;
-        
+        stats.consolidation = self
+            .memory
+            .consolidate(&self.config.consolidation, summarize_fn)
+            .await?;
+
         stats.total_memories = self.memory.count().await;
-        
+
         info!(
             "Dreaming complete: {} processed, {} merged, {} expanded, {} promoted, {} demoted",
             stats.consolidation.memories_processed,
@@ -421,7 +485,7 @@ impl DreamingService {
 }
 
 /// Create a summarization function from an LLM client
-/// 
+///
 /// This is a helper to create the `summarize_fn` argument for `dream()`.
 pub fn make_summarize_fn<C>(
     llm: Arc<C>,
@@ -433,14 +497,12 @@ where
     move |prompt: String| {
         let llm = llm.clone();
         let model = model.clone();
-        Box::pin(async move {
-            llm.summarize(&model, &prompt).await
-        })
+        Box::pin(async move { llm.summarize(&model, &prompt).await })
     }
 }
 
 /// Trait for LLM summarization (implemented by LlmClient)
-/// 
+///
 /// This is a simple trait that any LLM client can implement for memory consolidation.
 pub trait LlmSummarizer: Send + Sync {
     /// Summarize/consolidate the given prompt into a condensed memory.
@@ -466,13 +528,25 @@ mod tests {
     async fn test_feedback_recording() {
         let service = DreamingService::new(DreamingConfig::default());
 
-        service.record_feedback("mem-1", MemoryFeedback::Helpful).await;
-        service.record_feedback("mem-1", MemoryFeedback::UsedSuccessfully).await;
-        service.record_feedback("mem-2", MemoryFeedback::Unhelpful).await;
+        service
+            .record_feedback("mem-1", MemoryFeedback::Helpful)
+            .await;
+        service
+            .record_feedback("mem-1", MemoryFeedback::UsedSuccessfully)
+            .await;
+        service
+            .record_feedback("mem-2", MemoryFeedback::Unhelpful)
+            .await;
 
         let pending = service.pending_feedback.read().await;
-        assert_eq!(pending.get("mem-1").map(FeedbackTally::signal_count), Some(2));
-        assert_eq!(pending.get("mem-2").map(FeedbackTally::signal_count), Some(1));
+        assert_eq!(
+            pending.get("mem-1").map(FeedbackTally::signal_count),
+            Some(2)
+        );
+        assert_eq!(
+            pending.get("mem-2").map(FeedbackTally::signal_count),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -484,10 +558,14 @@ mod tests {
         // would leave the aggregate positive; the true sum is
         // 16(0.3) − 20(0.5) = −5.2, i.e. firmly negative.
         for _ in 0..16 {
-            service.record_feedback("hot", MemoryFeedback::Helpful).await;
+            service
+                .record_feedback("hot", MemoryFeedback::Helpful)
+                .await;
         }
         for _ in 0..20 {
-            service.record_feedback("hot", MemoryFeedback::CausedError).await;
+            service
+                .record_feedback("hot", MemoryFeedback::CausedError)
+                .await;
         }
 
         let tally = {
@@ -506,7 +584,10 @@ mod tests {
     fn feedback_tally_counters_saturate_instead_of_wrapping() {
         // A counter at u32::MAX must stay there (saturating), never wrap to 0
         // and silently zero out billions of signals.
-        let mut tally = FeedbackTally { helpful: u32::MAX, ..FeedbackTally::default() };
+        let mut tally = FeedbackTally {
+            helpful: u32::MAX,
+            ..FeedbackTally::default()
+        };
         tally.record(MemoryFeedback::Helpful);
         assert_eq!(tally.helpful, u32::MAX);
     }
@@ -611,5 +692,57 @@ mod tests {
             !called.load(Ordering::SeqCst),
             "summarize_fn must not be invoked when the cycle is skipped"
         );
+    }
+
+    /// A dimension-3 embedder good enough to let `remember` run in tests.
+    fn test_embed_fn() -> EmbedFn {
+        Arc::new(|_text: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }))
+    }
+
+    fn dim3_config() -> DreamingConfig {
+        DreamingConfig {
+            memory: MemoryServiceConfig {
+                dimension: 3,
+                ..MemoryServiceConfig::default()
+            },
+            ..DreamingConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn with_shared_memory_sees_writes_through_the_shared_arc() {
+        // Build a shared store, configure it, and hand it to the dreaming service.
+        let shared =
+            Arc::new(MemoryService::new(dim3_config().memory).with_embed_fn(test_embed_fn()));
+        let service = DreamingService::with_shared_memory(dim3_config(), Arc::clone(&shared));
+
+        // A memory written directly through the shared handle (as the daemon's
+        // `remember` tool would) must be visible to the dream service's store —
+        // proving they are the *same* store, not two isolated ones.
+        assert_eq!(service.memory().count().await, 0);
+        shared
+            .remember("shared fact", HashMap::new())
+            .await
+            .expect("remember must succeed");
+        assert_eq!(
+            service.memory().count().await,
+            1,
+            "dreaming must observe writes made through the shared Arc"
+        );
+        // The handle round-trips back out identical.
+        assert!(Arc::ptr_eq(&service.memory_arc(), &shared));
+    }
+
+    #[tokio::test]
+    async fn new_builds_an_isolated_store() {
+        // A privately-constructed service must NOT share state with an unrelated
+        // store — writes elsewhere are invisible.
+        let service = DreamingService::new(dim3_config()).with_embed_fn(test_embed_fn());
+        let other =
+            Arc::new(MemoryService::new(dim3_config().memory).with_embed_fn(test_embed_fn()));
+        other.remember("elsewhere", HashMap::new()).await.unwrap();
+
+        assert_eq!(service.memory().count().await, 0);
+        assert!(!Arc::ptr_eq(&service.memory_arc(), &other));
     }
 }
