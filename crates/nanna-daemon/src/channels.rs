@@ -6,8 +6,8 @@ use crate::control::ControlPlane;
 use crate::protocol::ChatAction;
 use nanna_channels::{
     ChannelId, DiscordChannel, DiscordListener, IncomingMessage, ListenerManager,
-    MessageContent, MessageRouter, OutgoingMessage, SlackChannel, SlackListener, TelegramChannel,
-    TelegramListener,
+    MessageContent, MessageRouter, OutgoingMessage, SlackChannel, SlackListener, StatusManager,
+    TelegramChannel, TelegramListener,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -59,31 +59,50 @@ pub struct ChannelManager {
     router: Arc<RwLock<MessageRouter>>,
     /// Control plane reference for processing messages
     control: Arc<ControlPlane>,
+    /// Shared status manager reported via ChannelAction::Status
+    status_manager: Arc<StatusManager>,
     /// Shutdown signal
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 impl ChannelManager {
-    /// Create a new channel manager
+    /// Create a new channel manager that owns a fresh status manager.
     pub fn new(control: Arc<ControlPlane>) -> Self {
+        Self::with_status_manager(control, Arc::new(StatusManager::new()))
+    }
+
+    /// Create a channel manager that reports status through the given manager
+    /// (typically the one attached to the control plane).
+    pub fn with_status_manager(control: Arc<ControlPlane>, status_manager: Arc<StatusManager>) -> Self {
         Self {
             listener_manager: RwLock::new(ListenerManager::new(1000)),
             router: Arc::new(RwLock::new(MessageRouter::new())),
             control,
+            status_manager,
             shutdown_tx: None,
         }
+    }
+
+    /// Shared status manager used by listeners and the control plane.
+    pub fn status_manager(&self) -> Arc<StatusManager> {
+        Arc::clone(&self.status_manager)
     }
 
     /// Configure channels from config
     pub async fn configure(&self, config: &ChannelsConfig) {
         let mut lm = self.listener_manager.write().await;
         let mut router = self.router.write().await;
+        let sm = Arc::clone(&self.status_manager);
 
         // Configure Telegram
         if let Some(tg) = &config.telegram {
+            let configured = !tg.bot_token.is_empty();
+            sm.register("telegram", "Telegram", configured, configured && !tg.use_webhooks).await;
+
             if !tg.use_webhooks {
                 let listener = TelegramListener::new(&tg.bot_token)
-                    .with_allowed_chats(tg.allowed_chats.clone());
+                    .with_allowed_chats(tg.allowed_chats.clone())
+                    .with_status_manager(Arc::clone(&sm));
                 
                 if let Err(e) = lm.add(Arc::new(listener)).await {
                     error!("Failed to start Telegram listener: {}", e);
@@ -101,8 +120,12 @@ impl ChannelManager {
 
         // Configure Discord
         if let Some(dc) = &config.discord {
+            let configured = !dc.bot_token.is_empty();
+            sm.register("discord", "Discord", configured, configured).await;
+
             let mut listener = DiscordListener::new(&dc.bot_token)
-                .with_allowed_guilds(dc.allowed_guilds.clone());
+                .with_allowed_guilds(dc.allowed_guilds.clone())
+                .with_status_manager(Arc::clone(&sm));
             
             if let Some(intents) = dc.intents {
                 listener = listener.with_intents(intents);
@@ -125,8 +148,12 @@ impl ChannelManager {
 
         // Configure Slack
         if let Some(sl) = &config.slack {
+            let configured = !sl.bot_token.is_empty() && !sl.app_token.is_empty();
+            sm.register("slack", "Slack", configured, configured).await;
+
             let listener = SlackListener::new(&sl.app_token, &sl.bot_token)
-                .with_allowed_channels(sl.allowed_channels.clone());
+                .with_allowed_channels(sl.allowed_channels.clone())
+                .with_status_manager(Arc::clone(&sm));
 
             if let Err(e) = lm.add(Arc::new(listener)).await {
                 error!("Failed to start Slack listener: {}", e);

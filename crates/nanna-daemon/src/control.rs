@@ -15,6 +15,7 @@ use crate::log_buffer::LogBuffer;
 use crate::protocol::*;
 use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionState};
 use crate::user_tools::UserToolManager;
+use nanna_channels::StatusManager;
 use nanna_config::Config;
 use nanna_core::{Scheduler, WorkspaceRegistry, Workspace};
 use nanna_llm::RequestBuilder;
@@ -58,6 +59,10 @@ pub struct ControlPlane {
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
     /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
     started_at: std::time::Instant,
+    /// Live channel connection state (shared with ChannelManager listeners).
+    /// `None` until ChannelManager attaches a status manager at daemon boot,
+    /// or in minimal test constructions that never start channels.
+    status_manager: Option<Arc<StatusManager>>,
 }
 
 impl ControlPlane {
@@ -84,6 +89,7 @@ impl ControlPlane {
             event_tx: None,
             services_workspace_id: None,
             started_at: std::time::Instant::now(),
+            status_manager: None,
         }
     }
 
@@ -92,6 +98,18 @@ impl ControlPlane {
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Attach (or replace) the live channel status manager used by
+    /// `ChannelAction::Status` and shared with channel listeners.
+    pub fn set_status_manager(&mut self, status_manager: Arc<StatusManager>) {
+        self.status_manager = Some(status_manager);
+    }
+
+    /// Shared channel status manager, if attached.
+    #[must_use]
+    pub fn status_manager(&self) -> Option<Arc<StatusManager>> {
+        self.status_manager.clone()
     }
 
     /// Create a control plane with full services
@@ -122,6 +140,7 @@ impl ControlPlane {
             event_tx: None,
             services_workspace_id: None,
             started_at: std::time::Instant::now(),
+            status_manager: None,
         }
     }
 
@@ -171,6 +190,7 @@ impl ControlPlane {
             event_tx: None,
             services_workspace_id: None,
             started_at: std::time::Instant::now(),
+            status_manager: None,
         }
     }
 
@@ -2056,19 +2076,31 @@ impl ControlPlane {
                 json!({ "channels": channels })
             }
             ChannelAction::Status { id } => {
-                // Return status for a specific channel or all
-                // TODO: This needs ChannelManager with actual connection status
-                if let Some(channel_id) = id {
-                    json!({ 
-                        "channel_id": channel_id,
-                        "status": "unknown",
-                        "message": "Channel status tracking requires full ChannelManager integration"
-                    })
-                } else {
-                    json!({ 
-                        "status": "unknown",
-                        "message": "Use List action to see configured channels"
-                    })
+                let Some(status_manager) = self.status_manager.as_ref() else {
+                    return json!({
+                        "status": "unavailable",
+                        "message": "Channel status manager not attached (no channel manager running)",
+                    });
+                };
+
+                match id {
+                    Some(channel_id) => match status_manager.get(&channel_id).await {
+                        Some(status) => json!({ "channel": status }),
+                        None => json!({
+                            "error": "not_found",
+                            "channel_id": channel_id,
+                            "message": "No status registered for this channel",
+                        }),
+                    },
+                    None => {
+                        let channels: Vec<_> = status_manager
+                            .all()
+                            .await
+                            .into_values()
+                            .collect();
+                        let summary = status_manager.summary().await;
+                        json!({ "channels": channels, "summary": summary })
+                    }
                 }
             }
             ChannelAction::Enable { id } => {
@@ -2585,6 +2617,7 @@ Do not generate code intended for malicious use. Assist with authorized security
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanna_channels::ConnectionState;
 
     #[test]
     fn uptime_starts_near_zero_and_is_monotonic() {
@@ -2596,6 +2629,62 @@ mod tests {
         );
         let second = cp.uptime_secs();
         assert!(second >= first, "uptime must be monotonic non-decreasing");
+    }
+
+    #[tokio::test]
+    async fn channel_status_reports_registered_state() {
+        let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        let sm = Arc::new(StatusManager::new());
+        sm.register("telegram", "Telegram", true, true).await;
+        sm.set_state("telegram", ConnectionState::Connected, None).await;
+        cp.set_status_manager(Arc::clone(&sm));
+
+        // Single-channel query
+        let one = cp
+            .handle(
+                "test",
+                Action::Channel(ChannelAction::Status {
+                    id: Some("telegram".into()),
+                }),
+            )
+            .await;
+        assert_eq!(one["channel"]["provider"], "telegram");
+        assert_eq!(one["channel"]["state"], "connected");
+        assert_eq!(one["channel"]["configured"], true);
+
+        // All-channel query includes summary
+        let all = cp
+            .handle(
+                "test",
+                Action::Channel(ChannelAction::Status { id: None }),
+            )
+            .await;
+        assert!(all["channels"].as_array().unwrap().len() >= 1);
+        assert_eq!(all["summary"]["connected"], 1);
+        assert_eq!(all["summary"]["configured"], 1);
+
+        // Missing id → not_found
+        let missing = cp
+            .handle(
+                "test",
+                Action::Channel(ChannelAction::Status {
+                    id: Some("nope".into()),
+                }),
+            )
+            .await;
+        assert_eq!(missing["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn channel_status_unavailable_without_manager() {
+        let cp = ControlPlane::new(Arc::new(SessionManager::new()));
+        let resp = cp
+            .handle(
+                "test",
+                Action::Channel(ChannelAction::Status { id: None }),
+            )
+            .await;
+        assert_eq!(resp["status"], "unavailable");
     }
 
     #[tokio::test]
