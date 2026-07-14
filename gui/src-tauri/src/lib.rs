@@ -189,36 +189,62 @@ const MIN_TOOL_RESULT_CHARS: usize = 2_000;
 // Memory Service Adapter for Tool System
 // =============================================================================
 
-/// Adapter to make MemoryService work with the MemoryStorage trait used by tools
+/// Adapter to make MemoryService work with the MemoryStorage trait used by tools.
+///
+/// Holds a live handle to the workspace registry so every remember/recall scopes
+/// to whatever workspace is active *at call time* (not at tool setup).
 struct MemoryServiceAdapter {
     service: Arc<MemoryService>,
+    workspaces: Arc<RwLock<WorkspaceRegistry>>,
 }
 
 impl MemoryServiceAdapter {
-    fn new(service: Arc<MemoryService>) -> Self {
-        Self { service }
+    fn new(service: Arc<MemoryService>, workspaces: Arc<RwLock<WorkspaceRegistry>>) -> Self {
+        assert!(Arc::strong_count(&service) >= 1, "memory service handle must be live");
+        assert!(
+            Arc::strong_count(&workspaces) >= 1,
+            "workspace registry handle must be live"
+        );
+        Self {
+            service,
+            workspaces,
+        }
+    }
+
+    /// Current active workspace id (`None` = global scope).
+    async fn active_workspace_id(&self) -> Option<String> {
+        let registry = self.workspaces.read().await;
+        registry.active().map(|ws| ws.id.clone())
     }
 }
 
 #[async_trait::async_trait]
 impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
     async fn store(&self, content: &str, tags: &[String]) -> Result<String, String> {
+        assert!(!content.is_empty(), "remember content must be non-empty");
         let mut metadata = std::collections::HashMap::new();
         if !tags.is_empty() {
             metadata.insert("tags".to_string(), tags.join(","));
         }
         metadata.insert("source".to_string(), "tool".to_string());
-        
+
+        let workspace_id = self.active_workspace_id().await;
         self.service
-            .remember_with_importance(content, metadata, 3.0) // Medium importance for explicit remembers
+            .remember_scoped(content, metadata, 3.0, workspace_id)
             .await
             .map(|(id, _action)| id)
             .map_err(|e| e.to_string())
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<nanna_tools::MemoryResult>, String> {
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<nanna_tools::MemoryResult>, String> {
+        assert!(limit > 0, "search limit must be positive");
+        let workspace_id = self.active_workspace_id().await;
         self.service
-            .recall(query)
+            .recall_scoped(query, workspace_id.as_deref())
             .await
             .map(|memories| {
                 memories
@@ -235,6 +261,7 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
     }
 
     async fn delete(&self, id: &str) -> Result<bool, String> {
+        assert!(!id.is_empty(), "memory id must be non-empty");
         self.service
             .forget(id)
             .await
@@ -243,9 +270,10 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
     }
 
     async fn list(&self, limit: usize) -> Result<Vec<nanna_tools::MemoryResult>, String> {
-        // Use list_all to get all memories and take up to limit
+        assert!(limit > 0, "list limit must be positive");
         let all = self.service.list_all().await;
-        Ok(all.into_iter()
+        Ok(all
+            .into_iter()
             .take(limit)
             .map(|e| nanna_tools::MemoryResult {
                 id: e.id,
@@ -255,6 +283,7 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
             .collect())
     }
 }
+
 
 // =============================================================================
 // Intelligent Context Budget Allocation
@@ -1093,30 +1122,60 @@ struct PendingToolCall {
 // Model Selection & Fallback
 // =============================================================================
 
-/// Parse a model ID to extract provider and model name
-/// Format: "provider/model" or just "model" (defaults to anthropic)
+/// Parse a model ID into `(provider, model_name)`.
+///
+/// Explicit provider prefixes always win (`openrouter/…`, `github/…`, `ollama/…`,
+/// `openai/…`, `anthropic/…`). Bare names are inferred from family prefixes:
+/// `gpt-*` / `o1` / `o3` → openai, `claude*` → anthropic, a `:tag` (e.g.
+/// `llama3.2:latest`) → ollama. Unknown bare names still default to anthropic,
+/// matching the historical behavior for Claude-only installs.
 fn parse_model_id(model_id: &str) -> (String, String) {
-    // Handle openrouter/vendor/model format (e.g., openrouter/meta-llama/llama-3.3-70b-instruct:free)
-    if model_id.starts_with("openrouter/") {
-        let rest = &model_id["openrouter/".len()..];
-        return ("openrouter".to_string(), rest.to_string());
+    assert!(!model_id.is_empty(), "model_id must be non-empty");
+
+    // Explicit multi-segment provider prefixes first.
+    if let Some(rest) = model_id.strip_prefix("openrouter/") {
+        assert!(!rest.is_empty(), "openrouter model id missing model segment");
+        return ("openrouter".into(), rest.to_string());
+    }
+    if let Some(rest) = model_id.strip_prefix("github/") {
+        assert!(!rest.is_empty(), "github model id missing model segment");
+        return ("github".into(), rest.to_string());
+    }
+    if let Some(rest) = model_id.strip_prefix("ollama/") {
+        assert!(!rest.is_empty(), "ollama model id missing model segment");
+        return ("ollama".into(), rest.to_string());
+    }
+    if let Some(rest) = model_id.strip_prefix("openai/") {
+        assert!(!rest.is_empty(), "openai model id missing model segment");
+        return ("openai".into(), rest.to_string());
+    }
+    if let Some(rest) = model_id.strip_prefix("anthropic/") {
+        assert!(!rest.is_empty(), "anthropic model id missing model segment");
+        return ("anthropic".into(), rest.to_string());
     }
 
+    // Generic provider/model form for remaining named prefixes (`provider/model`).
     if let Some((provider, model)) = model_id.split_once('/') {
-        (provider.to_string(), model.to_string())
-    } else {
-        // Guess provider from model name
-        let provider = if model_id.contains("claude") || model_id.contains("opus") || model_id.contains("sonnet") || model_id.contains("haiku") {
-            "anthropic"
-        } else if model_id.contains("gpt") || model_id.contains("o1") {
-            "openai"
-        } else if model_id.contains("llama") || model_id.contains("mistral") || model_id.contains("qwen") {
-            "ollama"
-        } else {
-            "anthropic" // default
-        };
-        (provider.to_string(), model_id.to_string())
+        if !provider.is_empty() && !model.is_empty() {
+            return (provider.to_string(), model.to_string());
+        }
     }
+
+    // Bare model name — infer provider from the family prefix.
+    let lower = model_id.to_ascii_lowercase();
+    if lower.starts_with("gpt-") || lower.starts_with("o1") || lower.starts_with("o3") {
+        return ("openai".into(), model_id.to_string());
+    }
+    if lower.starts_with("claude") {
+        return ("anthropic".into(), model_id.to_string());
+    }
+    // Ollama tag notation (e.g. "deepseek-r1:14b", "llama3.2:latest").
+    if lower.contains(':') {
+        return ("ollama".into(), model_id.to_string());
+    }
+
+    // Historical default: bare unknowns go to Anthropic.
+    ("anthropic".into(), model_id.to_string())
 }
 
 /// Create an LLM client for a specific model
@@ -7670,26 +7729,104 @@ async fn update_skill(
     })
 }
 
-/// Delete a skill
+/// Delete a skill.
+///
+/// Hardens the delete path against symlink escapes: the skill name is
+/// sanitized so `$skills_path/<name>` cannot resolve outside the skills root.
+/// Symlinked skill directories (or symlink children inside them) are refused
+/// rather than followed with `remove_dir_all`.
 #[tauri::command]
 async fn delete_skill(
     state: State<'_, Arc<RwLock<AppState>>>,
     name: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
-    
-    // Get skills directory
+
+    // Reject empty, path-separator-bearing, or parent-traversal names.
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Skill name must be non-empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!(
+            "Invalid skill name '{}': path separators and '..' are not allowed",
+            name
+        ));
+    }
+    // Keep the name to a conservative character class so it cannot smuggle
+    // platform-specific path tricks (e.g. device names).
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "Invalid skill name '{}': only alphanumeric, '-', '_', '.' are allowed",
+            name
+        ));
+    }
+
     let skills_path = get_skills_path(&state_guard).await;
-    
-    let skill_dir = skills_path.join(&name);
+    // Canonicalize the root when it already exists so later containment
+    // checks are against the real path (not a caller's symlink-as-root).
+    let skills_root = if skills_path.exists() {
+        std::fs::canonicalize(&skills_path)
+            .map_err(|e| format!("Failed to resolve skills directory: {}", e))?
+    } else {
+        return Err(format!("Skills directory {:?} does not exist", skills_path));
+    };
+
+    let skill_dir = skills_root.join(name);
     if !skill_dir.exists() {
         return Err(format!("Skill '{}' not found", name));
     }
-    
-    // Remove the entire skill directory
-    std::fs::remove_dir_all(&skill_dir)
-        .map_err(|e| format!("Failed to delete skill: {}", e))?;
-    
+
+    // Reject if the skill path itself is a symlink (avoid escaping via a
+    // pre-existing link under the skills root).
+    let meta = std::fs::symlink_metadata(&skill_dir)
+        .map_err(|e| format!("Failed to stat skill '{}': {}", name, e))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "Refusing to delete skill '{}': path is a symlink (escape risk)",
+            name
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!("Skill path '{}' is not a directory", name));
+    }
+
+    // Containment check after canonicalize (defends against junction /
+    // reparse races on Windows and symlink races on Unix between join and
+    // delete).
+    let canonical = std::fs::canonicalize(&skill_dir)
+        .map_err(|e| format!("Failed to resolve skill '{}': {}", name, e))?;
+    if !canonical.starts_with(&skills_root) {
+        return Err(format!(
+            "Refusing to delete skill '{}': resolved path escapes skills directory",
+            name
+        ));
+    }
+
+    // Refuse if any immediate child is a symlink. Soft-delete would be safer
+    // long-term; for now a hard refuse keeps `remove_dir_all` off untrusted
+    // trees.
+    for entry in std::fs::read_dir(&canonical)
+        .map_err(|e| format!("Failed to read skill '{}': {}", name, e))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read skill entry: {}", e))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("Failed to stat skill entry: {}", e))?;
+        if ft.is_symlink() {
+            return Err(format!(
+                "Refusing to delete skill '{}': contains symlink child '{:?}'",
+                name,
+                entry.file_name()
+            ));
+        }
+    }
+
+    std::fs::remove_dir_all(&canonical).map_err(|e| format!("Failed to delete skill: {}", e))?;
+
     info!("Deleted skill: {}", name);
     Ok(())
 }
@@ -8696,8 +8833,100 @@ async fn setup_state(
         info!("No saved memories found at {:?} (starting fresh)", memory_path);
     }
 
+    // Shared workspace registry — constructed early so memory tools can
+    // thread a live handle into the adapter and scope remembers/recalls to
+    // the *current* active workspace. Later AppState construction reuses this
+    // exact Arc so set/clear_active_workspace keep the adapter in step.
+    let workspaces: Arc<RwLock<WorkspaceRegistry>> = {
+        let mut registry = WorkspaceRegistry::new();
+        if let Some(ref storage) = storage {
+            match storage.workspaces().list().await {
+                Ok(records) if !records.is_empty() => {
+                    let mut active_id = None;
+                    for record in &records {
+                        let path = std::path::PathBuf::from(&record.path);
+                        if path.exists() {
+                            let mut ws = Workspace::new(&path);
+                            ws.id = record.id.clone();
+                            if let Err(e) = ws.load_context().await {
+                                warn!(
+                                    "Failed to load workspace context for {}: {}",
+                                    record.path, e
+                                );
+                            }
+                            registry.register(ws);
+                            if record.active {
+                                active_id = Some(record.id.clone());
+                            }
+                        } else {
+                            warn!(
+                                "Persisted workspace path no longer exists: {}",
+                                record.path
+                            );
+                        }
+                    }
+                    if let Some(id) = active_id {
+                        registry.set_active(&id);
+                    }
+                    info!("Restored {} workspaces from database", records.len());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to load workspaces from database: {}", e);
+                }
+            }
+        } else {
+            match backend.workspace_list().await {
+                Ok(result) => {
+                    let records = result
+                        .get("workspaces")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let active_id = result
+                        .get("active_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let count = records.len();
+                    for record in &records {
+                        let (Some(id), Some(path)) = (
+                            record.get("id").and_then(|v| v.as_str()),
+                            record.get("path").and_then(|v| v.as_str()),
+                        ) else {
+                            continue;
+                        };
+                        let path = std::path::PathBuf::from(path);
+                        if path.exists() {
+                            let mut ws = Workspace::new(&path);
+                            ws.id = id.to_string();
+                            if let Err(e) = ws.load_context().await {
+                                warn!(
+                                    "Failed to load workspace context for {:?}: {}",
+                                    path, e
+                                );
+                            }
+                            registry.register(ws);
+                        } else {
+                            warn!("Daemon workspace path no longer exists: {:?}", path);
+                        }
+                    }
+                    if let Some(id) = active_id {
+                        registry.set_active(&id);
+                    }
+                    if count > 0 {
+                        info!("Restored {} workspaces from daemon", count);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load workspaces from daemon: {}", e);
+                }
+            }
+        }
+        Arc::new(RwLock::new(registry))
+    };
+
     // Register memory tools (remember, recall, reflect) with the FSRS memory service
-    let memory_storage: nanna_tools::StorageHandle = Arc::new(MemoryServiceAdapter::new(memory.clone()));
+    let memory_storage: nanna_tools::StorageHandle = Arc::new(MemoryServiceAdapter::new(memory.clone(), workspaces.clone()));
     tools.register(nanna_tools::RememberTool::new(memory_storage.clone())).await;
     tools.register(nanna_tools::RecallTool::new(memory_storage.clone())).await;
     tools.register(nanna_tools::ReflectTool::new(memory_storage)).await;
@@ -9128,86 +9357,9 @@ async fn setup_state(
         active_model: Arc::new(RwLock::new(initial_active_model)),
         // Rate limited models (empty at startup)
         rate_limited_models: Arc::new(RwLock::new(HashMap::new())),
-        // Workspace registry (restored from local DB in embedded mode, from
-        // the daemon — which restored them from nanna.db — in daemon mode)
-        workspaces: {
-            let mut registry = WorkspaceRegistry::new();
-            if let Some(ref storage) = storage {
-                match storage.workspaces().list().await {
-                    Ok(records) if !records.is_empty() => {
-                        let mut active_id = None;
-                        for record in &records {
-                            let path = std::path::PathBuf::from(&record.path);
-                            if path.exists() {
-                                let mut ws = Workspace::new(&path);
-                                ws.id = record.id.clone();
-                                if let Err(e) = ws.load_context().await {
-                                    warn!("Failed to load workspace context for {}: {}", record.path, e);
-                                }
-                                registry.register(ws);
-                                if record.active {
-                                    active_id = Some(record.id.clone());
-                                }
-                            } else {
-                                warn!("Persisted workspace path no longer exists: {}", record.path);
-                            }
-                        }
-                        if let Some(id) = active_id {
-                            registry.set_active(&id);
-                        }
-                        info!("Restored {} workspaces from database", records.len());
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Failed to load workspaces from database: {}", e);
-                    }
-                }
-            } else {
-                match backend.workspace_list().await {
-                    Ok(result) => {
-                        let records = result
-                            .get("workspaces")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let active_id = result
-                            .get("active_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let count = records.len();
-                        for record in &records {
-                            let (Some(id), Some(path)) = (
-                                record.get("id").and_then(|v| v.as_str()),
-                                record.get("path").and_then(|v| v.as_str()),
-                            ) else {
-                                continue;
-                            };
-                            let path = std::path::PathBuf::from(path);
-                            if path.exists() {
-                                let mut ws = Workspace::new(&path);
-                                ws.id = id.to_string();
-                                if let Err(e) = ws.load_context().await {
-                                    warn!("Failed to load workspace context for {:?}: {}", path, e);
-                                }
-                                registry.register(ws);
-                            } else {
-                                warn!("Daemon workspace path no longer exists: {:?}", path);
-                            }
-                        }
-                        if let Some(id) = active_id {
-                            registry.set_active(&id);
-                        }
-                        if count > 0 {
-                            info!("Restored {} workspaces from daemon", count);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to load workspaces from daemon: {}", e);
-                    }
-                }
-            }
-            Arc::new(RwLock::new(registry))
-        },
+        // Workspace registry — shared Arc constructed earlier so memory tools
+        // observe the same active workspace as the GUI commands.
+        workspaces,
         // User tool authoring manager
         user_tools: user_tool_manager,
         // Backend (initialized above with embedded mode)
@@ -9562,4 +9714,72 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
 
     info!("System tray initialized");
     Ok(())
+}
+
+
+#[cfg(test)]
+mod parse_model_id_tests {
+    use super::parse_model_id;
+
+    #[test]
+    fn parse_model_id_infers_provider_by_family_prefix() {
+        assert_eq!(
+            parse_model_id("gpt-4o"),
+            ("openai".into(), "gpt-4o".into())
+        );
+        assert_eq!(
+            parse_model_id("o1-preview"),
+            ("openai".into(), "o1-preview".into())
+        );
+        assert_eq!(
+            parse_model_id("o3-mini"),
+            ("openai".into(), "o3-mini".into())
+        );
+        assert_eq!(
+            parse_model_id("claude-opus-4"),
+            ("anthropic".into(), "claude-opus-4".into())
+        );
+        // Case-insensitive on the family prefix.
+        assert_eq!(
+            parse_model_id("Claude-Sonnet-4"),
+            ("anthropic".into(), "Claude-Sonnet-4".into())
+        );
+        assert_eq!(
+            parse_model_id("llama3.2:latest"),
+            ("ollama".into(), "llama3.2:latest".into())
+        );
+        assert_eq!(
+            parse_model_id("deepseek-r1:14b"),
+            ("ollama".into(), "deepseek-r1:14b".into())
+        );
+        // Unknown bare names still default to Anthropic.
+        assert_eq!(
+            parse_model_id("some-unknown-model"),
+            ("anthropic".into(), "some-unknown-model".into())
+        );
+    }
+
+    #[test]
+    fn parse_model_id_respects_explicit_provider_prefixes() {
+        assert_eq!(
+            parse_model_id("openrouter/meta-llama/llama-3"),
+            ("openrouter".into(), "meta-llama/llama-3".into())
+        );
+        assert_eq!(
+            parse_model_id("github/gpt-4o"),
+            ("github".into(), "gpt-4o".into())
+        );
+        assert_eq!(
+            parse_model_id("ollama/qwen3"),
+            ("ollama".into(), "qwen3".into())
+        );
+        assert_eq!(
+            parse_model_id("openai/gpt-4o"),
+            ("openai".into(), "gpt-4o".into())
+        );
+        assert_eq!(
+            parse_model_id("anthropic/claude-opus-4"),
+            ("anthropic".into(), "claude-opus-4".into())
+        );
+    }
 }
