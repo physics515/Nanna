@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-11 (deps refresh + safe GUI pnpm slice · health server live shared state + dup-log fix · scripted-tool parameter-schema parsing (all 39 skills) · `ChatAction::Regenerate` implemented · folded: workspace-`cargo test` V8 stack overflow, hnsw_rs in-search filtering) · code snapshot through 2026-03-17
+**Last updated:** 2026-07-14 (deps refresh — `cargo update` transitive bumps green: rustls 0.23.42, socket2 0.6.5, http-body 1.1.0, mio 1.2.2, winnow 1.0.4, +3; no incompatible workspace-dep majors available) · prior: 2026-07-11 health server shared state + scripted-tool param-schema parsing + `ChatAction::Regenerate` · code snapshot through 2026-03-17
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
