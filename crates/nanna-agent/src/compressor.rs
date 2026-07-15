@@ -75,10 +75,13 @@ pub async fn compress_text(
          Output ONLY numbers, one per line, in order.\n\n{numbered}"
     );
 
+    let model_cache = nanna_llm::ModelInfoCache::default_location();
+    let model_info = client.get_model_info(model, model_cache.as_ref()).await;
+    let max_tokens = u32::try_from(model_info.max_output_tokens.min(256)).unwrap_or(u32::MAX);
     let request = AnthropicRequest {
         model: model.to_string(),
         messages: vec![AnthropicMessage::user_text(prompt)],
-        max_tokens: 256,
+        max_tokens,
         temperature: Some(0.1),
         system: Some("You are an information density scorer. Output ONLY one number (1-10) per line, nothing else.".to_string()),
         tools: None,

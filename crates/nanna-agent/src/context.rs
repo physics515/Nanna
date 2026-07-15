@@ -58,8 +58,6 @@ pub struct ContextSummarizationConfig {
     pub model_priority: Vec<String>,
     /// Ollama URL if using ollama models
     pub ollama_url: Option<String>,
-    /// Context window of the summarization model (in tokens)
-    pub summarizer_context_window: usize,
     /// Maximum iterations to prevent infinite loops
     pub max_iterations: usize,
     /// OpenRouter API key (for "openrouter/" prefixed models)
@@ -73,7 +71,6 @@ impl ContextSummarizationConfig {
         Self {
             model_priority,
             ollama_url: Some("http://localhost:11434".to_string()),
-            summarizer_context_window: 8000, // Conservative default for most local models
             max_iterations: 20,
             openrouter_api_key: None,
             openai_api_key: None,
@@ -82,11 +79,6 @@ impl ContextSummarizationConfig {
 
     pub fn with_ollama_url(mut self, url: impl Into<String>) -> Self {
         self.ollama_url = Some(url.into());
-        self
-    }
-
-    pub fn with_summarizer_context(mut self, tokens: usize) -> Self {
-        self.summarizer_context_window = tokens;
         self
     }
 }
@@ -177,11 +169,11 @@ fn default_include_memory() -> bool {
 }
 
 fn default_compression_threshold() -> usize {
-    160_000 // 80% of 200k default context window
+    nanna_llm::unknown_model_info("", "").compression_threshold()
 }
 
 fn default_hard_limit() -> usize {
-    192_000 // 200k - 8k for output
+    nanna_llm::unknown_model_info("", "").hard_input_limit()
 }
 
 impl AgentContext {
@@ -795,7 +787,9 @@ impl AgentContext {
         }
 
         let mut iterations = 0;
-        let max_chars_per_chunk = config.summarizer_context_window * 4; // ~4 chars per token
+        // Candidate summarizers resolve and enforce their own provider-reported limits.
+        // This only bounds extraction to the context already held by this agent.
+        let max_chars_per_chunk = self.hard_limit.saturating_mul(4);
 
         while self.exceeds_hard_limit() && iterations < config.max_iterations {
             iterations += 1;
@@ -927,9 +921,12 @@ impl AgentContext {
     ) -> Result<String, String> {
         let (client, model_name) = Self::create_client_for_model(model_spec, config)?;
 
-        // Truncate content to fit the summarizer's context window. Cut on a
-        // char boundary — a raw byte slice panics mid-codepoint.
-        let max_chars = config.summarizer_context_window * 4; // ~4 chars per token
+        // Fetch this fallback model's own limits; summarizers may have radically
+        // different windows even when they are in the same priority list.
+        let cache = nanna_llm::ModelInfoCache::default_location();
+        let model_info = client.get_model_info(&model_name, cache.as_ref()).await;
+        // Reserve output capacity and prompt framing before filling the input.
+        let max_chars = model_info.hard_input_limit().saturating_sub(512).saturating_mul(4);
         let truncated = if content.len() > max_chars {
             &content[..content.floor_char_boundary(max_chars)]
         } else {
@@ -946,7 +943,7 @@ impl AgentContext {
         let request = AnthropicRequest {
             model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
-            max_tokens: 2048,
+            max_tokens: u32::try_from(model_info.max_output_tokens.min(2_048)).unwrap_or(u32::MAX),
             temperature: Some(0.3),
             system: Some("You are a conversation summarizer. Output only the summary, no preamble.".to_string()),
             tools: None,

@@ -282,15 +282,6 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
 // Intelligent Context Budget Allocation
 // =============================================================================
 
-/// Resolve model limits from cache (prior API fetch) or the universal unknown floor.
-///
-/// No per-model name table — windows change constantly. Prefer an async
-/// `LlmClient::get_model_info` path (inside the agent loop) so providers are
-/// queried and the disk cache is warmed.
-fn resolve_model_info_sync(model: &str) -> nanna_llm::ModelInfo {
-    nanna_llm::model_info_from_cache_or_unknown(model, "")
-}
-
 /// Conversation-token budget for history truncation from a resolved model.
 ///
 /// Mirrors `ModelInfo::hard_input_limit` then reserves system + response headroom.
@@ -1487,9 +1478,13 @@ Be concise. Be useful. Be present.{}
     );
     request = request.with_message(nanna_llm::Message::system(&system_prompt));
 
-    // Add history with context truncation. Prefer disk-cached API model limits;
-    // fall back only to the universal floor (no per-model name table).
-    let history_model_info = resolve_model_info_sync(&state_guard.config.llm.model);
+    // Resolve provider metadata before truncating history. This avoids applying
+    // stale or generic limits on the first turn for a newly selected model.
+    let model_cache = nanna_llm::ModelInfoCache::default_location();
+    let history_model_info = state_guard
+        .llm
+        .get_model_info(&state_guard.config.llm.model, model_cache.as_ref())
+        .await;
     let history_budget = conversation_token_budget_for(&history_model_info);
     debug!(
         "History truncation budget: model={}, context={}, budget={} tokens",
@@ -8689,8 +8684,13 @@ async fn setup_state(
                     let embed_llm = LlmClient::openai(&openai_key);
                     let cache = ModelInfoCache::default_location();
                     let model_info = embed_llm.get_model_info(&saved_embedding_model, cache.as_ref()).await;
-                    let dimension = model_info.embedding_dimension
-                        .unwrap_or_else(|| MemoryServiceConfig::dimension_for_model(&saved_embedding_model));
+                    let dimension = match model_info.embedding_dimension {
+                        Some(dimension) => dimension,
+                        None => nanna_llm::EmbeddingClient::openai(&openai_key)
+                            .with_model(&saved_embedding_model)
+                            .embed_one("dimension probe").await
+                            .map_err(|e| format!("Failed to discover embedding dimension: {e}"))?.len(),
+                    };
                     info!("Embedding dimension: {} for model {} (from cache/API)", dimension, saved_embedding_model);
 
                     let memory_config = MemoryServiceConfig {
@@ -8764,8 +8764,13 @@ async fn setup_state(
                 let embed_llm = LlmClient::ollama(&ollama_url);
                 let cache = ModelInfoCache::default_location();
                 let model_info = embed_llm.get_model_info(&saved_embedding_model, cache.as_ref()).await;
-                let dimension = model_info.embedding_dimension
-                    .unwrap_or_else(|| MemoryServiceConfig::dimension_for_model(&saved_embedding_model));
+                let dimension = match model_info.embedding_dimension {
+                    Some(dimension) => dimension,
+                    None => nanna_llm::EmbeddingClient::ollama(&ollama_url)
+                        .with_model(&saved_embedding_model)
+                        .embed_one("dimension probe").await
+                        .map_err(|e| format!("Failed to discover embedding dimension: {e}"))?.len(),
+                };
                 info!("Embedding dimension: {} for model {} (from cache/API)", dimension, saved_embedding_model);
 
                 let memory_config = MemoryServiceConfig {
@@ -9743,9 +9748,9 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(test)]
 mod parse_model_id_tests {
     use super::{
-        conversation_token_budget_for, parse_model_id, resolve_model_info_sync,
+        conversation_token_budget_for, parse_model_id,
     };
-    use nanna_llm::{unknown_model_info, UNKNOWN_CONTEXT_WINDOW};
+    use nanna_llm::unknown_model_info;
 
     #[test]
     fn parse_model_id_infers_provider_by_family_prefix() {
