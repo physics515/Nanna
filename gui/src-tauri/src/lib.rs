@@ -166,18 +166,11 @@ async fn route_to_channel(
 // Context Management Constants
 // =============================================================================
 
-/// Target context budget (leaves room for system prompt + response)
-/// Most models have 200k context, but we aim lower for safety
-const TARGET_CONTEXT_TOKENS: usize = 150_000;
-
 /// Reserved tokens for system prompt, memory context, workspace context
 const SYSTEM_RESERVED_TOKENS: usize = 10_000;
 
 /// Reserved tokens for model response
 const RESPONSE_RESERVED_TOKENS: usize = 8_000;
-
-/// Maximum tokens available for conversation (history + tool results)
-const MAX_CONVERSATION_TOKENS: usize = TARGET_CONTEXT_TOKENS - SYSTEM_RESERVED_TOKENS - RESPONSE_RESERVED_TOKENS;
 
 /// Maximum characters per individual message before truncation
 const MAX_MESSAGE_CHARS: usize = 50_000;
@@ -289,33 +282,64 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
 // Intelligent Context Budget Allocation
 // =============================================================================
 
-/// Model-specific context limits (in tokens)
+/// Model-specific context limits (in tokens).
+/// Nested matches keep larger families ahead of their smaller substrings so e.g.
+/// `"gpt-4-turbo"` is not truncated by the generic `"gpt-4"` arm (8k).
 fn model_context_limit(model: &str) -> usize {
     match model {
         // Anthropic Claude 4 models
         m if m.contains("claude-opus-4") => 200_000,
         m if m.contains("claude-sonnet-4") => 200_000,
-        // Anthropic Claude 3.5 models
+        // Anthropic Claude 3.5 / 3 models
         m if m.contains("claude-3-5") => 200_000,
         m if m.contains("claude-3-opus") => 200_000,
         m if m.contains("claude-3-sonnet") => 200_000,
         m if m.contains("claude-3-haiku") => 200_000,
-        // OpenAI models
+        m if m.contains("claude") => 200_000,
+        // OpenAI models — larger first so "gpt-4o"/"turbo" win over bare "gpt-4"
         m if m.contains("gpt-4o") => 128_000,
         m if m.contains("gpt-4-turbo") => 128_000,
-        m if m.contains("gpt-4") => 128_000,
+        // Plain gpt-4 is 8k (matches nanna-agent/nanna-llm defaults)
+        m if m.contains("gpt-4") => 8_000,
         m if m.contains("o1") || m.contains("o3") => 200_000,
         // Google Gemini
         m if m.contains("gemini-2") => 1_000_000,
         m if m.contains("gemini-1.5") => 1_000_000,
         m if m.contains("gemini") => 128_000,
-        // Ollama / local models - conservative default
+        // Ollama / local models
+        m if m.contains("llama-3.1") || m.contains("llama-3.2") => 128_000,
+        m if m.contains("mistral-large") => 128_000,
         m if m.contains("llama") => 32_000,
         m if m.contains("mistral") => 32_000,
         m if m.contains("qwen") => 32_000,
-        // Default conservative estimate
-        _ => 100_000,
+        // Default: small-model conservative (mirrors AgentContext::configure_for_model_name)
+        _ => 32_000,
     }
+}
+
+/// Default max_output_tokens when we only have a model name.
+fn model_default_max_output(model: &str) -> usize {
+    match model {
+        m if m.contains("claude") => 8192,
+        _ => 4096,
+    }
+}
+
+/// Conversation-token budget for history truncation, model-aware.
+///
+/// Mirrors `ModelInfo::hard_input_limit` (floor at 50% of context so a large
+/// max_output cannot zero the budget) then reserves system + response headroom.
+/// Replaces the historical hardcoded `MAX_CONVERSATION_TOKENS` (132k), which gave
+/// a 32k Ollama model more room than it actually has.
+fn conversation_token_budget(model: &str) -> usize {
+    let context_window = model_context_limit(model);
+    let max_output = model_default_max_output(model);
+    // hard input = context − output, floored at 50% of context
+    let hard_limit = context_window.saturating_sub(max_output).max(context_window / 2);
+    // leave room for system prompt + reserved response tokens
+    let reserved = SYSTEM_RESERVED_TOKENS + RESPONSE_RESERVED_TOKENS;
+    // keep a small floor so truncation never completely empties history
+    hard_limit.saturating_sub(reserved).max(2_000)
 }
 
 /// Rough estimate: ~4 characters per token
@@ -1502,7 +1526,13 @@ Be concise. Be useful. Be present.{}
     request = request.with_message(nanna_llm::Message::system(&system_prompt));
 
     // Add history with context truncation
-    let truncated_history = truncate_context(&history, MAX_CONVERSATION_TOKENS);
+    // Model-aware conversation budget (replaces hardcoded 132k).
+    let history_budget = conversation_token_budget(&state_guard.config.llm.model);
+    debug!(
+        "History truncation budget: model={}, budget={} tokens",
+        state_guard.config.llm.model, history_budget
+    );
+    let truncated_history = truncate_context(&history, history_budget);
     for msg in &truncated_history {
         let llm_msg = match msg.role.as_str() {
             "user" => nanna_llm::Message::user(&msg.content),
@@ -1560,7 +1590,32 @@ Be concise. Be useful. Be present.{}
     // Always clean up embedded run state (success or error)
     embedded_run_states.write().await.remove(&session_id_clone);
 
-    let (full_response, tool_calls) = result?;
+    // On failure the user message is already stored, so leave a partial assistant
+    // reply instead of orphaning the turn (no assistant message at all).
+    let (full_response, tool_calls) = match result {
+        Ok(ok) => ok,
+        Err(e) => {
+            let err_text = format!(
+                "_(This turn was interrupted before a full reply could be stored.)_\n\nError: {}",
+                e
+            );
+            let state_guard = state.read().await;
+            if let Ok(storage) = state_guard.storage() {
+                if let Err(store_err) = storage
+                    .add_message(&session_id, "assistant", &err_text)
+                    .await
+                {
+                    warn!(
+                        "Failed to store partial error message after turn failure: {}",
+                        store_err
+                    );
+                } else {
+                    let _ = storage.touch_session(&session_id).await;
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // Re-acquire state to store the response
     let state_guard = state.read().await;
@@ -9719,7 +9774,9 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
 
 #[cfg(test)]
 mod parse_model_id_tests {
-    use super::parse_model_id;
+    use super::{
+        conversation_token_budget, model_context_limit, parse_model_id,
+    };
 
     #[test]
     fn parse_model_id_infers_provider_by_family_prefix() {
@@ -9781,5 +9838,47 @@ mod parse_model_id_tests {
             parse_model_id("anthropic/claude-opus-4"),
             ("anthropic".into(), "claude-opus-4".into())
         );
+    }
+
+    #[test]
+    fn conversation_budget_respects_small_model_context() {
+        // 32k Ollama model must not get the historical 132k hardcode.
+        let budget = conversation_token_budget("llama3.2");
+        assert!(
+            budget < 32_000,
+            "small-model budget {budget} must fit inside a 32k window"
+        );
+        // Still leave some room for history after system/response reserves.
+        assert!(budget >= 2_000, "budget {budget} collapsed to floor");
+    }
+
+    #[test]
+    fn conversation_budget_for_large_claude_is_generous() {
+        let budget = conversation_token_budget("claude-opus-4");
+        // 200k − max(output, 50%) − (10k+8k) ≈ 200k − 8192/100k − 18k → big.
+        // Floor hard_limit is max(200k-8k, 100k) = 191808; budget ≈ 173808.
+        assert!(budget > 100_000, "large-model budget {budget} regressed");
+        assert!(budget < 200_000);
+    }
+
+    #[test]
+    fn conversation_budget_for_plain_gpt4_uses_8k_window() {
+        // Bare gpt-4 is 8k (not 128k). hard = max(8k-4k, 4k) = 4k;
+        // budget = max(4k − 18k, 2k) = 2k floor.
+        let budget = conversation_token_budget("gpt-4");
+        assert_eq!(budget, 2_000);
+        // gpt-4o keeps the large window.
+        let large = conversation_token_budget("gpt-4o");
+        assert!(large > 50_000, "gpt-4o budget {large} collapsed");
+    }
+
+    #[test]
+    fn model_context_limit_prefers_specific_family() {
+        assert_eq!(model_context_limit("gpt-4o"), 128_000);
+        assert_eq!(model_context_limit("gpt-4-turbo"), 128_000);
+        assert_eq!(model_context_limit("gpt-4"), 8_000);
+        assert_eq!(model_context_limit("llama-3.1-70b"), 128_000);
+        assert_eq!(model_context_limit("llama3"), 32_000);
+        assert_eq!(model_context_limit("unknown-local"), 32_000);
     }
 }

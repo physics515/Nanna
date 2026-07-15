@@ -494,7 +494,7 @@ routine should drain first.**
       re-embeds + upserts the whole entry (content and embedding stay consistent). Applied to all three
       ingest paths via the shared `fold_into_memory` helper. See also P13 true-merge.*
 - [x] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through. *(2026-07-14 — GUI adapter now holds a live `Arc<RwLock<WorkspaceRegistry>>` (constructed once, shared with AppState) and every `store`/`search` call scopes to the *current* active workspace via `remember_scoped`/`recall_scoped`. Daemon path already had this via `services_workspace_id` + per-chat update.)*
-- [~] **Context budget for small models** — `truncate_context` uses hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model gets wrong math. Thread model limits everywhere.
+- [x] **Context budget for small models** — `truncate_context` used hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model got wrong math. Thread model limits everywhere.
       *(2026-07-13)* **Fixed the compression-threshold ↔ hard-limit inversion for small models** (a concrete
       slice of this item). `ModelInfo::compression_threshold` was a flat 80% of context while `hard_input_limit`
       is `max(context − max_output, 50% context)`. For a small model with a large output budget (e.g. context
@@ -507,8 +507,17 @@ routine should drain first.**
       `nanna-agent` (which also lacked the 50% hard-limit floor — added). `debug_assert`s guard the invariant
       on both paths. 5 tests (small stays below cap / large unchanged / output≥context degenerate — in both
       crates); 18 nanna-llm + 53 nanna-agent tests green, **−1 clippy warning** in each crate, full workspace
-      builds green. Remaining: the GUI-embedded `truncate_context`'s hardcoded 132k (needs a GUI build).
-- [ ] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
+      builds green.
+      *(2026-07-15)* Closed the remaining GUI-embedded slice. `gui/src-tauri/src/lib.rs`: added
+      `conversation_token_budget(model)` that mirrors `ModelInfo::hard_input_limit` (context − max_output,
+      floor 50% of context), then reserves system+response tokens and floors at 2k so history never empties.
+      `truncate_context` now takes that budget instead of the hardcoded 132k. `model_context_limit` aligned
+      with agent defaults (plain `gpt-4` → 8k, llama-3.1/3.2 → 128k, unknown → 32k). Removed unused
+      `TARGET_CONTEXT_TOKENS` / `MAX_CONVERSATION_TOKENS`. 4 new unit tests cover small/large/gpt-4 family.
+- [x] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
+      *(2026-07-15)* In `send_message` (embedded path), a failed `run_agent_loop_with_fallback` now stores a
+      partial assistant message (`_(This turn was interrupted…)_` + error) and touches the session before
+      returning the error, so the user turn is no longer orphaned in storage.
 - [x] `not_implemented` daemon control actions: ~~Regenerate message~~ **(done 2026-07-11 — `ChatAction::Regenerate` now drops the stale assistant reply via a new pure `Session::take_last_user_turn()` (removes the last user message **and** everything after it — reply + trailing tool turns — returning that user content; `None`/unchanged when there's no user message), persists the truncated session, then replays through the existing `Send` path via `Box::pin(self.handle_chat(..))` so it reuses all context/workspace/memory/agent logic with zero duplication. 4 unit tests cover reply-drop, prior-history preservation, trailing-tool-turn drop, and no-user→None. Daemon boots green; full turn execution needs a live LLM (unavailable unattended) so verified by build+boot smoke + unit tests)**, ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, ~~Channel status~~ **(done 2026-07-14 — `ControlPlane` holds an optional `Arc<StatusManager>` (attached before the Arc wrap at daemon boot); `ChannelManager::with_status_manager` shares the same manager, registers configured providers on `configure()`, and wires `.with_status_manager(..)` into Telegram/Discord/Slack listeners so circuit-breaker state transitions update live connection state; `ChannelAction::Status` returns a single channel or `{channels, summary}` (or `not_found` / `unavailable`); 2 tokio tests)**, ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
 - [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
 - [x] Server stats not wired to shared daemon state (`server.rs:882`).
