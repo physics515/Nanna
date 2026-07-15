@@ -737,6 +737,15 @@ impl Agent {
         message: &str,
         options: RunOptions,
     ) -> Result<AgentResponse, AgentError> {
+        // Resolve model limits from the provider before any context budgeting.
+        // This also refreshes the shared disk cache used by synchronous callers.
+        let model_cache = nanna_llm::ModelInfoCache::default_location();
+        let model_info = self
+            .llm
+            .get_model_info(&self.config.model, model_cache.as_ref())
+            .await;
+        self.context.write().await.configure_for_model(&model_info);
+
         // Resolve effective max_iterations: run option > config > unlimited
         let max_iterations = options.max_iterations.or(self.config.max_iterations);
         let mut state = RunState::new();
@@ -852,7 +861,6 @@ impl Agent {
                         let summarization_config = ContextSummarizationConfig {
                             model_priority: self.config.summarization_priority.clone(),
                             ollama_url: self.config.summarization_ollama_url.clone(),
-                            summarizer_context_window: 8000,
                             max_iterations: 20,
                             openrouter_api_key: self.config.openrouter_api_key.clone(),
                             openai_api_key: self.config.openai_api_key.clone(),
@@ -892,7 +900,6 @@ impl Agent {
                         let summarization_config = ContextSummarizationConfig {
                             model_priority: self.config.summarization_priority.clone(),
                             ollama_url: self.config.summarization_ollama_url.clone(),
-                            summarizer_context_window: 8000,
                             max_iterations: 20,
                             openrouter_api_key: self.config.openrouter_api_key.clone(),
                             openai_api_key: self.config.openai_api_key.clone(),
@@ -2549,10 +2556,15 @@ impl Agent {
             msgs
         };
 
+        let model_info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
+        let max_tokens = self.config.max_tokens.min(
+            u32::try_from(model_info.max_output_tokens).unwrap_or(u32::MAX),
+        );
+
         AnthropicRequest {
             model: self.config.model.clone(),
             messages,
-            max_tokens: self.config.max_tokens,
+            max_tokens,
             // Anthropic requires temperature=1 (or None) when thinking is enabled
             temperature: if thinking.is_some() { None } else { Some(self.config.temperature) },
             system: if system_prompt.is_empty() {

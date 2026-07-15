@@ -16,7 +16,7 @@ use crate::channels::{ChannelManager, ChannelsConfig};
 use crate::webhook::{WebhookConfig, WebhookServer, DEFAULT_WEBHOOK_PORT};
 use nanna_channels::{ChannelId, IncomingMessage, MessageContent, MessageRouter as ChannelMessageRouter, Sender as ChannelSender, TelegramChannel};
 use nanna_config::credentials::{self, SecureStore};
-use nanna_llm::{LlmClient, RequestBuilder};
+use nanna_llm::RequestBuilder;
 use nanna_memory::MemoryService;
 use nanna_tools::{
     ToolRegistry, AgentSpawner, ParentChannel, SpawnResult,
@@ -593,40 +593,29 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    /// Get the embedding dimension for the configured embedding model
-    ///
-    /// Retrieves dimension from ModelInfoCache (which queries the provider API if not cached).
-    /// Falls back to static lookup if the API doesn't provide dimension info.
-    async fn get_embedding_dimension(&self) -> usize {
-        use nanna_llm::ModelInfoCache;
-        use nanna_memory::MemoryServiceConfig;
-
-        // Create an LLM client for the embedding provider to fetch model info
-        let llm_client = match self.embedding.provider.as_str() {
+    /// Discover the embedding dimension from an actual provider response.
+    async fn get_embedding_dimension(&self) -> Result<usize, String> {
+        let client = match self.embedding.provider.as_str() {
             "openai" => {
-                let api_key = std::env::var("OPENAI_API_KEY").ok();
-                api_key.map(|key| LlmClient::openai(&key))
+                let key = std::env::var("OPENAI_API_KEY")
+                    .map_err(|_| "OPENAI_API_KEY is required for embedding discovery".to_string())?;
+                nanna_llm::EmbeddingClient::openai(&key).with_model(&self.embedding.model)
             }
-            "ollama" | _ => {
-                Some(LlmClient::ollama(&self.embedding.ollama_host))
+            "openrouter" => {
+                let key = std::env::var("OPENROUTER_API_KEY")
+                    .map_err(|_| "OPENROUTER_API_KEY is required for embedding discovery".to_string())?;
+                nanna_llm::EmbeddingClient::openai(&key)
+                    .with_model(&self.embedding.model)
+                    .with_base_url("https://openrouter.ai/api")
             }
+            _ => nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                .with_model(&self.embedding.model),
         };
-
-        let Some(client) = llm_client else {
-            // No client available, use static lookup
-            info!("No embedding client available, using static dimension lookup for {}", self.embedding.model);
-            return MemoryServiceConfig::dimension_for_model(&self.embedding.model);
-        };
-
-        // Get model info from cache or API
-        let cache = ModelInfoCache::default_location();
-        let model_info = client.get_model_info(&self.embedding.model, cache.as_ref()).await;
-
-        // Return embedding dimension from cache/API if available, otherwise fall back to static lookup
-        model_info.embedding_dimension.unwrap_or_else(|| {
-            debug!("No embedding dimension from cache/API for {}, using static lookup", self.embedding.model);
-            MemoryServiceConfig::dimension_for_model(&self.embedding.model)
-        })
+        let embedding = client.embed_one("dimension probe").await.map_err(|e| e.to_string())?;
+        if embedding.is_empty() {
+            return Err("embedding provider returned an empty vector".to_string());
+        }
+        Ok(embedding.len())
     }
 
     /// Create a new daemon server
@@ -860,10 +849,11 @@ impl DaemonServer {
                         "memory_consolidation" => {
                             if let Some(ref memory) = memory {
                                 info!("Running scheduled memory consolidation...");
+                                let summarizer_info = router.get_model_info(&summarization_model).await;
                                 let consolidation_config = scheduled_consolidation_config(
                                     consolidation_max_ratio,
                                     consolidation_min_remaining,
-                                    nanna_llm::model_context_window(&summarization_model),
+                                    summarizer_info.hard_input_limit(),
                                 );
                                 let summarize = |prompt: String| {
                                     let router = router.clone();
@@ -1555,7 +1545,9 @@ impl DaemonServer {
                     });
 
                     // Try to get embedding dimension from model info cache or API
-                    let dimension = self.get_embedding_dimension().await;
+                    let dimension = self.get_embedding_dimension().await.map_err(|e| {
+                        crate::DaemonError::Config(format!("Failed to discover embedding dimension: {e}"))
+                    })?;
                     let config = nanna_memory::MemoryServiceConfig {
                         dimension,
                         ..Default::default()

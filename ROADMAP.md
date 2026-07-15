@@ -522,6 +522,18 @@ routine should drain first.**
       GUI tool-budget path awaits `LlmClient::get_model_info`. Shared
       `ModelInfo::conversation_history_budget` owns the math. Tests assert floor semantics
       and that explicit `ModelInfo` (as an API would return) still drives small/large budgets.
+      *(2026-07-15)* **ModelInfo is the only source for model-dependent budgets.**
+      Removed remaining hardcodes that duplicated provider metadata: deleted
+      `embedding_dimension_for_model` and all name-based embedding-dimension tables
+      (API/cache metadata or a live probe embedding instead); removed
+      `ContextSummarizationConfig.summarizer_context_window` so each summarizer
+      model fetches its own `ModelInfo`; agent-loop `max_tokens` and compressor/
+      summarizer output caps clamp through `ModelInfo.max_output_tokens`; Ollama
+      / OpenRouter metadata no longer invent silent min floors or static output
+      caps (`context_window/2` only when the provider omits a completion limit);
+      AgentContext threshold defaults use `unknown_model_info` floors. Memory
+      consolidation still exposes a model-agnostic byte builder that daemon code
+      feeds from the summarizer's hard input limit.
 - [x] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
       *(2026-07-15)* In `send_message` (embedded path), a failed `run_agent_loop_with_fallback` now stores a
       partial assistant message (`_(This turn was interrupted…)_` + error) and touches the session before

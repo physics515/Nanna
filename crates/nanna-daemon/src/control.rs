@@ -1372,23 +1372,22 @@ impl ControlPlane {
                 if summarize_models.is_empty() {
                     summarize_models = cfg.llm.model_priority.clone();
                 }
-                // Size the per-cluster content budget to the summarizer model's
-                // context window so the consolidation prompt always fits it.
-                let summarizer_window = summarize_models.first().map_or(
-                    nanna_memory::FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
-                    |m| nanna_llm::model_context_window(m),
-                );
-                let config = ConsolidationConfig {
-                    max_compression_ratio: cfg.memory.max_compression_ratio,
-                    min_remaining_memories: cfg.memory.min_remaining_memories,
-                    ..ConsolidationConfig::default()
-                }
-                .with_summarizer_context_window(summarizer_window);
+                let max_compression_ratio = cfg.memory.max_compression_ratio;
+                let min_remaining_memories = cfg.memory.min_remaining_memories;
                 drop(cfg);
 
                 if summarize_models.is_empty() {
                     return json!({ "error": "no_models", "message": "No summarization or main models configured." });
                 }
+
+                // Resolve the actual summarizer before deriving consolidation limits.
+                let summarizer_info = router.get_model_info(&summarize_models[0]).await;
+                let config = ConsolidationConfig {
+                    max_compression_ratio,
+                    min_remaining_memories,
+                    ..ConsolidationConfig::default()
+                }
+                .with_summarizer_context_window(summarizer_info.hard_input_limit());
 
                 info!("Consolidation summarization priority: {:?}", summarize_models);
 

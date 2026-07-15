@@ -202,7 +202,7 @@ pub fn unknown_model_info(model: &str, provider: &str) -> ModelInfo {
         max_output_tokens: UNKNOWN_MAX_OUTPUT_TOKENS,
         supports_tools: true,
         supports_vision: false,
-        embedding_dimension: embedding_dimension_for_model(model),
+        embedding_dimension: None,
         cached_at: current_timestamp(),
         provider: provider.to_string(),
     }
@@ -211,60 +211,6 @@ pub fn unknown_model_info(model: &str, provider: &str) -> ModelInfo {
 /// Alias kept for local fetch_* fallbacks — one floor, not a model table.
 fn default_model_info(model: &str, provider: &str) -> ModelInfo {
     unknown_model_info(model, provider)
-}
-
-/// Get embedding dimension for known embedding models (fallback when API doesn't provide)
-/// Returns None if the model is not a known embedding model
-pub fn embedding_dimension_for_model(model: &str) -> Option<usize> {
-    let model_lower = model.to_lowercase();
-
-    // OpenAI embedding models
-    if model_lower.contains("text-embedding-3-large") {
-        return Some(3072);
-    }
-    if model_lower.contains("text-embedding-3-small") {
-        return Some(1536);
-    }
-    if model_lower.contains("text-embedding-ada") || model_lower.contains("ada-002") {
-        return Some(1536);
-    }
-
-    // BGE models (BAAI)
-    if model_lower.contains("bge-large") {
-        return Some(1024);
-    }
-    if model_lower.contains("bge-m3") {
-        return Some(1024);
-    }
-    if model_lower.contains("bge-small") {
-        return Some(384);
-    }
-    if model_lower.contains("bge-base") {
-        return Some(768);
-    }
-
-    // MxBai models
-    if model_lower.contains("mxbai-embed") {
-        return Some(1024);
-    }
-
-    // MiniLM models
-    if model_lower.contains("minilm") {
-        return Some(384);
-    }
-
-    // Nomic models
-    if model_lower.contains("nomic-embed") {
-        return Some(768);
-    }
-
-    // Jina models
-    if model_lower.contains("jina-embed") {
-        return Some(768);
-    }
-
-    // Not a known embedding model
-    None
 }
 
 /// File-based cache for model information
@@ -1284,23 +1230,23 @@ impl LlmClient {
 
         let api_response: OllamaShowResponse = response.json().await?;
 
-        // Try to extract context_length and embedding_length from model_info.
-        // Ollama models often report a small default context (e.g. 8K) even though
-        // they support much more.  We floor at 32K so the agent has room to work.
-        // The actual context is set via num_ctx in each request.
-        const OLLAMA_MIN_CONTEXT: usize = 32_768;
+        // Use the model metadata verbatim. In particular, do not silently raise
+        // a local model's configured context window above what Ollama reports.
+        let defaults = default_model_info(model, "ollama");
         let (context_window, embedding_dimension) = match api_response.model_info {
             Some(info) => (
-                info.context_length.unwrap_or(OLLAMA_MIN_CONTEXT).max(OLLAMA_MIN_CONTEXT),
-                info.embedding_length.or_else(|| embedding_dimension_for_model(model)),
+                info.context_length.unwrap_or(defaults.context_window),
+                info.embedding_length,
             ),
-            None => (OLLAMA_MIN_CONTEXT, embedding_dimension_for_model(model)),
+            None => (defaults.context_window, None),
         };
 
         Ok(ModelInfo {
             id: model.to_string(),
             context_window,
-            max_output_tokens: 4096,
+            // Ollama does not publish a distinct output cap. Derive the safe
+            // generation budget from this model's reported total window.
+            max_output_tokens: context_window / 2,
             supports_tools: true, // Ollama v0.5+ supports tool calling
             supports_vision: false,
             embedding_dimension,
@@ -1356,10 +1302,10 @@ impl LlmClient {
                     .top_provider
                     .as_ref()
                     .and_then(|p| p.max_completion_tokens)
-                    .unwrap_or(4096),
+                    .unwrap_or_else(|| m.context_length.unwrap_or(UNKNOWN_CONTEXT_WINDOW) / 2),
                 supports_tools: true, // OpenRouter usually routes to capable models
                 supports_vision: false,
-                embedding_dimension: embedding_dimension_for_model(model),
+                embedding_dimension: None,
                 cached_at: current_timestamp(),
                 provider: "openrouter".to_string(),
             });
