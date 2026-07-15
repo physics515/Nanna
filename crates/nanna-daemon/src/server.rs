@@ -1023,6 +1023,11 @@ impl DaemonServer {
             info!("Stats-informed routing enabled on LLM router");
         }
 
+        // Shared channel status manager — attached before the Arc wrap so
+        // ChannelAction::Status and ChannelManager listeners see the same state.
+        let channel_status_manager = Arc::new(nanna_channels::StatusManager::new());
+        control.set_status_manager(Arc::clone(&channel_status_manager));
+
         let control = Arc::new(control);
         
         // Take the request receiver from IPC server
@@ -1083,7 +1088,10 @@ impl DaemonServer {
             // We re-map from nanna_config types to the daemon-local types.
             let daemon_channels = build_daemon_channels_config(channels_config);
 
-            let mut manager = ChannelManager::new(Arc::clone(&control));
+            let mut manager = ChannelManager::with_status_manager(
+                Arc::clone(&control),
+                Arc::clone(&channel_status_manager),
+            );
             manager.configure(&daemon_channels).await;
 
             // Also register outbound channels for webhook-sourced providers that have
