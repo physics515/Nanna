@@ -2231,8 +2231,7 @@ async fn run_agent_loop(
 
         // Emit "started" events for all tools and track in run state
         for pending in &pending_tool_calls {
-            let input: serde_json::Value = serde_json::from_str(&pending.input_json)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let input: serde_json::Value = nanna_llm::heal_tool_args(&pending.input_json);
 
             // Track active tool call in embedded run state
             if let Ok(mut active) = active_tool_calls_state.try_write() {
@@ -2275,8 +2274,7 @@ async fn run_agent_loop(
                 let input_json = pending.input_json.clone();
 
                 async move {
-                    let input: serde_json::Value = serde_json::from_str(&input_json)
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    let input: serde_json::Value = nanna_llm::heal_tool_args(&input_json);
 
                     let start = std::time::Instant::now();
                     let params: HashMap<String, serde_json::Value> = match &input {
@@ -2410,8 +2408,7 @@ async fn run_agent_loop(
             });
         }
         for pending in &pending_tool_calls {
-            let input: serde_json::Value = serde_json::from_str(&pending.input_json)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let input: serde_json::Value = nanna_llm::heal_tool_args(&pending.input_json);
             assistant_content.push(nanna_llm::ContentBlock::ToolUse {
                 id: pending.id.clone(),
                 name: pending.name.clone(),

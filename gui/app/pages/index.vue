@@ -691,16 +691,26 @@ async function stopSession() {
       sessionId: currentSession.value.id,
     })
     if (cancelled) {
-      // Append cancellation note to streaming content
-      if (streamingContent.value) {
-        streamingContent.value += '\n\n[Stopped by user]'
+      // Annex a stop marker on the live bubble, but leave isStreaming true so the
+      // daemon's MessageEnd (which now carries preserved partial content) can
+      // promote it into a real assistant message without races/duplicates.
+      // The agent loop persists the same text into session + model context.
+      if (streamingContent.value && !streamingContent.value.includes('[Stopped by user]') && !streamingContent.value.includes('[Cancelled by user]')) {
+        streamingContent.value += '
+
+[Stopped by user]'
+      } else if (!streamingContent.value && !streamingThinking.value) {
+        // No tokens yet — leave a breadcrumb so the bubble isn't empty
+        streamingContent.value = '[Stopped by user]'
+        isStreaming.value = true
       }
-      clearStreamingState()
+      // Do NOT call clearStreamingState here — that was wiping unfinished work.
     }
   } catch (e) {
     console.error('Failed to cancel session:', e)
   }
 }
+
 
 // Injected from layout for workspace-aware session creation
 const currentTab = inject<Ref<{ type: string; workspaceId?: string }>>('currentTab', ref({ type: 'global' }))

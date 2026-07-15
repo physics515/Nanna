@@ -727,10 +727,10 @@ Output ONLY valid JSON, no markdown or explanation."#,
                 .with_message(nanna_llm::Message::user(&decomposition_prompt))
         ).await.map_err(AgentError::Llm)?;
 
-        // Parse the JSON response
-        let parsed: serde_json::Value = serde_json::from_str(&response)
-            .map_err(|e| AgentError::Llm(nanna_llm::LlmError::Stream(
-                format!("Failed to parse decomposition: {}", e)
+        // Parse (and heal) the JSON response — free models often wrap/garble it
+        let parsed: serde_json::Value = nanna_llm::heal_json(&response)
+            .ok_or_else(|| AgentError::Llm(nanna_llm::LlmError::Stream(
+                "Failed to parse decomposition JSON even after healing".to_string()
             )))?;
 
         let subtasks: Vec<Subtask> = parsed.get("subtasks")
