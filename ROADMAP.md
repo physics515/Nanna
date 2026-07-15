@@ -173,7 +173,7 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Add Start Menu / tray / launch-at-login support.
 - [ ] WebView2 handling on Windows.
 - [ ] Document uninstall process.
-- [ ] Add "check for updates" or auto-update mechanism 
+- [ ] Add "check for updates" or auto-update mechanism
 
 #### P0.1 - First Run UX
 - [ ] Create public facing website / Github Pages
@@ -236,7 +236,7 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
 vector store + conversation memory, LLM clients (Anthropic/OpenAI/OpenRouter/Ollama) with streaming +
-tool calling, agent loop with context management, scheduler (heartbeats, cron). 
+tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Onboarding writes API keys to plaintext config.toml (src/onboarding.rs), even though a SecureStore using OS keyring exists. The OS keychain should be the default path; TOML config should store only non-secret settings.
 - [ ] SecureStore file fallback is plaintext JSON (mode 0600), not encrypted — the module comment misleadingly says "encrypted file storage." Fix the comment or implement real AES-GCM encryption with an OS-protected key.
 - [ ] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
@@ -484,7 +484,7 @@ routine should drain first.**
 
 **Correctness bugs:**
 - [ ] when the user presses the "Stop" button and interrupts a models work all contexts from unfinished work is lost. it should be kept in both the UI and in the models context.
-- [x] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama). *(2026-07-06: the **daemon** already infers correctly via `ProviderId::from_model` + unit tests. 2026-07-14: **GUI** `parse_model_id` now matches — explicit `openrouter/`/`github/`/`ollama/`/`openai/`/`anthropic/` prefixes first, then family-prefix inference (`gpt-*`/`o1`/`o3`→openai, `claude*`→anthropic, `:tag`→ollama), historical Anthropic default for unknowns. 2 unit tests.)* 
+- [x] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama). *(2026-07-06: the **daemon** already infers correctly via `ProviderId::from_model` + unit tests. 2026-07-14: **GUI** `parse_model_id` now matches — explicit `openrouter/`/`github/`/`ollama/`/`openai/`/`anthropic/` prefixes first, then family-prefix inference (`gpt-*`/`o1`/`o3`→openai, `claude*`→anthropic, `:tag`→ollama), historical Anthropic default for unknowns. 2 unit tests.)*
 - [x] **Atomic memory persistence** — `save_memories` writes in place; a crash mid-write corrupts the store. Use `tempfile` → write → `fs::rename`.
       *(2026-07-06) `VectorStore::save` now writes to a sibling `.json.tmp` and `fs::rename`s it over the target (atomic on the same filesystem), so a crash mid-write can't leave a truncated store. Test: save→load round-trips and no temp file is left behind. (This JSON path is the deprecated JSON→Turso migration writer; the live path is Turso write-through.)*
 - [x] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
@@ -509,11 +509,18 @@ routine should drain first.**
       crates); 18 nanna-llm + 53 nanna-agent tests green, **−1 clippy warning** in each crate, full workspace
       builds green.
       *(2026-07-15)* Closed the remaining GUI-embedded slice. `gui/src-tauri/src/lib.rs`: added
-      `conversation_token_budget(model)` that mirrors `ModelInfo::hard_input_limit` (context − max_output,
+      `conversation_token_budget(_for)` that mirrors `ModelInfo::hard_input_limit` (context − max_output,
       floor 50% of context), then reserves system+response tokens and floors at 2k so history never empties.
-      `truncate_context` now takes that budget instead of the hardcoded 132k. `model_context_limit` aligned
-      with agent defaults (plain `gpt-4` → 8k, llama-3.1/3.2 → 128k, unknown → 32k). Removed unused
-      `TARGET_CONTEXT_TOKENS` / `MAX_CONVERSATION_TOKENS`. 4 new unit tests cover small/large/gpt-4 family.
+      `truncate_context` takes that budget instead of the hardcoded 132k. Removed unused
+      `TARGET_CONTEXT_TOKENS` / `MAX_CONVERSATION_TOKENS`.
+      *(2026-07-15 follow-up)* **No per-model context table anywhere.** Provider APIs / disk
+      `ModelInfoCache` are the source of truth; when neither is available, a single universal
+      floor (`UNKNOWN_CONTEXT_WINDOW` = 32k / `UNKNOWN_MAX_OUTPUT_TOKENS` = 4k) applies to every
+      name. Deleted the name-match tables in GUI, `nanna-llm::default_model_info`,
+      `AgentContext::configure_for_model_name`, and the daemon router missing-client path.
+      GUI tool-budget path awaits `LlmClient::get_model_info`. Shared
+      `ModelInfo::conversation_history_budget` owns the math. Tests assert floor semantics
+      and that explicit `ModelInfo` (as an API would return) still drives small/large budgets.
 - [x] Orphaned-message on failure — embedded mode stores the user message before the loop; a mid-loop failure leaves no assistant reply. Store a partial error message instead.
       *(2026-07-15)* In `send_message` (embedded path), a failed `run_agent_loop_with_fallback` now stores a
       partial assistant message (`_(This turn was interrupted…)_` + error) and touches the session before

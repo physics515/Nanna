@@ -23,7 +23,7 @@ use nanna_core::{
     Scheduler, SchedulerConfig, consolidation_task,
     MemoryService, MemoryServiceConfig, ConsolidationConfig,
     // Workspaces
-    Workspace, WorkspaceRegistry, 
+    Workspace, WorkspaceRegistry,
     find_workspace_root, discover_workspaces,
 };
 use nanna_llm::{AnthropicMessage, CompletionRequest, LlmClient, Message as LlmMessage, ModelInfoCache, RequestBuilder, Role, StreamEvent};
@@ -59,31 +59,31 @@ async fn route_to_channel(
     if parts.len() != 2 {
         return Err(format!("Invalid channel_id format '{}', expected 'provider:chat_id'", channel_id));
     }
-    
+
     let (provider, chat_id) = (parts[0], parts[1]);
-    
+
     match provider.to_lowercase().as_str() {
         "telegram" => {
             let config = channels.telegram.as_ref()
                 .ok_or("Telegram not configured")?;
-            
+
             let channel = nanna_channels::TelegramChannel::new(&config.bot_token);
             let outgoing = OutgoingMessage {
                 channel: ChannelId::new("telegram", chat_id),
                 content: MessageContent::text(message),
                 reply_to: None,
             };
-            
+
             channel.send(outgoing).await
                 .map_err(|e| format!("Telegram send failed: {}", e))?;
-            
+
             info!("Routed message to Telegram chat {}", chat_id);
             Ok(())
         }
         "discord" => {
             let config = channels.discord.as_ref()
                 .ok_or("Discord not configured")?;
-            
+
             let channel = nanna_channels::DiscordChannel::new(
                 &config.bot_token,
                 &config.application_id,
@@ -93,34 +93,34 @@ async fn route_to_channel(
                 content: MessageContent::text(message),
                 reply_to: None,
             };
-            
+
             channel.send(outgoing).await
                 .map_err(|e| format!("Discord send failed: {}", e))?;
-            
+
             info!("Routed message to Discord channel {}", chat_id);
             Ok(())
         }
         "slack" => {
             let config = channels.slack.as_ref()
                 .ok_or("Slack not configured")?;
-            
+
             let channel = nanna_channels::SlackChannel::new(&config.bot_token);
             let outgoing = OutgoingMessage {
                 channel: ChannelId::new("slack", chat_id),
                 content: MessageContent::text(message),
                 reply_to: None,
             };
-            
+
             channel.send(outgoing).await
                 .map_err(|e| format!("Slack send failed: {}", e))?;
-            
+
             info!("Routed message to Slack channel {}", chat_id);
             Ok(())
         }
         "signal" => {
             let config = channels.signal.as_ref()
                 .ok_or("Signal not configured")?;
-            
+
             // SignalChannel::new takes the phone number (account)
             let channel = nanna_channels::SignalChannel::new(&config.phone_number);
             let outgoing = OutgoingMessage {
@@ -128,33 +128,33 @@ async fn route_to_channel(
                 content: MessageContent::text(message),
                 reply_to: None,
             };
-            
+
             channel.send(outgoing).await
                 .map_err(|e| format!("Signal send failed: {}", e))?;
-            
+
             info!("Routed message to Signal {}", chat_id);
             Ok(())
         }
         "whatsapp" => {
             let config = channels.whatsapp.as_ref()
                 .ok_or("WhatsApp not configured")?;
-            
+
             // Only Cloud API is supported for outbound
             let access_token = config.access_token.as_ref()
                 .ok_or("WhatsApp access_token not configured")?;
             let phone_number_id = config.phone_number_id.as_ref()
                 .ok_or("WhatsApp phone_number_id not configured")?;
-            
+
             let channel = nanna_channels::WhatsAppChannel::new(access_token, phone_number_id);
             let outgoing = OutgoingMessage {
                 channel: ChannelId::new("whatsapp", chat_id),
                 content: MessageContent::text(message),
                 reply_to: None,
             };
-            
+
             channel.send(outgoing).await
                 .map_err(|e| format!("WhatsApp send failed: {}", e))?;
-            
+
             info!("Routed message to WhatsApp {}", chat_id);
             Ok(())
         }
@@ -282,64 +282,25 @@ impl nanna_tools::MemoryStorage for MemoryServiceAdapter {
 // Intelligent Context Budget Allocation
 // =============================================================================
 
-/// Model-specific context limits (in tokens).
-/// Nested matches keep larger families ahead of their smaller substrings so e.g.
-/// `"gpt-4-turbo"` is not truncated by the generic `"gpt-4"` arm (8k).
-fn model_context_limit(model: &str) -> usize {
-    match model {
-        // Anthropic Claude 4 models
-        m if m.contains("claude-opus-4") => 200_000,
-        m if m.contains("claude-sonnet-4") => 200_000,
-        // Anthropic Claude 3.5 / 3 models
-        m if m.contains("claude-3-5") => 200_000,
-        m if m.contains("claude-3-opus") => 200_000,
-        m if m.contains("claude-3-sonnet") => 200_000,
-        m if m.contains("claude-3-haiku") => 200_000,
-        m if m.contains("claude") => 200_000,
-        // OpenAI models — larger first so "gpt-4o"/"turbo" win over bare "gpt-4"
-        m if m.contains("gpt-4o") => 128_000,
-        m if m.contains("gpt-4-turbo") => 128_000,
-        // Plain gpt-4 is 8k (matches nanna-agent/nanna-llm defaults)
-        m if m.contains("gpt-4") => 8_000,
-        m if m.contains("o1") || m.contains("o3") => 200_000,
-        // Google Gemini
-        m if m.contains("gemini-2") => 1_000_000,
-        m if m.contains("gemini-1.5") => 1_000_000,
-        m if m.contains("gemini") => 128_000,
-        // Ollama / local models
-        m if m.contains("llama-3.1") || m.contains("llama-3.2") => 128_000,
-        m if m.contains("mistral-large") => 128_000,
-        m if m.contains("llama") => 32_000,
-        m if m.contains("mistral") => 32_000,
-        m if m.contains("qwen") => 32_000,
-        // Default: small-model conservative (mirrors AgentContext::configure_for_model_name)
-        _ => 32_000,
-    }
-}
-
-/// Default max_output_tokens when we only have a model name.
-fn model_default_max_output(model: &str) -> usize {
-    match model {
-        m if m.contains("claude") => 8192,
-        _ => 4096,
-    }
-}
-
-/// Conversation-token budget for history truncation, model-aware.
+/// Resolve model limits from cache (prior API fetch) or the universal unknown floor.
 ///
-/// Mirrors `ModelInfo::hard_input_limit` (floor at 50% of context so a large
-/// max_output cannot zero the budget) then reserves system + response headroom.
-/// Replaces the historical hardcoded `MAX_CONVERSATION_TOKENS` (132k), which gave
-/// a 32k Ollama model more room than it actually has.
-fn conversation_token_budget(model: &str) -> usize {
-    let context_window = model_context_limit(model);
-    let max_output = model_default_max_output(model);
-    // hard input = context − output, floored at 50% of context
-    let hard_limit = context_window.saturating_sub(max_output).max(context_window / 2);
-    // leave room for system prompt + reserved response tokens
-    let reserved = SYSTEM_RESERVED_TOKENS + RESPONSE_RESERVED_TOKENS;
-    // keep a small floor so truncation never completely empties history
-    hard_limit.saturating_sub(reserved).max(2_000)
+/// No per-model name table — windows change constantly. Prefer an async
+/// `LlmClient::get_model_info` path (inside the agent loop) so providers are
+/// queried and the disk cache is warmed.
+fn resolve_model_info_sync(model: &str) -> nanna_llm::ModelInfo {
+    nanna_llm::model_info_from_cache_or_unknown(model, "")
+}
+
+/// Conversation-token budget for history truncation from a resolved model.
+///
+/// Mirrors `ModelInfo::hard_input_limit` then reserves system + response headroom.
+/// Replaces the historical hardcoded `MAX_CONVERSATION_TOKENS` (132k).
+fn conversation_token_budget_for(info: &nanna_llm::ModelInfo) -> usize {
+    info.conversation_history_budget(
+        SYSTEM_RESERVED_TOKENS,
+        RESPONSE_RESERVED_TOKENS,
+        2_000,
+    )
 }
 
 /// Rough estimate: ~4 characters per token
@@ -352,7 +313,7 @@ fn smart_truncate_tool_result(content: &str, tool_name: &str, budget_chars: usiz
     if content.len() <= budget_chars {
         return content.to_string();
     }
-    
+
     // Apply tool-specific truncation strategies
     match tool_name {
         "read_file" => truncate_code_content(content, budget_chars),
@@ -367,29 +328,29 @@ fn smart_truncate_tool_result(content: &str, tool_name: &str, budget_chars: usiz
 fn truncate_code_content(content: &str, budget_chars: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
-    
+
     // For small files, just do generic truncation
     if total_lines <= 200 || content.len() <= budget_chars * 2 {
         return truncate_generic(content, budget_chars);
     }
-    
+
     // Calculate how many lines we can show (rough estimate)
     let avg_line_len = content.len() / total_lines;
     let target_lines = budget_chars / avg_line_len.max(1);
     let head_lines = target_lines * 2 / 3; // 2/3 for head
     let tail_lines = target_lines / 3;      // 1/3 for tail
-    
+
     let head_lines = head_lines.min(total_lines / 2).max(20);
     let tail_lines = tail_lines.min(total_lines / 2).max(10);
-    
+
     if head_lines + tail_lines >= total_lines {
         return truncate_generic(content, budget_chars);
     }
-    
+
     let head = lines[..head_lines].join("\n");
     let tail = lines[total_lines - tail_lines..].join("\n");
     let omitted = total_lines - head_lines - tail_lines;
-    
+
     format!(
         "{}\n\n... [{} lines omitted - showing first {} and last {} of {} total lines] ...\n\n{}",
         head, omitted, head_lines, tail_lines, total_lines, tail
@@ -400,28 +361,28 @@ fn truncate_code_content(content: &str, budget_chars: usize) -> String {
 fn truncate_command_output(content: &str, budget_chars: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
-    
+
     if content.len() <= budget_chars {
         return content.to_string();
     }
-    
+
     // For command output, tail is usually more important
     let avg_line_len = content.len() / total_lines.max(1);
     let target_lines = budget_chars / avg_line_len.max(1);
     let head_lines = target_lines / 4;      // 1/4 for head (context)
     let tail_lines = target_lines * 3 / 4;  // 3/4 for tail (results)
-    
+
     let head_lines = head_lines.min(50).max(5);
     let tail_lines = tail_lines.min(total_lines - head_lines).max(20);
-    
+
     if head_lines + tail_lines >= total_lines {
         return truncate_generic(content, budget_chars);
     }
-    
+
     let head = lines[..head_lines].join("\n");
     let tail = lines[total_lines - tail_lines..].join("\n");
     let omitted = total_lines - head_lines - tail_lines;
-    
+
     format!(
         "{}\n\n... [{} lines of output omitted] ...\n\n{}",
         head, omitted, tail
@@ -433,27 +394,27 @@ fn truncate_web_content(content: &str, budget_chars: usize) -> String {
     if content.len() <= budget_chars {
         return content.to_string();
     }
-    
+
     // Web content: prioritize beginning (usually has summary/intro)
     // and a bit of the end (conclusions)
     let head_budget = budget_chars * 4 / 5;
     let tail_budget = budget_chars / 5;
-    
+
     let head = if content.len() > head_budget {
         &content[..head_budget]
     } else {
         content
     };
-    
+
     let tail = if content.len() > budget_chars {
         let tail_start = content.len().saturating_sub(tail_budget);
         &content[tail_start..]
     } else {
         ""
     };
-    
+
     let omitted = content.len().saturating_sub(head_budget + tail_budget);
-    
+
     if omitted > 0 && !tail.is_empty() {
         format!(
             "{}\n\n... [{} chars omitted] ...\n\n{}",
@@ -470,7 +431,7 @@ fn truncate_search_results(content: &str, budget_chars: usize) -> String {
     if content.len() <= budget_chars {
         return content.to_string();
     }
-    
+
     // Simple approach: truncate from the end but try to keep structure
     truncate_generic(content, budget_chars)
 }
@@ -480,16 +441,16 @@ fn truncate_generic(content: &str, budget_chars: usize) -> String {
     if content.len() <= budget_chars {
         return content.to_string();
     }
-    
+
     // Find a good break point (newline or space) near the budget
     let break_point = content[..budget_chars]
         .rfind('\n')
         .or_else(|| content[..budget_chars].rfind(' '))
         .unwrap_or(budget_chars);
-    
+
     let truncated = &content[..break_point];
     let removed = content.len() - break_point;
-    
+
     format!(
         "{}\n\n[... {} chars truncated ...]",
         truncated, removed
@@ -509,25 +470,25 @@ fn truncate_context(
 ) -> Vec<nanna_storage::Message> {
     let mut result = Vec::new();
     let mut total_tokens = 0;
-    
+
     // Process from newest to oldest (reverse), keeping messages that fit
     for msg in messages.iter().rev() {
         let truncated_content = truncate_message(&msg.content, MAX_MESSAGE_CHARS);
         let msg_tokens = estimate_tokens(&truncated_content);
-        
+
         if total_tokens + msg_tokens > max_tokens {
             // Budget exceeded - stop adding older messages
             break;
         }
-        
+
         total_tokens += msg_tokens;
-        
+
         // Clone the message with potentially truncated content
         let mut truncated_msg = msg.clone();
         truncated_msg.content = truncated_content;
         result.push(truncated_msg);
     }
-    
+
     // Reverse back to chronological order
     result.reverse();
     result
@@ -556,61 +517,61 @@ fn allocate_tool_budgets(entries: &[ToolResultEntry], total_budget_tokens: usize
     if n == 0 {
         return vec![];
     }
-    
+
     let total_budget_chars = total_budget_tokens * 4;
     let total_raw: usize = entries.iter().map(|e| e.raw_tokens).sum();
     let total_raw_chars = total_raw * 4;
-    
+
     // If everything fits, no truncation needed
     if total_raw_chars <= total_budget_chars {
         return entries.iter().map(|e| e.content.len()).collect();
     }
-    
+
     // Calculate minimum floor per tool
     let floor_per_tool = MIN_TOOL_RESULT_CHARS;
     let total_floor = floor_per_tool * n;
-    
+
     // If we can't even give minimums, distribute equally
     if total_budget_chars <= total_floor {
         let per_tool = total_budget_chars / n;
         return vec![per_tool.max(500); n]; // Absolute minimum 500 chars
     }
-    
+
     // Distributable budget after floors
     let distributable = total_budget_chars - total_floor;
-    
+
     // Calculate weights: base weight from size + recency bonus
     let max_recency = entries.iter().map(|e| e.recency_index).max().unwrap_or(0) as f64;
-    
+
     let weights: Vec<f64> = entries.iter().map(|e| {
         // Base weight from original size (proportional)
         let size_weight = (e.raw_tokens as f64) / (total_raw as f64).max(1.0);
-        
+
         // Recency bonus: most recent gets up to 20% boost
         let recency_factor = if max_recency > 0.0 {
             1.0 + 0.2 * (e.recency_index as f64 / max_recency)
         } else {
             1.0
         };
-        
+
         size_weight * recency_factor
     }).collect();
-    
+
     // Normalize weights
     let weight_sum: f64 = weights.iter().sum();
     let normalized: Vec<f64> = weights.iter().map(|w| w / weight_sum.max(0.001)).collect();
-    
+
     // Allocate: floor + proportional share
     let mut allocations: Vec<usize> = normalized.iter().map(|w| {
         let extra = (distributable as f64 * w) as usize;
         floor_per_tool + extra
     }).collect();
-    
+
     // Cap allocations at actual content size (don't allocate more than needed)
     for (i, entry) in entries.iter().enumerate() {
         allocations[i] = allocations[i].min(entry.content.len());
     }
-    
+
     allocations
 }
 
@@ -903,12 +864,12 @@ async fn fit_tool_results_to_budget_with_summarization(
 /// Estimate tokens used by a CompletionRequest (for dynamic budget calculation)
 fn estimate_request_tokens(request: &nanna_llm::CompletionRequest) -> usize {
     let mut total = 0;
-    
+
     // Message tokens (includes system message with Role::System)
     for msg in &request.messages {
         total += estimate_tokens(&msg.content);
     }
-    
+
     // Anthropic message tokens (tool use blocks are larger)
     for msg in &request.anthropic_messages {
         for block in &msg.content {
@@ -930,28 +891,29 @@ fn estimate_request_tokens(request: &nanna_llm::CompletionRequest) -> usize {
             };
         }
     }
-    
+
     // Tool definitions overhead (~100 tokens per tool)
     total += request.tools.len() * 100;
-    
+
     total
 }
 
-/// Calculate dynamic tool budget from a CompletionRequest
-fn calculate_dynamic_tool_budget(request: &nanna_llm::CompletionRequest) -> usize {
-    let model = &request.model;
-    let total_limit = model_context_limit(model);
+/// Calculate dynamic tool budget from a CompletionRequest + resolved model limits.
+fn calculate_dynamic_tool_budget(
+    request: &nanna_llm::CompletionRequest,
+    model_info: &nanna_llm::ModelInfo,
+) -> usize {
+    let total_limit = model_info.context_window;
     let used = estimate_request_tokens(request);
     let response_reserve = RESPONSE_RESERVED_TOKENS;
-    
+
     let available = total_limit.saturating_sub(used).saturating_sub(response_reserve);
-    
-    // Log the calculation
+
     debug!(
         "Dynamic tool budget: model={}, limit={}, used={}, reserve={}, available={}",
-        model, total_limit, used, response_reserve, available
+        request.model, total_limit, used, response_reserve, available
     );
-    
+
     // Return at least a minimum budget to avoid degenerate cases
     available.max(10_000) // At least 10k tokens for tools
 }
@@ -1251,7 +1213,7 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
     let lower = error_msg.to_lowercase();
     // Check for our RECOVERABLE: prefix (mid-stream errors)
     error_msg.starts_with("RECOVERABLE:")
-        || lower.contains("rate_limit") 
+        || lower.contains("rate_limit")
         || lower.contains("rate limit")
         || lower.contains("429")
         || lower.contains("529")  // Anthropic overloaded
@@ -1263,7 +1225,7 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 fn parse_retry_after_from_error(error_msg: &str) -> Option<u64> {
     // Try to find "retry after X" or "retry-after: X" patterns
     let lower = error_msg.to_lowercase();
-    
+
     // Pattern: "retry after 30 seconds" or "retry-after: 30"
     for pattern in ["retry after ", "retry-after: ", "retry-after:", "wait "] {
         if let Some(pos) = lower.find(pattern) {
@@ -1278,7 +1240,7 @@ fn parse_retry_after_from_error(error_msg: &str) -> Option<u64> {
             }
         }
     }
-    
+
     None
 }
 
@@ -1295,9 +1257,9 @@ async fn send_message_daemon(
     attachments: Vec<serde_json::Value>,
 ) -> Result<ChatMessage, String> {
     use tracing::info;
-    
+
     info!("send_message_daemon: session={}, message={}", session_id, &message[..message.len().min(50)]);
-    
+
     // Send to daemon via backend client
     let result = match state.backend.chat_send(&session_id, &message, attachments).await {
         Ok(r) => {
@@ -1309,22 +1271,22 @@ async fn send_message_daemon(
             return Err(format!("Daemon error: {}", e));
         }
     };
-    
+
     // Daemon handles everything (streaming, tools, storage)
     // Events are forwarded to frontend via backend event forwarder
     // Just parse and return the result
-    
+
     // Check for error first
     if let Some(_error) = result.get("error") {
-        return Err(format!("Daemon error: {}", 
+        return Err(format!("Daemon error: {}",
             result.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")));
     }
-    
+
     let content = result.get("content")
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("Invalid response format: {:?}", result))?
         .to_string();
-    
+
     let tool_calls = result.get("tool_calls")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -1341,7 +1303,7 @@ async fn send_message_daemon(
             }).collect()
         })
         .unwrap_or_default();
-    
+
     Ok(ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: "assistant".to_string(),
@@ -1362,7 +1324,7 @@ async fn send_message(
     attachments: Option<Vec<serde_json::Value>>,
 ) -> Result<ChatMessage, String> {
     info!("🚀 send_message called! session={}, message_len={}", session_id, message.len());
-    
+
     let state_guard = state.read().await;
 
     // Check if we're in daemon mode - if so, route through daemon
@@ -1399,30 +1361,30 @@ async fn send_message(
     // =========================================================================
     // MEMORY RECALL: Retrieve relevant memories before responding
     // =========================================================================
-    
+
     // Get active workspace ID for scoped memory recall
     let active_workspace_id = {
         let registry = state_guard.workspaces.read().await;
         registry.active().map(|ws| ws.id.clone())
     };
-    
+
     let memory_count = state_guard.memory.count().await;
-    info!("Memory recall: searching {} memories for query: '{}' (workspace: {:?})", 
+    info!("Memory recall: searching {} memories for query: '{}' (workspace: {:?})",
           memory_count, message.chars().take(50).collect::<String>(), active_workspace_id);
-    
+
     // Use scoped recall - workspace sees global + own, global sees all
     let memory_context = match state_guard.memory.recall_scoped(&message, active_workspace_id.as_deref()).await {
         Ok(recalled) if !recalled.is_empty() => {
             // Apply FSRS testing effect - recalling strengthens memories
             state_guard.memory.apply_pending_updates().await;
-            
+
             // Separate stated facts (user said) from observations (model inferred)
             let mut stated_facts = Vec::new();
             let mut observations = Vec::new();
-            
+
             for m in recalled.iter().take(5) {
                 let fact_type = m.metadata.get("fact_type").map(|s| s.as_str()).unwrap_or("stated");
-                info!("  Recalled [{}]: {} (score: {:.3}, weight: {:.3})", 
+                info!("  Recalled [{}]: {} (score: {:.3}, weight: {:.3})",
                       fact_type, m.content.chars().take(40).collect::<String>(), m.score, m.weight);
                 if fact_type == "observed" {
                     observations.push(format!("• [observation] {}", m.content));
@@ -1430,7 +1392,7 @@ async fn send_message(
                     stated_facts.push(format!("• {}", m.content));
                 }
             }
-            
+
             let mut memory_text = String::new();
             if !stated_facts.is_empty() {
                 memory_text.push_str("**Things they told you:**\n");
@@ -1443,7 +1405,7 @@ async fn send_message(
                 memory_text.push_str("**Your observations (use with less certainty):**\n");
                 memory_text.push_str(&observations.join("\n"));
             }
-            
+
             info!("Recalled {} memories for context (FSRS updated)", recalled.len());
             format!(
                 "\n\n## Remembered Context (EXHAUSTIVE LIST - do not invent additional facts)\n{}\n\n(End of memories. Do not fabricate anything not listed above.)",
@@ -1508,7 +1470,7 @@ You have tools at your disposal — extensions of your will into the digital rea
 ## Memory
 You have a cognitive memory system that stores facts from previous conversations.
 
-IMPORTANT: Your memory contains ONLY the specific facts listed below in "Remembered Context". 
+IMPORTANT: Your memory contains ONLY the specific facts listed below in "Remembered Context".
 Do NOT fabricate, invent, or hallucinate additional memories. If something isn't listed, you don't know it.
 When asked what you know about someone, list ONLY the facts from memory — nothing more.
 
@@ -1525,12 +1487,13 @@ Be concise. Be useful. Be present.{}
     );
     request = request.with_message(nanna_llm::Message::system(&system_prompt));
 
-    // Add history with context truncation
-    // Model-aware conversation budget (replaces hardcoded 132k).
-    let history_budget = conversation_token_budget(&state_guard.config.llm.model);
+    // Add history with context truncation. Prefer disk-cached API model limits;
+    // fall back only to the universal floor (no per-model name table).
+    let history_model_info = resolve_model_info_sync(&state_guard.config.llm.model);
+    let history_budget = conversation_token_budget_for(&history_model_info);
     debug!(
-        "History truncation budget: model={}, budget={} tokens",
-        state_guard.config.llm.model, history_budget
+        "History truncation budget: model={}, context={}, budget={} tokens",
+        state_guard.config.llm.model, history_model_info.context_window, history_budget
     );
     let truncated_history = truncate_context(&history, history_budget);
     for msg in &truncated_history {
@@ -1541,7 +1504,7 @@ Be concise. Be useful. Be present.{}
         };
         request = request.with_message(llm_msg);
     }
-    
+
     if truncated_history.len() < history.len() {
         debug!("Context truncated: {} -> {} messages", history.len(), truncated_history.len());
     }
@@ -1561,7 +1524,7 @@ Be concise. Be useful. Be present.{}
     let memory = state_guard.memory.clone();
     let user_message = message.clone();
     let memory_workspace_id = active_workspace_id.clone(); // For scoped memory storage
-    
+
     // Get model priority list and config for fallback
     let model_priority = state_guard.config.llm.model_priority.clone();
     let config = state_guard.config.clone();
@@ -1656,7 +1619,7 @@ Be concise. Be useful. Be present.{}
     let extraction_model = state_guard.extraction_model.read().await.clone();
     let chat_model = state_guard.config.llm.model.clone();
     drop(state_guard);
-    
+
     // Spawn background task to extract memories
     let response_for_extraction = full_response.clone();
     let workspace_id_for_extraction = memory_workspace_id;
@@ -1696,7 +1659,7 @@ struct ExtractionConfig {
 }
 
 /// Extract memories from a conversation turn and store them
-/// 
+///
 /// Skips extraction if embeddings are disabled (recall won't work anyway).
 /// Uses configurable extraction model (falls back to chat model if empty).
 /// Includes importance scoring (1-5) for FSRS prioritization.
@@ -1770,11 +1733,11 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
     match llm.complete(&request).await {
         Ok(response) => {
             let mut stored_count = 0;
-            
+
             // Parse extracted facts with importance and source type
             for line in response.lines() {
                 let line = line.trim();
-                
+
                 // Determine fact type: STATED (user said) or OBSERVED (model inferred)
                 let (fact_type, rest) = if line.starts_with("STATED|") {
                     ("stated", line.strip_prefix("STATED|"))
@@ -1786,7 +1749,7 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
                 } else {
                     continue;
                 };
-                
+
                 if let Some(rest) = rest {
                     // Parse "importance: content"
                     if let Some((importance_str, fact)) = rest.split_once(':') {
@@ -1795,7 +1758,7 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
                             .parse()
                             .unwrap_or(3.0);
                         let fact = fact.trim();
-                        
+
                         if !fact.is_empty() && fact.len() > 5 {
                             // Store the memory with importance and fact type
                             let mut metadata = std::collections::HashMap::new();
@@ -1803,18 +1766,18 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
                             metadata.insert("source".to_string(), "extraction".to_string());
                             metadata.insert("importance".to_string(), importance.to_string());
                             metadata.insert("fact_type".to_string(), fact_type.to_string());
-                            
+
                             // Use scoped remember - memory is tied to current workspace (or global)
                             match memory.remember_scoped(fact, metadata, importance, workspace_id.clone()).await {
                                 Ok((id, action)) => {
-                                    info!("Memory {} [{}]: {} (id: {}, importance: {}, workspace: {:?})", 
+                                    info!("Memory {} [{}]: {} (id: {}, importance: {}, workspace: {:?})",
                                         match action {
                                             nanna_memory::IngestAction::Create => "stored",
                                             nanna_memory::IngestAction::Reinforce => "reinforced",
                                             nanna_memory::IngestAction::Update => "updated",
                                         },
                                         fact_type,
-                                        fact.chars().take(40).collect::<String>(), 
+                                        fact.chars().take(40).collect::<String>(),
                                         id,
                                         importance,
                                         workspace_id);
@@ -1828,7 +1791,7 @@ OBSERVED|3: User values performance and prefers Rust over higher-level languages
                     }
                 }
             }
-            
+
             // Auto-save memories after extraction if any were stored
             if stored_count > 0 {
                 if let Err(e) = memory.save(memory_path).await {
@@ -1858,14 +1821,14 @@ async fn run_agent_loop_with_fallback(
     embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
 ) -> Result<(String, Vec<ToolCallInfo>), String> {
     use nanna_llm::{estimate_request_tokens, ModelLimits};
-    
+
     // Estimate tokens for pre-flight check
     let estimated_tokens = estimate_request_tokens(&request);
     info!("Estimated request tokens: {}", estimated_tokens);
-    
+
     // Get rate-limited models
     let rate_limited_map = rate_limited.read().await.clone();
-    
+
     // Create summarization config if models are configured
     let summarization_config = if config.llm.summarization_priority.is_empty() {
         None
@@ -1888,7 +1851,7 @@ async fn run_agent_loop_with_fallback(
     for model_id in model_priority {
         // Check if we have credentials for this model
         let (_provider, _model_name) = parse_model_id(model_id);
-        
+
         // Skip if rate limited and cooldown hasn't expired
         let now = chrono::Utc::now().timestamp();
         if let Some(&cooldown_until) = rate_limited_map.get(model_id) {
@@ -1897,29 +1860,29 @@ async fn run_agent_loop_with_fallback(
                 continue;
             }
         }
-        
+
         // Pre-flight check: skip models that would likely exceed limits
         let limits = ModelLimits::for_model(model_id);
         if limits.would_exceed(estimated_tokens) {
-            info!("Skipping model {} - estimated {} tokens exceeds limit of {}", 
+            info!("Skipping model {} - estimated {} tokens exceeds limit of {}",
                   model_id, estimated_tokens, limits.input_tokens_per_minute);
             continue;
         }
-        
+
         // Try to create client for this model
         let Some((llm, actual_model)) = create_llm_client_for_model(model_id, config, ollama_host) else {
             debug!("No credentials for model: {}", model_id);
             continue;
         };
-        
+
         tried_models.push(model_id.clone());
-        
+
         // Update active model
         {
             let mut active = active_model.write().await;
             *active = model_id.clone();
         }
-        
+
         // Emit model status event
         let _ = app.emit("model-status", ModelStatusEvent {
             active_model: model_id.clone(),
@@ -1930,18 +1893,18 @@ async fn run_agent_loop_with_fallback(
             },
             rate_limited_models: rate_limited_map.keys().cloned().collect(),
         });
-        
+
         info!("Trying model: {} (attempt {})", model_id, tried_models.len());
-        
+
         // Create request with the actual model name
         let mut model_request = request.clone();
         model_request.model = actual_model;
-        
+
         // Run the agent loop with retry logic for preferred models
         let is_preferred = tried_models.len() == 1; // First model is preferred
         let max_retries = if is_preferred { 3 } else { 1 };
         let mut retry_count = 0;
-        
+
         loop {
             let model_request_clone = model_request.clone();
             match run_agent_loop(app, session_id, &llm, tools.clone(), model_request_clone, summarization_config.clone(), embedded_run_states.clone(), policy).await {
@@ -1952,49 +1915,49 @@ async fn run_agent_loop_with_fallback(
                 Err(e) => {
                     warn!("Model {} failed (attempt {}/{}): {}", model_id, retry_count + 1, max_retries, e);
                     last_error = e.clone();
-                    
+
                     // Check if it's a rate limit error
                     if is_rate_limit_error(&e) {
                         retry_count += 1;
-                        
+
                         // For preferred model, wait and retry instead of immediately falling back
                         if is_preferred && retry_count < max_retries {
                             // Parse retry-after from error if available, default to progressive backoff
                             let wait_secs = parse_retry_after_from_error(&e)
                                 .unwrap_or(15 * retry_count as u64); // 15s, 30s, 45s...
-                            
+
                             // Cap wait time at 60 seconds
                             let wait_secs = wait_secs.min(60);
-                            
-                            info!("Rate limited on preferred model {}, waiting {}s before retry {}/{}", 
+
+                            info!("Rate limited on preferred model {}, waiting {}s before retry {}/{}",
                                   model_id, wait_secs, retry_count + 1, max_retries);
-                            
+
                             // Emit waiting status to UI
                             let _ = app.emit("model-status", ModelStatusEvent {
                                 active_model: format!("{} (waiting {}s...)", model_id, wait_secs),
                                 fallback_reason: Some(format!("Rate limited, retry {}/{}", retry_count, max_retries)),
                                 rate_limited_models: vec![model_id.clone()],
                             });
-                            
+
                             // Wait before retry
                             tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                             continue; // Retry same model
                         }
-                        
+
                         // Max retries exceeded or not preferred - add cooldown and fall back
                         let cooldown_until = chrono::Utc::now().timestamp() + 60;
                         rate_limited.write().await.insert(model_id.clone(), cooldown_until);
                         info!("Rate limited model {} until {} (tried {} times)", model_id, cooldown_until, retry_count);
                         break; // Fall back to next model
                     }
-                    
+
                     // For non-rate-limit errors, fall back immediately
                     break;
                 }
             }
         }
     }
-    
+
     // All models exhausted
     error!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error);
     Err(format!("All models exhausted (tried {}). Last error: {}", tried_models.len(), last_error))
@@ -2226,12 +2189,12 @@ async fn run_agent_loop(
                 StreamEvent::RecoverableError { error, partial_text, partial_tool_calls } => {
                     // Mid-stream recoverable error (rate limit, network issue)
                     // Return a special error that includes the partial content for recovery
-                    warn!("Recoverable stream error: {} (partial: {} chars, {} tool calls)", 
+                    warn!("Recoverable stream error: {} (partial: {} chars, {} tool calls)",
                           error, partial_text.len(), partial_tool_calls.len());
-                    
+
                     // If we have partial content, include it in the error for potential retry
                     let error_msg = if !partial_text.is_empty() || !partial_tool_calls.is_empty() {
-                        format!("RECOVERABLE:{}: partial_text_len={}, partial_tools={}", 
+                        format!("RECOVERABLE:{}: partial_text_len={}, partial_tools={}",
                                 error, partial_text.len(), partial_tool_calls.len())
                     } else {
                         format!("RECOVERABLE:{}", error)
@@ -2307,7 +2270,7 @@ async fn run_agent_loop(
         // Log which tools are about to be executed
         let tool_names: Vec<&str> = pending_tool_calls.iter().map(|p| p.name.as_str()).collect();
         info!("🚀 Starting parallel execution of {} tools: {:?}", pending_tool_calls.len(), tool_names);
-        
+
         let tool_futures: Vec<_> = pending_tool_calls
             .iter()
             .map(|pending| {
@@ -2315,11 +2278,11 @@ async fn run_agent_loop(
                 let id = pending.id.clone();
                 let name = pending.name.clone();
                 let input_json = pending.input_json.clone();
-                
+
                 async move {
                     let input: serde_json::Value = serde_json::from_str(&input_json)
                         .unwrap_or(serde_json::Value::Object(Default::default()));
-                    
+
                     let start = std::time::Instant::now();
                     let params: HashMap<String, serde_json::Value> = match &input {
                         serde_json::Value::Object(map) => map.clone().into_iter().collect(),
@@ -2335,7 +2298,7 @@ async fn run_agent_loop(
                         .await;
 
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    
+
                     (id, name, input, response, duration_ms)
                 }
             })
@@ -2343,7 +2306,7 @@ async fn run_agent_loop(
 
         // Wait for all tools to complete in parallel
         let tool_executions = futures::future::join_all(tool_futures).await;
-        
+
         info!("Executed {} tools in parallel", tool_executions.len());
 
         // Process results and emit completion events
@@ -2362,12 +2325,12 @@ async fn run_agent_loop(
             } else {
                 response.result.content.clone()
             };
-            
+
             if response.result.success {
-                info!("🔧 Tool '{}' succeeded in {}ms | input: {} | output: {}", 
+                info!("🔧 Tool '{}' succeeded in {}ms | input: {} | output: {}",
                       name, duration_ms, input_preview, output_preview);
             } else {
-                error!("❌ Tool '{}' FAILED in {}ms | input: {} | error: {}", 
+                error!("❌ Tool '{}' FAILED in {}ms | input: {} | error: {}",
                        name, duration_ms, input_preview, output_preview);
             }
             let tool_call_info = ToolCallInfo {
@@ -2417,7 +2380,7 @@ async fn run_agent_loop(
             } else {
                 response.result.content
             };
-            
+
             tool_results_raw.push((
                 id,
                 tool_call_info.name,
@@ -2430,7 +2393,12 @@ async fn run_agent_loop(
         // Budget is based on: model context limit - (system + history + response reserve)
         // This replaces the old hardcoded 50k constant with actual remaining context space
         // If summarization models are configured, uses them instead of truncation
-        let tool_budget = calculate_dynamic_tool_budget(&request);
+        // Prefer provider-reported context (API + disk cache). Universal floor
+        // only when the provider cannot be queried.
+        let model_info_for_tools = llm
+            .get_model_info(&request.model, nanna_llm::ModelInfoCache::default_location().as_ref())
+            .await;
+        let tool_budget = calculate_dynamic_tool_budget(&request, &model_info_for_tools);
 
         let tool_results = fit_tool_results_to_budget_with_summarization(
             tool_results_raw,
@@ -2559,7 +2527,7 @@ async fn create_session(
 /// List sessions for the current context
 /// - workspace_id = Some(id): Show sessions belonging to that workspace
 /// - workspace_id = None: Show only GLOBAL sessions (workspace_id IS NULL)
-/// 
+///
 /// Memory access model:
 /// - Global sessions: Access ALL memory (global + all workspaces) - omniscient
 /// - Workspace sessions: Access global + their workspace's memory only - scoped
@@ -2573,7 +2541,7 @@ async fn list_sessions(
     // Route through daemon if available, but also merge with local SQLite sessions
     if state_guard.backend.is_daemon_mode().await {
         let mut all_sessions: Vec<SessionInfo> = Vec::new();
-        
+
         // Get daemon sessions:
         // - workspace_id = None → show ALL sessions (global view)
         // - workspace_id = Some(id) → show only that workspace's sessions
@@ -2603,7 +2571,7 @@ async fn list_sessions(
                 }
             }
         }
-        
+
         // Also merge sessions from local SQLite when we have it open (old
         // sessions from embedded mode). In daemon mode storage is None — the
         // daemon owns nanna.db, so its list already covers everything.
@@ -2616,7 +2584,7 @@ async fn list_sessions(
         };
         if let Ok(sqlite_sessions) = sqlite_result {
             let daemon_ids: std::collections::HashSet<_> = all_sessions.iter().map(|s| s.id.clone()).collect();
-            
+
             for session in sqlite_sessions {
                 // Only add if not already in daemon list
                 if !daemon_ids.contains(&session.session_id) {
@@ -2633,10 +2601,10 @@ async fn list_sessions(
                 }
             }
         }
-        
+
         // Sort by updated_at descending (newest first)
         all_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        
+
         return Ok(all_sessions);
     }
 
@@ -2666,12 +2634,12 @@ async fn list_sessions(
             .count_session_messages(&s.session_id)
             .await
             .unwrap_or(0);
-        
+
         // Get workspace name if session has workspace_id
         let workspace_name = s.workspace_id.as_ref()
             .and_then(|ws_id| registry.get(ws_id))
             .map(|ws| ws.name.clone());
-        
+
         result.push(SessionInfo {
             id: s.session_id.clone(),
             name: Storage::get_session_name(&s),
@@ -3434,7 +3402,7 @@ async fn get_extended_settings(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<ExtendedSettings, String> {
     let state_guard = state.read().await;
-    
+
     let tool_defs = state_guard.tools.definitions().await;
     let tools: Vec<ToolInfo> = tool_defs
         .into_iter()
@@ -3444,19 +3412,19 @@ async fn get_extended_settings(
             enabled: true, // TODO: implement per-tool enable/disable
         })
         .collect();
-    
+
     // Read runtime settings
     let dreaming_enabled = *state_guard.dreaming_enabled.read().await;
     let scheduler_enabled = *state_guard.scheduler_enabled.read().await;
     let heartbeat_enabled = *state_guard.heartbeat_enabled.read().await;
     let heartbeat_interval_seconds = *state_guard.heartbeat_interval_seconds.read().await;
-    
+
     // Read embedding settings
     let embedding_provider = state_guard.embedding_provider.read().await.clone();
     let embedding_model = state_guard.embedding_model.read().await.clone();
     let embedding_enabled = *state_guard.embedding_enabled.read().await;
     let ollama_host = state_guard.ollama_host.read().await.clone();
-    
+
     Ok(ExtendedSettings {
         anthropic_key_set: state_guard.config.llm.api_key.is_some()
             || std::env::var("ANTHROPIC_API_KEY").is_ok(),
@@ -3484,7 +3452,7 @@ async fn get_extended_settings(
             "claude-proxy".to_string(),
             "ollama".to_string(),
         ],
-        
+
         model: state_guard.config.llm.model.clone(),
         available_models: vec![
             // Anthropic
@@ -3511,7 +3479,7 @@ async fn get_extended_settings(
             "qwen2.5".to_string(),
             "deepseek-coder-v2".to_string(),
         ],
-        
+
         // Embedding settings (separate from chat)
         embedding_provider,
         embedding_model,
@@ -3530,10 +3498,10 @@ async fn get_extended_settings(
             "mxbai-embed-large".to_string(),       // 1024 dims
             "all-minilm".to_string(),              // 384 dims
         ],
-        
+
         ollama_host,
         ollama_api_key: state_guard.config.llm.ollama_api_key.clone().unwrap_or_default(),
-        
+
         // Memory extraction model
         extraction_model: state_guard.extraction_model.read().await.clone(),
         available_extraction_models: vec![
@@ -3543,13 +3511,13 @@ async fn get_extended_settings(
             "gpt-4o-mini".to_string(),
             "gpt-4o".to_string(),
         ],
-        
+
         temperature: 1.0,
         top_p: 0.95,
         max_tokens: 8192,
-        
+
         tools,
-        
+
         // Memory & Scheduling settings
         dreaming_enabled,
         max_compression_ratio: state_guard.config.memory.max_compression_ratio,
@@ -3613,7 +3581,7 @@ async fn set_scheduler_enabled(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
     *state_guard.scheduler_enabled.write().await = enabled;
-    
+
     // Start or stop the scheduler
     let mut scheduler = state_guard.scheduler.write().await;
     if enabled {
@@ -3623,7 +3591,7 @@ async fn set_scheduler_enabled(
         scheduler.stop().await;
         info!("Scheduler stopped");
     }
-    
+
     Ok(())
 }
 
@@ -3648,7 +3616,7 @@ async fn set_heartbeat_interval(
     if seconds < 30 {
         return Err("Heartbeat interval must be at least 30 seconds".to_string());
     }
-    
+
     let state_guard = state.read().await;
     *state_guard.heartbeat_interval_seconds.write().await = seconds;
     info!("Heartbeat interval set to {} seconds", seconds);
@@ -3662,17 +3630,17 @@ async fn set_extraction_model(
     model: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
-    
+
     // Update runtime state
     *state_guard.extraction_model.write().await = model.clone();
-    
+
     // Persist to config
     let mut config = state_guard.config.clone();
     config.memory.extraction_model = model.clone();
     if let Err(e) = config.save() {
         warn!("Failed to save extraction model to config: {}", e);
     }
-    
+
     if model.is_empty() {
         info!("Extraction model set to: (use chat model)");
     } else {
@@ -3689,12 +3657,12 @@ async fn set_provider_api_key(
     api_key: String,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    
+
     match provider.as_str() {
         "anthropic" => {
             state_guard.config.llm.api_key = Some(api_key.clone());
             unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
-            
+
             // Recreate LLM client if this is the active provider
             if state_guard.config.llm.provider == "anthropic" {
                 state_guard.llm = Arc::new(LlmClient::anthropic(&api_key));
@@ -3703,7 +3671,7 @@ async fn set_provider_api_key(
         "openai" => {
             state_guard.config.llm.openai_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
-            
+
             if state_guard.config.llm.provider == "openai" {
                 state_guard.llm = Arc::new(LlmClient::openai(&api_key));
             }
@@ -3746,7 +3714,7 @@ async fn set_provider_api_key(
         error!("Failed to save config: {}", e);
         // Non-fatal - key is set for this session
     }
-    
+
     info!("API key set for provider: {}", provider);
     Ok(())
 }
@@ -3824,7 +3792,7 @@ async fn import_claude_code_credentials(
             info!("Token expired, attempting auto-refresh...");
             let refreshed = manager.refresh_token(&loaded.credential).await
                 .map_err(|e| format!("Token expired and refresh failed: {}. Please run `claude login`.", e))?;
-            
+
             // Save refreshed token back to source
             if let Err(e) = manager.save(&refreshed, loaded.source) {
                 warn!("Failed to save refreshed token: {}", e);
@@ -4088,14 +4056,14 @@ async fn set_embedding_config(
     model: String,
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
-    
+
     // Validate provider
     if !["openai", "ollama", "disabled"].contains(&provider.as_str()) {
         return Err(format!("Unknown embedding provider: {}", provider));
     }
-    
+
     let model = if provider == "disabled" { "none".to_string() } else { model };
-    
+
     // Validate OpenAI models (Ollama accepts any installed model)
     if provider == "openai" {
         let valid_openai = ["text-embedding-3-small", "text-embedding-3-large"];
@@ -4103,12 +4071,12 @@ async fn set_embedding_config(
             return Err(format!("Unknown OpenAI embedding model: {}", model));
         }
     }
-    
+
     // Update state
     *state_guard.embedding_provider.write().await = provider.clone();
     *state_guard.embedding_model.write().await = model.clone();
     *state_guard.embedding_enabled.write().await = provider != "disabled";
-    
+
     // Save to config file
     state_guard.config.memory.embedding_provider = provider.clone();
     state_guard.config.memory.embedding_model = model.clone();
@@ -4116,9 +4084,9 @@ async fn set_embedding_config(
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save embedding config: {}", e);
     }
-    
+
     info!("Embedding config changed to: {} / {}", provider, model);
-    
+
     // Return warning about restart
     Ok("Embedding settings updated. Restart required for changes to take effect. Note: Changing embedding dimensions will make existing memories incompatible.".to_string())
 }
@@ -4136,17 +4104,17 @@ async fn set_ollama_host(
     host: String,
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
-    
+
     // Validate URL format
     if !host.starts_with("http://") && !host.starts_with("https://") {
         return Err("Ollama host must start with http:// or https://".to_string());
     }
-    
+
     // Remove trailing slash
     let host = host.trim_end_matches('/').to_string();
-    
+
     *state_guard.ollama_host.write().await = host.clone();
-    
+
     // Save to config file
     state_guard.config.memory.ollama_host = host.clone();
     match state_guard.config.save() {
@@ -4159,10 +4127,10 @@ async fn set_ollama_host(
             return Err(err_msg);
         }
     }
-    
+
     // Also set env var for current session
     unsafe { std::env::set_var("OLLAMA_HOST", &host); }
-    
+
     Ok(format!("Ollama host saved: {}", host))
 }
 
@@ -4194,36 +4162,36 @@ async fn get_ollama_models(
 ) -> Result<Vec<OllamaModelInfo>, String> {
     let state_guard = state.read().await;
     let ollama_host = state_guard.ollama_host.read().await.clone();
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
-    
+
     let response = client
         .get(format!("{}/api/tags", ollama_host))
         .send()
         .await
         .map_err(|e| format!("Failed to connect to Ollama at {}: {}", ollama_host, e))?;
-    
+
     if !response.status().is_success() {
         return Err(format!("Ollama returned error: {}", response.status()));
     }
-    
+
     #[derive(Deserialize)]
     struct OllamaTagsResponse {
         models: Vec<OllamaModel>,
     }
-    
+
     #[derive(Deserialize)]
     struct OllamaModel {
         name: String,
         size: u64,
     }
-    
+
     let tags: OllamaTagsResponse = response.json().await
         .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
-    
+
     // Convert to our info struct, marking known embedding models
     // Comprehensive list of known embedding model name patterns
     let embedding_patterns = [
@@ -4239,7 +4207,7 @@ async fn get_ollama_models(
         "snowflake-arctic-embed",
         // E5 family
         "e5-small", "e5-base", "e5-large", "e5-mistral",
-        // GTE family  
+        // GTE family
         "gte-small", "gte-base", "gte-large", "gte-qwen",
         // Jina
         "jina-embed",
@@ -4250,17 +4218,17 @@ async fn get_ollama_models(
         // Generic patterns (catch-all)
         "-embed-", "-embed:",
     ];
-    
+
     let models: Vec<OllamaModelInfo> = tags.models
         .into_iter()
         .map(|m| {
             let name_lower = m.name.to_lowercase();
             let base_name = m.name.split(':').next().unwrap_or(&m.name).to_lowercase();
-            
+
             // Check if model name contains "embed" or matches known embedding patterns
-            let is_embedding = name_lower.contains("embed") 
+            let is_embedding = name_lower.contains("embed")
                 || embedding_patterns.iter().any(|p| base_name.contains(p));
-            
+
             OllamaModelInfo {
                 name: m.name,
                 size_mb: m.size / 1_000_000,
@@ -4268,7 +4236,7 @@ async fn get_ollama_models(
             }
         })
         .collect();
-    
+
     Ok(models)
 }
 
@@ -4319,27 +4287,27 @@ async fn get_anthropic_models(
         .send()
         .await
         .map_err(|e| format!("Failed to fetch Anthropic models: {}", e))?;
-    
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(format!("Anthropic API error {}: {}", status, body));
     }
-    
+
     #[derive(Deserialize)]
     struct AnthropicModelsResponse {
         data: Vec<AnthropicModel>,
     }
-    
+
     #[derive(Deserialize)]
     struct AnthropicModel {
         id: String,
         display_name: Option<String>,
     }
-    
+
     let models: AnthropicModelsResponse = response.json().await
         .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
-    
+
     Ok(models.data.into_iter().map(|m| ModelInfo {
         id: m.id.clone(),
         name: m.display_name.unwrap_or(m.id),
@@ -4351,42 +4319,42 @@ async fn get_anthropic_models(
 async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| "No OpenAI API key configured")?;
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
-    
+
     let response = client
         .get("https://api.openai.com/v1/models")
         .header("Authorization", format!("Bearer {}", api_key))
         .send()
         .await
         .map_err(|e| format!("Failed to fetch OpenAI models: {}", e))?;
-    
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(format!("OpenAI API error {}: {}", status, body));
     }
-    
+
     #[derive(Deserialize)]
     struct OpenAIModelsResponse {
         data: Vec<OpenAIModel>,
     }
-    
+
     #[derive(Deserialize)]
     struct OpenAIModel {
         id: String,
     }
-    
+
     let models: OpenAIModelsResponse = response.json().await
         .map_err(|e| format!("Failed to parse OpenAI response: {}", e))?;
-    
+
     // Filter to chat models (gpt-*, o1-*, chatgpt-*)
     let chat_prefixes = ["gpt-4", "gpt-3.5", "o1", "o3", "chatgpt"];
     let embedding_prefixes = ["text-embedding"];
-    
+
     let mut result: Vec<ModelInfo> = models.data.into_iter()
         .filter(|m| {
             chat_prefixes.iter().any(|p| m.id.starts_with(p)) ||
@@ -4397,7 +4365,7 @@ async fn get_openai_models() -> Result<Vec<ModelInfo>, String> {
             name: m.id,
         })
         .collect();
-    
+
     // Sort by name
     result.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -4779,13 +4747,13 @@ async fn get_cognitive_memory_stats(
     // Embedded mode / fallback: direct memory service access
     let stats = state_guard.memory.stats().await;
     let last = state_guard.last_consolidation.read().await;
-    
+
     let last_consolidation = last.map(|ts| {
         chrono::DateTime::from_timestamp(ts, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
             .unwrap_or_else(|| ts.to_string())
     });
-    
+
     Ok(CognitiveMemoryStats {
         total_memories: stats.total,
         active: stats.active,
@@ -4839,7 +4807,7 @@ async fn trigger_consolidation(
     drop(state_guard); // Release the lock before async work
 
     let config = ConsolidationConfig::default();
-    
+
     // Create summarization callback using the LLM
     let summarize = |prompt: String| {
         let llm = llm.clone();
@@ -4847,7 +4815,7 @@ async fn trigger_consolidation(
             let request = nanna_llm::CompletionRequest::default()
                 .with_model("claude-3-5-haiku-20241022") // Use fast model for summarization
                 .with_message(nanna_llm::Message::user(&prompt));
-            
+
             llm.complete(&request)
                 .await
                 .map_err(|e| e.to_string())
@@ -4855,7 +4823,7 @@ async fn trigger_consolidation(
     };
 
     info!("Starting manual memory consolidation...");
-    
+
     let result = memory.consolidate(&config, summarize)
         .await
         .map_err(|e| format!("Consolidation failed: {}", e))?;
@@ -4924,7 +4892,7 @@ pub struct MemoryItem {
 }
 
 /// List all semantic memories (with optional workspace scope filter)
-/// 
+///
 /// scope: None = all memories, Some("global") = global only, Some(ws_id) = global + that workspace
 #[tauri::command]
 async fn list_memories(
@@ -4962,7 +4930,7 @@ async fn list_memories(
 
     // Embedded mode / fallback: direct memory service access
     let entries = state_guard.memory.list_all().await;
-    
+
     // Filter by scope
     let filtered: Vec<_> = entries.into_iter().filter(|e| {
         match &scope {
@@ -4974,7 +4942,7 @@ async fn list_memories(
             }
         }
     }).collect();
-    
+
     let mut items: Vec<MemoryItem> = filtered.into_iter().map(|e| {
         let fact_type = e.metadata.get("fact_type")
             .cloned()
@@ -5042,7 +5010,7 @@ async fn get_memory(
         let created_at = chrono::DateTime::from_timestamp(e.timestamp, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| e.timestamp.to_string());
-        
+
         MemoryItem {
             id: e.id,
             content: e.content,
@@ -5079,11 +5047,11 @@ async fn delete_memory(
     // Embedded mode / fallback: direct memory service access
     state_guard.memory.forget(&id).await
         .map_err(|e| format!("Failed to delete memory: {}", e))?;
-    
+
     // Auto-save after deletion
     state_guard.memory.save(&state_guard.memory_path).await
         .map_err(|e| format!("Failed to save after deletion: {}", e))?;
-    
+
     info!("Deleted memory: {}", id);
     Ok(())
 }
@@ -5109,11 +5077,11 @@ async fn update_memory(
     // Embedded mode / fallback: direct memory service access
     state_guard.memory.update_content(&id, &content).await
         .map_err(|e| format!("Failed to update memory: {}", e))?;
-    
+
     // Auto-save after update
     state_guard.memory.save(&state_guard.memory_path).await
         .map_err(|e| format!("Failed to save after update: {}", e))?;
-    
+
     info!("Updated memory: {}", id);
     Ok(())
 }
@@ -5155,14 +5123,14 @@ async fn send_notification(
     body: String,
 ) -> Result<(), String> {
     use tauri_plugin_notification::NotificationExt;
-    
+
     app.notification()
         .builder()
         .title(&title)
         .body(&body)
         .show()
         .map_err(|e| format!("Failed to send notification: {}", e))?;
-    
+
     info!("Sent notification: {} - {}", title, body);
     Ok(())
 }
@@ -5171,11 +5139,11 @@ async fn send_notification(
 #[tauri::command]
 async fn request_notification_permission(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_notification::NotificationExt;
-    
+
     let permission = app.notification()
         .request_permission()
         .map_err(|e| format!("Failed to request permission: {}", e))?;
-    
+
     Ok(matches!(permission, tauri_plugin_notification::PermissionState::Granted))
 }
 
@@ -5183,11 +5151,11 @@ async fn request_notification_permission(app: AppHandle) -> Result<bool, String>
 #[tauri::command]
 async fn check_notification_permission(app: AppHandle) -> Result<String, String> {
     use tauri_plugin_notification::NotificationExt;
-    
+
     let permission = app.notification()
         .permission_state()
         .map_err(|e| format!("Failed to check permission: {}", e))?;
-    
+
     Ok(match permission {
         tauri_plugin_notification::PermissionState::Granted => "granted",
         tauri_plugin_notification::PermissionState::Denied => "denied",
@@ -5217,10 +5185,10 @@ async fn set_similarity_threshold(
     if !(0.0..=1.0).contains(&threshold) {
         return Err("Threshold must be between 0.0 and 1.0".to_string());
     }
-    
+
     let state_guard = state.read().await;
     state_guard.memory.set_min_score(threshold);
-    
+
     info!("Set similarity threshold to {}", threshold);
     Ok(format!("Similarity threshold set to {:.2}", threshold))
 }
@@ -5246,11 +5214,11 @@ async fn set_system_prompt(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
     state_guard.config.agent.system_prompt = prompt.clone();
-    
+
     // Save to disk
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    
+
     info!("System prompt {}", if prompt.is_some() { "updated" } else { "reset to default" });
     Ok(())
 }
@@ -5375,12 +5343,12 @@ async fn import_config(
 ) -> Result<(), String> {
     let new_config: nanna_config::Config = toml::from_str(&config)
         .map_err(|e| format!("Failed to parse config: {}", e))?;
-    
+
     let mut state_guard = state.write().await;
     state_guard.config = new_config;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    
+
     info!("Config imported from TOML");
     Ok(())
 }
@@ -5459,7 +5427,7 @@ async fn set_embedding_model_priority(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
     state_guard.config.memory.embedding_priority = priority.clone();
-    
+
     // Update the primary embedding config for backwards compatibility
     if let Some(first) = priority.first() {
         if let Some((provider, model)) = first.split_once('/') {
@@ -5469,10 +5437,10 @@ async fn set_embedding_model_priority(
     } else {
         state_guard.config.memory.embedding_provider = "disabled".to_string();
     }
-    
+
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    
+
     info!("Embedding model priority set: {:?}", priority);
     Ok(())
 }
@@ -5674,7 +5642,7 @@ async fn get_model_status(
     let state_guard = state.read().await;
     let active = state_guard.active_model.read().await.clone();
     let rate_limited = state_guard.rate_limited_models.read().await;
-    
+
     // Filter to only models that are still rate limited
     let now = chrono::Utc::now().timestamp();
     let still_limited: Vec<String> = rate_limited
@@ -5682,7 +5650,7 @@ async fn get_model_status(
         .filter(|(_, until)| now < **until)
         .map(|(model, _)| model.clone())
         .collect();
-    
+
     Ok(ModelStatusEvent {
         active_model: active,
         fallback_reason: None,
@@ -5698,7 +5666,7 @@ async fn clear_rate_limit(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
     let mut rate_limited = state_guard.rate_limited_models.write().await;
-    
+
     if let Some(model_id) = model {
         rate_limited.remove(&model_id);
         info!("Cleared rate limit for model: {}", model_id);
@@ -5706,7 +5674,7 @@ async fn clear_rate_limit(
         rate_limited.clear();
         info!("Cleared all rate limits");
     }
-    
+
     Ok(())
 }
 
@@ -5972,7 +5940,7 @@ async fn save_config(
     let state_guard = state.read().await;
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    
+
     info!("Config saved to disk");
     Ok(())
 }
@@ -5985,15 +5953,15 @@ async fn save_channel_config(
     config: HashMap<String, String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    
+
     match channel.as_str() {
         "telegram" => {
             let bot_token = config.get("bot_token")
                 .ok_or("Missing bot_token")?
                 .clone();
-            
+
             let webhook_url = config.get("webhook_url").cloned();
-            
+
             let allowed_users: Option<Vec<i64>> = config.get("allowed_users")
                 .and_then(|s| {
                     let ids: Vec<i64> = s.split(',')
@@ -6001,7 +5969,7 @@ async fn save_channel_config(
                         .collect();
                     if ids.is_empty() { None } else { Some(ids) }
                 });
-            
+
             state_guard.config.channels.telegram = Some(nanna_config::TelegramConfig {
                 bot_token,
                 webhook_url,
@@ -6018,7 +5986,7 @@ async fn save_channel_config(
             let public_key = config.get("public_key")
                 .ok_or("Missing public_key")?
                 .clone();
-            
+
             state_guard.config.channels.discord = Some(nanna_config::DiscordConfig {
                 bot_token,
                 application_id,
@@ -6033,7 +6001,7 @@ async fn save_channel_config(
                 .ok_or("Missing signing_secret")?
                 .clone();
             let app_token = config.get("app_token").cloned();
-            
+
             state_guard.config.channels.slack = Some(nanna_config::SlackConfig {
                 bot_token,
                 app_token,
@@ -6047,7 +6015,7 @@ async fn save_channel_config(
             let api_url = config.get("api_url").cloned();
             let allowed_numbers = config.get("allowed_numbers")
                 .map(|s| s.split(',').map(|n| n.trim().to_string()).collect());
-            
+
             state_guard.config.channels.signal = Some(nanna_config::SignalConfig {
                 phone_number,
                 api_url,
@@ -6058,10 +6026,10 @@ async fn save_channel_config(
             let connection_method = config.get("connection_method")
                 .ok_or("Missing connection_method")?
                 .clone();
-            
+
             let allowed_contacts = config.get("allowed_contacts")
                 .map(|s| s.split(',').map(|n| n.trim().to_string()).collect());
-            
+
             state_guard.config.channels.whatsapp = Some(nanna_config::WhatsAppConfig {
                 connection_method,
                 phone_number_id: config.get("phone_number_id").cloned(),
@@ -6073,11 +6041,11 @@ async fn save_channel_config(
         }
         _ => return Err(format!("Unknown channel: {}", channel)),
     }
-    
+
     // Save to disk
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
-    
+
     info!("Saved {} channel configuration", channel);
     Ok(())
 }
@@ -6089,16 +6057,16 @@ async fn test_channel_connection(
     channel: String,
 ) -> Result<TestConnectionResult, String> {
     let state_guard = state.read().await;
-    
+
     match channel.to_lowercase().as_str() {
         "telegram" => {
             let config = state_guard.config.channels.telegram.as_ref()
                 .ok_or("Telegram not configured")?;
-            
+
             // Test by calling getMe
             let client = reqwest::Client::new();
             let url = format!("https://api.telegram.org/bot{}/getMe", config.bot_token);
-            
+
             match client.get(&url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
@@ -6125,10 +6093,10 @@ async fn test_channel_connection(
         "discord" => {
             let config = state_guard.config.channels.discord.as_ref()
                 .ok_or("Discord not configured")?;
-            
+
             // Test by calling /users/@me
             let client = reqwest::Client::new();
-            
+
             match client
                 .get("https://discord.com/api/v10/users/@me")
                 .header("Authorization", format!("Bot {}", config.bot_token))
@@ -6296,7 +6264,7 @@ async fn set_active_workspace(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
     let mut registry = state_guard.workspaces.write().await;
-    
+
     if registry.set_active(&id) {
         info!("Activated workspace: {}", id);
         drop(registry);
@@ -6360,7 +6328,7 @@ async fn get_workspace_context(
     id: String,
 ) -> Result<String, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         let result = state_guard.backend.workspace_get_context(&id).await?;
@@ -6369,13 +6337,13 @@ async fn get_workspace_context(
             .map(|s| s.to_string())
             .ok_or_else(|| "Invalid response from daemon".to_string());
     }
-    
+
     // Embedded mode: use local registry
     let registry = state_guard.workspaces.read().await;
-    
+
     let ws = registry.get(&id)
         .ok_or_else(|| format!("Workspace not found: {}", id))?;
-    
+
     Ok(ws.context.build_system_prompt_injection())
 }
 
@@ -6386,23 +6354,23 @@ async fn reload_workspace(
     id: String,
 ) -> Result<WorkspaceInfo, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         let result = state_guard.backend.workspace_reload(&id).await?;
         return serde_json::from_value(result)
             .map_err(|e| format!("Failed to parse daemon response: {}", e));
     }
-    
+
     // Embedded mode: use local registry
     let mut registry = state_guard.workspaces.write().await;
-    
+
     let ws = registry.get_mut(&id)
         .ok_or_else(|| format!("Workspace not found: {}", id))?;
-    
+
     ws.load_context().await
         .map_err(|e| format!("Failed to reload workspace: {}", e))?;
-    
+
     info!("Reloaded workspace: {}", ws.name);
     Ok(WorkspaceInfo::from(&*ws))
 }
@@ -6414,17 +6382,17 @@ async fn close_workspace(
     id: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         state_guard.backend.workspace_close(&id).await?;
         info!("Closed workspace via daemon: {}", id);
         return Ok(());
     }
-    
+
     // Embedded mode: use local registry
     let mut registry = state_guard.workspaces.write().await;
-    
+
     if registry.remove(&id).is_some() {
         info!("Closed workspace: {}", id);
         drop(registry);
@@ -6467,22 +6435,22 @@ async fn save_workspace_file(
     content: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         state_guard.backend.workspace_update_context(&workspace_id, &filename, &content).await?;
         return Ok(());
     }
-    
+
     // Embedded mode: use local registry
     let registry = state_guard.workspaces.read().await;
-    
+
     let ws = registry.get(&workspace_id)
         .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
-    
+
     ws.save_context_file(&filename, &content).await
         .map_err(|e| format!("Failed to save file: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -6495,13 +6463,13 @@ async fn append_workspace_memory(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
     let registry = state_guard.workspaces.read().await;
-    
+
     let ws = registry.get(&workspace_id)
         .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
-    
+
     ws.append_to_daily_memory(&content).await
         .map_err(|e| format!("Failed to append memory: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -6513,10 +6481,10 @@ async fn get_workspace_recent_memory(
 ) -> Result<String, String> {
     let state_guard = state.read().await;
     let registry = state_guard.workspaces.read().await;
-    
+
     let ws = registry.get(&workspace_id)
         .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
-    
+
     ws.read_recent_memory().await
         .map_err(|e| format!("Failed to read memory: {}", e))
 }
@@ -6537,16 +6505,16 @@ async fn list_workspace_memory_files(
     workspace_id: String,
 ) -> Result<Vec<WorkspaceMemoryFile>, String> {
     use std::path::Path;
-    
+
     let state_guard = state.read().await;
     let registry = state_guard.workspaces.read().await;
-    
+
     let ws = registry.get(&workspace_id)
         .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
-    
+
     let ws_path = Path::new(&ws.path);
     let mut files = Vec::new();
-    
+
     // Check for MEMORY.md
     let memory_md = ws_path.join("MEMORY.md");
     if memory_md.exists() {
@@ -6559,7 +6527,7 @@ async fn list_workspace_memory_files(
                     dt.format("%Y-%m-%d %H:%M").to_string()
                 })
                 .unwrap_or_default();
-            
+
             files.push(WorkspaceMemoryFile {
                 name: "MEMORY.md".to_string(),
                 path: memory_md.to_string_lossy().to_string(),
@@ -6568,13 +6536,13 @@ async fn list_workspace_memory_files(
             });
         }
     }
-    
+
     // Check for memory/*.md files
     let memory_dir = ws_path.join("memory");
     if memory_dir.is_dir() {
         if let Ok(mut entries) = tokio::fs::read_dir(&memory_dir).await {
             let mut daily_files = Vec::new();
-            
+
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
                 if path.extension().map(|e| e == "md").unwrap_or(false) {
@@ -6582,7 +6550,7 @@ async fn list_workspace_memory_files(
                         let name = path.file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        
+
                         let modified = tokio::fs::metadata(&path).await
                             .ok()
                             .and_then(|m| m.modified().ok())
@@ -6591,7 +6559,7 @@ async fn list_workspace_memory_files(
                                 dt.format("%Y-%m-%d %H:%M").to_string()
                             })
                             .unwrap_or_default();
-                        
+
                         daily_files.push(WorkspaceMemoryFile {
                             name,
                             path: path.to_string_lossy().to_string(),
@@ -6601,13 +6569,13 @@ async fn list_workspace_memory_files(
                     }
                 }
             }
-            
+
             // Sort by name (date) descending - newest first
             daily_files.sort_by(|a, b| b.name.cmp(&a.name));
             files.extend(daily_files);
         }
     }
-    
+
     Ok(files)
 }
 
@@ -6640,11 +6608,11 @@ Be the assistant you'd actually want to talk to. Concise when needed, thorough w
 
 *Learn about the person you're helping. Update this as you go.*
 
-- **Name:** 
-- **What to call them:** 
-- **Pronouns:** 
-- **Timezone:** 
-- **Notes:** 
+- **Name:**
+- **What to call them:**
+- **Pronouns:**
+- **Timezone:**
+- **Notes:**
 
 ## Context
 
@@ -6726,32 +6694,32 @@ async fn init_workspace(
 ) -> Result<(), String> {
     use tokio::fs;
     use nanna_core::NANNA_FOLDER;
-    
+
     let path = std::path::PathBuf::from(&path);
     let nanna_folder = path.join(NANNA_FOLDER);
-    
+
     // Create workspace directory if it doesn't exist
     if !path.exists() {
         fs::create_dir_all(&path).await
             .map_err(|e| format!("Failed to create directory: {}", e))?;
     }
-    
+
     // Create .nanna folder
     if !nanna_folder.exists() {
         fs::create_dir_all(&nanna_folder).await
             .map_err(|e| format!("Failed to create .nanna folder: {}", e))?;
         info!("Created .nanna folder: {:?}", nanna_folder);
     }
-    
+
     // Create requested files with templates (inside .nanna)
     for file in &files {
         let file_path = nanna_folder.join(file);
-        
+
         // Skip if file already exists
         if file_path.exists() {
             continue;
         }
-        
+
         let content = match file.as_str() {
             "SOUL.md" => workspace_templates::SOUL_MD,
             "USER.md" => workspace_templates::USER_MD,
@@ -6760,13 +6728,13 @@ async fn init_workspace(
             "MEMORY.md" => workspace_templates::MEMORY_MD,
             _ => continue, // Skip unknown files
         };
-        
+
         fs::write(&file_path, content).await
             .map_err(|e| format!("Failed to create {}: {}", file, e))?;
-        
+
         info!("Created workspace file: {:?}", file_path);
     }
-    
+
     // Create memory folder (inside .nanna)
     let memory_folder = nanna_folder.join("memory");
     if !memory_folder.exists() {
@@ -6774,7 +6742,7 @@ async fn init_workspace(
             .map_err(|e| format!("Failed to create memory folder: {}", e))?;
         info!("Created memory folder: {:?}", memory_folder);
     }
-    
+
     Ok(())
 }
 
@@ -6788,13 +6756,13 @@ async fn read_workspace_file(
 ) -> Result<Option<String>, String> {
     let state_guard = state.read().await;
     let registry = state_guard.workspaces.read().await;
-    
+
     let ws = registry.get(&workspace_id)
         .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
-    
+
     // Files are inside the .nanna folder
     let file_path = ws.nanna_folder().join(&filename);
-    
+
     match tokio::fs::read_to_string(&file_path).await {
         Ok(content) => Ok(Some(content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -6808,9 +6776,9 @@ async fn check_workspace_validity(
     path: String,
 ) -> Result<WorkspaceValidityCheck, String> {
     use nanna_core::{NANNA_FOLDER, AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, MEMORY_FOLDER};
-    
+
     let path = std::path::PathBuf::from(&path);
-    
+
     if !path.exists() {
         return Ok(WorkspaceValidityCheck {
             exists: false,
@@ -6823,11 +6791,11 @@ async fn check_workspace_validity(
             has_memory_folder: false,
         });
     }
-    
+
     // Check for .nanna folder
     let nanna_folder = path.join(NANNA_FOLDER);
     let has_nanna_folder = nanna_folder.exists();
-    
+
     // Check for files inside .nanna folder
     let has_soul = nanna_folder.join(SOUL_FILE).exists();
     let has_user = nanna_folder.join(USER_FILE).exists();
@@ -6835,10 +6803,10 @@ async fn check_workspace_validity(
     let has_tools = nanna_folder.join(TOOLS_FILE).exists();
     let has_memory = nanna_folder.join(MEMORY_FILE).exists();
     let has_memory_folder = nanna_folder.join(MEMORY_FOLDER).exists();
-    
+
     // Valid if has .nanna folder with at least SOUL.md or AGENTS.md
     let is_valid = has_nanna_folder && (has_soul || has_agents);
-    
+
     Ok(WorkspaceValidityCheck {
         exists: true,
         is_valid,
@@ -6922,9 +6890,9 @@ async fn get_channel_status(
 ) -> Result<Vec<ChannelStatus>, String> {
     let state_guard = state.read().await;
     let config = &state_guard.config;
-    
+
     let mut channels = Vec::new();
-    
+
     // Telegram
     channels.push(ChannelStatus {
         name: "Telegram".to_string(),
@@ -6940,7 +6908,7 @@ async fn get_channel_status(
             format!("Bot token: {}", token_preview)
         }),
     });
-    
+
     // Discord
     channels.push(ChannelStatus {
         name: "Discord".to_string(),
@@ -6951,7 +6919,7 @@ async fn get_channel_status(
             format!("App ID: {}", d.application_id)
         }),
     });
-    
+
     // Slack
     channels.push(ChannelStatus {
         name: "Slack".to_string(),
@@ -6963,7 +6931,7 @@ async fn get_channel_status(
             format!("Socket mode: {}", if has_app_token { "enabled" } else { "disabled" })
         }),
     });
-    
+
     // Signal
     channels.push(ChannelStatus {
         name: "Signal".to_string(),
@@ -6974,7 +6942,7 @@ async fn get_channel_status(
             format!("Phone: {}", s.phone_number)
         }),
     });
-    
+
     // WhatsApp
     channels.push(ChannelStatus {
         name: "WhatsApp".to_string(),
@@ -6985,7 +6953,7 @@ async fn get_channel_status(
             format!("Method: {}", w.connection_method)
         }),
     });
-    
+
     Ok(channels)
 }
 
@@ -6996,7 +6964,7 @@ async fn get_enhanced_channel_status(
 ) -> Result<Vec<EnhancedChannelStatus>, String> {
     let state_guard = state.read().await;
     let config = &state_guard.config;
-    
+
     let providers = [
         ("telegram", "Telegram", config.channels.telegram.is_some()),
         ("discord", "Discord", config.channels.discord.is_some()),
@@ -7004,13 +6972,13 @@ async fn get_enhanced_channel_status(
         ("signal", "Signal", config.channels.signal.is_some()),
         ("whatsapp", "WhatsApp", config.channels.whatsapp.is_some()),
     ];
-    
+
     let mut statuses = Vec::new();
-    
+
     for (provider, name, configured) in providers {
         let status = if configured { "ready" } else { "not_configured" };
         let connection_state = if configured { "connected" } else { "unconfigured" };
-        
+
         let details = match provider {
             "telegram" => config.channels.telegram.as_ref().map(|t| {
                 let token_preview = if t.bot_token.len() > 10 {
@@ -7035,7 +7003,7 @@ async fn get_enhanced_channel_status(
             }),
             _ => None,
         };
-        
+
         statuses.push(EnhancedChannelStatus {
             name: name.to_string(),
             provider: provider.to_string(),
@@ -7054,7 +7022,7 @@ async fn get_enhanced_channel_status(
             rate_limit_remaining_ms: None,
         });
     }
-    
+
     Ok(statuses)
 }
 
@@ -7069,9 +7037,9 @@ async fn test_all_channels(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
-    
+
     let mut results = HashMap::new();
-    
+
     // Telegram
     if let Some(telegram) = &config.channels.telegram {
         let url = format!("https://api.telegram.org/bot{}/getMe", telegram.bot_token);
@@ -7103,7 +7071,7 @@ async fn test_all_channels(
         };
         results.insert("telegram".to_string(), result);
     }
-    
+
     // Discord
     if let Some(discord) = &config.channels.discord {
         let result = match client
@@ -7139,7 +7107,7 @@ async fn test_all_channels(
         };
         results.insert("discord".to_string(), result);
     }
-    
+
     // Slack
     if let Some(slack) = &config.channels.slack {
         let result = match client
@@ -7179,7 +7147,7 @@ async fn test_all_channels(
         };
         results.insert("slack".to_string(), result);
     }
-    
+
     // Signal - test signald or REST API
     if let Some(signal) = &config.channels.signal {
         let api_url = signal.api_url.as_deref().unwrap_or("http://localhost:8080");
@@ -7204,7 +7172,7 @@ async fn test_all_channels(
         };
         results.insert("signal".to_string(), result);
     }
-    
+
     // WhatsApp - test based on connection method
     if let Some(whatsapp) = &config.channels.whatsapp {
         let result = if whatsapp.connection_method == "cloud_api" {
@@ -7252,7 +7220,7 @@ async fn test_all_channels(
         };
         results.insert("whatsapp".to_string(), result);
     }
-    
+
     Ok(results)
 }
 
@@ -7265,24 +7233,24 @@ async fn subscribe_channel_status(
 ) -> Result<(), String> {
     let interval = std::time::Duration::from_millis(interval_ms.unwrap_or(30_000));
     let state_arc = state.inner().clone();
-    
+
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        
+
         loop {
             tokio::time::sleep(interval).await;
-            
+
             let state_guard = state_arc.read().await;
             let config = &state_guard.config;
-            
+
             // Check Telegram
             if let Some(telegram) = &config.channels.telegram {
                 let start = std::time::Instant::now();
                 let url = format!("https://api.telegram.org/bot{}/getMe", telegram.bot_token);
-                
+
                 let (status, response_ms) = match client.get(&url).send().await {
                     Ok(response) => {
                         let ms = start.elapsed().as_millis() as f64;
@@ -7296,7 +7264,7 @@ async fn subscribe_channel_status(
                     }
                     Err(_) => ("unavailable", None),
                 };
-                
+
                 let event = ChannelStatusEvent {
                     provider: "telegram".to_string(),
                     status: EnhancedChannelStatus {
@@ -7319,14 +7287,14 @@ async fn subscribe_channel_status(
                     previous_state: None,
                     timestamp: chrono::Utc::now().timestamp_millis(),
                 };
-                
+
                 let _ = app.emit("channel-status", event);
             }
-            
+
             // Similar checks for other channels can be added here
         }
     });
-    
+
     info!("Started channel status polling (interval: {:?})", interval);
     Ok(())
 }
@@ -7349,14 +7317,14 @@ async fn list_user_tools_cmd(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<tool_authoring::UserToolMeta>, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         let result = state_guard.backend.tool_list_user().await?;
         return serde_json::from_value(result.get("tools").cloned().unwrap_or(serde_json::json!([])))
             .map_err(|e| format!("Failed to parse daemon response: {}", e));
     }
-    
+
     // Embedded mode
     Ok(state_guard.user_tools.list_tools().await)
 }
@@ -7367,7 +7335,7 @@ async fn get_user_tool(
     name: String,
 ) -> Result<Option<tool_authoring::UserToolMeta>, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode (get via tool_list_user and filter)
     if state_guard.backend.is_daemon_mode().await {
         let result = state_guard.backend.tool_list_user().await?;
@@ -7376,7 +7344,7 @@ async fn get_user_tool(
         ).map_err(|e| format!("Failed to parse daemon response: {}", e))?;
         return Ok(tools.into_iter().find(|t| t.name == name));
     }
-    
+
     // Embedded mode
     Ok(state_guard.user_tools.get_tool(&name).await)
 }
@@ -7407,7 +7375,7 @@ async fn create_user_tool(
     parameters: Option<serde_json::Value>,
 ) -> Result<tool_authoring::UserToolMeta, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         // Daemon tool_create uses (name, description, code, needs_shell)
@@ -7415,7 +7383,7 @@ async fn create_user_tool(
         return serde_json::from_value(result)
             .map_err(|e| format!("Failed to parse daemon response: {}", e));
     }
-    
+
     // Embedded mode: Create the tool locally
     let meta = state_guard.user_tools.create_tool(
         name.clone(),
@@ -7425,13 +7393,13 @@ async fn create_user_tool(
         parameters,
         None,
     ).await?;
-    
+
     // Register it with the tool registry
     if let Ok(tool_impl) = state_guard.user_tools.create_tool_impl(&meta) {
         state_guard.tools.register_boxed(tool_impl).await;
         info!("Registered new user tool: {}", name);
     }
-    
+
     Ok(meta)
 }
 
@@ -7445,7 +7413,7 @@ async fn update_user_tool(
     enabled: Option<bool>,
 ) -> Result<tool_authoring::UserToolMeta, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         let result = state_guard.backend.tool_update(
@@ -7457,7 +7425,7 @@ async fn update_user_tool(
         return serde_json::from_value(result)
             .map_err(|e| format!("Failed to parse daemon response: {}", e));
     }
-    
+
     // Embedded mode
     let meta = state_guard.user_tools.update_tool(
         &name,
@@ -7467,7 +7435,7 @@ async fn update_user_tool(
         None,
         enabled,
     ).await?;
-    
+
     // Re-register if enabled
     if meta.enabled {
         if let Ok(tool_impl) = state_guard.user_tools.create_tool_impl(&meta) {
@@ -7475,7 +7443,7 @@ async fn update_user_tool(
             info!("Re-registered updated user tool: {}", name);
         }
     }
-    
+
     Ok(meta)
 }
 
@@ -7485,13 +7453,13 @@ async fn delete_user_tool(
     name: String,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         state_guard.backend.tool_delete(&name).await?;
         return Ok(());
     }
-    
+
     // Embedded mode
     state_guard.user_tools.delete_tool(&name).await
 }
@@ -7503,7 +7471,7 @@ async fn test_user_tool(
     input: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
     let state_guard = state.read().await;
-    
+
     // Route through daemon if in daemon mode
     if state_guard.backend.is_daemon_mode().await {
         let input_value = serde_json::to_value(&input)
@@ -7514,7 +7482,7 @@ async fn test_user_tool(
             .map(|s| s.to_string())
             .ok_or_else(|| "Invalid response from daemon".to_string());
     }
-    
+
     // Embedded mode
     state_guard.user_tools.test_tool(&source, input).await
 }
@@ -7624,7 +7592,7 @@ async fn get_skills_path(state: &AppState) -> std::path::PathBuf {
         return ws.path.join("skills");
     }
     drop(registry);
-    
+
     // Fallback to config-based path
     directories::ProjectDirs::from("com", "clawd", "Nanna")
         .map(|p| p.data_dir().join("skills"))
@@ -7637,20 +7605,20 @@ async fn list_skills(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<SkillListResult, String> {
     let state_guard = state.read().await;
-    
+
     // Get skills directory from workspace or config
     let skills_path = get_skills_path(&state_guard).await;
-    
+
     // Ensure directory exists
     if !skills_path.exists() {
         if let Err(e) = std::fs::create_dir_all(&skills_path) {
             warn!("Failed to create skills directory: {}", e);
         }
     }
-    
+
     // Discover skills
     let discovered = nanna_tools::skills::discover_skills(&skills_path);
-    
+
     let mut skills = Vec::new();
     for skill in discovered {
         let (skill_type, language) = match &skill.source {
@@ -7665,14 +7633,14 @@ async fn list_skills(
                 ("manifest".to_string(), None)
             }
         };
-        
+
         // Read the code
         let code_path = match &skill.source {
             nanna_tools::skills::SkillSource::Script(p) => p.clone(),
             nanna_tools::skills::SkillSource::Manifest(p) => p.clone(),
         };
         let code = std::fs::read_to_string(&code_path).ok();
-        
+
         skills.push(SkillInfo {
             name: skill.name,
             skill_type,
@@ -7681,7 +7649,7 @@ async fn list_skills(
             code,
         });
     }
-    
+
     Ok(SkillListResult {
         skills,
         path: skills_path.display().to_string(),
@@ -7697,15 +7665,15 @@ async fn create_skill(
     code: String,
 ) -> Result<SkillInfo, String> {
     let state_guard = state.read().await;
-    
+
     // Validate name (lowercase, underscores, alphanumeric)
     if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
         return Err("Skill name must be lowercase alphanumeric with underscores or hyphens".to_string());
     }
-    
+
     // Get skills directory
     let skills_path = get_skills_path(&state_guard).await;
-    
+
     // Create skill directory
     let skill_dir = skills_path.join(&name);
     if skill_dir.exists() {
@@ -7713,21 +7681,21 @@ async fn create_skill(
     }
     std::fs::create_dir_all(&skill_dir)
         .map_err(|e| format!("Failed to create skill directory: {}", e))?;
-    
+
     // Determine file name and language
     let (filename, language) = match skill_type.as_str() {
         "manifest" => ("tool.yaml", None),
         "script" => ("tool.ts", Some("typescript".to_string())),
         _ => return Err(format!("Unknown skill type: {}", skill_type)),
     };
-    
+
     // Write the code file
     let code_path = skill_dir.join(filename);
     std::fs::write(&code_path, &code)
         .map_err(|e| format!("Failed to write skill code: {}", e))?;
-    
+
     info!("Created new skill: {} at {}", name, skill_dir.display());
-    
+
     Ok(SkillInfo {
         name,
         skill_type,
@@ -7745,26 +7713,26 @@ async fn update_skill(
     code: String,
 ) -> Result<SkillInfo, String> {
     let state_guard = state.read().await;
-    
+
     // Get skills directory
     let skills_path = get_skills_path(&state_guard).await;
-    
+
     let skill_dir = skills_path.join(&name);
     if !skill_dir.exists() {
         return Err(format!("Skill '{}' not found", name));
     }
-    
+
     // Find the code file
     let code_files = ["tool.ts", "tool.js", "tool.yaml", "tool.yml"];
     let code_path = code_files.iter()
         .map(|f| skill_dir.join(f))
         .find(|p| p.exists())
         .ok_or_else(|| format!("No tool file found in skill '{}'", name))?;
-    
+
     // Write the updated code
     std::fs::write(&code_path, &code)
         .map_err(|e| format!("Failed to update skill code: {}", e))?;
-    
+
     // Determine type from extension
     let (skill_type, language) = match code_path.extension().and_then(|e| e.to_str()) {
         Some("yaml") | Some("yml") => ("manifest".to_string(), None),
@@ -7772,9 +7740,9 @@ async fn update_skill(
         Some("js") => ("script".to_string(), Some("javascript".to_string())),
         _ => ("unknown".to_string(), None),
     };
-    
+
     info!("Updated skill: {}", name);
-    
+
     Ok(SkillInfo {
         name,
         skill_type,
@@ -7895,7 +7863,7 @@ async fn test_skill(
     input: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
     let state = state.read().await;
-    
+
     match skill_type.as_str() {
         "script" => {
             // Use user_tools test for scripts
@@ -8073,7 +8041,7 @@ async fn set_close_mode(
         "quit_completely" => CloseMode::QuitCompletely,
         _ => return Err(format!("Unknown close mode: {}", mode)),
     };
-    
+
     let state = state.read().await;
     *state.close_mode.write().await = close_mode;
     info!("Close mode set to: {:?}", close_mode);
@@ -8089,7 +8057,7 @@ async fn handle_window_close(
 ) -> Result<String, String> {
     let state_guard = state.read().await;
     let mode = *state_guard.close_mode.read().await;
-    
+
     match mode {
         CloseMode::Ask => {
             // Frontend should show dialog
@@ -8116,11 +8084,11 @@ async fn perform_quit(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<(), String> {
     let state_guard = state.read().await;
-    
+
     // Shutdown backend (stop daemon)
     info!("Performing quit - shutting down backend...");
     state_guard.backend.shutdown().await;
-    
+
     // Save memories
     let count = state_guard.memory.count().await;
     if count > 0 {
@@ -8130,14 +8098,14 @@ async fn perform_quit(
                 warn!("Failed to create memory backup: {}", e);
             }
         }
-        
+
         if let Err(e) = state_guard.memory.save(&state_guard.memory_path).await {
             error!("Failed to save memories on exit: {}", e);
         } else {
             info!("Saved {} memories", count);
         }
     }
-    
+
     // Exit the app
     app.exit(0);
     Ok(())
@@ -8219,7 +8187,7 @@ async fn list_cron_jobs(
 
     let scheduler = state_guard.scheduler.read().await;
     let tasks = scheduler.list_tasks().await;
-    
+
     let jobs: Vec<CronJobInfo> = tasks.into_iter().map(|t| {
         let (schedule, next_run, schedule_description) = match &t.task_type {
             nanna_core::TaskType::Heartbeat => {
@@ -8246,7 +8214,7 @@ async fn list_cron_jobs(
                 (format!("delay_{}s", delay.as_secs()), None, "One-shot delayed".to_string())
             }
         };
-        
+
         CronJobInfo {
             id: t.id.clone(),
             name: t.name.clone(),
@@ -8260,7 +8228,7 @@ async fn list_cron_jobs(
             timezone: t.timezone.clone(),
         }
     }).collect();
-    
+
     Ok(jobs)
 }
 
@@ -8274,11 +8242,11 @@ async fn create_cron_job(
     timezone: Option<String>,
 ) -> Result<CronJobInfo, String> {
     use nanna_core::CronExpr;
-    
+
     // Validate the cron expression
     let parsed = CronExpr::parse(&schedule).map_err(|e| e.to_string())?;
     let next_run = parsed.next_from_now();
-    
+
     let task = nanna_core::ScheduledTask {
         id: format!("{}-{}", name, uuid::Uuid::new_v4()),
         name: name.clone(),
@@ -8295,7 +8263,7 @@ async fn create_cron_job(
         target_channel: None,
         target_session: None,
     };
-    
+
     let state_guard = state.read().await;
 
     // Daemon mode: create the job on the daemon (it owns nanna.db and runs
@@ -8537,7 +8505,7 @@ async fn get_cron_job_history(
     let scheduler = state_guard.scheduler.read().await;
 
     let runs = scheduler.get_history(&job_id, limit.unwrap_or(20)).await;
-    
+
     Ok(runs.into_iter().map(|r| JobRunInfo {
         id: r.id,
         job_id: r.job_id,
@@ -8556,7 +8524,7 @@ async fn validate_cron_expression(
     expression: String,
 ) -> Result<(bool, String), String> {
     use nanna_core::CronExpr;
-    
+
     match CronExpr::parse(&expression) {
         Ok(parsed) => {
             let description = parsed.describe();
@@ -8668,7 +8636,7 @@ async fn setup_state(
     tools.register(nanna_tools::ListDirTool::new()).await;
     tools.register(nanna_tools::ExecTool::new()).await;
     tools.register(nanna_tools::WebFetchTool::new()).await;
-    
+
     // WebSearchTool requires BRAVE_API_KEY (env var or config)
     let brave_key = std::env::var("BRAVE_API_KEY").ok()
         .or_else(|| config.tools.brave_api_key.clone());
@@ -8708,9 +8676,9 @@ async fn setup_state(
 
     info!("Loaded embedding config: provider={}, model={}, ollama_host={}",
           saved_embedding_provider, saved_embedding_model, saved_ollama_host);
-    
+
     // Initialize based on configured provider
-    let (embedding_provider, embedding_model, embedding_enabled, memory) = 
+    let (embedding_provider, embedding_model, embedding_enabled, memory) =
         match saved_embedding_provider.as_str() {
             "openai" => {
                 if let Some(openai_key) = openai_key {
@@ -8729,17 +8697,17 @@ async fn setup_state(
                         dimension,
                         ..Default::default()
                     };
-                    
+
                     let embed_client = reqwest::Client::new();
                     let embed_key = openai_key.clone();
                     let model_name = saved_embedding_model.clone();
-                    
+
                     let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
                         let client = embed_client.clone();
                         let key = embed_key.clone();
                         let model = model_name.clone();
                         let text = text.to_string();
-                        
+
                         Box::pin(async move {
                             let response = client
                                 .post("https://api.openai.com/v1/embeddings")
@@ -8751,27 +8719,27 @@ async fn setup_state(
                                 .send()
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            
+
                             let json: serde_json::Value = response
                                 .json()
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            
+
                             let embedding = json["data"][0]["embedding"]
                                 .as_array()
                                 .ok_or("No embedding in response")?
                                 .iter()
                                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                                 .collect::<Vec<f32>>();
-                            
+
                             if embedding.is_empty() {
                                 return Err("Empty embedding returned".to_string());
                             }
-                            
+
                             Ok(embedding)
                         })
                     });
-                    
+
                     (
                         "openai".to_string(),
                         saved_embedding_model.clone(),
@@ -8804,19 +8772,19 @@ async fn setup_state(
                     dimension,
                     ..Default::default()
                 };
-                
+
                 let embed_client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(60))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
-                
+
                 let model_name = saved_embedding_model.clone();
                 let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
                     let client = embed_client.clone();
                     let url = ollama_url.clone();
                     let model = model_name.clone();
                     let text = text.to_string();
-                    
+
                     Box::pin(async move {
                         let response = client
                             .post(format!("{}/api/embeddings", url))
@@ -8828,33 +8796,33 @@ async fn setup_state(
                             .send()
                             .await
                             .map_err(|e| e.to_string())?;
-                        
+
                         if !response.status().is_success() {
                             let status = response.status();
                             let body = response.text().await.unwrap_or_default();
                             return Err(format!("Ollama error {}: {}", status, body));
                         }
-                        
+
                         let json: serde_json::Value = response
                             .json()
                             .await
                             .map_err(|e| e.to_string())?;
-                        
+
                         let embedding = json["embedding"]
                             .as_array()
                             .ok_or("No embedding in Ollama response")?
                             .iter()
                             .filter_map(|v| v.as_f64().map(|f| f as f32))
                             .collect::<Vec<f32>>();
-                        
+
                         if embedding.is_empty() {
                             return Err("Empty embedding returned from Ollama".to_string());
                         }
-                        
+
                         Ok(embedding)
                     })
                 });
-                
+
                 (
                     "ollama".to_string(),
                     saved_embedding_model.clone(),
@@ -8878,7 +8846,7 @@ async fn setup_state(
     let memory_path = Config::default_data_dir()
         .map(|d| d.join("memories.json"))
         .unwrap_or_else(|_| std::path::PathBuf::from("memories.json"));
-    
+
     if memory_path.exists() {
         match memory.load(&memory_path).await {
             Ok(()) => info!("Loaded {} memories from {:?}", memory.count().await, memory_path),
@@ -8992,18 +8960,18 @@ async fn setup_state(
         .map(|d| d.join("user_tools"))
         .unwrap_or_else(|_| std::path::PathBuf::from("user_tools"));
     let user_tool_manager = Arc::new(tool_authoring::UserToolManager::new(user_tools_dir));
-    
+
     // Load existing user tools
     match user_tool_manager.load_all().await {
         Ok(count) => info!("Loaded {} user-created tools", count),
         Err(e) => warn!("Failed to load user tools: {}", e),
     }
-    
+
     // Register user tools with the registry
     let tools = Arc::new(tools);
     let registered = user_tool_manager.register_with_registry(&tools).await;
     info!("Registered {} user tools with the tool registry", registered);
-    
+
     // Register create_tool and list_user_tools tools (so Nanna can create tools at runtime)
     tools.register(tool_authoring::CreateToolTool::new(user_tool_manager.clone(), tools.clone())).await;
     tools.register(tool_authoring::ListUserToolsTool::new(user_tool_manager.clone())).await;
@@ -9125,24 +9093,24 @@ async fn setup_state(
                         llm.clone(),
                         tools.clone(),
                     );
-                    
+
                     // Run the agent with the heartbeat prompt
                     let run_options = nanna_agent::RunOptions::default();
                     match agent.run(&prompt, run_options).await {
                         Ok(response) => {
                             let finished_at = chrono::Utc::now();
                             let output = response.text.clone();
-                            
+
                             // Check if agent responded with HEARTBEAT_OK
-                            let is_heartbeat_ok = output.trim().starts_with("HEARTBEAT_OK") 
+                            let is_heartbeat_ok = output.trim().starts_with("HEARTBEAT_OK")
                                 || output.trim().ends_with("HEARTBEAT_OK")
                                 || output.trim() == "HEARTBEAT_OK";
-                            
+
                             if is_heartbeat_ok {
                                 debug!("Heartbeat: OK (nothing to do)");
                             } else {
                                 info!("Heartbeat response: {}", output.chars().take(200).collect::<String>());
-                                
+
                                 // Route to channel if specified
                                 if let Some(ref channel_id) = task.target_channel {
                                     if let Err(e) = route_to_channel(&channels, channel_id, &output).await {
@@ -9150,15 +9118,15 @@ async fn setup_state(
                                     }
                                 }
                             }
-                            
+
                             nanna_core::TaskResult {
                                 task_id: task.id.clone(),
                                 task_name: task.name.clone(),
                                 success: true,
-                                output: Some(if is_heartbeat_ok { 
-                                    "HEARTBEAT_OK".to_string() 
-                                } else { 
-                                    output 
+                                output: Some(if is_heartbeat_ok {
+                                    "HEARTBEAT_OK".to_string()
+                                } else {
+                                    output
                                 }),
                                 error: None,
                                 duration_ms: start.elapsed().as_millis() as u64,
@@ -9213,7 +9181,7 @@ async fn setup_state(
                             llm.complete(&request).await.map_err(|e| e.to_string())
                         }
                     };
-                    
+
                     match memory.consolidate(&consolidation_config, summarize).await {
                         Ok(result) => {
                             let finished_at = chrono::Utc::now();
@@ -9282,21 +9250,21 @@ async fn setup_state(
                             llm.clone(),
                             tools.clone(),
                         );
-                        
+
                         let run_options = nanna_agent::RunOptions::default();
                         match agent.run(&task.payload, run_options).await {
                             Ok(response) => {
                                 let finished_at = chrono::Utc::now();
                                 let output = response.text;
                                 info!("Cron job '{}' completed", task.name);
-                                
+
                                 // Route to channel if specified
                                 if let Some(ref channel_id) = task.target_channel {
                                     if let Err(e) = route_to_channel(&channels, channel_id, &output).await {
                                         warn!("Failed to route cron job to channel {}: {}", channel_id, e);
                                     }
                                 }
-                                
+
                                 nanna_core::TaskResult {
                                     task_id: task.id.clone(),
                                     task_name: task.name.clone(),
@@ -9341,7 +9309,7 @@ async fn setup_state(
             }
         })
     });
-    
+
     scheduler = scheduler.with_executor(executor);
     match mode {
         BackendMode::Embedded => {
@@ -9355,7 +9323,7 @@ async fn setup_state(
             info!("Daemon mode: local scheduler not started (the daemon runs heartbeat + cron)");
         }
     }
-    
+
     let scheduler = Arc::new(RwLock::new(scheduler));
     let last_consolidation = Arc::new(RwLock::new(None));
 
@@ -9365,7 +9333,7 @@ async fn setup_state(
 
     // Get extraction model from config (empty = use chat model)
     let saved_extraction_model = config.memory.extraction_model.clone();
-    
+
     // Get initial active model from priority list or default
     let initial_active_model = config.llm.model_priority.first()
         .cloned()
@@ -9680,13 +9648,13 @@ pub fn run() {
                     let state = state.inner().clone();
                     tauri::async_runtime::block_on(async {
                         let state_guard = state.read().await;
-                        
+
                         // Stop the daemon sidecar
                         info!("Shutting down backend...");
                         state_guard.backend.shutdown().await;
-                        
+
                         let count = state_guard.memory.count().await;
-                        
+
                         // Only save if we have memories (prevents wiping on failed load)
                         if count > 0 {
                             // Create backup before saving
@@ -9696,7 +9664,7 @@ pub fn run() {
                                     warn!("Failed to create memory backup: {}", e);
                                 }
                             }
-                            
+
                             if let Err(e) = state_guard.memory.save(&state_guard.memory_path).await {
                                 error!("Failed to save memories on exit: {}", e);
                             } else {
@@ -9775,8 +9743,9 @@ fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(test)]
 mod parse_model_id_tests {
     use super::{
-        conversation_token_budget, model_context_limit, parse_model_id,
+        conversation_token_budget_for, parse_model_id, resolve_model_info_sync,
     };
+    use nanna_llm::{unknown_model_info, UNKNOWN_CONTEXT_WINDOW};
 
     #[test]
     fn parse_model_id_infers_provider_by_family_prefix() {
@@ -9841,44 +9810,52 @@ mod parse_model_id_tests {
     }
 
     #[test]
-    fn conversation_budget_respects_small_model_context() {
-        // 32k Ollama model must not get the historical 132k hardcode.
-        let budget = conversation_token_budget("llama3.2");
+    fn conversation_budget_uses_resolved_model_info() {
+        // Small window (API/cache would report this) must not inherit a cloud-sized
+        // default: budget must fit the hard input limit and keep a history floor.
+        let small = nanna_llm::ModelInfo {
+            id: "local".into(),
+            context_window: 8_000,
+            max_output_tokens: 4_096,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "test".into(),
+        };
+        let budget = conversation_token_budget_for(&small);
         assert!(
-            budget < 32_000,
-            "small-model budget {budget} must fit inside a 32k window"
+            budget <= small.hard_input_limit(),
+            "budget {budget} exceeds hard input {}",
+            small.hard_input_limit()
         );
-        // Still leave some room for history after system/response reserves.
-        assert!(budget >= 2_000, "budget {budget} collapsed to floor");
+        assert!(budget >= 2_000, "budget {budget} collapsed below floor");
     }
 
     #[test]
-    fn conversation_budget_for_large_claude_is_generous() {
-        let budget = conversation_token_budget("claude-opus-4");
-        // 200k − max(output, 50%) − (10k+8k) ≈ 200k − 8192/100k − 18k → big.
-        // Floor hard_limit is max(200k-8k, 100k) = 191808; budget ≈ 173808.
+    fn conversation_budget_scales_with_large_context() {
+        let large = nanna_llm::ModelInfo {
+            id: "big".into(),
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "test".into(),
+        };
+        let budget = conversation_token_budget_for(&large);
         assert!(budget > 100_000, "large-model budget {budget} regressed");
-        assert!(budget < 200_000);
+        assert!(budget < large.context_window);
     }
 
     #[test]
-    fn conversation_budget_for_plain_gpt4_uses_8k_window() {
-        // Bare gpt-4 is 8k (not 128k). hard = max(8k-4k, 4k) = 4k;
-        // budget = max(4k − 18k, 2k) = 2k floor.
-        let budget = conversation_token_budget("gpt-4");
-        assert_eq!(budget, 2_000);
-        // gpt-4o keeps the large window.
-        let large = conversation_token_budget("gpt-4o");
-        assert!(large > 50_000, "gpt-4o budget {large} collapsed");
-    }
-
-    #[test]
-    fn model_context_limit_prefers_specific_family() {
-        assert_eq!(model_context_limit("gpt-4o"), 128_000);
-        assert_eq!(model_context_limit("gpt-4-turbo"), 128_000);
-        assert_eq!(model_context_limit("gpt-4"), 8_000);
-        assert_eq!(model_context_limit("llama-3.1-70b"), 128_000);
-        assert_eq!(model_context_limit("llama3"), 32_000);
-        assert_eq!(model_context_limit("unknown-local"), 32_000);
+    fn uncached_model_name_uses_universal_floor() {
+        // No per-model table: any name without a cache entry gets UNKNOWN_CONTEXT_WINDOW.
+        let info = resolve_model_info_sync("some-unknown-local-model-xyz");
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        let budget = conversation_token_budget_for(&info);
+        let expected = conversation_token_budget_for(&unknown_model_info("x", ""));
+        assert_eq!(budget, expected);
     }
 }

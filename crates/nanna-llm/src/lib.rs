@@ -128,6 +128,24 @@ impl ModelInfo {
         self.cached_at = current_timestamp();
         self
     }
+
+    /// Tokens available for conversation history after hard-input + reserved heads.
+    ///
+    /// `system_reserved` / `response_reserved` cover prompt + completion heads that
+    /// sit outside the stored history window (GUI system prompt + response reserve).
+    /// Floored at `min_history` so truncation never empties the transcript, but
+    /// never above the hard input limit itself.
+    #[must_use]
+    pub fn conversation_history_budget(
+        &self,
+        system_reserved: usize,
+        response_reserved: usize,
+        min_history: usize,
+    ) -> usize {
+        let hard = self.hard_input_limit();
+        hard.saturating_sub(system_reserved.saturating_add(response_reserved))
+            .max(min_history.min(hard))
+    }
 }
 
 /// Get current Unix timestamp
@@ -138,57 +156,61 @@ fn current_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+/// Universal context floor when no provider has reported limits for a model.
+///
+/// Providers update windows constantly; we never hardcode per-model values.
+/// Callers should prefer [`LlmClient::get_model_info`] / [`ModelInfoCache`].
+/// This floor is intentionally conservative so unknown / offline models stay
+/// under their real window rather than overshoot and 400.
+pub const UNKNOWN_CONTEXT_WINDOW: usize = 32_000;
+
+/// Universal max-output floor when the provider does not report it.
+pub const UNKNOWN_MAX_OUTPUT_TOKENS: usize = 4_096;
+
 /// Best-effort context window (in tokens) for a model by name.
 ///
-/// From the same fallback table as [`default_model_info`]; lets non-LLM callers
-/// (e.g. memory consolidation) size token budgets without an async info fetch.
+/// Order: live disk cache from a prior API fetch, else [`UNKNOWN_CONTEXT_WINDOW`].
+/// No per-model name table — models change constantly; use the provider API.
 #[must_use]
 pub fn model_context_window(model: &str) -> usize {
-    default_model_info(model, "").context_window
+    model_info_from_cache_or_unknown(model, "").context_window
 }
 
-/// Default context windows for known models (fallback when API doesn't provide)
-fn default_model_info(model: &str, provider: &str) -> ModelInfo {
-    let model_lower = model.to_lowercase();
-
-    // Check if this is an embedding model first
-    let embedding_dimension = embedding_dimension_for_model(&model_lower);
-
-    let (context_window, max_output, supports_tools, supports_vision) = match model {
-        // Claude models - 200K context (can be 1M with beta header)
-        m if m.contains("claude-3") || m.contains("claude-sonnet") || m.contains("claude-opus") || m.contains("claude-haiku") => {
-            (200_000, 8192, true, true)
+/// Build a [`ModelInfo`] from the on-disk cache, or the universal unknown floor.
+///
+/// Used by sync paths that cannot await a provider fetch (e.g. consolidation
+/// sizing). Prefer [`LlmClient::get_model_info`] whenever a client is available.
+#[must_use]
+pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInfo {
+    if let Some(cache) = ModelInfoCache::default_location() {
+        if let Some(info) = cache.get(model) {
+            return info;
         }
-        // GPT-4 Turbo / GPT-4o - 128K context
-        m if m.contains("gpt-4-turbo") || m.contains("gpt-4o") => {
-            (128_000, 4096, true, true)
-        }
-        // GPT-4 (original) - 8K or 32K
-        m if m.contains("gpt-4-32k") => (32_000, 4096, true, false),
-        m if m.contains("gpt-4") => (8_000, 4096, true, false),
-        // GPT-3.5 Turbo - 16K
-        m if m.contains("gpt-3.5-turbo-16k") => (16_000, 4096, true, false),
-        m if m.contains("gpt-3.5") => (4_000, 4096, true, false),
-        // Llama models
-        m if m.contains("llama-3.1") || m.contains("llama-3.2") => (128_000, 4096, true, false),
-        m if m.contains("llama") => (8_000, 4096, false, false),
-        // Mistral models
-        m if m.contains("mistral-large") => (128_000, 4096, true, false),
-        m if m.contains("mistral") => (32_000, 4096, true, false),
-        // Conservative default
-        _ => (32_000, 4096, false, false),
-    };
+    }
+    unknown_model_info(model, provider)
+}
 
+/// Conservative model info when the provider has not (yet) told us limits.
+///
+/// Supports tools optimistically — capability misses are softer than overrunning
+/// a too-small context budget on a modern agent path.
+#[must_use]
+pub fn unknown_model_info(model: &str, provider: &str) -> ModelInfo {
     ModelInfo {
         id: model.to_string(),
-        context_window,
-        max_output_tokens: max_output,
-        supports_tools,
-        supports_vision,
-        embedding_dimension,
+        context_window: UNKNOWN_CONTEXT_WINDOW,
+        max_output_tokens: UNKNOWN_MAX_OUTPUT_TOKENS,
+        supports_tools: true,
+        supports_vision: false,
+        embedding_dimension: embedding_dimension_for_model(model),
         cached_at: current_timestamp(),
         provider: provider.to_string(),
     }
+}
+
+/// Alias kept for local fetch_* fallbacks — one floor, not a model table.
+fn default_model_info(model: &str, provider: &str) -> ModelInfo {
+    unknown_model_info(model, provider)
 }
 
 /// Get embedding dimension for known embedding models (fallback when API doesn't provide)
@@ -334,10 +356,10 @@ impl LlmError {
     /// Check if this error is a rate limit error (429)
     #[must_use]
     pub fn is_rate_limit(&self) -> bool {
-        matches!(self, LlmError::RateLimit { .. }) 
+        matches!(self, LlmError::RateLimit { .. })
             || matches!(self, LlmError::Api { status: 429, .. })
     }
-    
+
     /// Check if this error should trigger a fallback to another model
     #[must_use]
     pub fn should_fallback(&self) -> bool {
@@ -362,7 +384,7 @@ impl LlmError {
             _ => false,
         }
     }
-    
+
     /// Parse an API error response to extract rate limit info
     pub fn from_api_response(status: u16, message: String) -> Self {
         // Check if it's a rate limit error
@@ -371,10 +393,10 @@ impl LlmError {
             let retry_after = Self::parse_retry_after(&message);
             return LlmError::RateLimit { message, retry_after };
         }
-        
+
         LlmError::Api { status, message }
     }
-    
+
     /// Try to parse retry-after seconds from error message
     fn parse_retry_after(_message: &str) -> Option<u64> {
         // Anthropic includes "try again later" but not specific timing
@@ -438,7 +460,7 @@ impl AnthropicMessage {
             }],
         }
     }
-    
+
     /// Create an assistant message with tool use
     pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: serde_json::Value) -> Self {
         Self {
@@ -450,7 +472,7 @@ impl AnthropicMessage {
             }],
         }
     }
-    
+
     /// Create an assistant message with text and tool use
     pub fn assistant_with_tool_use(
         text: Option<String>,
@@ -514,12 +536,12 @@ pub struct AnthropicMessage {
 }
 
 impl AnthropicMessage {
-    #[must_use] 
+    #[must_use]
     pub fn user(content: Vec<ContentBlock>) -> Self {
         Self { role: "user".to_string(), content }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn assistant(content: Vec<ContentBlock>) -> Self {
         Self { role: "assistant".to_string(), content }
     }
@@ -615,7 +637,7 @@ impl CompletionRequest {
         self.tools = tools;
         self
     }
-    
+
     /// Add an Anthropic-format message (for tool use/results)
     #[must_use]
     pub fn with_anthropic_message(mut self, msg: AnthropicMessage) -> Self {
@@ -746,11 +768,11 @@ impl OAuthAnthropicRequest {
     /// Convert from a standard AnthropicRequest, prepending Claude Code identity
     fn from_request(request: &AnthropicRequest, prepend_identity: bool) -> Self {
         let mut system = Vec::new();
-        
+
         if prepend_identity {
             system.push(SystemBlock::text(CLAUDE_CODE_IDENTITY));
         }
-        
+
         if let Some(ref sys) = request.system {
             if !sys.is_empty() {
                 system.push(SystemBlock::text(sys));
@@ -764,7 +786,7 @@ impl OAuthAnthropicRequest {
                 last.cache_control = Some(CacheControl::ephemeral());
             }
         }
-        
+
         Self {
             model: request.model.clone(),
             messages: request.messages.clone(),
@@ -1329,7 +1351,7 @@ impl LlmClient {
         if let Some(m) = api_response.data.iter().find(|m| m.id == model) {
             return Ok(ModelInfo {
                 id: m.id.clone(),
-                context_window: m.context_length.unwrap_or(32_000),
+                context_window: m.context_length.unwrap_or(UNKNOWN_CONTEXT_WINDOW),
                 max_output_tokens: m
                     .top_provider
                     .as_ref()
@@ -1598,7 +1620,7 @@ impl LlmClient {
         };
 
         let result = self.complete_anthropic(&anthropic_request).await?;
-        
+
         // Extract text from response
         let text = result
             .content
@@ -1817,12 +1839,12 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
             }
         }
     }
-    
+
     // Tools definitions
     for tool in &request.tools {
         total += estimate_tokens(&tool.to_string());
     }
-    
+
     total
 }
 
@@ -1881,7 +1903,7 @@ impl RateLimitHeaders {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok())
         };
-        
+
         Self {
             // Anthropic uses x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens
             // OpenAI uses x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens (same!)
@@ -1894,7 +1916,7 @@ impl RateLimitHeaders {
             retry_after: get_u64("retry-after"),
         }
     }
-    
+
     /// Convert to ModelLimits, using defaults where headers are missing
     #[must_use]
     pub fn to_model_limits(&self, defaults: &ModelLimits) -> ModelLimits {
@@ -1910,7 +1932,7 @@ impl RateLimitHeaders {
 impl ModelLimits {
     /// Get default limits for common models.
     /// These are conservative fallbacks — actual limits come from API headers.
-    /// 
+    ///
     /// **Note:** These are baseline Tier 1 limits. Higher tiers get much more.
     /// The system will update these from response headers at runtime.
     #[must_use]
@@ -1966,13 +1988,13 @@ impl ModelLimits {
             _ => Self::default(),
         }
     }
-    
+
     /// Check if a request would likely exceed rate limits
     #[must_use]
     pub fn would_exceed(&self, estimated_input_tokens: usize) -> bool {
         estimated_input_tokens as u32 > self.input_tokens_per_minute
     }
-    
+
     /// Update limits from API response headers
     pub fn update_from_headers(&mut self, headers: &RateLimitHeaders) {
         if let Some(limit) = headers.limit_tokens {
@@ -2269,8 +2291,8 @@ pub enum StreamEvent {
         cache_creation_tokens: u32,
     },
     /// Start of a content block
-    ContentBlockStart { 
-        index: usize, 
+    ContentBlockStart {
+        index: usize,
         content_type: String,
         /// Tool use ID (only for tool_use blocks)
         tool_id: Option<String>,
@@ -2290,7 +2312,7 @@ pub enum StreamEvent {
     /// Message finished
     MessageStop { stop_reason: String },
     /// Usage statistics
-    MessageDelta { 
+    MessageDelta {
         stop_reason: Option<String>,
         output_tokens: u32,
     },
@@ -2334,7 +2356,7 @@ impl StreamAccumulator {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Process an event and accumulate content
     pub fn process(&mut self, event: &StreamEvent) {
         match event {
@@ -2362,7 +2384,7 @@ impl StreamAccumulator {
             _ => {}
         }
     }
-    
+
     /// Get partial tool calls as (id, name, json) tuples
     #[must_use]
     pub fn partial_tool_calls(&self) -> Vec<(String, String, String)> {
@@ -2370,7 +2392,7 @@ impl StreamAccumulator {
             .map(|(_, id, name, json)| (id.clone(), name.clone(), json.clone()))
             .collect()
     }
-    
+
     /// Check if there's any accumulated content
     #[must_use]
     pub fn has_content(&self) -> bool {
@@ -3554,20 +3576,20 @@ impl LlmClient {
             }
         }
     }
-    
+
     /// Stream with explicit accumulator for advanced recovery scenarios.
-    /// 
+    ///
     /// Returns both events and the final accumulator state (even on error).
     pub fn stream_with_recovery(
         &self,
         request: &CompletionRequest,
     ) -> impl Stream<Item = (StreamEvent, StreamAccumulator)> + '_ {
         let base_stream = self.stream(request);
-        
+
         stream! {
             let mut accumulator = StreamAccumulator::new();
             tokio::pin!(base_stream);
-            
+
             while let Some(event) = base_stream.next().await {
                 accumulator.process(&event);
                 yield (event, accumulator.clone());
@@ -4230,11 +4252,27 @@ mod tests {
     }
 
     #[test]
-    fn model_context_window_resolves_from_the_fallback_table() {
-        // Used to size memory-consolidation budgets without an async fetch.
-        assert_eq!(model_context_window("claude-opus-4-8"), 200_000);
-        assert_eq!(model_context_window("gpt-4"), 8_000);
-        // Unknown model falls back to the conservative default window.
-        assert_eq!(model_context_window("some-unknown-model"), 32_000);
+    fn model_context_window_uses_universal_floor_without_cache() {
+        // No per-model table: uncached names all inherit the conservative floor.
+        assert_eq!(model_context_window("claude-opus-4-8"), UNKNOWN_CONTEXT_WINDOW);
+        assert_eq!(model_context_window("gpt-4"), UNKNOWN_CONTEXT_WINDOW);
+        assert_eq!(model_context_window("some-unknown-model"), UNKNOWN_CONTEXT_WINDOW);
+        let info = unknown_model_info("x", "test");
+        assert_eq!(info.context_window, UNKNOWN_CONTEXT_WINDOW);
+        assert_eq!(info.max_output_tokens, UNKNOWN_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn conversation_history_budget_respects_hard_limit() {
+        let small = model_info(8_000, 4_096);
+        let budget = small.conversation_history_budget(2_000, 2_000, 1_000);
+        assert!(budget <= small.hard_input_limit());
+        assert!(budget >= 1_000);
+        let tiny = model_info(2_000, 1_000);
+        // min_history must not exceed hard limit
+        assert_eq!(
+            tiny.conversation_history_budget(10_000, 10_000, 5_000),
+            tiny.hard_input_limit()
+        );
     }
 }
