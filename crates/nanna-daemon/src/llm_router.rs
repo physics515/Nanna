@@ -236,17 +236,13 @@ impl LlmRouter {
         if let Some(client) = self.providers.get(&provider) {
             client.get_model_info(actual_model, self.model_cache.as_ref()).await
         } else {
-            // Return defaults if provider not available
-            ModelInfo {
-                id: model.to_string(),
-                context_window: 128_000,
-                max_output_tokens: 8192,
-                supports_tools: true,
-                supports_vision: false,
-                embedding_dimension: None,
-                provider: format!("{:?}", provider),
-                cached_at: chrono::Utc::now().timestamp(),
+            // Provider client missing: cache first, else universal floor (no name table).
+            if let Some(cache) = self.model_cache.as_ref() {
+                if let Some(info) = cache.get(actual_model) {
+                    return info;
+                }
             }
+            nanna_llm::unknown_model_info(model, &format!("{:?}", provider))
         }
     }
 

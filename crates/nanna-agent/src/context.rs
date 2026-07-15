@@ -427,44 +427,23 @@ impl AgentContext {
         model_changed
     }
 
-    /// Configure context limits for a model by name using defaults.
+    /// Configure context limits for a model by name.
     ///
-    /// Use this when you don't have a ModelInfo instance.
+    /// Prefer [`Self::configure_for_model`] with a live [`ModelInfo`] from the
+    /// provider API. This name-only path uses the on-disk model-info cache when
+    /// a previous API fetch stored windows, otherwise the universal floor in
+    /// [`nanna_llm::unknown_model_info`] — **no per-model name table**.
     pub fn configure_for_model_name(&mut self, model: &str) {
-        // Use the default_model_info logic embedded here to avoid circular deps
-        let (context_window, max_output): (usize, usize) = match model {
-            m if m.contains("claude") => (200_000, 8192),
-            m if m.contains("gpt-4-turbo") || m.contains("gpt-4o") => (128_000, 4096),
-            m if m.contains("gpt-4") => (8_000, 4096),
-            m if m.contains("llama-3.1") || m.contains("llama-3.2") => (128_000, 4096),
-            m if m.contains("mistral-large") => (128_000, 4096),
-            _ => (32_000, 4096),
-        };
-
-        // Mirror `ModelInfo::hard_input_limit`/`compression_threshold`: floor the
-        // hard limit at 50% of context (a large `max_output` must not zero it) and
-        // keep the proactive-compression threshold *below* that cap so small models
-        // compress before slamming the hard limit (see nanna-llm::ModelInfo).
-        let hard_limit = context_window.saturating_sub(max_output).max(context_window / 2);
-        let compression_threshold = ((context_window * 80) / 100).min((hard_limit * 90) / 100);
+        // Cache-or-universal-floor only — no per-model name table.
+        // Prefer configure_for_model(&ModelInfo) once the provider has been queried.
+        let info = nanna_llm::model_info_from_cache_or_unknown(model, "");
+        let _ = self.configure_for_model(&info);
+        // Force current_model to the given name (cache may use a stripped id).
+        self.current_model = Some(model.to_string());
         debug_assert!(
-            compression_threshold <= hard_limit,
+            self.compression_threshold <= self.hard_limit,
             "compression must trigger before the hard input cap"
         );
-
-        if self.current_model.as_ref() != Some(&model.to_string()) {
-            info!(
-                model = %model,
-                context_window = context_window,
-                compression_threshold = compression_threshold,
-                hard_limit = hard_limit,
-                "Configuring context for model (using defaults)"
-            );
-        }
-
-        self.compression_threshold = compression_threshold;
-        self.hard_limit = hard_limit;
-        self.current_model = Some(model.to_string());
     }
 
     /// Set the context budget in tokens
@@ -515,7 +494,7 @@ impl AgentContext {
     }
 
     /// Reload workspace context from disk
-    /// 
+    ///
     /// # Errors
     /// Returns error if workspace cannot be loaded
     pub async fn reload_workspace(&mut self) -> Result<(), nanna_workspace::WorkspaceError> {
@@ -527,31 +506,31 @@ impl AgentContext {
     }
 
     /// Allocate a portion of context budget to a sub-agent.
-    /// 
+    ///
     /// Divides the available budget among multiple sub-agents, with the option
     /// to give priority to earlier agents (lower index gets slightly more).
-    /// 
+    ///
     /// # Arguments
     /// * `num_agents` - Total number of sub-agents to allocate for
     /// * `agent_index` - Index of this agent (0-based)
-    /// 
+    ///
     /// # Returns
     /// The allocated budget in tokens for this sub-agent.
     /// Returns a default of 10,000 tokens if no budget is set.
     #[must_use]
     pub fn allocate_budget(&self, num_agents: usize, agent_index: usize) -> usize {
         let total_budget = self.context_budget.unwrap_or(100_000);
-        
+
         if num_agents == 0 {
             return total_budget;
         }
-        
+
         // Reserve 20% for coordination/aggregation overhead
         let distributable = (total_budget * 80) / 100;
-        
+
         // Base allocation per agent
         let base_per_agent = distributable / num_agents;
-        
+
         // Give slightly more to earlier agents (they often do foundational work)
         // This creates a gentle gradient: first agent gets ~10% more than last
         let priority_bonus = if num_agents > 1 {
@@ -561,7 +540,7 @@ impl AgentContext {
         } else {
             0
         };
-        
+
         base_per_agent + priority_bonus
     }
 
@@ -627,7 +606,7 @@ impl AgentContext {
     /// commonly cited 4, because code, JSON, and tool calls tokenize at a higher
     /// ratio. Over-estimating triggers earlier compression, which is much better
     /// than hitting a 400 context_length_exceeded error mid-run.
-    #[must_use] 
+    #[must_use]
     pub fn estimate_tokens(&self) -> usize {
         let system_tokens = estimate_token_count(self.system_prompt.len());
         let summary_tokens: usize = self.summaries.iter().map(|s| estimate_token_count(s.summary.len())).sum();
@@ -1197,9 +1176,9 @@ impl AgentContext {
     }
 
     /// Compress old messages into a summary using LLM.
-    /// 
+    ///
     /// Keeps the most recent `keep_recent` messages and compresses the rest.
-    /// 
+    ///
     /// # Errors
     /// Returns error if LLM call fails
     pub async fn compress(
@@ -1223,7 +1202,7 @@ impl AgentContext {
         let split_point = self.messages.len() - keep_recent;
         let compress_start = 1.min(split_point); // skip index 0 (pinned first message)
         let old_messages = &self.messages[compress_start..split_point];
-        
+
         // Build a text representation of old messages
         let mut conversation_text = String::new();
         for msg in old_messages {
@@ -1395,10 +1374,19 @@ mod tests {
 
     #[test]
     fn small_model_compression_threshold_stays_below_hard_limit() {
-        // gpt-4 → (context 8k, output 4k): naive 80%-of-context (6400) would
-        // exceed the hard cap, so compression must be pulled below it.
+        // Explicit ModelInfo (as API would return), not a name table.
+        let info = ModelInfo {
+            id: "tiny".into(),
+            context_window: 8_000,
+            max_output_tokens: 4_096,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "test".into(),
+        };
         let mut ctx = AgentContext::new("s");
-        ctx.configure_for_model_name("gpt-4");
+        ctx.configure_for_model(&info);
         assert!(
             ctx.compression_threshold < ctx.hard_limit,
             "threshold {} must be below hard limit {}",
@@ -1409,11 +1397,28 @@ mod tests {
 
     #[test]
     fn large_model_compression_threshold_unchanged() {
-        // claude → (context 200k, output 8k): 80%-of-context is already smaller,
-        // so the invariant fix must not perturb the large-model threshold.
+        let info = ModelInfo {
+            id: "claude-big".into(),
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            supports_tools: true,
+            supports_vision: true,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "test".into(),
+        };
         let mut ctx = AgentContext::new("s");
-        ctx.configure_for_model_name("claude-opus-4-8");
+        ctx.configure_for_model(&info);
         assert_eq!(ctx.compression_threshold, 160_000);
         assert!(ctx.compression_threshold < ctx.hard_limit);
+    }
+
+    #[test]
+    fn name_path_uses_universal_floor_without_cache() {
+        let mut ctx = AgentContext::new("s");
+        ctx.configure_for_model_name("totally-unknown-local-model");
+        // Mirrors unknown_model_info floors (no per-model table).
+        assert_eq!(ctx.hard_limit, nanna_llm::unknown_model_info("x", "").hard_input_limit());
+        assert!(ctx.compression_threshold <= ctx.hard_limit);
     }
 }
