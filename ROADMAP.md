@@ -1067,6 +1067,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             Algorithm page still documents FSRS-6 only.) Sources:
             [srs-benchmark](https://github.com/open-spaced-repetition/srs-benchmark),
             [fsrs-rs PR #395](https://github.com/open-spaced-repetition/fsrs-rs/pull/395).
+      - [ ] *(research 2026-07-16)* **We ship the FSRS-6 curve with the FSRS-5 decay constant — `w20` is wrong
+            by ~7.6x.** `nanna-memory/src/fsrs.rs` implements the FSRS-6 forgetting curve *exactly*
+            (`R(t,S) = (1 + factor·t/S)^(-w20)` with `factor = 0.9^(-1/w20) - 1`, `power_law_retrievability`),
+            but defaults `w20: 0.5` — commented "typically 0.5", which is in fact **FSRS-4.5/5's hardcoded
+            `DECAY = -0.5`**, not an FSRS-6 value. **FSRS-6's default `w20` is `0.0658`**; making that exponent
+            trainable is the entire point of the version we claim to implement. A 0.5 exponent decays
+            retrievability far faster than FSRS-6 intends, so every consumer of retrievability is skewed:
+            testing-effect reinforcement, the FSRS weight bands the dream cycle clusters by, and
+            `retrieval_strength`. **Do not blind-flip the constant**: it changes live memory behavior, so land
+            it behind the **memory retention harness** (recall before/after a dream cycle) already listed under
+            *Performance & Benchmarking* — that harness is the instrument that tells us whether 0.0658 actually
+            recalls better, and it is exactly the "measure, don't guess" case. Then fit `w0..w20` from the
+            accumulated access history rather than any static default (see the 2026-07-06 note above).
+            Source: [awesome-fsrs — The Algorithm](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
