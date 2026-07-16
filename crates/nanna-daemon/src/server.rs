@@ -5,6 +5,7 @@
 use crate::agent_service::{AgentService, AgentServiceConfig};
 use nanna_agent::ThinkingMode;
 use crate::control::ControlPlane;
+use crate::embedding_router::{EmbeddingProviderInfo, EmbeddingRouter};
 use crate::memory_persistence::TursoMemoryPersistence;
 use crate::health::{HealthServer, HealthState, PidFile, DEFAULT_HEALTH_PORT};
 use crate::ipc::{IpcServer, IpcServerConfig};
@@ -593,28 +594,25 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    /// Discover the embedding dimension from an actual provider response.
-    async fn get_embedding_dimension(&self) -> Result<usize, String> {
-        let client = match self.embedding.provider.as_str() {
-            "openai" => {
-                let key = std::env::var("OPENAI_API_KEY")
-                    .map_err(|_| "OPENAI_API_KEY is required for embedding discovery".to_string())?;
-                nanna_llm::EmbeddingClient::openai(&key).with_model(&self.embedding.model)
-            }
-            "openrouter" => {
-                let key = std::env::var("OPENROUTER_API_KEY")
-                    .map_err(|_| "OPENROUTER_API_KEY is required for embedding discovery".to_string())?;
-                nanna_llm::EmbeddingClient::openai(&key)
-                    .with_model(&self.embedding.model)
-                    .with_base_url("https://openrouter.ai/api")
-            }
-            _ => nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
-                .with_model(&self.embedding.model),
-        };
-        let embedding = client.embed_one("dimension probe").await.map_err(|e| e.to_string())?;
+    /// Discover the embedding dimension by probing **the same router the live
+    /// embed path uses**.
+    ///
+    /// Probing through the router (rather than a bespoke client built from
+    /// `embedding.provider`) matters for two reasons:
+    ///
+    /// 1. The router resolves cloud keys from **config *or* env**, while a
+    ///    bespoke client read only the env — so a key set in `config.toml`
+    ///    probed as "missing" even though every real embed succeeded.
+    /// 2. The router carries the Ollama fallback, so a probe survives an
+    ///    unreachable/unkeyed cloud provider exactly like a real embed does.
+    ///
+    /// A failure here is **not** fatal — see the call site.
+    async fn probe_embedding_dimension(router: &EmbeddingRouter) -> Result<usize, String> {
+        let (embedding, _provider_changed) = router.embed_one("dimension probe").await?;
         if embedding.is_empty() {
             return Err("embedding provider returned an empty vector".to_string());
         }
+        debug_assert!(!embedding.is_empty(), "probe returned a non-empty vector");
         Ok(embedding.len())
     }
 
@@ -1425,7 +1423,6 @@ impl DaemonServer {
         
         // Initialize memory service with embeddings if enabled
         let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
-            use crate::embedding_router::{EmbeddingRouter, EmbeddingProviderInfo};
 
             // Build primary embedding client
             let primary_client = match self.embedding.provider.as_str() {
@@ -1544,15 +1541,44 @@ impl DaemonServer {
                         })
                     });
 
-                    // Try to get embedding dimension from model info cache or API
-                    let dimension = self.get_embedding_dimension().await.map_err(|e| {
-                        crate::DaemonError::Config(format!("Failed to discover embedding dimension: {e}"))
-                    })?;
+                    // Seed the embedding dimension by probing the router.
+                    //
+                    // A probe failure must NOT stop the daemon: Nanna is
+                    // offline-capable by default, so an unreachable or unkeyed
+                    // embedding provider degrades memory — it does not refuse
+                    // to boot. The seed only has to be a valid positive
+                    // dimension: real vectors always come from the provider,
+                    // and the background `probe_and_align_dimension` below
+                    // corrects the store (re-embedding any mismatched entries)
+                    // as soon as a provider answers. Probing here is purely an
+                    // optimization — when it succeeds the store is right
+                    // immediately and nothing is ever re-embedded.
+                    let seed_dimension = nanna_memory::MemoryServiceConfig::default().dimension;
+                    let dimension = match Self::probe_embedding_dimension(&embed_router).await {
+                        Ok(dim) => {
+                            info!(
+                                "Memory service using probed dimension {} for model {}",
+                                dim, self.embedding.model
+                            );
+                            dim
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Could not probe the embedding dimension ({e}). Starting anyway with a \
+                                 provisional dimension of {seed_dimension}; memory will re-align \
+                                 automatically once an embedding provider is reachable. To enable \
+                                 embeddings, run a local Ollama with `ollama pull {}` or set an \
+                                 OpenAI/OpenRouter key.",
+                                self.embedding.model
+                            );
+                            seed_dimension
+                        }
+                    };
+                    assert!(dimension > 0, "embedding dimension must be positive");
                     let config = nanna_memory::MemoryServiceConfig {
                         dimension,
                         ..Default::default()
                     };
-                    info!("Memory service using dimension {} for model {}", dimension, self.embedding.model);
 
                     // Wire up Turso persistence if storage is available.
                     // The persistence adapter is constructed here and attached to the
@@ -2181,6 +2207,94 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve exactly one HTTP request with a canned body, then exit.
+    ///
+    /// Bound on port 0 so the OS assigns a free port — the test never races a
+    /// real Ollama or another test for a fixed port. Returns the base URL.
+    async fn spawn_one_shot_embedding_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read whatever the client sends; we only need the socket
+                // drained enough to reply.
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn ollama_router_at(base_url: &str) -> EmbeddingRouter {
+        EmbeddingRouter::new(
+            EmbeddingProviderInfo { name: "ollama".into(), model: "nomic-embed-text".into() },
+            Arc::new(nanna_llm::EmbeddingClient::ollama(base_url).with_model("nomic-embed-text")),
+        )
+    }
+
+    /// The probe reports the dimension the provider actually returned — it does
+    /// not consult any per-model dimension table.
+    #[tokio::test]
+    async fn probe_reports_the_dimension_the_provider_returns() {
+        let base = spawn_one_shot_embedding_server(r#"{"embeddings":[[0.1,0.2,0.3,0.4,0.5]]}"#).await;
+        let dim = DaemonServer::probe_embedding_dimension(&ollama_router_at(&base))
+            .await
+            .expect("probe succeeds against a responsive provider");
+        assert_eq!(dim, 5, "dimension comes from the response vector's length");
+    }
+
+    /// A provider that answers with an empty vector is an error, not a
+    /// zero-dimension memory store.
+    #[tokio::test]
+    async fn probe_rejects_an_empty_embedding_vector() {
+        let base = spawn_one_shot_embedding_server(r#"{"embeddings":[[]]}"#).await;
+        let err = DaemonServer::probe_embedding_dimension(&ollama_router_at(&base))
+            .await
+            .expect_err("an empty vector must not pass as a valid dimension");
+        assert!(!err.is_empty(), "the failure carries a reason");
+    }
+
+    /// The regression this fixes: an unreachable/unkeyed provider makes the
+    /// probe fail, and the caller must be able to carry on. The probe returns
+    /// `Err` rather than panicking, so boot can degrade to a provisional
+    /// dimension instead of aborting.
+    #[tokio::test]
+    async fn probe_fails_cleanly_when_no_provider_answers() {
+        // Bind then immediately drop the listener, so the port is (almost
+        // certainly) closed — a stand-in for "no embedding provider running".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let err = DaemonServer::probe_embedding_dimension(&ollama_router_at(&format!("http://{addr}")))
+            .await
+            .expect_err("probe must fail when nothing is listening");
+        assert!(
+            err.contains("embedding providers failed"),
+            "the router reports exhausting its providers, got: {err}"
+        );
+    }
+
+    /// The seed the daemon falls back to must itself be a usable dimension —
+    /// this is the value memory runs on until a provider answers.
+    #[test]
+    fn provisional_seed_dimension_is_positive() {
+        assert!(
+            nanna_memory::MemoryServiceConfig::default().dimension > 0,
+            "a zero seed would make every add() fail before the probe realigns"
+        );
+    }
 
     #[test]
     fn scheduled_consolidation_config_threads_user_memory_settings() {

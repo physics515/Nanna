@@ -640,17 +640,35 @@ routine should drain first.**
       `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
       `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
-- [ ] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
-      *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir)* Boot gets all the
-      way through storage + migrations + `LLM router initialized with 3 providers` + tools dir, then dies:
-      `Error: Config error: Failed to discover embedding dimension: OPENROUTER_API_KEY is required for
-      embedding discovery` — **never reaching "Daemon ready"**. This is the cost of the (correct) 2026-07-15
-      "no hardcoded embedding-dimension table" change: dimension now comes from provider metadata or a live
-      probe, so a config naming a cloud embedding provider makes a **network credential a hard boot
-      dependency**. A local-first daemon must still start without cloud keys. Fix: fall back to a local/Ollama
-      embedder or defer discovery until first embed (degrade memory, don't refuse to boot), and make the
-      failure actionable rather than fatal. Also blocks unattended real-binary verification of any daemon
-      path (this run had to fall back to unit tests + release-profile checks for the `python.exec` fix).
+- [x] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
+      *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir; fixed 2026-07-16)*
+      Boot got all the way through storage + migrations + `LLM router initialized with 3 providers` + tools dir,
+      then died: `Error: Config error: Failed to discover embedding dimension: OPENROUTER_API_KEY is required
+      for embedding discovery` — **never reaching "Daemon ready"**.
+      **The diagnosis above was wrong about the cause.** It was not the 2026-07-15 "no dimension table" change
+      making a credential load-bearing: the daemon **had a perfectly valid OpenRouter key in `config.toml` the
+      whole time**. `get_embedding_dimension` built its *own* client and read the key from
+      `std::env::var(..)` **only**, while the `EmbeddingRouter` that serves every real embed reads
+      `config.llm.openrouter_api_key.or_else(env)` — so the probe reported "missing key" for a key the live
+      path used successfully. It also duplicated provider construction, bypassing the router's **Ollama
+      fallback**, so it couldn't degrade the way real embeds do.
+      **Fix (a deletion, not an addition):** the probe now goes through the *same router the embed path uses*
+      (`probe_embedding_dimension(&EmbeddingRouter)`), which drops the duplicated client construction and
+      inherits both config-or-env key resolution and the Ollama failover. A probe failure is now **non-fatal**:
+      boot logs an actionable warning and seeds a provisional dimension. That is safe because the seed only
+      has to be positive — real vectors always come from the provider, and the **pre-existing background
+      `probe_and_align_dimension`** (added earlier precisely so a cold Ollama couldn't block startup) corrects
+      the store and re-embeds any mismatched entries as soon as a provider answers. The blocking probe is now
+      purely an optimization: when it succeeds, nothing is ever re-embedded.
+      **Verified on the real binary** (`--port 5249 --health-port 5248 --data-dir <scratch>`, no
+      `OPENROUTER_API_KEY` in env, key only in config): `Primary embeddings: OpenRouter` → `Memory service
+      using probed dimension 2048` → **`Daemon ready. IPC server listening`** → `Embedding dimension
+      confirmed: 2048`. 4 unit tests (probe reports the provider's length; empty vector rejected; nothing
+      listening → clean `Err` so boot can degrade; seed is positive) driven against a one-shot localhost
+      server on an OS-assigned port. 48 daemon tests green (was 44); clippy **2081 → 2081** (no new warnings).
+      **This also unblocks unattended real-binary daemon verification**, which had been forcing runs to fall
+      back to unit tests. Not yet exercised end-to-end: the all-providers-unreachable degrade path (needs a
+      host with no Ollama *and* no key) — covered by unit test rather than a live boot.
 - [x] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11; root-caused
       + fixed 2026-07-16)* **The 2026-07-11 diagnosis was wrong on both the culprit and the blast radius.**
       It is **not** deno/V8: `cargo test -p nanna-scripting --features deno` passes 20/20 clean. The
