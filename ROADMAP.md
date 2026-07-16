@@ -754,8 +754,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [x] Rename `SqliteMemoryPersistence` → `TursoMemoryPersistence` (`nanna-daemon/src/memory_persistence.rs`; refs in `server.rs`); align with the already-correct `TursoMemoryStorage`.
       *(2026-07-07) Struct renamed (all 5 refs, both files); module doc + the "sqlite datetime format"
       comment de-SQLite'd (no SQL/`.db`/`datetime('now')` changed). Builds green.*
-- [ ] Purge the word "SQLite" from code comments, log/`warn!` strings, and doc-comments (storage lib.rs/Cargo.toml; daemon persistence/session/control/server; memory service/lib; GUI `sqlite_*` var names) → "Turso"/"the database". **Do not** change SQL, `.db` files, or `datetime('now')`/`AUTOINCREMENT`/`json_*`.
+- [x] Purge the word "SQLite" from code comments, log/`warn!` strings, and doc-comments (storage lib.rs/Cargo.toml; daemon persistence/session/control/server; memory service/lib; GUI `sqlite_*` var names) → "Turso"/"the database". **Do not** change SQL, `.db` files, or `datetime('now')`/`AUTOINCREMENT`/`json_*`.
       *(2026-07-06) Done for the **daemon** (server/persistence/session/control/memory_persistence) and **nanna-memory** (service/lib). Left as-is: `nanna-storage/src/lib.rs:6` (a factual "Turso is a Rust-native `SQLite` implementation" — describes SQL-compat, not a mislabel). Remaining: GUI `sqlite_*` var names (need a GUI build to verify).*
+      *(2026-07-16) **Closed the GUI slice.** Post-decomposition the remaining references had all landed in one
+      file, `gui/src-tauri/src/commands/sessions.rs` (12 occurrences): the two local bindings
+      `sqlite_result`/`sqlite_sessions` → `local_result`/`local_sessions`, nine comments → "the local store" /
+      "the local Turso store" / "the database", and one **user-visible log string**
+      (`"Cleared {} local sessions from SQLite"` → `"… from the database"`). Naming-only: no SQL, `.db` path,
+      `datetime('now')`, or control flow touched — the diff is comments + two identifier renames.
+      Repo-wide the only surviving "SQLite" is the intentional factual line at `nanna-storage/src/lib.rs:6`,
+      exactly as this item specifies. Verified with `cargo check -p nanna-gui` + `cargo test -p nanna-gui`
+      (4 pass) — the GUI build needs the sidecar + built frontend staged first (see the build-env note under
+      Immediate next actions #2).
 - [x] Delete stale `crates/nanna-daemon/src/server.rs.bak`. Pin `turso` precisely (0.x is pre-1.0). Add a CI guard that fails if `rusqlite`/`libsql`/`sqlx` ever enters the dep tree. (Note: a transitive `libsqlite3-sys` comes from RustPython in `nanna-scripting`, separate concern.)
       *(2026-07-06) `server.rs.bak` already absent. `turso` pinned `=0.4.4` in `nanna-storage`. The
       CI guard is a `cargo test` (`nanna-storage/tests/dep_guard.rs`) that scans `Cargo.lock` and fails
@@ -946,7 +956,11 @@ keep the phases readable; promote individual items into a phase when they become
 
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
 
-1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: ~~rename `SqliteMemoryPersistence`~~ **(done 2026-07-07)**, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: purge remaining "SQLite" strings from comments/logs/var names across storage/daemon/memory/GUI (do NOT touch SQL, `.db`, `datetime('now')`).
+1. ~~**Turso-only cleanup** (P13)~~ — **DONE (2026-07-16)**: ~~rename `SqliteMemoryPersistence`~~ (2026-07-07),
+   ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ (2026-07-06), ~~purge "SQLite" from
+   comments/logs/var names across storage/daemon/memory/GUI~~ (2026-07-16 — the last slice was
+   `gui/.../commands/sessions.rs`; only the intentional factual line at `nanna-storage/src/lib.rs:6`
+   remains, by design). SQL, `.db`, and `datetime('now')` untouched throughout.
 2. **Bring all deps to latest + commit `Cargo.lock`** (doctrine → *Dependency freshness*) — `Cargo.lock`
    un-gitignored and committed (2026-07-07); compatible deps already at latest (`cargo update` = 0 changes).
    Low-risk majors applied green: `directories 5→6` (unified with the workspace pin), `tower-http 0.6→0.7`
