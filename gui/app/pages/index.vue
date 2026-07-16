@@ -696,9 +696,7 @@ async function stopSession() {
       // promote it into a real assistant message without races/duplicates.
       // The agent loop persists the same text into session + model context.
       if (streamingContent.value && !streamingContent.value.includes('[Stopped by user]') && !streamingContent.value.includes('[Cancelled by user]')) {
-        streamingContent.value += '
-
-[Stopped by user]'
+        streamingContent.value += '\n\n[Stopped by user]'
       } else if (!streamingContent.value && !streamingThinking.value) {
         // No tokens yet — leave a breadcrumb so the bubble isn't empty
         streamingContent.value = '[Stopped by user]'

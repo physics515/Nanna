@@ -649,11 +649,59 @@ routine should drain first.**
 - [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
 
 **Architecture debt:**
-- [ ] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
-- [ ] **Unify embedded vs daemon agent loop** — embedded path (~280 lines) duplicates the daemon's `AgentService`; make `nanna-agent::AgentContext` the single source of truth and have embedded delegate to `AgentService`.
-- [ ] Split `control.rs` (1,523 lines) into `control/{scheduler,workspace,config,system}.rs`; reduce Backend's ~50 near-identical proxy methods with a macro.
-- [ ] Split `settings.vue` (1,483 lines) into per-tab components.
-- [ ] Refactor over-long `main.rs` command handlers (~1099, ~1221).
+- [x] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
+      *(2026-07-16)* By execution time the file had grown to 9,863 lines. Pure move into exactly the planned
+      layout: `state.rs` (AppState + event/DTO types + MemoryServiceAdapter), `llm/{routing,truncation,
+      summarization}.rs`, and the nine `commands/*.rs` modules; lib.rs is now 1,273 lines (module decls,
+      `pub(crate)` glob re-exports so sibling files needed zero edits, `setup_state`, `run()` with
+      fully-qualified `generate_handler!` paths, system tray). Largest module is `commands/settings.rs`
+      (1,815). Also repaired the pre-existing `uncached_model_name_uses_universal_floor` test, which called
+      a nonexistent `resolve_model_info_sync` and didn't compile on master. `cargo check`/`cargo test
+      -p nanna-gui` green; normalized diff confirms every original line moved verbatim.
+- [x] **Unify embedded vs daemon agent loop** — embedded path (~280 lines) duplicates the daemon's `AgentService`; make `nanna-agent::AgentContext` the single source of truth and have embedded delegate to `AgentService`.
+      *(2026-07-16)* The duplicate had grown to ~750 lines (`run_agent_loop` + `run_agent_loop_with_fallback`
+      + post-loop storage/extraction) plus the dead `EmbeddedBackend` mini-loop. Embedded mode now constructs
+      the daemon's `AgentService` in-process (`gui/src-tauri` gained a `nanna-daemon` dep): `embedded.rs` is a
+      thin adapter that builds an `LlmRouter` from GUI config (same provider wiring as the daemon's
+      `init_services`, wired `.with_storage` + shared `ModelStatsTracker` for health-aware routing), maps
+      config → `AgentServiceConfig` (unbounded iterations + wrap-up-nudge policy preserved), and bridges
+      `protocol::Event` → `DaemonEvent` into the SAME broadcast bus the WebSocket client uses — so
+      `Backend::start_event_forwarding` (now started once for both modes, and lag-tolerant) is the single
+      event→Tauri path; emitted event-name set verified identical. `send_message`'s embedded branch keeps its
+      pre-work (store user msg, auto-remember, scoped recall, workspace context) then delegates to
+      `chat_with_options`; the f4e83c3 no-orphaned-turn guarantee is preserved (partial result w/ "⚠️
+      incomplete" footer, or the interruption marker). `cancel_session`/`get_session_run_state` delegate to
+      `AgentService::cancel`/`get_run_state`. Deleted as dead after delegation: `llm/truncation.rs` (377),
+      `llm/summarization.rs` (446), rate-limit helpers in `llm/routing.rs`, `EmbeddedRunState`/
+      `IterationPolicy`/`PendingToolCall`. Net **−1,613 lines**. Embedded turns now get the daemon's extras:
+      per-session FIFO queueing, checkpoint crash recovery, thinking-mode reasoning capture, loop-runner
+      tool-result handling (memory stubs + compression instead of GUI-side proportional truncation), and
+      daemon-style memory auto-extraction (replaces the GUI's STATED/OBSERVED extractor — legacy memories
+      keep their tags). Known trade: `claude-proxy` models don't work embedded (router has no such provider;
+      the daemon never had one either — modes now match). Verified by `cargo check --workspace` +
+      `cargo test -p nanna-gui`/`-p nanna-daemon` green; a live end-to-end GUI turn was not run unattended.
+- [x] Split `control.rs` (1,523 lines) into `control/{scheduler,workspace,config,system}.rs`; reduce Backend's ~50 near-identical proxy methods with a macro.
+      *(2026-07-16)* `control.rs` had grown to 2,727 lines; split as a pure move into `control/{mod,chat,
+      session,memory,config,tool,scheduler,channel,system,workspace,tests}.rs` — the roadmap's four-domain
+      sketch gained chat/session/memory/tool/channel domains instead of a `system.rs` catch-all. `mod.rs`
+      (533 lines) keeps the ControlPlane struct, constructors, shared helpers, and dispatch; each domain is
+      an `impl ControlPlane` block in its own file; public API unchanged. 44/44 daemon tests pass, identical
+      to baseline. Backend side: 53 of 64 proxy methods (mode check → same-named `DaemonClient` call →
+      `EMBEDDED_MODE` error) are now one `daemon_proxies!` macro table with doc passthrough — adding a proxy
+      is a one-line entry; the 11 mode-specific methods stay hand-written. `backend.rs` 857 → 522 lines.
+- [x] Split `settings.vue` (1,483 lines) into per-tab components.
+      *(2026-07-16)* Had grown to 2,054 lines. Now a 133-line shell over six tab components
+      (`components/settings/Settings{Models,Agent,Memory,Tools,Scheduler,Data}Tab.vue`) with genuinely
+      cross-tab state (settings, toast, model catalog, memory stats) in a provide/inject composable
+      (`composables/useSettingsPage.ts`). Tabs stay `v-show`-mounted so tab-local state persists as before,
+      and per-tab `onSettingsLoaded` hooks preserve the "any save reloads everything" behavior in original
+      order. Bonus fix: `index.vue` had a hard build break (string literal spanning raw newlines, from
+      f4e83c3) — every `pnpm build` failed; now escaped properly and the production build is green.
+- [x] Refactor over-long `main.rs` command handlers (~1099, ~1221).
+      *(2026-07-16)* Pure move: `src/main.rs` (1,701 lines) → 311-line CLI shell (clap structs, logging,
+      dispatch) + `src/setup.rs` (component wiring: `ensure_api_key`/`create_scheduler`/`init_components`)
+      + `src/commands/{serve,cli,workspace,credentials,daemon}.rs`. Legacy `run_daemon()` now lives in
+      `src/commands/serve.rs`, behavior untouched. `--help` output byte-identical; check/tests match baseline.
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single

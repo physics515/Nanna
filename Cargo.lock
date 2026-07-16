@@ -5522,6 +5522,7 @@ dependencies = [
  "nanna-channels",
  "nanna-config",
  "nanna-core",
+ "nanna-daemon",
  "nanna-llm",
  "nanna-memory",
  "nanna-scripting",

@@ -520,6 +520,13 @@ impl DaemonClient {
     pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
         self.event_tx.subscribe()
     }
+
+    /// Sender side of the event bus. Used in embedded mode to inject events
+    /// from the in-process `AgentService` so the same subscribers (the single
+    /// Tauri event-forwarding task) see them exactly like daemon events.
+    pub fn event_sender(&self) -> broadcast::Sender<DaemonEvent> {
+        self.event_tx.clone()
+    }
     
     /// Send a request to the daemon with the default timeout
     pub async fn request(&self, action: Value) -> Result<Value, String> {
