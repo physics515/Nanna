@@ -93,7 +93,7 @@ pub async fn list_sessions(
 ) -> Result<Vec<SessionInfo>, String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if available, but also merge with local SQLite sessions
+    // Route through daemon if available, but also merge with local database sessions
     if state_guard.backend.is_daemon_mode().await {
         let mut all_sessions: Vec<SessionInfo> = Vec::new();
 
@@ -127,20 +127,20 @@ pub async fn list_sessions(
             }
         }
 
-        // Also merge sessions from local SQLite when we have it open (old
+        // Also merge sessions from the local Turso store when we have it open (old
         // sessions from embedded mode). In daemon mode storage is None — the
         // daemon owns nanna.db, so its list already covers everything.
-        let sqlite_result = match &state_guard.storage {
+        let local_result = match &state_guard.storage {
             Some(storage) if workspace_id.is_some() => {
                 storage.sessions().list_by_workspace(workspace_id.as_deref(), 100).await
             }
             Some(storage) => storage.list_gui_sessions(100).await,
             None => Ok(Vec::new()),
         };
-        if let Ok(sqlite_sessions) = sqlite_result {
+        if let Ok(local_sessions) = local_result {
             let daemon_ids: std::collections::HashSet<_> = all_sessions.iter().map(|s| s.id.clone()).collect();
 
-            for session in sqlite_sessions {
+            for session in local_sessions {
                 // Only add if not already in daemon list
                 if !daemon_ids.contains(&session.session_id) {
                     let name = nanna_storage::Storage::get_session_name(&session);
@@ -227,7 +227,7 @@ pub async fn get_session_history(
 ) -> Result<Vec<ChatMessage>, String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if available, with fallback to SQLite for old sessions
+    // Route through daemon if available, with fallback to the local store for old sessions
     if state_guard.backend.is_daemon_mode().await {
         // Try daemon first
         if let Ok(result) = state_guard.backend.session_history(&session_id, Some(500)).await {
@@ -255,7 +255,7 @@ pub async fn get_session_history(
             }
         }
 
-        // Fallback to SQLite for old sessions (from embedded mode) — only
+        // Fallback to the local store for old sessions (from embedded mode) — only
         // possible when the GUI has the local DB open (storage is Some)
         if let Some(storage) = &state_guard.storage {
             if let Ok(messages) = storage.get_session_messages(&session_id, 500).await {
@@ -311,7 +311,7 @@ pub async fn delete_session(
         if let Ok(_) = state_guard.backend.session_delete(&session_id).await {
             return Ok(());
         }
-        // Fall through to SQLite for backward compatibility
+        // Fall through to the local store for backward compatibility
     }
 
     // Embedded mode / fallback: direct storage access
@@ -332,7 +332,7 @@ pub async fn clear_all_sessions(
 ) -> Result<usize, String> {
     let state_guard = state.read().await;
 
-    // Clear local SQLite storage when we have it open (GUI sessions live there
+    // Clear local Turso storage when we have it open (GUI sessions live there
     // in embedded mode). Use list_gui_sessions to get ALL sessions (both
     // global and workspace-scoped).
     let mut local_count = 0;
@@ -347,7 +347,7 @@ pub async fn clear_all_sessions(
                 warn!("Failed to delete local session {}: {}", session.session_id, e);
             }
         }
-        info!("Cleared {} local sessions from SQLite", local_count);
+        info!("Cleared {} local sessions from the database", local_count);
     }
 
     // Also clear daemon sessions if in daemon mode
@@ -535,7 +535,7 @@ pub async fn rename_session(
         if let Ok(_) = state_guard.backend.session_rename(&session_id, &name).await {
             return Ok(());
         }
-        // Fall through to SQLite for backward compatibility
+        // Fall through to the local store for backward compatibility
     }
 
     // Embedded mode / fallback: direct storage access
@@ -687,7 +687,7 @@ pub async fn get_session_run_state(
     };
 
     if let Some(ref agent_service) = state.agent_service {
-        // Embedded sessions live in local SQLite, not a daemon SessionManager,
+        // Embedded sessions live in the local Turso store, not a daemon SessionManager,
         // so pass an empty manager and patch the message count from storage.
         let sessions = nanna_daemon::SessionManager::new();
         let snapshot = agent_service.get_run_state(&session_id, &sessions).await;

@@ -433,6 +433,17 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       (onyums `status()` / `status_events()`), QR pairing.
 - [ ] **Claude Code / external-agent bridge** — HTTP/SSE transport on the MCP server + peer-tool registration + auth.
 - [ ] Key rotation announcement, identity backup (BIP-39?), Tor-state caching, mobile (arti on Android) investigation.
+- [ ] *(research 2026-07-16)* **onyums is alive and healthy — the P9 bet still holds.** Latest commit
+      **2026-07-14**, latest published **0.3.1 (2026-06-18)**. Two concrete facts for when we wire it: (1) it
+      pins **arti 0.43.0** across `arti-client`/`tor-hsservice`/`tor-hscrypto`/etc., while **arti-client 0.44.0
+      shipped 2026-06-30** — onyums is **one minor behind**, so do *not* pin arti 0.44 ourselves and expect it
+      to unify (take arti transitively via onyums, exactly as Appendix C says). (2) New since 0.3.0: a
+      `crates/onyums-skin` workspace member — pure-Rust WAF (regex signatures), `governor` rate limiting, and an
+      **optional Equi-X PoW backend behind an `equix` feature that is LGPL-3.0 and off by default** — keep it
+      off unless we accept copyleft. It also now ships a vanity `.onion` miner and pure-Rust QR (`qrcode`,
+      `default-features = false`, no `image`/FFI) — matching the "no C where avoidable" doctrine.
+      Sources: [onyums](https://github.com/basic-automation/onyums),
+      [onyums crate](https://crates.io/crates/onyums), [arti-client](https://crates.io/api/v1/crates/arti-client).
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -629,23 +640,75 @@ routine should drain first.**
       `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
       `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
-- [ ] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11)* Under
-      full-workspace feature unification the `nanna-scripting` **deno** feature (V8) is enabled, so its lib
-      tests grow from 12 (boa-only) to 20, and a V8-backed test **overflows a `tokio-rt-worker` stack** on
-      Windows (`thread 'tokio-rt-worker' has overflowed its stack`), making `cargo test --workspace` red even
-      though every crate is green with `-p`. deno_core/V8 needs a large native stack; the default tokio
-      worker stack is too small. Fix: run the affected deno tests on a runtime with a bigger
-      `thread_stack_size` (e.g. a `Builder::new_multi_thread().thread_stack_size(16<<20)` or a dedicated
-      `std::thread` with an 8–16 MB stack), or gate the V8 tests behind a non-default feature. This blocks the
-      "`cargo test` green" guardrail for the nightly routine, which currently must fall back to per-crate
-      runs. Sources: [deno#24325](https://github.com/denoland/deno/issues/24325),
-      [deno#7279](https://github.com/denoland/deno/issues/7279).
+- [ ] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
+      *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir)* Boot gets all the
+      way through storage + migrations + `LLM router initialized with 3 providers` + tools dir, then dies:
+      `Error: Config error: Failed to discover embedding dimension: OPENROUTER_API_KEY is required for
+      embedding discovery` — **never reaching "Daemon ready"**. This is the cost of the (correct) 2026-07-15
+      "no hardcoded embedding-dimension table" change: dimension now comes from provider metadata or a live
+      probe, so a config naming a cloud embedding provider makes a **network credential a hard boot
+      dependency**. A local-first daemon must still start without cloud keys. Fix: fall back to a local/Ollama
+      embedder or defer discovery until first embed (degrade memory, don't refuse to boot), and make the
+      failure actionable rather than fatal. Also blocks unattended real-binary verification of any daemon
+      path (this run had to fall back to unit tests + release-profile checks for the `python.exec` fix).
+- [x] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11; root-caused
+      + fixed 2026-07-16)* **The 2026-07-11 diagnosis was wrong on both the culprit and the blast radius.**
+      It is **not** deno/V8: `cargo test -p nanna-scripting --features deno` passes 20/20 clean. The
+      overflowing feature is **`python` (RustPython)** — no dependent enables `deno` at all
+      (`gui`→`boa`, `daemon`→`python`), so workspace unification turns on `python`, and
+      `cargo test -p nanna-scripting --features python` reproduces the overflow on the *first* python test.
+      **Not a test-infra annoyance — a live daemon crash.** `python.exec` is a registered daemon service
+      (`server.rs:385`) reachable from any JS/TS tool, and `PythonEngine::execute` ran RustPython via
+      `spawn_blocking`, i.e. on a Tokio thread with the default **2 MiB** stack. RustPython overflows that
+      on `print('hello')`, and a Rust stack overflow is an uncatchable `abort()` — `spawn_blocking`'s unwind
+      guard cannot contain it. So **the python tool never worked and took the whole daemon down with it**;
+      the red workspace test was just the symptom that surfaced first.
+      **Fix:** the interpreter now runs on its own `std::thread` with an explicitly sized stack
+      (`spawn_interpreter_thread` + `PYTHON_STACK_BYTES`), joined through a `oneshot`; timeout/panic
+      semantics are unchanged (a synchronous interpreter was never cancellable mid-run either).
+      **The bound is derived and measured in BOTH profiles:** `stack_needed = recursion_limit x
+      per_frame_native_bytes`, where RustPython's own default `recursion_limit` (**256 debug / 1000 release**,
+      `rustpython_vm::VirtualMachine`) is the term that makes it finite. Bisecting the stack at which the
+      suite (incl. a runaway-recursion test) stops crashing:
+      | profile | `recursion_limit` | overflows at | passes at |
+      |---------|-------------------|--------------|-----------|
+      | debug   | 256               | 16 MiB       | 64 MiB    |
+      | release | 1000              | 64 MiB       | 128 MiB   |
+      So release frames are **not** cheaper (~64-128 KiB either way) — the profiles differ by the 4x limit.
+      `PYTHON_STACK_BYTES` = **256 MiB**, one doubling above the worst measured requirement, and the
+      `const _` assert floors it at the release number. **Debug-only measurement is a trap**: an earlier
+      64 MiB passed `cargo test` and then **segfaulted the release build** (`STATUS_ACCESS_VIOLATION`) — any
+      change here must be re-measured under `--release`. Cost is a lazily-committed reservation on a 64-bit
+      address space, one thread per in-flight call. 3 new tests (dedicated-thread execution under a
+      `current_thread` runtime; runaway recursion errors cleanly without aborting; plus the 7 pre-existing
+      python tests that could never have passed before).
+      Verified: `cargo test --workspace` reaches **0 stack overflows** (was 3); nanna-scripting **29+1 green
+      in debug *and* release**; clippy **108 → 101** warnings in-crate, none new.
+      - [ ] **Residual (pre-existing, narrower):** user code can still `sys.setrecursionlimit(...)` above the
+            default and overflow even a 64 MiB stack → uncatchable process abort from model-authored Python.
+            RustPython does not bound native depth itself; `vm.recursion_limit` is a public `Cell<usize>`.
+            Fix options: clamp the limit from the stack budget after `Interpreter::build`, re-clamp around
+            each execution, or reject `setrecursionlimit` in the wrapper. Until then `python.exec` is a
+            DoS vector for untrusted Python. Source: `rustpython-vm-0.5.0/src/vm/mod.rs:737`.
 - [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
       *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
       rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file
       helpers became `&self` methods honoring `file_dir`. Tests rewritten deterministically (`file_only_at`
       + `TempDir`): round-trip, overwrite, delete/not-found, and cross-dir isolation. Also usable for
       headless/service deployments where the OS keyring is inaccessible.*
+- [x] **Env-race in `nanna-tools` `resolve_tools_dir` tests (unattended-red).** *(2026-07-16)* Surfaced the
+      moment the RustPython overflow above stopped aborting the run: `test_resolve_tools_dir_from_env`
+      `set_var`s `NANNA_TOOLS_DIR` while `test_resolve_tools_dir_from_config` `remove_var`s it, and the
+      environment is process-global while `cargo test` runs tests on parallel threads — so the remove could
+      land between the other test's set and its `resolve_tools_dir(None)`, which then fell through to
+      `DEV_TOOLS_DIR` and asserted the source-tree `default-skills` path against a temp dir. A real race, not
+      a flake to retry. Fixed with a test-local `ENV_LOCK` mutex plus an RAII `EnvGuard` that restores the
+      previous value on drop (so a panicking test can't leak state, and a developer's real env survives);
+      the guard also makes the `unsafe` env writes sound by construction (all writers hold the lock), and
+      recovers from a poisoned lock instead of cascading an unrelated panic. Added
+      `env_overrides_config_tools_dir`, pinning the documented env-beats-config precedence that was never
+      tested and is only safely testable now. **`cargo test --workspace` is now green end-to-end: exit 0,
+      0 overflows, 0 failed suites, 378 tests / 41 suites.**
 - [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
 
 **Architecture debt:**
@@ -734,6 +797,26 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             text-only variant + VRAM estimate) and the VRAM-budgeting picker. Reconfirms 8GB→Qwen3.5-9B Q4_K_M as
             the reference default. Sources: [localllm.in 8GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025), [mayhemcode 2026 by-task](https://www.mayhemcode.com/2026/06/best-local-llms-for-4gb-6gb-and-8gb.html).
       - [ ] *(research 2026-07-07)* Tool-budget evidence **validates the two-tier tool discovery design**: each tool definition costs ~50–150 tokens; keep the always-sent set **under 5–10 tools** for 7–9B models (Nanna's core-tools-vs-`discover_tools` split already does this). Add a benchmark asserting the local model's active-tool count stays within this budget, and prefer `discover_tools` activation over sending the full registry on the local path.
+      - [ ] *(research 2026-07-16)* **`LFM2.5-8B-A1B` (Liquid AI, 2026-05-28) is now the best primary-source-backed
+            8GB pick** — 8B total / **1B active** MoE, **under 6 GB at standard quantization**, day-one llama.cpp
+            support + official GGUF. BFCLv3 **64.36**, BFCLv4 **48.50**, τ²-telecom 88.07. **Caveat that lands on
+            us:** it emits **Pythonic** function calls (a Python list between special tokens), *not* JSON tool
+            blocks — the local tool-call parser needs a shim, unlike Qwen3.5. Compare against **Qwen3.5-9B**
+            (BFCL-V4 **66.1**, τ²-bench 79.1, 262K native context) which scores higher but is dense (~6 GB Q4_K_M,
+            tighter on 8 GB) and has **thinking mode on by default** (`<think>`) that must be disabled for tool
+            loops. Note **Qwen3.6 has no sub-10B model** (35B-A3B / 27B only), so it is not an 8GB option.
+            Sources: [LFM2.5-8B-A1B](https://www.liquid.ai/blog/lfm2-5-8b-a1b),
+            [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B), [Qwen3.6](https://github.com/QwenLM/Qwen3.6).
+      - [ ] *(research 2026-07-16)* **Burn is still 0.21.0 (2026-05-07) — no 0.22**, so the 0.21 notes below remain
+            current. Two corrections for the Mummu contract: **there is no KV-cache API in Burn 0.21** (searched
+            release notes; must be hand-rolled), and **`burn-lm`** (Tracel's own LLM engine) is **alpha and not a
+            viable dependency** — only v0.0.1 published, last commit 2026-06-08, models limited to Llama 3.x /
+            TinyLlama. Quantization is **not** new in 0.21 (shipped in 0.19). What 0.21 *does* add for inference:
+            `attention()` with `scale`/`attn_bias`/`softcap`/`is_causal`, flash attention with causal masking, and
+            attention autotune. Adoption breakage to expect: `TensorData::shape` is now `Shape` (old
+            `BinFileRecorder` records are not forward-compatible). Sources:
+            [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
+            [burn-lm](https://github.com/tracel-ai/burn-lm).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -754,8 +837,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [x] Rename `SqliteMemoryPersistence` → `TursoMemoryPersistence` (`nanna-daemon/src/memory_persistence.rs`; refs in `server.rs`); align with the already-correct `TursoMemoryStorage`.
       *(2026-07-07) Struct renamed (all 5 refs, both files); module doc + the "sqlite datetime format"
       comment de-SQLite'd (no SQL/`.db`/`datetime('now')` changed). Builds green.*
-- [ ] Purge the word "SQLite" from code comments, log/`warn!` strings, and doc-comments (storage lib.rs/Cargo.toml; daemon persistence/session/control/server; memory service/lib; GUI `sqlite_*` var names) → "Turso"/"the database". **Do not** change SQL, `.db` files, or `datetime('now')`/`AUTOINCREMENT`/`json_*`.
+- [x] Purge the word "SQLite" from code comments, log/`warn!` strings, and doc-comments (storage lib.rs/Cargo.toml; daemon persistence/session/control/server; memory service/lib; GUI `sqlite_*` var names) → "Turso"/"the database". **Do not** change SQL, `.db` files, or `datetime('now')`/`AUTOINCREMENT`/`json_*`.
       *(2026-07-06) Done for the **daemon** (server/persistence/session/control/memory_persistence) and **nanna-memory** (service/lib). Left as-is: `nanna-storage/src/lib.rs:6` (a factual "Turso is a Rust-native `SQLite` implementation" — describes SQL-compat, not a mislabel). Remaining: GUI `sqlite_*` var names (need a GUI build to verify).*
+      *(2026-07-16) **Closed the GUI slice.** Post-decomposition the remaining references had all landed in one
+      file, `gui/src-tauri/src/commands/sessions.rs` (12 occurrences): the two local bindings
+      `sqlite_result`/`sqlite_sessions` → `local_result`/`local_sessions`, nine comments → "the local store" /
+      "the local Turso store" / "the database", and one **user-visible log string**
+      (`"Cleared {} local sessions from SQLite"` → `"… from the database"`). Naming-only: no SQL, `.db` path,
+      `datetime('now')`, or control flow touched — the diff is comments + two identifier renames.
+      Repo-wide the only surviving "SQLite" is the intentional factual line at `nanna-storage/src/lib.rs:6`,
+      exactly as this item specifies. Verified with `cargo check -p nanna-gui` + `cargo test -p nanna-gui`
+      (4 pass) — the GUI build needs the sidecar + built frontend staged first (see the build-env note under
+      Immediate next actions #2).
 - [x] Delete stale `crates/nanna-daemon/src/server.rs.bak`. Pin `turso` precisely (0.x is pre-1.0). Add a CI guard that fails if `rusqlite`/`libsql`/`sqlx` ever enters the dep tree. (Note: a transitive `libsqlite3-sys` comes from RustPython in `nanna-scripting`, separate concern.)
       *(2026-07-06) `server.rs.bak` already absent. `turso` pinned `=0.4.4` in `nanna-storage`. The
       CI guard is a `cargo test` (`nanna-storage/tests/dep_guard.rs`) that scans `Cargo.lock` and fails
@@ -855,6 +948,22 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             **workspace-scoped recall over one shared index**: keep a single HNSW of all memories and filter to
             the active workspace's ids at query time, instead of rebuilding a per-workspace index — directly
             useful for the P11 "tool-memory workspace scope" item too. Source: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html).
+      - [ ] *(research 2026-07-16, corrects the crate shortlist)* Two of the three shortlisted crates need
+            re-reading. **`instant-distance` is dormant — rule it out**: no release since **0.6.1 (June 2023)**
+            despite repo activity, so the "smallest/simplest pure-Rust HNSW" option is not a live choice.
+            **`hnswlib-rs` 0.10.0 (2026-01-05) is a *different crate* than the 2026-07-13 note assumed** — it is
+            not jean-pierreBoth's; it is a pure-Rust port from the **CoreNN** project (wilsonzlin/corenn). The
+            storage-decoupling property still holds and still suits our Turso-backed store. **`hnsw_rs` 0.3.4
+            (2026-02-28)** remains current and published (0.3.5 is in `Changes.md` but **unpublished**); its
+            `modify_level_scale` (0.3.1) buys better recall, or equal recall at smaller `max_nb_conn` (less RAM).
+            Also worth evaluating before we build: **CoreNN** itself — an embeddable pure-Rust vector DB with
+            built-in **per-vector int8 quantization** (`insert_qi8`) + f16/bf16 inserts, which overlaps the
+            "f16 embedding compression" backlog item. Ruled out: `usearch` (C++ w/ Rust bindings — fails the
+            pure-Rust preference); `rust-diskann` 0.3.5 is experimental (~890 downloads). Decision unchanged:
+            `hnsw_rs::insert_parallel` for the rebuild-per-dream clusterer. Sources:
+            [hnsw_rs Changes](https://github.com/jean-pierreBoth/hnswlib-rs/blob/master/Changes.md),
+            [hnswlib-rs 0.10](https://crates.io/crates/hnswlib-rs), [CoreNN](https://blog.wilsonl.in/corenn),
+            [instant-distance](https://crates.io/api/v1/crates/instant-distance).
       - [ ] *(research 2026-07-13)* **`hnswlib-rs` (Jan-2026 rewrite) decouples the graph from vector storage**:
             the `Hnsw` struct owns only the graph + an external-key→dense-`NodeId` map, while the caller supplies a
             `VectorStore` keyed by `NodeId`; its `InMemoryVectorStore` does **lock-free reads + parallel updates**,
@@ -883,6 +992,16 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       with the correct sign; tally == signal-by-signal reference sum; saturate-not-wrap; boost signs). 38
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
+      - [ ] *(research 2026-07-16)* **FSRS-7 exists, but is not reachable from Rust yet — do not plan on it.**
+            The benchmark repo documents FSRS-7 as the newest version (first to handle **fractional intervals**;
+            forgetting curve now has **8 optimizable parameters**; the only version with realistic same-day-review
+            predictions). **However `fsrs-rs` is 6.6.1 (2026-06-09) and implements FSRS-6** — FSRS-7 support is
+            **PR #395, open since 2026-04-07 and still unmerged**, blocked on upstream formula work. So adopting
+            FSRS-7 means vendoring an unmerged PR; staying on FSRS-6 is the correct default until it lands.
+            (Explicitly unverified: the claim that "FSRS-7 is final" traces to no primary source — Expertium's own
+            Algorithm page still documents FSRS-6 only.) Sources:
+            [srs-benchmark](https://github.com/open-spaced-repetition/srs-benchmark),
+            [fsrs-rs PR #395](https://github.com/open-spaced-repetition/fsrs-rs/pull/395).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
@@ -946,7 +1065,11 @@ keep the phases readable; promote individual items into a phase when they become
 
 Reordered around the local-first pivot (P12/P13 lead), with the highest-value safety items kept in view.
 
-1. **Turso-only cleanup** (P13) — fast, pure hygiene that sets the direction: ~~rename `SqliteMemoryPersistence`~~ **(done 2026-07-07)**, ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ **(done 2026-07-06)**. Remaining: purge remaining "SQLite" strings from comments/logs/var names across storage/daemon/memory/GUI (do NOT touch SQL, `.db`, `datetime('now')`).
+1. ~~**Turso-only cleanup** (P13)~~ — **DONE (2026-07-16)**: ~~rename `SqliteMemoryPersistence`~~ (2026-07-07),
+   ~~delete `server.rs.bak`~~ (gone), ~~add the CI dep-guard~~ (2026-07-06), ~~purge "SQLite" from
+   comments/logs/var names across storage/daemon/memory/GUI~~ (2026-07-16 — the last slice was
+   `gui/.../commands/sessions.rs`; only the intentional factual line at `nanna-storage/src/lib.rs:6`
+   remains, by design). SQL, `.db`, and `datetime('now')` untouched throughout.
 2. **Bring all deps to latest + commit `Cargo.lock`** (doctrine → *Dependency freshness*) — `Cargo.lock`
    un-gitignored and committed (2026-07-07); compatible deps already at latest (`cargo update` = 0 changes).
    Low-risk majors applied green: `directories 5→6` (unified with the workspace pin), `tower-http 0.6→0.7`
@@ -1015,9 +1138,38 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - [ ] `vue-router 4 → 5` (major)
      - [ ] `vue-sonner 1 → 2` (major — toast API)
      - [ ] `marked 17 → 18` (major — chat markdown renderer; audit render output)
-     - [ ] `lucide-vue-next 0.563 → 1.0` and `@formkit/drag-and-drop 0.5 → 0.6` (0.x→1.0 / pre-1.0 minor; low risk, bundle with the next GUI pass)
+     - [ ] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-07-16 —
+           corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
+           **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
+           `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
+           dead package. The whole `lucide-vue-next` package is deprecated at every version. Real latest
+           functional release is **0.577.0** (applied this run). Migration = switch to `@lucide/vue` and
+           rewrite the import specifier across the **40 files** that import icons; verify via
+           `cargo tauri build` + WebDriver.
+     - [x] ~~`@formkit/drag-and-drop 0.5 → 0.6`~~ — **dep removed instead** *(2026-07-16)*: it was an
+           **unused dependency** (zero references anywhere in `gui/` outside `package.json`/lockfile —
+           the editor's drag-drop is Tiptap's own). Bumping dead weight is noise; dropped it. `pnpm build`
+           green after removal, confirming it was genuinely unreferenced.
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
+   - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
+     `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
+     `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
+     only two reqs behind: `deno_core 0.407 → 0.408` (nanna-scripting; compiled unchanged, no source
+     edits) and `uuid 1.23 → 1.24` (workspace + nanna-server req bump). Workspace **including
+     `nanna-gui`** builds green; scripting 19+1 / llm 28 / agent 61 tests pass; clippy clean on the
+     bumped crates. Frontend: `tailwindcss`/`@tailwindcss/postcss 4.3.3`, `postcss 8.5.19`,
+     `vue 3.5.40` applied green (`pnpm build` → nitro + client, 2.25 MB / 502 kB gzip).
+   - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
+     not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
+     (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
+     `gui/.output/public` (`pnpm build`, else `generate_context!` panics with "`frontendDist` …
+     doesn't exist"). A fresh worktree needs `pnpm install` + both before the GUI compiles.
+   - **`cargo fmt --all` is not safe to run blanket:** `origin/master` is not fmt-clean and the repo has
+     mixed CRLF/LF line endings with `core.autocrlf=false` / `core.eol=lf` / no `.gitattributes`, so
+     `cargo fmt --all` rewrites ~165 files (mostly pure EOL churn). Format only the files you touch.
+     - [ ] Decide the line-ending policy: add a `.gitattributes` (`*.rs text eol=lf`) and land one
+           tree-wide `cargo fmt` normalization commit, so future runs can use `fmt`/`fmt --check` normally.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
