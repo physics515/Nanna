@@ -369,8 +369,23 @@ Done: daemon binary + service install, IPC protocol, session persistence, `nanna
 wiring, agent integration, OAuth in daemon, tool-name aliases, webhook server (all endpoints),
 channel listeners (Telegram/Discord/Slack), unified router + response routing, cron system, sub-agent
 scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-authoring. Open:
-- [ ] **End-to-end daemon testing** (High) — start daemon, connect client, run a conversation, verify
+- [~] **End-to-end daemon testing** (High) — start daemon, connect client, run a conversation, verify
       persistence + embedded fallback + reconnection (currently untested).
+      *(2026-07-16)* **First real E2E suite shipped** — `crates/nanna-client/tests/e2e_daemon.rs`, 4 tests
+      driving a real `DaemonServer` over the real WebSocket IPC with a real `Client` (no mocks). Lives in
+      `nanna-client` because it already depends on `nanna-daemon`, so the dependency edge stays one-way.
+      Hermetic by construction: built via `DaemonBuilder` with explicit settings instead of
+      `from_nanna_config`, on an OS-assigned free port + a `TempDir`, with `with_memory(false)` — so a run
+      never reads the developer's `config.toml`/`.db` and needs no API key or reachable model. Covers:
+      daemon boots → client attaches → protocol answers; a created session is visible; **state survives a
+      client disconnect + fresh reattach** (the GUI reconnect path); and **sessions survive a full daemon
+      restart** on the same data dir (durable control plane, not a cache). Stable across 3 consecutive runs.
+      **Found and fixed a real bug:** `Client::disconnect()` only signalled the handler task and returned, so
+      the state flipped to `Disconnected` *asynchronously* — `is_connected()` could still report `Connected`
+      right after `disconnect()` returned, and a `request()` in that window passed the connected check before
+      failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
+      `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
+      and the **embedded-fallback** path (needs a GUI build).
 - [ ] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
 - [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
@@ -1212,5 +1227,9 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
 6. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
 7. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
 8. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
-9. **End-to-end daemon test** (P8) — the daemon/embedded/reconnect story is still unverified.
+9. **End-to-end daemon test** (P8) — ~~the daemon/embedded/reconnect story is still unverified~~ **mostly
+   done (2026-07-16)**: a hermetic 4-test E2E suite (`crates/nanna-client/tests/e2e_daemon.rs`) now covers
+   start → connect → session state → client reconnect → **daemon restart persistence**, and caught a real
+   `Client::disconnect()` state bug. Still open: a real conversation turn (needs a live LLM) and the
+   **embedded-fallback** path (needs a GUI build).
 
