@@ -741,6 +741,20 @@ routine should drain first.**
             new regression test (`raising_the_recursion_limit_cannot_abort_the_process`, green in debug **and**
             release). **A clamp was written and then deleted**: capping the limit to the stack budget would
             have *reduced* usable depth from ~131k to ~2k — a regression dressed as a safety fix.
+            **Primary source (2026-07-16 research):** the guard is `VirtualMachine::check_c_stack_overflow`
+            (`rustpython-vm-0.5.0/src/vm/mod.rs:1520`) — a port of CPython's `_Py_MakeRecCheck`, run on every
+            recursive call from `with_recursion`, comparing the live `psm::stack_pointer()` against a soft
+            limit derived from the thread's **actual** stack bounds. Hence depth ∝ `stack_size`, and
+            `recursion_limit` never binds first. Contradicts the old note's "RustPython does not bound native
+            depth itself".
+      - [ ] *(research 2026-07-16)* **The native guard is a band, not a floor — a narrow theoretical residual.**
+            `check_c_stack_overflow` fires only while the stack pointer is within `2 x STACK_MARGIN_BYTES`
+            (2048 x `usize` = 16 KiB, so a **32 KiB** window) above the stack base; a single frame that
+            advances the pointer *past* the whole window steps over the check and can still reach the guard
+            page. Measured Python frames (~2 KiB) always land inside it, so this is not reachable via ordinary
+            recursion — but a path with an unusually large native frame (deep C-level nesting, a big stack
+            local) is not covered by the proof above. Worth a probe if untrusted Python ever becomes a
+            first-class threat model. Source: `rustpython-vm-0.5.0/src/vm/mod.rs:1503-1527`.
 - [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
       *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
       rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file

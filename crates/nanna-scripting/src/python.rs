@@ -34,12 +34,23 @@ use tracing::debug;
 ///
 /// **`RustPython` guards on remaining stack, not just its `recursion_limit`.** Probing
 /// with `sys.setrecursionlimit(1_000_000)` still raised `RecursionError` at the
-/// stack-derived depth above (131,004 on 256 MiB) rather than overflowing. That is why
-/// `sys.setrecursionlimit` is **not** a way for user code to abort the process, and why
-/// no clamp is installed on it: the VM's own guard already keeps recursion in the
-/// catchable domain, and capping the limit ourselves would only *reduce* the depth
-/// legitimate code may use. `raising_the_recursion_limit_cannot_abort_the_process`
-/// pins this behavior.
+/// stack-derived depth above (131,004 on 256 MiB) rather than overflowing. The
+/// mechanism is `VirtualMachine::check_c_stack_overflow`
+/// (`rustpython-vm-0.5.0/src/vm/mod.rs:1520`), a CPython `_Py_MakeRecCheck` port run on
+/// **every** recursive call: it compares the live stack pointer (`psm::stack_pointer()`)
+/// against a soft limit computed from the thread's *actual* stack bounds. That is why
+/// depth tracks `stack_size` and why `recursion_limit` never binds first.
+///
+/// So `sys.setrecursionlimit` is **not** a way for user code to abort the process, and
+/// no clamp is installed on it: the VM's guard already keeps recursion in the catchable
+/// domain, and capping the limit ourselves would only *reduce* the depth legitimate
+/// code may use. `raising_the_recursion_limit_cannot_abort_the_process` pins this.
+///
+/// Caveat worth knowing: that guard tests a **band**, not a floor — it fires only while
+/// the stack pointer sits within `2 x STACK_MARGIN_BYTES` (32 KiB) above the stack base.
+/// A single frame that advanced the pointer by more than the band could step over it
+/// and reach the guard page. Measured Python frames (~2 KiB) land inside the band every
+/// time, which is what makes the guarantee above hold in practice.
 ///
 /// Cost is bounded and cheap: a thread stack is *reserved* address space committed
 /// lazily by page, so a shallow execution touches only the pages it actually uses —
