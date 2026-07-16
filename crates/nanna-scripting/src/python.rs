@@ -19,19 +19,28 @@ use tracing::debug;
 ///     stack_needed = recursion_limit x per_frame_native_bytes
 /// ```
 ///
-/// Both terms are measured, not guessed (rustpython 0.5, Windows `x86_64`):
+/// `recursion_limit` is what makes that product finite: it is `RustPython`'s own
+/// default (**256 in debug, 1000 in release** — `rustpython_vm::VirtualMachine`), and
+/// exceeding it raises a catchable Python `RecursionError` instead of touching the
+/// guard page.
 ///
-/// * `recursion_limit` — `RustPython`'s default, **256 in debug / 1000 in release**
-///   (`rustpython_vm::VirtualMachine`). This is the term that makes the product
-///   finite: exceeding it raises a catchable Python `RecursionError`.
-/// * `per_frame_native_bytes` — **~64 KiB in debug**, derived by bisecting the depth
-///   an explicitly-sized thread survives (500 frames overflow 16 MiB; 1000 overflow
-///   64 MiB once the limit is lifted). Release frames are smaller.
+/// **Both profiles were measured** (rustpython 0.5, Windows `x86_64`), by bisecting
+/// the stack size at which the suite — including a runaway-recursion test — stops
+/// crashing:
 ///
-/// That gives ~16 MiB (debug: 256 x 64 KiB) and ~16-32 MiB (release: 1000 x a
-/// smaller frame). **64 MiB** is the next power of two above both, leaving ~4x margin
-/// in debug — and it is empirically the size at which runaway recursion reports a
-/// clean `RecursionError` instead of aborting, which 16 MiB did not.
+/// | profile | `recursion_limit` | overflows at | passes at |
+/// |---------|-------------------|--------------|-----------|
+/// | debug   | 256               | 16 MiB       | 64 MiB    |
+/// | release | 1000              | 64 MiB       | 128 MiB   |
+///
+/// So a release frame is **not** cheaper than a debug one (~64-128 KiB either way);
+/// the profiles differ mainly by the 4x recursion limit. **256 MiB** is one doubling
+/// above the worst measured requirement (release, 128 MiB).
+///
+/// Sizing to the *release* number matters: an earlier 64 MiB — comfortable in debug —
+/// passed `cargo test` and then **segfaulted the release build**
+/// (`STATUS_ACCESS_VIOLATION`). Any change here must be re-measured under
+/// `--release`, not just `cargo test`.
 ///
 /// Why this is not merely a tuning knob: Tokio's default worker/blocking stack is
 /// **2 MiB**, which every `python.exec` overflowed — and a Rust stack overflow is an
@@ -40,14 +49,14 @@ use tracing::debug;
 /// thread rather than inheriting the runtime's.
 ///
 /// Cost is bounded and cheap: a thread stack is *reserved* address space committed
-/// lazily by page, so a shallow execution touches only the pages it uses — the
-/// 64 MiB is a ceiling, not an allocation, and only one thread exists per in-flight
-/// call.
-const PYTHON_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// lazily by page, so a shallow execution touches only the pages it actually uses —
+/// the 256 MiB is a ceiling on a 64-bit address space, not an allocation, and only
+/// one such thread exists per in-flight call.
+const PYTHON_STACK_BYTES: usize = 256 * 1024 * 1024;
 
-/// The stack must hold `recursion_limit x per_frame_native_bytes` (256 x ~64 KiB in
-/// debug) with margin; below ~32 MiB runaway recursion aborts instead of raising.
-const _: () = assert!(PYTHON_STACK_BYTES >= 32 * 1024 * 1024);
+/// Must stay at or above the measured **release** requirement (128 MiB). Lowering this
+/// to a debug-comfortable value ships a release segfault — see the table above.
+const _: () = assert!(PYTHON_STACK_BYTES >= 128 * 1024 * 1024);
 
 /// Result of executing Python code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,8 +351,10 @@ mod tests {
     /// native stack overflow (which aborts the whole process, uncatchably).
     ///
     /// This is the guard on the sizing rule in `PYTHON_STACK_BYTES`: the stack must
-    /// comfortably hold `recursion_limit x per-frame native cost`. It failed at
-    /// 16 MiB, which is why the constant is 64 MiB.
+    /// hold `recursion_limit x per-frame native cost`. It crashed at 16 MiB in debug
+    /// and at 64 MiB in release (where the limit is 4x higher), which is what drove
+    /// the constant to 256 MiB. **Run this under `--release` too** — it is the case
+    /// that catches a debug-only sizing mistake.
     #[tokio::test]
     async fn runaway_recursion_errors_cleanly_without_aborting() {
         let engine = PythonEngine::new();

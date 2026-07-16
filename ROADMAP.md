@@ -433,6 +433,17 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
       (onyums `status()` / `status_events()`), QR pairing.
 - [ ] **Claude Code / external-agent bridge** — HTTP/SSE transport on the MCP server + peer-tool registration + auth.
 - [ ] Key rotation announcement, identity backup (BIP-39?), Tor-state caching, mobile (arti on Android) investigation.
+- [ ] *(research 2026-07-16)* **onyums is alive and healthy — the P9 bet still holds.** Latest commit
+      **2026-07-14**, latest published **0.3.1 (2026-06-18)**. Two concrete facts for when we wire it: (1) it
+      pins **arti 0.43.0** across `arti-client`/`tor-hsservice`/`tor-hscrypto`/etc., while **arti-client 0.44.0
+      shipped 2026-06-30** — onyums is **one minor behind**, so do *not* pin arti 0.44 ourselves and expect it
+      to unify (take arti transitively via onyums, exactly as Appendix C says). (2) New since 0.3.0: a
+      `crates/onyums-skin` workspace member — pure-Rust WAF (regex signatures), `governor` rate limiting, and an
+      **optional Equi-X PoW backend behind an `equix` feature that is LGPL-3.0 and off by default** — keep it
+      off unless we accept copyleft. It also now ships a vanity `.onion` miner and pure-Rust QR (`qrcode`,
+      `default-features = false`, no `image`/FFI) — matching the "no C where avoidable" doctrine.
+      Sources: [onyums](https://github.com/basic-automation/onyums),
+      [onyums crate](https://crates.io/crates/onyums), [arti-client](https://crates.io/api/v1/crates/arti-client).
 
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
@@ -629,6 +640,17 @@ routine should drain first.**
       `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
       `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
+- [ ] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
+      *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir)* Boot gets all the
+      way through storage + migrations + `LLM router initialized with 3 providers` + tools dir, then dies:
+      `Error: Config error: Failed to discover embedding dimension: OPENROUTER_API_KEY is required for
+      embedding discovery` — **never reaching "Daemon ready"**. This is the cost of the (correct) 2026-07-15
+      "no hardcoded embedding-dimension table" change: dimension now comes from provider metadata or a live
+      probe, so a config naming a cloud embedding provider makes a **network credential a hard boot
+      dependency**. A local-first daemon must still start without cloud keys. Fix: fall back to a local/Ollama
+      embedder or defer discovery until first embed (degrade memory, don't refuse to boot), and make the
+      failure actionable rather than fatal. Also blocks unattended real-binary verification of any daemon
+      path (this run had to fall back to unit tests + release-profile checks for the `python.exec` fix).
 - [x] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11; root-caused
       + fixed 2026-07-16)* **The 2026-07-11 diagnosis was wrong on both the culprit and the blast radius.**
       It is **not** deno/V8: `cargo test -p nanna-scripting --features deno` passes 20/20 clean. The
@@ -644,17 +666,24 @@ routine should drain first.**
       **Fix:** the interpreter now runs on its own `std::thread` with an explicitly sized stack
       (`spawn_interpreter_thread` + `PYTHON_STACK_BYTES`), joined through a `oneshot`; timeout/panic
       semantics are unchanged (a synchronous interpreter was never cancellable mid-run either).
-      **The bound is derived, not guessed:** `stack_needed = recursion_limit x per_frame_native_bytes`, where
-      RustPython's own default `recursion_limit` (**256 debug / 1000 release**, `rustpython_vm::VirtualMachine`)
-      is the term that makes it finite, and `per_frame_native_bytes` was measured at **~64 KiB in debug** by
-      bisecting survivable depth (500 frames overflow 16 MiB; 1000 overflow 64 MiB with the limit lifted).
-      256 x 64 KiB = 16 MiB → **64 MiB** is the next power of two above both profiles (~4x debug margin), and
-      is empirically the size at which runaway recursion raises a catchable `RecursionError` instead of
-      aborting — 16 MiB did **not**. Cost is a lazily-committed reservation, one thread per in-flight call.
-      3 new tests (dedicated-thread execution under a `current_thread` runtime; runaway recursion errors
-      cleanly without aborting; plus the 7 pre-existing python tests that could never have passed before).
-      Verified: `cargo test --workspace` reaches **0 stack overflows** (was 3) and 317 tests pass;
-      nanna-scripting 29+1 green; clippy **108 → 101** warnings in-crate, none new.
+      **The bound is derived and measured in BOTH profiles:** `stack_needed = recursion_limit x
+      per_frame_native_bytes`, where RustPython's own default `recursion_limit` (**256 debug / 1000 release**,
+      `rustpython_vm::VirtualMachine`) is the term that makes it finite. Bisecting the stack at which the
+      suite (incl. a runaway-recursion test) stops crashing:
+      | profile | `recursion_limit` | overflows at | passes at |
+      |---------|-------------------|--------------|-----------|
+      | debug   | 256               | 16 MiB       | 64 MiB    |
+      | release | 1000              | 64 MiB       | 128 MiB   |
+      So release frames are **not** cheaper (~64-128 KiB either way) — the profiles differ by the 4x limit.
+      `PYTHON_STACK_BYTES` = **256 MiB**, one doubling above the worst measured requirement, and the
+      `const _` assert floors it at the release number. **Debug-only measurement is a trap**: an earlier
+      64 MiB passed `cargo test` and then **segfaulted the release build** (`STATUS_ACCESS_VIOLATION`) — any
+      change here must be re-measured under `--release`. Cost is a lazily-committed reservation on a 64-bit
+      address space, one thread per in-flight call. 3 new tests (dedicated-thread execution under a
+      `current_thread` runtime; runaway recursion errors cleanly without aborting; plus the 7 pre-existing
+      python tests that could never have passed before).
+      Verified: `cargo test --workspace` reaches **0 stack overflows** (was 3); nanna-scripting **29+1 green
+      in debug *and* release**; clippy **108 → 101** warnings in-crate, none new.
       - [ ] **Residual (pre-existing, narrower):** user code can still `sys.setrecursionlimit(...)` above the
             default and overflow even a 64 MiB stack → uncatchable process abort from model-authored Python.
             RustPython does not bound native depth itself; `vm.recursion_limit` is a public `Cell<usize>`.
@@ -768,6 +797,26 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             text-only variant + VRAM estimate) and the VRAM-budgeting picker. Reconfirms 8GB→Qwen3.5-9B Q4_K_M as
             the reference default. Sources: [localllm.in 8GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025), [mayhemcode 2026 by-task](https://www.mayhemcode.com/2026/06/best-local-llms-for-4gb-6gb-and-8gb.html).
       - [ ] *(research 2026-07-07)* Tool-budget evidence **validates the two-tier tool discovery design**: each tool definition costs ~50–150 tokens; keep the always-sent set **under 5–10 tools** for 7–9B models (Nanna's core-tools-vs-`discover_tools` split already does this). Add a benchmark asserting the local model's active-tool count stays within this budget, and prefer `discover_tools` activation over sending the full registry on the local path.
+      - [ ] *(research 2026-07-16)* **`LFM2.5-8B-A1B` (Liquid AI, 2026-05-28) is now the best primary-source-backed
+            8GB pick** — 8B total / **1B active** MoE, **under 6 GB at standard quantization**, day-one llama.cpp
+            support + official GGUF. BFCLv3 **64.36**, BFCLv4 **48.50**, τ²-telecom 88.07. **Caveat that lands on
+            us:** it emits **Pythonic** function calls (a Python list between special tokens), *not* JSON tool
+            blocks — the local tool-call parser needs a shim, unlike Qwen3.5. Compare against **Qwen3.5-9B**
+            (BFCL-V4 **66.1**, τ²-bench 79.1, 262K native context) which scores higher but is dense (~6 GB Q4_K_M,
+            tighter on 8 GB) and has **thinking mode on by default** (`<think>`) that must be disabled for tool
+            loops. Note **Qwen3.6 has no sub-10B model** (35B-A3B / 27B only), so it is not an 8GB option.
+            Sources: [LFM2.5-8B-A1B](https://www.liquid.ai/blog/lfm2-5-8b-a1b),
+            [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B), [Qwen3.6](https://github.com/QwenLM/Qwen3.6).
+      - [ ] *(research 2026-07-16)* **Burn is still 0.21.0 (2026-05-07) — no 0.22**, so the 0.21 notes below remain
+            current. Two corrections for the Mummu contract: **there is no KV-cache API in Burn 0.21** (searched
+            release notes; must be hand-rolled), and **`burn-lm`** (Tracel's own LLM engine) is **alpha and not a
+            viable dependency** — only v0.0.1 published, last commit 2026-06-08, models limited to Llama 3.x /
+            TinyLlama. Quantization is **not** new in 0.21 (shipped in 0.19). What 0.21 *does* add for inference:
+            `attention()` with `scale`/`attn_bias`/`softcap`/`is_causal`, flash attention with causal masking, and
+            attention autotune. Adoption breakage to expect: `TensorData::shape` is now `Shape` (old
+            `BinFileRecorder` records are not forward-compatible). Sources:
+            [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
+            [burn-lm](https://github.com/tracel-ai/burn-lm).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -899,6 +948,22 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             **workspace-scoped recall over one shared index**: keep a single HNSW of all memories and filter to
             the active workspace's ids at query time, instead of rebuilding a per-workspace index — directly
             useful for the P11 "tool-memory workspace scope" item too. Source: [hnsw_rs docs](https://docs.rs/hnsw_rs/latest/hnsw_rs/hnsw/index.html).
+      - [ ] *(research 2026-07-16, corrects the crate shortlist)* Two of the three shortlisted crates need
+            re-reading. **`instant-distance` is dormant — rule it out**: no release since **0.6.1 (June 2023)**
+            despite repo activity, so the "smallest/simplest pure-Rust HNSW" option is not a live choice.
+            **`hnswlib-rs` 0.10.0 (2026-01-05) is a *different crate* than the 2026-07-13 note assumed** — it is
+            not jean-pierreBoth's; it is a pure-Rust port from the **CoreNN** project (wilsonzlin/corenn). The
+            storage-decoupling property still holds and still suits our Turso-backed store. **`hnsw_rs` 0.3.4
+            (2026-02-28)** remains current and published (0.3.5 is in `Changes.md` but **unpublished**); its
+            `modify_level_scale` (0.3.1) buys better recall, or equal recall at smaller `max_nb_conn` (less RAM).
+            Also worth evaluating before we build: **CoreNN** itself — an embeddable pure-Rust vector DB with
+            built-in **per-vector int8 quantization** (`insert_qi8`) + f16/bf16 inserts, which overlaps the
+            "f16 embedding compression" backlog item. Ruled out: `usearch` (C++ w/ Rust bindings — fails the
+            pure-Rust preference); `rust-diskann` 0.3.5 is experimental (~890 downloads). Decision unchanged:
+            `hnsw_rs::insert_parallel` for the rebuild-per-dream clusterer. Sources:
+            [hnsw_rs Changes](https://github.com/jean-pierreBoth/hnswlib-rs/blob/master/Changes.md),
+            [hnswlib-rs 0.10](https://crates.io/crates/hnswlib-rs), [CoreNN](https://blog.wilsonl.in/corenn),
+            [instant-distance](https://crates.io/api/v1/crates/instant-distance).
       - [ ] *(research 2026-07-13)* **`hnswlib-rs` (Jan-2026 rewrite) decouples the graph from vector storage**:
             the `Hnsw` struct owns only the graph + an external-key→dense-`NodeId` map, while the caller supplies a
             `VectorStore` keyed by `NodeId`; its `InMemoryVectorStore` does **lock-free reads + parallel updates**,
@@ -927,6 +992,16 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       with the correct sign; tally == signal-by-signal reference sum; saturate-not-wrap; boost signs). 38
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
+      - [ ] *(research 2026-07-16)* **FSRS-7 exists, but is not reachable from Rust yet — do not plan on it.**
+            The benchmark repo documents FSRS-7 as the newest version (first to handle **fractional intervals**;
+            forgetting curve now has **8 optimizable parameters**; the only version with realistic same-day-review
+            predictions). **However `fsrs-rs` is 6.6.1 (2026-06-09) and implements FSRS-6** — FSRS-7 support is
+            **PR #395, open since 2026-04-07 and still unmerged**, blocked on upstream formula work. So adopting
+            FSRS-7 means vendoring an unmerged PR; staying on FSRS-6 is the correct default until it lands.
+            (Explicitly unverified: the claim that "FSRS-7 is final" traces to no primary source — Expertium's own
+            Algorithm page still documents FSRS-6 only.) Sources:
+            [srs-benchmark](https://github.com/open-spaced-repetition/srs-benchmark),
+            [fsrs-rs PR #395](https://github.com/open-spaced-repetition/fsrs-rs/pull/395).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
