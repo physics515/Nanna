@@ -70,7 +70,8 @@ fn extract_version_from_source(source: &str) -> Option<String> {
 /// In debug builds, fall back to the source tree's default-skills directory.
 /// This is resolved at compile time relative to the nanna-tools crate.
 #[cfg(debug_assertions)]
-pub const DEV_TOOLS_DIR: Option<&str> = Some(concat!(env!("CARGO_MANIFEST_DIR"), "\\default-skills"));
+pub const DEV_TOOLS_DIR: Option<&str> =
+    Some(concat!(env!("CARGO_MANIFEST_DIR"), "\\default-skills"));
 
 #[cfg(not(debug_assertions))]
 pub const DEV_TOOLS_DIR: Option<&str> = None;
@@ -171,7 +172,10 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
                         (Some(e), Some(i)) if is_newer_version(e, i) => {
                             tracing::info!(
                                 "Upgrading default skill {}/{}: {} → {}",
-                                entry.skill_name, entry.file_name, i, e
+                                entry.skill_name,
+                                entry.file_name,
+                                i,
+                                e
                             );
                             // Fall through to write
                         }
@@ -179,7 +183,9 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
                             // Installed tool has no version — embedded does. Upgrade it.
                             tracing::info!(
                                 "Upgrading unversioned skill {}/{} to {}",
-                                entry.skill_name, entry.file_name, e
+                                entry.skill_name,
+                                entry.file_name,
+                                e
                             );
                             // Fall through to write
                         }
@@ -204,7 +210,11 @@ pub fn bootstrap_default_skills(tools_dir: &Path) -> usize {
                 continue;
             }
 
-            tracing::info!("Bootstrapped default skill: {}/{}", entry.skill_name, entry.file_name);
+            tracing::info!(
+                "Bootstrapped default skill: {}/{}",
+                entry.skill_name,
+                entry.file_name
+            );
             count += 1;
         }
 
@@ -257,15 +267,59 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Serializes tests that mutate `NANNA_TOOLS_DIR`.
+    ///
+    /// The environment is process-global while `cargo test` runs test functions on
+    /// parallel threads, so two tests touching the same variable race: without this
+    /// lock, `test_resolve_tools_dir_from_config`'s `remove_var` could land between
+    /// the other test's `set_var` and its `resolve_tools_dir(None)` call, which then
+    /// fell through to `DEV_TOOLS_DIR` and failed with the source-tree
+    /// `default-skills` path instead of the temp dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores `NANNA_TOOLS_DIR` to its pre-test value on drop, so a panicking test
+    /// cannot leak state into the next one (and so a developer's real env survives).
+    struct EnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(value: Option<&std::path::Path>) -> Self {
+            // A poisoned lock only means some other test panicked; the env is still
+            // ours to restore, so recover rather than cascade the failure.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("NANNA_TOOLS_DIR");
+            match value {
+                // SAFETY: every writer of this variable holds ENV_LOCK, so no other
+                // thread reads or writes it concurrently.
+                Some(path) => unsafe { std::env::set_var("NANNA_TOOLS_DIR", path) },
+                None => unsafe { std::env::remove_var("NANNA_TOOLS_DIR") },
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the lock is still held until this guard is fully dropped.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("NANNA_TOOLS_DIR", value) },
+                None => unsafe { std::env::remove_var("NANNA_TOOLS_DIR") },
+            }
+        }
+    }
+
     #[test]
     fn test_resolve_tools_dir_from_env() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_path_buf();
 
-        // Temporarily set env var
-        unsafe { std::env::set_var("NANNA_TOOLS_DIR", &path); }
+        let _env = EnvGuard::set(Some(&path));
         let resolved = resolve_tools_dir(None);
-        unsafe { std::env::remove_var("NANNA_TOOLS_DIR"); }
 
         assert_eq!(resolved, Some(path));
     }
@@ -275,11 +329,26 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().to_path_buf();
 
-        // Make sure env var doesn't interfere
-        unsafe { std::env::remove_var("NANNA_TOOLS_DIR"); }
-
+        // The explicit config path must win even with no env var set.
+        let _env = EnvGuard::set(None);
         let resolved = resolve_tools_dir(Some(&path));
+
         assert_eq!(resolved, Some(path));
+    }
+
+    /// The env var must take precedence over an explicit config path — the ordering
+    /// `resolve_tools_dir` documents. Previously untested, and only safely testable
+    /// now that env mutation is serialized.
+    #[test]
+    fn env_overrides_config_tools_dir() {
+        let env_dir = tempdir().unwrap();
+        let config_dir = tempdir().unwrap();
+
+        let _env = EnvGuard::set(Some(env_dir.path()));
+        let resolved = resolve_tools_dir(Some(config_dir.path()));
+
+        assert_eq!(resolved, Some(env_dir.path().to_path_buf()));
+        assert_ne!(resolved, Some(config_dir.path().to_path_buf()));
     }
 
     #[test]
@@ -303,7 +372,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let dt_dir = dir.path().join("discover_tools");
         std::fs::create_dir_all(&dt_dir).unwrap();
-        std::fs::write(dt_dir.join("tool.ts"), "export default { name: 'discover_tools' }").unwrap();
+        std::fs::write(
+            dt_dir.join("tool.ts"),
+            "export default { name: 'discover_tools' }",
+        )
+        .unwrap();
 
         let source = load_discover_tools_source(dir.path());
         assert!(source.is_some());
@@ -336,7 +409,7 @@ mod tests {
         assert!(is_newer_version("0.1.1", "0.1.0"));
         assert!(!is_newer_version("0.1.0", "0.1.0")); // same = not newer
         assert!(!is_newer_version("0.1.0", "0.2.0")); // older
-        assert!(!is_newer_version("bad", "0.1.0"));    // unparseable
+        assert!(!is_newer_version("bad", "0.1.0")); // unparseable
     }
 
     #[test]
@@ -346,13 +419,19 @@ mod tests {
   version: "0.1.0",
   description: "Run stuff",
 }"#;
-        assert_eq!(extract_version_from_source(source), Some("0.1.0".to_string()));
+        assert_eq!(
+            extract_version_from_source(source),
+            Some("0.1.0".to_string())
+        );
 
         let source_single = r#"export default {
   name: 'exec',
   version: '1.2.3',
 }"#;
-        assert_eq!(extract_version_from_source(source_single), Some("1.2.3".to_string()));
+        assert_eq!(
+            extract_version_from_source(source_single),
+            Some("1.2.3".to_string())
+        );
 
         let no_version = r#"export default { name: "exec" }"#;
         assert_eq!(extract_version_from_source(no_version), None);

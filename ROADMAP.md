@@ -667,6 +667,19 @@ routine should drain first.**
       helpers became `&self` methods honoring `file_dir`. Tests rewritten deterministically (`file_only_at`
       + `TempDir`): round-trip, overwrite, delete/not-found, and cross-dir isolation. Also usable for
       headless/service deployments where the OS keyring is inaccessible.*
+- [x] **Env-race in `nanna-tools` `resolve_tools_dir` tests (unattended-red).** *(2026-07-16)* Surfaced the
+      moment the RustPython overflow above stopped aborting the run: `test_resolve_tools_dir_from_env`
+      `set_var`s `NANNA_TOOLS_DIR` while `test_resolve_tools_dir_from_config` `remove_var`s it, and the
+      environment is process-global while `cargo test` runs tests on parallel threads — so the remove could
+      land between the other test's set and its `resolve_tools_dir(None)`, which then fell through to
+      `DEV_TOOLS_DIR` and asserted the source-tree `default-skills` path against a temp dir. A real race, not
+      a flake to retry. Fixed with a test-local `ENV_LOCK` mutex plus an RAII `EnvGuard` that restores the
+      previous value on drop (so a panicking test can't leak state, and a developer's real env survives);
+      the guard also makes the `unsafe` env writes sound by construction (all writers hold the lock), and
+      recovers from a poisoned lock instead of cascading an unrelated panic. Added
+      `env_overrides_config_tools_dir`, pinning the documented env-beats-config precedence that was never
+      tested and is only safely testable now. **`cargo test --workspace` is now green end-to-end: exit 0,
+      0 overflows, 0 failed suites, 378 tests / 41 suites.**
 - [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
 
 **Architecture debt:**
