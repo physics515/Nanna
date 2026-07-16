@@ -439,7 +439,16 @@ Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider mo
 complexity classifier + tool-call-only routing + first-message override, aggressive tool-output
 summarization, progressive distillation (rolling summary every N turns), tool-result eviction,
 CDC message-level dedup, per-model stats tracker + persistence + stats-informed routing. Open:
-- [ ] **LLMLingua-style prompt compression** (needs local GPU model, e.g. Phi-3/Qwen2 via Ollama; perplexity token scoring, selective).
+- [x] **LLMLingua-style prompt compression** (needs local GPU model, e.g. Phi-3/Qwen2 via Ollama; perplexity token scoring, selective).
+      *(2026-07-16) Wired end-to-end against the **summarization-model settings** (not a hard-coded Ollama):
+      `nanna-agent::compressor` scores sentences via the configured model, keeps top-`1/ratio` by
+      information density, falls back to head/tail truncation on score-count mismatch. Pure helpers
+      (`parse_scores`, `select_keep_indices`, `fallback_compress`, `split_sentences`) are unit-tested.
+      Tool-output path walks `summarization_priority` with client failover (`compress_with_priority`).
+      Tier-1 proactive compression now preferentially rewrites large older tool results in context
+      (`AgentContext::compress_older_tool_results` / `Agent::compress_older_context_tool_results`)
+      before the prior `drop_oldest` fallback. Note: sentence-level scoring (not per-token perplexity)
+      — practical on chat-completion APIs where raw logprobs aren't exposed.*
 - [ ] **Structured tool output schemas** — audit tool verbosity, optional `output_schema` on `ToolDefinition`, JSON output mode.
 - [~] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
       multipliers (3.5 code / 4 English / 2 CJK); account for per-message framing (~100 tok) and
