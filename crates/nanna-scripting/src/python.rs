@@ -12,50 +12,57 @@ use tracing::debug;
 
 /// Native stack reserved for the thread running the `RustPython` interpreter.
 ///
-/// `RustPython`'s VM recurses natively per Python frame, so the native stack it needs
-/// is bounded by the VM's own recursion limit:
+/// `RustPython`'s VM recurses natively per Python frame, so how deep Python can go is
+/// a function of this number.
 ///
-/// ```text
-///     stack_needed = recursion_limit x per_frame_native_bytes
-/// ```
+/// **What this thread buys us:** Tokio's default worker/blocking stack is **2 MiB**,
+/// which every `python.exec` overflowed — and a Rust stack overflow is an immediate
+/// `abort()`, not a catchable panic, so `spawn_blocking`'s unwind guard could never
+/// contain it. The interpreter therefore gets its own explicitly-sized thread rather
+/// than inheriting the runtime's.
 ///
-/// `recursion_limit` is what makes that product finite: it is `RustPython`'s own
-/// default (**256 in debug, 1000 in release** — `rustpython_vm::VirtualMachine`), and
-/// exceeding it raises a catchable Python `RecursionError` instead of touching the
-/// guard page.
+/// **Measured relationship** (rustpython 0.5, release, Windows `x86_64`) — the maximum
+/// recursion depth reached before a *catchable* `RecursionError`:
 ///
-/// **Both profiles were measured** (rustpython 0.5, Windows `x86_64`), by bisecting
-/// the stack size at which the suite — including a runaway-recursion test — stops
-/// crashing:
+/// | stack   | max depth reached | implied bytes/frame |
+/// |---------|-------------------|---------------------|
+/// | 64 MiB  | 32,727            | ~2,050              |
+/// | 256 MiB | 131,004           | ~2,050              |
 ///
-/// | profile | `recursion_limit` | overflows at | passes at |
-/// |---------|-------------------|--------------|-----------|
-/// | debug   | 256               | 16 MiB       | 64 MiB    |
-/// | release | 1000              | 64 MiB       | 128 MiB   |
+/// Depth scales **linearly** with the stack (4x stack → 4.00x depth), so a frame costs
+/// about **2 KiB** and the usable depth is roughly `stack_bytes / 2 KiB`.
 ///
-/// So a release frame is **not** cheaper than a debug one (~64-128 KiB either way);
-/// the profiles differ mainly by the 4x recursion limit. **256 MiB** is one doubling
-/// above the worst measured requirement (release, 128 MiB).
-///
-/// Sizing to the *release* number matters: an earlier 64 MiB — comfortable in debug —
-/// passed `cargo test` and then **segfaulted the release build**
-/// (`STATUS_ACCESS_VIOLATION`). Any change here must be re-measured under
-/// `--release`, not just `cargo test`.
-///
-/// Why this is not merely a tuning knob: Tokio's default worker/blocking stack is
-/// **2 MiB**, which every `python.exec` overflowed — and a Rust stack overflow is an
-/// immediate `abort()`, not a catchable panic, so `spawn_blocking`'s unwind guard
-/// could never contain it. The interpreter therefore gets its own explicitly-sized
-/// thread rather than inheriting the runtime's.
+/// **`RustPython` guards on remaining stack, not just its `recursion_limit`.** Probing
+/// with `sys.setrecursionlimit(1_000_000)` still raised `RecursionError` at the
+/// stack-derived depth above (131,004 on 256 MiB) rather than overflowing. That is why
+/// `sys.setrecursionlimit` is **not** a way for user code to abort the process, and why
+/// no clamp is installed on it: the VM's own guard already keeps recursion in the
+/// catchable domain, and capping the limit ourselves would only *reduce* the depth
+/// legitimate code may use. `raising_the_recursion_limit_cannot_abort_the_process`
+/// pins this behavior.
 ///
 /// Cost is bounded and cheap: a thread stack is *reserved* address space committed
 /// lazily by page, so a shallow execution touches only the pages it actually uses —
 /// the 256 MiB is a ceiling on a 64-bit address space, not an allocation, and only
-/// one such thread exists per in-flight call.
+/// one such thread exists per in-flight call. At ~2 KiB/frame it is far more than the
+/// stock `recursion_limit` (1000 release / 256 debug) can consume; it is retained
+/// because it is measured-good and effectively free, not because the limit needs it.
+///
+/// Any change here must be re-measured under `--release` as well as `cargo test`: the
+/// two profiles carry different default recursion limits (**256 debug / 1000 release**,
+/// `rustpython_vm::VirtualMachine`), so debug-only evidence has been misleading here
+/// before.
 const PYTHON_STACK_BYTES: usize = 256 * 1024 * 1024;
 
-/// Must stay at or above the measured **release** requirement (128 MiB). Lowering this
-/// to a debug-comfortable value ships a release segfault — see the table above.
+/// Keeps the usable recursion depth comfortably above anything the stock interpreter
+/// can reach: at the measured ~2 KiB/frame, this floor is ~65,000 frames, versus a
+/// default `recursion_limit` of 1000 (release) / 256 (debug).
+///
+/// The floor is deliberately conservative rather than tight. `python.exec` demonstrably
+/// could not even run `print('hello')` on Tokio's 2 MiB stack, so interpreter setup
+/// costs far more stack than the per-frame figure alone predicts, and that setup cost
+/// has not been measured separately. Until it is, do not shrink this toward the
+/// `1000 x 2 KiB` the recursion limit implies — the two are not the same budget.
 const _: () = assert!(PYTHON_STACK_BYTES >= 128 * 1024 * 1024);
 
 /// Result of executing Python code.
@@ -377,6 +384,43 @@ f(0)",
         assert!(
             error.contains("RecursionError"),
             "expected a Python RecursionError, got: {error}"
+        );
+    }
+
+    /// `sys.setrecursionlimit` is the one lever user code has over native stack depth,
+    /// so it is the obvious way model-authored Python might try to abort the daemon (a
+    /// Rust stack overflow is an uncatchable `abort()`, which no timeout or unwind
+    /// guard can contain).
+    ///
+    /// It does not work, and this test pins why: `RustPython` guards on **remaining
+    /// stack**, not merely on its own `recursion_limit`, so raising the limit to a
+    /// million still lands on a catchable `RecursionError` at the stack-derived depth.
+    /// No clamp on `setrecursionlimit` is needed — see `PYTHON_STACK_BYTES`. If a
+    /// future rustpython drops that guard, this test fails by killing the test process
+    /// rather than reporting an assertion — which is itself the signal.
+    ///
+    /// Must hold under `--release` too: the release recursion default is 4x debug's.
+    #[tokio::test]
+    async fn raising_the_recursion_limit_cannot_abort_the_process() {
+        let engine = PythonEngine::new();
+        let result = engine
+            .execute(
+                "import sys
+sys.setrecursionlimit(1000000)
+def f(n):
+    return f(n + 1)
+f(0)",
+                None,
+                60,
+            )
+            .await
+            .expect("a raised recursion limit must still return a result, not kill the process");
+
+        assert!(!result.success, "infinite recursion must not report success");
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("RecursionError"),
+            "a raised limit must stay in the catchable domain, got: {error}"
         );
     }
 

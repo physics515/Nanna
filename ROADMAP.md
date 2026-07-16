@@ -702,12 +702,30 @@ routine should drain first.**
       python tests that could never have passed before).
       Verified: `cargo test --workspace` reaches **0 stack overflows** (was 3); nanna-scripting **29+1 green
       in debug *and* release**; clippy **108 → 101** warnings in-crate, none new.
-      - [ ] **Residual (pre-existing, narrower):** user code can still `sys.setrecursionlimit(...)` above the
-            default and overflow even a 64 MiB stack → uncatchable process abort from model-authored Python.
-            RustPython does not bound native depth itself; `vm.recursion_limit` is a public `Cell<usize>`.
-            Fix options: clamp the limit from the stack budget after `Interpreter::build`, re-clamp around
-            each execution, or reject `setrecursionlimit` in the wrapper. Until then `python.exec` is a
-            DoS vector for untrusted Python. Source: `rustpython-vm-0.5.0/src/vm/mod.rs:737`.
+      *(2026-07-16 correction — the sizing model above is wrong; the fix and the 256 MiB value stand.)*
+      Re-measured on the real engine in release by reading back the depth actually reached: **64 MiB → 32,727
+      frames, 256 MiB → 131,004 frames**. Depth scales **linearly** with the stack (4x → 4.00x), so a frame
+      costs **~2 KiB**, not the 64–128 KiB inferred above, and the usable depth is `stack_bytes / ~2 KiB`.
+      Two claims in this note did not reproduce: the full release suite (incl. runaway recursion) passes at
+      **64 MiB with no `STATUS_ACCESS_VIOLATION`**, and `stack_needed = recursion_limit x per_frame` is not the
+      binding rule — `recursion_limit` never binds, because the VM's stack guard fires first (see the closed
+      residual below). The real justification for a large stack is that interpreter **setup** overflowed
+      Tokio's 2 MiB (`print('hello')` aborted), a cost never measured separately. `PYTHON_STACK_BYTES` stays
+      **256 MiB** — measured-good, and a lazily-committed reservation is effectively free — but it is no longer
+      claimed to be derived from the recursion limit.
+      - [ ] Measure interpreter **setup** stack cost separately (the only term that actually justifies the
+            size), then right-size `PYTHON_STACK_BYTES` and its `const _` floor against *that* number instead
+            of the disproved per-frame model. Re-measure in `--release`.
+      - [x] ~~**Residual (pre-existing, narrower):** user code can still `sys.setrecursionlimit(...)` above the
+            default and overflow even a 64 MiB stack → uncatchable process abort from model-authored Python.~~
+            **(2026-07-16 — the vulnerability does not exist; closed with evidence, no code change.)** The
+            premise "RustPython does not bound native depth itself" is **false**: the VM guards on **remaining
+            stack**, not merely on `vm.recursion_limit`. Probed directly on the real engine in **release** —
+            `sys.setrecursionlimit(1_000_000)` + unbounded recursion still raises a catchable `RecursionError`,
+            at depth **131,004** on the 256 MiB stack, never approaching the limit it was given. Pinned by a
+            new regression test (`raising_the_recursion_limit_cannot_abort_the_process`, green in debug **and**
+            release). **A clamp was written and then deleted**: capping the limit to the stack budget would
+            have *reduced* usable depth from ~131k to ~2k — a regression dressed as a safety fix.
 - [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
       *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
       rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file
