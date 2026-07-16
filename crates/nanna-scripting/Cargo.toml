@@ -34,7 +34,7 @@ boa_engine = { git = "https://github.com/boa-dev/boa.git", rev = "4f98f6446812f1
 boa_runtime = { git = "https://github.com/boa-dev/boa.git", rev = "4f98f6446812f1c5923153f8c7e1beda3a891bfe", optional = true }
 
 # Deno - V8-based (full featured fallback)
-deno_core = { version = "0.407", optional = true }
+deno_core = { version = "0.408", optional = true }
 deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
 deno_error = { version = "0.7", optional = true }
 

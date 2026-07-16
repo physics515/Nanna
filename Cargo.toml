@@ -115,7 +115,7 @@ half = "2.7"  # f16 support
 axum = { version = "0.8", features = ["macros"] }
 
 # Utilities
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.24", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 

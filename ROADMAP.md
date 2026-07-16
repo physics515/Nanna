@@ -1015,9 +1015,38 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - [ ] `vue-router 4 → 5` (major)
      - [ ] `vue-sonner 1 → 2` (major — toast API)
      - [ ] `marked 17 → 18` (major — chat markdown renderer; audit render output)
-     - [ ] `lucide-vue-next 0.563 → 1.0` and `@formkit/drag-and-drop 0.5 → 0.6` (0.x→1.0 / pre-1.0 minor; low risk, bundle with the next GUI pass)
+     - [ ] **`lucide-vue-next` → `@lucide/vue` (package rename, not a version bump).** *(2026-07-16 —
+           corrected: the earlier "0.563 → 1.0, low risk" read was wrong.)* `lucide-vue-next@1.0.0` is a
+           **deprecation tombstone** ("Package deprecated. Please use `@lucide/vue` instead") — it is the
+           `latest` dist-tag but is not a functional release, so `pnpm update --latest` silently installs a
+           dead package. The whole `lucide-vue-next` package is deprecated at every version. Real latest
+           functional release is **0.577.0** (applied this run). Migration = switch to `@lucide/vue` and
+           rewrite the import specifier across the **40 files** that import icons; verify via
+           `cargo tauri build` + WebDriver.
+     - [x] ~~`@formkit/drag-and-drop 0.5 → 0.6`~~ — **dep removed instead** *(2026-07-16)*: it was an
+           **unused dependency** (zero references anywhere in `gui/` outside `package.json`/lockfile —
+           the editor's drag-drop is Tiptap's own). Bumping dead weight is noise; dropped it. `pnpm build`
+           green after removal, confirming it was genuinely unreferenced.
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
+   - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
+     `keyring 4.1.5`, `regex 1.13.1`, `clap 4.6.2`, `syn 2.0.119`, `bitflags 2.13.1`, `bstr 1.13.0`,
+     `regex-automata 0.4.16`, `simd-adler32 0.3.10`, `which 8.0.5`). `cargo upgrade --incompatible` →
+     only two reqs behind: `deno_core 0.407 → 0.408` (nanna-scripting; compiled unchanged, no source
+     edits) and `uuid 1.23 → 1.24` (workspace + nanna-server req bump). Workspace **including
+     `nanna-gui`** builds green; scripting 19+1 / llm 28 / agent 61 tests pass; clippy clean on the
+     bumped crates. Frontend: `tailwindcss`/`@tailwindcss/postcss 4.3.3`, `postcss 8.5.19`,
+     `vue 3.5.40` applied green (`pnpm build` → nitro + client, 2.25 MB / 502 kB gzip).
+   - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
+     not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
+     (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
+     `gui/.output/public` (`pnpm build`, else `generate_context!` panics with "`frontendDist` …
+     doesn't exist"). A fresh worktree needs `pnpm install` + both before the GUI compiles.
+   - **`cargo fmt --all` is not safe to run blanket:** `origin/master` is not fmt-clean and the repo has
+     mixed CRLF/LF line endings with `core.autocrlf=false` / `core.eol=lf` / no `.gitattributes`, so
+     `cargo fmt --all` rewrites ~165 files (mostly pure EOL churn). Format only the files you touch.
+     - [ ] Decide the line-ending policy: add a `.gitattributes` (`*.rs text eol=lf`) and land one
+           tree-wide `cargo fmt` normalization commit, so future runs can use `fmt`/`fmt --check` normally.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
