@@ -14,13 +14,13 @@
 
 use crate::daemon_client::{ConnectionMode, DaemonClient, DaemonClientConfig, DaemonEvent};
 use crate::daemon_manager::{DaemonManager, DaemonManagerConfig, DaemonState};
-use crate::embedded::EmbeddedBackend;
 use crate::AppState;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
 /// Backend mode
@@ -48,10 +48,12 @@ pub struct Backend {
     mode: Arc<RwLock<BackendMode>>,
     daemon_manager: Arc<DaemonManager>,
     daemon_client: Arc<DaemonClient>,
-    embedded: Arc<RwLock<Option<EmbeddedBackend>>>,
     app: Arc<RwLock<Option<AppHandle>>>,
     /// Flag to prevent concurrent init attempts
     initializing: Arc<RwLock<bool>>,
+    /// Ensures the single DaemonEvent→Tauri forwarding task starts exactly once,
+    /// even if `init` runs multiple times (retry, mode changes).
+    forwarding_started: Arc<AtomicBool>,
 }
 
 impl Backend {
@@ -67,15 +69,21 @@ impl Backend {
             mode: Arc::new(RwLock::new(BackendMode::Embedded)),
             daemon_manager: Arc::new(DaemonManager::new(manager_config)),
             daemon_client: Arc::new(DaemonClient::new(client_config)),
-            embedded: Arc::new(RwLock::new(None)),
             app: Arc::new(RwLock::new(None)),
             initializing: Arc::new(RwLock::new(false)),
+            forwarding_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Set the embedded backend (must be called before init)
-    pub async fn set_embedded(&self, embedded: EmbeddedBackend) {
-        *self.embedded.write().await = Some(embedded);
+    /// Sender side of the shared [`DaemonEvent`] bus.
+    ///
+    /// In daemon mode the WebSocket client publishes deserialized daemon events
+    /// here; in embedded mode the in-process `AgentService`'s events are
+    /// injected into the same bus (see `embedded::spawn_event_bridge`). Either
+    /// way, [`Backend::start_event_forwarding`] is the single place that
+    /// translates them into Tauri window events.
+    pub fn daemon_event_sender(&self) -> broadcast::Sender<DaemonEvent> {
+        self.daemon_client.event_sender()
     }
 
     /// Set the app handle (required for sidecar and event emission)
@@ -117,6 +125,11 @@ impl Backend {
         // Store app handle
         *self.app.write().await = Some(app.clone());
 
+        // Start the single event-forwarding task for BOTH modes: the bus it
+        // consumes carries daemon WebSocket events in daemon mode and the
+        // in-process AgentService's events in embedded mode.
+        self.start_event_forwarding(app.clone());
+
         // Step 1: Start the daemon sidecar
         let result = match self.daemon_manager.start(app).await {
             Ok(()) => {
@@ -129,9 +142,6 @@ impl Backend {
                     ConnectionMode::Daemon => {
                         info!("Backend: daemon mode (sidecar)");
                         *self.mode.write().await = BackendMode::Daemon;
-
-                        // Start event forwarding
-                        self.start_event_forwarding(app.clone());
 
                         // Start health monitoring
                         self.daemon_manager.clone().start_health_monitor(app.clone());
@@ -216,12 +226,28 @@ impl Backend {
         self.daemon_client.request(action).await
     }
 
-    /// Start forwarding daemon events to Tauri
+    /// Start forwarding daemon events to Tauri.
+    ///
+    /// This is the ONLY `DaemonEvent` → Tauri translation path. It serves both
+    /// modes: daemon events arrive over the WebSocket, embedded events are
+    /// injected onto the same bus by the in-process agent's event bridge.
     fn start_event_forwarding(&self, app: AppHandle) {
+        // Guard against double-start (init can run more than once).
+        if self.forwarding_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let mut events = self.daemon_client.subscribe_events();
 
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Event forwarding lagged, dropped {} events", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 match &event {
                     DaemonEvent::MessageDelta { session_id, delta, .. } => {
                         let _ = app.emit("stream-chunk", serde_json::json!({

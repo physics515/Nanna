@@ -107,42 +107,6 @@ pub(crate) fn create_llm_client_for_model(model_id: &str, config: &Config, ollam
     }
 }
 
-/// Check if an error message indicates a rate limit or recoverable error
-pub(crate) fn is_rate_limit_error(error_msg: &str) -> bool {
-    let lower = error_msg.to_lowercase();
-    // Check for our RECOVERABLE: prefix (mid-stream errors)
-    error_msg.starts_with("RECOVERABLE:")
-        || lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("429")
-        || lower.contains("529")  // Anthropic overloaded
-        || lower.contains("too many requests")
-        || lower.contains("overloaded")
-}
-
-/// Parse retry-after seconds from error message (if available)
-pub(crate) fn parse_retry_after_from_error(error_msg: &str) -> Option<u64> {
-    // Try to find "retry after X" or "retry-after: X" patterns
-    let lower = error_msg.to_lowercase();
-
-    // Pattern: "retry after 30 seconds" or "retry-after: 30"
-    for pattern in ["retry after ", "retry-after: ", "retry-after:", "wait "] {
-        if let Some(pos) = lower.find(pattern) {
-            let after_pattern = &error_msg[pos + pattern.len()..];
-            // Extract the number
-            let num_str: String = after_pattern
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if let Ok(secs) = num_str.parse::<u64>() {
-                return Some(secs);
-            }
-        }
-    }
-
-    None
-}
-
 /// Format Claude model IDs into friendly names
 pub(crate) fn format_claude_model_name(id: &str) -> String {
     match id {
@@ -158,8 +122,6 @@ pub(crate) fn format_claude_model_name(id: &str) -> String {
 #[cfg(test)]
 mod parse_model_id_tests {
     use super::parse_model_id;
-    use crate::llm::truncation::conversation_token_budget_for;
-    use nanna_llm::unknown_model_info;
 
     #[test]
     fn parse_model_id_infers_provider_by_family_prefix() {
@@ -223,53 +185,4 @@ mod parse_model_id_tests {
         );
     }
 
-    #[test]
-    fn conversation_budget_uses_resolved_model_info() {
-        // Small window (API/cache would report this) must not inherit a cloud-sized
-        // default: budget must fit the hard input limit and keep a history floor.
-        let small = nanna_llm::ModelInfo {
-            id: "local".into(),
-            context_window: 8_000,
-            max_output_tokens: 4_096,
-            supports_tools: true,
-            supports_vision: false,
-            embedding_dimension: None,
-            cached_at: 0,
-            provider: "test".into(),
-        };
-        let budget = conversation_token_budget_for(&small);
-        assert!(
-            budget <= small.hard_input_limit(),
-            "budget {budget} exceeds hard input {}",
-            small.hard_input_limit()
-        );
-        assert!(budget >= 2_000, "budget {budget} collapsed below floor");
-    }
-
-    #[test]
-    fn conversation_budget_scales_with_large_context() {
-        let large = nanna_llm::ModelInfo {
-            id: "big".into(),
-            context_window: 200_000,
-            max_output_tokens: 8_192,
-            supports_tools: true,
-            supports_vision: false,
-            embedding_dimension: None,
-            cached_at: 0,
-            provider: "test".into(),
-        };
-        let budget = conversation_token_budget_for(&large);
-        assert!(budget > 100_000, "large-model budget {budget} regressed");
-        assert!(budget < large.context_window);
-    }
-
-    #[test]
-    fn uncached_model_name_uses_universal_floor() {
-        // No per-model table: any name without a cache entry gets UNKNOWN_CONTEXT_WINDOW.
-        let info = nanna_llm::model_info_from_cache_or_unknown("some-unknown-local-model-xyz", "");
-        assert_eq!(info.context_window, nanna_llm::UNKNOWN_CONTEXT_WINDOW);
-        let budget = conversation_token_budget_for(&info);
-        let expected = conversation_token_budget_for(&unknown_model_info("x", ""));
-        assert_eq!(budget, expected);
-    }
 }

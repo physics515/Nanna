@@ -157,8 +157,9 @@ pub struct AppState {
     pub(crate) user_tools: Arc<tool_authoring::UserToolManager>,
     /// Backend abstraction (daemon or embedded mode)
     pub(crate) backend: Arc<Backend>,
-    /// Tracks in-flight agent runs for embedded mode (shared with run_agent_loop)
-    pub(crate) embedded_run_states: Arc<RwLock<HashMap<String, EmbeddedRunState>>>,
+    /// In-process agent service for embedded mode (the daemon's `AgentService`
+    /// running inside the GUI). `None` in daemon mode — the daemon runs its own.
+    pub(crate) agent_service: Option<Arc<nanna_daemon::agent_service::AgentService>>,
 }
 
 impl AppState {
@@ -168,41 +169,6 @@ impl AppState {
         self.storage.as_ref().ok_or_else(|| {
             "Local storage is not open (daemon mode — the daemon owns nanna.db)".to_string()
         })
-    }
-}
-
-/// Tracks the in-flight state of an embedded mode agent run
-pub struct EmbeddedRunState {
-    pub accumulated_text: Arc<RwLock<String>>,
-    pub accumulated_thinking: Arc<RwLock<String>>,
-    pub active_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
-    pub completed_tool_calls: Arc<RwLock<Vec<serde_json::Value>>>,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    /// Cooperative cancellation flag. `cancel_session` sets this; the embedded
-    /// agent loop checks it each iteration and stops. This is the ONLY thing that
-    /// ends an otherwise-unbounded run in embedded mode (besides the model finishing).
-    pub cancel_flag: Arc<AtomicBool>,
-}
-
-/// Agent-loop iteration policy (long-horizon by default). Threaded from
-/// `config.agent` into the embedded loop.
-#[derive(Clone, Copy)]
-pub struct IterationPolicy {
-    /// Absolute backstop. `None` = unbounded (only cancellation / the model finishing stops it).
-    pub(crate) max_iterations: Option<usize>,
-    /// Iteration at which the first escalating wrap-up nudge is injected.
-    pub(crate) nudge_after: usize,
-    /// Interval between escalating nudges after the first.
-    pub(crate) nudge_interval: usize,
-}
-
-impl IterationPolicy {
-    pub(crate) fn from_config(agent: &nanna_config::AgentConfig) -> Self {
-        Self {
-            max_iterations: agent.max_iterations,
-            nudge_after: agent.nudge_after_iterations,
-            nudge_interval: agent.nudge_interval_iterations,
-        }
     }
 }
 
@@ -254,22 +220,6 @@ pub struct SessionInfo {
     pub workspace_name: Option<String>,
 }
 
-/// Streaming chunk event
-#[derive(Debug, Clone, Serialize)]
-pub struct StreamChunk {
-    pub session_id: String,
-    pub chunk: String,
-    pub done: bool,
-}
-
-/// Tool call event for frontend visualization
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolCallEvent {
-    pub session_id: String,
-    pub tool_call: ToolCallInfo,
-    pub status: String, // "started" | "completed" | "error"
-}
-
 /// Application config for frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -280,10 +230,3 @@ pub struct AppConfig {
     pub available_tools: Vec<String>,
 }
 
-/// Pending tool call being assembled from stream
-#[derive(Debug, Clone)]
-pub struct PendingToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) input_json: String,
-}

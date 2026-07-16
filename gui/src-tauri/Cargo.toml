@@ -65,6 +65,9 @@ nanna-agent = { path = "../../crates/nanna-agent" }
 nanna-workspace = { path = "../../crates/nanna-workspace" }
 nanna-scripting = { path = "../../crates/nanna-scripting", features = ["boa"] }
 nanna-channels = { path = "../../crates/nanna-channels" }
+# Daemon lib: embedded mode runs the daemon's AgentService in-process so both
+# modes share ONE agent loop (nanna-agent) and ONE event pipeline.
+nanna-daemon = { path = "../../crates/nanna-daemon" }
 
 [features]
 default = ["custom-protocol", "devtools"]

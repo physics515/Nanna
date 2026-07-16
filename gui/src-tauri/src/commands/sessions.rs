@@ -679,28 +679,22 @@ pub async fn get_session_run_state(
         return state.backend.session_get_run_state(&session_id).await;
     }
 
-    // Embedded mode: check local run states
-    let run_states = state.embedded_run_states.read().await;
+    // Embedded mode: query the in-process AgentService (same tracker the
+    // daemon uses — accumulated text/thinking, active + completed tools).
     let msg_count = match &state.storage {
         Some(storage) => storage.count_session_messages(&session_id).await.unwrap_or(0) as usize,
         None => 0,
     };
 
-    if let Some(run_state) = run_states.get(&session_id) {
-        let text = run_state.accumulated_text.read().await.clone();
-        let thinking = run_state.accumulated_thinking.read().await.clone();
-        let active = run_state.active_tool_calls.read().await.clone();
-        let completed = run_state.completed_tool_calls.read().await.clone();
-
-        Ok(serde_json::json!({
-            "is_running": true,
-            "accumulated_text": text,
-            "accumulated_thinking": thinking,
-            "active_tool_calls": active,
-            "completed_tool_calls": completed,
-            "started_at": run_state.started_at.to_rfc3339(),
-            "message_count": msg_count,
-        }))
+    if let Some(ref agent_service) = state.agent_service {
+        // Embedded sessions live in local SQLite, not a daemon SessionManager,
+        // so pass an empty manager and patch the message count from storage.
+        let sessions = nanna_daemon::SessionManager::new();
+        let snapshot = agent_service.get_run_state(&session_id, &sessions).await;
+        let mut value = serde_json::to_value(&snapshot)
+            .map_err(|e| format!("Failed to serialize run state: {}", e))?;
+        value["message_count"] = serde_json::json!(msg_count);
+        Ok(value)
     } else {
         Ok(serde_json::json!({
             "is_running": false,
@@ -727,18 +721,17 @@ pub async fn cancel_session(
     let state_guard = state.read().await;
     if state_guard.backend.is_daemon_mode().await {
         state_guard.backend.chat_cancel(&session_id).await
-    } else {
-        // Embedded mode: trip the running loop's cooperative cancellation flag.
-        // The loop checks it at the top of each iteration, emits the terminal
-        // stream event, and returns with whatever it has so far.
-        let states = state_guard.embedded_run_states.read().await;
-        if let Some(run) = states.get(&session_id) {
-            run.cancel_flag.store(true, Ordering::Relaxed);
+    } else if let Some(ref agent_service) = state_guard.agent_service {
+        // Embedded mode: delegate to the in-process AgentService, which trips
+        // the agent loop's cooperative cancellation flag. The loop finishes
+        // gracefully with whatever it has so far (same behavior as the daemon).
+        let cancelled = agent_service.cancel(&session_id).await;
+        if cancelled {
             info!("Embedded run for session {} flagged for cancellation", session_id);
-            Ok(true)
-        } else {
-            // No in-flight embedded run for this session.
-            Ok(false)
         }
+        Ok(cancelled)
+    } else {
+        // No in-process agent service — nothing to cancel.
+        Ok(false)
     }
 }

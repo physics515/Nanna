@@ -29,13 +29,12 @@ use nanna_core::{
     Workspace, WorkspaceRegistry,
     find_workspace_root, discover_workspaces,
 };
-use nanna_llm::{AnthropicMessage, CompletionRequest, LlmClient, Message as LlmMessage, ModelInfoCache, RequestBuilder, Role, StreamEvent};
+use nanna_llm::{CompletionRequest, LlmClient, Message as LlmMessage, ModelInfoCache, RequestBuilder, Role};
 use nanna_storage::{Storage, StorageConfig};
-use nanna_tools::{ToolCall, ToolRegistry};
+use nanna_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -56,8 +55,6 @@ use nanna_channels::{Channel, ChannelId, MessageContent, OutgoingMessage};
 pub(crate) use commands::chat::*;
 pub(crate) use commands::settings::*;
 pub(crate) use llm::routing::*;
-pub(crate) use llm::summarization::*;
-pub(crate) use llm::truncation::*;
 pub(crate) use state::*;
 
 // =============================================================================
@@ -872,20 +869,29 @@ async fn setup_state(
         .cloned()
         .unwrap_or_else(|| config.llm.model.clone());
 
-    // Wire the embedded backend into the already-initialized Backend. Only
-    // possible when the GUI owns local storage (i.e. embedded mode).
-    if let Some(ref storage) = storage {
-        let embedded = embedded::EmbeddedBackend::new(
-            llm.clone(),
+    // Embedded mode: construct the long-lived in-process AgentService (the
+    // daemon's agent loop running inside the GUI). Its events are bridged onto
+    // the same DaemonEvent bus the backend already forwards to Tauri, so both
+    // modes share one loop and one event pipeline. Only possible when the GUI
+    // owns local storage (i.e. embedded mode).
+    let agent_service = if let Some(ref storage) = storage {
+        let service = embedded::build_embedded_agent_service(
+            &config,
+            &saved_ollama_host,
             tools.clone(),
             memory.clone(),
             storage.clone(),
-        ).await;
-        backend.set_embedded(embedded).await;
-        info!("Embedded backend ready (GUI owns local storage)");
+            backend.daemon_event_sender(),
+        )
+        .await;
+        if service.is_some() {
+            info!("Embedded agent service ready (GUI owns local storage)");
+        }
+        service
     } else {
-        info!("Daemon mode: embedded backend not constructed");
-    }
+        info!("Daemon mode: in-process agent service not constructed");
+        None
+    };
 
     Ok(AppState {
         storage: storage.clone(),
@@ -922,8 +928,8 @@ async fn setup_state(
         backend,
         // Close behavior (default: ask user)
         close_mode: Arc::new(RwLock::new(CloseMode::default())),
-        // Embedded run state tracking (empty at startup)
-        embedded_run_states: Arc::new(RwLock::new(HashMap::new())),
+        // In-process agent service (embedded mode only)
+        agent_service,
     })
 }
 
