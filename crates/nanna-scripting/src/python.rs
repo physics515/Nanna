@@ -10,6 +10,45 @@ use crate::{Result, ScriptError};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Native stack reserved for the thread running the `RustPython` interpreter.
+///
+/// `RustPython`'s VM recurses natively per Python frame, so the native stack it needs
+/// is bounded by the VM's own recursion limit:
+///
+/// ```text
+///     stack_needed = recursion_limit x per_frame_native_bytes
+/// ```
+///
+/// Both terms are measured, not guessed (rustpython 0.5, Windows `x86_64`):
+///
+/// * `recursion_limit` — `RustPython`'s default, **256 in debug / 1000 in release**
+///   (`rustpython_vm::VirtualMachine`). This is the term that makes the product
+///   finite: exceeding it raises a catchable Python `RecursionError`.
+/// * `per_frame_native_bytes` — **~64 KiB in debug**, derived by bisecting the depth
+///   an explicitly-sized thread survives (500 frames overflow 16 MiB; 1000 overflow
+///   64 MiB once the limit is lifted). Release frames are smaller.
+///
+/// That gives ~16 MiB (debug: 256 x 64 KiB) and ~16-32 MiB (release: 1000 x a
+/// smaller frame). **64 MiB** is the next power of two above both, leaving ~4x margin
+/// in debug — and it is empirically the size at which runaway recursion reports a
+/// clean `RecursionError` instead of aborting, which 16 MiB did not.
+///
+/// Why this is not merely a tuning knob: Tokio's default worker/blocking stack is
+/// **2 MiB**, which every `python.exec` overflowed — and a Rust stack overflow is an
+/// immediate `abort()`, not a catchable panic, so `spawn_blocking`'s unwind guard
+/// could never contain it. The interpreter therefore gets its own explicitly-sized
+/// thread rather than inheriting the runtime's.
+///
+/// Cost is bounded and cheap: a thread stack is *reserved* address space committed
+/// lazily by page, so a shallow execution touches only the pages it uses — the
+/// 64 MiB is a ceiling, not an allocation, and only one thread exists per in-flight
+/// call.
+const PYTHON_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// The stack must hold `recursion_limit x per_frame_native_bytes` (256 x ~64 KiB in
+/// debug) with margin; below ~32 MiB runaway recursion aborts instead of raising.
+const _: () = assert!(PYTHON_STACK_BYTES >= 32 * 1024 * 1024);
+
 /// Result of executing Python code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonResult {
@@ -20,7 +59,7 @@ pub struct PythonResult {
     pub duration_ms: u64,
 }
 
-/// Manages embedded RustPython execution.
+/// Manages embedded `RustPython` execution.
 ///
 /// Each execution creates a fresh interpreter to ensure isolation.
 /// This is lightweight enough for tool-call frequency.
@@ -48,14 +87,13 @@ impl PythonEngine {
 
         let start = std::time::Instant::now();
 
-        // Run in a blocking task since RustPython is synchronous and !Send
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            tokio::task::spawn_blocking(move || {
-                execute_isolated(&code, workdir.as_deref())
-            }),
-        )
-        .await;
+        // RustPython is synchronous and !Send, and needs far more native stack than a
+        // Tokio blocking thread provides (see PYTHON_STACK_BYTES), so it gets its own
+        // explicitly-sized thread rather than the runtime's ambient one.
+        let receiver = spawn_interpreter_thread(code, workdir)?;
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), receiver).await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -70,12 +108,48 @@ impl PythonEngine {
                 );
                 Ok(py_result)
             }
-            Ok(Err(e)) => Err(ScriptError::Execution(format!(
-                "Python task panicked: {e}"
-            ))),
+            // The sender is only dropped without a value if the interpreter thread
+            // panicked; the panic itself is reported by the default hook.
+            Ok(Err(_)) => Err(ScriptError::Execution(
+                "Python interpreter thread terminated without returning a result".to_string(),
+            )),
             Err(_) => Err(ScriptError::Timeout(timeout_secs * 1000)),
         }
     }
+}
+
+/// Run one isolated interpreter on a dedicated thread with a stack large enough for
+/// `RustPython`, returning a receiver for its result.
+///
+/// A timed-out caller simply stops awaiting the receiver; the thread runs to
+/// completion and its result is dropped. That matches the previous `spawn_blocking`
+/// behavior — a synchronous interpreter cannot be pre-empted mid-execution — and the
+/// thread is bounded by the caller's timeout in practice.
+fn spawn_interpreter_thread(
+    code: String,
+    workdir: Option<String>,
+) -> Result<tokio::sync::oneshot::Receiver<PythonResult>> {
+    // The stack invariant is enforced at compile time by the `const _` assert on
+    // PYTHON_STACK_BYTES — stronger than a debug_assert here, and free.
+    //
+    // Empty source is *user* input (the daemon's python.exec defaults `code` to ""),
+    // so it is handled by the interpreter rather than asserted on, and a failed spawn
+    // is an operational error returned as Err below. Hence no runtime assertion.
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+
+    std::thread::Builder::new()
+        .name("nanna-python".to_string())
+        .stack_size(PYTHON_STACK_BYTES)
+        .spawn(move || {
+            let result = execute_isolated(&code, workdir.as_deref());
+            // A dropped receiver means the caller timed out — expected, not an error.
+            drop(sender.send(result));
+        })
+        .map_err(|e| {
+            ScriptError::Execution(format!("failed to spawn Python interpreter thread: {e}"))
+        })?;
+
+    Ok(receiver)
 }
 
 /// Execute code in a fresh, isolated interpreter.
@@ -119,7 +193,8 @@ fn execute_isolated(code: &str, workdir: Option<&str>) -> PythonResult {
 import json as _nj
 _nanna_json = _nj.dumps(_nanna_result)
 "#;
-                if let Ok(code_obj) = vm.compile(extract, Mode::Exec, "<nanna-extract>".to_owned()) {
+                if let Ok(code_obj) = vm.compile(extract, Mode::Exec, "<nanna-extract>".to_owned())
+                {
                     let _ = vm.run_code_obj(code_obj, scope.clone());
                 }
 
@@ -130,12 +205,28 @@ _nanna_json = _nj.dumps(_nanna_result)
                         if let Ok(s) = val.str(vm) {
                             // rustpython 0.5: PyStr::as_str was replaced by
                             // to_string_lossy (strings may be non-UTF-8 kinds).
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s.to_string_lossy()) {
+                            if let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(&s.to_string_lossy())
+                            {
                                 return PythonResult {
-                                    stdout: parsed.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                    stderr: parsed.get("stderr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                    success: parsed.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
-                                    error: parsed.get("error").and_then(|v| v.as_str()).map(String::from),
+                                    stdout: parsed
+                                        .get("stdout")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    stderr: parsed
+                                        .get("stderr")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    success: parsed
+                                        .get("success")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                    error: parsed
+                                        .get("error")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from),
                                     duration_ms: 0,
                                 };
                             }
@@ -247,10 +338,59 @@ fn python_string_literal(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Runaway recursion must surface as a catchable Python `RecursionError`, never a
+    /// native stack overflow (which aborts the whole process, uncatchably).
+    ///
+    /// This is the guard on the sizing rule in `PYTHON_STACK_BYTES`: the stack must
+    /// comfortably hold `recursion_limit x per-frame native cost`. It failed at
+    /// 16 MiB, which is why the constant is 64 MiB.
+    #[tokio::test]
+    async fn runaway_recursion_errors_cleanly_without_aborting() {
+        let engine = PythonEngine::new();
+        let result = engine
+            .execute(
+                "def f(n):
+    return f(n + 1)
+f(0)",
+                None,
+                30,
+            )
+            .await
+            .expect("runaway recursion must return a result, not kill the process");
+
+        assert!(
+            !result.success,
+            "infinite recursion must not report success"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("RecursionError"),
+            "expected a Python RecursionError, got: {error}"
+        );
+    }
+
+    /// A single-threaded Tokio runtime is the worst case for the old design: there is
+    /// no blocking pool thread with a bigger stack to fall back on. Executing here
+    /// proves the interpreter's stack is independent of the runtime's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn executes_under_current_thread_runtime() {
+        let engine = PythonEngine::new();
+        let result = engine
+            .execute("import json\nprint(json.dumps({'ok': True}))", None, 10)
+            .await
+            .expect("execute must succeed on a current_thread runtime");
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(result.stdout.contains("ok"));
+    }
+
     #[tokio::test]
     async fn test_basic_execution() {
         let engine = PythonEngine::new();
-        let result = engine.execute("print('hello world')", None, 10).await.unwrap();
+        let result = engine
+            .execute("print('hello world')", None, 10)
+            .await
+            .unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert_eq!(result.stdout.trim(), "hello world");
     }
@@ -258,7 +398,10 @@ mod tests {
     #[tokio::test]
     async fn test_error_handling() {
         let engine = PythonEngine::new();
-        let result = engine.execute("raise ValueError('test error')", None, 10).await.unwrap();
+        let result = engine
+            .execute("raise ValueError('test error')", None, 10)
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("ValueError"));
     }
@@ -287,7 +430,11 @@ print("Counter:", collections.Counter('aabbc'))
 print("Path:", type(pathlib.Path('.')).__name__)
 "#;
         let result = engine.execute(code, None, 10).await.unwrap();
-        assert!(result.success, "stderr: {}, error: {:?}", result.stderr, result.error);
+        assert!(
+            result.success,
+            "stderr: {}, error: {:?}",
+            result.stderr, result.error
+        );
         assert!(result.stdout.contains("os: True"));
     }
 

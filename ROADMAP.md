@@ -629,17 +629,38 @@ routine should drain first.**
       `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
       `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
-- [ ] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11)* Under
-      full-workspace feature unification the `nanna-scripting` **deno** feature (V8) is enabled, so its lib
-      tests grow from 12 (boa-only) to 20, and a V8-backed test **overflows a `tokio-rt-worker` stack** on
-      Windows (`thread 'tokio-rt-worker' has overflowed its stack`), making `cargo test --workspace` red even
-      though every crate is green with `-p`. deno_core/V8 needs a large native stack; the default tokio
-      worker stack is too small. Fix: run the affected deno tests on a runtime with a bigger
-      `thread_stack_size` (e.g. a `Builder::new_multi_thread().thread_stack_size(16<<20)` or a dedicated
-      `std::thread` with an 8–16 MB stack), or gate the V8 tests behind a non-default feature. This blocks the
-      "`cargo test` green" guardrail for the nightly routine, which currently must fall back to per-crate
-      runs. Sources: [deno#24325](https://github.com/denoland/deno/issues/24325),
-      [deno#7279](https://github.com/denoland/deno/issues/7279).
+- [x] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11; root-caused
+      + fixed 2026-07-16)* **The 2026-07-11 diagnosis was wrong on both the culprit and the blast radius.**
+      It is **not** deno/V8: `cargo test -p nanna-scripting --features deno` passes 20/20 clean. The
+      overflowing feature is **`python` (RustPython)** — no dependent enables `deno` at all
+      (`gui`→`boa`, `daemon`→`python`), so workspace unification turns on `python`, and
+      `cargo test -p nanna-scripting --features python` reproduces the overflow on the *first* python test.
+      **Not a test-infra annoyance — a live daemon crash.** `python.exec` is a registered daemon service
+      (`server.rs:385`) reachable from any JS/TS tool, and `PythonEngine::execute` ran RustPython via
+      `spawn_blocking`, i.e. on a Tokio thread with the default **2 MiB** stack. RustPython overflows that
+      on `print('hello')`, and a Rust stack overflow is an uncatchable `abort()` — `spawn_blocking`'s unwind
+      guard cannot contain it. So **the python tool never worked and took the whole daemon down with it**;
+      the red workspace test was just the symptom that surfaced first.
+      **Fix:** the interpreter now runs on its own `std::thread` with an explicitly sized stack
+      (`spawn_interpreter_thread` + `PYTHON_STACK_BYTES`), joined through a `oneshot`; timeout/panic
+      semantics are unchanged (a synchronous interpreter was never cancellable mid-run either).
+      **The bound is derived, not guessed:** `stack_needed = recursion_limit x per_frame_native_bytes`, where
+      RustPython's own default `recursion_limit` (**256 debug / 1000 release**, `rustpython_vm::VirtualMachine`)
+      is the term that makes it finite, and `per_frame_native_bytes` was measured at **~64 KiB in debug** by
+      bisecting survivable depth (500 frames overflow 16 MiB; 1000 overflow 64 MiB with the limit lifted).
+      256 x 64 KiB = 16 MiB → **64 MiB** is the next power of two above both profiles (~4x debug margin), and
+      is empirically the size at which runaway recursion raises a catchable `RecursionError` instead of
+      aborting — 16 MiB did **not**. Cost is a lazily-committed reservation, one thread per in-flight call.
+      3 new tests (dedicated-thread execution under a `current_thread` runtime; runaway recursion errors
+      cleanly without aborting; plus the 7 pre-existing python tests that could never have passed before).
+      Verified: `cargo test --workspace` reaches **0 stack overflows** (was 3) and 317 tests pass;
+      nanna-scripting 29+1 green; clippy **108 → 101** warnings in-crate, none new.
+      - [ ] **Residual (pre-existing, narrower):** user code can still `sys.setrecursionlimit(...)` above the
+            default and overflow even a 64 MiB stack → uncatchable process abort from model-authored Python.
+            RustPython does not bound native depth itself; `vm.recursion_limit` is a public `Cell<usize>`.
+            Fix options: clamp the limit from the stack budget after `Interpreter::build`, re-clamp around
+            each execution, or reject `setrecursionlimit` in the wrapper. Until then `python.exec` is a
+            DoS vector for untrusted Python. Source: `rustpython-vm-0.5.0/src/vm/mod.rs:737`.
 - [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
       *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
       rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file
