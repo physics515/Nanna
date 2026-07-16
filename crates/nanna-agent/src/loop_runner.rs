@@ -767,9 +767,7 @@ impl Agent {
             // Check cancellation flag
             if let Some(ref flag) = options.cancellation_flag {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    info!("Agent cancelled by user");
-                    state.final_text.push_str("\n\n[Cancelled by user]");
-                    return Ok(state.into_response(true));
+                    return self.finish_cancelled(state, &options).await;
                 }
             }
 
@@ -1173,6 +1171,14 @@ impl Agent {
             if !result.text.is_empty() {
                 state.final_text = result.text;
             }
+            // Mid-stream cancel closes the LLM call with partial text; fold it and exit.
+            if let Some(ref flag) = options.cancellation_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Content blocks may already be stored above — finish_cancelled
+                    // de-dupes the cancel marker message.
+                    return self.finish_cancelled(state, &options).await;
+                }
+            }
 
             // If no tool calls, check for narration loop before exiting
             if result.tool_uses.is_empty() {
@@ -1385,6 +1391,57 @@ impl Agent {
         }
     }
 
+    /// Cooperative cancel: preserve unfinished text in the response AND in the
+    /// live conversation context so the next user turn still sees it.
+    async fn finish_cancelled(
+        &self,
+        mut state: RunState,
+        options: &RunOptions,
+    ) -> Result<AgentResponse, AgentError> {
+        info!("Agent cancelled by user — preserving unfinished context");
+        if state.streamed_text.len() > state.final_text.len() {
+            state.final_text = state.streamed_text.clone();
+        }
+        if !state.final_text.contains("[Cancelled by user]")
+            && !state.final_text.contains("[Stopped by user]")
+        {
+            if !state.final_text.is_empty() && !state.final_text.ends_with('\n') {
+                state.final_text.push_str("\n\n");
+            }
+            state.final_text.push_str("[Cancelled by user]");
+        }
+
+        // Model context: fold partial assistant work into conversation history.
+        if !state.final_text.trim().is_empty() {
+            let mut ctx = self.context.write().await;
+            let already = ctx.messages.last().is_some_and(|m| {
+                m.role == "assistant"
+                    && m.content.iter().any(|b| match b {
+                        ContentBlock::Text { text } => {
+                            text.contains("[Cancelled by user]")
+                                || text.contains("[Stopped by user]")
+                        }
+                        _ => false,
+                    })
+            });
+            if !already {
+                ctx.messages
+                    .push(AnthropicMessage::assistant_text(state.final_text.clone()));
+            }
+        }
+
+        if options.auto_extract_memories {
+            if let Some(ref on_memory) = options.on_memory {
+                if let Ok(memories) = self.extract_memories().await {
+                    for memory in memories {
+                        on_memory(memory).await;
+                    }
+                }
+            }
+        }
+        Ok(state.into_response(true))
+    }
+
     async fn call_llm(
         &self,
         request: &AnthropicRequest,
@@ -1397,7 +1454,13 @@ impl Agent {
 
         loop {
             let result = if let Some(ref on_text) = options.on_text {
-                self.call_llm_streaming(request, on_text, options.on_thinking.as_ref(), state).await
+                self.call_llm_streaming(
+                    request,
+                    on_text,
+                    options.on_thinking.as_ref(),
+                    state,
+                    options.cancellation_flag.as_ref(),
+                ).await
             } else {
                 self.call_llm_sync(request, state).await
             };
@@ -1439,6 +1502,7 @@ impl Agent {
         on_text: &StreamCallback,
         on_thinking: Option<&ThinkingCallback>,
         state: &mut RunState,
+        cancellation_flag: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<LlmResult, AgentError> {
         use futures::StreamExt;
         use std::pin::pin;
@@ -1463,10 +1527,18 @@ impl Agent {
         let mut narration_check_len = 0usize; // track text length at last narration check
 
         while let Some(event) = stream.next().await {
+            if let Some(flag) = cancellation_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    info!("Stream cancelled mid-token batch — returning partial");
+                    // Incomplete tool JSON is discarded; text/thinking already accumulated.
+                    break;
+                }
+            }
             match event? {
                 StreamEvent::TextDelta { text, .. } => {
                     on_text(&text);
                     response_text.push_str(&text);
+                    state.streamed_text.push_str(&text);
 
                     // Periodically check for narration loops and degenerate
                     // repetition (every ~8000 chars of text)
@@ -1548,77 +1620,54 @@ impl Agent {
                         if current_tool_json.trim().is_empty() {
                             current_tool_json = "{}".to_string();
                         }
-                        match serde_json::from_str::<Value>(&current_tool_json) {
-                            Ok(input) => {
+                        match nanna_llm::heal_json(&current_tool_json) {
+                            Some(input) => {
+                                if serde_json::from_str::<Value>(&current_tool_json).is_err() {
+                                    warn!(
+                                        tool_id = %current_tool_id,
+                                        tool_name = %current_tool_name,
+                                        original_json = %current_tool_json,
+                                        healed = %input,
+                                        "Healed malformed tool_use JSON from stream"
+                                    );
+                                }
                                 tool_uses.push((
                                     current_tool_id.clone(),
                                     current_tool_name.clone(),
-                                    input,
+                                    input.clone(),
                                 ));
                                 content_blocks.push(ContentBlock::ToolUse {
                                     id: std::mem::take(&mut current_tool_id),
                                     name: std::mem::take(&mut current_tool_name),
-                                    input: serde_json::from_str(&current_tool_json).unwrap_or_default(),
+                                    input,
                                 });
                             }
-                            Err(e) => {
-                                // Try to salvage a valid JSON object from garbled output.
-                                // Some models (especially free-tier) emit concatenated or
-                                // malformed JSON like: {"a":"b" garbage"}{"a":"b"}
-                                // We attempt to find the last valid JSON object in the string.
-                                let mut salvaged = false;
-                                if let Some(last_brace) = current_tool_json.rfind('{') {
-                                    let candidate = &current_tool_json[last_brace..];
-                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(candidate) {
-                                        warn!(
-                                            tool_id = %current_tool_id,
-                                            tool_name = %current_tool_name,
-                                            original_json = %current_tool_json,
-                                            salvaged_json = %candidate,
-                                            "Salvaged valid JSON from garbled tool call stream"
-                                        );
-                                        tool_uses.push((
-                                            current_tool_id.clone(),
-                                            current_tool_name.clone(),
-                                            parsed.clone(),
-                                        ));
-                                        content_blocks.push(ContentBlock::ToolUse {
-                                            id: std::mem::take(&mut current_tool_id),
-                                            name: std::mem::take(&mut current_tool_name),
-                                            input: parsed,
-                                        });
-                                        salvaged = true;
-                                    }
-                                }
-                                if !salvaged {
-                                    warn!(
-                                        tool_id = %current_tool_id,
-                                        tool_name = %current_tool_name,
-                                        json = %current_tool_json,
-                                        error = %e,
-                                        "Failed to parse tool_use JSON from stream — returning error to model"
-                                    );
-                                    // Push the ToolUse to content_blocks so the assistant
-                                    // message is well-formed (Claude API requires a matching
-                                    // ToolResult for every ToolUse).
-                                    content_blocks.push(ContentBlock::ToolUse {
-                                        id: current_tool_id.clone(),
-                                        name: current_tool_name.clone(),
-                                        input: serde_json::json!({}),
-                                    });
-                                    // Push a synthetic error tool result that will be sent
-                                    // back to the model so it knows the call failed.
-                                    pending_error_tool_results.push(ContentBlock::ToolResult {
-                                        tool_use_id: std::mem::take(&mut current_tool_id),
-                                        content: format!(
-                                            "Error: Your tool call for '{}' had malformed JSON arguments and could not be parsed. \
-                                             Parse error: {}. Please retry with valid JSON.",
-                                            current_tool_name, e
-                                        ),
-                                        is_error: Some(true),
-                                    });
-                                    current_tool_name.clear();
-                                }
+                            None => {
+                                warn!(
+                                    tool_id = %current_tool_id,
+                                    tool_name = %current_tool_name,
+                                    json = %current_tool_json,
+                                    "Failed to heal tool_use JSON from stream — returning error to model"
+                                );
+                                // Push the ToolUse to content_blocks so the assistant
+                                // message is well-formed (Claude API requires a matching
+                                // ToolResult for every ToolUse).
+                                content_blocks.push(ContentBlock::ToolUse {
+                                    id: current_tool_id.clone(),
+                                    name: current_tool_name.clone(),
+                                    input: serde_json::json!({}),
+                                });
+                                // Push a synthetic error tool result that will be sent
+                                // back to the model so it knows the call failed.
+                                pending_error_tool_results.push(ContentBlock::ToolResult {
+                                    tool_use_id: std::mem::take(&mut current_tool_id),
+                                    content: format!(
+                                        "Error: Your tool call for '{}' had malformed JSON arguments and could not be parsed.                                          Please retry with valid JSON.",
+                                        current_tool_name
+                                    ),
+                                    is_error: Some(true),
+                                });
+                                current_tool_name.clear();
                             }
                         }
                         current_tool_json.clear();
@@ -2835,12 +2884,15 @@ impl Agent {
                     trimmed
                 };
 
-                match serde_json::from_str::<Vec<ExtractedMemoryRaw>>(json_str) {
-                    Ok(parsed) => {
+                match nanna_llm::heal_json_as::<Vec<ExtractedMemoryRaw>>(json_str) {
+                    Some(parsed) => {
                         memories.extend(filter_extracted_memories(parsed));
                     }
-                    Err(e) => {
-                        warn!("Memory extraction JSON parse failed: {} — raw response: {}", e, &json_str[..json_str.len().min(200)]);
+                    None => {
+                        warn!(
+                            "Memory extraction JSON parse failed after healing — raw response: {}",
+                            &json_str[..json_str.len().min(200)]
+                        );
                     }
                 }
             }
@@ -2940,6 +2992,8 @@ struct RunState {
     input_tokens: u32,
     output_tokens: u32,
     final_text: String,
+    /// All text streamed via on_text this run (survives mid-iteration cancel)
+    streamed_text: String,
     confidence: Option<f32>,
     emotional_context: Option<EmotionalContext>,
     /// Accumulated reasoning content
@@ -2972,6 +3026,7 @@ impl RunState {
             input_tokens: 0,
             output_tokens: 0,
             final_text: String::new(),
+            streamed_text: String::new(),
             confidence: None,
             emotional_context: None,
             reasoning_content: String::new(),

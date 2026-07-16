@@ -13,6 +13,9 @@ pub mod oauth;
 #[cfg(feature = "auto-refresh")]
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
+pub mod heal;
+pub use heal::{heal_json, heal_json_as, heal_tool_args};
+
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use reqwest::Client;
@@ -2121,7 +2124,17 @@ impl EmbeddingClient {
             return Err(LlmError::from_api_response(status, message));
         }
 
-        let result: EmbedResponse = response.json().await?;
+        // Heal malformed embedding JSON bodies (some proxies/wrappers garble arrays).
+        let raw = response.text().await?;
+        let result: EmbedResponse = match serde_json::from_str(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                let healed = heal::heal_json(&raw)
+                    .ok_or_else(|| LlmError::Json(format!("embedding response: {e}")))?;
+                serde_json::from_value(healed)
+                    .map_err(|e2| LlmError::Json(format!("embedding response after heal: {e2}")))?
+            }
+        };
         Ok(result.data.into_iter().map(|d| d.embedding).collect())
     }
 
@@ -2170,7 +2183,11 @@ impl EmbeddingClient {
             .await?;
 
         if response.status().is_success() {
-            if let Ok(resp) = response.json::<NewResp>().await {
+            let raw = response.text().await.unwrap_or_default();
+            let resp: Option<NewResp> = serde_json::from_str(&raw)
+                .ok()
+                .or_else(|| heal::heal_json(&raw).and_then(|v| serde_json::from_value(v).ok()));
+            if let Some(resp) = resp {
                 if let Some(emb) = resp.embeddings.into_iter().next() {
                     if !emb.is_empty() {
                         return Ok(emb);
@@ -2198,7 +2215,16 @@ impl EmbeddingClient {
             return Err(LlmError::from_api_response(status, message));
         }
 
-        let result: LegacyResp = response.json().await?;
+        let raw = response.text().await?;
+        let result: LegacyResp = match serde_json::from_str(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                let healed = heal::heal_json(&raw)
+                    .ok_or_else(|| LlmError::Json(format!("ollama embedding: {e}")))?;
+                serde_json::from_value(healed)
+                    .map_err(|e2| LlmError::Json(format!("ollama embedding after heal: {e2}")))?
+            }
+        };
         Ok(result.embedding)
     }
 
@@ -3730,7 +3756,7 @@ fn openai_response_to_anthropic(model: &str, response: &serde_json::Value) -> Re
             let id = tc["id"].as_str().unwrap_or("").to_string();
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-            let input = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+            let input = heal::heal_tool_args(args_str);
             content.push(ContentBlock::ToolUse { id, name, input });
         }
     }
