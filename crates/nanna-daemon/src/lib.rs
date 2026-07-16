@@ -40,7 +40,7 @@ pub use session::{Session, SessionManager, SessionId};
 pub use control::ControlPlane;
 pub use health::{PidFile, PidFileError, HealthServer, HealthState, DEFAULT_HEALTH_PORT};
 pub use webhook::{WebhookServer, WebhookConfig, WebhookEvent, WebhookMessage, DEFAULT_WEBHOOK_PORT};
-pub use log_buffer::{LogBuffer, LogEntry};
+pub use log_buffer::{LogBuffer, LogEntry, LogSource};
 
 use thiserror::Error;
 

@@ -29,6 +29,7 @@ use nanna_core::{
     Workspace, WorkspaceRegistry,
     find_workspace_root, discover_workspaces,
 };
+use nanna_daemon::log_buffer::{LogBuffer, LogBufferLayer, LogEntry, LogSource};
 use nanna_llm::{CompletionRequest, LlmClient, Message as LlmMessage, ModelInfoCache, RequestBuilder, Role};
 use nanna_storage::{Storage, StorageConfig};
 use nanna_tools::ToolRegistry;
@@ -64,6 +65,7 @@ pub(crate) use state::*;
 async fn setup_state(
     backend: Arc<Backend>,
     mode: BackendMode,
+    log_buffer: LogBuffer,
 ) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
     // Load config
     let config = Config::load().unwrap_or_default().with_env_overrides();
@@ -930,17 +932,36 @@ async fn setup_state(
         close_mode: Arc::new(RwLock::new(CloseMode::default())),
         // In-process agent service (embedded mode only)
         agent_service,
+        // Shares the buffer the tracing layer in run() writes into.
+        log_buffer,
     })
 }
 
+/// Recent in-process log lines, kept so the Logs page can show them.
+///
+/// Matches the daemon's own capacity (`main.rs`) so both halves of a merged view
+/// have the same depth. ~5k entries x ~200 B is ~1 MB resident — bounded, and the
+/// page never asks for more than `MAX_LOG_LINES` at a time.
+const GUI_LOG_BUFFER_ENTRIES: usize = 5000;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Initialize tracing: log to stdout AND into an in-memory buffer, so the GUI's
+    // own lines are visible on the Logs page instead of vanishing into a console
+    // nobody sees. Without this layer the page is empty in embedded mode, because
+    // there is no daemon to ask for logs and nothing captures ours.
+    let log_buffer = LogBuffer::new(GUI_LOG_BUFFER_ENTRIES, LogSource::Embedded);
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nanna=info".parse().unwrap()),
+                .add_directive("nanna=info".parse().unwrap_or_else(|_| LevelFilter::INFO.into())),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(LogBufferLayer::new(log_buffer.clone()))
         .init();
 
     tauri::Builder::default()
@@ -965,7 +986,7 @@ pub fn run() {
                 let mode = backend.init(&handle).await;
                 info!("Backend initialized in {:?} mode", mode);
 
-                match setup_state(backend, mode).await {
+                match setup_state(backend, mode, log_buffer).await {
                     Ok(state) => {
                         // Create agent registry with shared LLM and tools
                         let agent_registry = agents::AgentRegistryState::new(
