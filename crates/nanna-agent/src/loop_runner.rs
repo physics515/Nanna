@@ -833,9 +833,10 @@ impl Agent {
                 let hard_limit = ctx.hard_limit;
                 let proactive_threshold = compression_threshold * 40 / 100; // ~64K for 160K threshold
 
-                // Tier 1 (proactive): Every 5 iterations, if >40% of compression_threshold
-                // Keep at least 20 recent messages to avoid dropping tool results
-                // the agent still needs for its current task.
+                // Tier 1 (proactive): Every 5 iterations, if >40% of compression_threshold.
+                // Prefer selective older-tool-result compression (LLMLingua via the
+                // summarization-model settings) before dropping messages wholesale.
+                // Keep at least 20 recent messages so the agent retains working context.
                 if state.iterations > 1
                     && state.iterations % 5 == 0
                     && estimated > proactive_threshold
@@ -847,9 +848,25 @@ impl Agent {
                         tier = "proactive",
                         "Tier 1: proactive compression triggered"
                     );
-                    let dropped = ctx.drop_oldest(20);
-                    if dropped > 0 {
-                        info!(dropped_messages = dropped, "Tier 1 compression complete");
+
+                    let compressed_results = self
+                        .compress_older_context_tool_results(&mut ctx, 20)
+                        .await;
+
+                    if compressed_results == 0 {
+                        let dropped = ctx.drop_oldest(20);
+                        if dropped > 0 {
+                            info!(
+                                dropped_messages = dropped,
+                                "Tier 1 compression complete (drop fallback)"
+                            );
+                        }
+                    } else {
+                        info!(
+                            compressed_results = compressed_results,
+                            estimated_tokens = ctx.estimate_tokens(),
+                            "Tier 1 compression complete (LLMLingua selective)"
+                        );
                     }
                 }
 
@@ -1973,17 +1990,15 @@ impl Agent {
                 OutputTarget::Context => {
                     // Context-targeted tools: never store in memory, never stub.
                     // For large outputs: try LLMLingua compression → summarization → truncation.
+                    // Compression walks `summarization_priority` (settings) with client failover.
                     if result_content.len() > threshold {
-                        // Try LLMLingua-style compression first (faster, preserves more detail)
-                        let compressed = if !self.config.summarization_priority.is_empty() {
-                            if let Ok((client, model_name)) = self.create_client_for_model(&self.config.summarization_priority[0]) {
-                                crate::compressor::compress_text(&client, &model_name, &result_content, 4).await
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
+                        let compressed = crate::compressor::compress_with_priority(
+                            &result_content,
+                            4,
+                            &self.config.summarization_priority,
+                            |model_spec| self.create_client_for_model(model_spec),
+                        )
+                        .await;
 
                         if let Some(compressed) = compressed {
                             if compressed.len() < result_content.len() / 2 {
@@ -2099,6 +2114,57 @@ impl Agent {
             || lower.contains("prompt is too long")
             || lower.contains("too many tokens")
             || (lower.contains("400") && lower.contains("token"))
+    }
+
+    /// Compress large tool results in older messages using the summarization-model
+    /// priority from settings (LLMLingua-style selective compression).
+    ///
+    /// Returns how many tool results were rewritten. Zero means either nothing
+    /// was large enough or no summarization model is configured — callers may
+    /// fall back to `drop_oldest`.
+    async fn compress_older_context_tool_results(
+        &self,
+        ctx: &mut AgentContext,
+        keep_recent: usize,
+    ) -> usize {
+        if self.config.summarization_priority.is_empty() {
+            return 0;
+        }
+        // Pre-resolve every model client once so the awaitable compressor can
+        // own them without re-borrowing `&self`.
+        let mut clients: Vec<(LlmClient, String)> = Vec::new();
+        for model_spec in &self.config.summarization_priority {
+            match self.create_client_for_model(model_spec) {
+                Ok(pair) => clients.push(pair),
+                Err(e) => {
+                    debug!(
+                        model = %model_spec,
+                        error = %e,
+                        "Skipping compression model for older context"
+                    );
+                }
+            }
+        }
+        if clients.is_empty() {
+            return 0;
+        }
+
+        ctx.compress_older_tool_results(keep_recent, 500, |content| {
+            let clients = clients.clone();
+            async move {
+                for (client, model_name) in &clients {
+                    if let Some(compressed) =
+                        crate::compressor::compress_text(client, model_name, &content, 4).await
+                    {
+                        if compressed.len() < content.len() {
+                            return Some(compressed);
+                        }
+                    }
+                }
+                None
+            }
+        })
+        .await
     }
 
     /// Create an LLM client for the specified model

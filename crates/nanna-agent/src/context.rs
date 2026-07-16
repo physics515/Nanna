@@ -1172,6 +1172,86 @@ impl AgentContext {
         drop_count
     }
 
+    /// LLMLingua-style selective compression of older large tool results.
+    ///
+    /// Walks messages older than `keep_recent`, scores each large
+    /// [`ContentBlock::ToolResult`] with the summarization-model priority list
+    /// via `compress_with`, and rewrites the block in place when compression
+    /// actually shrinks content. Pinned first message is never touched.
+    /// Returns the number of tool results rewritten.
+    pub async fn compress_older_tool_results<F, Fut>(
+        &mut self,
+        keep_recent: usize,
+        min_chars: usize,
+        mut compress_with: F,
+    ) -> usize
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        if self.messages.len() <= keep_recent + 1 {
+            return 0;
+        }
+        // Preserve index 0 (pinned original request) and the most recent `keep_recent`.
+        let end = self.messages.len().saturating_sub(keep_recent);
+        if end <= 1 {
+            return 0;
+        }
+
+        // Collect candidates first so we can drop the exclusive borrow before any await.
+        let mut candidates: Vec<(usize, usize, String)> = Vec::new();
+        for (msg_idx, msg) in self.messages[1..end].iter().enumerate() {
+            let absolute = msg_idx + 1;
+            for (block_idx, block) in msg.content.iter().enumerate() {
+                if let ContentBlock::ToolResult { content, is_error, .. } = block {
+                    if is_error.unwrap_or(false) {
+                        continue; // keep errors verbatim
+                    }
+                    if content.len() >= min_chars {
+                        candidates.push((absolute, block_idx, content.clone()));
+                    }
+                }
+            }
+        }
+
+        let mut compressed_count = 0usize;
+        for (msg_idx, block_idx, content) in candidates {
+            let Some(compressed) = compress_with(content.clone()).await else {
+                continue;
+            };
+            if compressed.len() >= content.len() {
+                continue;
+            }
+            if let Some(msg) = self.messages.get_mut(msg_idx) {
+                if let Some(ContentBlock::ToolResult {
+                    content: slot,
+                    ..
+                }) = msg.content.get_mut(block_idx)
+                {
+                    let original_len = slot.len();
+                    *slot = compressed;
+                    compressed_count += 1;
+                    debug!(
+                        msg_idx,
+                        block_idx,
+                        original_len,
+                        compressed_len = slot.len(),
+                        "🗜️ Compressed older tool result in context"
+                    );
+                }
+            }
+        }
+
+        if compressed_count > 0 {
+            info!(
+                compressed = compressed_count,
+                estimated_tokens = self.estimate_tokens(),
+                "LLMLingua selective older-context compression complete"
+            );
+        }
+        compressed_count
+    }
+
     /// Compress old messages into a summary using LLM.
     ///
     /// Keeps the most recent `keep_recent` messages and compresses the rest.
