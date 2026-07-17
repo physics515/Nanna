@@ -46,9 +46,9 @@ impl Chunk {
         })
     }
 
-    /// Estimate token count (rough heuristic: ~4 chars per token).
+    /// Estimate token count (family-aware heuristic via nanna-llm).
     fn estimate_tokens(content: &str) -> usize {
-        (content.len() + 3) / 4
+        nanna_llm::estimate_tokens(content)
     }
 
     /// Split content on semantic boundaries (sentences, paragraphs).

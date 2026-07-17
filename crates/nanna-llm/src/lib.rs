@@ -1733,27 +1733,161 @@ impl LlmClient {
 /// long conversations by several hundred tokens.
 pub const MESSAGE_FRAMING_TOKENS: usize = 4;
 
-/// Estimate token count for a string.
+/// Approximate char/token ratios used by the heuristic estimator.
+///
+/// These replace the old blanket `len()/4`:
+/// - English/prose ASCII: ~4 chars/token
+/// - Source code / JSON / identifiers: denser ~3.5 chars/token
+/// - CJK / wide scripts: ~1 token per character
+pub const CHARS_PER_TOKEN_ENGLISH: f32 = 4.0;
+pub const CHARS_PER_TOKEN_CODE: f32 = 3.5;
+/// Wide-script (CJK etc.) density, tokens per character (not chars/token).
+pub const TOKENS_PER_WIDE_CHAR: f32 = 1.0;
+
+/// Content family used to pick a char/token multiplier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenContentFamily {
+    /// Natural-language English / Latin prose.
+    English,
+    /// Source code, JSON, XML, identifiers, punctuation-heavy text.
+    Code,
+    /// Auto-detect from content (default).
+    Auto,
+}
+
+/// Estimate token count for a string using the family-aware heuristic.
 ///
 /// Character-class aware: ASCII/Latin text tokenizes at roughly 4 chars per
-/// token, while CJK and other non-ASCII scripts are far denser. The old
-/// `bytes / 4` heuristic badly under-counted CJK — a single CJK char is 3 UTF-8
-/// bytes yet ~1 token — which caused real context overflows. We count chars by
-/// class and round the ASCII share up so short strings never estimate to zero.
+/// token (English) or ~3.5 for code-like content, while CJK and other non-ASCII
+/// scripts are far denser. The old `bytes / 4` heuristic badly under-counted CJK
+/// — a single CJK char is 3 UTF-8 bytes yet ~1 token — which caused real context
+/// overflows. Auto mode blends English/code ratios based on a simple
+/// punctuation/identifier density scan.
 #[must_use]
 pub fn estimate_tokens(text: &str) -> usize {
+    estimate_tokens_for_family(text, TokenContentFamily::Auto)
+}
+
+/// Estimate tokens with an explicit content family.
+#[must_use]
+pub fn estimate_tokens_for_family(text: &str, family: TokenContentFamily) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
     let mut ascii_chars = 0usize;
     let mut wide_chars = 0usize;
+    let mut code_markers = 0usize;
+
     for ch in text.chars() {
         if ch.is_ascii() {
             ascii_chars += 1;
+            // Common code/json/identifier density signals.
+            if matches!(
+                ch,
+                '{' | '}' | '[' | ']' | '(' | ')' | ';' | ':' | '_' | '<' | '>' | '=' | '|'
+                    | '&' | '*' | '/' | '\\' | '#' | '@' | '$' | '`'
+            ) {
+                code_markers += 1;
+            }
         } else {
             wide_chars += 1;
         }
     }
-    // ~4 ASCII chars/token; ~1 token per wide char (a conservative middle that
-    // errs high, since over-estimating input is safer than overflowing).
-    ascii_chars.div_ceil(4) + wide_chars
+
+    let ratio = match family {
+        TokenContentFamily::English => CHARS_PER_TOKEN_ENGLISH,
+        TokenContentFamily::Code => CHARS_PER_TOKEN_CODE,
+        TokenContentFamily::Auto => {
+            // If ≥8% of ASCII chars are code-ish punctuation, treat as code.
+            if ascii_chars > 0 && (code_markers.saturating_mul(100) / ascii_chars) >= 8 {
+                CHARS_PER_TOKEN_CODE
+            } else {
+                CHARS_PER_TOKEN_ENGLISH
+            }
+        }
+    };
+
+    // Round the ASCII share up so short strings never estimate to zero.
+    let ascii_tokens = if ascii_chars == 0 {
+        0
+    } else {
+        // ceil(ascii_chars / ratio) without float hacks in the hot edge cases.
+        ((ascii_chars as f32) / ratio).ceil() as usize
+    };
+    let wide_tokens = (wide_chars as f32 * TOKENS_PER_WIDE_CHAR).ceil() as usize;
+    // At least 1 token for non-empty input.
+    (ascii_tokens + wide_tokens).max(1)
+}
+
+/// Exact OpenAI BPE tokenization via `tiktoken-rs` when the `tiktoken` feature
+/// is enabled. Falls back to the heuristic when tokenization fails or the
+/// feature is off.
+///
+/// - prefers `o200k_base` (GPT-4o / GPT-5 / o-series) because it is the modern
+///   default encoding;
+/// - falls back to `cl100k_base` (GPT-4 / GPT-3.5) if o200k cannot init.
+#[must_use]
+pub fn estimate_tokens_exact(text: &str) -> usize {
+    #[cfg(feature = "tiktoken")]
+    {
+        if let Some(n) = tiktoken_count(text) {
+            return n;
+        }
+    }
+    estimate_tokens(text)
+}
+
+/// Exact count with an explicit model hint (e.g. `"gpt-4o"`, `"gpt-4"`,
+/// `"o3-mini"`). When the feature is off, or the model is unknown, falls back
+/// to [`estimate_tokens`].
+#[must_use]
+pub fn estimate_tokens_for_model(text: &str, model: &str) -> usize {
+    #[cfg(feature = "tiktoken")]
+    {
+        if let Some(n) = tiktoken_count_for_model(text, model) {
+            return n;
+        }
+    }
+    let _ = model;
+    estimate_tokens(text)
+}
+
+#[cfg(feature = "tiktoken")]
+fn tiktoken_count(text: &str) -> Option<usize> {
+    // Prefer modern o200k (GPT-4o / GPT-5 / o*), then cl100k.
+    if let Ok(bpe) = tiktoken_rs::o200k_base() {
+        return Some(bpe.encode_with_special_tokens(text).len());
+    }
+    if let Ok(bpe) = tiktoken_rs::cl100k_base() {
+        return Some(bpe.encode_with_special_tokens(text).len());
+    }
+    None
+}
+
+#[cfg(feature = "tiktoken")]
+fn tiktoken_count_for_model(text: &str, model: &str) -> Option<usize> {
+    // bpe_for_model is the preferred API in 0.12; falls through on unknown names.
+    if let Ok(bpe) = tiktoken_rs::bpe_for_model(model) {
+        return Some(bpe.encode_with_special_tokens(text).len());
+    }
+    // Heuristic family pick from the model name string.
+    let lower = model.to_ascii_lowercase();
+    let o200k = lower.contains("gpt-4o")
+        || lower.contains("gpt-5")
+        || lower.contains("gpt-4.1")
+        || lower.starts_with('o')
+        || lower.contains("codex")
+        || lower.contains("chatgpt");
+    if o200k {
+        if let Ok(bpe) = tiktoken_rs::o200k_base() {
+            return Some(bpe.encode_with_special_tokens(text).len());
+        }
+    }
+    if let Ok(bpe) = tiktoken_rs::cl100k_base() {
+        return Some(bpe.encode_with_special_tokens(text).len());
+    }
+    None
 }
 
 /// Estimate total tokens for a completion request
@@ -1773,7 +1907,11 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
             match block {
                 ContentBlock::Text { text } => total += estimate_tokens(text),
                 ContentBlock::ToolUse { input, .. } => {
-                    total += estimate_tokens(&input.to_string());
+                    // Tool inputs are code/JSON-shaped.
+                    total += estimate_tokens_for_family(
+                        &input.to_string(),
+                        TokenContentFamily::Code,
+                    );
                 }
                 ContentBlock::ToolResult { content, .. } => {
                     total += estimate_tokens(content);
@@ -1791,7 +1929,7 @@ pub fn estimate_request_tokens(request: &CompletionRequest) -> usize {
 
     // Tools definitions
     for tool in &request.tools {
-        total += estimate_tokens(&tool.to_string());
+        total += estimate_tokens_for_family(&tool.to_string(), TokenContentFamily::Code);
     }
 
     total
@@ -4040,7 +4178,7 @@ mod tests {
     #[test]
     fn test_estimate_tokens_ascii_and_cjk() {
         assert_eq!(estimate_tokens(""), 0);
-        // ASCII: ~4 chars/token, rounded up so short strings aren't zero.
+        // ASCII English: ~4 chars/token, rounded up so short strings aren't zero.
         assert_eq!(estimate_tokens("hi"), 1);
         assert_eq!(estimate_tokens(&"a".repeat(8)), 2);
         // CJK is denser: 4 chars ~ 4 tokens (byte-len/4 would wrongly give 3).
@@ -4052,6 +4190,26 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_tokens_code_vs_english_ratio() {
+        // Pure prose ASCII letter run → English ratio (4 chars/token).
+        let prose = "abcdefgh"; // 8 chars
+        assert_eq!(
+            estimate_tokens_for_family(prose, TokenContentFamily::English),
+            2
+        );
+        // Same length treated as code → denser 3.5 chars/token → ceil(8/3.5)=3.
+        assert_eq!(
+            estimate_tokens_for_family(prose, TokenContentFamily::Code),
+            3
+        );
+        // Auto-detect: punctuation-heavy JSON should pick code path.
+        let jsonish = r#"{"a":1,"b":2,"c":3,"d":4}"#; // lots of braces/colons
+        let auto = estimate_tokens_for_family(jsonish, TokenContentFamily::Auto);
+        let as_code = estimate_tokens_for_family(jsonish, TokenContentFamily::Code);
+        assert_eq!(auto, as_code);
+    }
+
+    #[test]
     fn test_estimate_request_tokens_adds_message_framing() {
         // Two 8-char ASCII messages: 2 tokens content each + framing per message.
         let request = CompletionRequest::default()
@@ -4059,6 +4217,18 @@ mod tests {
             .with_message(Message::user("bbbbbbbb"));
         let expected = 2 * (2 + MESSAGE_FRAMING_TOKENS);
         assert_eq!(estimate_request_tokens(&request), expected);
+    }
+
+    #[test]
+    fn test_estimate_tokens_exact_smoke() {
+        // Empty always 0; non-empty path must agree with some positive count
+        // (exact under the tiktoken feature, heuristic otherwise).
+        assert_eq!(estimate_tokens_exact(""), 0);
+        let n = estimate_tokens_exact("hello world");
+        assert!(n >= 1, "expected at least 1 token, got {n}");
+        // Model-hinted path should also return a positive count.
+        let m = estimate_tokens_for_model("hello world", "gpt-4o");
+        assert!(m >= 1, "expected at least 1 token for gpt-4o, got {m}");
     }
 
     #[test]
