@@ -620,23 +620,34 @@ mod tests {
     #[tokio::test]
     async fn dreaming_shrinks_store_while_holding_recall() {
         let dim = 48;
+        // Under the FSRS-6 decay exponent (w20 = 0.0658, now the default) memories
+        // decay slowly, so a corpus must be aged well past a year for its weight to
+        // fall into a compressible band; importance is held uniform so no topic sits
+        // in the never-consolidated high-weight tail.
         let corpus = RetentionCorpus::generate(
             99,
             CorpusParams {
                 topic_count: 6,
                 per_topic: 10,
                 dimension: dim,
-                ..CorpusParams::default()
+                age_days: 1000.0,
+                era_gap_days: 60.0,
+                stability_days: 1.0,
+                importance: Some(1.0),
             },
         );
         let mut service = service_for(dim);
         service.set_embed_fn(corpus.topic_embed_fn());
         corpus.load_into(&service).await.unwrap();
 
-        // A low floor so the 60-memory store actually consolidates.
+        // A low floor so the 60-memory store actually consolidates. The raised
+        // cluster threshold keeps consolidation to genuinely-similar memories
+        // (within-topic composite score ~1.0) and refuses borderline cross-topic
+        // pairs (~0.45) that would otherwise over-merge and drop a topic.
         let consolidation = ConsolidationConfig {
             min_remaining_memories: 6,
             max_compression_ratio: 0.9,
+            cluster_threshold: 0.65,
             ..ConsolidationConfig::default()
         };
 
