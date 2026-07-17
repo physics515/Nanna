@@ -89,11 +89,27 @@ pub async fn create_user_tool(
         None,
     ).await?;
 
-    // Register it with the tool registry
-    if let Ok(tool_impl) = state_guard.user_tools.create_tool_impl(&meta) {
-        state_guard.tools.register_boxed(tool_impl).await;
-        info!("Registered new user tool: {}", name);
-    }
+    // Register it with the tool registry.
+    //
+    // A failure here used to be swallowed by `if let Ok(..)`: the tool was written
+    // to disk and reported created, but never registered — so it showed up in the
+    // UI and silently was not callable until the next restart. Roll the creation
+    // back instead, so disk and registry cannot disagree, and report the real
+    // error. `create_tool_impl` is infallible today; this is about the swallow not
+    // outliving that.
+    let tool_impl = match state_guard.user_tools.create_tool_impl(&meta) {
+        Ok(tool_impl) => tool_impl,
+        Err(e) => {
+            // Best-effort: if the rollback also fails the tool is left on disk and
+            // will register on the next start, so surface the original error.
+            if let Err(cleanup_err) = state_guard.user_tools.delete_tool(&name).await {
+                warn!("Failed to roll back tool '{name}' after a registration error: {cleanup_err}");
+            }
+            return Err(format!("Tool '{name}' could not be activated: {e}"));
+        }
+    };
+    state_guard.tools.register_boxed(tool_impl).await;
+    info!("Registered new user tool: {}", name);
 
     Ok(meta)
 }
