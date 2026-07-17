@@ -154,7 +154,11 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 
 - [ ] `nanna-bench` crate (criterion) — unify the existing `nanna-gpu` benches
 - [ ] Define the **agent-eval suite** (the task-success denominator)
-- [ ] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
+- [~] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
+      *(2026-07-17)* **`bench/BASELINE.md` created** — the committed diff-target the routine was missing.
+      First rows seeded from the Suite 3 (dreaming/compression) retention harness: consolidation
+      compression 0.90 @ recall retention 1.000, plus the w20 aged-recall correctness fixture (6/6 vs 0/6).
+      Other suites (inference/vector-search/agent-loop/guardrails/efficiency) are listed as not-yet-baselined.
 - [ ] CI gate — fail a PR that regresses a budget past threshold
 - [~] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
       *(2026-07-17)* **Memory retention harness shipped** (`nanna-memory::retention`) — the instrument the FSRS
