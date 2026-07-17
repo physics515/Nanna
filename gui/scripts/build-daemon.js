@@ -47,8 +47,32 @@ const sidecarName = isWindows
 const isDebug = process.argv.includes('--debug');
 const profile = isDebug ? 'debug' : 'release';
 
+/**
+ * Ask cargo where it actually puts build artifacts.
+ *
+ * `<root>/target` is only the default: CARGO_TARGET_DIR or a `target-dir` in any
+ * .cargo/config.toml (including the user's global one) moves it elsewhere, and
+ * hardcoding the default makes `cargo tauri build` fail on those machines with a
+ * confusing ENOENT on copyfile after a successful compile.
+ */
+function resolveTargetDir() {
+  try {
+    const meta = execSync('cargo metadata --format-version 1 --no-deps', {
+      cwd: rootDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const dir = JSON.parse(meta).target_directory;
+    if (dir) return dir;
+  } catch {
+    // Fall through to the default layout below.
+  }
+  return join(rootDir, 'target');
+}
+
 // Source and destination paths
-const sourcePath = join(rootDir, 'target', profile, binaryName);
+const targetDir = resolveTargetDir();
+const sourcePath = join(targetDir, profile, binaryName);
 const destPath = join(binariesDir, sidecarName);
 
 console.log('Building nanna-daemon...');
@@ -56,6 +80,7 @@ console.log(`  Platform: ${process.platform}`);
 console.log(`  Target: ${targetTriple}`);
 console.log(`  Profile: ${profile}`);
 console.log(`  Root dir: ${rootDir}`);
+console.log(`  Target dir: ${targetDir}`);
 
 try {
   // Build the daemon

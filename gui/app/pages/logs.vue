@@ -4,8 +4,8 @@
     <div class="relative z-10 px-4 sm:px-6 py-4 border-b border-white/[0.04]">
       <div class="flex items-center justify-between">
         <div>
-          <h1 class="text-xl sm:text-2xl font-bold text-white/90">Daemon Logs</h1>
-          <p class="text-xs sm:text-sm text-white/30 mt-0.5">Real-time daemon output and diagnostics</p>
+          <h1 class="text-xl sm:text-2xl font-bold text-white/90">Logs</h1>
+          <p class="text-xs sm:text-sm text-white/30 mt-0.5">Real-time output and diagnostics — embedded backend and daemon</p>
         </div>
         <div class="flex items-center gap-2">
           <!-- Auto-scroll button -->
@@ -33,10 +33,11 @@
       <div class="px-4 sm:px-6 py-2 border-b border-white/[0.04] text-xs text-white/30 flex items-center justify-between">
         <div class="flex items-center gap-4">
           <span>{{ logs.length }} lines</span>
-          <span v-if="backendStatus">
-            <span :class="backendStatus.connected ? 'text-emerald-400/60' : 'text-amber-400/60'">
-              {{ backendStatus.connected ? '\u25cf Connected' : '\u25cb Disconnected' }}
-            </span>
+          <!-- Which sources are feeding this view. The GUI always logs itself, so
+               'embedded' is always live; 'daemon' only when one is attached. -->
+          <span class="text-cyan-300/60">&#x25cf; embedded</span>
+          <span :class="daemonAttached ? 'text-violet-300/60' : 'text-white/25'">
+            {{ daemonAttached ? '\u25cf daemon' : '\u25cb daemon (not attached)' }}
           </span>
           <span v-if="lastUpdate">{{ formatTime(lastUpdate) }}</span>
         </div>
@@ -54,7 +55,7 @@
         <div v-if="logs.length === 0" class="flex items-center justify-center min-h-[300px]">
           <div class="text-center">
             <div class="text-4xl mb-3">&#x1f4cb;</div>
-            <p class="text-white/30">No logs yet. Daemon logs will appear here.</p>
+            <p class="text-white/30">No logs yet. Embedded and daemon logs will appear here.</p>
           </div>
         </div>
 
@@ -71,6 +72,15 @@
           ]"
         >
           <span class="text-white/20 text-xs select-none">{{ log.timestamp }}</span>
+          <span :class="[
+            'inline-block w-[4.5rem] text-center text-[10px] font-bold uppercase tracking-wide',
+            'ml-2 px-1 py-px rounded border select-none',
+            sourceOf(log) === 'daemon'
+              ? 'text-violet-300/70 border-violet-400/20 bg-violet-400/[0.06]'
+              : 'text-cyan-300/70 border-cyan-400/20 bg-cyan-400/[0.06]'
+          ]">
+            {{ sourceOf(log) }}
+          </span>
           <span :class="[
             'inline-block w-8 text-xs font-bold ml-2 select-none',
             log.level === 'error' ? 'text-red-400/80' :
@@ -89,17 +99,25 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ChevronDown, Trash2, Circle } from 'lucide-vue-next'
+
+type LogSource = 'embedded' | 'daemon'
 
 interface LogEntry {
   timestamp: string
   level: 'error' | 'warn' | 'info' | 'debug'
   target: string
   message: string
+  // Absent only if an older daemon omitted it; rendered as 'daemon' in that case.
+  source?: LogSource
 }
+
+/** How often the view re-reads the buffers while Live. */
+const POLL_INTERVAL_MS = 1000
+/** Matches MAX_LOG_LINES in the Rust command — asking for more returns no more. */
+const LOG_LINE_LIMIT = 2000
 
 const logs = ref<LogEntry[]>([])
 const logsContainer = ref<HTMLElement | null>(null)
@@ -108,44 +126,54 @@ const liveMode = ref(true)
 const isLoading = ref(false)
 const lastUpdate = ref<Date | null>(null)
 
-let unlistenLogs: UnlistenFn | null = null
+// Lines at or before this timestamp were cleared by the user and must not come
+// back on the next poll. Clearing hides history; it does not stop the tail.
+const clearedBefore = ref<string | null>(null)
+
+let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const { status: backendStatus } = useBackend()
+
+// A daemon only contributes lines when the GUI is actually attached to one.
+const daemonAttached = computed(() => backendStatus.value?.connected === true)
+
+function sourceOf(log: LogEntry): LogSource {
+  return log.source ?? 'daemon'
+}
+
+async function refreshLogs() {
+  try {
+    const fetched = await invoke<LogEntry[]>('get_daemon_logs', { limit: LOG_LINE_LIMIT })
+    const cutoff = clearedBefore.value
+    logs.value = cutoff ? fetched.filter(l => l.timestamp > cutoff) : fetched
+    lastUpdate.value = new Date()
+  } catch (e) {
+    console.error('Failed to load logs:', e)
+  }
+}
 
 onMounted(async () => {
   isLoading.value = true
   try {
-    const initialLogs = await invoke<LogEntry[]>('get_daemon_logs', { limit: 1000 })
-    logs.value = initialLogs
-    lastUpdate.value = new Date()
+    await refreshLogs()
     await nextTick()
     scrollToBottom()
-  } catch (e) {
-    console.error('Failed to load logs:', e)
   } finally {
     isLoading.value = false
   }
 
-  unlistenLogs = await listen<LogEntry>('daemon-log', (event) => {
-    if (liveMode.value) {
-      logs.value.push(event.payload)
-      lastUpdate.value = new Date()
-
-      if (logs.value.length > 10000) {
-        logs.value = logs.value.slice(-10000)
-      }
-
-      if (autoScroll.value) {
-        nextTick(() => scrollToBottom())
-      }
-    }
-  })
+  // The backend has no log push channel, so Live is a poll of the merged
+  // embedded + daemon buffers rather than a subscription.
+  pollTimer = setInterval(async () => {
+    if (!liveMode.value) return
+    const wasAtBottom = autoScroll.value
+    await refreshLogs()
+    if (wasAtBottom) nextTick(() => scrollToBottom())
+  }, POLL_INTERVAL_MS)
 })
 
 onUnmounted(() => {
-  if (unlistenLogs) {
-    unlistenLogs()
-  }
+  if (pollTimer) clearInterval(pollTimer)
 })
 
 watch(autoScroll, async () => {
@@ -170,6 +198,10 @@ function toggleLiveMode() {
 }
 
 function clearLogs() {
+  // Remember how far we cleared, otherwise the next poll re-fetches the same
+  // history straight back into the view.
+  const newest = logs.value[logs.value.length - 1]
+  if (newest) clearedBefore.value = newest.timestamp
   logs.value = []
 }
 

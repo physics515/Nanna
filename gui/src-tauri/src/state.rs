@@ -160,6 +160,10 @@ pub struct AppState {
     /// In-process agent service for embedded mode (the daemon's `AgentService`
     /// running inside the GUI). `None` in daemon mode — the daemon runs its own.
     pub(crate) agent_service: Option<Arc<nanna_daemon::agent_service::AgentService>>,
+    /// Recent log lines emitted by *this* process, captured by the tracing layer
+    /// installed in `run()`. Populated in both modes: even when attached to a
+    /// daemon the GUI still emits its own lines, and the Logs page shows both.
+    pub(crate) log_buffer: LogBuffer,
 }
 
 impl AppState {

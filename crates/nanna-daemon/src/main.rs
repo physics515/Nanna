@@ -161,7 +161,8 @@ fn main() {
     }
     
     // Setup logging for non-service modes with log buffer for GUI
-    let log_buffer = nanna_daemon::log_buffer::LogBuffer::new(5000);
+    let log_buffer =
+        nanna_daemon::log_buffer::LogBuffer::new(5000, nanna_daemon::log_buffer::LogSource::Daemon);
     let log_layer = nanna_daemon::log_buffer::LogBufferLayer::new(log_buffer.clone());
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

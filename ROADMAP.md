@@ -298,6 +298,34 @@ management, tabbed settings + full config migration + import/export, tool-call v
 memory browser, channel onboarding wizards (all five), model-stats + tool-stats dashboards, system
 tray, native notifications, UI component library, mobile-responsive layouts. **Shipped.**
 Open polish: mobile testing on real devices (Tauri Android/iOS), per-tool drill-down finish, latency sparklines.
+- [x] **Logs page shows embedded logs, tagged by source.** *(2026-07-16, user-reported: "no logs in
+      embedded mode")* The page was **structurally empty in embedded mode**, not merely unpopulated:
+      `get_daemon_logs` hard-returned `Ok(vec![])` whenever `!is_daemon_mode()` (`commands/system.rs`),
+      and the GUI installed a bare `tracing_subscriber::fmt()` to **stdout with no capture** — so the
+      lines it would have shown never existed. Fixed end-to-end: (1) `run()` now composes
+      `registry().with(EnvFilter).with(fmt::layer()).with(LogBufferLayer)` over a 5000-entry
+      `LogBuffer` (matches the daemon's cap; ~1 MB) held in `AppState`; (2) `LogEntry` gained a
+      `source: LogSource` (`embedded` | `daemon`) stamped by the buffer that captured it — the tag lives
+      on the `LogBuffer`, so a mixed-origin buffer is unrepresentable; (3) `get_daemon_logs` **merges**
+      both origins (the GUI emits its own lines even while attached to a daemon, so the two are
+      genuinely simultaneous), sorts by timestamp, and bounds the result at `MAX_LOG_LINES` (2000);
+      (4) the page renders a per-line source badge, and the header/status now name both sources instead
+      of a bare "Daemon Logs / Disconnected" that read as broken next to a full log view.
+      `#[serde(default)]` on `source` keeps a newer GUI readable against an older daemon (untagged →
+      `daemon`, which is where it came from). Also **deleted `gui/src-tauri/src/logs.rs`** — a 62-line
+      orphan module with a duplicate `LogEntry`/`LogBuffer` and a second stubbed `get_daemon_logs`
+      returning `Ok(vec![])`, never registered and referenced by nothing (a decoy for exactly this bug).
+      11 tests (6 buffer incl. wire round-trip + legacy-untagged default; 5 merge incl. interleaving,
+      per-line tags, newest-kept-at-limit, zero-limit).
+- [x] **"Live" on the Logs page was decorative.** *(2026-07-16)* The page listened for a `daemon-log`
+      Tauri event that **has no emitter anywhere in the codebase** — so it was a frozen snapshot from
+      page-load in *both* modes, despite the "Real-time daemon output" subtitle and a lit Live button.
+      Replaced the dead listener with a 1 s poll of the merged view while Live is on. Clear now records
+      a `clearedBefore` watermark so cleared history does not reappear on the next poll.
+      - [ ] Follow-up: polling re-serialises up to 2000 lines/s. A push channel (daemon-side
+            `SystemAction::Logs` subscribe + a real `daemon-log` emit) or a monotonic per-entry sequence
+            number for incremental `since`-cursor fetches would be strictly better; poll was chosen to
+            avoid an IPC protocol change in a user-reported bugfix.
 
 ### P5 — Agent Swarm & Context Management ✅
 Swarm coordinator (parallel decomposition, dynamic sub-agent spawning, result aggregation, critical-path
@@ -684,6 +712,27 @@ routine should drain first.**
       **This also unblocks unattended real-binary daemon verification**, which had been forcing runs to fall
       back to unit tests. Not yet exercised end-to-end: the all-providers-unreachable degrade path (needs a
       host with no Ollama *and* no key) — covered by unit test rather than a live boot.
+      - [ ] **The GUI-embedded path still has the same bug.** `gui/src-tauri/src/lib.rs:217` and `:297` each
+            build their own embedding client and `?` on `Failed to discover embedding dimension`, exactly as
+            the daemon did before this fix. Apply the same treatment (probe through the shared router;
+            degrade instead of fail). Almost certainly related to the two embedded-mode reports below.
+- [ ] **`recall` is broken in embedded mode: "IO error: No embedding function configured".**
+      *(user-reported 2026-07-16, with a live transcript)* The agent's `recall` tool fails outright in the
+      GUI's embedded mode, so memory search is unavailable exactly where local-first is supposed to work.
+      Same root theme as the daemon's boot failure (`OPENROUTER_API_KEY is required for embedding
+      discovery`): embeddings are wired to a cloud provider and there is **no local/offline embedder**, so
+      with no key configured the memory system is not degraded but dead. Both should resolve together —
+      P12 "Local embeddings in Burn"/Mummu is the real fix; until then `recall` must fail *soft* with an
+      actionable message ("no embedding provider configured — set one in Settings") rather than an
+      `IO error` surfaced to the model, which cannot act on it.
+- [ ] **Agent reports only `remember`/`recall`/`reflect` are available in embedded mode.**
+      *(user-reported 2026-07-16)* In a live embedded session the agent stated it had no filesystem,
+      shell, git, or network tools and therefore could not do the work. Expected: the two-tier design
+      sends 4 core tools (incl. `discover_tools`) and the model activates the rest on demand — so either
+      `discover_tools` is not being registered/offered on the embedded path, or the model is not being
+      told it can activate more. Verify the embedded tool registry actually carries `discover_tools`
+      (it is registered manually with a `Weak<ToolRegistry>` per entry point — an easy path to miss)
+      and that activation round-trips in embedded mode.
 - [x] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11; root-caused
       + fixed 2026-07-16)* **The 2026-07-11 diagnosis was wrong on both the culprit and the blast radius.**
       It is **not** deno/V8: `cargo test -p nanna-scripting --features deno` passes 20/20 clean. The
