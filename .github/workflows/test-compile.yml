@@ -28,7 +28,11 @@ jobs:
     # `windows-service` integration). A Linux runner would not exercise the
     # `#[cfg(windows)]` code, which is where the service layer lives.
     runs-on: windows-latest
-    timeout-minutes: 60
+    # Measured: 16m12s on the first run, with a completely cold cache
+    # (run 29557077493). 30 gives ~2x headroom for a dependency bump that
+    # invalidates everything, while still killing a hang in reasonable time.
+    # Re-measure if the graph grows; do not raise it to paper over a hang.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4

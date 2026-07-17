@@ -929,8 +929,14 @@ routine should drain first.**
       `#[cfg(windows)]` service layer. `nanna-gui` is excluded because its build.rs needs the Tauri sidecar +
       built frontend, neither committed — that is a packaging job, not a smoke check (see the build-env note
       under *Immediate next actions* #2). Caches via `Swatinem/rust-cache`; 60-min timeout.
-      - [ ] Confirm the first run is green and tune the timeout from its real cold-cache duration — CI YAML
-            cannot be verified locally, so the PR that adds it is its own first test.
+      - [x] ~~Confirm the first run is green and tune the timeout from its real cold-cache duration — CI YAML
+            cannot be verified locally, so the PR that adds it is its own first test.~~ **(2026-07-17)**
+            First run **passed** ([29557077493](https://github.com/physics515/Nanna/actions/runs/29557077493)):
+            **16m12s with a completely cold cache**, so the whole non-GUI workspace compiles clean on a stock
+            `windows-latest` runner — no MSVC/clang surprises, and the pinned `aegis`/`turso` hold there.
+            Timeout tuned **60 → 30 min** from that measurement (~2x headroom for a dep bump that invalidates
+            the cache); the original 60 was a guess. Warm-cache runs should be far shorter — re-measure before
+            raising it, and never raise it to paper over a hang.
 
 **Architecture debt:**
 - [x] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
