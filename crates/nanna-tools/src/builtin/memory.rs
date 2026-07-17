@@ -57,6 +57,21 @@ impl MemoryStorage for MemoryServiceStorage {
 /// Storage handle for memory tools
 pub type StorageHandle = Arc<dyn MemoryStorage + Send + Sync>;
 
+/// Leading text of `MemoryError::NoEmbeddingProvider`'s message (nanna-memory).
+///
+/// Errors cross the `MemoryStorage` trait boundary as plain strings, so the
+/// tools cannot match on the variant — they match on this prefix instead. The
+/// full message is pinned by tests in nanna-memory to never regress, so the
+/// prefix is stable.
+pub const NO_EMBEDDING_PROVIDER_MARKER: &str = "no embedding provider configured";
+
+/// True when a memory-storage error string means "no embedding provider is
+/// wired up" — a legible, user-fixable condition, not a tool failure.
+#[must_use]
+pub fn is_no_embedding_provider(err: &str) -> bool {
+    err.starts_with(NO_EMBEDDING_PROVIDER_MARKER)
+}
+
 /// Trait for memory storage operations (allows mocking/different backends)
 #[async_trait]
 pub trait MemoryStorage: Send + Sync {
@@ -253,11 +268,18 @@ impl Tool for RecallTool {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(5) as usize;
 
-        let results = self
-            .storage
-            .search(query, limit)
-            .await
-            .map_err(ToolError::ExecutionFailed)?;
+        let results = match self.storage.search(query, limit).await {
+            Ok(results) => results,
+            Err(e) if is_no_embedding_provider(&e) => {
+                // Memory is unconfigured, not failed: return a normal result so
+                // the model reads it as "memory search unavailable" and moves on
+                // instead of seeing a failed tool call it cannot act on.
+                return Ok(ToolResult::success(format!(
+                    "Memory search is unavailable: {e}"
+                )));
+            }
+            Err(e) => return Err(ToolError::ExecutionFailed(e)),
+        };
 
         if results.is_empty() {
             Ok(ToolResult::success("No memories found matching query."))
@@ -331,5 +353,116 @@ impl Tool for ReflectTool {
             category,
             truncate(observation, 100)
         )))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Storage that always fails the way nanna-memory does with no embedder wired:
+    /// `MemoryError::NoEmbeddingProvider`'s display text, verbatim.
+    struct UnconfiguredStorage;
+
+    #[async_trait]
+    impl MemoryStorage for UnconfiguredStorage {
+        async fn store(&self, _content: &str, _tags: &[String]) -> Result<String, String> {
+            Err(format!(
+                "{NO_EMBEDDING_PROVIDER_MARKER} — set one in Settings, or run a local Ollama with an embedding model pulled, then memory search will work"
+            ))
+        }
+
+        async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<MemoryResult>, String> {
+            Err(format!(
+                "{NO_EMBEDDING_PROVIDER_MARKER} — set one in Settings, or run a local Ollama with an embedding model pulled, then memory search will work"
+            ))
+        }
+
+        async fn delete(&self, _id: &str) -> Result<bool, String> {
+            Err(NO_EMBEDDING_PROVIDER_MARKER.to_string())
+        }
+
+        async fn list(&self, _limit: usize) -> Result<Vec<MemoryResult>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Storage whose search fails with a real, unrelated error.
+    struct BrokenStorage;
+
+    #[async_trait]
+    impl MemoryStorage for BrokenStorage {
+        async fn store(&self, _content: &str, _tags: &[String]) -> Result<String, String> {
+            Err("disk on fire".to_string())
+        }
+
+        async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<MemoryResult>, String> {
+            Err("vector index corrupted".to_string())
+        }
+
+        async fn delete(&self, _id: &str) -> Result<bool, String> {
+            Err("disk on fire".to_string())
+        }
+
+        async fn list(&self, _limit: usize) -> Result<Vec<MemoryResult>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn params(query: &str) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("query".to_string(), Value::String(query.to_string()));
+        m
+    }
+
+    #[tokio::test]
+    async fn recall_soft_degrades_when_no_embedding_provider() {
+        let tool = RecallTool::new(Arc::new(UnconfiguredStorage));
+        let result = tool
+            .execute(params("anything"))
+            .await
+            .expect("unconfigured memory must not be a tool error");
+
+        assert!(
+            result.success,
+            "soft-degraded recall must report success, got: {result:?}"
+        );
+        assert!(
+            result.content.contains(NO_EMBEDDING_PROVIDER_MARKER),
+            "soft-degraded recall must carry the actionable text, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("unavailable"),
+            "the model should read this as memory being unavailable, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_real_errors_still_fail() {
+        let tool = RecallTool::new(Arc::new(BrokenStorage));
+        let err = tool
+            .execute(params("anything"))
+            .await
+            .expect_err("genuine storage failures must remain tool errors");
+
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(_)),
+            "expected ExecutionFailed, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn marker_matches_nanna_memory_message_prefix() {
+        // nanna-memory pins the full NoEmbeddingProvider message with its own tests;
+        // here we pin the prefix the tools actually match on.
+        assert_eq!(NO_EMBEDDING_PROVIDER_MARKER, "no embedding provider configured");
+        assert!(is_no_embedding_provider(
+            "no embedding provider configured — set one in Settings, or run a local Ollama with an embedding model pulled, then memory search will work"
+        ));
+        assert!(!is_no_embedding_provider("IO error: No embedding function configured"));
+        assert!(!is_no_embedding_provider("vector index corrupted"));
     }
 }

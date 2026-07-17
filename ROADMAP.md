@@ -816,9 +816,19 @@ routine should drain first.**
             same way, not just `recall`. 2 tests pin the variant *and* that the message never regresses to
             `IO error`. Not a cloud-key workaround: with no provider, memory still cannot embed — the failure
             is now legible instead of misleading.
-      - [ ] Remaining: make the `recall` **tool** degrade to a normal (non-error) result carrying this text, so
-            the model treats it as "memory is unconfigured" rather than a failed tool call; and the real fix,
-            a local embedder (P12 / Mummu).
+      - [x] The tool-degradation half is fixed (2026-07-17). Errors cross the `MemoryStorage` trait boundary
+            as plain strings, so `RecallTool` could not match on the variant — added
+            `NO_EMBEDDING_PROVIDER_MARKER` + `is_no_embedding_provider()` in
+            `crates/nanna-tools/src/builtin/memory.rs` (the marker is the message prefix the nanna-memory
+            tests already pin, so it cannot drift). `recall` now returns a normal success result —
+            "Memory search is unavailable: no embedding provider configured — set one in Settings, ..."
+            — instead of `ToolError::ExecutionFailed`, which the loop surfaced as `is_error: true`. A
+            failed tool call invites retries or "memory is broken"; a normal result is read as state,
+            and the model moves on. Covers both embedded GUI and daemon paths (both adapters funnel
+            through the same `RecallTool`). Writes (`remember`/`reflect`) still hard-error on the same
+            condition by design: the model must know a store did not happen. 3 tests pin the soft
+            degrade, that genuine storage failures still fail, and the marker prefix itself.
+      - [ ] Remaining: the real fix — a local embedder (P12 / Mummu).
 - [ ] **Agent reports only `remember`/`recall`/`reflect` are available in embedded mode.**
       **ROOT-CAUSED 2026-07-17 — the report is accurate and the cause is worse than "discover_tools is
       missing": the GUI never loads the default skills at all.** `grep load_skills gui/src-tauri/src/`
@@ -966,6 +976,8 @@ routine should drain first.**
             Timeout tuned **60 → 30 min** from that measurement (~2x headroom for a dep bump that invalidates
             the cache); the original 60 was a guess. Warm-cache runs should be far shorter — re-measure before
             raising it, and never raise it to paper over a hang.
+
+- [ ] **Scripted `exec` tool ignores its `timeout` parameter and orphans the child process on engine timeout** (found while working inside nanna, 2026-07-17). Three layers disagree about how long a command may run: the model passes `timeout: 600` and the bridge (`NannaBridge::exec_with_timeout`) would honor it, but the Boa engine wraps the whole script in `tokio::time::timeout(tool.timeout_ms)` with a fixed 30_000 ms default (`ScriptedTool::new`/`from_file`), and the exec skill's manifest sets no override — so every scripted `exec` dies at exactly 30 s with "Script execution failed: Timeout after 30000ms" no matter what the model asked for. Worse, `nanna_exec` runs the bridge on a detached `std::thread`, so when the engine timeout fires the script is abandoned but the bridge thread *and its child process keep running*: repeated `cargo test` calls each orphaned a cargo.exe, all holding the workspace build lock and deadlocking each other until killed by hand. (The bridge's own 120 s auto-detect for cargo/git/npm is equally unreachable — it never gets 120 s because the engine kills it at 30 s.) Fix direction: the scripted engine's timeout should be at least the requested exec timeout (plumb `input.timeout` up, or set the exec skill's manifest timeout to a real ceiling and let the bridge own the real timeout), and engine-timeout should cancel/kill the child process tree rather than detach it.
 
 **Architecture debt:**
 - [x] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
