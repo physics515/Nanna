@@ -1,0 +1,57 @@
+# Smoke check: the test code must still compile.
+#
+# The failure this exists to catch (2026-07-06): the full-workspace `cargo test`
+# did not compile at all — missing `tempfile` dev-deps, a stale `ChannelId`
+# import, test initializers referencing fields that had been removed, and a
+# `DaemonConfig` field omission that was a *production* build break. None of it
+# was noticed, because nothing ran the tests on a schedule anyone watched.
+#
+# `--no-run` builds every test target without executing it: it catches drift
+# cheaply and cannot fail for flaky-runtime reasons, which is what makes it a
+# smoke check rather than a test suite.
+name: test-compile
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A newer push to the same branch makes the older run irrelevant.
+concurrency:
+  group: test-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-tests:
+    # Windows on purpose: it is the platform this workspace is developed and
+    # pinned against (MSVC toolchain, `aegis` on the pure-Rust path, the
+    # `windows-service` integration). A Linux runner would not exercise the
+    # `#[cfg(windows)]` code, which is where the service layer lives.
+    runs-on: windows-latest
+    # Measured: 16m12s on the first run, with a completely cold cache
+    # (run 29557077493). 30 gives ~2x headroom for a dependency bump that
+    # invalidates everything, while still killing a hang in reasonable time.
+    # Re-measure if the graph grows; do not raise it to paper over a hang.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No rust-toolchain.toml in the repo; the workspace uses edition 2024 and
+      # `-Z` flags locally, so nightly is the honest choice here.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinguish this job's cache from any future workflow's.
+          key: test-compile
+
+      # `nanna-gui` is excluded deliberately, not out of convenience: its
+      # build.rs needs two artifacts the repo does not commit — the Tauri sidecar
+      # binary (`gui/src-tauri/binaries/nanna-daemon-<triple>.exe`) and the built
+      # frontend at `gui/.output/public`. Building it here would mean running the
+      # full pnpm + daemon build, which is a packaging job, not a smoke check.
+      - name: Compile all test targets
+        run: cargo test --no-run --workspace --exclude nanna-gui --locked

@@ -46,6 +46,19 @@ pub enum MemoryError {
     DimensionMismatch { expected: usize, got: usize },
     #[error("Memory not found: {0}")]
     NotFound(String),
+    /// No embedding provider is wired up, so anything needing a vector cannot run.
+    ///
+    /// This is its own variant because it is the one memory failure a *user* can
+    /// fix, and the message is read by the agent: it used to be reported as
+    /// `MemoryError::Io(NotConnected, "No embedding function configured")`, which
+    /// surfaced to the model as `IO error: ...`. A model cannot act on an IO
+    /// error — it retries or gives up — so `recall` looked broken rather than
+    /// unconfigured. Keep the text actionable and addressed to the person.
+    #[error(
+        "no embedding provider configured — set one in Settings, or run a local Ollama \
+         with an embedding model pulled, then memory search will work"
+    )]
+    NoEmbeddingProvider,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]

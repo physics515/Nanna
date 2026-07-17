@@ -4,6 +4,7 @@
 
 #![cfg(windows)]
 
+use crate::service::ServiceConfig;
 use std::ffi::OsString;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -19,6 +20,12 @@ use windows_service::{
     service_dispatcher,
 };
 
+/// The name this process reports to the SCM when it runs *as* a service.
+///
+/// Only the runtime side uses this (the dispatcher and the control handler); the
+/// management functions below take the name from `ServiceConfig` instead. For an
+/// `OWN_PROCESS` service the SCM ignores the dispatch-table name, so a service
+/// installed under a different name still runs correctly.
 const SERVICE_NAME: &str = "nanna-daemon";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
@@ -118,8 +125,14 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), String> {
     Ok(())
 }
 
-/// Install the Windows Service
-pub fn install_service() -> Result<(), String> {
+/// Install the Windows Service described by `config`.
+///
+/// The SCM starts this executable with `config.arguments`, which on Windows must
+/// reach `run_as_service` (the `service` subcommand) rather than the console
+/// runner — a service that never calls `StartServiceCtrlDispatcher` is killed by
+/// the SCM for not reporting status. `ServiceConfig::default()` already selects
+/// the right argument per platform; see its definition.
+pub fn install_service(config: &ServiceConfig) -> Result<(), String> {
     use std::process::Command;
     use windows_service::{
         service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType},
@@ -132,17 +145,14 @@ pub fn install_service() -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to connect to service manager: {}", e))?;
 
-    let executable_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
-
     let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from("Nanna Daemon"),
+        name: OsString::from(&config.name),
+        display_name: OsString::from(&config.display_name),
         service_type: SERVICE_TYPE,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path,
-        launch_arguments: vec![OsString::from("service")],
+        executable_path: config.executable.clone(),
+        launch_arguments: config.arguments.iter().map(OsString::from).collect(),
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
@@ -152,13 +162,12 @@ pub fn install_service() -> Result<(), String> {
         .create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
         .map_err(|e| format!("Failed to create service: {}", e))?;
 
-    // Set description
+    // `create_service` cannot set the description, and the SCM API for it is not
+    // exposed by windows-service; shelling out to `sc` is the pragmatic route.
+    // A failure here leaves a working service with a blank description, so it
+    // warns rather than failing the install.
     if let Ok(output) = Command::new("sc")
-        .args([
-            "description",
-            SERVICE_NAME,
-            "Nanna AI assistant background service",
-        ])
+        .args(["description", &config.name, &config.description])
         .output()
     {
         if !output.status.success() {
@@ -166,12 +175,12 @@ pub fn install_service() -> Result<(), String> {
         }
     }
 
-    info!("Service installed successfully");
+    info!("Service '{}' installed successfully", config.name);
     Ok(())
 }
 
-/// Uninstall the Windows Service
-pub fn uninstall_service() -> Result<(), String> {
+/// Uninstall the Windows Service named by `config`.
+pub fn uninstall_service(config: &ServiceConfig) -> Result<(), String> {
     use windows_service::{
         service::ServiceAccess,
         service_manager::{ServiceManager, ServiceManagerAccess},
@@ -184,7 +193,7 @@ pub fn uninstall_service() -> Result<(), String> {
     .map_err(|e| format!("Failed to connect to service manager: {}", e))?;
 
     let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::STOP)
+        .open_service(&config.name, ServiceAccess::DELETE | ServiceAccess::STOP)
         .map_err(|e| format!("Failed to open service: {}", e))?;
 
     // Stop the service if running
@@ -196,12 +205,12 @@ pub fn uninstall_service() -> Result<(), String> {
         .delete()
         .map_err(|e| format!("Failed to delete service: {}", e))?;
 
-    info!("Service uninstalled successfully");
+    info!("Service '{}' uninstalled successfully", config.name);
     Ok(())
 }
 
-/// Start the Windows Service
-pub fn start_service() -> Result<(), String> {
+/// Start the Windows Service named by `config`.
+pub fn start_service(config: &ServiceConfig) -> Result<(), String> {
     use windows_service::{
         service::ServiceAccess,
         service_manager::{ServiceManager, ServiceManagerAccess},
@@ -214,19 +223,19 @@ pub fn start_service() -> Result<(), String> {
     .map_err(|e| format!("Failed to connect to service manager: {}", e))?;
 
     let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::START)
+        .open_service(&config.name, ServiceAccess::START)
         .map_err(|e| format!("Failed to open service: {}", e))?;
 
     service
         .start::<String>(&[])
         .map_err(|e| format!("Failed to start service: {}", e))?;
 
-    info!("Service started");
+    info!("Service '{}' started", config.name);
     Ok(())
 }
 
-/// Stop the Windows Service
-pub fn stop_service() -> Result<(), String> {
+/// Stop the Windows Service named by `config`.
+pub fn stop_service(config: &ServiceConfig) -> Result<(), String> {
     use windows_service::{
         service::ServiceAccess,
         service_manager::{ServiceManager, ServiceManagerAccess},
@@ -239,19 +248,24 @@ pub fn stop_service() -> Result<(), String> {
     .map_err(|e| format!("Failed to connect to service manager: {}", e))?;
 
     let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::STOP)
+        .open_service(&config.name, ServiceAccess::STOP)
         .map_err(|e| format!("Failed to open service: {}", e))?;
 
     service
         .stop()
         .map_err(|e| format!("Failed to stop service: {}", e))?;
 
-    info!("Service stopped");
+    info!("Service '{}' stopped", config.name);
     Ok(())
 }
 
-/// Query Windows Service status
-pub fn query_service_status() -> crate::service::ServiceStatus {
+/// Query the status of the Windows Service named by `config`.
+///
+/// A service that cannot be opened is reported `Stopped` rather than `Unknown`:
+/// the common cause is that it is not installed, and callers act on that the same
+/// way they act on a stopped service. An SCM that cannot be reached at all is
+/// genuinely `Unknown`.
+pub fn query_service_status(config: &ServiceConfig) -> crate::service::ServiceStatus {
     use windows_service::{
         service::ServiceAccess,
         service_manager::{ServiceManager, ServiceManagerAccess},
@@ -265,7 +279,7 @@ pub fn query_service_status() -> crate::service::ServiceStatus {
         Err(_) => return crate::service::ServiceStatus::Unknown,
     };
 
-    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+    let service = match manager.open_service(&config.name, ServiceAccess::QUERY_STATUS) {
         Ok(s) => s,
         Err(_) => return crate::service::ServiceStatus::Stopped,
     };

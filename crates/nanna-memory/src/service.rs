@@ -134,12 +134,7 @@ impl MemoryService {
     /// Returns `MemoryError` if no embedding function is configured or the
     /// probe embedding call fails.
     pub async fn probe_and_align_dimension(&self) -> Result<usize, MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         // Generate a test embedding with a short probe string
         let test_embedding = (embed_fn)("dimension probe")
@@ -219,12 +214,7 @@ impl MemoryService {
         content: &str,
         metadata: HashMap<String, String>,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         // Generate embedding
         let embedding = (embed_fn)(content)
@@ -355,12 +345,7 @@ impl MemoryService {
         metadata: HashMap<String, String>,
         importance: f32,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         // Truncate oversized content to avoid embedding model context overflow
         // Most embedding models have 8192 token context; ~4 chars/token ≈ 30k chars safe limit
@@ -465,12 +450,7 @@ impl MemoryService {
         importance: f32,
         workspace_id: Option<String>,
     ) -> Result<(String, IngestAction), MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         // Generate embedding
         let embedding = (embed_fn)(content)
@@ -546,12 +526,7 @@ impl MemoryService {
     ///
     /// Returns `MemoryError` if no embedding function is configured.
     pub async fn recall(&self, query: &str) -> Result<Vec<RecallResult>, MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let store_count = self.store.len().await;
         info!("Recall: generating embedding for query (store has {} entries)", store_count);
@@ -636,12 +611,7 @@ impl MemoryService {
         query: &str,
         workspace_id: Option<&str>,
     ) -> Result<Vec<RecallResult>, MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let store_count = self.store.len().await;
         info!("Recall (scoped {:?}): generating embedding for query (store has {} entries)", 
@@ -1039,12 +1009,7 @@ impl MemoryService {
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
         // Generate embedding for the summary
-        let embed_fn = self.embed_fn.as_ref().ok_or_else(|| {
-            MemoryError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No embedding function configured",
-            ))
-        })?;
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
 
         let embedding = (embed_fn)(&summary)
             .await
@@ -1226,6 +1191,57 @@ mod tests {
         // Should fail without embed function
         let result = service.remember("test", HashMap::new()).await;
         assert!(result.is_err());
+    }
+
+    /// The user-reported bug: with no embedding provider, `recall` failed with
+    /// `IO error: No embedding function configured`. That reaches the *model*,
+    /// which cannot act on an IO error — so memory looked broken rather than
+    /// unconfigured. It must name the real condition instead.
+    #[tokio::test]
+    async fn recall_without_an_embedding_provider_names_the_real_problem() {
+        let service = MemoryService::new(MemoryServiceConfig::default());
+
+        let err = service
+            .recall("anything")
+            .await
+            .expect_err("recall cannot run without an embedding provider");
+
+        assert!(
+            matches!(err, MemoryError::NoEmbeddingProvider),
+            "expected the dedicated variant, got: {err:?}"
+        );
+
+        let message = err.to_string();
+        assert!(
+            !message.starts_with("IO error"),
+            "an unconfigured provider is not an IO failure: {message}"
+        );
+        assert!(
+            message.contains("embedding provider"),
+            "the message must name what is missing: {message}"
+        );
+        assert!(
+            message.contains("Settings") || message.contains("Ollama"),
+            "the message must say how to fix it: {message}"
+        );
+    }
+
+    /// Every embed-dependent entry point should report the same actionable
+    /// condition, not just `recall` — the reporter hit it through `recall`, but
+    /// `remember` is the same latent trap.
+    #[tokio::test]
+    async fn remember_without_an_embedding_provider_uses_the_same_variant() {
+        let service = MemoryService::new(MemoryServiceConfig::default());
+
+        let err = service
+            .remember("test", HashMap::new())
+            .await
+            .expect_err("remember cannot run without an embedding provider");
+
+        assert!(
+            matches!(err, MemoryError::NoEmbeddingProvider),
+            "expected the dedicated variant, got: {err:?}"
+        );
     }
 
     #[test]

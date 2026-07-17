@@ -24,9 +24,21 @@ pub struct ServiceConfig {
     pub display_name: String,
     pub description: String,
     pub executable: PathBuf,
+    /// Arguments the platform's service supervisor passes when it launches
+    /// `executable`. **Platform-dependent** — see `Default`.
     pub arguments: Vec<String>,
     pub working_directory: Option<PathBuf>,
 }
+
+/// The subcommand a service supervisor must invoke to start the daemon.
+///
+/// Windows is the odd one out and it is not cosmetic: the SCM requires the
+/// process it launches to call `StartServiceCtrlDispatcher` and report status,
+/// which is what the `service` subcommand does (`windows_service::run_as_service`).
+/// Installing with `run` yields a console daemon that never reports to the SCM,
+/// so Windows kills it as failed-to-start. launchd and systemd have no such
+/// handshake — they supervise the foreground process `run` gives them.
+const DEFAULT_SERVICE_ARGUMENT: &str = if cfg!(windows) { "service" } else { "run" };
 
 impl Default for ServiceConfig {
     fn default() -> Self {
@@ -35,7 +47,7 @@ impl Default for ServiceConfig {
             display_name: "Nanna Daemon".to_string(),
             description: "Nanna AI assistant background service".to_string(),
             executable: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nanna-daemon")),
-            arguments: vec!["run".to_string()],
+            arguments: vec![DEFAULT_SERVICE_ARGUMENT.to_string()],
             working_directory: None,
         }
     }
@@ -130,44 +142,36 @@ impl ServiceManager {
     // Windows implementation
     // =========================================================================
     
+    // These delegate to `crate::windows_service`, which is where the SCM work
+    // actually lives. They used to be `not yet implemented` stubs while
+    // `windows_service` had a full implementation the CLI called directly — so
+    // the platform abstraction reported a capability as missing that the binary
+    // had been shipping all along. There is now one implementation per platform,
+    // reached the same way.
+
     #[cfg(windows)]
     fn install_windows(&self) -> Result<(), String> {
-        // TODO: Use windows-service crate
-        Err(format!(
-            "Windows service installation not yet implemented for '{}'",
-            self.config.name
-        ))
+        crate::windows_service::install_service(&self.config)
     }
-    
+
     #[cfg(windows)]
     fn uninstall_windows(&self) -> Result<(), String> {
-        Err(format!(
-            "Windows service uninstallation not yet implemented for '{}'",
-            self.config.name
-        ))
+        crate::windows_service::uninstall_service(&self.config)
     }
-    
+
     #[cfg(windows)]
     fn start_windows(&self) -> Result<(), String> {
-        Err(format!(
-            "Windows service start not yet implemented for '{}'",
-            self.config.name
-        ))
+        crate::windows_service::start_service(&self.config)
     }
-    
+
     #[cfg(windows)]
     fn stop_windows(&self) -> Result<(), String> {
-        Err(format!(
-            "Windows service stop not yet implemented for '{}'",
-            self.config.name
-        ))
+        crate::windows_service::stop_service(&self.config)
     }
-    
+
     #[cfg(windows)]
     fn status_windows(&self) -> ServiceStatus {
-        // TODO: Query Windows SCM for service '{}' status
-        eprintln!("Windows service status not yet implemented for '{}'", self.config.name);
-        ServiceStatus::Unknown
+        crate::windows_service::query_service_status(&self.config)
     }
     
     // =========================================================================
@@ -395,5 +399,64 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 "#, self.config.description, exe, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this guards: Windows needs the `service` subcommand (the SCM
+    /// dispatcher), every other platform needs `run` (a supervised foreground
+    /// process). Installing Windows with `run` yields a service the SCM kills for
+    /// never reporting status — which is exactly why the Windows path used to
+    /// bypass `ServiceConfig` and hardcode its own argument.
+    #[test]
+    fn default_service_argument_matches_the_platform_contract() {
+        let config = ServiceConfig::default();
+        if cfg!(windows) {
+            assert_eq!(
+                config.arguments,
+                vec!["service".to_string()],
+                "Windows must launch the SCM dispatcher, not the console runner"
+            );
+        } else {
+            assert_eq!(
+                config.arguments,
+                vec!["run".to_string()],
+                "launchd/systemd supervise the foreground process"
+            );
+        }
+    }
+
+    /// The supervisor is handed `executable` + `arguments`; a default that named
+    /// no subcommand would start the interactive daemon under a service manager.
+    #[test]
+    fn default_config_is_installable() {
+        let config = ServiceConfig::default();
+        assert!(!config.name.is_empty(), "a service needs a name to register under");
+        assert!(!config.display_name.is_empty(), "the SCM shows the display name");
+        assert_eq!(config.arguments.len(), 1, "exactly one subcommand is passed");
+        assert!(
+            !config.arguments[0].is_empty(),
+            "an empty argument would launch the default (interactive) mode"
+        );
+    }
+
+    /// The systemd unit interpolates `arguments`; a regression there silently
+    /// produces a unit that runs the wrong mode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_unit_execstart_carries_the_configured_argument() {
+        let manager = ServiceManager::new(ServiceConfig::default());
+        let unit = manager.generate_systemd_unit();
+        assert!(
+            unit.contains("ExecStart="),
+            "unit must define ExecStart, got:\n{unit}"
+        );
+        assert!(
+            unit.contains(" run"),
+            "ExecStart must pass the run subcommand, got:\n{unit}"
+        );
     }
 }
