@@ -107,7 +107,9 @@ top-priority, zero-cost tier** and cloud is an opt-in escalation.
 ## Current State (what's real today)
 
 Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **8** are partial;
-**9** is greenfield. The new local-first phases (**P12**, **P13**) are greenfield. Concretely, today Nanna:
+**9** is greenfield. The new local-first phases (**P12**, **P13**) are greenfield, as are **P14**
+(long-horizon autonomy on a small local model) and **P15** (the agent-grade task store that P14 runs on —
+the two ship together). Concretely, today Nanna:
 
 - Runs as a **headless daemon** (Windows service / systemd / launchd) with WebSocket IPC, PID
   lockfile, health endpoints, and session persistence to **Turso**; the **GUI attaches** as a client
@@ -604,7 +606,24 @@ routine should drain first.**
       partial assistant message (`_(This turn was interrupted…)_` + error) and touches the session before
       returning the error, so the user turn is no longer orphaned in storage.
 - [x] `not_implemented` daemon control actions: ~~Regenerate message~~ **(done 2026-07-11 — `ChatAction::Regenerate` now drops the stale assistant reply via a new pure `Session::take_last_user_turn()` (removes the last user message **and** everything after it — reply + trailing tool turns — returning that user content; `None`/unchanged when there's no user message), persists the truncated session, then replays through the existing `Send` path via `Box::pin(self.handle_chat(..))` so it reuses all context/workspace/memory/agent logic with zero duplication. 4 unit tests cover reply-drop, prior-history preservation, trailing-tool-turn drop, and no-user→None. Daemon boots green; full turn execution needs a live LLM (unavailable unattended) so verified by build+boot smoke + unit tests)**, ~~Tool enable/disable~~ **(done 2026-07-09 — `ToolAction::Enable`/`Disable` now persist the flag via `update_tool` and reconcile the live registry through a shared `reconcile_tool_registration` helper (also used by `Update`): disable→unregister, enable→re-register, effective without a restart; tokio test drives the real create→register→disable→enable path on a live `ToolRegistry`)**, ~~Channel status~~ **(done 2026-07-14 — `ControlPlane` holds an optional `Arc<StatusManager>` (attached before the Arc wrap at daemon boot); `ChannelManager::with_status_manager` shares the same manager, registers configured providers on `configure()`, and wires `.with_status_manager(..)` into Telegram/Discord/Slack listeners so circuit-breaker state transitions update live connection state; `ChannelAction::Status` returns a single channel or `{channels, summary}` (or `not_found` / `unavailable`); 2 tokio tests)**, ~~Uptime (`control.rs:1636`, needs start timestamp)~~ **(done 2026-07-06 — `ControlPlane.started_at: Instant` + `uptime_secs()` accessor; `SystemAction::Status` reports real uptime; test)**, ~~non-destructive `peek_mailbox` (`control.rs:578`)~~ **(done 2026-07-06 — `SessionManager::peek_mailbox` clones without draining; sub-session status now peeks instead of destructively draining pending inter-session messages; test)**.
-- [ ] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
+- [x] Windows service `install/uninstall/start/stop` return errors (`service.rs:136`) though runtime works via `windows_service.rs`.
+      *(2026-07-17)* **The stubs were dead code in front of a working implementation.** `windows_service.rs`
+      already had full SCM install/uninstall/start/stop/status, and `main.rs` called it **directly** behind
+      `#[cfg(windows)]` — so the CLI worked while `ServiceManager` (the platform abstraction) reported the
+      capability as "not yet implemented" to any library consumer, and `main.rs` carried **six cfg-split
+      duplicate functions** (start/stop/restart/status/install/uninstall) that differed only in how they
+      reached the service ops.
+      Root cause of the split: `ServiceConfig::default().arguments` was `["run"]`, which is right for
+      launchd/systemd (they supervise a foreground process) and **wrong for Windows** — the SCM requires the
+      launched process to call `StartServiceCtrlDispatcher` and report status, i.e. the `service` subcommand,
+      or it kills it as failed-to-start. So the Windows path could not use the shared config and hardcoded its
+      own argument. Fixed by making the default platform-aware (`DEFAULT_SERVICE_ARGUMENT`), then
+      parameterizing the `windows_service` management fns with `&ServiceConfig` (they hardcoded name/display/
+      description, ignoring config), delegating `service.rs`'s Windows arm to them, and collapsing the six
+      duplicates in `main.rs` into one implementation each. `SERVICE_NAME` remains for the runtime dispatcher
+      only (an `OWN_PROCESS` service's dispatch-table name is ignored by the SCM, so a custom install name
+      still runs). 3 tests on the platform-argument contract; the SCM calls themselves need an elevated
+      Windows host, so they are not unit-testable here.
 - [x] Server stats not wired to shared daemon state (`server.rs:882`).
       *(2026-07-12)* Bigger bug than the label: the daemon's **main agent was built without any stats
       tracker** (`AgentService` → `Agent::new(..).with_context(..)`, no `with_stats`) **and** the sub-agent
@@ -668,7 +687,15 @@ routine should drain first.**
       dup-check→save→insert (atomic vs a racing create), instead of silently clobbering an existing tool +
       its `.json`. 2 tests: duplicate-create rejected + original untouched; a bad-source update fails whole
       and a fresh manager reloading from disk still sees the original. clippy unchanged (2057). Remaining
-      here: `create_user_tool`'s `if let Ok` swallow + the GUI-embedded `tool_authoring.rs` copy (needs a GUI build).
+      here: ~~`create_user_tool`'s `if let Ok` swallow~~ **(done 2026-07-17)** + the GUI-embedded
+      `tool_authoring.rs` copy (needs a GUI build).
+      *(2026-07-17)* `create_user_tool`'s `if let Ok(tool_impl) = ..create_tool_impl(..)` swallowed a
+      registration failure: the tool was written to disk and **reported created**, but never registered — so
+      it appeared in the UI and silently was not callable until the next restart. It now propagates the error
+      and **rolls the creation back** (`delete_tool`) so disk and registry cannot disagree, with the rollback
+      itself best-effort (a failed rollback logs and still surfaces the original error, since the tool would
+      register on the next start). `create_tool_impl` is infallible today, so this is about the swallow not
+      outliving that.
       *(2026-07-09)* Replaced the naive one-line `ToolRegistry::unregister` (removed only the primary key, so a deleted tool stayed reachable through its own alias entry) with a cascading version: deleting a canonical tool also drops every alias whose target is it and purges the `alias_targets` reverse-map; deleting an alias leaves the canonical intact. Returns the entry-count removed. Wired into the **daemon** control plane: `ToolAction::Delete` now `unregister`s the live tool (deletion takes effect without a restart), and `ToolAction::Update` reconciles the registry with the new `enabled` flag — unregister then re-register only if still enabled, so a disabled tool stops executing and an edit's new source goes live immediately. 4 registry unit tests (uncallable-after-delete, alias cascade, alias-only removal leaves canonical, unknown-name no-op). Remaining: the GUI-embedded `UserToolManager` copy (`tool_authoring.rs`) still needs the same wiring (needs a GUI build to verify).
 - [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
       *(2026-07-12: verified the **daemon** analog `AgentService.active_chats` is NOT leaky — the only exits
@@ -716,6 +743,31 @@ routine should drain first.**
             build their own embedding client and `?` on `Failed to discover embedding dimension`, exactly as
             the daemon did before this fix. Apply the same treatment (probe through the shared router;
             degrade instead of fail). Almost certainly related to the two embedded-mode reports below.
+> **The three embedded-mode reports below are one bug, not three** *(investigated 2026-07-17)*. The GUI is
+> not *choosing* embedded mode — it is **falling back** to it because the daemon dies at boot, and everything
+> else follows from being in a mode that was never finished:
+> 1. **2026-07-15, `93a7076`** ("drive model budgets from provider `ModelInfo` only") made the boot embedding
+>    probe read the key from `std::env::var()` **only**, while the `EmbeddingRouter` that serves every real
+>    embed reads `config.llm.openrouter_api_key.or_else(env)`. Verified on this machine:
+>    `OPENROUTER_API_KEY` is **not set in Process, User, or Machine** scope, and the key is in `config.toml`
+>    — precisely the case that fails. So the probe reported a missing key for a key the daemon had.
+> 2. Boot dies before `Daemon ready` → the sidecar exits → `Backend::init` cannot connect and
+>    **silently falls back to embedded** (`gui/src-tauri/src/backend.rs:~157`, warn-level only).
+> 3. Embedded mode loads **no skills** → "only `remember`/`recall`/`reflect`" (see the item below).
+> 4. Embedded mode has no embedder → `recall` fails (this item).
+>
+> **Root cause fixed 2026-07-16 (PR #34)** — the probe now goes through the same router as the embed path;
+> verified on the real binary with no env key: `Primary embeddings: OpenRouter` → `probed dimension 2048` →
+> `Daemon ready`. **The GUI needs a rebuilt sidecar to pick it up** (`pnpm build:daemon` bundles the daemon
+> binary into `gui/src-tauri/binaries/`), so a GUI built before that commit keeps falling back.
+> - [ ] **The silent fallback is its own bug.** Losing the daemon costs the user every script tool and all of
+>       memory, and it is reported only as a `warn!` in a log nobody reads — the UI says nothing. Surface it:
+>       show the mode and *why* the daemon was unreachable, so a dead daemon cannot masquerade as a working
+>       app with three tools. This is what let a two-day outage go undiagnosed.
+> - [ ] **Ports note:** the `9833` "daemon sidecar (GUI-spawned)" in *Core Model* is **stale** — the GUI
+>       spawns with `--port 5149` (`daemon_manager.rs:47,109`) and connects to `ws://127.0.0.1:5149`
+>       (`daemon_client.rs:69`). They agree; fix the doc, and fold this into the P1 port-unification item.
+
 - [ ] **`recall` is broken in embedded mode: "IO error: No embedding function configured".**
       *(user-reported 2026-07-16, with a live transcript)* The agent's `recall` tool fails outright in the
       GUI's embedded mode, so memory search is unavailable exactly where local-first is supposed to work.
@@ -725,8 +777,42 @@ routine should drain first.**
       P12 "Local embeddings in Burn"/Mummu is the real fix; until then `recall` must fail *soft* with an
       actionable message ("no embedding provider configured — set one in Settings") rather than an
       `IO error` surfaced to the model, which cannot act on it.
+      - [x] **The message half is fixed** *(2026-07-17)*. The condition was reported as
+            `MemoryError::Io(ErrorKind::NotConnected, "No embedding function configured")` — a misuse of the
+            IO variant that rendered to the model as `IO error: ...`. A model cannot act on an IO error (it
+            retries, or gives up and says memory is broken), which is exactly what the transcript shows. Added
+            a dedicated `MemoryError::NoEmbeddingProvider` whose text names the condition and the fix ("set one
+            in Settings, or run a local Ollama with an embedding model pulled"), and replaced all **7** sites
+            that constructed the fake IO error — so `remember`, `reflect` and the dimension probe report it the
+            same way, not just `recall`. 2 tests pin the variant *and* that the message never regresses to
+            `IO error`. Not a cloud-key workaround: with no provider, memory still cannot embed — the failure
+            is now legible instead of misleading.
+      - [ ] Remaining: make the `recall` **tool** degrade to a normal (non-error) result carrying this text, so
+            the model treats it as "memory is unconfigured" rather than a failed tool call; and the real fix,
+            a local embedder (P12 / Mummu).
 - [ ] **Agent reports only `remember`/`recall`/`reflect` are available in embedded mode.**
-      *(user-reported 2026-07-16)* In a live embedded session the agent stated it had no filesystem,
+      **ROOT-CAUSED 2026-07-17 — the report is accurate and the cause is worse than "discover_tools is
+      missing": the GUI never loads the default skills at all.** `grep load_skills gui/src-tauri/src/`
+      returns **nothing**. The daemon populates its registry at `server.rs:1773` with
+      `tools.load_skills_with_services(dir, &services)` (all 39 skills); the GUI's `setup_state`
+      (`gui/src-tauri/src/lib.rs:~505-528`) registers only user tools, `create_tool`/`list_user_tools`, and
+      `discover_tools` — no skill loading, so filesystem/shell/git/web tools are simply not in the embedded
+      registry. What remains is exactly what the transcript shows.
+      **And `discover_tools` itself is debug-only in practice.** The GUI calls
+      `resolve_tools_dir(config.tools.tools_dir)` and gives up on `None`. Resolution order is
+      `NANNA_TOOLS_DIR` → `config.tools.tools_dir` → `DEV_TOOLS_DIR` → `None`, and **`DEV_TOOLS_DIR` is
+      `None` in release** (`defaults.rs:76`). So an installed build with no configured `tools_dir` resolves
+      `None` → not even `discover_tools` registers. The daemon avoids this by falling back to
+      `data_dir.join("tools")` and then calling `bootstrap_default_skills`, which **extracts the
+      compile-time-embedded skills on first run** — the GUI calls neither.
+      **Fix (mirror the daemon, in `setup_state`):** resolve with the same `unwrap_or_else(|| data_dir
+      .join("tools"))` fallback → `bootstrap_default_skills(&resolved)` → `ensure_permissions(&resolved)` →
+      `load_skills_with_services(&resolved, &services)`. Blocker to sort out first: `build_script_services`
+      is **private** in `nanna-daemon/src/server.rs:253`, so either make it `pub` (the GUI already depends on
+      `nanna-daemon` since PR #31) or build the equivalent memory/agent-spawner closures GUI-side. Not landed
+      here because it needs a real GUI build **and** a live embedded session to confirm the tool list — this
+      is the "prove it in the running app" case, not a compile-and-ship one.
+      *(original report, 2026-07-16)* In a live embedded session the agent stated it had no filesystem,
       shell, git, or network tools and therefore could not do the work. Expected: the two-tier design
       sends 4 core tools (incl. `discover_tools`) and the model activates the rest on demand — so either
       `discover_tools` is not being registered/offered on the embedded path, or the model is not being
@@ -834,7 +920,17 @@ routine should drain first.**
       385 passed, 0 failed, 0 overflows.** (`nanna-gui` needs the sidecar + built frontend staged first — see
       the build-env note under *Immediate next actions* #2 — so a bare `cargo test --workspace` still fails in
       its build script, not in a test.)
-- [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
+- [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. ~~Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.~~
+      *(2026-07-17)* **Smoke check added** — `.github/workflows/test-compile.yml`, the repo's **first CI
+      workflow**: `cargo test --no-run --workspace --exclude nanna-gui --locked` on every PR and every push to
+      master. `--no-run` builds every test target without executing it, so it catches drift cheaply and cannot
+      go red for flaky-runtime reasons. Runs on **windows-latest** on purpose: it is the platform this
+      workspace is pinned against (MSVC, `aegis` on its pure-Rust path) and the only one that compiles the
+      `#[cfg(windows)]` service layer. `nanna-gui` is excluded because its build.rs needs the Tauri sidecar +
+      built frontend, neither committed — that is a packaging job, not a smoke check (see the build-env note
+      under *Immediate next actions* #2). Caches via `Swatinem/rust-cache`; 60-min timeout.
+      - [ ] Confirm the first run is green and tune the timeout from its real cold-cache duration — CI YAML
+            cannot be verified locally, so the PR that adds it is its own first test.
 
 **Architecture debt:**
 - [x] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
@@ -1152,6 +1248,147 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [ ] **Decision — Turso-only vs DSP `.dspseg`:** DSP normally keeps measurements in `.dspseg` files *outside* libSQL. To stay Turso-only, lift DSP's *pure algorithms* (`simplify_with_aggressiveness`, `splimes`) and store reduced points in Turso BLOBs, rather than depending on DSP's `SegmentStore`/`Database`. (Revisit if the timeline outgrows Turso.)
 - [ ] **Make it demoable** — GUI dream-log + a salience **spectrogram/waterfall** over time (consolidation lineage `consolidated_from`/`generation` already exists). This is the "unique sauce" screen.
 - [ ] Also from backlog: HNSW persistent vector index (avoid full `bulk_load` into RAM); emotional valence; memory-graph edges; dedup-before-store; ~~extraction filtering (<50 chars)~~ **(done 2026-07-06 — `is_storable_memory` drops sub-50-char extractions in `loop_runner::extract_memories`; 2 tests)**.
+
+### P14 — Long-Horizon Autonomy on a Small Local Model 🌱 (new — the P12 payoff)
+
+**Goal:** a 7–9B local model that stays on task for **hours**, not 2–3 tool calls, at a token cost that a
+single GPU can actually sustain. P12 gives us a model that *runs*; this phase is what makes it *useful*.
+Everything here is testable **today against Ollama** — none of it waits on Mummu.
+
+**The problem, stated honestly.** Our own research already says local ~7–9B models *"lose coherence after
+2–3 tool-chain steps"* (P12, 2026-07-07). A frontier model survives long tasks by brute context: it
+re-reads a 200k-token history and re-derives intent every turn. A local model has neither the window nor
+the tok/s to do that. So long-horizon capability cannot come from the model — it has to come from the
+**harness**. The design bet: *the agent should never need to remember; the harness should make forgetting
+survivable.* Two goals that sound opposed — hours of coherence, few tokens — are the same goal, because
+**the way you burn tokens is by re-establishing context you failed to persist.**
+
+**Governing metric:** *task success @ tokens* — fraction of a long-task eval suite completed, over total
+tokens spent. Not tok/s, not context size. A run that finishes in 40k tokens beats one that finishes in
+400k, and both beat one that drifts. Ties into the P-&-B *agent-eval suite* (that suite is the denominator).
+
+**Design spine — externalize state, keep the window tiny:**
+- [ ] **The todo file *is* the agent's working memory** (P15) — not a note, the **control structure**. On
+      every iteration the harness injects only: the current task, its acceptance check, and the last
+      result. The model's job shrinks from "hold the plan" to "advance one step", which is what a 7–9B can
+      actually do. This is the single highest-leverage item here and the reason P15 exists.
+- [ ] **Re-anchor, don't re-read.** Rebuild the prompt each turn from the todo + a fixed-size scratchpad
+      instead of appending history. Long-run context becomes **O(1)**, not O(turns) — this is where the
+      token savings come from, and it is also what stops drift. Today's `progressive distillation` (P10)
+      still summarizes an ever-growing transcript; this replaces the transcript as the substrate.
+- [ ] **One tool per step, chosen from ≤5.** Extend the two-tier `discover_tools` design: the *active* set
+      is scoped to the current todo item (its `tools:` hint), not the whole registry. Existing research:
+      each definition costs ~50–150 tokens and 7–9B models degrade past 5–10 tools (P12, 2026-07-07).
+- [ ] **Sub-agent per subtask, fresh context, structured return.** The parent never sees the child's
+      transcript — only its result and acceptance verdict. `task` + the swarm coordinator (P5) already do
+      the spawning; what is missing is that the *parent's* context must not grow when a child runs.
+- [ ] **Checkpoint + resume across restarts.** Hours means surviving a crash, an OOM, a reboot. The todo
+      store (Turso) is the checkpoint; a resumed run reloads the todo and continues without replaying
+      anything. `AgentService` already has per-session checkpoints — extend, don't re-invent.
+
+**Staying on track (drift is the real enemy, not context length):**
+- [ ] **Acceptance check per todo item.** Every item carries a machine-checkable done-condition (a command
+      exit code, a file exists, a regex over output). The *harness* runs it — not the model. A model that
+      cannot mark its own homework cannot drift into declaring success. This is the difference between
+      "hours of work" and "hours of looking busy".
+- [ ] **Progress-or-replan.** N iterations with no acceptance check flipping = stop and replan, don't
+      grind. Generalizes the existing escalating wrap-up nudges (`AgentServiceConfig`) from "end the run"
+      to "re-decompose the task".
+- [ ] **Loop/repetition detector.** Same tool + same args + same result twice ⇒ intervene. Small models
+      loop; today only a narration-loop detector exists (`be1af7e`). Cheap to detect, expensive to ignore.
+- [ ] **Bounded blast radius.** Per-run caps on wall-clock, tokens, and tool calls, surfaced as budget
+      *the model can see* ("2 of 20 steps used"). An agent that knows its budget plans around it.
+- [ ] **The goal is immutable.** The original request is pinned verbatim in every prompt and never
+      summarized. Everything else is compressible; intent is not. Cheapest anti-drift measure available.
+
+**Token economics (measure before optimizing):**
+- [ ] **Token budget accounting per run** — tokens/completed-item, not tokens/turn, so regressions are
+      visible. `CostTracker` (P6) already records per-call usage; aggregate it against todo completions.
+- [ ] **Prompt-cache the immutable prefix.** System + goal + tool defs are stable across a long run —
+      exactly the shape prompt caching rewards (P10 already has cache hit tracking on cloud). For the
+      local tier the analogue is **KV-cache reuse across turns** (a P12/Mummu contract item): a rebuilt
+      O(1) prompt with a stable prefix is *ideal* for it. Design the prompt so the prefix never moves.
+- [ ] **Ladder the model, don't fix it.** Decompose/replan on a bigger model (or cloud) *rarely*; execute
+      steps on the local model *constantly*. The P10 complexity router already picks per call — teach it
+      the step *kind* (plan vs execute vs verify), which is far more predictive than message length.
+- [ ] **Stop paying for tool output twice.** Per-tool `output: context|memory` routing exists; long runs
+      need the default to be "summary in context, full text in memory" for *every* verbose tool.
+- [ ] **Benchmark:** a "4-hour task" eval (e.g. a multi-file refactor with a test-suite acceptance check)
+      run on the 8GB reference tier. Record task-success @ tokens in `bench/BASELINE.md`. Without this the
+      rest of this phase is opinion.
+
+- [ ] *(research 2026-07-17)* Cross-check the design against published long-horizon agent work before
+      building — the failure modes (drift, looping, context rot, self-graded success) are well documented,
+      and the eval suite should reuse an existing benchmark's task set where one fits rather than inventing
+      one. Prior art to read: the SWE-bench-style acceptance-by-tests pattern (which is exactly the
+      "harness runs the check" item above), and any 2026 work on small-model agent harnesses.
+
+### P15 — Agent-Grade Task Store (todo as control structure) 🌱 (new)
+
+**Goal:** replace the flat, session-scoped `todo` skill with a task store an agent can *plan* against and
+the harness can *drive* a long run from. This is P14's substrate — the two ship together or neither works.
+
+**What exists** (`crates/nanna-tools/default-skills/todo/tool.ts`, 259 lines, v0.1.0): a flat list in a
+per-session JSON file (`.nanna-todo-{session}.json`) with `add/create/done/update/remove/clear/clear_all/
+list` and status `pending|in_progress|blocked|done`. That is a **scratchpad**, and its limits are exactly
+what breaks long runs: no hierarchy, so a big task cannot be decomposed in place; **no dependencies**, so
+`blocked` is a label a model sets by vibes rather than a fact the harness derives; no persistence beyond a
+session, so an agent that restarts forgets the plan; no query, so "what is next?" costs a full-list dump
+into context every turn; and no acceptance criteria, so *the model decides when it is done*.
+
+**Todoist as the reference feature set** *(2026-07-17 — surveyed [features](https://www.todoist.com/features)
+and the [filter syntax](https://www.todoist.com/help/articles/introduction-to-filters-V98wIH))*. It is the
+right prior art because it solved "a human keeps hundreds of tasks straight for years" — but the mapping is
+not 1:1, and the differences matter more than the similarities:
+
+| Todoist | Take it? | Why |
+|---|---|---|
+| Projects / sections / **sub-tasks** | **Yes** | Hierarchy *is* decomposition; the unit a sub-agent gets |
+| **Dependencies / blocking** | **Yes — the big one** | Makes `next()` derivable instead of guessed |
+| **Filter query language** (`&`/`\|`/`!`/parens, `today`, `overdue`, `p1`, `@label`, `#project`, `search:`) | **Yes** | An agent that can *query* stops paying to re-read the list |
+| Priorities `p1..p4` | Yes | Cheap, and orders `next()` |
+| Labels | Yes | Doubles as the per-item **tool scope** hint (P14) |
+| Due dates + **natural-language parsing** | Partly | Deadlines matter; NL parsing is a *human* affordance — an agent should emit structured dates. Don't build a date parser for a machine caller |
+| Recurring tasks | Yes | Maps onto HEARTBEAT.md / cron (P8) — one recurrence engine, not two |
+| Reminders | Reuse | `remind`/`cancel_reminder`/`list_reminders` skills already exist — wire, don't duplicate |
+| Comments / attachments | Adapt | Becomes **per-task working notes** — the durable scratchpad P14 needs |
+| Activity history | **Yes** | The audit trail of a 4-hour run; also the dataset for "why did it drift?" |
+| Karma / productivity charts | **No** | Gamification for humans. An agent needs an acceptance check, not points |
+| Collaboration / assignment / roles | **Reframe** | "Assignee" = *which agent* (parent vs sub-agent), not which person |
+| Templates | Later | Useful once recurring multi-step jobs exist |
+| Views (board/calendar), 80+ integrations | GUI-only | A rendering concern, not agent-facing |
+
+**Build-out:**
+- [ ] **Move the store to Turso**, not a JSON file per session. Scope: `session | workspace | global`, so a
+      plan outlives the chat that made it (P14's resume depends on this). Schema: `id, parent_id, title,
+      notes, status, priority, labels[], due_at, recurrence, depends_on[], acceptance, assignee,
+      created_at/updated_at/completed_at`. Follow the P13 rule — Turso only, no new store.
+- [ ] **Hierarchy** — `parent_id` + ordering; a parent auto-completes when its children do (and cannot be
+      marked done while a child is open: the harness enforces it, not the prompt).
+- [ ] **Dependencies** — `depends_on[]`, with a **cycle check on write** (reject, don't detect later).
+      `blocked` becomes *derived state*, never a value the model writes.
+- [ ] **`next()`** — the single most valuable call: return the one actionable item (unblocked, highest
+      priority, respecting order) plus its acceptance check and tool scope. A long run is a loop over
+      `next()`. It is also the token fix: one item in context per turn instead of the whole list.
+- [ ] **Acceptance criteria per item** (`acceptance: {kind: command|file_exists|regex, ...}`) — run by the
+      **harness**; `done` is a *verdict*, not an assertion. This is the P14 anti-drift keystone.
+- [ ] **Filter/query language** — a deliberate subset of Todoist's: `&`, `|`, `!`, parens, `p1..p4`,
+      `@label`, `#project`, `overdue`, `due before:`, `no date`, `search:`, `subtask`. Pure parser →
+      unit-testable with zero I/O, which is how it gets to be trustworthy.
+- [ ] **Working notes per task** — append-only; where a sub-agent leaves findings for its parent. Long-run
+      state lives *here* rather than in the transcript.
+- [ ] **Activity log** — every transition, with actor (which agent) and timestamp. Feeds the drift
+      post-mortem and the P14 benchmark.
+- [ ] **Assignee = agent** — which sub-agent owns an item; makes swarm work (P5) legible instead of
+      inferred from logs.
+- [ ] **Recurrence via the existing scheduler** (P8 cron / HEARTBEAT.md). One recurrence engine.
+- [ ] **Keep the tool surface tiny.** ~5 actions the model actually needs (`next`, `add`, `update`,
+      `done`, `query`) — every extra action is ~50–150 tokens on *every* turn (P12 research) and one more
+      way for a small model to pick wrong. Todoist's full API is the *store's* capability, not the tool's.
+- [ ] **Migrate the JSON file** on first run; keep `todo` as the tool name and the v0.1 actions working
+      (`extract_version_from_source`/`bootstrap_default_skills` already handle skill upgrades).
+- [ ] **GUI**: a task view is the natural place to *watch* a 4-hour run — the "is it still on track?"
+      screen. Pairs with the P13 dream-log as demoable surface.
 
 ---
 
