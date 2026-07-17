@@ -67,7 +67,7 @@ repository = "https://github.com/clawdbot/nanna"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 
 # GPU compute
 wgpu = "30"
