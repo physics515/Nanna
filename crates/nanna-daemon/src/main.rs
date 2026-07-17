@@ -13,9 +13,7 @@
 
 use clap::{Parser, Subcommand};
 use nanna_daemon::server::DaemonBuilder;
-use nanna_daemon::service::ServiceStatus;
-#[cfg(not(windows))]
-use nanna_daemon::service::{ServiceConfig, ServiceManager};
+use nanna_daemon::service::{ServiceConfig, ServiceManager, ServiceStatus};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::{error, info};
@@ -278,23 +276,6 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
     })
 }
 
-#[cfg(windows)]
-fn start_service(_cli: &Cli) -> Result<(), String> {
-    match windows_service::query_service_status() {
-        ServiceStatus::Running => {
-            println!("Daemon is already running");
-            Ok(())
-        }
-        _ => {
-            println!("Starting daemon...");
-            windows_service::start_service()?;
-            println!("Daemon started");
-            Ok(())
-        }
-    }
-}
-
-#[cfg(not(windows))]
 fn start_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     match manager.status() {
@@ -311,23 +292,6 @@ fn start_service(cli: &Cli) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
-fn stop_service(_cli: &Cli) -> Result<(), String> {
-    match windows_service::query_service_status() {
-        ServiceStatus::Stopped => {
-            println!("Daemon is not running");
-            Ok(())
-        }
-        _ => {
-            println!("Stopping daemon...");
-            windows_service::stop_service()?;
-            println!("Daemon stopped");
-            Ok(())
-        }
-    }
-}
-
-#[cfg(not(windows))]
 fn stop_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     match manager.status() {
@@ -344,20 +308,6 @@ fn stop_service(cli: &Cli) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
-fn restart_service(_cli: &Cli) -> Result<(), String> {
-    if windows_service::query_service_status() == ServiceStatus::Running {
-        println!("Stopping daemon...");
-        windows_service::stop_service()?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    println!("Starting daemon...");
-    windows_service::start_service()?;
-    println!("Daemon restarted");
-    Ok(())
-}
-
-#[cfg(not(windows))]
 fn restart_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     if manager.status() == ServiceStatus::Running {
@@ -372,12 +322,8 @@ fn restart_service(cli: &Cli) -> Result<(), String> {
 }
 
 fn show_status(cli: &Cli) -> Result<(), String> {
-    #[cfg(windows)]
-    let status = windows_service::query_service_status();
-    
-    #[cfg(not(windows))]
     let status = get_service_manager(cli).status();
-    
+
     println!("Nanna Daemon Status");
     println!("==================");
     println!("Service: {}", match status {
@@ -434,17 +380,6 @@ fn show_status(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn install_service(_cli: &Cli) -> Result<(), String> {
-    println!("Installing Nanna daemon as Windows Service...");
-    windows_service::install_service()?;
-    println!("Service installed successfully");
-    println!("\nTo start the daemon, run:");
-    println!("  nanna-daemon start");
-    Ok(())
-}
-
-#[cfg(not(windows))]
 fn install_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
     println!("Installing Nanna daemon as system service...");
@@ -455,39 +390,22 @@ fn install_service(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn uninstall_service(_cli: &Cli) -> Result<(), String> {
-    // Stop if running
-    if windows_service::query_service_status() == ServiceStatus::Running {
-        println!("Stopping running daemon...");
-        windows_service::stop_service()?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    
-    println!("Uninstalling Nanna daemon service...");
-    windows_service::uninstall_service()?;
-    println!("Service uninstalled successfully");
-    Ok(())
-}
-
-#[cfg(not(windows))]
 fn uninstall_service(cli: &Cli) -> Result<(), String> {
     let manager = get_service_manager(cli);
-    
+
     // Stop if running
     if manager.status() == ServiceStatus::Running {
         println!("Stopping running daemon...");
         manager.stop()?;
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    
+
     println!("Uninstalling Nanna daemon service...");
     manager.uninstall()?;
     println!("Service uninstalled successfully");
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn get_service_manager(_cli: &Cli) -> ServiceManager {
     ServiceManager::new(ServiceConfig::default())
 }
