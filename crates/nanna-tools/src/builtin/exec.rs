@@ -1,6 +1,6 @@
 //! Shell execution tool
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult};
+use crate::{output_schemas, Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -55,6 +55,13 @@ impl Tool for ExecTool {
         .string_param("command", "The shell command to execute", true)
         .string_param("workdir", "Working directory (optional)", false)
         .int_param("timeout", "Timeout in seconds (default: 30)", false)
+        .enum_param(
+            "output_mode",
+            "text (default) or json — json returns structured stdout/stderr/exit_code",
+            false,
+            &["text", "json"],
+        )
+        .with_output_schema(output_schemas::exec())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -122,6 +129,14 @@ impl Tool for ExecTool {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+        let data = serde_json::json!({
+            "command": command,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "workdir": workdir,
+        });
 
         let result = if output.status.success() {
             let content = if stderr.is_empty() {
@@ -129,7 +144,7 @@ impl Tool for ExecTool {
             } else {
                 format!("{stdout}\n\nStderr:\n{stderr}")
             };
-            ToolResult::success(content)
+            ToolResult::success(content).with_data(data.clone())
         } else {
             let error_msg = if stderr.is_empty() {
                 format!("Command failed with exit code: {:?}", output.status.code())
@@ -140,7 +155,7 @@ impl Tool for ExecTool {
                 success: false,
                 content: stdout.to_string(),
                 error: Some(error_msg),
-                data: None,
+                data: Some(data),
             }
         };
 

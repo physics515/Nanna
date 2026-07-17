@@ -1,6 +1,6 @@
 //! File operation tools
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult};
+use crate::{output_schemas, Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -69,6 +69,13 @@ impl Tool for ReadFileTool {
             .string_param("path", "Path to the file to read", true)
             .int_param("offset", "Line number to start reading from (1-indexed)", false)
             .int_param("limit", "Maximum number of lines to read", false)
+            .enum_param(
+                "output_mode",
+                "text (default) or json — json returns structured metadata + content",
+                false,
+                &["text", "json"],
+            )
+            .with_output_schema(output_schemas::read_file())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -117,13 +124,15 @@ impl Tool for ReadFileTool {
             lines.into_iter().skip(offset).collect()
         };
 
+        let lines_returned = selected.len();
         let result_content = selected.join("\n");
 
-        Ok(ToolResult::success(result_content).with_data(serde_json::json!({
+        Ok(ToolResult::success(result_content.clone()).with_data(serde_json::json!({
             "path": path_str,
             "total_lines": total_lines,
             "offset": offset + 1,
-            "lines_returned": selected.len(),
+            "lines_returned": lines_returned,
+            "content": result_content,
         })))
     }
 }
@@ -173,6 +182,13 @@ impl Tool for WriteFileTool {
         ToolDefinition::new("write_file", "Write content to a file (creates directories as needed)")
             .string_param("path", "Path to the file to write", true)
             .string_param("content", "Content to write to the file", true)
+            .enum_param(
+                "output_mode",
+                "text (default) or json",
+                false,
+                &["text", "json"],
+            )
+            .with_output_schema(output_schemas::write_file())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -204,7 +220,10 @@ impl Tool for WriteFileTool {
             "Successfully wrote {} bytes to {}",
             content.len(),
             path_str
-        )))
+        )).with_data(serde_json::json!({
+            "path": path_str,
+            "bytes_written": content.len(),
+        })))
     }
 }
 
@@ -237,6 +256,13 @@ impl Tool for ListDirTool {
         ToolDefinition::new("list_dir", "List contents of a directory")
             .string_param("path", "Path to the directory to list", true)
             .bool_param("recursive", "List recursively (default: false)", false)
+            .enum_param(
+                "output_mode",
+                "text (default) or json — json returns structured entry list",
+                false,
+                &["text", "json"],
+            )
+            .with_output_schema(output_schemas::list_dir())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -302,10 +328,26 @@ impl Tool for ListDirTool {
         }
 
         entries.sort();
+        let structured: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                // entries are formatted as "[kind] name"
+                if let Some(rest) = e.strip_prefix('[') {
+                    if let Some((kind, name)) = rest.split_once("] ") {
+                        return serde_json::json!({
+                            "name": name,
+                            "kind": kind,
+                        });
+                    }
+                }
+                serde_json::json!({ "name": e, "kind": "other" })
+            })
+            .collect();
         Ok(ToolResult::success(entries.join("\n")).with_data(serde_json::json!({
             "path": path_str,
             "count": entries.len(),
             "recursive": recursive,
+            "entries": structured,
         })))
     }
 }

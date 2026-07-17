@@ -522,15 +522,27 @@ CDC message-level dedup, per-model stats tracker + persistence + stats-informed 
       (`AgentContext::compress_older_tool_results` / `Agent::compress_older_context_tool_results`)
       before the prior `drop_oldest` fallback. Note: sentence-level scoring (not per-token perplexity)
       — practical on chat-completion APIs where raw logprobs aren't exposed.*
-- [ ] **Structured tool output schemas** — audit tool verbosity, optional `output_schema` on `ToolDefinition`, JSON output mode.
-- [~] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
+- [x] **Structured tool output schemas** — audit tool verbosity, optional `output_schema` on `ToolDefinition`, JSON output mode.
+      *(2026-07-17) Done end-to-end. `ToolDefinition::output_schema` + `with_output_schema`;
+      `nanna_tools::output::{format_tool_output, wants_json_output, schemas}` with registry-side
+      JSON rewrite of successful results. Audited verbose tools (`read_file`, `write_file`,
+      `list_dir`, `exec`, `code_search`, `project_structure`, `web_search`, `web_fetch`) all
+      declare schemas, accept `output_mode=text|json`, and attach structured `data` via
+      `ToolResult::with_data`. Default remains free-form text.*
+- [x] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
       multipliers (3.5 code / 4 English / 2 CJK); account for per-message framing (~100 tok) and
       truncation-marker text. Current heuristic causes ~20–30% overflow/underutilization.
       *(2026-07-07) First pass in `nanna-llm`: `estimate_tokens` is now character-class aware
       (ASCII ~4 chars/token via `div_ceil`; wide/CJK ~1 token/char — fixes the byte-`len()/4`
       CJK under-count that was the main overflow source), and `estimate_request_tokens` adds
-      `MESSAGE_FRAMING_TOKENS` (4) per message. Tests cover ASCII/CJK/mixed + framing. Still TODO:
-      a real tiktoken path and code-vs-English (3.5) differentiation.*
+      `MESSAGE_FRAMING_TOKENS` (4) per message. Tests cover ASCII/CJK/mixed + framing.
+      (2026-07-17) Residual TODOs closed. Family-aware estimators
+      (`TokenContentFamily::{English,Code,Auto}` with 4.0/3.5/1.0 densities + auto density
+      scan for code-ish punctuation) and a real `tiktoken-rs` path
+      (`estimate_tokens_exact` / `estimate_tokens_for_model`, default-on `tiktoken` feature,
+      o200k then cl100k / `bpe_for_model`). Tool-use / input blocks route through the Code
+      family. `nanna-agent` context + chunker now call the family-aware helpers. Tests cover
+      English vs Code vs Auto-JSON, framing, and exact smoke path.*
 - [x] Streaming cache tracking (`loop_runner.rs:834`) — parse usage from `message_start` for accurate cache stats.
       *(2026-07-06) `StreamEvent::MessageStart` now carries `input_tokens`/`cache_read_tokens`/`cache_creation_tokens` (parsed from the Anthropic `message_start` usage object; zero for providers that don't report it); the streaming loop captures them into `LlmResult` instead of the old `input_tokens: 100` + zero-cache placeholders. 2 tests on `parse_sse_event` (with/without usage).*
 

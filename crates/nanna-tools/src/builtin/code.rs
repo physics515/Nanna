@@ -3,7 +3,7 @@
 //! These tools return compact summaries of code structure rather than full file contents,
 //! saving significant context space when the agent only needs to understand structure.
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult};
+use crate::{output_schemas, Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
@@ -248,6 +248,13 @@ impl Tool for CodeSearchTool {
         .string_param("file_pattern", "Glob pattern to filter files (e.g. '*.rs', '*.py').", false)
         .int_param("context_lines", "Lines of context before/after each match (default: 2).", false)
         .int_param("max_results", "Maximum number of matches to return (default: 50).", false)
+        .enum_param(
+            "output_mode",
+            "text (default) or json — json returns structured match list",
+            false,
+            &["text", "json"],
+        )
+        .with_output_schema(output_schemas::code_search())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -283,6 +290,7 @@ impl Tool for CodeSearchTool {
         }).flatten();
 
         let mut results = Vec::new();
+        let mut structured_matches: Vec<serde_json::Value> = Vec::new();
         let mut files_searched = 0;
         let mut total_matches = 0;
 
@@ -343,6 +351,11 @@ impl Tool for CodeSearchTool {
                         let marker = if j == i { ">" } else { " " };
                         match_block.push_str(&format!("{} {:>4} | {}\n", marker, j + 1, lines[j]));
                     }
+                    structured_matches.push(serde_json::json!({
+                        "file": path.display().to_string(),
+                        "line": i + 1,
+                        "text": *line,
+                    }));
                     results.push(match_block);
                 }
             }
@@ -359,7 +372,13 @@ impl Tool for CodeSearchTool {
             results.len().min(max_results)
         );
 
-        Ok(ToolResult::success(format!("{}{}", header, results.join("\n"))))
+        Ok(ToolResult::success(format!("{}{}", header, results.join("\n"))).with_data(serde_json::json!({
+            "pattern": pattern_str,
+            "path": search_path,
+            "total_matches": total_matches,
+            "files_searched": files_searched,
+            "matches": structured_matches,
+        })))
     }
 
     fn timeout_secs(&self) -> Option<u64> {
@@ -394,6 +413,13 @@ impl Tool for ProjectStructureTool {
         )
         .string_param("path", "Root directory to scan (default: current dir).", false)
         .int_param("max_depth", "Maximum directory depth (default: 3).", false)
+        .enum_param(
+            "output_mode",
+            "text (default) or json — json returns totals + tree",
+            false,
+            &["text", "json"],
+        )
+        .with_output_schema(output_schemas::project_structure())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -473,7 +499,13 @@ impl Tool for ProjectStructureTool {
             total_lines
         ));
 
-        Ok(ToolResult::success(output.join("\n")))
+        Ok(ToolResult::success(output.join("\n")).with_data(serde_json::json!({
+            "path": root,
+            "total_files": total_files,
+            "total_size": total_size,
+            "total_lines": total_lines,
+            "tree": output.join("\n"),
+        })))
     }
 
     fn timeout_secs(&self) -> Option<u64> {

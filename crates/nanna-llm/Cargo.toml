@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["tiktoken"]
 auto-refresh = ["nanna-config"]
+# Exact OpenAI BPE counts via tiktoken-rs (o200k_base / cl100k_base).
+# The default heuristic remains always available and is used as a fallback.
+tiktoken = ["dep:tiktoken-rs"]
 
 [dependencies]
 tokio.workspace = true
@@ -20,3 +23,6 @@ directories = "6"
 
 # Optional: for OAuth auto-refresh
 nanna-config = { path = "../nanna-config", optional = true }
+
+# Optional exact OpenAI token counting
+tiktoken-rs = { version = "0.12", optional = true }

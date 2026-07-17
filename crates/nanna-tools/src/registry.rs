@@ -1,6 +1,6 @@
 //! Tool registry for managing available tools
 
-use crate::{Tool, ToolCall, ToolDefinition, ToolResponse, ToolResult, OutputTarget};
+use crate::{Tool, ToolCall, ToolDefinition, ToolResponse, ToolResult, OutputTarget, format_tool_output};
 use crate::skills::{load_skill, discover_skills};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -428,7 +428,19 @@ impl ToolRegistry {
         };
 
         let duration_ms = start.elapsed().as_millis();
-        
+
+        // Prefer compact structured data when the call requested JSON output
+        // and the tool attached an `output_schema` / structured `data` payload.
+        // Text mode (default) is untouched — content stays as the tool wrote it.
+        let mut result = result;
+        if result.success {
+            let def = tool.definition();
+            let formatted = format_tool_output(&result, Some(&def), &parameters);
+            if formatted != result.content {
+                result.content = formatted;
+            }
+        }
+
         // Log result summary
         let output_preview = if result.content.len() > 200 {
             let end = truncate_boundary(&result.content, 200);

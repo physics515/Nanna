@@ -1,6 +1,6 @@
 //! Web-related tools
 
-use crate::{Tool, ToolDefinition, ToolError, ToolResult};
+use crate::{output_schemas, Tool, ToolDefinition, ToolError, ToolResult};
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde::Deserialize;
@@ -55,6 +55,13 @@ impl Tool for WebSearchTool {
         ToolDefinition::new("web_search", "Search the web using Brave Search API")
             .string_param("query", "Search query string", true)
             .int_param("count", "Number of results to return (1-10)", false)
+            .enum_param(
+                "output_mode",
+                "text (default) or json — json returns structured result list",
+                false,
+                &["text", "json"],
+            )
+            .with_output_schema(output_schemas::web_search())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -120,9 +127,22 @@ impl Tool for WebSearchTool {
             ));
         }
 
+        let structured: Vec<serde_json::Value> = results
+            .iter()
+            .take(count)
+            .map(|r| {
+                serde_json::json!({
+                    "title": r.title,
+                    "url": r.url,
+                    "description": r.description,
+                })
+            })
+            .collect();
+
         Ok(ToolResult::success(output).with_data(serde_json::json!({
             "query": query,
-            "result_count": results.len(),
+            "result_count": structured.len(),
+            "results": structured,
         })))
     }
 }
@@ -296,6 +316,13 @@ impl Tool for WebFetchTool {
         ToolDefinition::new("web_fetch", "Fetch and extract readable content from a URL")
             .string_param("url", "HTTP or HTTPS URL to fetch", true)
             .int_param("max_chars", "Maximum characters to return", false)
+            .enum_param(
+                "output_mode",
+                "text (default) or json — json returns url/title/content",
+                false,
+                &["text", "json"],
+            )
+            .with_output_schema(output_schemas::web_fetch())
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
@@ -352,10 +379,12 @@ impl Tool for WebFetchTool {
             text
         };
 
-        Ok(ToolResult::success(truncated).with_data(serde_json::json!({
+        Ok(ToolResult::success(truncated.clone()).with_data(serde_json::json!({
             "url": url,
             "status": status.as_u16(),
             "original_length": content.len(),
+            "chars": truncated.len(),
+            "content": truncated,
         })))
     }
 

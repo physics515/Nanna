@@ -1,7 +1,7 @@
 //! Agent context management
 
 use crate::chunker::Chunk;
-use nanna_llm::{AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient, ModelInfo, RequestBuilder};
+use nanna_llm::{estimate_tokens, estimate_tokens_for_family, AnthropicMessage, AnthropicRequest, ContentBlock, LlmClient, ModelInfo, RequestBuilder, TokenContentFamily};
 use nanna_workspace::{Workspace, WorkspaceFiles};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -600,8 +600,9 @@ impl AgentContext {
     /// than hitting a 400 context_length_exceeded error mid-run.
     #[must_use]
     pub fn estimate_tokens(&self) -> usize {
-        let system_tokens = estimate_token_count(self.system_prompt.len());
-        let summary_tokens: usize = self.summaries.iter().map(|s| estimate_token_count(s.summary.len())).sum();
+        // Family-aware heuristic from nanna-llm (ASCII English/code + CJK density).
+        let system_tokens = estimate_tokens(&self.system_prompt);
+        let summary_tokens: usize = self.summaries.iter().map(|s| estimate_tokens(&s.summary)).sum();
         let message_tokens: usize = self
             .messages
             .iter()
@@ -609,13 +610,16 @@ impl AgentContext {
                 m.content
                     .iter()
                     .map(|c| match c {
-                        ContentBlock::Text { text } => estimate_token_count(text.len()),
+                        ContentBlock::Text { text } => estimate_tokens(text),
                         ContentBlock::ToolUse { input, .. } => {
-                            estimate_token_count(input.to_string().len()) + 50
+                            estimate_tokens_for_family(
+                                &input.to_string(),
+                                TokenContentFamily::Code,
+                            ) + 50
                         }
-                        ContentBlock::ToolResult { content, .. } => estimate_token_count(content.len()) + 20,
+                        ContentBlock::ToolResult { content, .. } => estimate_tokens(content) + 20,
                         ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
-                        ContentBlock::Thinking { thinking, .. } => estimate_token_count(thinking.len()),
+                        ContentBlock::Thinking { thinking, .. } => estimate_tokens(thinking),
                     })
                     .sum::<usize>()
             })
