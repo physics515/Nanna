@@ -31,9 +31,9 @@ pub use service::{
     MemoryStats, MemoryListEntry, ConsolidationBands,
 };
 pub use retention::{
-    measure_recall, run_retention_cycle, CorpusParams, RetentionCorpus,
-    RetentionMeasurement, RetentionProbe, RetentionReport, topic_centroid,
-    TOPIC_METADATA_KEY,
+    measure_gated_recall, measure_recall, run_retention_cycle, CorpusParams,
+    RetentionCorpus, RetentionMeasurement, RetentionProbe, RetentionReport,
+    topic_centroid, TOPIC_METADATA_KEY,
 };
 
 use async_trait::async_trait;

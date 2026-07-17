@@ -212,6 +212,54 @@ where
     Ok((report, result))
 }
 
+/// Measure topic recall through the **FSRS-gated** [`MemoryService::recall`] path
+/// — the one an agent actually uses — rather than raw vector search.
+///
+/// Unlike [`measure_recall`], `recall` drops memories whose FSRS `weight`
+/// (retrievability × importance) is below `min_weight`, and retrievability is
+/// governed by the forgetting-curve decay exponent `w20`. So this measurement is
+/// **`w20`-sensitive**: an over-fast decay exponent marks aged-but-valid memories
+/// "forgotten" and they never surface. Replaying one corpus under two
+/// [`FsrsParameters`](crate::FsrsParameters) and comparing this fraction is the
+/// concrete w20 experiment (see the crate tests).
+///
+/// A probe hits when any returned result carries `topic == probe.topic`. Returns
+/// the hit fraction in `[0, 1]`. `service` must have an embedding function set
+/// (e.g. [`RetentionCorpus::topic_embed_fn`]); probes are turned into `topic:<n>`
+/// query strings that embedding function maps back to the topic centroid.
+///
+/// # Errors
+/// Propagates any [`MemoryError`] from the recall path (e.g. no embedding fn).
+pub async fn measure_gated_recall(
+    service: &MemoryService,
+    probes: &[RetentionProbe],
+) -> Result<f32, MemoryError> {
+    let probe_count = probes.len();
+    if probe_count == 0 {
+        return Ok(0.0);
+    }
+
+    let mut hits: usize = 0;
+    for probe in probes {
+        // The corpus's `topic_embed_fn` maps this tag back to the topic centroid.
+        let query = format!("topic:{} recall", probe.topic);
+        let results = service.recall(&query).await?;
+        let hit = results
+            .iter()
+            .any(|r| r.metadata.get(TOPIC_METADATA_KEY) == Some(&probe.topic));
+        if hit {
+            hits += 1;
+        }
+    }
+
+    let fraction = hits as f32 / probe_count as f32;
+    debug_assert!(
+        fraction.is_finite() && (0.0..=1.0).contains(&fraction),
+        "gated recall fraction out of range: {fraction}"
+    );
+    Ok(fraction)
+}
+
 /// A deterministic synthetic corpus of topic clusters plus one probe per topic.
 ///
 /// Several clusters of near-duplicate memories, reproducible from a single `seed`
@@ -250,6 +298,11 @@ pub struct CorpusParams {
     pub era_gap_days: f32,
     /// Initial FSRS stability (days) for each memory.
     pub stability_days: f32,
+    /// Fixed importance for every memory, or `None` to vary it per topic
+    /// (`1.0 + (topic % 3) * 0.5`). A fixed value isolates the effect of the
+    /// FSRS decay exponent in the `w20` recall experiment (where importance must
+    /// be held constant so only retrievability moves).
+    pub importance: Option<f32>,
 }
 
 impl Default for CorpusParams {
@@ -261,6 +314,7 @@ impl Default for CorpusParams {
             age_days: 6.0,
             era_gap_days: 50.0,
             stability_days: 1.0,
+            importance: None,
         }
     }
 }
@@ -294,7 +348,7 @@ impl RetentionCorpus {
             // members bind tightly; across topics they diverge.
             let topic_age_days = params.age_days + topic as f32 * params.era_gap_days;
             let topic_last_access = now - (topic_age_days * 86_400.0) as i64;
-            let topic_importance = 1.0 + (topic % 3) as f32 * 0.5;
+            let topic_importance = params.importance.unwrap_or(1.0 + (topic % 3) as f32 * 0.5);
             let topic_access_count = topic as u32 * 4;
 
             for member in 0..params.per_topic {
@@ -612,6 +666,99 @@ mod tests {
             report.recall_retention() >= 1.0,
             "dreaming lost recall: retention {} ({report:?})",
             report.recall_retention()
+        );
+    }
+
+    /// Build a service whose FSRS decay exponent is `w20`, with the corpus's
+    /// tag-aware embedding function attached so gated recall works.
+    fn service_with_w20(dim: usize, w20: f32, embed: crate::EmbedFn) -> MemoryService {
+        let fsrs = crate::FsrsParameters {
+            w20,
+            ..crate::FsrsParameters::default()
+        };
+        MemoryService::new(MemoryServiceConfig {
+            dimension: dim,
+            fsrs,
+            ..MemoryServiceConfig::default()
+        })
+        .with_embed_fn(embed)
+    }
+
+    #[tokio::test]
+    async fn gated_recall_reaches_fresh_memories() {
+        let dim = 32;
+        let corpus = RetentionCorpus::generate(
+            3,
+            CorpusParams {
+                topic_count: 4,
+                per_topic: 5,
+                dimension: dim,
+                age_days: 0.0,
+                era_gap_days: 0.0,
+                importance: Some(1.0),
+                ..CorpusParams::default()
+            },
+        );
+        let service = service_with_w20(dim, 0.5, corpus.topic_embed_fn());
+        corpus.load_into(&service).await.unwrap();
+
+        // Fresh memories (retrievability ~1) pass the weight gate under any w20.
+        let gated = measure_gated_recall(&service, &corpus.probes)
+            .await
+            .unwrap();
+        assert!(
+            (gated - 1.0).abs() < 1e-6,
+            "fresh gated recall should be perfect, got {gated}"
+        );
+    }
+
+    /// The w20 experiment the harness exists to run: on a heavily-aged corpus,
+    /// the FSRS-5 constant we currently ship (`w20 = 0.5`) decays retrievability
+    /// so fast that valid memories fall below the recall weight gate and vanish,
+    /// while the correct FSRS-6 default (`w20 = 0.0658`) keeps them retrievable.
+    ///
+    /// This is the evidence that flipping the default is an improvement — kept as
+    /// a live gate so a future default change is validated, not guessed.
+    #[tokio::test]
+    async fn w20_experiment_aged_recall() {
+        let dim = 32;
+        // One age, uniform importance, no era spread → w20 is the only variable.
+        let params = CorpusParams {
+            topic_count: 6,
+            per_topic: 4,
+            dimension: dim,
+            age_days: 800.0,
+            era_gap_days: 0.0,
+            stability_days: 1.0,
+            importance: Some(1.0),
+        };
+
+        let corpus = RetentionCorpus::generate(2024, params);
+
+        // Ship-current (wrong) exponent.
+        let svc_fast = service_with_w20(dim, 0.5, corpus.topic_embed_fn());
+        corpus.load_into(&svc_fast).await.unwrap();
+        let recall_fast = measure_gated_recall(&svc_fast, &corpus.probes)
+            .await
+            .unwrap();
+
+        // FSRS-6 default exponent.
+        let svc_slow = service_with_w20(dim, 0.0658, corpus.topic_embed_fn());
+        corpus.load_into(&svc_slow).await.unwrap();
+        let recall_slow = measure_gated_recall(&svc_slow, &corpus.probes)
+            .await
+            .unwrap();
+
+        // The FSRS-6 exponent keeps every aged topic retrievable...
+        assert!(
+            recall_slow >= 0.99,
+            "FSRS-6 w20 should still recall aged memories, got {recall_slow}"
+        );
+        // ...while the ship-current fast-decay exponent has lost some of them.
+        assert!(
+            recall_fast < recall_slow,
+            "fast decay (w20=0.5) should lose aged recall the FSRS-6 default keeps: \
+             fast={recall_fast} slow={recall_slow}"
         );
     }
 }

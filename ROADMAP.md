@@ -1256,6 +1256,17 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             recalls better, and it is exactly the "measure, don't guess" case. Then fit `w0..w20` from the
             accumulated access history rather than any static default (see the 2026-07-06 note above).
             Source: [awesome-fsrs — The Algorithm](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
+      - [~] *(2026-07-17)* **The harness now exists and the evidence is in — the flip is measured, not guessed.**
+            `nanna-memory::retention::measure_gated_recall` measures recall through the FSRS-gated
+            `MemoryService::recall` path (the one that drops memories whose `weight = retrievability × importance`
+            is below `min_weight`), so it is `w20`-sensitive unlike raw vector recall. The `w20_experiment_aged_recall`
+            test replays one aged corpus (800 days, uniform importance, `stability = 1`) under both exponents:
+            **`w20 = 0.5` recalls 0/6 topics** (every valid memory decays below the weight gate and vanishes) while
+            **`w20 = 0.0658` recalls 6/6**. That is the "recalls better" proof the flip was gated on. **Still not
+            flipping the live default this run** — the change has wide blast radius (testing-effect, the dream
+            cycle's weight bands, `retrieval_strength`), and several existing tests/corpora encode the fast-decay
+            assumption; flipping needs its own increment that re-baselines those. This increment delivers the gate;
+            the flip is the next, deliberate step.
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
