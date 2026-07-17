@@ -761,6 +761,45 @@ impl MemoryService {
         self.store.len().await
     }
 
+    /// Add a fully-formed [`MemoryEntry`] straight to the store, bypassing
+    /// embedding generation and FSRS initialization.
+    ///
+    /// This is for callers that already hold a complete entry with a controlled
+    /// embedding and FSRS state — notably the retention harness
+    /// ([`crate::retention`]), which needs deterministic vectors and aged
+    /// timestamps that the `remember` path (fresh FSRS, model-generated
+    /// embeddings) can't express. The store still normalizes the embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::DimensionMismatch`] if the embedding's length does
+    /// not match the store dimension.
+    pub async fn add_entry(&self, entry: MemoryEntry) -> Result<(), MemoryError> {
+        debug_assert!(!entry.embedding.is_empty(), "add_entry with empty embedding");
+        self.store.add(entry).await
+    }
+
+    /// Raw top-`k` vector search by a pre-computed query embedding.
+    ///
+    /// Unlike [`Self::recall`], this bypasses the string→embedding step and the
+    /// `min_score`/`min_weight` recall gating, returning the store's raw
+    /// cosine-nearest entries. It exists so the retention harness
+    /// ([`crate::retention`]) can measure vector recall directly — isolating a
+    /// dream cycle's effect on retrievability from the recall gating and any
+    /// embedding-model noise.
+    ///
+    /// Returns `(entry, score)` pairs, at most `top_k` of them, score-descending.
+    pub async fn search_by_embedding(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> Vec<(MemoryEntry, f32)> {
+        debug_assert!(top_k >= 1, "search_by_embedding needs a positive top_k");
+        let results = self.store.search(query_embedding, top_k).await;
+        debug_assert!(results.len() <= top_k, "store returned more than top_k results");
+        results
+    }
+
     /// Get memory statistics
     pub async fn stats(&self) -> MemoryStats {
         let entries = self.store.all_entries().await;

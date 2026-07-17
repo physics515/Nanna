@@ -43,11 +43,14 @@ pub struct FsrsParameters {
     pub w19: f32, // Reserved
     /// Forgetting-curve decay exponent.
     ///
-    /// NOTE: the default below is `0.5` — FSRS-4.5/5's hardcoded `DECAY`, **not** an
-    /// FSRS-6 value (FSRS-6's default is `0.0658`, and making this trainable is the
-    /// point of FSRS-6). The curve here is FSRS-6's; only this constant lags. Changing
-    /// it moves live memory behavior, so it is gated on the retention harness — see
-    /// ROADMAP P13.
+    /// Defaults to FSRS-6's `0.0658`. This was previously `0.5` — FSRS-4.5/5's
+    /// hardcoded `DECAY` — mistakenly paired with the FSRS-6 curve, which decayed
+    /// retrievability ~7.6x too fast and made aged-but-valid memories fall below
+    /// the recall weight gate and vanish. The flip was gated on the retention
+    /// harness ([`crate::retention`]): its `w20` experiment showed a 800-day-aged
+    /// corpus recalled 0/6 topics at `0.5` versus 6/6 at `0.0658`. Making this
+    /// exponent *trainable* (fit `w0..=w20` from access history) is the eventual
+    /// FSRS-6 goal — see ROADMAP P13.
     pub w20: f32,
 }
 
@@ -75,8 +78,8 @@ impl Default for FsrsParameters {
             w17: 0.0,
             w18: 0.0,
             w19: 0.0,
-            // FSRS-4.5/5 DECAY; FSRS-6 defaults to 0.0658 — see the field doc.
-            w20: 0.5,
+            // FSRS-6 default decay exponent (was 0.5, the FSRS-5 constant) — see the field doc.
+            w20: 0.0658,
         }
     }
 }

@@ -154,9 +154,26 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 
 - [ ] `nanna-bench` crate (criterion) — unify the existing `nanna-gpu` benches
 - [ ] Define the **agent-eval suite** (the task-success denominator)
-- [ ] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
+- [~] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
+      *(2026-07-17)* **`bench/BASELINE.md` created** — the committed diff-target the routine was missing.
+      First rows seeded from the Suite 3 (dreaming/compression) retention harness: consolidation
+      compression 0.90 @ recall retention 1.000, plus the w20 aged-recall correctness fixture (6/6 vs 0/6).
+      Other suites (inference/vector-search/agent-loop/guardrails/efficiency) are listed as not-yet-baselined.
 - [ ] CI gate — fail a PR that regresses a budget past threshold
-- [ ] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
+- [~] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
+      *(2026-07-17)* **Memory retention harness shipped** (`nanna-memory::retention`) — the instrument the FSRS
+      `w20` fix (P13) is gated on. Measures **topic recall@k** (fraction of probe queries whose raw top-`k`
+      vector neighbours still include a same-topic memory) once before and once after a real `consolidate()`
+      dream cycle, and reports compression alongside `recall_retention` (after/before). Deterministic + offline:
+      a `RetentionCorpus` fabricates topic clusters from a `SplitMix64` seed with per-topic **era + salience +
+      access** separation (so the composite clusterer keeps topics apart instead of merging everything — the
+      non-similarity signals otherwise dominate the fixed clustering weights and cross-cluster). Replay the same
+      corpus under two `FsrsParameters` to compare `recall_retention` — that is the w20 experiment. Added thin
+      `MemoryService::{add_entry, search_by_embedding}` accessors (controlled vectors/aged FSRS + raw top-k,
+      bypassing the recall gating). Demonstration run: **60 → 6 memories (0.90 compression) with recall
+      1.000 → 1.000** (each 10-memory topic collapsed to one, recall perfectly held). 5 unit tests
+      (determinism, tag-parse, ratio-math edge cases incl. empty/appeared, fresh-corpus recall, shrink-while-
+      holding-recall); 51 nanna-memory tests green. Inference parity harness still open (belongs to Mummu).
 - [ ] Perf dashboard — live TTFT / tok-s / VRAM / cache-hit in the GUI
 
 ---
@@ -1219,6 +1236,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       with the correct sign; tally == signal-by-signal reference sum; saturate-not-wrap; boost signs). 38
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
+      - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
+            Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17), the eventual "learn the
+            params from history" step has a ready tool: `fsrs-rs` (6.6.x, 2026-06) exposes
+            `FSRS::compute_parameters(ComputeParametersInput) -> Result<Parameters>`, fed a `Vec<FSRSItem>` where
+            each `FSRSItem` is a review vector of `FSRSReview { rating, delta_t }`. Our `FsrsState.access_count` +
+            the testing-effect `record_access` history is exactly that review stream (map `Rating`→FSRS rating,
+            elapsed-days→`delta_t`); persist per-memory review logs, batch them, call `compute_parameters` during a
+            dream cycle, and replace `FsrsParameters::default()` with the fitted set. Caveat: `fsrs-rs`'s trainer is
+            **Burn-backed** (per the crate's "full training support using Burn" description) — pulling it in adds
+            Burn to `nanna-memory`'s tree, so gate adoption on whether the P12/Mummu Burn stack is already a
+            workspace dependency by then (don't add a second heavy ML dep just for this). Validate any fitted set
+            through the retention harness before it becomes the default, same gate the w20 flip used. Sources:
+            [fsrs-rs](https://github.com/open-spaced-repetition/fsrs-rs), [fsrs crate](https://crates.io/crates/fsrs).
       - [ ] *(research 2026-07-16)* **FSRS-7 exists, but is not reachable from Rust yet — do not plan on it.**
             The benchmark repo documents FSRS-7 as the newest version (first to handle **fractional intervals**;
             forgetting curve now has **8 optimizable parameters**; the only version with realistic same-day-review
@@ -1243,6 +1273,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             recalls better, and it is exactly the "measure, don't guess" case. Then fit `w0..w20` from the
             accumulated access history rather than any static default (see the 2026-07-06 note above).
             Source: [awesome-fsrs — The Algorithm](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
+      - [x] *(2026-07-17)* **Measured, then flipped — `FsrsParameters::default().w20` is now `0.0658`.**
+            `nanna-memory::retention::measure_gated_recall` measures recall through the FSRS-gated
+            `MemoryService::recall` path (the one that drops memories whose `weight = retrievability × importance`
+            is below `min_weight`), so it is `w20`-sensitive unlike raw vector recall. The `w20_experiment_aged_recall`
+            test replays one aged corpus (800 days, uniform importance, `stability = 1`) under both exponents:
+            **`w20 = 0.5` recalls 0/6 topics** (every valid memory decays below the weight gate and vanishes) while
+            **`w20 = 0.0658` recalls 6/6** — the "recalls better" proof the flip was gated on. With that evidence
+            the default was flipped `0.5 → 0.0658` (the correct FSRS-6 value; `0.5` was FSRS-4.5/5's `DECAY`
+            mispaired with the FSRS-6 curve, decaying ~7.6x too fast). Blast radius verified contained: the only
+            w20-sensitive tests are `fsrs.rs` (monotonic decay / literal-accessibility state / stability updates —
+            all w20-agnostic) and the retention consolidation test (re-baselined — under slower decay a corpus must
+            age past a year and hold uniform importance to reach a compressible band; still 60→6, recall 1.0→1.0).
+            nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
+            `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
 - [ ] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
