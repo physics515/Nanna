@@ -41,16 +41,19 @@ use tracing::debug;
 /// against a soft limit computed from the thread's *actual* stack bounds. That is why
 /// depth tracks `stack_size` and why `recursion_limit` never binds first.
 ///
-/// So `sys.setrecursionlimit` is **not** a way for user code to abort the process, and
-/// no clamp is installed on it: the VM's guard already keeps recursion in the catchable
-/// domain, and capping the limit ourselves would only *reduce* the depth legitimate
-/// code may use. `raising_the_recursion_limit_cannot_abort_the_process` pins this.
+/// **That guard is not sufficient on its own, because it tests a *band*, not a floor.**
+/// It fires only while the stack pointer sits within `2 x STACK_MARGIN_BYTES` (32 KiB)
+/// above the stack base, so a frame that advances the pointer by more than the band
+/// steps clean over the check and into the guard page — an uncatchable `abort()`.
+/// Release frames (~2 KiB, above) land inside the band every time. **Debug frames do
+/// not**: with `--features python` in a workspace build, raising the limit and recursing
+/// overflows for real (`thread 'nanna-python' has overflowed its stack`).
 ///
-/// Caveat worth knowing: that guard tests a **band**, not a floor — it fires only while
-/// the stack pointer sits within `2 x STACK_MARGIN_BYTES` (32 KiB) above the stack base.
-/// A single frame that advanced the pointer by more than the band could step over it
-/// and reach the guard page. Measured Python frames (~2 KiB) land inside the band every
-/// time, which is what makes the guarantee above hold in practice.
+/// That is why `build_wrapper` clamps `sys.setrecursionlimit` to the interpreter's own
+/// startup default (256 debug / 1000 release) — the depth this stack is validated at.
+/// User code may lower the limit, not raise it. `raising_the_recursion_limit_cannot_abort_the_process`
+/// pins it, and **fails in debug without the clamp**, so the profile that catches this
+/// is the one `cargo test --workspace` actually runs.
 ///
 /// Cost is bounded and cheap: a thread stack is *reserved* address space committed
 /// lazily by page, so a shallow execution touches only the pages it actually uses —
@@ -298,9 +301,40 @@ fn build_wrapper(user_code: &str, workdir: Option<&str>) -> String {
         .replace('\\', "\\\\")
         .replace("\"\"\"", "\\\"\\\"\\\"");
 
+    // Clamp `sys.setrecursionlimit` before any user code runs.
+    //
+    // The cap is the interpreter's *own* default limit, read at startup — not a number
+    // we invent. That default (256 debug / 1000 release) is the configuration
+    // PYTHON_STACK_BYTES was validated against, so it is exactly the depth we know the
+    // stack survives. User code may lower the limit freely; it may not raise it past
+    // what we tested. CPython's own default is 1000, so this is not an unusual ceiling.
+    //
+    // This is load-bearing, not belt-and-braces: RustPython's native stack guard tests a
+    // *band* (see PYTHON_STACK_BYTES), and a build whose frames are larger than that band
+    // — debug builds are — can step straight over it into the guard page, which aborts
+    // the process uncatchably. `raising_the_recursion_limit_cannot_abort_the_process`
+    // fails without this, in debug.
+    //
+    // The real function is captured in a closure and the installer name deleted, so the
+    // un-clamped original is not reachable by name from the user's globals (`exec` below
+    // shares them). That stops the ordinary footgun and casual abuse; it is not an
+    // escape-proof sandbox — a determined script may still reach the closure cell by
+    // introspection.
+    let recursion_clamp = r#"
+def _nanna_install_recursion_clamp():
+    _real = sys.setrecursionlimit
+    _cap = sys.getrecursionlimit()
+    def _clamped(limit):
+        _real(min(limit, _cap))
+    sys.setrecursionlimit = _clamped
+_nanna_install_recursion_clamp()
+del _nanna_install_recursion_clamp
+"#;
+
     format!(
         r#"
 import sys, io, traceback
+{recursion_clamp}
 {chdir}
 _nanna_stdout_buf = io.StringIO()
 _nanna_stderr_buf = io.StringIO()
@@ -433,6 +467,55 @@ f(0)",
             error.contains("RecursionError"),
             "a raised limit must stay in the catchable domain, got: {error}"
         );
+    }
+
+    /// The clamp lowers an over-large request rather than rejecting it, and pins it to
+    /// the interpreter's own default — so legitimate code that raises the limit keeps
+    /// running, it just cannot exceed the depth this stack is validated for.
+    ///
+    /// Asserted against the default read back at runtime rather than a literal, because
+    /// that default is profile-dependent (256 debug / 1000 release).
+    #[tokio::test]
+    async fn raising_the_recursion_limit_is_clamped_to_the_interpreter_default() {
+        let engine = PythonEngine::new();
+        let result = engine
+            .execute(
+                "import sys
+_default = sys.getrecursionlimit()
+sys.setrecursionlimit(1000000)
+print(sys.getrecursionlimit() == _default, sys.getrecursionlimit())",
+                None,
+                30,
+            )
+            .await
+            .expect("execution completes");
+
+        assert!(result.success, "clamping must not raise: {:?}", result.error);
+        assert!(
+            result.stdout.starts_with("True"),
+            "an over-large request is pinned to the startup default, got: {}",
+            result.stdout.trim()
+        );
+    }
+
+    /// Below the cap, `setrecursionlimit` behaves exactly as stock Python does — the
+    /// clamp is a ceiling, not a rewrite. 100 is under both profiles' defaults.
+    #[tokio::test]
+    async fn lowering_the_recursion_limit_is_untouched() {
+        let engine = PythonEngine::new();
+        let result = engine
+            .execute(
+                "import sys
+sys.setrecursionlimit(100)
+print(sys.getrecursionlimit())",
+                None,
+                30,
+            )
+            .await
+            .expect("execution completes");
+
+        assert!(result.success, "lowering the limit must work: {:?}", result.error);
+        assert_eq!(result.stdout.trim(), "100", "a limit under the cap passes through");
     }
 
     /// A single-threaded Tokio runtime is the worst case for the old design: there is
