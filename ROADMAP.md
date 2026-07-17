@@ -397,8 +397,23 @@ Done: daemon binary + service install, IPC protocol, session persistence, `nanna
 wiring, agent integration, OAuth in daemon, tool-name aliases, webhook server (all endpoints),
 channel listeners (Telegram/Discord/Slack), unified router + response routing, cron system, sub-agent
 scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-authoring. Open:
-- [ ] **End-to-end daemon testing** (High) — start daemon, connect client, run a conversation, verify
+- [~] **End-to-end daemon testing** (High) — start daemon, connect client, run a conversation, verify
       persistence + embedded fallback + reconnection (currently untested).
+      *(2026-07-16)* **First real E2E suite shipped** — `crates/nanna-client/tests/e2e_daemon.rs`, 4 tests
+      driving a real `DaemonServer` over the real WebSocket IPC with a real `Client` (no mocks). Lives in
+      `nanna-client` because it already depends on `nanna-daemon`, so the dependency edge stays one-way.
+      Hermetic by construction: built via `DaemonBuilder` with explicit settings instead of
+      `from_nanna_config`, on an OS-assigned free port + a `TempDir`, with `with_memory(false)` — so a run
+      never reads the developer's `config.toml`/`.db` and needs no API key or reachable model. Covers:
+      daemon boots → client attaches → protocol answers; a created session is visible; **state survives a
+      client disconnect + fresh reattach** (the GUI reconnect path); and **sessions survive a full daemon
+      restart** on the same data dir (durable control plane, not a cache). Stable across 3 consecutive runs.
+      **Found and fixed a real bug:** `Client::disconnect()` only signalled the handler task and returned, so
+      the state flipped to `Disconnected` *asynchronously* — `is_connected()` could still report `Connected`
+      right after `disconnect()` returned, and a `request()` in that window passed the connected check before
+      failing confusingly. It now sets the state itself (the handler still does too; idempotent) and
+      `debug_assert`s the postcondition. Remaining for this item: a real conversation turn (needs a live LLM)
+      and the **embedded-fallback** path (needs a GUI build).
 - [ ] **Per-channel sessions** (High) — map `channel_id:chat_id → session_id` so each chat/DM gets
       isolated context (all messages currently share one context).
 - [~] **Response formatting per channel** — a `ResponseFormatter` driven by `ChannelFeatures` bitflags
@@ -668,17 +683,39 @@ routine should drain first.**
       `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
       `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
 - [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
-- [ ] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
-      *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir)* Boot gets all the
-      way through storage + migrations + `LLM router initialized with 3 providers` + tools dir, then dies:
-      `Error: Config error: Failed to discover embedding dimension: OPENROUTER_API_KEY is required for
-      embedding discovery` — **never reaching "Daemon ready"**. This is the cost of the (correct) 2026-07-15
-      "no hardcoded embedding-dimension table" change: dimension now comes from provider metadata or a live
-      probe, so a config naming a cloud embedding provider makes a **network credential a hard boot
-      dependency**. A local-first daemon must still start without cloud keys. Fix: fall back to a local/Ollama
-      embedder or defer discovery until first embed (degrade memory, don't refuse to boot), and make the
-      failure actionable rather than fatal. Also blocks unattended real-binary verification of any daemon
-      path (this run had to fall back to unit tests + release-profile checks for the `python.exec` fix).
+- [x] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
+      *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir; fixed 2026-07-16)*
+      Boot got all the way through storage + migrations + `LLM router initialized with 3 providers` + tools dir,
+      then died: `Error: Config error: Failed to discover embedding dimension: OPENROUTER_API_KEY is required
+      for embedding discovery` — **never reaching "Daemon ready"**.
+      **The diagnosis above was wrong about the cause.** It was not the 2026-07-15 "no dimension table" change
+      making a credential load-bearing: the daemon **had a perfectly valid OpenRouter key in `config.toml` the
+      whole time**. `get_embedding_dimension` built its *own* client and read the key from
+      `std::env::var(..)` **only**, while the `EmbeddingRouter` that serves every real embed reads
+      `config.llm.openrouter_api_key.or_else(env)` — so the probe reported "missing key" for a key the live
+      path used successfully. It also duplicated provider construction, bypassing the router's **Ollama
+      fallback**, so it couldn't degrade the way real embeds do.
+      **Fix (a deletion, not an addition):** the probe now goes through the *same router the embed path uses*
+      (`probe_embedding_dimension(&EmbeddingRouter)`), which drops the duplicated client construction and
+      inherits both config-or-env key resolution and the Ollama failover. A probe failure is now **non-fatal**:
+      boot logs an actionable warning and seeds a provisional dimension. That is safe because the seed only
+      has to be positive — real vectors always come from the provider, and the **pre-existing background
+      `probe_and_align_dimension`** (added earlier precisely so a cold Ollama couldn't block startup) corrects
+      the store and re-embeds any mismatched entries as soon as a provider answers. The blocking probe is now
+      purely an optimization: when it succeeds, nothing is ever re-embedded.
+      **Verified on the real binary** (`--port 5249 --health-port 5248 --data-dir <scratch>`, no
+      `OPENROUTER_API_KEY` in env, key only in config): `Primary embeddings: OpenRouter` → `Memory service
+      using probed dimension 2048` → **`Daemon ready. IPC server listening`** → `Embedding dimension
+      confirmed: 2048`. 4 unit tests (probe reports the provider's length; empty vector rejected; nothing
+      listening → clean `Err` so boot can degrade; seed is positive) driven against a one-shot localhost
+      server on an OS-assigned port. 48 daemon tests green (was 44); clippy **2081 → 2081** (no new warnings).
+      **This also unblocks unattended real-binary daemon verification**, which had been forcing runs to fall
+      back to unit tests. Not yet exercised end-to-end: the all-providers-unreachable degrade path (needs a
+      host with no Ollama *and* no key) — covered by unit test rather than a live boot.
+      - [ ] **The GUI-embedded path still has the same bug.** `gui/src-tauri/src/lib.rs:217` and `:297` each
+            build their own embedding client and `?` on `Failed to discover embedding dimension`, exactly as
+            the daemon did before this fix. Apply the same treatment (probe through the shared router;
+            degrade instead of fail). Almost certainly related to the two embedded-mode reports below.
 - [ ] **`recall` is broken in embedded mode: "IO error: No embedding function configured".**
       *(user-reported 2026-07-16, with a live transcript)* The agent's `recall` tool fails outright in the
       GUI's embedded mode, so memory search is unavailable exactly where local-first is supposed to work.
@@ -729,12 +766,46 @@ routine should drain first.**
       python tests that could never have passed before).
       Verified: `cargo test --workspace` reaches **0 stack overflows** (was 3); nanna-scripting **29+1 green
       in debug *and* release**; clippy **108 → 101** warnings in-crate, none new.
-      - [ ] **Residual (pre-existing, narrower):** user code can still `sys.setrecursionlimit(...)` above the
-            default and overflow even a 64 MiB stack → uncatchable process abort from model-authored Python.
-            RustPython does not bound native depth itself; `vm.recursion_limit` is a public `Cell<usize>`.
-            Fix options: clamp the limit from the stack budget after `Interpreter::build`, re-clamp around
-            each execution, or reject `setrecursionlimit` in the wrapper. Until then `python.exec` is a
-            DoS vector for untrusted Python. Source: `rustpython-vm-0.5.0/src/vm/mod.rs:737`.
+      *(2026-07-16 correction — the sizing model above is wrong; the fix and the 256 MiB value stand.)*
+      Re-measured on the real engine in **release** by reading back the depth actually reached: **64 MiB →
+      32,727 frames, 256 MiB → 131,004 frames**. Depth scales **linearly** with the stack (4x → 4.00x), so a
+      *release* frame costs **~2 KiB**, not the 64–128 KiB inferred above. `stack_needed = recursion_limit x
+      per_frame` is **not** the binding rule: the VM's own stack guard fires first (see the closed residual
+      below), so `recursion_limit` never binds — which also means the "overflows at / passes at" bisection
+      above was measuring the guard's *band* behavior, not a per-frame budget. The full **release** suite
+      (incl. runaway recursion) also passes at **64 MiB** with no `STATUS_ACCESS_VIOLATION`, so that recorded
+      segfault did not reproduce in release. **Debug is the profile that still overflows** (frames there
+      exceed the guard's 32 KiB band), which is what the recorded debug numbers were really detecting.
+      The honest justification for a large stack is that interpreter **setup** overflowed Tokio's 2 MiB
+      (`print('hello')` aborted) — a cost never measured separately. `PYTHON_STACK_BYTES` stays **256 MiB**:
+      measured-good, and a lazily-committed reservation is effectively free. It is no longer claimed to be
+      derived from the recursion limit.
+      - [ ] Measure interpreter **setup** stack cost separately (the only term that actually justifies the
+            size), then right-size `PYTHON_STACK_BYTES` and its `const _` floor against *that* number instead
+            of the disproved per-frame model. Re-measure in `--release`.
+      - [x] **Residual: `sys.setrecursionlimit` could abort the process.** **(fixed 2026-07-16 — clamped.)**
+            The item was **right that the DoS is real, wrong about why**, and an intermediate attempt this run
+            wrongly "disproved" it on release-only evidence. The corrected picture, all measured:
+            RustPython *does* bound native depth — `VirtualMachine::check_c_stack_overflow`
+            (`rustpython-vm-0.5.0/src/vm/mod.rs:1520`), a CPython `_Py_MakeRecCheck` port run on every
+            recursive call from `with_recursion`, comparing the live `psm::stack_pointer()` against a soft
+            limit derived from the thread's **actual** stack bounds. That is why depth ∝ `stack_size`
+            (measured: **64 MiB → 32,727 frames, 256 MiB → 131,004** — 4x stack, 4.00x depth, ~2 KiB/frame).
+            **But that guard tests a *band*, not a floor**: it fires only while the stack pointer is within
+            `2 x STACK_MARGIN_BYTES` (2048 x `usize` = 16 KiB → a **32 KiB** window) above the stack base
+            (`vm/mod.rs:1503-1527`). A frame that advances the pointer further than the window steps **over**
+            the check into the guard page. Release frames (~2 KiB) always land inside the band — which is why
+            release looked immune and the "disproof" was believable. **Debug frames do not**: under
+            `cargo test --workspace` (which unifies `python` on) the probe aborted for real —
+            `thread 'nanna-python' has overflowed its stack`.
+            **Fix:** `build_wrapper` clamps `sys.setrecursionlimit` to the interpreter's **own startup
+            default** (256 debug / 1000 release) — read at runtime, not an invented constant, and exactly the
+            depth `PYTHON_STACK_BYTES` is validated at. Lowering still works; raising is pinned. The real
+            function is captured in a closure and the installer name deleted, so it is not reachable by name
+            from user globals (best-effort, not an escape-proof sandbox).
+            Pinned by `raising_the_recursion_limit_cannot_abort_the_process`, which **aborts in debug without
+            the clamp** — i.e. the profile `cargo test --workspace` actually runs is the one that catches it.
+            nanna-scripting **32+1 green in debug *and* release**.
 - [x] **Env-flaky test** `credentials::tests::test_secure_store_file_fallback` (`nanna-config`) — `set` succeeds but `get` fails under a headless OS keyring, so `cargo test` is red in unattended runs. Make the file-fallback path deterministic for tests (temp store dir / feature flag) so it doesn't depend on an interactive keyring. *(discovered 2026-07-06)*
       *(2026-07-07) Added `SecureStore::file_only_at(dir)` — a keyring-bypassing, file-store-only mode
       rooted at an explicit dir. `get`/`set`/`delete` short-circuit to the file helpers; the three file
@@ -754,6 +825,15 @@ routine should drain first.**
       `env_overrides_config_tools_dir`, pinning the documented env-beats-config precedence that was never
       tested and is only safely testable now. **`cargo test --workspace` is now green end-to-end: exit 0,
       0 overflows, 0 failed suites, 378 tests / 41 suites.**
+      *(2026-07-16 correction)* That "0 overflows" held only because **no test raised the recursion limit**.
+      Adding one (`raising_the_recursion_limit_cannot_abort_the_process`) re-surfaced a real
+      `thread 'nanna-python' has overflowed its stack` under `cargo test --workspace` — the RustPython stack
+      guard is a 32 KiB band that *debug* frames step over (see the P11 residual above). Closed by clamping
+      `sys.setrecursionlimit` to the interpreter's startup default. Current tally, all suites that build
+      without the GUI's staged artifacts: **`cargo test --workspace --exclude nanna-gui` → exit 0, 39 suites,
+      385 passed, 0 failed, 0 overflows.** (`nanna-gui` needs the sidecar + built frontend staged first — see
+      the build-env note under *Immediate next actions* #2 — so a bare `cargo test --workspace` still fails in
+      its build script, not in a test.)
 - [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.
 
 **Architecture debt:**
@@ -1047,6 +1127,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             Algorithm page still documents FSRS-6 only.) Sources:
             [srs-benchmark](https://github.com/open-spaced-repetition/srs-benchmark),
             [fsrs-rs PR #395](https://github.com/open-spaced-repetition/fsrs-rs/pull/395).
+      - [ ] *(research 2026-07-16)* **We ship the FSRS-6 curve with the FSRS-5 decay constant — `w20` is wrong
+            by ~7.6x.** `nanna-memory/src/fsrs.rs` implements the FSRS-6 forgetting curve *exactly*
+            (`R(t,S) = (1 + factor·t/S)^(-w20)` with `factor = 0.9^(-1/w20) - 1`, `power_law_retrievability`),
+            but defaults `w20: 0.5` — commented "typically 0.5", which is in fact **FSRS-4.5/5's hardcoded
+            `DECAY = -0.5`**, not an FSRS-6 value. **FSRS-6's default `w20` is `0.0658`**; making that exponent
+            trainable is the entire point of the version we claim to implement. A 0.5 exponent decays
+            retrievability far faster than FSRS-6 intends, so every consumer of retrievability is skewed:
+            testing-effect reinforcement, the FSRS weight bands the dream cycle clusters by, and
+            `retrieval_strength`. **Do not blind-flip the constant**: it changes live memory behavior, so land
+            it behind the **memory retention harness** (recall before/after a dream cycle) already listed under
+            *Performance & Benchmarking* — that harness is the instrument that tells us whether 0.0658 actually
+            recalls better, and it is exactly the "measure, don't guess" case. Then fit `w0..w20` from the
+            accumulated access history rather than any static default (see the 2026-07-06 note above).
+            Source: [awesome-fsrs — The Algorithm](https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm).
 - [ ] **Local dreaming** — run `summarize_fn` on the local Burn model (P12) so consolidation is fully offline; persist the `SummaryCache` (currently in-memory, lost on restart).
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
@@ -1221,5 +1315,9 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
 6. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
 7. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
 8. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
-9. **End-to-end daemon test** (P8) — the daemon/embedded/reconnect story is still unverified.
+9. **End-to-end daemon test** (P8) — ~~the daemon/embedded/reconnect story is still unverified~~ **mostly
+   done (2026-07-16)**: a hermetic 4-test E2E suite (`crates/nanna-client/tests/e2e_daemon.rs`) now covers
+   start → connect → session state → client reconnect → **daemon restart persistence**, and caught a real
+   `Client::disconnect()` state bug. Still open: a real conversation turn (needs a live LLM) and the
+   **embedded-fallback** path (needs a GUI build).
 

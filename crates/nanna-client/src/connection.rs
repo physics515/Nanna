@@ -261,9 +261,18 @@ impl Client {
         }
     }
     
-    /// Disconnect from daemon
+    /// Disconnect from daemon.
+    ///
+    /// On return the client reports `Disconnected` and `request()` fails fast with
+    /// `NotConnected`. The state is set here rather than left to the handler task:
+    /// signalling shutdown only *asks* that task to stop, so a caller that checked
+    /// `is_connected()` (or issued a request) immediately after `disconnect()` could
+    /// still observe `Connected` and send into a socket that is going away. The
+    /// handler sets the same state when it winds down; doing it twice is harmless.
     pub async fn disconnect(&self) {
+        *self.state.write().await = ConnectionState::Disconnected;
         let _ = self.shutdown_tx.send(());
+        debug_assert!(!self.is_connected().await, "disconnect() leaves the client disconnected");
     }
     
     // =========================================================================

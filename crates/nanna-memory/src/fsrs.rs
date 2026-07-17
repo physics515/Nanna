@@ -41,7 +41,14 @@ pub struct FsrsParameters {
     pub w17: f32, // Long-term stability factor
     pub w18: f32, // Forgetting curve decay
     pub w19: f32, // Reserved
-    pub w20: f32, // Decay exponent (typically 0.5)
+    /// Forgetting-curve decay exponent.
+    ///
+    /// NOTE: the default below is `0.5` — FSRS-4.5/5's hardcoded `DECAY`, **not** an
+    /// FSRS-6 value (FSRS-6's default is `0.0658`, and making this trainable is the
+    /// point of FSRS-6). The curve here is FSRS-6's; only this constant lags. Changing
+    /// it moves live memory behavior, so it is gated on the retention harness — see
+    /// ROADMAP P13.
+    pub w20: f32,
 }
 
 impl Default for FsrsParameters {
@@ -68,7 +75,8 @@ impl Default for FsrsParameters {
             w17: 0.0,
             w18: 0.0,
             w19: 0.0,
-            w20: 0.5, // Decay exponent
+            // FSRS-4.5/5 DECAY; FSRS-6 defaults to 0.0658 — see the field doc.
+            w20: 0.5,
         }
     }
 }
