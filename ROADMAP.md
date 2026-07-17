@@ -1232,6 +1232,19 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       with the correct sign; tally == signal-by-signal reference sum; saturate-not-wrap; boost signs). 38
       nanna-memory tests green, net −2 clippy warnings, full workspace builds green, real daemon boot healthy.
       - [ ] *(research 2026-07-06)* **FSRS-6** (late-2025, trained on ~700M reviews) has **17 trainable weights + `w20`** governing the forgetting-curve *shape*; ~20-30% fewer reviews for equal retention. Learn w0-w20 (incl. w20) from the accumulated feedback signals rather than static params. Source: [expertium benchmark](https://expertium.github.io/Benchmark.html).
+      - [ ] *(research 2026-07-17)* **Don't hand-roll the w0..=w20 fit — `fsrs-rs` already ships the optimizer.**
+            Now that the default `w20` is the correct FSRS-6 value (fixed 2026-07-17), the eventual "learn the
+            params from history" step has a ready tool: `fsrs-rs` (6.6.x, 2026-06) exposes
+            `FSRS::compute_parameters(ComputeParametersInput) -> Result<Parameters>`, fed a `Vec<FSRSItem>` where
+            each `FSRSItem` is a review vector of `FSRSReview { rating, delta_t }`. Our `FsrsState.access_count` +
+            the testing-effect `record_access` history is exactly that review stream (map `Rating`→FSRS rating,
+            elapsed-days→`delta_t`); persist per-memory review logs, batch them, call `compute_parameters` during a
+            dream cycle, and replace `FsrsParameters::default()` with the fitted set. Caveat: `fsrs-rs`'s trainer is
+            **Burn-backed** (per the crate's "full training support using Burn" description) — pulling it in adds
+            Burn to `nanna-memory`'s tree, so gate adoption on whether the P12/Mummu Burn stack is already a
+            workspace dependency by then (don't add a second heavy ML dep just for this). Validate any fitted set
+            through the retention harness before it becomes the default, same gate the w20 flip used. Sources:
+            [fsrs-rs](https://github.com/open-spaced-repetition/fsrs-rs), [fsrs crate](https://crates.io/crates/fsrs).
       - [ ] *(research 2026-07-16)* **FSRS-7 exists, but is not reachable from Rust yet — do not plan on it.**
             The benchmark repo documents FSRS-7 as the newest version (first to handle **fractional intervals**;
             forgetting curve now has **8 optimizable parameters**; the only version with realistic same-day-review
