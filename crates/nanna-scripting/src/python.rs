@@ -36,10 +36,12 @@ use tracing::debug;
 /// with `sys.setrecursionlimit(1_000_000)` still raised `RecursionError` at the
 /// stack-derived depth above (131,004 on 256 MiB) rather than overflowing. The
 /// mechanism is `VirtualMachine::check_c_stack_overflow`
-/// (`rustpython-vm-0.5.0/src/vm/mod.rs:1520`), a CPython `_Py_MakeRecCheck` port run on
+/// (`rustpython-vm-0.5.0/src/vm/mod.rs:1520`), a `CPython` `_Py_MakeRecCheck` port, run on
 /// **every** recursive call: it compares the live stack pointer (`psm::stack_pointer()`)
 /// against a soft limit computed from the thread's *actual* stack bounds. That is why
-/// depth tracks `stack_size` and why `recursion_limit` never binds first.
+/// the reachable depth tracks `stack_size` at all. (At the *default* limit the limit
+/// binds first and the guard never comes up; it only matters once user code raises the
+/// limit past what the stack holds — which is the case this whole section is about.)
 ///
 /// **That guard is not sufficient on its own, because it tests a *band*, not a floor.**
 /// It fires only while the stack pointer sits within `2 x STACK_MARGIN_BYTES` (32 KiB)
@@ -320,7 +322,7 @@ fn build_wrapper(user_code: &str, workdir: Option<&str>) -> String {
     // shares them). That stops the ordinary footgun and casual abuse; it is not an
     // escape-proof sandbox — a determined script may still reach the closure cell by
     // introspection.
-    let recursion_clamp = r#"
+    let recursion_clamp = r"
 def _nanna_install_recursion_clamp():
     _real = sys.setrecursionlimit
     _cap = sys.getrecursionlimit()
@@ -329,7 +331,7 @@ def _nanna_install_recursion_clamp():
     sys.setrecursionlimit = _clamped
 _nanna_install_recursion_clamp()
 del _nanna_install_recursion_clamp
-"#;
+";
 
     format!(
         r#"
