@@ -156,7 +156,20 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Define the **agent-eval suite** (the task-success denominator)
 - [ ] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
 - [ ] CI gate — fail a PR that regresses a budget past threshold
-- [ ] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
+- [~] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
+      *(2026-07-17)* **Memory retention harness shipped** (`nanna-memory::retention`) — the instrument the FSRS
+      `w20` fix (P13) is gated on. Measures **topic recall@k** (fraction of probe queries whose raw top-`k`
+      vector neighbours still include a same-topic memory) once before and once after a real `consolidate()`
+      dream cycle, and reports compression alongside `recall_retention` (after/before). Deterministic + offline:
+      a `RetentionCorpus` fabricates topic clusters from a `SplitMix64` seed with per-topic **era + salience +
+      access** separation (so the composite clusterer keeps topics apart instead of merging everything — the
+      non-similarity signals otherwise dominate the fixed clustering weights and cross-cluster). Replay the same
+      corpus under two `FsrsParameters` to compare `recall_retention` — that is the w20 experiment. Added thin
+      `MemoryService::{add_entry, search_by_embedding}` accessors (controlled vectors/aged FSRS + raw top-k,
+      bypassing the recall gating). Demonstration run: **60 → 6 memories (0.90 compression) with recall
+      1.000 → 1.000** (each 10-memory topic collapsed to one, recall perfectly held). 5 unit tests
+      (determinism, tag-parse, ratio-math edge cases incl. empty/appeared, fresh-corpus recall, shrink-while-
+      holding-recall); 51 nanna-memory tests green. Inference parity harness still open (belongs to Mummu).
 - [ ] Perf dashboard — live TTFT / tok-s / VRAM / cache-hit in the GUI
 
 ---
