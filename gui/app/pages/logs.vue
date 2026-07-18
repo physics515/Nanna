@@ -13,6 +13,11 @@
             <ChevronDown class="w-3.5 h-3.5" />
             {{ autoScroll ? 'Auto-scroll' : 'Manual' }}
           </UiGlassButton>
+          <!-- Copy all logs button -->
+          <UiGlassButton pill size="xs" :disabled="logs.length === 0" @click="copyAllLogs">
+            <Copy class="w-3.5 h-3.5" />
+            {{ copyLabel }}
+          </UiGlassButton>
           <!-- Clear button -->
           <UiGlassButton pill size="xs" @click="clearLogs">
             <Trash2 class="w-3.5 h-3.5" />
@@ -101,7 +106,8 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { ChevronDown, Trash2, Circle } from 'lucide-vue-next'
+import { ChevronDown, Trash2, Circle, Copy } from 'lucide-vue-next'
+import { toast } from 'vue-sonner'
 
 type LogSource = 'embedded' | 'daemon'
 
@@ -125,6 +131,8 @@ const autoScroll = ref(true)
 const liveMode = ref(true)
 const isLoading = ref(false)
 const lastUpdate = ref<Date | null>(null)
+const copyLabel = ref('Copy all')
+let copyLabelTimer: ReturnType<typeof setTimeout> | null = null
 
 // Lines at or before this timestamp were cleared by the user and must not come
 // back on the next poll. Clearing hides history; it does not stop the tail.
@@ -174,6 +182,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  if (copyLabelTimer) clearTimeout(copyLabelTimer)
 })
 
 watch(autoScroll, async () => {
@@ -203,6 +212,29 @@ function clearLogs() {
   const newest = logs.value[logs.value.length - 1]
   if (newest) clearedBefore.value = newest.timestamp
   logs.value = []
+}
+
+async function copyAllLogs() {
+  if (logs.value.length === 0) return
+
+  const text = logs.value.map((log) => {
+    const level = log.level.toUpperCase().padEnd(5)
+    return `${log.timestamp} [${sourceOf(log)}] ${level} [${log.target}] ${log.message}`
+  }).join('\n')
+
+  try {
+    await navigator.clipboard.writeText(text)
+    copyLabel.value = 'Copied'
+    if (copyLabelTimer) clearTimeout(copyLabelTimer)
+    copyLabelTimer = setTimeout(() => {
+      copyLabel.value = 'Copy all'
+      copyLabelTimer = null
+    }, 1500)
+    toast.success(`Copied ${logs.value.length} log lines`)
+  } catch (e) {
+    console.error('Failed to copy logs:', e)
+    toast.error('Failed to copy logs')
+  }
 }
 
 function formatTime(date: Date): string {
