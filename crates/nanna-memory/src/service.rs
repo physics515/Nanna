@@ -116,6 +116,13 @@ impl MemoryService {
         self.store.load_from_db().await
     }
 
+    /// Durable-store health from the last [`load_from_db`](Self::load_from_db) —
+    /// `degraded` is true when a corrupt row was skipped. Lets the daemon surface
+    /// a degraded/corrupt store via `/status` instead of a silent empty one.
+    pub async fn store_health(&self) -> crate::MemoryStoreHealth {
+        self.store.store_health().await
+    }
+
     /// Probe the actual embedding dimension and re-embed any mismatched entries.
     ///
     /// Generates a test embedding to detect the real model dimension. If it

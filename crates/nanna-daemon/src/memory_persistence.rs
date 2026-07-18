@@ -5,7 +5,7 @@
 //! (storage models).  All FSRS fields are round-tripped losslessly.
 
 use async_trait::async_trait;
-use nanna_memory::{FsrsState, MemoryEntry, MemoryError, MemoryPersistence};
+use nanna_memory::{FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence};
 use nanna_storage::{MemoryRepository, NewMemory};
 use std::collections::HashMap;
 use tracing::warn;
@@ -197,5 +197,64 @@ impl MemoryPersistence for TursoMemoryPersistence {
         }
 
         Ok(entries)
+    }
+
+    /// Load with a corruption report.
+    ///
+    /// Fast path first: the single-scan `bulk_load`. Only when it fails with a
+    /// **corruption** error (`is_corruption_error`) do we pay for the row-by-row
+    /// `bulk_load_salvage` (one `SELECT id` + one point lookup per row) — so a
+    /// healthy store of N memories stays a single scan, not N+1 queries. A
+    /// non-corruption failure propagates unchanged. `corrupt_rows` counts genuine
+    /// unreadable rows (data loss); benign no-embedding rows are just skipped.
+    async fn load_all_report(&self) -> Result<LoadReport, MemoryError> {
+        match self.repo.bulk_load().await {
+            Ok(db_memories) => {
+                let expected = db_memories.len();
+                let (entries, no_embedding) = Self::convert_rows(db_memories);
+                if no_embedding > 0 {
+                    warn!("Skipped {} memories with no embedding during bulk load", no_embedding);
+                }
+                Ok(LoadReport { entries, corrupt_rows: 0, expected })
+            }
+            Err(e) if nanna_storage::is_corruption_error(&e) => {
+                warn!("Bulk memory load hit corruption ({e}); falling back to row-by-row salvage");
+                let report = self
+                    .repo
+                    .bulk_load_salvage()
+                    .await
+                    .map_err(|se| MemoryError::Persistence(se.to_string()))?;
+                let expected = report.expected;
+                let corrupt_rows = report.corrupt_ids.len();
+                let (entries, no_embedding) = Self::convert_rows(report.memories);
+                if no_embedding > 0 {
+                    warn!("Skipped {} memories with no embedding during salvage load", no_embedding);
+                }
+                warn!(
+                    "Salvage load recovered {} of {} rows; {} corrupt rows skipped",
+                    entries.len(),
+                    expected,
+                    corrupt_rows
+                );
+                Ok(LoadReport { entries, corrupt_rows, expected })
+            }
+            Err(e) => Err(MemoryError::Persistence(e.to_string())),
+        }
+    }
+}
+
+impl TursoMemoryPersistence {
+    /// Convert stored `Memory` rows to `MemoryEntry`, returning the converted
+    /// entries and the count skipped for having no embedding (unsearchable).
+    fn convert_rows(rows: Vec<nanna_storage::Memory>) -> (Vec<MemoryEntry>, usize) {
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut no_embedding = 0usize;
+        for mem in rows {
+            match db_memory_to_entry(mem) {
+                Some(entry) => entries.push(entry),
+                None => no_embedding += 1,
+            }
+        }
+        (entries, no_embedding)
     }
 }

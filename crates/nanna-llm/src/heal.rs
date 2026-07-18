@@ -231,6 +231,41 @@ fn repair_common(s: &str) -> String {
     out
 }
 
+/// Count balanced top-level JSON objects/arrays in `s`.
+///
+/// A count `> 1` is the signal that a single streamed `tool_use` argument buffer
+/// holds *multiple* concatenated objects — i.e. several distinct tool calls
+/// collapsed into one block (see the agent stream accumulator). String-aware, so
+/// braces inside string literals do not inflate the count. Single pass, O(n).
+#[must_use]
+pub fn count_balanced_top_level_objects(s: &str) -> usize {
+    let (mut count, mut depth, mut in_string, mut escape) = (0usize, 0i32, false, false);
+    for &b in s.as_bytes() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +326,27 @@ mod tests {
         let raw = r#"{"a":1} garbage {"b":2}"#;
         let v = heal_json(raw).unwrap();
         assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn single_object_counts_one() {
+        assert_eq!(count_balanced_top_level_objects(r#"{"a":1}"#), 1);
+        assert_eq!(count_balanced_top_level_objects(r#"  {"a":{"b":2}}  "#), 1);
+    }
+
+    #[test]
+    fn two_concatenated_objects_counts_two() {
+        // The streaming-collapse shape: two tool calls' args in one buffer.
+        let raw = r#"{"a":1}{"b":2}"#;
+        assert_eq!(count_balanced_top_level_objects(raw), 2);
+        // heal_json still salvages the FIRST object — count is the collapse
+        // signal, heal is the (lossy) fallback.
+        assert_eq!(heal_json(raw).unwrap()["a"], 1);
+    }
+
+    #[test]
+    fn braces_inside_strings_ignored() {
+        assert_eq!(count_balanced_top_level_objects(r#"{"a":"}{"}"#), 1);
+        assert_eq!(count_balanced_top_level_objects(r#"{"a":"\""}"#), 1);
     }
 }

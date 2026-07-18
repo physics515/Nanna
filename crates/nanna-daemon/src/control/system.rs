@@ -28,7 +28,16 @@ impl ControlPlane {
                 
                 let workspace_count = self.workspaces.read().await.len();
                 let scheduler_available = self.scheduler.is_some();
-                
+
+                // Durable-store health: a corrupt row skipped on load leaves the
+                // store degraded — surface it rather than a silent empty store.
+                let (memory_degraded, memory_corrupt_rows) = if let Some(ref m) = self.memory {
+                    let h = m.store_health().await;
+                    (h.degraded, h.corrupt_rows)
+                } else {
+                    (false, 0)
+                };
+
                 json!({
                     "status": "running",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -37,6 +46,8 @@ impl ControlPlane {
                     "workspaces": workspace_count,
                     "agent_available": self.agent.is_some(),
                     "memory_available": self.memory.is_some(),
+                    "memory_degraded": memory_degraded,
+                    "memory_corrupt_rows": memory_corrupt_rows,
                     "memory_stats": memory_stats,
                     "tools_available": self.tools.is_some(),
                     "tool_count": tool_count,

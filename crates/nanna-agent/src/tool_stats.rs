@@ -40,7 +40,8 @@ struct ToolStatsInner {
 }
 
 /// Accumulated statistics for a single tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolStats {
     /// Tool name
     pub name: String,
@@ -61,7 +62,8 @@ pub struct ToolStats {
 }
 
 /// Per-session aggregate statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionStats {
     /// Session identifier
     pub session_id: String,
@@ -326,27 +328,77 @@ impl ToolStatsTracker {
     }
 
     /// Import stats from a previously persisted JSON blob.
+    ///
+    /// Tolerant by design: iterates the `tools`/`sessions` maps and deserializes
+    /// each value individually, so a single drifted/legacy entry cannot nuke the
+    /// whole import (the old whole-blob `from_value::<ToolStatsInner>` aborted on
+    /// the first bad field — a boot logged `invalid type: integer 202, expected a
+    /// map` because the DB aggregate emits `sessions` as a scalar count). A
+    /// non-map `sessions` value is skipped rather than treated as fatal, and the
+    /// map key is authoritative for the tool/session name (DB-shaped entries omit
+    /// it).
     pub async fn import_json(&self, data: &serde_json::Value) {
-        match serde_json::from_value::<ToolStatsInner>(data.clone()) {
-            Ok(imported) => {
-                let mut inner = self.inner.write().await;
-                // Merge: for each tool, add to existing if present
-                for (name, stats) in imported.tools {
-                    inner.tools.entry(name).or_insert(stats);
+        let mut inner = self.inner.write().await;
+
+        let mut imported_tools = 0usize;
+        let mut skipped_tools = 0usize;
+        match data.get("tools") {
+            Some(serde_json::Value::Object(tools)) => {
+                for (name, value) in tools {
+                    match serde_json::from_value::<ToolStats>(value.clone()) {
+                        Ok(mut stats) => {
+                            // Map key is authoritative (DB entries omit `name`).
+                            stats.name = name.clone();
+                            inner.tools.entry(name.clone()).or_insert(stats);
+                            imported_tools += 1;
+                        }
+                        Err(e) => {
+                            skipped_tools += 1;
+                            warn!(tool = %name, "Skipping drifted tool-stats entry: {e}");
+                        }
+                    }
                 }
-                for (sid, session) in imported.sessions {
-                    inner.sessions.entry(sid).or_insert(session);
-                }
-                info!(
-                    tools = inner.tools.len(),
-                    sessions = inner.sessions.len(),
-                    "Imported tool stats from persistence"
-                );
             }
-            Err(e) => {
-                warn!("Failed to import tool stats: {e}");
+            Some(other) if !other.is_null() => {
+                warn!("Tool stats 'tools' field is not a map; skipping tool import");
             }
+            _ => {}
         }
+
+        let mut imported_sessions = 0usize;
+        let mut skipped_sessions = 0usize;
+        match data.get("sessions") {
+            Some(serde_json::Value::Object(sessions)) => {
+                for (sid, value) in sessions {
+                    match serde_json::from_value::<SessionStats>(value.clone()) {
+                        Ok(mut session) => {
+                            session.session_id = sid.clone();
+                            inner.sessions.entry(sid.clone()).or_insert(session);
+                            imported_sessions += 1;
+                        }
+                        Err(e) => {
+                            skipped_sessions += 1;
+                            warn!(session = %sid, "Skipping drifted session-stats entry: {e}");
+                        }
+                    }
+                }
+            }
+            // Legacy/aggregate shape: `sessions` was an integer count — tolerate it.
+            Some(other) if !other.is_null() => {
+                debug!("Tool stats 'sessions' is not a map (legacy scalar); skipping session import");
+            }
+            _ => {}
+        }
+
+        info!(
+            imported_tools,
+            skipped_tools,
+            imported_sessions,
+            skipped_sessions,
+            total_tools = inner.tools.len(),
+            total_sessions = inner.sessions.len(),
+            "Imported tool stats from persistence (tolerant)"
+        );
     }
 }
 
@@ -448,4 +500,89 @@ fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn import_tolerates_bad_tool_entry() {
+        // One bad entry must not drop the good ones.
+        let t = ToolStatsTracker::new();
+        t.import_json(&json!({
+            "tools": {
+                "good": {"name":"good","call_count":5,"success_count":5,"failure_count":0,
+                         "latencies_ms":[10],"output_sizes":[100],"last_called":null,"errors":[]},
+                "bad": 202
+            },
+            "sessions": {}
+        }))
+        .await;
+        let good = t.summary("good").await;
+        assert!(good.is_some());
+        assert_eq!(good.unwrap().call_count, 5);
+        assert!(t.summary("bad").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn import_tolerates_integer_sessions() {
+        // The exact reported shape: DB aggregate emits `sessions` as a scalar
+        // count and tool entries omit `name`. Must not abort the whole import.
+        let t = ToolStatsTracker::new();
+        t.import_json(&json!({
+            "tools": {
+                "read_file": {"call_count":3,"success_count":3,"failure_count":0,
+                              "total_duration_ms":30,"last_called_epoch_ms":1,
+                              "latencies_ms":[10],"output_sizes":[50],"errors":[]}
+            },
+            "sessions": 202
+        }))
+        .await;
+        let s = t.summary("read_file").await;
+        assert!(s.is_some(), "integer sessions must not abort the tool import");
+        let s = s.unwrap();
+        assert_eq!(s.call_count, 3);
+        assert_eq!(s.name, "read_file", "name is backfilled from the map key");
+    }
+
+    #[tokio::test]
+    async fn export_import_round_trips() {
+        let t1 = ToolStatsTracker::new();
+        t1.record(ToolObservation {
+            tool_name: "read_file".into(),
+            success: true,
+            duration_ms: 12,
+            output_size: 100,
+            error: None,
+            session_id: Some("s1".into()),
+        })
+        .await;
+        t1.record(ToolObservation {
+            tool_name: "exec".into(),
+            success: false,
+            duration_ms: 5,
+            output_size: 0,
+            error: Some("boom".into()),
+            session_id: Some("s1".into()),
+        })
+        .await;
+        t1.record_iteration("s1").await;
+        t1.record_llm_time("s1", 100, 10, 20).await;
+
+        let blob = t1.export_json().await;
+        let t2 = ToolStatsTracker::new();
+        t2.import_json(&blob).await;
+        // Value equality on objects is order-independent, so this proves a
+        // fully-valid blob round-trips losslessly (tools + sessions map intact).
+        assert_eq!(t2.export_json().await, blob);
+    }
+
+    #[tokio::test]
+    async fn import_skips_non_map_tools() {
+        let t = ToolStatsTracker::new();
+        t.import_json(&json!({"tools": 5})).await;
+        assert!(t.summaries().await.is_empty());
+    }
 }

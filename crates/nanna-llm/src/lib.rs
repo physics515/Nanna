@@ -14,7 +14,7 @@ pub mod oauth;
 pub use oauth::{OAuthClient, create_oauth_client, create_oauth_client_sync};
 
 pub mod heal;
-pub use heal::{heal_json, heal_json_as, heal_tool_args};
+pub use heal::{count_balanced_top_level_objects, heal_json, heal_json_as, heal_tool_args};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
@@ -2892,8 +2892,10 @@ impl LlmClient {
                         if text_block_started {
                             yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                         }
-                        for (idx, _) in &tool_calls_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                        let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
+                        stop_indices.sort_unstable();
+                        for idx in stop_indices {
+                            yield Ok(StreamEvent::ContentBlockStop { index: idx });
                         }
                         yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
                         return;
@@ -2979,8 +2981,10 @@ impl LlmClient {
                                 if text_block_started {
                                     yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                                 }
-                                for (idx, _) in &tool_calls_started {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                                let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
+                                stop_indices.sort_unstable();
+                                for idx in stop_indices {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: idx });
                                 }
                                 let stop_reason = match reason.as_str() {
                                     "tool_calls" => "tool_use",
@@ -2999,8 +3003,10 @@ impl LlmClient {
             if text_block_started {
                 yield Ok(StreamEvent::ContentBlockStop { index: 0 });
             }
-            for (idx, _) in &tool_calls_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+            let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
+            stop_indices.sort_unstable();
+            for idx in stop_indices {
+                yield Ok(StreamEvent::ContentBlockStop { index: idx });
             }
             yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
@@ -3414,8 +3420,10 @@ impl LlmClient {
                         if text_block_started {
                             yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                         }
-                        for (idx, _) in &tool_calls_started {
-                            yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                        let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
+                        stop_indices.sort_unstable();
+                        for idx in stop_indices {
+                            yield Ok(StreamEvent::ContentBlockStop { index: idx });
                         }
                         yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
                         return;
@@ -3487,8 +3495,10 @@ impl LlmClient {
                                 if text_block_started {
                                     yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                                 }
-                                for (idx, _) in &tool_calls_started {
-                                    yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+                                let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
+                                stop_indices.sort_unstable();
+                                for idx in stop_indices {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: idx });
                                 }
 
                                 let stop_reason = match reason.as_str() {
@@ -3508,8 +3518,10 @@ impl LlmClient {
             if text_block_started {
                 yield Ok(StreamEvent::ContentBlockStop { index: 0 });
             }
-            for (idx, _) in &tool_calls_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: *idx });
+            let mut stop_indices: Vec<usize> = tool_calls_started.keys().copied().collect();
+            stop_indices.sort_unstable();
+            for idx in stop_indices {
+                yield Ok(StreamEvent::ContentBlockStop { index: idx });
             }
             yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
         }
