@@ -1,5 +1,6 @@
 # Rust
 target/
+target-check/
 # Cargo.lock is committed for reproducible builds + reviewable dependency bumps
 # (this is a workspace with binaries, so pinning the lockfile is the right call; see ROADMAP P13 / daily-dev Appendix B).
 
