@@ -310,49 +310,28 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 
 ### P3 — Multi-Agent & MCP ✅ (one caveat)
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
-spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy,
-SupervisionStrategy OneForOne/OneForAll/RestForOne, HealthCheckConfig). **Shipped**, except:
-- [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file
-      does not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement
-      (stdio server, tool/resource/prompt registration, HTTP mode, tool filtering, auth, streaming).
+spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
+health checks). **Shipped**, except:
+- [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+      not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
-- [x] Supervisor recovery tracking recovers on first success instead of counting consecutive successes (`supervisor.rs:577`).
-      *(2026-07-06) Extracted a pure `apply_health_result` state machine (Unhealthy→Running requires `success_threshold` **consecutive** successes; Running→Unhealthy requires `failure_threshold` consecutive failures; thresholds floored at 1; a failure resets the recovery streak). Added the `consecutive_health_successes` stat. Bonus: events now emit after the agents write-lock is released (was held across `.await`). 6 unit tests.*
+- [x] Supervisor recovery counts consecutive successes, not first-success (pure `apply_health_result`
+      state machine + `consecutive_health_successes` stat; events emit after lock release). *(2026-07-06)*
 
 ### P4 — GUI Application ✅
-Tauri 2 + Nuxt 4 + Tailwind 4, 80s-hacker Palenight theme. Streaming chat with markdown, session
-management, tabbed settings + full config migration + import/export, tool-call visualization,
-memory browser, channel onboarding wizards (all five), model-stats + tool-stats dashboards, system
-tray, native notifications, UI component library, mobile-responsive layouts. **Shipped.**
-Open polish: mobile testing on real devices (Tauri Android/iOS), per-tool drill-down finish, latency sparklines.
-- [x] **Logs page shows embedded logs, tagged by source.** *(2026-07-16, user-reported: "no logs in
-      embedded mode")* The page was **structurally empty in embedded mode**, not merely unpopulated:
-      `get_daemon_logs` hard-returned `Ok(vec![])` whenever `!is_daemon_mode()` (`commands/system.rs`),
-      and the GUI installed a bare `tracing_subscriber::fmt()` to **stdout with no capture** — so the
-      lines it would have shown never existed. Fixed end-to-end: (1) `run()` now composes
-      `registry().with(EnvFilter).with(fmt::layer()).with(LogBufferLayer)` over a 5000-entry
-      `LogBuffer` (matches the daemon's cap; ~1 MB) held in `AppState`; (2) `LogEntry` gained a
-      `source: LogSource` (`embedded` | `daemon`) stamped by the buffer that captured it — the tag lives
-      on the `LogBuffer`, so a mixed-origin buffer is unrepresentable; (3) `get_daemon_logs` **merges**
-      both origins (the GUI emits its own lines even while attached to a daemon, so the two are
-      genuinely simultaneous), sorts by timestamp, and bounds the result at `MAX_LOG_LINES` (2000);
-      (4) the page renders a per-line source badge, and the header/status now name both sources instead
-      of a bare "Daemon Logs / Disconnected" that read as broken next to a full log view.
-      `#[serde(default)]` on `source` keeps a newer GUI readable against an older daemon (untagged →
-      `daemon`, which is where it came from). Also **deleted `gui/src-tauri/src/logs.rs`** — a 62-line
-      orphan module with a duplicate `LogEntry`/`LogBuffer` and a second stubbed `get_daemon_logs`
-      returning `Ok(vec![])`, never registered and referenced by nothing (a decoy for exactly this bug).
-      11 tests (6 buffer incl. wire round-trip + legacy-untagged default; 5 merge incl. interleaving,
-      per-line tags, newest-kept-at-limit, zero-limit).
-- [x] **"Live" on the Logs page was decorative.** *(2026-07-16)* The page listened for a `daemon-log`
-      Tauri event that **has no emitter anywhere in the codebase** — so it was a frozen snapshot from
-      page-load in *both* modes, despite the "Real-time daemon output" subtitle and a lit Live button.
-      Replaced the dead listener with a 1 s poll of the merged view while Live is on. Clear now records
-      a `clearedBefore` watermark so cleared history does not reappear on the next poll.
-      - [ ] Follow-up: polling re-serialises up to 2000 lines/s. A push channel (daemon-side
-            `SystemAction::Logs` subscribe + a real `daemon-log` emit) or a monotonic per-entry sequence
-            number for incremental `since`-cursor fetches would be strictly better; poll was chosen to
-            avoid an IPC protocol change in a user-reported bugfix.
+Tauri 2 + Nuxt 4 + Tailwind 4 (Palenight theme). Streaming markdown chat, session management, tabbed
+settings + config migration + import/export, tool-call visualization, memory browser, channel onboarding
+wizards (all five), model-stats + tool-stats dashboards, system tray, native notifications,
+mobile-responsive layouts. **Shipped.** Open polish: real-device mobile testing, per-tool drill-down,
+latency sparklines.
+- [x] **Logs page shows in-process logs, tagged by source** *(2026-07-16)* — `run()` composes a
+      `LogBufferLayer` over a 5000-entry buffer; `LogEntry.source` (`embedded`|`daemon`) is stamped by the
+      capturing buffer; `get_daemon_logs` merges both origins, sorts by timestamp, bounds at 2000. Deleted
+      the orphan `logs.rs` decoy. 11 tests. *(log_buffer relocated to `nanna-core` in P16.)*
+- [x] **Live logs actually poll** *(2026-07-16)* — the old `daemon-log` listener had no emitter (frozen
+      snapshot); replaced with a 1 s poll of the merged view + a `clearedBefore` watermark.
+      - [ ] Follow-up: a push channel (daemon subscribe + real emit) or a `since`-cursor beats
+            re-serialising up to 2000 lines/s; poll avoided an IPC change in a bugfix.
 
 #### P4 follow-on — GUI Testing & UX Quality 🚧 (active track)
 
@@ -602,41 +581,20 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
 complexity classifier + tool-call-only routing + first-message override, aggressive tool-output
-summarization, progressive distillation (rolling summary every N turns), tool-result eviction,
-CDC message-level dedup, per-model stats tracker + persistence + stats-informed routing. Open:
-- [x] **LLMLingua-style prompt compression** (needs local GPU model, e.g. Phi-3/Qwen2 via Ollama; perplexity token scoring, selective).
-      *(2026-07-16) Wired end-to-end against the **summarization-model settings** (not a hard-coded Ollama):
-      `nanna-agent::compressor` scores sentences via the configured model, keeps top-`1/ratio` by
-      information density, falls back to head/tail truncation on score-count mismatch. Pure helpers
-      (`parse_scores`, `select_keep_indices`, `fallback_compress`, `split_sentences`) are unit-tested.
-      Tool-output path walks `summarization_priority` with client failover (`compress_with_priority`).
-      Tier-1 proactive compression now preferentially rewrites large older tool results in context
-      (`AgentContext::compress_older_tool_results` / `Agent::compress_older_context_tool_results`)
-      before the prior `drop_oldest` fallback. Note: sentence-level scoring (not per-token perplexity)
-      — practical on chat-completion APIs where raw logprobs aren't exposed.*
-- [x] **Structured tool output schemas** — audit tool verbosity, optional `output_schema` on `ToolDefinition`, JSON output mode.
-      *(2026-07-17) Done end-to-end. `ToolDefinition::output_schema` + `with_output_schema`;
-      `nanna_tools::output::{format_tool_output, wants_json_output, schemas}` with registry-side
-      JSON rewrite of successful results. Audited verbose tools (`read_file`, `write_file`,
-      `list_dir`, `exec`, `code_search`, `project_structure`, `web_search`, `web_fetch`) all
-      declare schemas, accept `output_mode=text|json`, and attach structured `data` via
-      `ToolResult::with_data`. Default remains free-form text.*
-- [x] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
-      multipliers (3.5 code / 4 English / 2 CJK); account for per-message framing (~100 tok) and
-      truncation-marker text. Current heuristic causes ~20–30% overflow/underutilization.
-      *(2026-07-07) First pass in `nanna-llm`: `estimate_tokens` is now character-class aware
-      (ASCII ~4 chars/token via `div_ceil`; wide/CJK ~1 token/char — fixes the byte-`len()/4`
-      CJK under-count that was the main overflow source), and `estimate_request_tokens` adds
-      `MESSAGE_FRAMING_TOKENS` (4) per message. Tests cover ASCII/CJK/mixed + framing.
-      (2026-07-17) Residual TODOs closed. Family-aware estimators
-      (`TokenContentFamily::{English,Code,Auto}` with 4.0/3.5/1.0 densities + auto density
-      scan for code-ish punctuation) and a real `tiktoken-rs` path
-      (`estimate_tokens_exact` / `estimate_tokens_for_model`, default-on `tiktoken` feature,
-      o200k then cl100k / `bpe_for_model`). Tool-use / input blocks route through the Code
-      family. `nanna-agent` context + chunker now call the family-aware helpers. Tests cover
-      English vs Code vs Auto-JSON, framing, and exact smoke path.*
-- [x] Streaming cache tracking (`loop_runner.rs:834`) — parse usage from `message_start` for accurate cache stats.
-      *(2026-07-06) `StreamEvent::MessageStart` now carries `input_tokens`/`cache_read_tokens`/`cache_creation_tokens` (parsed from the Anthropic `message_start` usage object; zero for providers that don't report it); the streaming loop captures them into `LlmResult` instead of the old `input_tokens: 100` + zero-cache placeholders. 2 tests on `parse_sse_event` (with/without usage).*
+summarization, progressive distillation (rolling summary every N turns), tool-result eviction, CDC
+message-level dedup, per-model stats tracker + persistence + stats-informed routing.
+- [x] **LLMLingua-style prompt compression** *(2026-07-16)* — `nanna-agent::compressor` scores sentences
+      via the configured summarization model, keeps top-`1/ratio` by density (head/tail fallback); tier-1
+      proactive pass rewrites large older tool results before `drop_oldest`. (Sentence-level, not per-token.)
+- [x] **Structured tool output schemas** *(2026-07-17)* — `ToolDefinition::output_schema` +
+      `nanna_tools::output`; verbose tools declare schemas, accept `output_mode=text|json`, attach `data`
+      via `ToolResult::with_data`. Default stays free-form text.
+- [x] **Better token estimation** *(2026-07-07 / 07-17)* — character-class + family-aware estimators
+      (English/Code/Auto densities) with per-message framing, plus an exact `tiktoken-rs` path
+      (`estimate_tokens_for_model`, default-on `tiktoken` feature); replaces the `len()/4` heuristic.
+- [x] **Streaming cache tracking** *(2026-07-06)* — `StreamEvent::MessageStart` carries
+      `input_tokens`/`cache_read`/`cache_creation` (from Anthropic `message_start` usage), captured into
+      `LlmResult` instead of placeholders.
 
 ### P11 — Correctness, Security & Architecture Debt 🚧 (new — cross-cutting)
 Concrete, actionable items with `file:line` anchors. **This is the near-term backlog the daily
