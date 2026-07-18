@@ -15,7 +15,7 @@ WhatsApp), and is extensible with JS/TS tools and MCP servers.
 > local model runner (built on **Burn**) and the DSP-backed **dreaming** memory that is Nanna's moat
 > are in active development — see [`ROADMAP.md`](ROADMAP.md) **P12 / P13**.
 
-**Status:** v0.1.0 · Rust 2024 (rustc 1.85+) · phases 1–5 & 7 complete, 10 mostly complete, 6 & 8
+**Status:** v0.1.0 · Rust 2024 (rustc 1.85+) · phases 1–5, 7 & 16 complete, 10 mostly complete, 6 & 8
 partial; local model runner (P12) + memory/dreaming overhaul (P13) in progress. See
 [`ROADMAP.md`](ROADMAP.md) for the full status source of truth.
 
@@ -30,10 +30,12 @@ Nanna is not a chatbot. It's a *presence*.
 
 ## What works today
 
-- **Headless daemon + attachable GUI.** Runs as a Windows service / systemd / launchd unit with
+- **Headless daemon + pure-client GUI.** Runs as a Windows service / systemd / launchd unit with
   WebSocket IPC, PID lockfile, and health endpoints; persists sessions to **Turso** (embedded,
-  SQLite-compatible, pure-Rust). The Tauri GUI attaches as a client with auto-reconnect, and falls back
-  to an embedded in-process backend when no daemon is running.
+  SQLite-compatible, pure-Rust). The Tauri GUI is a **pure daemon client**: it launches the daemon as a
+  managed sidecar and attaches over IPC with auto-reconnect. The daemon owns *all* state (one agent loop,
+  one memory system, one tool registry, one scheduler) — there is no in-process fallback, so a lost
+  daemon surfaces as a clear disconnected state rather than a silently divergent second backend.
 - **Agentic chat.** Streaming responses, tool calling, interleaved thinking modes, and tiered context
   compression (summarization, CDC dedup, proactive drop). Multi-agent swarm with parallel task
   decomposition and Erlang/OTP-style supervisors.

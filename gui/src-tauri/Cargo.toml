@@ -26,10 +26,8 @@ tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
-# Async utilities
-futures = "0.3"
+# Async utilities (futures-util backs the WebSocket daemon client)
 futures-util = "0.3"
-async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # WebSocket for daemon connection
@@ -54,20 +52,15 @@ rand = "0.10"
 # Directories for fallback paths
 directories.workspace = true
 
-# Link to nanna crates for IPC
+# Nanna crates the daemon *client* needs. The GUI is a pure daemon client, so it
+# links only: nanna-config (config cache read/write + credential manager),
+# nanna-core (cron parsing/description, workspace registry cache + folder
+# constants, and the relocated log_buffer), and nanna-tools (workspace skills
+# discovery). All heavy subsystems (storage, memory, agent loop, scheduler, LLM
+# routing, channels) live in the daemon and are reached over IPC.
 nanna-core = { path = "../../crates/nanna-core" }
-nanna-llm = { path = "../../crates/nanna-llm" }
 nanna-config = { path = "../../crates/nanna-config" }
-nanna-storage = { path = "../../crates/nanna-storage" }
 nanna-tools = { path = "../../crates/nanna-tools", features = ["scripting"] }
-nanna-memory = { path = "../../crates/nanna-memory" }
-nanna-agent = { path = "../../crates/nanna-agent" }
-nanna-workspace = { path = "../../crates/nanna-workspace" }
-nanna-scripting = { path = "../../crates/nanna-scripting", features = ["boa"] }
-nanna-channels = { path = "../../crates/nanna-channels" }
-# Daemon lib: embedded mode runs the daemon's AgentService in-process so both
-# modes share ONE agent loop (nanna-agent) and ONE event pipeline.
-nanna-daemon = { path = "../../crates/nanna-daemon" }
 
 [features]
 default = ["custom-protocol", "devtools"]

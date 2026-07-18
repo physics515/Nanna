@@ -299,28 +299,20 @@ pub async fn get_backend_status(
     Ok(state.backend.status().await)
 }
 
-/// Initialize the backend - starts daemon sidecar and connects
+/// Initialize the backend - starts the daemon sidecar and connects.
 #[tauri::command]
 pub async fn init_backend(
     app: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<String, String> {
     let state = state.read().await;
-    if state.backend.is_daemon_mode().await {
+    if state.backend.is_connected().await {
         return Ok("daemon".to_string());
-    }
-    // Embedded mode with local storage open: this process holds the exclusive
-    // nanna.db lock, so a daemon spawned now would boot storage-less (no
-    // session or memory persistence) — worse than staying embedded. Switching
-    // to daemon mode requires an app restart so the daemon can own the DB.
-    if state.storage.is_some() {
-        info!("init_backend: staying embedded — local storage owns nanna.db (restart to use daemon mode)");
-        return Ok("embedded".to_string());
     }
     let mode = state.backend.init(&app).await;
     Ok(match mode {
         BackendMode::Daemon => "daemon".to_string(),
-        BackendMode::Embedded => "embedded".to_string(),
+        BackendMode::Disconnected => "disconnected".to_string(),
     })
 }
 
@@ -355,7 +347,7 @@ pub async fn get_daemon_logs(
     // field sends untagged entries; serde defaults those to `daemon`, which is
     // where they came from. A malformed entry is skipped rather than failing the
     // whole page.
-    if state_guard.backend.is_daemon_mode().await {
+    if state_guard.backend.is_connected().await {
         let raw = state_guard.backend.get_logs(Some(limit)).await?;
         entries.extend(
             raw.into_iter()
@@ -462,28 +454,10 @@ pub async fn perform_quit(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
 
-    // Shutdown backend (stop daemon)
+    // Stop the daemon sidecar. Memory/session persistence is the daemon's job.
     info!("Performing quit - shutting down backend...");
     state_guard.backend.shutdown().await;
 
-    // Save memories
-    let count = state_guard.memory.count().await;
-    if count > 0 {
-        let backup_path = state_guard.memory_path.with_extension("json.bak");
-        if state_guard.memory_path.exists() {
-            if let Err(e) = std::fs::copy(&state_guard.memory_path, &backup_path) {
-                warn!("Failed to create memory backup: {}", e);
-            }
-        }
-
-        if let Err(e) = state_guard.memory.save(&state_guard.memory_path).await {
-            error!("Failed to save memories on exit: {}", e);
-        } else {
-            info!("Saved {} memories", count);
-        }
-    }
-
-    // Exit the app
     app.exit(0);
     Ok(())
 }

@@ -68,25 +68,21 @@ pub async fn open_workspace(
     workspace.load_context().await
         .map_err(|e| format!("Failed to load workspace: {}", e))?;
 
-    // In daemon mode the daemon owns persistence (nanna.db): open the
-    // workspace there first and adopt ITS id locally, so both registries
-    // agree and the workspace survives a restart.
-    let is_daemon = state_guard.backend.is_daemon_mode().await;
-    if is_daemon {
-        let result = state_guard
-            .backend
-            .workspace_open(&path.to_string_lossy())
-            .await?;
-        if result.get("error").is_some() {
-            let msg = result
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(format!("Daemon failed to open workspace: {msg}"));
-        }
-        if let Some(daemon_id) = result.get("id").and_then(|v| v.as_str()) {
-            workspace.id = daemon_id.to_string();
-        }
+    // The daemon owns persistence (nanna.db): open the workspace there first and
+    // adopt ITS id locally, so both registries agree and it survives a restart.
+    let result = state_guard
+        .backend
+        .workspace_open(&path.to_string_lossy())
+        .await?;
+    if result.get("error").is_some() {
+        let msg = result
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("Daemon failed to open workspace: {msg}"));
+    }
+    if let Some(daemon_id) = result.get("id").and_then(|v| v.as_str()) {
+        workspace.id = daemon_id.to_string();
     }
 
     let id = registry.register(workspace);
@@ -96,26 +92,10 @@ pub async fn open_workspace(
     let info = WorkspaceInfo::from(ws);
     info!("Opened workspace: {} at {:?}", ws.name, path);
 
-    // Persist activation
     drop(registry);
-    if is_daemon {
-        // The daemon's open does not activate; sync it (drives tool cwd too).
-        if let Err(e) = state_guard.backend.workspace_set_active(&id).await {
-            warn!("Failed to activate workspace on daemon: {}", e);
-        }
-    }
-    let record = nanna_storage::WorkspaceRecord {
-        id: info.id.clone(),
-        name: info.name.clone(),
-        path: info.path.clone(),
-        active: true,
-        created_at: String::new(),
-        last_accessed: String::new(),
-    };
-    if let Some(storage) = &state_guard.storage {
-        if let Err(e) = storage.workspaces().upsert(&record).await {
-            warn!("Failed to persist workspace to DB: {}", e);
-        }
+    // The daemon's open does not activate; sync it (drives tool cwd too).
+    if let Err(e) = state_guard.backend.workspace_set_active(&id).await {
+        warn!("Failed to activate workspace on daemon: {}", e);
     }
 
     Ok(info)
@@ -133,17 +113,9 @@ pub async fn set_active_workspace(
     if registry.set_active(&id) {
         info!("Activated workspace: {}", id);
         drop(registry);
-        // Persist active state to DB
-        if let Some(storage) = &state_guard.storage {
-            if let Err(e) = storage.workspaces().set_active(&id).await {
-                warn!("Failed to persist active workspace to DB: {}", e);
-            }
-        }
-        // Notify daemon so it updates its in-memory registry and tool working directory
-        if state_guard.backend.is_daemon_mode().await {
-            if let Err(e) = state_guard.backend.workspace_set_active(&id).await {
-                warn!("Failed to notify daemon of workspace activation: {}", e);
-            }
+        // Notify the daemon so it updates its registry and tool working directory.
+        if let Err(e) = state_guard.backend.workspace_set_active(&id).await {
+            warn!("Failed to notify daemon of workspace activation: {}", e);
         }
         Ok(())
     } else {
@@ -161,17 +133,9 @@ pub async fn clear_active_workspace(
     registry.clear_active();
     drop(registry);
     info!("Cleared active workspace, now in global mode");
-    // Persist to DB
-    if let Some(storage) = &state_guard.storage {
-        if let Err(e) = storage.workspaces().clear_active().await {
-            warn!("Failed to persist cleared workspace to DB: {}", e);
-        }
-    }
-    // Notify daemon so it clears its working directory
-    if state_guard.backend.is_daemon_mode().await {
-        if let Err(e) = state_guard.backend.workspace_clear_active().await {
-            warn!("Failed to notify daemon of workspace deactivation: {}", e);
-        }
+    // Notify the daemon so it clears its working directory.
+    if let Err(e) = state_guard.backend.workspace_clear_active().await {
+        warn!("Failed to notify daemon of workspace deactivation: {}", e);
     }
     Ok(())
 }
@@ -192,18 +156,9 @@ pub async fn get_workspace_context(
     state: State<'_, Arc<RwLock<AppState>>>,
     id: String,
 ) -> Result<String, String> {
+    // Served from the local registry cache (hydrated from the daemon at startup
+    // and kept current on reload).
     let state_guard = state.read().await;
-
-    // Route through daemon if in daemon mode
-    if state_guard.backend.is_daemon_mode().await {
-        let result = state_guard.backend.workspace_get_context(&id).await?;
-        return result.get("context")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| "Invalid response from daemon".to_string());
-    }
-
-    // Embedded mode: use local registry
     let registry = state_guard.workspaces.read().await;
 
     let ws = registry.get(&id)
@@ -220,24 +175,21 @@ pub async fn reload_workspace(
 ) -> Result<WorkspaceInfo, String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if in daemon mode
-    if state_guard.backend.is_daemon_mode().await {
-        let result = state_guard.backend.workspace_reload(&id).await?;
-        return serde_json::from_value(result)
-            .map_err(|e| format!("Failed to parse daemon response: {}", e));
+    // Reload the local cache from disk, then best-effort notify the daemon so
+    // its own context copy refreshes too.
+    let info = {
+        let mut registry = state_guard.workspaces.write().await;
+        let ws = registry.get_mut(&id)
+            .ok_or_else(|| format!("Workspace not found: {}", id))?;
+        ws.load_context().await
+            .map_err(|e| format!("Failed to reload workspace: {}", e))?;
+        info!("Reloaded workspace: {}", ws.name);
+        WorkspaceInfo::from(&*ws)
+    };
+    if let Err(e) = state_guard.backend.workspace_reload(&id).await {
+        warn!("Failed to notify daemon of workspace reload: {}", e);
     }
-
-    // Embedded mode: use local registry
-    let mut registry = state_guard.workspaces.write().await;
-
-    let ws = registry.get_mut(&id)
-        .ok_or_else(|| format!("Workspace not found: {}", id))?;
-
-    ws.load_context().await
-        .map_err(|e| format!("Failed to reload workspace: {}", e))?;
-
-    info!("Reloaded workspace: {}", ws.name);
-    Ok(WorkspaceInfo::from(&*ws))
+    Ok(info)
 }
 
 /// Close a workspace
@@ -248,29 +200,13 @@ pub async fn close_workspace(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if in daemon mode
-    if state_guard.backend.is_daemon_mode().await {
-        state_guard.backend.workspace_close(&id).await?;
-        info!("Closed workspace via daemon: {}", id);
-        return Ok(());
-    }
+    // The daemon owns persistence; close there, then drop the local cache entry.
+    state_guard.backend.workspace_close(&id).await?;
 
-    // Embedded mode: use local registry
     let mut registry = state_guard.workspaces.write().await;
-
-    if registry.remove(&id).is_some() {
-        info!("Closed workspace: {}", id);
-        drop(registry);
-        // Remove from DB
-        if let Some(storage) = &state_guard.storage {
-            if let Err(e) = storage.workspaces().delete(&id).await {
-                warn!("Failed to remove workspace from DB: {}", e);
-            }
-        }
-        Ok(())
-    } else {
-        Err(format!("Workspace not found: {}", id))
-    }
+    registry.remove(&id);
+    info!("Closed workspace: {}", id);
+    Ok(())
 }
 
 /// Discover workspaces in a directory
@@ -301,20 +237,22 @@ pub async fn save_workspace_file(
 ) -> Result<(), String> {
     let state_guard = state.read().await;
 
-    // Route through daemon if in daemon mode
-    if state_guard.backend.is_daemon_mode().await {
-        state_guard.backend.workspace_update_context(&workspace_id, &filename, &content).await?;
-        return Ok(());
+    // Write to disk (workspace files live under .nanna), then notify the daemon
+    // so its context copy refreshes.
+    {
+        let registry = state_guard.workspaces.read().await;
+        let ws = registry.get(&workspace_id)
+            .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
+        ws.save_context_file(&filename, &content).await
+            .map_err(|e| format!("Failed to save file: {}", e))?;
     }
-
-    // Embedded mode: use local registry
-    let registry = state_guard.workspaces.read().await;
-
-    let ws = registry.get(&workspace_id)
-        .ok_or_else(|| format!("Workspace not found: {}", workspace_id))?;
-
-    ws.save_context_file(&filename, &content).await
-        .map_err(|e| format!("Failed to save file: {}", e))?;
+    if let Err(e) = state_guard
+        .backend
+        .workspace_update_context(&workspace_id, &filename, &content)
+        .await
+    {
+        warn!("Failed to notify daemon of workspace file update: {}", e);
+    }
 
     Ok(())
 }
