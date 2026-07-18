@@ -106,6 +106,75 @@ fn git_bash_path() -> Option<&'static Path> {
         .as_deref()
 }
 
+/// Default per-command exec timeout, in seconds, for an unremarkable command.
+pub const EXEC_DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Auto-detected exec timeout, in seconds, for build/VCS tools (git, cargo,
+/// npm, …) which routinely exceed [`EXEC_DEFAULT_TIMEOUT_SECS`] on large repos.
+/// This is the widest window the bridge picks on its own; a caller can still
+/// request more explicitly.
+pub const EXEC_MAX_AUTODETECT_SECS: u64 = 120;
+
+/// The per-command execution timeout (seconds) to use when the caller gives no
+/// explicit override, auto-detected from the command text.
+///
+/// Pure (no IO). Extracted from `exec_with_timeout` so the outer script-engine
+/// deadline can be sized against the *same* value the bridge will actually
+/// enforce, and so the classification is unit-testable.
+#[must_use]
+pub fn default_exec_timeout_secs(command: &str) -> u64 {
+    let cmd_lower = command.to_lowercase();
+    if cmd_lower.starts_with("git ")
+        || cmd_lower.starts_with("cargo ")
+        || cmd_lower.starts_with("npm ")
+        || cmd_lower.starts_with("pnpm ")
+        || cmd_lower.starts_with("yarn ")
+        || cmd_lower.starts_with("pip ")
+        || cmd_lower.starts_with("make ")
+        || cmd_lower.starts_with("cmake ")
+        || cmd_lower.starts_with("dotnet ")
+        || cmd_lower.starts_with("mvn ")
+        || cmd_lower.starts_with("gradle ")
+        || cmd_lower.contains("cargo ")
+        || cmd_lower.contains("git checkout")
+        || cmd_lower.contains("git clone")
+        || cmd_lower.contains("git fetch")
+        || cmd_lower.contains("git pull")
+        || cmd_lower.contains("cargo build")
+        || cmd_lower.contains("cargo check")
+        || cmd_lower.contains("cargo clippy")
+        || cmd_lower.contains("cargo test")
+    {
+        EXEC_MAX_AUTODETECT_SECS
+    } else {
+        EXEC_DEFAULT_TIMEOUT_SECS
+    }
+}
+
+/// Kill a process and its descendants, best-effort.
+///
+/// On Windows this shells out to `taskkill /T /F`, which walks the tree from
+/// `pid` — necessary because killing only the shell we spawned would leave a
+/// grandchild (`cargo`, `git`) running and holding a workspace/build lock. On
+/// Unix we rely on `kill_on_drop` reaping the direct child (the common
+/// exec-optimized single command replaces the shell, so the direct child *is*
+/// the workload); a dedicated process-group kill is a possible future hardening.
+async fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid; // direct child is reaped by kill_on_drop when the future drops
+    }
+}
+
 impl NannaBridge {
     /// Create a new bridge with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
@@ -174,7 +243,12 @@ impl NannaBridge {
         
         let p = Path::new(path);
         if p.is_relative() && !path.is_empty() {
-            // Resolve relative to workspace working directory, then home dir
+            // Resolve relative to the active workspace working directory. The
+            // registry seeds `default_workdir` from the active workspace (at boot,
+            // on switch, and per-chat), so bare relative paths land in the workspace
+            // the user is in — not the home dir. Home is only a last resort when
+            // there is genuinely no active workspace (global mode). `~`-prefixed
+            // paths were already expanded above.
             if let Some(wd) = default_workdir {
                 return wd.join(p);
             }
@@ -308,8 +382,12 @@ impl NannaBridge {
         if let Some(wd) = workdir {
             cmd.current_dir(self.resolve_path(wd));
         } else if let Some(ref wd) = self.default_workdir {
+            // No explicit workdir: run in the active workspace directory (the
+            // registry seeds `default_workdir` from it). This is what makes exec
+            // run "in the workspace you're in" rather than the home dir.
             cmd.current_dir(wd);
         } else if let Some(home) = Self::home_dir() {
+            // Last resort only when there is genuinely no active workspace.
             cmd.current_dir(home);
         }
 
@@ -323,41 +401,35 @@ impl NannaBridge {
 
         // Smart default timeout: longer for known slow commands.
         // Git, cargo, npm, pip, and build tools regularly exceed 30s on large repos.
-        let timeout = timeout_secs.unwrap_or_else(|| {
-            let cmd_lower = command.to_lowercase();
-            if cmd_lower.starts_with("git ")
-                || cmd_lower.starts_with("cargo ")
-                || cmd_lower.starts_with("npm ")
-                || cmd_lower.starts_with("pnpm ")
-                || cmd_lower.starts_with("yarn ")
-                || cmd_lower.starts_with("pip ")
-                || cmd_lower.starts_with("make ")
-                || cmd_lower.starts_with("cmake ")
-                || cmd_lower.starts_with("dotnet ")
-                || cmd_lower.starts_with("mvn ")
-                || cmd_lower.starts_with("gradle ")
-                || cmd_lower.contains("cargo ")
-                || cmd_lower.contains("git checkout")
-                || cmd_lower.contains("git clone")
-                || cmd_lower.contains("git fetch")
-                || cmd_lower.contains("git pull")
-                || cmd_lower.contains("cargo build")
-                || cmd_lower.contains("cargo check")
-                || cmd_lower.contains("cargo clippy")
-                || cmd_lower.contains("cargo test")
-            {
-                120 // 2 minutes for build/VCS tools
-            } else {
-                30 // default
+        let timeout = timeout_secs.unwrap_or_else(|| default_exec_timeout_secs(command));
+
+        // Reap our direct child if this future is dropped (e.g. the outer script
+        // engine deadline fires) — a backstop for the explicit tree-kill below.
+        cmd.kill_on_drop(true);
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
+        // Capture the pid *before* the wait future consumes the child, so a timeout
+        // can kill the whole process tree rooted here (not just the shell).
+        let pid = child.id();
+        let wait = child.wait_with_output();
+        tokio::pin!(wait);
+        let output = tokio::select! {
+            res = &mut wait => res
+                .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?,
+            () = tokio::time::sleep(std::time::Duration::from_secs(timeout)) => {
+                // Overran the deadline. Kill the entire tree — the shell *and* any
+                // long-running grandchild like cargo/git — so it can't outlive the
+                // tool call and hold a workspace/build lock (the failure mode that
+                // deadlocked repeated exec calls against each other). Do this while
+                // `wait` still owns the child, so the pid is still live.
+                if let Some(pid) = pid {
+                    kill_process_tree(pid).await;
+                }
+                return Err(ScriptError::Timeout(timeout * 1000));
             }
-        });
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| ScriptError::Timeout(timeout * 1000))?
-        .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
+        };
 
         let stdout = strip_ansi_escapes(&String::from_utf8_lossy(&output.stdout));
         let stderr = strip_ansi_escapes(&String::from_utf8_lossy(&output.stderr));
@@ -824,6 +896,98 @@ mod tests {
 
         assert!(bridge.permissions.allows_net("api.example.com"));
         assert!(!bridge.permissions.allows_net("evil.com"));
+    }
+
+    #[test]
+    fn relative_path_resolves_against_active_workspace() {
+        // A bare relative path resolves against the active workspace directory
+        // (the registry seeds `default_workdir` from it) — the behavior that keeps
+        // tools operating in the workspace the user is in, not the home dir.
+        let ws = std::path::Path::new(if cfg!(windows) { "D:\\ws" } else { "/ws" });
+        let resolved = NannaBridge::resolve_path_with_workdir("a/b.txt", Some(ws));
+        assert_eq!(resolved, ws.join("a/b.txt"));
+    }
+
+    #[test]
+    fn tilde_path_still_expands_to_home() {
+        // `~` remains explicitly home-relative regardless of the CWD fallback.
+        let home = NannaBridge::home_dir().unwrap();
+        let resolved = NannaBridge::resolve_path_with_workdir("~/notes.txt", None);
+        assert_eq!(resolved, home.join("notes.txt"));
+    }
+
+    #[test]
+    fn absolute_path_is_unchanged() {
+        let abs = if cfg!(windows) { "C:\\tmp\\x.txt" } else { "/tmp/x.txt" };
+        let resolved = NannaBridge::resolve_path_with_workdir(abs, None);
+        assert_eq!(resolved, std::path::PathBuf::from(abs));
+    }
+
+    #[test]
+    fn default_exec_timeout_classifies_build_and_vcs_tools() {
+        // Build/VCS tools get the wide window; everything else the default.
+        for slow in [
+            "cargo test",
+            "cargo build --release",
+            "git status",
+            "git clone https://x",
+            "npm install",
+            "pnpm build",
+            "make -j8",
+            "cd repo && cargo check",
+        ] {
+            assert_eq!(
+                default_exec_timeout_secs(slow),
+                EXEC_MAX_AUTODETECT_SECS,
+                "expected wide window for {slow:?}"
+            );
+        }
+        for fast in ["ls -la", "echo hi", "cat file.txt", "grep -r foo ."] {
+            assert_eq!(
+                default_exec_timeout_secs(fast),
+                EXEC_DEFAULT_TIMEOUT_SECS,
+                "expected default window for {fast:?}"
+            );
+        }
+    }
+
+    /// A command that overruns its (explicit) timeout must return `Timeout`
+    /// promptly — not run to completion. Regression guard for the exec timeout
+    /// actually being honored and the select-based deadline firing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_times_out_and_returns_promptly() {
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let start = std::time::Instant::now();
+        let res = bridge.exec_with_timeout("sleep 10", None, Some(1)).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(res, Err(ScriptError::Timeout(_))), "got {res:?}");
+        // Must fire near the 1s deadline, well before the 10s sleep would end.
+        assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// Same guard on Windows, routed through Git Bash (skipped if absent).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exec_times_out_and_returns_promptly() {
+        if git_bash_path().is_none() {
+            eprintln!("skipping exec_times_out_and_returns_promptly: Git Bash not installed");
+            return;
+        }
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let start = std::time::Instant::now();
+        let res = bridge.exec_with_timeout("sleep 10", None, Some(1)).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(res, Err(ScriptError::Timeout(_))), "got {res:?}");
+        assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
     }
 
     /// End-to-end: a POSIX/bash command with a pipe + `tail` (which used to fail in

@@ -147,11 +147,21 @@ pub async fn update_user_tool(
         enabled,
     ).await?;
 
-    // Re-register if enabled
+    // Reconcile the live registry with the new state so the edit takes effect
+    // without a restart: drop the old registration, then re-register only if the
+    // tool is still enabled. This makes a `disable` actually stop execution (the
+    // old path only ever *added*, so a disabled tool kept running until restart)
+    // and makes an edit's new source go live immediately.
+    state_guard.tools.unregister(&name).await;
     if meta.enabled {
-        if let Ok(tool_impl) = state_guard.user_tools.create_tool_impl(&meta) {
-            state_guard.tools.register_boxed(tool_impl).await;
-            info!("Re-registered updated user tool: {}", name);
+        match state_guard.user_tools.create_tool_impl(&meta) {
+            Ok(tool_impl) => {
+                state_guard.tools.register_boxed(tool_impl).await;
+                info!("Re-registered updated user tool: {}", name);
+            }
+            Err(e) => {
+                warn!("Failed to re-register updated tool '{name}': {e}");
+            }
         }
     }
 
@@ -171,8 +181,12 @@ pub async fn delete_user_tool(
         return Ok(());
     }
 
-    // Embedded mode
-    state_guard.user_tools.delete_tool(&name).await
+    // Embedded mode: remove from disk + cache, then unregister from the live
+    // registry so the deleted tool stops being callable without a restart
+    // (previously a deleted tool stayed live until the process restarted).
+    state_guard.user_tools.delete_tool(&name).await?;
+    state_guard.tools.unregister(&name).await;
+    Ok(())
 }
 
 #[tauri::command]

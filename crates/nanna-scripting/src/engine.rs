@@ -122,6 +122,24 @@ impl ScriptEngine {
         let bridge = Arc::new(bridge);
         let start = std::time::Instant::now();
 
+        // The script-engine deadline wraps the *whole* script, including any shell
+        // command it runs via the bridge. A tool that shells out (e.g. `exec`)
+        // forwards an integer `timeout` (seconds) input to the bridge, which owns
+        // the *command* deadline and can kill the child. If the engine deadline
+        // were shorter than that command deadline it would preempt a legitimately
+        // long command — and worse, orphan the child the bridge would otherwise
+        // reap. So extend the engine deadline to cover the requested command
+        // deadline. We only ever *extend*, never shorten, so tools without a
+        // meaningful `timeout` input keep their configured deadline.
+        let effective_timeout_ms = effective_timeout_ms(tool.timeout_ms, &input);
+        let tool_owned;
+        let tool: &ScriptedTool = if effective_timeout_ms == tool.timeout_ms {
+            tool
+        } else {
+            tool_owned = tool.clone().with_timeout(effective_timeout_ms);
+            &tool_owned
+        };
+
         // Check if script needs an advanced engine (async/await, TypeScript, etc.)
         let needs_advanced = needs_advanced_engine(&tool.source);
 
@@ -282,6 +300,32 @@ impl Default for ScriptEngine {
     }
 }
 
+/// Slack between the bridge's per-command deadline and the outer engine
+/// deadline, in ms. The engine deadline must OUTLIVE the command deadline so the
+/// bridge (which can kill the child) always fires first; this covers the
+/// script/bridge handoff overhead (TS transpile, thread + runtime spawn, result
+/// marshaling), all sub-second, with margin.
+const ENGINE_TIMEOUT_HANDOFF_MARGIN_MS: u64 = 10_000;
+
+/// Compute the effective script-engine deadline for one execution.
+///
+/// Extends `base_ms` (the tool's configured deadline) to cover a `timeout`
+/// (seconds) declared in `input` — the deadline the shell bridge will enforce
+/// for a command — plus [`ENGINE_TIMEOUT_HANDOFF_MARGIN_MS`]. Only ever extends;
+/// a tool with no `timeout` input (or a zero/absent one) keeps `base_ms`.
+fn effective_timeout_ms(base_ms: u64, input: &Value) -> u64 {
+    let requested_ms = input
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .filter(|&s| s > 0)
+        .and_then(|s| s.checked_mul(1000))
+        .map(|ms| ms.saturating_add(ENGINE_TIMEOUT_HANDOFF_MARGIN_MS));
+    match requested_ms {
+        Some(req) => base_ms.max(req),
+        None => base_ms,
+    }
+}
+
 /// Detect if a script uses features that Boa can't handle.
 ///
 /// Returns `true` if the script should skip Boa and go straight to Deno.
@@ -306,11 +350,46 @@ mod tests {
     fn test_available_engines() {
         let engine = ScriptEngine::new();
         let available = engine.available_engines();
-        
+
         #[cfg(feature = "boa")]
         assert!(available.contains(&EngineKind::Boa));
-        
+
         #[cfg(feature = "deno")]
         assert!(available.contains(&EngineKind::Deno));
+    }
+
+    #[test]
+    fn effective_timeout_extends_for_requested_command_timeout() {
+        // A large explicit `timeout` input pushes the engine deadline past it by
+        // the handoff margin, so the bridge's command deadline fires first.
+        let base = 30_000;
+        let input = serde_json::json!({ "command": "cargo build", "timeout": 600 });
+        let eff = effective_timeout_ms(base, &input);
+        assert_eq!(eff, 600_000 + ENGINE_TIMEOUT_HANDOFF_MARGIN_MS);
+        assert!(eff > 600_000, "engine must outlive the 600s command deadline");
+    }
+
+    #[test]
+    fn effective_timeout_never_shortens() {
+        // A small requested timeout must not pull the engine deadline below the
+        // tool's configured base (e.g. exec's 180s ceiling).
+        let base = 180_000;
+        let input = serde_json::json!({ "timeout": 5 });
+        assert_eq!(effective_timeout_ms(base, &input), base);
+    }
+
+    #[test]
+    fn effective_timeout_ignores_absent_or_zero() {
+        let base = 30_000;
+        assert_eq!(effective_timeout_ms(base, &serde_json::json!({})), base);
+        assert_eq!(
+            effective_timeout_ms(base, &serde_json::json!({ "timeout": 0 })),
+            base
+        );
+        // Non-integer timeouts are ignored (no partial/garbage parse).
+        assert_eq!(
+            effective_timeout_ms(base, &serde_json::json!({ "timeout": "soon" })),
+            base
+        );
     }
 }
