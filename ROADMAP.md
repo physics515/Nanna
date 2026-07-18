@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-15 (response healing + stop-context retention; prior: 2026-07-14 deps refresh)
+**Last updated:** 2026-07-18 (GUI testing + UI/UX quality track; prior: 2026-07-15 response healing + stop-context)
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -248,6 +248,7 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ]  Add gitleaks/trufflehog secret-scan step to CI.
 - [ ]  Add coverage tracking (codecov/coveralls) if practical.
 - [ ]  Add ESLint/Prettier/Vitest/Playwright configs for frontend.
+- [ ]  Wire GUI automated tests into CI (see P4 follow-on GUI Testing & UX Quality): unit/component on every PR; Playwright + Tauri/WebDriver smoke on packaging jobs.
 - [ ]  Add Dependabot/Renovate config.
 - [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
 - [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
@@ -345,6 +346,90 @@ Open polish: mobile testing on real devices (Tauri Android/iOS), per-tool drill-
             `SystemAction::Logs` subscribe + a real `daemon-log` emit) or a monotonic per-entry sequence
             number for incremental `since`-cursor fetches would be strictly better; poll was chosen to
             avoid an IPC protocol change in a user-reported bugfix.
+
+#### P4 follow-on — GUI Testing & UX Quality 🚧 (active track)
+
+Capability shipped in P4; quality did not. The GUI is the richest channel and currently the weakest
+*verified* surface — almost no automated UI coverage, and polish debt that makes power features feel
+crowded to new users. Goal: **default calm + progressive power** — a new user can chat, set a backend,
+and leave; power users still reach logs, tools, workspaces, stats, scheduler without hunting. Track
+bugs and improvements here; do not bury them only in the backlog bullet.
+
+**Doctrine**
+- Default path is short. Advanced controls live behind progressive disclosure (Advanced, Cmd/Ctrl+K, overflow).
+- Power-user depth is non-negotiable: never remove a capability; relocate, name, and shortcut it.
+- Prefer fixing root UX (density, hierarchy, language) over adding tutorial chrome.
+- Every critical flow gets a regression test before calling the bug closed.
+
+##### GUI automated testing
+- [ ] **Vitest + Vue Test Utils** — unit/component tests for composables, pure helpers, and high-risk widgets
+      (ChatInput stop/send, SessionItem actions, ConnectionStatus / BackendStatus, settings forms, Logs filters).
+- [ ] **Playwright E2E (web/dev shell)** against `pnpm dev` / built Nuxt for fast iteration without a full Tauri shell.
+- [ ] **Tauri WebDriver / tauri-driver smoke** on a packaged or `cargo tauri dev` window: launch → show main
+      chrome → open Settings / Logs → window close hygiene.
+- [ ] **Critical-path scenarios** (automated): first-run / no-key empty state; open chat → send (mock LLM) → stream
+      chunk → Stop; session create / rename / delete / switch; backend disconnect → toast + reconnect affordance;
+      Settings open + API-key field round-trip (mocked); Logs Live on/off, Clear, **Copy all**.
+- [ ] **Page smoke matrix** — agents, channels, memory, model-stats, scheduler, settings, tool-stats, tools,
+      workspaces each load without error and render primary content (no white/blank shell).
+- [ ] **A11y gate on changed surfaces** — keyboard tab order, focus ring, `aria-*` on dialogs/menus, min contrast
+      on Palenight tokens; axe/vitest-axe or Playwright a11y assertions on chat + settings first.
+- [ ] **Visual / theme regression (lightweight)** — screenshot baselining for chat empty/streaming, settings shell,
+      logs toolbar (tolerate font antialias; store goldens under `gui/e2e/__snapshots__`).
+- [ ] **CI wiring** — unit/component on every PR; Playwright web smoke on `gui/**` changes; Tauri/WebDriver on
+      packaging / nightly CI (artifact upload on failure). Cross-link from P0.3 Code Quality & CI.
+- [ ] **Fixtures & mocks** — mock daemon IPC / Tauri invoke harness so chat+settings tests do not need a live LLM
+      or real keyring; hermetic, deterministic, offline by default.
+- [ ] **Crash / error boundaries** — Vue error boundary around shell + chat; assert a recoverable error panel instead
+      of a blank window when a child throws.
+
+##### UI / UX bugfix (known + sweep)
+- [ ] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,
+      scheduler, workspaces, agents) — no silent blank panels; retry or next-step where recovery exists.
+- [ ] **Connection & backend signalling** — ConnectionStatus / BackendStatus language matches reality (embedded vs
+      daemon, reconnecting, degraded); avoid "Disconnected" next to live data (Logs taught this lesson).
+- [ ] **Toasts & destructive confirms** — success/error coverage for copy, save, delete, clear; ConfirmDialog on
+      irreversible actions; Escape / outside-click policy consistent app-wide.
+- [ ] **Focus, scroll, and overflow** — chat sticks to latest unless user scrolled up; settings tabs don't lose
+      focus/scroll jump; long lists virtualize or paginate; no double scrollbars / clipped CTAs on 1280×720 and
+      1440×900 baselines.
+- [ ] **Keyboard & shortcuts** — global Esc closes topmost dialog/menu; Cmd/Ctrl+K reserved for palette;
+      documented shortcuts for new chat / focus input / Stop generation.
+- [ ] **Density & contrast sweep** on Palenight — readable secondary text, toolbar icon hit-targets ≥ 32px,
+      consistent spacing scale; no low-contrast badges on logs/stats.
+- [ ] **Forms validation** — API key / channel wizard / settings save: inline errors, disable duplicate submit,
+      don't clear valid fields on partial failure.
+- [ ] **Title bar / tray / window controls** (Windows primary) — min/max/close, tray show/hide, quit vs hide
+      semantics match user expectation; no orphan daemon on "close to tray" confusion (document + test).
+- [ ] **Bug bash log** — keep a rolling short list in daily-dev notes or issues labelled `gui-ux`; promote
+      fixed items to dated `[x]` lines here when closed.
+
+##### UI simplification (default calm, power remains)
+- [ ] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)
+      vs admin (logs, raw stats, scheduler, workspaces). Nav / TitleBar should match that hierarchy.
+- [ ] **Progressive disclosure** — fold rarely-used settings into **Advanced**; keep power paths one click or one
+      command-palette query away; optional "Compact power mode" density for existing users.
+- [ ] **Command palette (Cmd/Ctrl+K)** — navigate pages, switch sessions/workspaces, toggle Live logs, jump to
+      model/settings; primary discovery path for power features so chrome can stay thin.
+- [ ] **Chat-first shell** — reduce competing sidebar chrome default; rich editor/tool cards compact until expanded;
+      streaming/stop/queue status always obvious without reading tool internals.
+- [ ] **Unify settings shell** — consistent section headers, descriptions, save model (auto-save vs explicit Save);
+      one pattern for comprising toggles + danger zones.
+- [ ] **Onboarding compression** (pairs with P0.1) — first-run: what Nanna is → pick backend → health → chat;
+      defer channel wizards, tool permissions detail, memory deep-dive until after first successful turn.
+- [ ] **Copy / tone pass** — system language calm and specific ("Daemon not reachable on 5149" beat "Error");
+      kill decorative status that lies (see Logs Live).
+- [ ] **Component cleanup** — inventory near-duplicate dialogs/status badges; consolidate on `components/ui`;
+      delete dead CSS/unused props after simplification.
+
+##### UX / product improvements (still on this track)
+- [ ] Full-text search across sessions; export conversations (MD/PDF/JSON).
+- [ ] Context-budget visualization and live run view (iteration, active tools, token burn-rate, optional Gantt).
+- [ ] Drag-drop file upload into chat; optional split view.
+- [ ] Font-size + accent controls; theme-token audit; lazy-load Monaco.
+- [ ] Mobile / small-window real-device pass (Tauri Android/iOS later; desktop responsive now).
+- [ ] Per-tool stats drill-down + latency sparklines (P4 polish tail).
+- [ ] Swarm execution view (from P5 open item) when swarm UX becomes demoable.
 
 ### P5 — Agent Swarm & Context Management ✅
 Swarm coordinator (parallel decomposition, dynamic sub-agent spawning, result aggregation, critical-path
@@ -1503,10 +1588,11 @@ keep the phases readable; promote individual items into a phase when they become
 - **Tools:** agent-callable `UpdateTool`/`DeleteTool`; non-blocking fs I/O (`tokio::fs`/`spawn_blocking`);
   tool call caching (idempotent); versioning/rollback; duplicate-name detection; dangerous-tool
   confirmation; circuit breaker; analytics; tool marketplace/sharing; WASM tool support; **Python tool support** (currently JS/TS only).
-- **GUI:** command palette (Cmd/Ctrl+K); full-text search across sessions; export conversations
-  (MD/PDF/JSON); context-budget visualization; live run view (iteration, active tools, token burn-rate,
-  Gantt timeline); drag-drop file upload; split view; font-size + accent-color controls; ARIA/keyboard
-  accessibility; Vue error boundary; lazy-load Monaco; theme-token audit.
+- **GUI:** **Active quality track lives in P4 follow-on (testing + UI/UX fix + simplification).**
+  Remaining aspirational: command palette extras beyond navigation; full-text session search; export
+  conversations (MD/PDF/JSON); context-budget visualization; live run view (iteration, active tools, token
+  burn-rate, Gantt); drag-drop upload; split view; font-size + accent controls; ARIA/keyboard a11y; Vue error
+  boundary; lazy-load Monaco; theme-token audit; compact power-mode density.
 - **Storage:** DB migrations system; WAL mode; backup/restore. *(Turso-only is decided — the "SQLite" naming cleanup lives in P13, not an engine swap.)*
 - **SIMD/GPU:** verify AVX-512 + add ARM NEON (Apple Silicon/mobile, critical for mobile); benchmark
   vs `simsimd`; GPU optimizations to lower the SIMD→GPU crossover from ~50k toward ~5k vectors
@@ -1637,4 +1723,7 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    start → connect → session state → client reconnect → **daemon restart persistence**, and caught a real
    `Client::disconnect()` state bug. Still open: a real conversation turn (needs a live LLM) and the
    **embedded-fallback** path (needs a GUI build).
+10. **GUI test harness foothold** (P4 follow-on) — Vitest + one critical-path Playwright smoke (chat shell load
+    + Logs Copy all / Live toggle) + fixture for mocked Tauri invoke; keeps UI fixes from regressing while
+    P12/P13 lead the feature queue. Promote IA simplification / command palette once harness is green.
 
