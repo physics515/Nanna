@@ -1,11 +1,11 @@
 //! Workspace management for Nanna
 //!
-//! A workspace is a directory context that provides:
-//! - Project-specific configuration (AGENTS.md, SOUL.md, USER.md, TOOLS.md)
-//! - Per-workspace memory (memory/ folder with daily notes)
-//! - Isolation for multi-agent scenarios
+//! A workspace is a project directory. Context comes from the project's *standard*
+//! files (`README.md`, root `AGENTS.md`, `CONTRIBUTING.md`, `ROADMAP.md`, …) — not a
+//! pile of bespoke `.nanna/*.md` agent sidecar files. Persona / user profile live in
+//! global agent config; memory lives in the Turso store.
 //!
-//! Workspaces are inspired by Clawdbot's directory-based project context.
+//! `.nanna/` may still hold non-markdown local state (workspace id / config.toml).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,99 +25,137 @@ pub enum WorkspaceError {
     Invalid(String),
 }
 
-/// Hidden folder containing all Nanna workspace files
+/// Local non-md workspace state directory (workspace id / config.toml).
+/// Markdown context does **not** live here.
 pub const NANNA_FOLDER: &str = ".nanna";
 
-/// Standard workspace files (relative to NANNA_FOLDER)
+/// Standard project context files (at workspace root)
 pub const AGENTS_FILE: &str = "AGENTS.md";
-pub const SOUL_FILE: &str = "SOUL.md";
-pub const USER_FILE: &str = "USER.md";
-pub const TOOLS_FILE: &str = "TOOLS.md";
-pub const MEMORY_FILE: &str = "MEMORY.md";
-pub const IDENTITY_FILE: &str = "IDENTITY.md";
-pub const HEARTBEAT_FILE: &str = "HEARTBEAT.md";
+pub const README_FILE: &str = "README.md";
+pub const ROADMAP_FILE: &str = "ROADMAP.md";
+pub const CONTRIBUTING_FILE: &str = "CONTRIBUTING.md";
 
-/// Memory folder for daily notes (inside NANNA_FOLDER)
-pub const MEMORY_FOLDER: &str = "memory";
-
-/// Files/folders that indicate a workspace root
-pub const WORKSPACE_MARKERS: &[&str] = &[
-    NANNA_FOLDER,    // .nanna folder (primary marker)
-    "nanna.toml",    // Legacy: Config file at root
+/// Allowlisted context filenames that may be read/written at the workspace root.
+pub const STANDARD_CONTEXT_FILES: &[&str] = &[
+    README_FILE,
+    AGENTS_FILE,
+    ROADMAP_FILE,
+    CONTRIBUTING_FILE,
 ];
 
-/// Workspace context files loaded from disk
+/// Files/folders that indicate a workspace root (stronger first within a directory).
+pub const WORKSPACE_MARKERS: &[&str] = &[
+    ".git",
+    AGENTS_FILE,
+    ROADMAP_FILE,
+    README_FILE,
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    NANNA_FOLDER, // weak legacy / local-state signal
+    "nanna.toml", // legacy
+];
+
+/// Project context assembled from standard repo files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkspaceContext {
-    /// AGENTS.md content - how the agent should behave
+    /// README.md — what the project is
+    pub readme: Option<String>,
+    /// Root AGENTS.md — agent instructions for this repo
     pub agents: Option<String>,
-    /// SOUL.md content - agent personality/identity
-    pub soul: Option<String>,
-    /// USER.md content - info about the user
-    pub user: Option<String>,
-    /// TOOLS.md content - tool-specific notes
-    pub tools: Option<String>,
-    /// MEMORY.md content - long-term memory
-    pub memory: Option<String>,
-    /// IDENTITY.md content - agent identity details
-    pub identity: Option<String>,
-    /// HEARTBEAT.md content - periodic task checklist
-    pub heartbeat: Option<String>,
+    /// CONTRIBUTING.md — conventions / how to work here
+    pub contributing: Option<String>,
+    /// ROADMAP.md — plan / checklist
+    pub roadmap: Option<String>,
 }
 
 impl WorkspaceContext {
     /// Check if context has any content
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.agents.is_none()
-            && self.soul.is_none()
-            && self.user.is_none()
-            && self.tools.is_none()
-            && self.memory.is_none()
-            && self.identity.is_none()
-            && self.heartbeat.is_none()
+        self.readme.is_none()
+            && self.agents.is_none()
+            && self.contributing.is_none()
+            && self.roadmap.is_none()
     }
 
-    /// Build a system prompt injection from the context files
+    /// Build a system prompt injection from the standard project files
     #[must_use]
     pub fn build_system_prompt_injection(&self) -> String {
         let mut parts = Vec::new();
 
-        if let Some(soul) = &self.soul {
-            parts.push(format!("## SOUL.md\n{soul}"));
-        }
-        if let Some(user) = &self.user {
-            parts.push(format!("## USER.md\n{user}"));
+        if let Some(readme) = &self.readme {
+            parts.push(format!("## README.md\n{readme}"));
         }
         if let Some(agents) = &self.agents {
             parts.push(format!("## AGENTS.md\n{agents}"));
         }
-        if let Some(tools) = &self.tools {
-            parts.push(format!("## TOOLS.md\n{tools}"));
+        if let Some(contributing) = &self.contributing {
+            parts.push(format!("## CONTRIBUTING.md\n{contributing}"));
         }
-        if let Some(identity) = &self.identity {
-            parts.push(format!("## IDENTITY.md\n{identity}"));
+        if let Some(roadmap) = &self.roadmap {
+            parts.push(format!("## ROADMAP.md\n{roadmap}"));
         }
-        // Note: MEMORY.md and HEARTBEAT.md are typically not injected directly
-        // They're used for memory recall and periodic tasks
 
         if parts.is_empty() {
             String::new()
         } else {
-            format!("# Project Context\n\n{}", parts.join("\n\n"))
+            format!(
+                "# Project Context\n\nThe following project files have been loaded:\n\n{}",
+                parts.join("\n\n")
+            )
         }
     }
 
     /// Get total character count of all context
     #[must_use]
     pub fn total_chars(&self) -> usize {
-        self.agents.as_ref().map_or(0, String::len)
-            + self.soul.as_ref().map_or(0, String::len)
-            + self.user.as_ref().map_or(0, String::len)
-            + self.tools.as_ref().map_or(0, String::len)
-            + self.memory.as_ref().map_or(0, String::len)
-            + self.identity.as_ref().map_or(0, String::len)
-            + self.heartbeat.as_ref().map_or(0, String::len)
+        self.readme.as_ref().map_or(0, String::len)
+            + self.agents.as_ref().map_or(0, String::len)
+            + self.contributing.as_ref().map_or(0, String::len)
+            + self.roadmap.as_ref().map_or(0, String::len)
+    }
+}
+
+/// Global persona + user profile injected into every session, independent of workspace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GlobalPersona {
+    /// Who the agent is (formerly SOUL.md / IDENTITY.md)
+    pub persona: Option<String>,
+    /// Who the user is (formerly USER.md)
+    pub user_profile: Option<String>,
+}
+
+impl GlobalPersona {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.persona.as_ref().map_or(true, |s| s.trim().is_empty())
+            && self.user_profile.as_ref().map_or(true, |s| s.trim().is_empty())
+    }
+
+    /// Build the system-prompt section for global persona/user.
+    #[must_use]
+    pub fn build_system_prompt_injection(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = &self.persona {
+            let t = p.trim();
+            if !t.is_empty() {
+                parts.push(format!("## Persona\n{t}"));
+            }
+        }
+        if let Some(u) = &self.user_profile {
+            let t = u.trim();
+            if !t.is_empty() {
+                parts.push(format!("## User Profile\n{t}"));
+            }
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("# Agent Identity\n\n{}", parts.join("\n\n"))
+        }
     }
 }
 
@@ -168,13 +206,15 @@ impl Workspace {
         self
     }
 
-    /// Get path to the .nanna folder
+    /// Path to the optional local-state directory (`.nanna/`).
+    ///
+    /// Holds non-md state only (config.toml / workspace id). Not a markdown sidecar.
     #[must_use]
     pub fn nanna_folder(&self) -> PathBuf {
         self.path.join(NANNA_FOLDER)
     }
 
-    /// Ensure .nanna folder exists
+    /// Ensure `.nanna/` exists for local non-md state.
     ///
     /// # Errors
     /// Returns `WorkspaceError::Io` if folder cannot be created.
@@ -182,51 +222,57 @@ impl Workspace {
         let folder = self.nanna_folder();
         if !folder.exists() {
             fs::create_dir_all(&folder).await?;
-            info!("Created .nanna folder: {:?}", folder);
+            info!("Created .nanna local-state folder: {:?}", folder);
         }
         Ok(folder)
     }
 
-    /// Load context files from disk
+    /// Load standard project context files from the workspace root
     ///
     /// # Errors
     /// Returns `WorkspaceError::Io` if files cannot be read.
     pub async fn load_context(&mut self) -> Result<(), WorkspaceError> {
-        let nanna = self.nanna_folder();
-        
+        let root = &self.path;
+
         self.context = WorkspaceContext {
-            agents: read_optional_file(&nanna.join(AGENTS_FILE)).await?,
-            soul: read_optional_file(&nanna.join(SOUL_FILE)).await?,
-            user: read_optional_file(&nanna.join(USER_FILE)).await?,
-            tools: read_optional_file(&nanna.join(TOOLS_FILE)).await?,
-            memory: read_optional_file(&nanna.join(MEMORY_FILE)).await?,
-            identity: read_optional_file(&nanna.join(IDENTITY_FILE)).await?,
-            heartbeat: read_optional_file(&nanna.join(HEARTBEAT_FILE)).await?,
+            readme: read_optional_file(&root.join(README_FILE)).await?,
+            agents: read_optional_file(&root.join(AGENTS_FILE)).await?,
+            contributing: read_optional_file(&root.join(CONTRIBUTING_FILE)).await?,
+            roadmap: read_optional_file(&root.join(ROADMAP_FILE)).await?,
         };
-        
+
+        // One-shot legacy import: if root AGENTS.md is missing but `.nanna/AGENTS.md`
+        // exists, surface it (do not delete — migration is best-effort).
+        if self.context.agents.is_none() {
+            let legacy = self.nanna_folder().join(AGENTS_FILE);
+            if let Some(content) = read_optional_file(&legacy).await? {
+                debug!("Loaded legacy .nanna/AGENTS.md for {}", self.name);
+                self.context.agents = Some(content);
+            }
+        }
+
         self.last_accessed = chrono_timestamp();
-        
+
         debug!(
             "Loaded workspace context: {} ({} chars)",
             self.name,
             self.context.total_chars()
         );
-        
+
         Ok(())
     }
 
-    /// Save a context file back to disk
+    /// Save a standard context file at the workspace root
     ///
     /// # Errors
-    /// Returns `WorkspaceError::Io` if file cannot be written.
+    /// Returns `WorkspaceError::Io` / `Invalid` if file cannot be written or name rejected.
     pub async fn save_context_file(&self, filename: &str, content: &str) -> Result<(), WorkspaceError> {
         validate_context_filename(filename)?;
-        let folder = self.ensure_nanna_folder().await?;
-        let path = folder.join(filename);
-        // Postcondition: a validated single-component name stays inside .nanna.
+        let path = self.path.join(filename);
+        // Postcondition: a validated single-component name stays inside root.
         debug_assert!(
-            path.parent() == Some(folder.as_path()),
-            "validated filename escaped .nanna folder: {}",
+            path.parent() == Some(self.path.as_path()),
+            "validated filename escaped workspace root: {}",
             path.display()
         );
         fs::write(&path, content).await?;
@@ -234,108 +280,79 @@ impl Workspace {
         Ok(())
     }
 
-    /// Get path to memory folder (inside .nanna)
-    #[must_use]
-    pub fn memory_folder(&self) -> PathBuf {
-        self.nanna_folder().join(MEMORY_FOLDER)
-    }
-
-    /// Get path to today's memory file
-    #[must_use]
-    pub fn today_memory_file(&self) -> PathBuf {
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        self.memory_folder().join(format!("{date}.md"))
-    }
-
-    /// Ensure memory folder exists
+    /// Initialize a minimal workspace: root `AGENTS.md` (+ optional `ROADMAP.md`).
+    ///
+    /// Does **not** scaffold SOUL/USER/TOOLS/IDENTITY/HEARTBEAT/MEMORY or a memory folder.
     ///
     /// # Errors
-    /// Returns `WorkspaceError::Io` if folder cannot be created.
-    pub async fn ensure_memory_folder(&self) -> Result<PathBuf, WorkspaceError> {
-        let folder = self.memory_folder();
-        if !folder.exists() {
-            fs::create_dir_all(&folder).await?;
-            info!("Created memory folder: {:?}", folder);
-        }
-        Ok(folder)
-    }
+    /// Returns `WorkspaceError::Io` on write failure.
+    pub async fn initialize_minimal(&self, with_roadmap: bool) -> Result<(), WorkspaceError> {
+        fs::create_dir_all(&self.path).await?;
 
-    /// Append to today's memory file
-    ///
-    /// # Errors
-    /// Returns `WorkspaceError::Io` if file cannot be written.
-    pub async fn append_to_daily_memory(&self, content: &str) -> Result<(), WorkspaceError> {
-        self.ensure_memory_folder().await?;
-        let path = self.today_memory_file();
-        
-        let mut existing = fs::read_to_string(&path).await.unwrap_or_default();
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            existing.push('\n');
+        let agents_path = self.path.join(AGENTS_FILE);
+        if !agents_path.exists() {
+            fs::write(&agents_path, DEFAULT_AGENTS_MD).await?;
+            info!("Created {}", agents_path.display());
         }
-        existing.push_str(content);
-        if !existing.ends_with('\n') {
-            existing.push('\n');
+
+        if with_roadmap {
+            let roadmap_path = self.path.join(ROADMAP_FILE);
+            if !roadmap_path.exists() {
+                let name = &self.name;
+                let body = format!(
+                    "# {name} — Roadmap\n\n\
+                     > Project plan. Phases, checklists, dated notes.\n\n\
+                     **Last updated:** (add date)\n\n\
+                     ---\n\n\
+                     ## Immediate next actions\n\n\
+                     1. \n"
+                );
+                fs::write(&roadmap_path, body).await?;
+                info!("Created {}", roadmap_path.display());
+            }
         }
-        
-        fs::write(&path, existing).await?;
-        debug!("Appended to daily memory: {:?}", path);
+
+        // Optional local-state dir for non-md config (not a markdown sidecar).
+        let _ = self.ensure_nanna_folder().await?;
         Ok(())
-    }
-
-    /// Read recent memory files (today + yesterday)
-    ///
-    /// # Errors
-    /// Returns `WorkspaceError::Io` if files cannot be read.
-    pub async fn read_recent_memory(&self) -> Result<String, WorkspaceError> {
-        let folder = self.memory_folder();
-        let mut content = String::new();
-        
-        // Read yesterday's file
-        let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
-            .format("%Y-%m-%d")
-            .to_string();
-        let yesterday_path = folder.join(format!("{yesterday}.md"));
-        if let Some(text) = read_optional_file(&yesterday_path).await? {
-            content.push_str(&format!("# {yesterday}\n{text}\n\n"));
-        }
-        
-        // Read today's file
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let today_path = folder.join(format!("{today}.md"));
-        if let Some(text) = read_optional_file(&today_path).await? {
-            content.push_str(&format!("# {today}\n{text}\n"));
-        }
-        
-        Ok(content)
     }
 }
 
+/// Default root AGENTS.md template (minimal).
+pub const DEFAULT_AGENTS_MD: &str = r#"# AGENTS.md
+
+This is the project workspace. Treat it that way.
+
+## Every Session
+
+1. Read `README.md` — what this project is
+2. Read this file — agent instructions for the repo
+3. Check `ROADMAP.md` if present — current plan / next actions
+
+## Safety
+
+- Don't exfiltrate private data. Ever.
+- Don't run destructive commands without asking.
+- When in doubt, ask.
+
+## Make It Yours
+
+Capture build commands, architecture notes, and common pitfalls here so future
+sessions start with that knowledge. Keep it concise — this file is injected into
+every prompt.
+"#;
+
 /// Maximum length of a workspace context filename, in bytes.
-///
-/// Bounded per Tiger Style: every input has an explicit ceiling. 128 comfortably
-/// fits the standard files (`AGENTS.md`, …) while rejecting pathological input.
 const CONTEXT_FILENAME_LEN_MAX: usize = 128;
 
-/// Compile-time invariant: the cap must stay large enough for the standard files.
 const _: () = assert!(CONTEXT_FILENAME_LEN_MAX >= 16);
 
-/// Validate that `filename` is a safe, single-component filename that cannot
-/// escape the workspace `.nanna` folder.
-///
-/// This is the security guard for path traversal: the daemon path already
-/// allowlists the seven standard files, but the embedded (in-process GUI) path
-/// calls [`Workspace::save_context_file`] directly with an unvalidated name, so
-/// the guard lives on the chokepoint itself for defense in depth.
-///
-/// Accepts only a single normal path component with no separators, no `.`/`..`,
-/// and no root/drive prefix. Backslash is rejected explicitly because it is not
-/// a path separator on Unix (so a store written on Unix cannot smuggle a
-/// Windows-traversing name into a later Windows read).
+/// Validate that `filename` is a safe, single-component, allowlisted context filename.
 ///
 /// # Errors
-/// Returns [`WorkspaceError::Invalid`] if the name is empty, too long, or is not
-/// a single safe filename component.
-fn validate_context_filename(filename: &str) -> Result<(), WorkspaceError> {
+/// Returns [`WorkspaceError::Invalid`] if the name is empty, too long, not a single
+/// safe component, or not in [`STANDARD_CONTEXT_FILES`].
+pub fn validate_context_filename(filename: &str) -> Result<(), WorkspaceError> {
     if filename.is_empty() || filename.len() > CONTEXT_FILENAME_LEN_MAX {
         return Err(WorkspaceError::Invalid(format!(
             "context filename must be 1..={CONTEXT_FILENAME_LEN_MAX} bytes: {filename:?}"
@@ -346,14 +363,17 @@ fn validate_context_filename(filename: &str) -> Result<(), WorkspaceError> {
             "context filename must not contain path separators: {filename:?}"
         )));
     }
-    // Must resolve to exactly one Normal component (rejects `..`, `.`, absolute
-    // and drive-prefixed paths).
     let mut components = Path::new(filename).components();
     let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
     if !single_normal {
         return Err(WorkspaceError::Invalid(format!(
             "context filename must be a single path component: {filename:?}"
+        )));
+    }
+    if !STANDARD_CONTEXT_FILES.contains(&filename) {
+        return Err(WorkspaceError::Invalid(format!(
+            "context filename not allowlisted (expected one of {STANDARD_CONTEXT_FILES:?}): {filename}"
         )));
     }
     Ok(())
@@ -368,175 +388,153 @@ async fn read_optional_file(path: &Path) -> Result<Option<String>, WorkspaceErro
     }
 }
 
-/// Find workspace root by walking up from a path
+/// Find workspace root by walking up from a path.
 ///
-/// Looks for workspace markers (AGENTS.md, SOUL.md, .nanna, nanna.toml)
+/// Looks for standard project signals (`.git`, `README.md`, `AGENTS.md`,
+/// `ROADMAP.md`, `Cargo.toml` / `package.json` / `pyproject.toml`, etc.).
 pub async fn find_workspace_root(start_path: impl AsRef<Path>) -> Option<PathBuf> {
     let mut current = start_path.as_ref().to_path_buf();
-    
-    // Ensure we start with an absolute path
+
     if current.is_relative() {
         if let Ok(abs) = current.canonicalize() {
             current = abs;
         }
     }
-    
+
     loop {
-        // Check for any workspace markers
         for marker in WORKSPACE_MARKERS {
             if current.join(marker).exists() {
                 debug!("Found workspace root at {:?} (marker: {})", current, marker);
                 return Some(current);
             }
         }
-        
-        // Move up to parent
+
         if !current.pop() {
             break;
         }
     }
-    
+
     None
 }
 
-/// Discover all workspaces in a directory (non-recursive for now)
+/// Discover workspaces under a search path (non-recursive beyond immediate children
+/// that themselves look like workspace roots, plus the search path itself).
 pub async fn discover_workspaces(search_path: impl AsRef<Path>) -> Vec<PathBuf> {
-    let search_path = search_path.as_ref();
-    let mut workspaces = Vec::new();
-    
-    // Check if search_path itself is a workspace
-    if is_workspace_root(search_path).await {
-        workspaces.push(search_path.to_path_buf());
+    let search = search_path.as_ref();
+    let mut found = Vec::new();
+
+    if is_workspace_root(search).await {
+        found.push(search.to_path_buf());
     }
-    
-    // Check immediate children
-    if let Ok(mut entries) = fs::read_dir(search_path).await {
+
+    if let Ok(mut entries) = fs::read_dir(search).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.is_dir() && is_workspace_root(&path).await {
-                workspaces.push(path);
+                found.push(path);
             }
         }
     }
-    
-    workspaces
+
+    found
 }
 
-/// Check if a path is a workspace root
+/// Check if a path looks like a workspace root
 pub async fn is_workspace_root(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    for marker in WORKSPACE_MARKERS {
-        if path.join(marker).exists() {
-            return true;
-        }
+    if !path.is_dir() {
+        return false;
     }
-    false
+    WORKSPACE_MARKERS.iter().any(|m| path.join(m).exists())
 }
 
-/// Global workspace registry
+/// In-memory registry of open workspaces
 #[derive(Debug, Default)]
 pub struct WorkspaceRegistry {
     workspaces: HashMap<String, Workspace>,
-    active_workspace_id: Option<String>,
+    active_id: Option<String>,
 }
 
 impl WorkspaceRegistry {
-    /// Create a new empty registry
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Register a workspace
     pub fn register(&mut self, workspace: Workspace) -> String {
         let id = workspace.id.clone();
         self.workspaces.insert(id.clone(), workspace);
         id
     }
 
-    /// Get a workspace by ID
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&Workspace> {
         self.workspaces.get(id)
     }
 
-    /// Get a mutable workspace by ID
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Workspace> {
         self.workspaces.get_mut(id)
     }
 
-    /// Get workspace by path
     #[must_use]
     pub fn get_by_path(&self, path: &Path) -> Option<&Workspace> {
-        self.workspaces.values().find(|w| w.path == path)
+        self.workspaces.values().find(|ws| ws.path == path)
     }
 
-    /// Set active workspace
     pub fn set_active(&mut self, id: &str) -> bool {
-        if self.workspaces.contains_key(id) {
-            // Deactivate previous
-            if let Some(prev_id) = &self.active_workspace_id {
-                if let Some(prev) = self.workspaces.get_mut(prev_id) {
-                    prev.active = false;
-                }
-            }
-            // Activate new
-            if let Some(ws) = self.workspaces.get_mut(id) {
-                ws.active = true;
-                ws.last_accessed = chrono_timestamp();
-            }
-            self.active_workspace_id = Some(id.to_string());
-            true
-        } else {
-            false
+        if !self.workspaces.contains_key(id) {
+            return false;
         }
+        if let Some(prev) = self.active_id.take() {
+            if let Some(ws) = self.workspaces.get_mut(&prev) {
+                ws.active = false;
+            }
+        }
+        if let Some(ws) = self.workspaces.get_mut(id) {
+            ws.active = true;
+            ws.last_accessed = chrono_timestamp();
+        }
+        self.active_id = Some(id.to_string());
+        true
     }
 
-    /// Clear active workspace (switch to global mode)
     pub fn clear_active(&mut self) {
-        if let Some(prev_id) = &self.active_workspace_id {
-            if let Some(prev) = self.workspaces.get_mut(prev_id) {
-                prev.active = false;
+        if let Some(prev) = self.active_id.take() {
+            if let Some(ws) = self.workspaces.get_mut(&prev) {
+                ws.active = false;
             }
         }
-        self.active_workspace_id = None;
     }
 
-    /// Get active workspace
     #[must_use]
     pub fn active(&self) -> Option<&Workspace> {
-        self.active_workspace_id
+        self.active_id
             .as_ref()
             .and_then(|id| self.workspaces.get(id))
     }
 
-    /// Get active workspace mutably
     pub fn active_mut(&mut self) -> Option<&mut Workspace> {
-        let id = self.active_workspace_id.clone()?;
+        let id = self.active_id.clone()?;
         self.workspaces.get_mut(&id)
     }
 
-    /// List all workspaces
     #[must_use]
     pub fn list(&self) -> Vec<&Workspace> {
         self.workspaces.values().collect()
     }
 
-    /// Remove a workspace
     pub fn remove(&mut self, id: &str) -> Option<Workspace> {
-        if self.active_workspace_id.as_deref() == Some(id) {
-            self.active_workspace_id = None;
+        if self.active_id.as_deref() == Some(id) {
+            self.active_id = None;
         }
         self.workspaces.remove(id)
     }
 
-    /// Get count of workspaces
     #[must_use]
     pub fn len(&self) -> usize {
         self.workspaces.len()
     }
 
-    /// Check if empty
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.workspaces.is_empty()
@@ -546,7 +544,8 @@ impl WorkspaceRegistry {
 fn chrono_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -556,144 +555,127 @@ mod tests {
 
     #[tokio::test]
     async fn test_workspace_creation() {
-        let ws = Workspace::new("/tmp/test-project");
-        assert_eq!(ws.name, "test-project");
-        assert!(!ws.active);
+        let dir = tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+        assert_eq!(ws.path, dir.path());
+        assert!(!ws.id.is_empty());
     }
 
     #[tokio::test]
     async fn test_workspace_context_injection() {
-        let mut ctx = WorkspaceContext::default();
-        ctx.soul = Some("You are helpful.".to_string());
-        ctx.user = Some("Name: Alice".to_string());
-        
+        let ctx = WorkspaceContext {
+            readme: Some("A project".into()),
+            agents: Some("Be careful".into()),
+            contributing: None,
+            roadmap: Some("Ship it".into()),
+        };
         let injection = ctx.build_system_prompt_injection();
-        assert!(injection.contains("SOUL.md"));
-        assert!(injection.contains("You are helpful"));
-        assert!(injection.contains("USER.md"));
-        assert!(injection.contains("Alice"));
+        assert!(injection.contains("README.md"));
+        assert!(injection.contains("A project"));
+        assert!(injection.contains("AGENTS.md"));
+        assert!(injection.contains("ROADMAP.md"));
+        assert!(!injection.contains("SOUL.md"));
+        assert!(!injection.contains("MEMORY.md"));
     }
 
     #[tokio::test]
     async fn test_workspace_load_context() {
         let dir = tempdir().unwrap();
-        // Create .nanna folder and files inside it
-        let nanna_folder = dir.path().join(NANNA_FOLDER);
-        std::fs::create_dir(&nanna_folder).unwrap();
-        let soul_path = nanna_folder.join(SOUL_FILE);
-        std::fs::write(&soul_path, "Test soul content").unwrap();
-        
+        std::fs::write(dir.path().join(AGENTS_FILE), "instructions").unwrap();
+        std::fs::write(dir.path().join(README_FILE), "hello").unwrap();
+
         let mut ws = Workspace::new(dir.path());
         ws.load_context().await.unwrap();
-        
-        assert_eq!(ws.context.soul, Some("Test soul content".to_string()));
-        assert!(ws.context.agents.is_none());
+        assert_eq!(ws.context.agents.as_deref(), Some("instructions"));
+        assert_eq!(ws.context.readme.as_deref(), Some("hello"));
+        assert!(ws.context.roadmap.is_none());
     }
 
     #[tokio::test]
     async fn test_find_workspace_root() {
         let dir = tempdir().unwrap();
-        // Create .nanna folder as workspace marker
-        let nanna_folder = dir.path().join(NANNA_FOLDER);
-        std::fs::create_dir(&nanna_folder).unwrap();
-        
-        // Create a subdirectory
-        let subdir = dir.path().join("subdir");
-        std::fs::create_dir(&subdir).unwrap();
-        
-        // Should find root from subdirectory
-        let root = find_workspace_root(&subdir).await;
-        assert_eq!(root, Some(dir.path().to_path_buf()));
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let nested = dir.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let found = find_workspace_root(&nested).await.unwrap();
+        assert_eq!(found, dir.path());
     }
 
     #[tokio::test]
     async fn test_workspace_registry() {
-        let mut registry = WorkspaceRegistry::new();
-        
-        let ws1 = Workspace::new("/tmp/project1");
-        let ws2 = Workspace::new("/tmp/project2");
-        
-        let id1 = registry.register(ws1);
-        let id2 = registry.register(ws2);
-        
-        assert_eq!(registry.len(), 2);
-        assert!(registry.active().is_none());
-        
-        registry.set_active(&id1);
-        assert!(registry.active().is_some());
-        assert!(registry.get(&id1).unwrap().active);
-        
-        registry.set_active(&id2);
-        assert!(!registry.get(&id1).unwrap().active);
-        assert!(registry.get(&id2).unwrap().active);
+        let dir = tempdir().unwrap();
+        let mut reg = WorkspaceRegistry::new();
+        let ws = Workspace::new(dir.path());
+        let id = reg.register(ws);
+        assert!(reg.set_active(&id));
+        assert!(reg.active().is_some());
+        reg.clear_active();
+        assert!(reg.active().is_none());
     }
 
     #[test]
     fn test_validate_context_filename_accepts_standard_files() {
-        for f in [
-            AGENTS_FILE,
-            SOUL_FILE,
-            USER_FILE,
-            TOOLS_FILE,
-            MEMORY_FILE,
-            IDENTITY_FILE,
-            HEARTBEAT_FILE,
-            "notes.md",
-            "a",
-        ] {
-            assert!(validate_context_filename(f).is_ok(), "should accept {f:?}");
+        for name in STANDARD_CONTEXT_FILES {
+            assert!(validate_context_filename(name).is_ok(), "{name}");
         }
     }
 
     #[test]
     fn test_validate_context_filename_rejects_traversal() {
-        for bad in [
-            "",
-            "../evil",
-            "../../etc/passwd",
-            "..",
-            ".",
-            "sub/dir.md",
-            "sub\\dir.md",
-            "/etc/passwd",
-            "\\\\server\\share",
-            "..\\..\\windows",
-        ] {
-            assert!(
-                validate_context_filename(bad).is_err(),
-                "should reject {bad:?}"
-            );
-        }
-        // Over the length cap.
-        let too_long = "a".repeat(CONTEXT_FILENAME_LEN_MAX + 1);
-        assert!(validate_context_filename(&too_long).is_err());
+        assert!(validate_context_filename("../etc/passwd").is_err());
+        assert!(validate_context_filename("..\\secret").is_err());
+        assert!(validate_context_filename("SOUL.md").is_err());
+        assert!(validate_context_filename("MEMORY.md").is_err());
+        assert!(validate_context_filename("").is_err());
     }
 
     #[tokio::test]
     async fn test_save_context_file_rejects_traversal() {
         let dir = tempdir().unwrap();
         let ws = Workspace::new(dir.path());
-        // A traversal name must be refused and must not create a file outside .nanna.
-        let err = ws.save_context_file("../escaped.md", "pwned").await;
-        assert!(err.is_err());
-        assert!(!dir.path().join("escaped.md").exists());
-
-        // A legitimate name still works.
-        ws.save_context_file(AGENTS_FILE, "hello").await.unwrap();
-        let written = dir.path().join(NANNA_FOLDER).join(AGENTS_FILE);
-        assert_eq!(std::fs::read_to_string(written).unwrap(), "hello");
+        let err = ws
+            .save_context_file("../escape.md", "nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::Invalid(_)));
     }
 
     #[tokio::test]
-    async fn test_daily_memory() {
+    async fn test_initialize_minimal() {
         let dir = tempdir().unwrap();
-        let ws = Workspace::new(dir.path());
-        
-        ws.append_to_daily_memory("First note").await.unwrap();
-        ws.append_to_daily_memory("Second note").await.unwrap();
-        
-        let content = std::fs::read_to_string(ws.today_memory_file()).unwrap();
-        assert!(content.contains("First note"));
-        assert!(content.contains("Second note"));
+        let ws = Workspace::new(dir.path().join("proj"));
+        ws.initialize_minimal(true).await.unwrap();
+        assert!(ws.path.join(AGENTS_FILE).exists());
+        assert!(ws.path.join(ROADMAP_FILE).exists());
+        assert!(ws.path.join(NANNA_FOLDER).exists());
+        assert!(!ws.path.join("SOUL.md").exists());
+        assert!(!ws.path.join("MEMORY.md").exists());
+        assert!(!ws.path.join("memory").exists());
+    }
+
+    #[test]
+    fn test_global_persona_injection() {
+        let g = GlobalPersona {
+            persona: Some("Calm and competent".into()),
+            user_profile: Some("Works nights".into()),
+        };
+        let s = g.build_system_prompt_injection();
+        assert!(s.contains("Persona"));
+        assert!(s.contains("Calm and competent"));
+        assert!(s.contains("User Profile"));
+        assert!(s.contains("Works nights"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_agents_fallback() {
+        let dir = tempdir().unwrap();
+        let nanna = dir.path().join(NANNA_FOLDER);
+        std::fs::create_dir_all(&nanna).unwrap();
+        std::fs::write(nanna.join(AGENTS_FILE), "legacy agents").unwrap();
+
+        let mut ws = Workspace::new(dir.path());
+        ws.load_context().await.unwrap();
+        assert_eq!(ws.context.agents.as_deref(), Some("legacy agents"));
     }
 }

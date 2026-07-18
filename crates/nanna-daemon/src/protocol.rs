@@ -324,7 +324,7 @@ pub enum WorkspaceAction {
     ClearActive,
     /// Reload workspace context files
     Reload { id: String },
-    /// Get workspace context (SOUL.md, USER.md, etc.)
+    /// Get workspace context (README.md, AGENTS.md, ROADMAP.md, …)
     GetContext { id: String },
     /// Update workspace context file
     UpdateContext { id: String, file: String, content: String },

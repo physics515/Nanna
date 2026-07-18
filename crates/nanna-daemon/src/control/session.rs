@@ -267,7 +267,17 @@ impl ControlPlane {
         let sys_prompt = system_prompt.unwrap_or_else(|| {
             let base = self.system_prompt.blocking_read().clone();
 
-            // Inject workspace context so sub-agents see AGENTS.md, SOUL.md, etc.
+            // Global persona / user profile
+            let persona_inj = {
+                let cfg = self.config.blocking_read();
+                nanna_core::GlobalPersona {
+                    persona: cfg.agent.persona.clone(),
+                    user_profile: cfg.agent.user_profile.clone(),
+                }
+                .build_system_prompt_injection()
+            };
+
+            // Inject workspace context so sub-agents see README.md, AGENTS.md, ROADMAP.md
             let ws_context = {
                 let registry = self.workspaces.blocking_read();
                 registry.active()
@@ -275,20 +285,36 @@ impl ControlPlane {
                         let mut ctx = String::new();
                         let ws_path = ws.path.display();
                         ctx.push_str(&format!(
-                            "\n\n## Active Workspace\n\
-                            **Root directory: {ws_path}**\n\
-                            All file operations and commands MUST use this directory as the base.\n"
+                            "
+
+## Active Workspace
+                            **Root directory: {ws_path}**
+                            All file operations and commands MUST use this directory as the base.
+"
                         ));
                         let injection = ws.context.build_system_prompt_injection();
                         if !injection.is_empty() {
-                            ctx.push_str(&format!("\n{injection}"));
+                            ctx.push_str(&format!("
+{injection}"));
                         }
                         ctx
                     })
                     .unwrap_or_default()
             };
 
-            format!("{base}{ws_context}\n\nYou are a sub-agent. All tools are pre-activated — use them directly (no need to call discover_tools). Execute the task immediately and return results when done.\n\nYour task: {task}")
+            let persona_block = if persona_inj.is_empty() {
+                String::new()
+            } else {
+                format!("
+
+{persona_inj}")
+            };
+
+            format!("{base}{persona_block}{ws_context}
+
+You are a sub-agent. All tools are pre-activated — use them directly (no need to call discover_tools). Execute the task immediately and return results when done.
+
+Your task: {task}")
         });
 
         // Spawn the agent in a background task
@@ -352,110 +378,57 @@ impl ControlPlane {
                     }
                     info!("Sub-session {} completed", sid);
 
-                    // Extract project knowledge and update AGENTS.md + TOOLS.md
+                    // Extract project knowledge into root AGENTS.md (standard project file)
                     let ws_info = {
                         let reg = workspaces.read().await;
                         reg.active().map(|ws| (
                             ws.path.clone(),
                             ws.context.agents.clone(),
-                            ws.context.tools.clone(),
                         ))
                     };
-                    if let Some((ws_path, current_agents, current_tools)) = ws_info {
+                    if let Some((ws_path, current_agents)) = ws_info {
                         let result_text = chat_result.content;
                         let extraction_task = task_for_extraction.clone();
                         let agent_for_extract = agent.clone();
                         tokio::spawn(async move {
-                            // Trim result to last 2000 chars to keep extraction prompt small
-                            let result_tail: String = if result_text.len() > 2000 {
-                                result_text[result_text.len() - 2000..].to_string()
-                            } else {
-                                result_text.clone()
-                            };
-                            let extraction_prompt = format!(
-                                "A sub-agent just completed a task. Extract NEW knowledge into two categories.\n\n\
-                                Task: {}\n\n\
-                                Result (tail):\n{}\n\n\
-                                Current AGENTS.md:\n{}\n\n\
-                                Current TOOLS.md:\n{}\n\n\
-                                Respond in this EXACT format (include both headers even if empty):\n\
-                                \n\
-                                AGENTS:\n\
-                                (bullet points about project knowledge: build commands, file locations, architecture, \
-                                gotchas, conventions, error fixes. Or write NONE)\n\
-                                \n\
-                                TOOLS:\n\
-                                (bullet points about tool/environment specifics: host names, paths, device names, \
-                                CLI flags, environment variables, service URLs, config details. Or write NONE)\n\
-                                \n\
-                                Rules: be concise, no duplicates of existing content, bullet points only.",
-                                extraction_task,
-                                result_tail,
-                                current_agents.as_deref().unwrap_or("(empty)"),
-                                current_tools.as_deref().unwrap_or("(empty)")
+                            let agents_ctx = current_agents.as_deref().unwrap_or("(empty)");
+                            let extract_prompt = format!(
+                                "You maintain the project's root AGENTS.md (agent instructions for this repo).\n\
+                                 Task just completed: {extraction_task}\n\n\
+                                 Result summary:\n{result_text}\n\n\
+                                 Current AGENTS.md:\n{agents_ctx}\n\n\
+                                 Reply with ONLY new bullet points worth adding to AGENTS.md \
+                                 (build commands, architecture, pitfalls). If nothing lasting, reply NONE.\n\
+                                 Keep under 800 characters. No preamble."
                             );
-                            let extract_sid = format!("_extract_{}", uuid::Uuid::new_v4());
-                            match agent_for_extract.chat(
-                                &extract_sid,
-                                &extraction_prompt,
-                                Some("You are a concise knowledge extractor. Follow the output format exactly.".to_string()),
-                                &[],
-                            ).await {
-                                Ok(resp) => {
-                                    let content = resp.content.trim();
-                                    if content.len() > 4000 || content.is_empty() {
-                                        return; // Sanity guard
-                                    }
-
-                                    // Parse the two sections
-                                    let (agents_section, tools_section) = {
-                                        let upper = content.to_uppercase();
-                                        let agents_start = upper.find("AGENTS:");
-                                        let tools_start = upper.find("TOOLS:");
-
-                                        let agents_part = match (agents_start, tools_start) {
-                                            (Some(a), Some(t)) if a < t => {
-                                                Some(content[a + "AGENTS:".len()..t].trim())
-                                            }
-                                            (Some(a), None) => {
-                                                Some(content[a + "AGENTS:".len()..].trim())
-                                            }
-                                            _ => None,
+                            match agent_for_extract
+                                .chat(
+                                    &format!("extract-{}", uuid::Uuid::new_v4()),
+                                    &extract_prompt,
+                                    None,
+                                    &[],
+                                )
+                                .await
+                            {
+                                Ok(extract_result) => {
+                                    let agents_new = extract_result.content.trim();
+                                    if !agents_new.eq_ignore_ascii_case("NONE")
+                                        && !agents_new.is_empty()
+                                        && agents_new.len() < 2000
+                                    {
+                                        let agents_path = ws_path.join("AGENTS.md");
+                                        let existing = tokio::fs::read_to_string(&agents_path)
+                                            .await
+                                            .unwrap_or_default();
+                                        let updated = if existing.trim().is_empty() {
+                                            format!("# AGENTS.md\n\n### Learned\n{agents_new}\n")
+                                        } else {
+                                            format!("{}\n\n### Learned\n{}\n", existing.trim_end(), agents_new)
                                         };
-                                        let tools_part = match tools_start {
-                                            Some(t) => Some(content[t + "TOOLS:".len()..].trim()),
-                                            None => None,
-                                        };
-                                        (agents_part, tools_part)
-                                    };
-
-                                    // Update AGENTS.md if there's new content
-                                    if let Some(agents_new) = agents_section {
-                                        if !agents_new.eq_ignore_ascii_case("NONE") && !agents_new.is_empty() && agents_new.len() < 2000 {
-                                            let agents_path = ws_path.join(".nanna").join("AGENTS.md");
-                                            if let Ok(existing) = tokio::fs::read_to_string(&agents_path).await {
-                                                let updated = format!("{}\n\n### Learned\n{}\n", existing.trim_end(), agents_new);
-                                                if let Err(e) = tokio::fs::write(&agents_path, updated).await {
-                                                    warn!("Failed to update AGENTS.md: {e}");
-                                                } else {
-                                                    info!("Updated AGENTS.md with knowledge from sub-agent task");
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Update TOOLS.md if there's new content
-                                    if let Some(tools_new) = tools_section {
-                                        if !tools_new.eq_ignore_ascii_case("NONE") && !tools_new.is_empty() && tools_new.len() < 2000 {
-                                            let tools_path = ws_path.join(".nanna").join("TOOLS.md");
-                                            if let Ok(existing) = tokio::fs::read_to_string(&tools_path).await {
-                                                let updated = format!("{}\n\n### Learned\n{}\n", existing.trim_end(), tools_new);
-                                                if let Err(e) = tokio::fs::write(&tools_path, updated).await {
-                                                    warn!("Failed to update TOOLS.md: {e}");
-                                                } else {
-                                                    info!("Updated TOOLS.md with knowledge from sub-agent task");
-                                                }
-                                            }
+                                        if let Err(e) = tokio::fs::write(&agents_path, updated).await {
+                                            warn!("Failed to update AGENTS.md: {e}");
+                                        } else {
+                                            info!("Updated AGENTS.md with knowledge from sub-agent task");
                                         }
                                     }
                                 }

@@ -22,10 +22,10 @@ pub use scheduler::{
     DREAMING_TASK_NAME, is_dreaming_task,
 };
 pub use workspace::{
-    Workspace, WorkspaceContext, WorkspaceError, WorkspaceRegistry,
-    find_workspace_root, discover_workspaces, is_workspace_root,
-    NANNA_FOLDER, AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE, MEMORY_FILE, 
-    IDENTITY_FILE, HEARTBEAT_FILE, MEMORY_FOLDER, WORKSPACE_MARKERS,
+    Workspace, WorkspaceContext, WorkspaceError, WorkspaceRegistry, GlobalPersona,
+    find_workspace_root, discover_workspaces, is_workspace_root, validate_context_filename,
+    NANNA_FOLDER, AGENTS_FILE, README_FILE, ROADMAP_FILE, CONTRIBUTING_FILE,
+    STANDARD_CONTEXT_FILES, WORKSPACE_MARKERS, DEFAULT_AGENTS_MD,
 };
 
 pub use nanna_channels::{

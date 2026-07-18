@@ -169,13 +169,10 @@ impl ControlPlane {
                 if let Some(ws) = registry.get(&id) {
                     json!({
                         "context": {
+                            "readme": ws.context.readme,
                             "agents": ws.context.agents,
-                            "soul": ws.context.soul,
-                            "user": ws.context.user,
-                            "tools": ws.context.tools,
-                            "memory": ws.context.memory,
-                            "identity": ws.context.identity,
-                            "heartbeat": ws.context.heartbeat,
+                            "contributing": ws.context.contributing,
+                            "roadmap": ws.context.roadmap,
                         },
                         "total_chars": ws.context.total_chars(),
                         "system_prompt_injection": ws.context.build_system_prompt_injection(),
@@ -185,16 +182,8 @@ impl ControlPlane {
                 }
             }
             WorkspaceAction::UpdateContext { id, file, content } => {
-                // Validate file name
-                let valid_files = [
-                    nanna_core::AGENTS_FILE,
-                    nanna_core::SOUL_FILE,
-                    nanna_core::USER_FILE,
-                    nanna_core::TOOLS_FILE,
-                    nanna_core::MEMORY_FILE,
-                    nanna_core::IDENTITY_FILE,
-                    nanna_core::HEARTBEAT_FILE,
-                ];
+                // Validate against standard project context files
+                let valid_files = nanna_core::STANDARD_CONTEXT_FILES;
                 
                 if !valid_files.contains(&file.as_str()) {
                     return json!({ 

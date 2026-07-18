@@ -3,12 +3,11 @@
 
 //! Workspace management for Nanna
 //!
-//! Provides directory-based agent context, including:
-//! - Workspace detection and auto-discovery
-//! - Context files (AGENTS.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md)
-//! - Per-workspace memory folders
+//! Provides directory-based project context:
+//! - Workspace detection from standard project signals
+//! - Context from root `README.md` / `AGENTS.md` / `CONTRIBUTING.md` / `ROADMAP.md`
 //! - System prompt injection
-//! - Workspace templates
+//! - Minimal workspace templates (no bespoke SOUL/USER/MEMORY sidecar)
 
 mod discovery;
 mod files;
@@ -39,18 +38,11 @@ pub enum WorkspaceError {
     Parse(String),
 }
 
-/// Well-known workspace file names
+/// Standard project context files (workspace root)
 pub const AGENTS_FILE: &str = "AGENTS.md";
-pub const SOUL_FILE: &str = "SOUL.md";
-pub const USER_FILE: &str = "USER.md";
-pub const TOOLS_FILE: &str = "TOOLS.md";
-pub const MEMORY_FILE: &str = "MEMORY.md";
-pub const IDENTITY_FILE: &str = "IDENTITY.md";
-pub const HEARTBEAT_FILE: &str = "HEARTBEAT.md";
-pub const BOOTSTRAP_FILE: &str = "BOOTSTRAP.md";
+pub const README_FILE: &str = "README.md";
+pub const ROADMAP_FILE: &str = "ROADMAP.md";
+pub const CONTRIBUTING_FILE: &str = "CONTRIBUTING.md";
 
-/// Memory subfolder name
-pub const MEMORY_FOLDER: &str = "memory";
-
-/// Workspace marker directory
+/// Local non-md workspace state directory
 pub const WORKSPACE_MARKER_DIR: &str = ".nanna";

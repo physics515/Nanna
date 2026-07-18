@@ -2715,8 +2715,7 @@ impl Agent {
         let mut ctx = self.context.write().await;
         ctx.workspace_root = Some(workspace.root.clone());
         ctx.workspace_context = Some(workspace.system_context());
-        ctx.include_workspace_memory = workspace.config.include_memory;
-    }
+        }
 
     /// Reload workspace context from disk
     pub async fn reload_workspace(&self) -> Result<(), nanna_workspace::WorkspaceError> {

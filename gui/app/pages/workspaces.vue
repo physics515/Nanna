@@ -69,7 +69,7 @@
               </span>
 
               <button
-                v-if="!activeWorkspace.has_soul || !activeWorkspace.has_user"
+                v-if="!activeWorkspace.has_agents"
                 @click="repairWorkspace(activeWorkspace)"
                 class="ml-auto text-[10px] text-amber-300/60 hover:text-amber-300/90 transition-colors flex items-center gap-1"
               >
@@ -155,7 +155,7 @@
                   <span v-if="ws.active" class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-400/15 text-cyan-300/80">
                     Active
                   </span>
-                  <span v-if="!ws.has_soul && !ws.has_agents" class="text-[10px] px-2 py-0.5 rounded-full bg-amber-400/15 text-amber-300/70">
+                  <span v-if="!ws.has_agents" class="text-[10px] px-2 py-0.5 rounded-full bg-amber-400/15 text-amber-300/70">
                     Incomplete
                   </span>
                 </div>
@@ -487,22 +487,22 @@ interface WorkspaceInfo {
   name: string
   path: string
   active: boolean
+  has_readme: boolean
   has_agents: boolean
-  has_soul: boolean
-  has_user: boolean
-  has_memory: boolean
+  has_contributing: boolean
+  has_roadmap: boolean
   context_chars: number
 }
 
 interface WorkspaceValidity {
   exists: boolean
   is_valid: boolean
-  has_soul: boolean
-  has_user: boolean
+  has_readme: boolean
   has_agents: boolean
-  has_tools: boolean
-  has_memory: boolean
-  has_memory_folder: boolean
+  has_contributing: boolean
+  has_roadmap: boolean
+  has_git: boolean
+  has_manifest: boolean
 }
 
 const workspaces = ref<WorkspaceInfo[]>([])
@@ -512,7 +512,7 @@ const selectedWorkspace = ref<WorkspaceInfo | null>(null)
 // Create dialog state
 const showCreateDialog = ref(false)
 const createPath = ref('')
-const createFiles = ref<string[]>(['SOUL.md', 'USER.md', 'AGENTS.md'])
+const createFiles = ref<string[]>(['AGENTS.md'])
 const createValidity = ref<WorkspaceValidity | null>(null)
 
 // Repair dialog state
@@ -523,34 +523,31 @@ const repairFiles = ref<string[]>([])
 const activeWorkspace = computed(() => workspaces.value.find(ws => ws.active))
 
 const contextFiles = [
-  { key: 'has_soul', name: 'SOUL.md', short: 'S' },
-  { key: 'has_user', name: 'USER.md', short: 'U' },
+  { key: 'has_readme', name: 'README.md', short: 'R' },
   { key: 'has_agents', name: 'AGENTS.md', short: 'A' },
-  { key: 'has_memory', name: 'MEMORY.md', short: 'M' },
+  { key: 'has_contributing', name: 'CONTRIBUTING.md', short: 'C' },
+  { key: 'has_roadmap', name: 'ROADMAP.md', short: 'RM' },
 ]
 
 const detailFiles = [
-  { key: 'has_soul', name: 'SOUL.md' },
-  { key: 'has_user', name: 'USER.md' },
+  { key: 'has_readme', name: 'README.md' },
   { key: 'has_agents', name: 'AGENTS.md' },
-  { key: 'has_memory', name: 'MEMORY.md' },
+  { key: 'has_contributing', name: 'CONTRIBUTING.md' },
+  { key: 'has_roadmap', name: 'ROADMAP.md' },
 ]
 
 const availableFiles = [
-  { name: 'SOUL.md', desc: 'Agent personality', existsKey: 'has_soul' },
-  { name: 'USER.md', desc: 'User info', existsKey: 'has_user' },
-  { name: 'AGENTS.md', desc: 'Behavior rules', existsKey: 'has_agents' },
-  { name: 'TOOLS.md', desc: 'Tool notes', existsKey: 'has_tools' },
-  { name: 'MEMORY.md', desc: 'Long-term memory', existsKey: 'has_memory' },
+  { name: 'AGENTS.md', desc: 'Agent instructions', existsKey: 'has_agents' },
+  { name: 'README.md', desc: 'Project overview', existsKey: 'has_readme' },
+  { name: 'CONTRIBUTING.md', desc: 'Contribution guide', existsKey: 'has_contributing' },
+  { name: 'ROADMAP.md', desc: 'Project roadmap', existsKey: 'has_roadmap' },
 ]
 
 const fileReference = [
-  { name: 'SOUL.md', desc: 'Agent personality, identity, voice' },
-  { name: 'USER.md', desc: 'Info about the user (name, preferences)' },
   { name: 'AGENTS.md', desc: 'How the agent should behave in this workspace' },
-  { name: 'TOOLS.md', desc: 'Tool-specific notes and configurations' },
-  { name: 'MEMORY.md', desc: 'Long-term curated memories' },
-  { name: 'memory/', desc: 'Daily notes (YYYY-MM-DD.md files)' },
+  { name: 'README.md', desc: 'Project overview and documentation' },
+  { name: 'CONTRIBUTING.md', desc: 'How to work in this repository' },
+  { name: 'ROADMAP.md', desc: 'Planned work and project direction' },
 ]
 
 const missingFilesForRepair = computed(() => {
@@ -664,7 +661,7 @@ async function createWorkspace() {
     await openWorkspace(createPath.value)
     showCreateDialog.value = false
     createPath.value = ''
-    createFiles.value = ['SOUL.md', 'USER.md', 'AGENTS.md']
+    createFiles.value = ['AGENTS.md']
     createValidity.value = null
   } catch (e) {
     console.error('Failed to create workspace:', e)
