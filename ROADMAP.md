@@ -10,8 +10,8 @@
 
 **Last updated:** 2026-07-18 (**P16 daemon-only consolidation LANDED** — GUI is now a pure daemon client:
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
-deps pruned to config/core/tools; prior same day: GUI testing + UI/UX quality track; P11 tool-manager
-consistency closed + scripted-exec timeout/tree-kill + tools resolve against the active workspace dir)
+deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
+standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -115,7 +115,8 @@ Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **
 the two ship together). **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
 what it does: **P16** (daemon-only consolidation — delete embedded mode, GUI becomes a pure daemon client,
 iOS deferred) collapses the double-implementation tax behind most P4/P8/P11 "GUI-embedded copy drifted" debt;
-**P17** (retire the bespoke `ROADMAP.md`/agent docs for standard GitHub Issues/Projects + community-health files).
+**P17** (drop the bespoke per-workspace `.nanna/` agent markdown — Nanna reads a project's *standard* files
+`README`/`AGENTS.md`/`ROADMAP.md`, and persona/user/memory move to global config + the DB).
 Concretely, today Nanna:
 
 - Runs as a **headless daemon** (Windows service / systemd / launchd) with WebSocket IPC, PID
@@ -1589,54 +1590,65 @@ forwarding; removed every command's embedded arm; rewired `/agents` onto daemon 
 - **Config ownership** — GUI keeps a `config.toml` write cache that pushes via `config_set`/`config_reload`;
   a single-writer daemon-owned model with a pure read cache is the endgame.
 
-### P17 — Repository restructure: standard GitHub conventions (retire ROADMAP.md + agent docs) 🌱 (new — 2026-07-17)
-**Directional change (owner-requested):** stop running the repo's *own* development on bespoke markdown — the
-custom single-source-of-truth `ROADMAP.md` and any agent-specific docs — and use **only standard GitHub files
-the way they're intended**, with **GitHub Issues + Projects + Milestones** as the planning surface. One
-conventional structure any contributor (human or agent) already understands. **This is the last thing
-`ROADMAP.md` is used for** — P16/P17 themselves migrate into Issues, then the file is deleted.
+### P17 — Workspace context: standard project files instead of bespoke `.nanna/` agent files 🌱 (new — 2026-07-17, product direction)
+**Directional change (owner-requested):** stop making Nanna scaffold and read a pile of bespoke per-workspace
+agent markdown. Today, initializing a *user's* workspace creates `.nanna/{AGENTS,SOUL,USER,TOOLS,IDENTITY,
+HEARTBEAT,MEMORY}.md`, and agent context is assembled by reading them. **Going forward a workspace's context
+comes from the project's OWN standard files** — the ones any repo already has and any contributor already
+understands — with per-workspace planning in a `ROADMAP.md` modeled on Nanna's own. Nanna should drop into any
+existing repo and be useful from its `README.md` / `AGENTS.md` / `ROADMAP.md` with **no `.nanna/` scaffolding
+required**. *(Scope: this is the PRODUCT's per-workspace files, NOT the nanna source repo's own dev docs —
+Nanna's own `ROADMAP.md` stays.)*
 
-**Inventory (2026-07-17):** 14 tracked `.md`, no `docs/`. `ROADMAP.md` = ~1,682 lines, phases P0–P17;
-coupled to exactly **two** files — `README.md` (3 links) and `.claude/skills/daily-dev/SKILL.md` (reads **and
-writes** it) — nothing in code/CI/Cargo references it. There is **no** root `CLAUDE.md`/`.cursorrules`/
-`AGENTS.md`, so "agent docs" here means the `ROADMAP.md`↔`daily-dev` coupling and `.claude/` dev tooling, not a
-pile of instruction files. **Do NOT touch product-feature markdown:** the `.nanna/` workspace context files
-(SOUL/USER/AGENTS/TOOLS/MEMORY) are a runtime feature (constants in `nanna-core/src/workspace.rs`,
-`nanna-workspace/src/{lib,files,templates,manager}.rs`, templates `include_str!`-embedded), and
-`crates/nanna-tools/default-skills/**` are shipped product assets.
+**Target model (decided 2026-07-17):**
+- **Workspace context = the project's standard files.** Nanna reads, in priority order: `README.md` (what the
+  project is), root `AGENTS.md` (the emerging *agents.md* standard — agent instructions for this repo),
+  `CONTRIBUTING.md` (conventions / how to work here), `docs/**`, and `ROADMAP.md` (the plan — Nanna both reads
+  and maintains it, in the same phase/checklist/dated-note structure as Nanna's own). A root `AGENTS.md` is
+  *standard*, not bespoke, so it stays; `SOUL/USER/TOOLS/IDENTITY/HEARTBEAT/MEMORY` go.
+- **Persona + user profile → GLOBAL agent config.** `SOUL.md` (who the agent is) and `USER.md` (who the user is)
+  are cross-workspace, not per-project — they move into global agent settings applied to every workspace, not
+  files scaffolded into each project; `IDENTITY.md` folds in here too.
+- **Memory → DB-backed only.** Drop the `.nanna/MEMORY.md` (+ `memory/*.md`) file mirror; memory already lives in
+  Turso (`nanna-memory`, FSRS). The GUI/daemon memory reads that go through the files today route to the store.
+- **Heartbeat → scheduled-task config.** Drop `HEARTBEAT.md` as a prompt file; periodic tasks become scheduler
+  config (the daemon already runs a heartbeat/cron loop — the "Read HEARTBEAT.md if it exists" prompt is replaced
+  by task definitions).
+- **`TOOLS.md` → dropped.** Tools are discoverable at runtime; a static notes file is redundant.
 
-**Add the missing community-health files** (several also close standing P0.2/P1 items):
-- [ ] `LICENSE` (MIT) — closes P0.2 "Commit LICENSE file (MIT) — appears absent despite README reference".
-- [ ] `SECURITY.md` (vulnerability disclosure) — closes the P1 "No SECURITY.md" items.
-- [ ] `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`.
-- [ ] `.github/ISSUE_TEMPLATE/` (bug_report, feature_request, `config.yml`) + `.github/PULL_REQUEST_TEMPLATE.md`.
+**Code surface to change** (2026-07-17 inventory):
+- [ ] Retire the file-name constants + context assembly: `crates/nanna-core/src/workspace.rs:32-38`
+      (`AGENTS_FILE`…`HEARTBEAT_FILE`) + the read/assemble at `:87-101,198-…`; the parallel set in
+      `crates/nanna-workspace/src/lib.rs:43-49` and the context builder `crates/nanna-workspace/src/files.rs:81-275`
+      (emits `## AGENTS.md`…`## HEARTBEAT.md` sections). Re-point context assembly at the standard files.
+- [ ] Stop auto-creating the sidecar: `crates/nanna-workspace/src/manager.rs:164-188` (creates `AGENTS.md`/
+      `SOUL.md`) and the templates `crates/nanna-workspace/templates/standard/{AGENTS,SOUL,USER,TOOLS,IDENTITY}.md`
+      + `templates.rs:74-78` `include_str!`. Keep only a minimal root `AGENTS.md` (+ optional `ROADMAP.md`)
+      template; delete the rest.
+- [ ] **Workspace detection** (`crates/nanna-workspace/src/discovery.rs:12-60`) currently scores `.nanna/` /
+      `SOUL.md` / `AGENTS.md`. Re-key on standard project signals: `.git`, `README.md`, root `AGENTS.md`,
+      `ROADMAP.md`, `Cargo.toml` / `package.json` / `pyproject.toml`, etc.
+- [ ] **Global persona/user config:** add persona + user-profile fields to the global agent config (the source of
+      truth), injected into every session's context independent of the workspace.
+- [ ] **Heartbeat:** replace the `HEARTBEAT_FILE` prompt reads (`nanna-core/src/scheduler.rs:105`,
+      `nanna-daemon/src/server.rs:795`, `gui/src-tauri/src/lib.rs:534`) with scheduled-task definitions.
+- [ ] **Memory:** re-point the GUI memory reads off `MEMORY.md` / `memory/*.md`
+      (`gui/src-tauri/src/commands/workspaces.rs:366-593`) onto the store; drop the `.md` mirror + the
+      `include_memory` gating in `files.rs`.
+- [ ] **CLI + GUI + protocol:** update `src/commands/workspace.rs:23-41` (CLI `init` creates the 7 files), the GUI
+      workspace-validity check that requires `.nanna` with `SOUL.md`/`AGENTS.md` (`commands/workspaces.rs:672`),
+      `workspaces.vue`, and the daemon `protocol.rs` / `control/{session,chat}.rs` filename references.
+- [ ] **`.nanna/` dir fate:** the *markdown* sidecar goes; decide whether `.nanna/` survives for non-md workspace
+      state (workspace id / local config) or that state moves to the central store. (Minor — surface in impl.)
 
-**Move durable narrative out of ROADMAP.md into `docs/`** (so the vision/architecture/perf content survives the
-file's deletion):
-- [ ] `docs/architecture.md` ← "Core Model" (crate tiers, governing "channels as control-plane clients").
-- [ ] `docs/performance.md` ← "Performance & Benchmarking" methodology + the `bench/BASELINE.md` pointer. Fix
-      `README.md`'s `ROADMAP.md#performance--benchmarking-governing-concern` anchor to target this page.
-- [ ] `docs/north-star.md` ← the North Star / local-first pivot narrative.
+**Migration (existing workspaces have `.nanna/` files today):** on first run against a legacy workspace, import
+`SOUL.md`/`USER.md` → global config, confirm memory is in the store (it is), then stop reading `.nanna/*.md`.
+delete the old files.
 
-**Move planning to GitHub** and cut the coupling in one final change:
-- [ ] Create a **GitHub Project (v2)** + **Milestones** seeded from the phase headings (P0…P16 → milestones or
-      labels). Convert each *open* `- [ ]` item into an Issue with milestone/label; leave the *done* `- [x]`
-      history in git as the record (the ROADMAP's final committed state) rather than re-creating closed Issues.
-- [ ] **Retire/rewrite `.claude/skills/daily-dev/SKILL.md`** — it currently reads+writes `ROADMAP.md`; it must
-      instead pull the next item from the Project/Issues, or be retired for issue-driven work. Do this in the
-      SAME change that deletes `ROADMAP.md` so nothing points at a missing file.
-- [ ] Repoint `README.md`'s 3 `ROADMAP.md` links at the Project board + `docs/`; fold the user-facing README
-      rewrite (P0.2) in here.
-- [ ] **Delete `ROADMAP.md`** (after the above).
-
-**Housekeeping surfaced by the inventory:**
-- [ ] `.claude/settings.local.json` carries stale `clawdbot-rs` (old repo name) paths; the P1 item "Remove or
-      gitignore `.claude/settings.local.json`" already flags it — resolve here.
-- [ ] The repo commits a **live root `.nanna/` dogfood workspace** (SOUL/USER/AGENTS/TOOLS/MEMORY). Gitignore it
-      so product-runtime context stops intermixing with repo docs (keeps the *feature*, drops the in-repo instance).
-
-**Sequencing:** land community files + `docs/` + Project seeding first (all additive, zero breakage); then, in
-one final commit, flip README links, retire the `daily-dev`↔`ROADMAP` coupling, and delete `ROADMAP.md`.
+**Payoff:** Nanna works in any existing repo from its standard files with zero bespoke scaffolding;
+persona/user/memory stop being duplicated into every project; one planning convention (`ROADMAP.md`) shared with
+how Nanna plans itself. Orthogonal to P16 (daemon-only) but both touch workspace handling — sequence **after** P16
+lands so the workspace code is edited once, not in two copies.
 
 ---
 
