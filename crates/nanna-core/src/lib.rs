@@ -7,10 +7,12 @@
 
 pub mod cron;
 mod dreaming;
+pub mod log_buffer;
 mod scheduler;
 mod workspace;
 
 pub use cron::{CronError, CronExpr};
+pub use log_buffer::{LogBuffer, LogBufferLayer, LogEntry, LogSource};
 pub use dreaming::{
     DreamingRuntime, DreamingRuntimeConfig, create_dreaming_executor,
 };

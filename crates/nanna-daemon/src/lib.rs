@@ -18,7 +18,10 @@ pub mod embedding_router;
 pub mod health;
 pub mod ipc;
 pub mod llm_router;
-pub mod log_buffer;
+// `log_buffer` now lives in `nanna-core` so pure daemon clients (the GUI) can
+// capture their own lines without linking this crate. Re-exported here so
+// `crate::log_buffer::…` and `nanna_daemon::log_buffer::…` paths keep resolving.
+pub use nanna_core::log_buffer;
 pub mod log_file;
 pub mod memory_adapter;
 pub mod memory_persistence;

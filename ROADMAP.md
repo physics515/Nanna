@@ -8,7 +8,10 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-18 (GUI testing + UI/UX quality track; P11 tool-manager consistency closed + scripted-exec timeout/tree-kill + tools resolve against the active workspace dir; **added P16 daemon-only consolidation + P17 workspace-context standardization directional phases**; prior: 2026-07-15 response healing + stop-context retention)
+**Last updated:** 2026-07-18 (**P16 daemon-only consolidation LANDED** — GUI is now a pure daemon client:
+embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
+deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
+standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -308,49 +311,28 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 
 ### P3 — Multi-Agent & MCP ✅ (one caveat)
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
-spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy,
-SupervisionStrategy OneForOne/OneForAll/RestForOne, HealthCheckConfig). **Shipped**, except:
-- [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file
-      does not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement
-      (stdio server, tool/resource/prompt registration, HTTP mode, tool filtering, auth, streaming).
+spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
+health checks). **Shipped**, except:
+- [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+      not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
-- [x] Supervisor recovery tracking recovers on first success instead of counting consecutive successes (`supervisor.rs:577`).
-      *(2026-07-06) Extracted a pure `apply_health_result` state machine (Unhealthy→Running requires `success_threshold` **consecutive** successes; Running→Unhealthy requires `failure_threshold` consecutive failures; thresholds floored at 1; a failure resets the recovery streak). Added the `consecutive_health_successes` stat. Bonus: events now emit after the agents write-lock is released (was held across `.await`). 6 unit tests.*
+- [x] Supervisor recovery counts consecutive successes, not first-success (pure `apply_health_result`
+      state machine + `consecutive_health_successes` stat; events emit after lock release). *(2026-07-06)*
 
 ### P4 — GUI Application ✅
-Tauri 2 + Nuxt 4 + Tailwind 4, 80s-hacker Palenight theme. Streaming chat with markdown, session
-management, tabbed settings + full config migration + import/export, tool-call visualization,
-memory browser, channel onboarding wizards (all five), model-stats + tool-stats dashboards, system
-tray, native notifications, UI component library, mobile-responsive layouts. **Shipped.**
-Open polish: mobile testing on real devices (Tauri Android/iOS), per-tool drill-down finish, latency sparklines.
-- [x] **Logs page shows embedded logs, tagged by source.** *(2026-07-16, user-reported: "no logs in
-      embedded mode")* The page was **structurally empty in embedded mode**, not merely unpopulated:
-      `get_daemon_logs` hard-returned `Ok(vec![])` whenever `!is_daemon_mode()` (`commands/system.rs`),
-      and the GUI installed a bare `tracing_subscriber::fmt()` to **stdout with no capture** — so the
-      lines it would have shown never existed. Fixed end-to-end: (1) `run()` now composes
-      `registry().with(EnvFilter).with(fmt::layer()).with(LogBufferLayer)` over a 5000-entry
-      `LogBuffer` (matches the daemon's cap; ~1 MB) held in `AppState`; (2) `LogEntry` gained a
-      `source: LogSource` (`embedded` | `daemon`) stamped by the buffer that captured it — the tag lives
-      on the `LogBuffer`, so a mixed-origin buffer is unrepresentable; (3) `get_daemon_logs` **merges**
-      both origins (the GUI emits its own lines even while attached to a daemon, so the two are
-      genuinely simultaneous), sorts by timestamp, and bounds the result at `MAX_LOG_LINES` (2000);
-      (4) the page renders a per-line source badge, and the header/status now name both sources instead
-      of a bare "Daemon Logs / Disconnected" that read as broken next to a full log view.
-      `#[serde(default)]` on `source` keeps a newer GUI readable against an older daemon (untagged →
-      `daemon`, which is where it came from). Also **deleted `gui/src-tauri/src/logs.rs`** — a 62-line
-      orphan module with a duplicate `LogEntry`/`LogBuffer` and a second stubbed `get_daemon_logs`
-      returning `Ok(vec![])`, never registered and referenced by nothing (a decoy for exactly this bug).
-      11 tests (6 buffer incl. wire round-trip + legacy-untagged default; 5 merge incl. interleaving,
-      per-line tags, newest-kept-at-limit, zero-limit).
-- [x] **"Live" on the Logs page was decorative.** *(2026-07-16)* The page listened for a `daemon-log`
-      Tauri event that **has no emitter anywhere in the codebase** — so it was a frozen snapshot from
-      page-load in *both* modes, despite the "Real-time daemon output" subtitle and a lit Live button.
-      Replaced the dead listener with a 1 s poll of the merged view while Live is on. Clear now records
-      a `clearedBefore` watermark so cleared history does not reappear on the next poll.
-      - [ ] Follow-up: polling re-serialises up to 2000 lines/s. A push channel (daemon-side
-            `SystemAction::Logs` subscribe + a real `daemon-log` emit) or a monotonic per-entry sequence
-            number for incremental `since`-cursor fetches would be strictly better; poll was chosen to
-            avoid an IPC protocol change in a user-reported bugfix.
+Tauri 2 + Nuxt 4 + Tailwind 4 (Palenight theme). Streaming markdown chat, session management, tabbed
+settings + config migration + import/export, tool-call visualization, memory browser, channel onboarding
+wizards (all five), model-stats + tool-stats dashboards, system tray, native notifications,
+mobile-responsive layouts. **Shipped.** Open polish: real-device mobile testing, per-tool drill-down,
+latency sparklines.
+- [x] **Logs page shows in-process logs, tagged by source** *(2026-07-16)* — `run()` composes a
+      `LogBufferLayer` over a 5000-entry buffer; `LogEntry.source` (`embedded`|`daemon`) is stamped by the
+      capturing buffer; `get_daemon_logs` merges both origins, sorts by timestamp, bounds at 2000. Deleted
+      the orphan `logs.rs` decoy. 11 tests. *(log_buffer relocated to `nanna-core` in P16.)*
+- [x] **Live logs actually poll** *(2026-07-16)* — the old `daemon-log` listener had no emitter (frozen
+      snapshot); replaced with a 1 s poll of the merged view + a `clearedBefore` watermark.
+      - [ ] Follow-up: a push channel (daemon subscribe + real emit) or a `since`-cursor beats
+            re-serialising up to 2000 lines/s; poll avoided an IPC change in a bugfix.
 
 #### P4 follow-on — GUI Testing & UX Quality 🚧 (active track)
 
@@ -600,41 +582,20 @@ and ships TLS, QR address output, abuse defense, and client authorization out of
 ### P10 — Token Efficiency & Cost Optimization ✅ (mostly)
 Done: Anthropic + OpenAI native prompt caching + hit tracking, cross-provider model routing with
 complexity classifier + tool-call-only routing + first-message override, aggressive tool-output
-summarization, progressive distillation (rolling summary every N turns), tool-result eviction,
-CDC message-level dedup, per-model stats tracker + persistence + stats-informed routing. Open:
-- [x] **LLMLingua-style prompt compression** (needs local GPU model, e.g. Phi-3/Qwen2 via Ollama; perplexity token scoring, selective).
-      *(2026-07-16) Wired end-to-end against the **summarization-model settings** (not a hard-coded Ollama):
-      `nanna-agent::compressor` scores sentences via the configured model, keeps top-`1/ratio` by
-      information density, falls back to head/tail truncation on score-count mismatch. Pure helpers
-      (`parse_scores`, `select_keep_indices`, `fallback_compress`, `split_sentences`) are unit-tested.
-      Tool-output path walks `summarization_priority` with client failover (`compress_with_priority`).
-      Tier-1 proactive compression now preferentially rewrites large older tool results in context
-      (`AgentContext::compress_older_tool_results` / `Agent::compress_older_context_tool_results`)
-      before the prior `drop_oldest` fallback. Note: sentence-level scoring (not per-token perplexity)
-      — practical on chat-completion APIs where raw logprobs aren't exposed.*
-- [x] **Structured tool output schemas** — audit tool verbosity, optional `output_schema` on `ToolDefinition`, JSON output mode.
-      *(2026-07-17) Done end-to-end. `ToolDefinition::output_schema` + `with_output_schema`;
-      `nanna_tools::output::{format_tool_output, wants_json_output, schemas}` with registry-side
-      JSON rewrite of successful results. Audited verbose tools (`read_file`, `write_file`,
-      `list_dir`, `exec`, `code_search`, `project_structure`, `web_search`, `web_fetch`) all
-      declare schemas, accept `output_mode=text|json`, and attach structured `data` via
-      `ToolResult::with_data`. Default remains free-form text.*
-- [x] **Better token estimation** — replace `len()/4` with tiktoken-rs (OpenAI) or family-aware
-      multipliers (3.5 code / 4 English / 2 CJK); account for per-message framing (~100 tok) and
-      truncation-marker text. Current heuristic causes ~20–30% overflow/underutilization.
-      *(2026-07-07) First pass in `nanna-llm`: `estimate_tokens` is now character-class aware
-      (ASCII ~4 chars/token via `div_ceil`; wide/CJK ~1 token/char — fixes the byte-`len()/4`
-      CJK under-count that was the main overflow source), and `estimate_request_tokens` adds
-      `MESSAGE_FRAMING_TOKENS` (4) per message. Tests cover ASCII/CJK/mixed + framing.
-      (2026-07-17) Residual TODOs closed. Family-aware estimators
-      (`TokenContentFamily::{English,Code,Auto}` with 4.0/3.5/1.0 densities + auto density
-      scan for code-ish punctuation) and a real `tiktoken-rs` path
-      (`estimate_tokens_exact` / `estimate_tokens_for_model`, default-on `tiktoken` feature,
-      o200k then cl100k / `bpe_for_model`). Tool-use / input blocks route through the Code
-      family. `nanna-agent` context + chunker now call the family-aware helpers. Tests cover
-      English vs Code vs Auto-JSON, framing, and exact smoke path.*
-- [x] Streaming cache tracking (`loop_runner.rs:834`) — parse usage from `message_start` for accurate cache stats.
-      *(2026-07-06) `StreamEvent::MessageStart` now carries `input_tokens`/`cache_read_tokens`/`cache_creation_tokens` (parsed from the Anthropic `message_start` usage object; zero for providers that don't report it); the streaming loop captures them into `LlmResult` instead of the old `input_tokens: 100` + zero-cache placeholders. 2 tests on `parse_sse_event` (with/without usage).*
+summarization, progressive distillation (rolling summary every N turns), tool-result eviction, CDC
+message-level dedup, per-model stats tracker + persistence + stats-informed routing.
+- [x] **LLMLingua-style prompt compression** *(2026-07-16)* — `nanna-agent::compressor` scores sentences
+      via the configured summarization model, keeps top-`1/ratio` by density (head/tail fallback); tier-1
+      proactive pass rewrites large older tool results before `drop_oldest`. (Sentence-level, not per-token.)
+- [x] **Structured tool output schemas** *(2026-07-17)* — `ToolDefinition::output_schema` +
+      `nanna_tools::output`; verbose tools declare schemas, accept `output_mode=text|json`, attach `data`
+      via `ToolResult::with_data`. Default stays free-form text.
+- [x] **Better token estimation** *(2026-07-07 / 07-17)* — character-class + family-aware estimators
+      (English/Code/Auto densities) with per-message framing, plus an exact `tiktoken-rs` path
+      (`estimate_tokens_for_model`, default-on `tiktoken` feature); replaces the `len()/4` heuristic.
+- [x] **Streaming cache tracking** *(2026-07-06)* — `StreamEvent::MessageStart` carries
+      `input_tokens`/`cache_read`/`cache_creation` (from Anthropic `message_start` usage), captured into
+      `LlmResult` instead of placeholders.
 
 ### P11 — Correctness, Security & Architecture Debt 🚧 (new — cross-cutting)
 Concrete, actionable items with `file:line` anchors. **This is the near-term backlog the daily
@@ -1602,82 +1563,32 @@ not 1:1, and the differences matter more than the similarities:
 - [ ] **GUI**: a task view is the natural place to *watch* a 4-hour run — the "is it still on track?"
       screen. Pairs with the P13 dream-log as demoable surface.
 
-### P16 — Daemon-only consolidation: delete embedded mode, GUI becomes a thin client 🌱 (new — 2026-07-17, flagship refactor)
-**Directional change (owner-requested):** drop **all** in-process "embedded" execution from the GUI. Today the
-Tauri app runs in one of two modes — attach to the headless `nanna-daemon` over IPC, **or** fall back to an
-in-process backend that runs the whole agent loop, tools, memory, scheduler, and LLM routing inside the GUI
-process. Maintaining both is a permanent double-implementation tax (every feature written twice, every bug
-reproduced in two places — the recurring "daemon has X, embedded copy of X drifted" P11 items are the symptom).
-**Go daemon-only: one codebase (the daemon), one agent loop, one event path; the GUI is purely a daemon client.**
-A failed daemon connect becomes a hard error, not a fallback. **Explicitly dropping planned iOS/mobile for now —
-that's an acceptable cost of one codebase.** (This retroactively simplifies the many P4/P8/P11 "GUI-embedded copy
-needs the same fix" items — they evaporate.)
+### P16 — Daemon-only consolidation: GUI is a pure daemon client ✅ (landed 2026-07-18, flagship refactor)
+**Landed:** dropped **all** in-process "embedded" execution from the Tauri GUI. It now only attaches to
+`nanna-daemon` over IPC and forwards every request; a failed connect is a hard `Disconnected` status (no
+fallback). This ends the double-implementation tax the P4/P8/P11 "embedded copy of X drifted" items were a
+symptom of — one agent loop, one memory system, one tool registry, one scheduler. iOS/mobile deferred.
+Net **−5,510 / +1,282** LOC; `cargo check -p nanna-gui` clean, log-buffer + log-merge tests green.
 
-**Framing correction from the inventory (2026-07-17):** the GUI's IPC layer is **not** `nanna-client` — it's the
-self-contained `gui/src-tauri/src/daemon_client.rs` (+ `daemon_manager.rs` sidecar lifecycle), which speaks
-WebSocket via `tokio-tungstenite` and imports no daemon internals. **Keep** those two; the sidecar binary in
-`gui/src-tauri/binaries/` stays. The daemon's `ControlPlane::handle` already dispatches Chat/Session/Memory/
-Config/Tool/Scheduler/Channel/System/Workspace actions and runs a real heartbeat+cron scheduler, so the core
-control plane already backs every proxy the GUI needs.
+What shipped: deleted `embedded.rs` / `tool_authoring.rs` / `llm/`; pruned `AppState` to a thin client
+(config cache, workspace-registry cache, backend, log buffer, model-badge caches); gutted `setup_state`
+(no local Storage/LlmClient/ToolRegistry/MemoryService/Scheduler+executor; workspaces hydrate from the
+daemon); collapsed `backend.rs` to `BackendMode {Daemon, Disconnected}` with unconditional daemon
+forwarding; removed every command's embedded arm; rewired `/agents` onto daemon sub-sessions; relocated
+`log_buffer` to `nanna-core`; pruned GUI `nanna-*` deps to `nanna-config` + `nanna-core` + `nanna-tools`
+(dropped storage/memory/scripting/agent/workspace/channels/daemon/llm); removed the mobile entry + android icons.
 
-**Prerequisites — control-plane gaps the daemon MUST gain before embedded is deleted** (these features today work
-*only* in the embedded path; removing embedded without them = regressions):
-- [ ] **Skill directory CRUD + test** — `list/create/update/delete/test_skill` (`commands/tools.rs:328-607`) do
-      direct local-filesystem I/O on the workspace `skills/` dir with no daemon routing. Add daemon actions (or
-      fold into the existing `tool_*` actions) so the GUI edits the daemon's `tools_dir`, not a divergent local one.
-- [ ] **Memory tuning knobs** — `set_dreaming_enabled` / `set_max_compression_ratio` / `set_min_remaining_memories`
-      / `apply_memory_updates` / `save_memories` / `get|set_similarity_threshold` (`commands/memory.rs`) mutate the
-      local `MemoryService` only; the daemon exposes memory CRUD/consolidate but not these. Add control actions or
-      drop the UI knobs.
-- [ ] **Scheduler/heartbeat runtime toggles** — `set_scheduler_enabled` / `set_heartbeat_enabled` /
-      `set_heartbeat_interval` (`commands/scheduler.rs:8/30/42`) flip local flags; the daemon has cron CRUD but no
-      enable/interval action. Add one, else these become dead toggles.
-- [ ] **Agent visualization feed** — the `/agents` page reads an in-process `AgentRegistry` (`src/agents.rs`,
-      `AgentRegistryState`) populated by local runs; in daemon mode nothing populates it. Daemon must emit an
-      agent-registry/visualization feed (events or a query action) or the page goes blank.
-- [ ] **Relocate `log_buffer`** out of `nanna-daemon` (e.g. into `nanna-core`) — the GUI's own tracing capture
-      (`LogBuffer`/`LogBufferLayer`/`LogEntry`/`LogSource`, `lib.rs:32,957-965`; `system.rs` merge) is the one
-      non-embedded reason the GUI links `nanna-daemon`. Relocating it is the prerequisite to dropping that dep.
-- [ ] Decide **workspace-mirror** and **config-ownership**: `list_workspaces` reads a local `WorkspaceRegistry`
-      mirror even in daemon mode; settings write `config.toml` locally *and* push via `config_set`. Pick one
-      source of truth (daemon) with a thin client cache, to avoid two writers / stale state.
-
-**Delete immediately (no daemon dependency needed):**
-- [ ] `src/embedded.rs` (whole — `build_embedded_agent_service`, `build_llm_router`, `spawn_event_bridge`).
-- [ ] `src/tool_authoring.rs` (whole — daemon has `crates/nanna-daemon/src/user_tools.rs`; **the P11 tool-manager
-      parity work just done on this file becomes moot once it's deleted** — that's fine, it was correctness debt
-      that this phase erases wholesale).
-- [ ] `src/llm/` (whole — `routing.rs` `create_llm_client_for_model` + cache is used only by the embedded executor).
-- [ ] `src/state.rs`: `MemoryServiceAdapter` + the embedded-only `AppState` fields (`storage`, `llm`, `tools`,
-      `memory`, `memory_path`, `scheduler`, `last_consolidation`, `embedding_*`, `extraction_model`, `active_model`,
-      `rate_limited_models`, `user_tools`, `agent_service`, dreaming flags) — prune to what client commands need.
-- [ ] In `setup_state` (`lib.rs:65-938`): the embedded `Storage` open, the in-process `LlmClient` match, the
-      `ToolRegistry` + Rust built-in tool registrations (`lib.rs:153-187`), the `MemoryService`+embedding adapters
-      (`189-389`), the memory tools, `UserToolManager` + `CreateToolTool`/`discover_tools` wiring (`484-528`), and
-      the **entire `Scheduler` + `TaskExecutor` closure** (`531-857`) — the daemon already runs heartbeat+cron.
-- [ ] `memories.json` load + exit-handler save (`lib.rs:377-389, 1216-1235`).
-- [ ] The embedded arms of every dual-path command (delete the `else`, keep the daemon body):
-      `commands/{chat,memory,scheduler,sessions,settings,system,workspaces,tools}.rs` — each has an
-      `if is_daemon_mode() { … } else { /* embedded */ }`; the inventory lists every one with file:line.
-- [ ] **iOS/mobile:** remove `#[cfg_attr(mobile, tauri::mobile_entry_point)]` (`lib.rs:947`) and
-      `gui/src-tauri/icons/android/**`. (No real mobile project exists — it's scaffolding only.)
-
-**Collapse the abstraction (after the deletes):**
-- [ ] `src/backend.rs`: drop `BackendMode::Embedded`, `is_daemon_mode()`, the `init()` fallback ladder, and every
-      `Err("EMBEDDED_MODE")`/`else` arm in the `daemon_proxies!` macro (`backend.rs:396-542`) — each ~70 proxy
-      becomes an unconditional forward to `daemon_client`. A failed daemon connect is now a hard, user-visible error
-      (with a "start the daemon" affordance), not a silent embedded fallback.
-- [ ] Prune `gui/src-tauri/Cargo.toml` `nanna-*` deps: **drop** `nanna-storage`, `nanna-memory`, `nanna-scripting`,
-      `nanna-agent`, `nanna-workspace` (directly unused), and `nanna-daemon` (once `log_buffer` is relocated);
-      re-evaluate `nanna-tools`/`nanna-llm`/`nanna-core`/`nanna-channels` (kept only for cron parsing, model-listing,
-      folder constants, channel test/config — move server-side where cheap). **Keep** `nanna-config`.
-
-**Ordering (safe, incremental):** (1) add the missing daemon control actions for the prerequisites + relocate
-`log_buffer`; (2) repoint the skill/agent/memory-knob/scheduler-toggle commands to those actions; (3) delete
-`embedded.rs`/`llm/`/`tool_authoring.rs` + the embedded arms + the scheduler executor; (4) prune `AppState` +
-`Cargo.toml`; (5) collapse `backend.rs` to unconditional daemon forwarding. Each step compiles and ships on its own.
-**Payoff:** one agent loop, one memory system, one tool registry, one scheduler — every future feature and bugfix
-lands once. (Trade-off consciously accepted: the GUI now requires a running daemon; iOS is deferred.)
+**Deferred follow-ups** (worked only in the embedded path; no daemon control action yet — degraded, not lost):
+- Memory/scheduler runtime toggles — `set_dreaming_enabled`, `set_scheduler_enabled`,
+  `set_heartbeat_enabled`/`_interval`, `get|set_similarity_threshold`, `apply_memory_updates`,
+  `save_memories` — are **no-ops** (were already dead in daemon mode). Add daemon control actions to wire
+  them back. (`max_compression_ratio` / `min_remaining_memories` already persist via `config_set`.)
+- **Skill-directory CRUD** still edits the workspace `skills/` dir on disk (test routes to the daemon
+  sandbox) — fold into daemon `tool_*` actions so the GUI edits the daemon's `tools_dir`.
+- **`/agents`** maps daemon sub-sessions but has no live `agent-event` feed / workspace tagging (it polls)
+  — add a daemon agent-event feed.
+- **Config ownership** — GUI keeps a `config.toml` write cache that pushes via `config_set`/`config_reload`;
+  a single-writer daemon-owned model with a pure read cache is the endgame.
 
 ### P17 — Workspace context: standard project files instead of bespoke `.nanna/` agent files 🌱 (new — 2026-07-17, product direction)
 **Directional change (owner-requested):** stop making Nanna scaffold and read a pile of bespoke per-workspace

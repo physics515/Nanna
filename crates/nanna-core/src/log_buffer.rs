@@ -1,7 +1,12 @@
-//! In-memory circular log buffer for recent daemon logs
+//! In-memory circular log buffer for recent process logs
 //!
-//! Captures log events via a tracing Layer and makes them available to the GUI.
-//! Uses std::sync::Mutex (not tokio) so it works before the Tokio runtime starts.
+//! Captures log events via a tracing Layer and makes them available to clients
+//! (the GUI's Logs page, the daemon's `system logs` action). Uses
+//! `std::sync::Mutex` (not tokio) so it works before the Tokio runtime starts.
+//!
+//! This lives in `nanna-core` (rather than `nanna-daemon`) so a pure daemon
+//! client such as the GUI can capture its own lines without linking the whole
+//! daemon crate.
 
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};

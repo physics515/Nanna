@@ -1,20 +1,48 @@
 //! Settings, credentials, and model configuration commands.
+//!
+//! The daemon owns the live LLM clients, tool registry, and memory service.
+//! These commands mutate the local `config` cache and persist it to
+//! `config.toml` (which the daemon also reads); model/tool listings that need
+//! live state are fetched from the daemon.
 
 #[allow(clippy::wildcard_imports)]
 use crate::*;
+
+/// Tool names as seen by the daemon's registry (empty if the daemon is down).
+async fn daemon_tool_names(state: &AppState) -> Vec<String> {
+    state
+        .backend
+        .tool_list()
+        .await
+        .ok()
+        .and_then(|r| {
+            r.get("tools").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Format Claude model IDs into friendly names.
+fn format_claude_model_name(id: &str) -> String {
+    match id {
+        "claude-opus-4-5-20251101" => "Claude Opus 4.5".to_string(),
+        "claude-opus-4-20250514" => "Claude Opus 4".to_string(),
+        "claude-sonnet-4-20250514" => "Claude Sonnet 4".to_string(),
+        "claude-3-5-sonnet-20241022" => "Claude Sonnet 3.5".to_string(),
+        "claude-3-5-haiku-20241022" => "Claude Haiku 3.5".to_string(),
+        _ => id.to_string(),
+    }
+}
 
 /// Get application config
 #[tauri::command]
 pub async fn get_config(state: State<'_, Arc<RwLock<AppState>>>) -> Result<AppConfig, String> {
     let state_guard = state.read().await;
 
-    let tool_names: Vec<String> = state_guard
-        .tools
-        .definitions()
-        .await
-        .into_iter()
-        .map(|t| t.name)
-        .collect();
+    let tool_names: Vec<String> = daemon_tool_names(&state_guard).await;
 
     Ok(AppConfig {
         theme: "dark".to_string(),
@@ -66,22 +94,19 @@ pub async fn set_api_key(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
 
-    // Update config
+    // The daemon owns the live LLM client; persist the key to config (which the
+    // daemon reads) and ask it to reload.
     state_guard.config.llm.api_key = Some(api_key.clone());
-    crate::llm::routing::invalidate_llm_client_cache();
 
-    // Recreate LLM client with new key
-    let llm = match state_guard.config.llm.provider.as_str() {
-        "openai" => LlmClient::openai(&api_key),
-        _ => LlmClient::anthropic(&api_key),
-    };
-    state_guard.llm = Arc::new(llm);
-
-    // Also set env var for this process
-    // SAFETY: This is a single-threaded application context
+    // SAFETY: single-threaded application context
     unsafe {
         std::env::set_var("ANTHROPIC_API_KEY", &api_key);
     }
+
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save config: {e}");
+    }
+    let _ = state_guard.backend.config_reload().await;
 
     info!("API key updated");
     Ok(())
@@ -162,27 +187,39 @@ pub async fn get_extended_settings(
 ) -> Result<ExtendedSettings, String> {
     let state_guard = state.read().await;
 
-    let tool_defs = state_guard.tools.definitions().await;
-    let tools: Vec<ToolInfo> = tool_defs
-        .into_iter()
-        .map(|t| ToolInfo {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            enabled: true, // TODO: implement per-tool enable/disable
+    // Tools come from the daemon's live registry.
+    let tools: Vec<ToolInfo> = state_guard
+        .backend
+        .tool_list()
+        .await
+        .ok()
+        .and_then(|r| {
+            r.get("tools").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        Some(ToolInfo {
+                            name: t.get("name")?.as_str()?.to_string(),
+                            description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                        })
+                    })
+                    .collect()
+            })
         })
-        .collect();
+        .unwrap_or_default();
 
-    // Read runtime settings
-    let dreaming_enabled = *state_guard.dreaming_enabled.read().await;
-    let scheduler_enabled = *state_guard.scheduler_enabled.read().await;
-    let heartbeat_enabled = *state_guard.heartbeat_enabled.read().await;
-    let heartbeat_interval_seconds = *state_guard.heartbeat_interval_seconds.read().await;
+    // Runtime memory/scheduler toggles have no daemon control action yet; the
+    // daemon-only setters are no-ops, so report the enabled defaults.
+    let dreaming_enabled = true;
+    let scheduler_enabled = true;
+    let heartbeat_enabled = true;
+    let heartbeat_interval_seconds = 1800;
 
-    // Read embedding settings
-    let embedding_provider = state_guard.embedding_provider.read().await.clone();
-    let embedding_model = state_guard.embedding_model.read().await.clone();
-    let embedding_enabled = *state_guard.embedding_enabled.read().await;
-    let ollama_host = state_guard.ollama_host.read().await.clone();
+    // Embedding settings come from the config cache (the daemon reads the same file).
+    let embedding_provider = state_guard.config.memory.embedding_provider.clone();
+    let embedding_model = state_guard.config.memory.embedding_model.clone();
+    let embedding_enabled = state_guard.config.memory.enabled;
+    let ollama_host = state_guard.config.memory.ollama_host.clone();
 
     Ok(ExtendedSettings {
         anthropic_key_set: state_guard.config.llm.api_key.is_some()
@@ -262,7 +299,7 @@ pub async fn get_extended_settings(
         ollama_api_key: state_guard.config.llm.ollama_api_key.clone().unwrap_or_default(),
 
         // Memory extraction model
-        extraction_model: state_guard.extraction_model.read().await.clone(),
+        extraction_model: state_guard.config.memory.extraction_model.clone(),
         available_extraction_models: vec![
             String::new(), // Empty = use chat model
             "claude-3-5-haiku-20241022".to_string(),
@@ -298,17 +335,14 @@ pub async fn set_extraction_model(
     state: State<'_, Arc<RwLock<AppState>>>,
     model: String,
 ) -> Result<(), String> {
-    let state_guard = state.read().await;
+    let mut state_guard = state.write().await;
 
-    // Update runtime state
-    *state_guard.extraction_model.write().await = model.clone();
-
-    // Persist to config
-    let mut config = state_guard.config.clone();
-    config.memory.extraction_model = model.clone();
-    if let Err(e) = config.save() {
+    // Persist to config (the daemon reads the same file).
+    state_guard.config.memory.extraction_model = model.clone();
+    if let Err(e) = state_guard.config.save() {
         warn!("Failed to save extraction model to config: {}", e);
     }
+    let _ = state_guard.backend.config_reload().await;
 
     if model.is_empty() {
         info!("Extraction model set to: (use chat model)");
@@ -327,50 +361,28 @@ pub async fn set_provider_api_key(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
 
+    // The daemon owns the live LLM clients and tool registry; persist the key to
+    // config (+ env for this process) and let the daemon reload.
     match provider.as_str() {
         "anthropic" => {
             state_guard.config.llm.api_key = Some(api_key.clone());
             unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
-            crate::llm::routing::invalidate_llm_client_cache();
-
-            // Recreate LLM client if this is the active provider
-            if state_guard.config.llm.provider == "anthropic" {
-                state_guard.llm = Arc::new(LlmClient::anthropic(&api_key));
-            }
         }
         "openai" => {
             state_guard.config.llm.openai_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
-            crate::llm::routing::invalidate_llm_client_cache();
-
-            if state_guard.config.llm.provider == "openai" {
-                state_guard.llm = Arc::new(LlmClient::openai(&api_key));
-            }
         }
         "brave" => {
             state_guard.config.tools.brave_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("BRAVE_API_KEY", &api_key); }
-            // Re-register WebSearchTool with the new API key
-            let web_search = nanna_tools::WebSearchTool::new().with_api_key(&api_key);
-            state_guard.tools.register(web_search).await;
         }
         "openrouter" => {
             state_guard.config.llm.openrouter_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
-            crate::llm::routing::invalidate_llm_client_cache();
-
-            if state_guard.config.llm.provider == "openrouter" {
-                state_guard.llm = Arc::new(LlmClient::openrouter(&api_key));
-            }
         }
         "github" => {
             state_guard.config.llm.github_token = Some(api_key.clone());
             unsafe { std::env::set_var("GITHUB_TOKEN", &api_key); }
-            crate::llm::routing::invalidate_llm_client_cache();
-
-            if state_guard.config.llm.provider == "github" {
-                state_guard.llm = Arc::new(LlmClient::github_models(&api_key));
-            }
         }
         "claude-proxy" => {
             // For claude-proxy, the "api_key" is actually the proxy URL
@@ -387,6 +399,7 @@ pub async fn set_provider_api_key(
         error!("Failed to save config: {}", e);
         // Non-fatal - key is set for this session
     }
+    let _ = state_guard.backend.config_reload().await;
 
     info!("API key set for provider: {}", provider);
     Ok(())
@@ -430,15 +443,11 @@ pub async fn run_claude_setup_token(
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
-    crate::llm::routing::invalidate_llm_client_cache();
-
-    if state_guard.config.llm.provider == "anthropic" {
-        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&loaded.credential.access_token));
-    }
 
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save OAuth token: {}", e);
     }
+    let _ = state_guard.backend.config_reload().await;
 
     let subscription = loaded.credential.subscription_type.unwrap_or_else(|| "unknown".to_string());
     info!("Successfully authenticated via claude setup-token (subscription: {})", subscription);
@@ -476,15 +485,11 @@ pub async fn import_claude_code_credentials(
             let mut state_guard = state.write().await;
             state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
             state_guard.config.llm.anthropic_use_oauth = true;
-            crate::llm::routing::invalidate_llm_client_cache();
-
-            if state_guard.config.llm.provider == "anthropic" {
-                state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&refreshed.access_token));
-            }
 
             if let Err(e) = state_guard.config.save() {
                 error!("Failed to save config: {}", e);
             }
+            let _ = state_guard.backend.config_reload().await;
 
             info!("Token refreshed and imported (subscription: {:?})", refreshed.subscription_type);
             return Ok(());
@@ -502,17 +507,12 @@ pub async fn import_claude_code_credentials(
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
-    crate::llm::routing::invalidate_llm_client_cache();
 
-    // Recreate LLM client with OAuth token
-    if state_guard.config.llm.provider == "anthropic" {
-        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&loaded.credential.access_token));
-    }
-
-    // Persist to config
+    // Persist to config (the daemon rebuilds its LLM client on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save OAuth token: {}", e);
     }
+    let _ = state_guard.backend.config_reload().await;
 
     info!("Successfully imported Claude Code credentials");
     Ok(())
@@ -534,17 +534,12 @@ pub async fn save_anthropic_oauth_token(
     // Save the token and enable OAuth mode
     state_guard.config.llm.anthropic_oauth_token = Some(token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
-    crate::llm::routing::invalidate_llm_client_cache();
 
-    // Recreate LLM client with OAuth token if anthropic is active provider
-    if state_guard.config.llm.provider == "anthropic" {
-        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&token));
-    }
-
-    // Persist to config
+    // Persist to config (the daemon rebuilds its LLM client on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save OAuth token: {}", e);
     }
+    let _ = state_guard.backend.config_reload().await;
 
     info!("Anthropic OAuth token saved");
     Ok(())
@@ -559,21 +554,12 @@ pub async fn logout_anthropic_oauth(
 
     state_guard.config.llm.anthropic_oauth_token = None;
     state_guard.config.llm.anthropic_use_oauth = false;
-    crate::llm::routing::invalidate_llm_client_cache();
 
-    // If using anthropic, switch back to API key if available
-    if state_guard.config.llm.provider == "anthropic" {
-        if let Some(api_key) = state_guard.config.llm.api_key.clone()
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        {
-            state_guard.llm = Arc::new(LlmClient::anthropic(&api_key));
-        }
-    }
-
-    // Persist to config
+    // Persist to config (the daemon rebuilds its LLM client on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config after logout: {}", e);
     }
+    let _ = state_guard.backend.config_reload().await;
 
     info!("Anthropic OAuth logout successful");
     Ok(())
@@ -653,18 +639,14 @@ pub async fn refresh_oauth_token(
         warn!("Failed to save refreshed token to source: {}", e);
     }
 
-    // Update app state
+    // Update the config cache and let the daemon rebuild its client on reload.
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
-    crate::llm::routing::invalidate_llm_client_cache();
-
-    if state_guard.config.llm.provider == "anthropic" && state_guard.config.llm.anthropic_use_oauth {
-        state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&refreshed.access_token));
-    }
 
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
     }
+    let _ = state_guard.backend.config_reload().await;
 
     let hours = refreshed.seconds_until_expiry().map(|s| s / 3600).unwrap_or(0);
     info!("OAuth token refreshed, expires in {}h", hours);
@@ -680,48 +662,39 @@ pub async fn set_provider(
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
 
-    // Create new LLM client based on provider
-    let llm = match provider.as_str() {
+    // Validate that the selected provider has usable credentials, so we fail
+    // here with a clear message rather than at chat time in the daemon. The
+    // daemon owns the actual LLM client; we just persist the choice.
+    match provider.as_str() {
         "anthropic" => {
-            // Always use OAuth token for Anthropic (from `claude setup-token`)
-            let oauth_token = state_guard.config.llm.anthropic_oauth_token.clone()
-                .ok_or_else(|| "No OAuth token available. Run `claude setup-token` or paste your token.".to_string())?;
-            LlmClient::anthropic_oauth(&oauth_token)
+            if state_guard.config.llm.anthropic_oauth_token.is_none() {
+                return Err("No OAuth token available. Run `claude setup-token` or paste your token.".to_string());
+            }
         }
         "openai" => {
-            let api_key = state_guard.config.llm.openai_api_key.clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .ok_or_else(|| "No API key set for openai".to_string())?;
-            LlmClient::openai(&api_key)
+            if state_guard.config.llm.openai_api_key.is_none() && std::env::var("OPENAI_API_KEY").is_err() {
+                return Err("No API key set for openai".to_string());
+            }
         }
         "openrouter" => {
-            let api_key = state_guard.config.llm.openrouter_api_key.clone()
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .ok_or_else(|| "No API key set for openrouter".to_string())?;
-            LlmClient::openrouter(&api_key)
+            if state_guard.config.llm.openrouter_api_key.is_none() && std::env::var("OPENROUTER_API_KEY").is_err() {
+                return Err("No API key set for openrouter".to_string());
+            }
         }
         "github" => {
-            let api_key = state_guard.config.llm.github_token.clone()
-                .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-                .ok_or_else(|| "No API key set for github".to_string())?;
-            LlmClient::github_models(&api_key)
+            if state_guard.config.llm.github_token.is_none() && std::env::var("GITHUB_TOKEN").is_err() {
+                return Err("No API key set for github".to_string());
+            }
         }
-        "claude-proxy" => {
-            // Claude proxy doesn't need an API key - uses Claude Code CLI credentials
-            let proxy_url = std::env::var("CLAUDE_PROXY_URL")
-                .unwrap_or_else(|_| "http://localhost:3456".to_string());
-            LlmClient::claude_proxy(&proxy_url)
-        }
-        "ollama" => {
-            // Ollama doesn't need an API key - uses configured host
-            let base_url = state_guard.ollama_host.read().await.clone();
-            LlmClient::ollama(&base_url)
-        }
+        "claude-proxy" | "ollama" => {}
         _ => return Err(format!("Unknown provider: {}", provider)),
-    };
+    }
 
     state_guard.config.llm.provider = provider.clone();
-    state_guard.llm = Arc::new(llm);
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save config: {}", e);
+    }
+    let _ = state_guard.backend.config_reload().await;
 
     info!("Provider changed to: {}", provider);
     Ok(())
@@ -751,12 +724,7 @@ pub async fn set_embedding_config(
         }
     }
 
-    // Update state
-    *state_guard.embedding_provider.write().await = provider.clone();
-    *state_guard.embedding_model.write().await = model.clone();
-    *state_guard.embedding_enabled.write().await = provider != "disabled";
-
-    // Save to config file
+    // Save to config file (the daemon reads the same file at startup)
     state_guard.config.memory.embedding_provider = provider.clone();
     state_guard.config.memory.embedding_model = model.clone();
     state_guard.config.memory.enabled = provider != "disabled";
@@ -792,10 +760,7 @@ pub async fn set_ollama_host(
     // Remove trailing slash
     let host = host.trim_end_matches('/').to_string();
 
-    *state_guard.ollama_host.write().await = host.clone();
-    crate::llm::routing::invalidate_llm_client_cache();
-
-    // Save to config file
+    // Save to config file (the daemon reads the same file)
     state_guard.config.memory.ollama_host = host.clone();
     match state_guard.config.save() {
         Ok(()) => {
@@ -807,6 +772,7 @@ pub async fn set_ollama_host(
             return Err(err_msg);
         }
     }
+    let _ = state_guard.backend.config_reload().await;
 
     // Also set env var for current session
     unsafe { std::env::set_var("OLLAMA_HOST", &host); }
@@ -822,7 +788,6 @@ pub async fn set_ollama_api_key(
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
     state_guard.config.llm.ollama_api_key = if key.is_empty() { None } else { Some(key.clone()) };
-    crate::llm::routing::invalidate_llm_client_cache();
     match state_guard.config.save() {
         Ok(()) => {
             info!("Ollama API key saved");
@@ -833,6 +798,7 @@ pub async fn set_ollama_api_key(
             return Err(err_msg);
         }
     }
+    let _ = state_guard.backend.config_reload().await;
     Ok("Ollama API key saved".to_string())
 }
 
@@ -842,7 +808,7 @@ pub async fn get_ollama_models(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<OllamaModelInfo>, String> {
     let state_guard = state.read().await;
-    let ollama_host = state_guard.ollama_host.read().await.clone();
+    let ollama_host = state_guard.config.memory.ollama_host.clone();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -1571,13 +1537,11 @@ pub async fn set_chat_model_priority(
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
-    // Propagate to running daemon so changes take effect without restart
-    if state_guard.backend.is_daemon_mode().await {
-        let _ = state_guard.backend.config_set(
-            "llm.model_priority",
-            serde_json::to_value(&priority).unwrap_or_default(),
-        ).await;
-    }
+    // Propagate to the daemon so changes take effect without restart
+    let _ = state_guard.backend.config_set(
+        "llm.model_priority",
+        serde_json::to_value(&priority).unwrap_or_default(),
+    ).await;
 
     // Emit model-status event so the GUI badge updates
     let _ = app.emit("model-status", ModelStatusEvent {
@@ -1730,13 +1694,11 @@ pub async fn set_model_routing(
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
-    // Propagate to running daemon
-    if state_guard.backend.is_daemon_mode().await {
-        let _ = state_guard.backend.config_set(
-            "llm.model_routing",
-            serde_json::to_value(&routes).unwrap_or_default(),
-        ).await;
-    }
+    // Propagate to the daemon
+    let _ = state_guard.backend.config_set(
+        "llm.model_routing",
+        serde_json::to_value(&routes).unwrap_or_default(),
+    ).await;
 
     info!("Model routing set: {:?}", routes);
     Ok(())
@@ -1763,13 +1725,11 @@ pub async fn set_routing_first_turn_primary(
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
-    // Propagate to running daemon
-    if state_guard.backend.is_daemon_mode().await {
-        let _ = state_guard.backend.config_set(
-            "llm.routing_first_turn_primary",
-            serde_json::Value::Bool(enabled),
-        ).await;
-    }
+    // Propagate to the daemon
+    let _ = state_guard.backend.config_set(
+        "llm.routing_first_turn_primary",
+        serde_json::Value::Bool(enabled),
+    ).await;
 
     info!("Routing first turn primary set: {}", enabled);
     Ok(())
@@ -1798,13 +1758,11 @@ pub async fn set_sub_agent_model(
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
-    // Propagate to running daemon
-    if state_guard.backend.is_daemon_mode().await {
-        let _ = state_guard.backend.config_set(
-            "llm.sub_agent_model",
-            model.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
-        ).await;
-    }
+    // Propagate to the daemon
+    let _ = state_guard.backend.config_set(
+        "llm.sub_agent_model",
+        model.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+    ).await;
 
     info!("Sub-agent model set: {:?}", state_guard.config.llm.sub_agent_model);
     Ok(())
