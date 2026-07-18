@@ -20,6 +20,7 @@ chrono.workspace = true
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
+regex = "1"
 nanna-storage = { path = "../nanna-storage" }
 
 nanna-llm = { path = "../nanna-llm" }
@@ -27,3 +28,6 @@ nanna-tools = { path = "../nanna-tools" }
 nanna-memory = { path = "../nanna-memory" }
 nanna-workspace = { path = "../nanna-workspace" }
 nanna-mcp = { path = "../nanna-mcp", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

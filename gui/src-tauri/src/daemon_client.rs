@@ -129,6 +129,9 @@ pub enum DaemonEvent {
     Error { code: String, message: String },
     Connected { client_id: String },
     Disconnected { client_id: String },
+    TaskRunStarted { scope: String, #[serde(default)] scope_id: Option<String>, goal: String },
+    TaskRunProgress { scope: String, #[serde(default)] scope_id: Option<String>, #[serde(default)] task_id: Option<i64>, kind: String, detail: serde_json::Value },
+    TaskRunCompleted { scope: String, #[serde(default)] scope_id: Option<String>, report: serde_json::Value },
 }
 
 /// Pending request waiting for response
@@ -1283,6 +1286,124 @@ impl DaemonClient {
             "type": "channel",
             "action": "status",
             "id": id
+        })).await
+    }
+
+    // =========================================================================
+    // Task operations
+    // =========================================================================
+
+    /// Merge a pass-through payload's fields into a base task request.
+    fn task_request_with_payload(action: &str, payload: &Value) -> Value {
+        let mut req = serde_json::json!({
+            "type": "task",
+            "action": action
+        });
+        if let (Some(obj), Some(payload_obj)) = (req.as_object_mut(), payload.as_object()) {
+            for (k, v) in payload_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        req
+    }
+
+    /// List tasks in a scope
+    pub async fn task_list(&self, scope: &str, session_id: Option<&str>, include_closed: Option<bool>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "list",
+            "scope": scope,
+            "session_id": session_id,
+            "include_closed": include_closed
+        })).await
+    }
+
+    /// Get one task with notes + activity
+    pub async fn task_get(&self, id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "get",
+            "id": id
+        })).await
+    }
+
+    /// Create a task (payload fields flattened into the request)
+    pub async fn task_create(&self, payload: Value) -> Result<Value, String> {
+        self.request(Self::task_request_with_payload("create", &payload)).await
+    }
+
+    /// Partially update a task
+    pub async fn task_update(&self, id: i64, patch: Value) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "update",
+            "id": id,
+            "patch": patch
+        })).await
+    }
+
+    /// Complete a task (with acceptance verification)
+    pub async fn task_done(&self, id: i64, workdir: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "done",
+            "id": id,
+            "workdir": workdir
+        })).await
+    }
+
+    /// Delete a task subtree
+    pub async fn task_delete(&self, id: i64) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "delete",
+            "id": id
+        })).await
+    }
+
+    /// Append a working note to a task
+    pub async fn task_note(&self, id: i64, content: &str) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "note",
+            "id": id,
+            "content": content
+        })).await
+    }
+
+    /// Filter-language query over a scope's tasks
+    pub async fn task_query(&self, filter: &str, scope: &str, session_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "query",
+            "filter": filter,
+            "scope": scope,
+            "session_id": session_id
+        })).await
+    }
+
+    /// Start a long-horizon run (payload fields flattened into the request)
+    pub async fn task_start_run(&self, payload: Value) -> Result<Value, String> {
+        self.request(Self::task_request_with_payload("start_run", &payload)).await
+    }
+
+    /// Status of the scope's run (live or last report)
+    pub async fn task_run_status(&self, scope: &str, session_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "run_status",
+            "scope": scope,
+            "session_id": session_id
+        })).await
+    }
+
+    /// Cancel the scope's active run
+    pub async fn task_cancel_run(&self, scope: &str, session_id: Option<&str>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "cancel_run",
+            "scope": scope,
+            "session_id": session_id
         })).await
     }
 }

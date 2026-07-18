@@ -114,9 +114,12 @@ top-priority, zero-cost tier** and cloud is an opt-in escalation.
 ## Current State (what's real today)
 
 Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **8** are partial;
-**9** is greenfield. The new local-first phases (**P12**, **P13**) are greenfield, as are **P14**
-(long-horizon autonomy on a small local model) and **P15** (the agent-grade task store that P14 runs on —
-the two ship together). **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
+**9** is greenfield. The new local-first phases (**P12**, **P13**) are greenfield. **P14**
+(long-horizon autonomy on a small local model) and **P15** (the agent-grade task store P14 runs on)
+**landed together 2026-07-18**: Turso task store with hierarchy/dependencies/derived-blocked/`next()`/
+filter language, harness-run acceptance checks, the re-anchored O(1) step loop with progress-or-replan
+and budget caps, todo v0.2 + `TaskAction` IPC + GUI `/tasks` run monitor — only P14's live on-model
+"4-hour task" eval remains open (needs the agent-eval task set). **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
 what it does: **P16** (daemon-only consolidation — delete embedded mode, GUI becomes a pure daemon client,
 iOS deferred) collapses the double-implementation tax behind most P4/P8/P11 "GUI-embedded copy drifted" debt;
 **P17** (drop the bespoke per-workspace `.nanna/` agent markdown — Nanna reads a project's *standard* files
@@ -1575,7 +1578,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [ ] Also from backlog: HNSW persistent vector index (avoid full `bulk_load` into RAM); emotional valence; memory-graph edges; dedup-before-store; ~~extraction filtering (<50 chars)~~ **(done 2026-07-06 — `is_storable_memory` drops sub-50-char extractions in `loop_runner::extract_memories`; 2 tests)**.
 - [ ] add correlation tool that requires time-series data + event timestamps to use DSP to make predictions.
 
-### P14 — Long-Horizon Autonomy on a Small Local Model 🌱 (new — the P12 payoff)
+### P14 — Long-Horizon Autonomy on a Small Local Model ✅ (harness landed 2026-07-18; live on-model eval open)
 
 **Goal:** a 7–9B local model that stays on task for **hours**, not 2–3 tool calls, at a token cost that a
 single GPU can actually sustain. P12 gives us a model that *runs*; this phase is what makes it *useful*.
@@ -1593,63 +1596,103 @@ survivable.* Two goals that sound opposed — hours of coherence, few tokens —
 tokens spent. Not tok/s, not context size. A run that finishes in 40k tokens beats one that finishes in
 400k, and both beat one that drifts. Ties into the P-&-B *agent-eval suite* (that suite is the denominator).
 
+**Landed (2026-07-18):** the whole harness ships in `nanna-agent/src/harness.rs` (the engine:
+`LongHorizonRunner` over two traits, `TaskSource` + `StepRunner`, so the control loop is
+deterministically testable without a model — 20+ tests incl. the Suite 4 fixtures) with daemon
+production impls in `nanna-daemon/src/tasks.rs` (`TursoTaskSource`, `AgentStepRunner` = fresh
+`Agent` + empty context per step, `TaskRunManager` for background runs) and IPC surface
+`TaskAction::StartRun/RunStatus/CancelRun` + `TaskRun*` events. What remains open is exactly one
+item: the *live* on-model eval (last checkbox).
+
 **Design spine — externalize state, keep the window tiny:**
-- [ ] **The todo file *is* the agent's working memory** (P15) — not a note, the **control structure**. On
-      every iteration the harness injects only: the current task, its acceptance check, and the last
-      result. The model's job shrinks from "hold the plan" to "advance one step", which is what a 7–9B can
-      actually do. This is the single highest-leverage item here and the reason P15 exists.
-- [ ] **Re-anchor, don't re-read.** Rebuild the prompt each turn from the todo + a fixed-size scratchpad
-      instead of appending history. Long-run context becomes **O(1)**, not O(turns) — this is where the
-      token savings come from, and it is also what stops drift. Today's `progressive distillation` (P10)
-      still summarizes an ever-growing transcript; this replaces the transcript as the substrate.
-- [ ] **One tool per step, chosen from ≤5.** Extend the two-tier `discover_tools` design: the *active* set
-      is scoped to the current todo item (its `tools:` hint), not the whole registry. Existing research:
-      each definition costs ~50–150 tokens and 7–9B models degrade past 5–10 tools (P12, 2026-07-07).
-- [ ] **Sub-agent per subtask, fresh context, structured return.** The parent never sees the child's
-      transcript — only its result and acceptance verdict. `task` + the swarm coordinator (P5) already do
-      the spawning; what is missing is that the *parent's* context must not grow when a child runs.
-- [ ] **Checkpoint + resume across restarts.** Hours means surviving a crash, an OOM, a reboot. The todo
-      store (Turso) is the checkpoint; a resumed run reloads the todo and continues without replaying
-      anything. `AgentService` already has per-session checkpoints — extend, don't re-invent.
+- [x] **The todo store *is* the agent's working memory** (P15) — *(2026-07-18)* a run is a loop over
+      `next()`; each step's prompt carries only the current task, its acceptance check, its recent
+      notes, and the last result. The model's job is "advance one step".
+- [x] **Re-anchor, don't re-read.** *(2026-07-18)* Every step runs in a **fresh agent context**
+      (`AgentStepRunner` builds a new `Agent` + empty `AgentContext` per step) — long-run context is
+      O(1) by construction, not by compression. Findings persist via task notes (append-only,
+      16 KiB bound), not the transcript. Validated by research: "self-conditioning" (arXiv 2509.09677)
+      shows models err more when their own past errors stay in context, and it is NOT fixed by scale.
+- [x] **One tool per step, chosen from ≤5.** *(2026-07-18)* Per-item `tools:` hint on the task row →
+      `RunOptions.initial_active_tools`; the step activates exactly the scoped set (+ `todo`, its only
+      memory) instead of the registry. `discover_tools` stays available as the escape hatch.
+- [x] **Sub-agent per subtask, fresh context, structured return.** *(2026-07-18)* The engine sees only
+      `StepOutcome` (text + token counts + tool-call *digests*) — the parent's context cannot grow
+      when a step runs, structurally.
+- [x] **Checkpoint + resume across restarts.** *(2026-07-18)* The task store **is** the checkpoint:
+      every mutation is durable in Turso at the moment it happens, so resuming after a crash/reboot is
+      just `StartRun` on the same scope — `next()` picks up exactly where the plan stands, no replay.
+      (Run *counters* — tokens spent so far — reset on restart; the plan and all notes do not.)
 
 **Staying on track (drift is the real enemy, not context length):**
-- [ ] **Acceptance check per todo item.** Every item carries a machine-checkable done-condition (a command
-      exit code, a file exists, a regex over output). The *harness* runs it — not the model. A model that
-      cannot mark its own homework cannot drift into declaring success. This is the difference between
-      "hours of work" and "hours of looking busy".
-- [ ] **Progress-or-replan.** N iterations with no acceptance check flipping = stop and replan, don't
-      grind. Generalizes the existing escalating wrap-up nudges (`AgentServiceConfig`) from "end the run"
-      to "re-decompose the task".
-- [ ] **Loop/repetition detector.** Same tool + same args + same result twice ⇒ intervene. Small models
-      loop; today only a narration-loop detector exists (`be1af7e`). Cheap to detect, expensive to ignore.
-- [ ] **Bounded blast radius.** Per-run caps on wall-clock, tokens, and tool calls, surfaced as budget
-      *the model can see* ("2 of 20 steps used"). An agent that knows its budget plans around it.
-- [ ] **The goal is immutable.** The original request is pinned verbatim in every prompt and never
-      summarized. Everything else is compressible; intent is not. Cheapest anti-drift measure available.
+- [x] **Acceptance check per todo item.** *(2026-07-18)* `AcceptanceCheck` (command exit-0 /
+      file_exists / regex over file-or-command-output, timeout-bounded) runs **in the harness** after
+      every step; with a check present, the environment is the only judge — a `TASK COMPLETE` claim
+      that the check refutes is counted as a `false_success_claim` and logged, never recorded as done.
+      The `tasks.done` service and GUI `Done` action gate the same way, so the model can't route
+      around it. Shape validated at write time by the store.
+- [x] **Progress-or-replan.** *(2026-07-18)* N steps (default 5) with no check flipping ⇒ a `Plan`-kind
+      replan step that decomposes the item into subtasks *in the store* (via the todo tool — no plan
+      parsing); after `max_replans_per_item` (default 2) the item is abandoned (cancelled + reason in
+      the activity log) and the run moves on. Grinding is bounded by construction — see the drift
+      containment row in `bench/BASELINE.md` Suite 4.
+- [x] **Loop/repetition detector.** *(2026-07-18)* Two signals, per the research (hash-identical loops
+      and semantically-varied flailing are different failure modes): in-run, same tool + same args +
+      same result twice ⇒ one corrective nudge (`detect_tool_call_loop`, next to the narration/spiral
+      detectors); cross-step, an identical tool-call signature two steps running doubles the stall
+      counter, accelerating replan/abandon.
+- [x] **Bounded blast radius.** *(2026-07-18)* Per-run caps on wall-clock, total tokens, and (loop-level)
+      tool calls — `RunOptions.max_wall_clock`/`max_tool_calls` + harness `max_wall_clock`/
+      `max_total_tokens`, all caller-set, no magic defaults at the loop level. The budget is surfaced
+      *to the model*: a `== BUDGET ==` line in every step prompt, and the agent loop now injects a
+      model-visible status message at 80% of a token budget (previously log-only).
+- [x] **The goal is immutable.** *(2026-07-18)* Pinned verbatim at the top of the byte-stable prompt
+      prefix of every step; never summarized, never compressed (test-asserted).
 
 **Token economics (measure before optimizing):**
-- [ ] **Token budget accounting per run** — tokens/completed-item, not tokens/turn, so regressions are
-      visible. `CostTracker` (P6) already records per-call usage; aggregate it against todo completions.
-- [ ] **Prompt-cache the immutable prefix.** System + goal + tool defs are stable across a long run —
-      exactly the shape prompt caching rewards (P10 already has cache hit tracking on cloud). For the
-      local tier the analogue is **KV-cache reuse across turns** (a P12/Mummu contract item): a rebuilt
-      O(1) prompt with a stable prefix is *ideal* for it. Design the prompt so the prefix never moves.
-- [ ] **Ladder the model, don't fix it.** Decompose/replan on a bigger model (or cloud) *rarely*; execute
-      steps on the local model *constantly*. The P10 complexity router already picks per call — teach it
-      the step *kind* (plan vs execute vs verify), which is far more predictive than message length.
-- [ ] **Stop paying for tool output twice.** Per-tool `output: context|memory` routing exists; long runs
-      need the default to be "summary in context, full text in memory" for *every* verbose tool.
-- [ ] **Benchmark:** a "4-hour task" eval (e.g. a multi-file refactor with a test-suite acceptance check)
-      run on the 8GB reference tier. Record task-success @ tokens in `bench/BASELINE.md`. Without this the
-      rest of this phase is opinion.
+- [x] **Token budget accounting per run** — *(2026-07-18)* `LongHorizonReport.tokens_per_completed_item`
+      is the run's governing metric; per-item `tokens_spent` also lands in the completion activity
+      detail, so post-mortems can see which item burned the budget. (Note: the roadmap's "CostTracker
+      (P6)" never existed as a type — accounting builds on `RunState` token counters + `ModelStatsTracker`.)
+- [x] **Prompt-cache the immutable prefix.** *(2026-07-18)* The step prompt is stable-prefix +
+      dynamic-tail by construction (`build_step_prompt`): system rules + verbatim goal never move
+      (byte-identical across steps, test-asserted — the shape KV-prefix reuse rewards), and the
+      current task/verdict/budget ride at the end, in recent attention (the Manus recitation pattern).
+- [x] **Ladder the model, don't fix it.** *(2026-07-18)* `StepKind` (plan | execute | verify) threads
+      from `RunOptions` into `classify_complexity`/`route_model`: Plan ⇒ Complex (biggest model),
+      Verify ⇒ Medium, Execute ⇒ the structural heuristic (cheap-model biased); execute steps also skip
+      the routing's first-turn-primary rule since every re-anchored step is a "first turn".
+- [x] **Stop paying for tool output twice.** *(pre-existing, confirmed)* Per-tool `output:
+      context|memory` routing already defaults verbose tools to "chunk to memory + stub in context";
+      the task tools declare `output: "context"` so plans are never stubbed away.
+- [x] **Benchmark (deterministic half):** *(2026-07-18)* `bench/BASELINE.md` Suite 4 commits
+      task-success @ tokens rows from scripted-model fixtures (`cargo test -p nanna-agent harness`):
+      compliant runs complete 3/3 at exactly 1200 tokens/item, a perma-false-claiming model admits
+      **0** completions and costs ≤ 6000 tokens before abandonment, loops abandon in < 4 steps.
+- [ ] **Benchmark (live half):** the "4-hour task" eval against a real 7–9B Ollama model on the 8 GB
+      reference tier — needs the P-&-B agent-eval task set; per the research below, reuse
+      Terminal-Bench easy-tier tasks (Docker + end-state verifier) or SWE-bench Lite rather than
+      inventing tasks, report pass^k (k=3–5) alongside task-success @ tokens, and calibrate hard:
+      raw 7B agents resolve ~0.7% of SWE-bench, so minutes-scale tasks are the right grain.
 
-- [ ] *(research 2026-07-17)* Cross-check the design against published long-horizon agent work before
-      building — the failure modes (drift, looping, context rot, self-graded success) are well documented,
-      and the eval suite should reuse an existing benchmark's task set where one fits rather than inventing
-      one. Prior art to read: the SWE-bench-style acceptance-by-tests pattern (which is exactly the
-      "harness runs the check" item above), and any 2026 work on small-model agent harnesses.
+- [x] *(research 2026-07-17 → done 2026-07-18)* Cross-checked against published work; the design held
+      up and got sharper. Key findings: long-task failure is execution/context, not reasoning —
+      "self-conditioning" means fresh minimal context beats a transcript, and scaling doesn't fix it
+      (arXiv 2509.09677); "false success" (agent claims done, environment disagrees) is 45–76% of
+      failures in several suites and LLM judges barely detect it (AUROC 0.54–0.65) — harness-run
+      environment checks are the fix (arXiv 2606.09863, AgentRewardBench); tool-selection accuracy
+      collapses >90% → ~13% as tool count grows, specifically for small models (RAG-MCP, MCPVerse);
+      goal drift worsens with horizon for every model tested (arXiv 2505.02709); reliability
+      (τ-bench pass^k) collapses across repeated trials, so soft nudges through a small model's
+      context are weak medicine — enforcement must be harness-side, on objective signals. Prior art
+      for store-as-control-structure is rich (Claude Code TodoWrite, Manus todo.md recitation, Beads'
+      DB-over-markdown argument, claude-task-master's advisory `testStrategy`) — none combines an
+      external store with *harness-executed* acceptance on 7–9B local models; that combination is the
+      novel part. Design deltas adopted from the research: the false-success counter, the dual
+      repetition signal, replan-splits-tasks (MAST: ~42% of failures are bad decomposition), and
+      byte-stable prefix + recency-positioned task (Manus KV-cache lesson).
 
-### P15 — Agent-Grade Task Store (todo as control structure) 🌱 (new)
+### P15 — Agent-Grade Task Store (todo as control structure) ✅ (landed 2026-07-18)
 
 **Goal:** replace the flat, session-scoped `todo` skill with a task store an agent can *plan* against and
 the harness can *drive* a long run from. This is P14's substrate — the two ship together or neither works.
@@ -1684,37 +1727,64 @@ not 1:1, and the differences matter more than the similarities:
 | Templates | Later | Useful once recurring multi-step jobs exist |
 | Views (board/calendar), 80+ integrations | GUI-only | A rendering concern, not agent-facing |
 
-**Build-out:**
-- [ ] **Move the store to Turso**, not a JSON file per session. Scope: `session | workspace | global`, so a
-      plan outlives the chat that made it (P14's resume depends on this). Schema: `id, parent_id, title,
-      notes, status, priority, labels[], due_at, recurrence, depends_on[], acceptance, assignee,
-      created_at/updated_at/completed_at`. Follow the P13 rule — Turso only, no new store.
-- [ ] **Hierarchy** — `parent_id` + ordering; a parent auto-completes when its children do (and cannot be
-      marked done while a child is open: the harness enforces it, not the prompt).
-- [ ] **Dependencies** — `depends_on[]`, with a **cycle check on write** (reject, don't detect later).
-      `blocked` becomes *derived state*, never a value the model writes.
-- [ ] **`next()`** — the single most valuable call: return the one actionable item (unblocked, highest
-      priority, respecting order) plus its acceptance check and tool scope. A long run is a loop over
-      `next()`. It is also the token fix: one item in context per turn instead of the whole list.
-- [ ] **Acceptance criteria per item** (`acceptance: {kind: command|file_exists|regex, ...}`) — run by the
-      **harness**; `done` is a *verdict*, not an assertion. This is the P14 anti-drift keystone.
-- [ ] **Filter/query language** — a deliberate subset of Todoist's: `&`, `|`, `!`, parens, `p1..p4`,
-      `@label`, `#project`, `overdue`, `due before:`, `no date`, `search:`, `subtask`. Pure parser →
-      unit-testable with zero I/O, which is how it gets to be trustworthy.
-- [ ] **Working notes per task** — append-only; where a sub-agent leaves findings for its parent. Long-run
-      state lives *here* rather than in the transcript.
-- [ ] **Activity log** — every transition, with actor (which agent) and timestamp. Feeds the drift
-      post-mortem and the P14 benchmark.
-- [ ] **Assignee = agent** — which sub-agent owns an item; makes swarm work (P5) legible instead of
-      inferred from logs.
-- [ ] **Recurrence via the existing scheduler** (P8 cron / HEARTBEAT.md). One recurrence engine.
-- [ ] **Keep the tool surface tiny.** ~5 actions the model actually needs (`next`, `add`, `update`,
-      `done`, `query`) — every extra action is ~50–150 tokens on *every* turn (P12 research) and one more
-      way for a small model to pick wrong. Todoist's full API is the *store's* capability, not the tool's.
-- [ ] **Migrate the JSON file** on first run; keep `todo` as the tool name and the v0.1 actions working
-      (`extract_version_from_source`/`bootstrap_default_skills` already handle skill upgrades).
-- [ ] **GUI**: a task view is the natural place to *watch* a 4-hour run — the "is it still on track?"
-      screen. Pairs with the P13 dream-log as demoable surface.
+**Build-out (all landed 2026-07-18 — migration `011_tasks`, `TaskRepository` in
+`nanna-storage/src/tasks.rs` (24 tests), filter parser in `task_filter.rs` (26 tests), todo skill
+v0.2.0, `tasks.*` script services + `TaskAction` IPC group + GUI `/tasks` page):**
+- [x] **Store in Turso** — `tasks` + `task_notes` + `task_activity` tables (migration `011_tasks`);
+      scope `session | workspace | global` with disjoint views, so a plan outlives the chat that made
+      it. Integer ids (small-model-friendly; uuids add nothing agent-facing). Turso only, no new store.
+      *Learned the hard way:* an unfinished `Rows` cursor on the shared turso connection **silently
+      swallows subsequent writes** — drop cursors before writing (found via a vanishing activity row;
+      comment at the create() site).
+- [x] **Hierarchy** — `parent_id` + `sort_order`; a parent **cannot** complete while a child is open
+      (repo-enforced, instructive error), and auto-completes when its last child closes — *unless it
+      carries its own acceptance check*, in which case it must be completed explicitly so its check
+      runs. Depth bounded at 32 (recursion protection, documented justification). Cancelling a parent
+      cascades to its open subtree (children of a dead plan must not surface from `next()`).
+- [x] **Dependencies** — `depends_on[]` with cycle check **on write** (BFS over the would-be graph;
+      reject self-deps and transitive cycles; parent-chain cycles too). `blocked` is derived at read
+      time — writing `status='blocked'` is rejected with "add a dependency instead". Cancelled
+      dependencies count as satisfied (a dependent must not block forever on an abandoned item).
+- [x] **`next()`** — the one actionable item: open, unblocked, leaf (no open children); ordered
+      `in_progress` first (resume what you started), then priority, due date (nulls last), explicit
+      order, id. Returned with its acceptance check, tool scope, and a 5-note tail — one item in
+      context per turn.
+- [x] **Acceptance criteria per item** — `{kind: command|file_exists|regex, ...}`, shape-validated at
+      write time so the harness never meets a malformed check; run by the harness / `tasks.done`
+      service (see P14). `done` via plain `update` is rejected: "use the done action so the
+      acceptance check can run".
+- [x] **Filter/query language** — the planned Todoist subset (`&`, `|`, `!`, parens, `p1..p4`,
+      `@label`, `#project`, `overdue`, `due before:/after:`, `no date`, `no label`, `search:`,
+      `subtask`) plus status atoms (`pending`/`in_progress`/`done`/`cancelled`/`blocked`-as-derived)
+      and `today`. Pure recursive-descent parser, zero I/O, bounded input (4 KiB) and depth (32),
+      structured ISO dates only (no NL date parser for a machine caller), 26 unit tests incl.
+      precedence, no-space colon forms, and adversarial inputs.
+- [x] **Working notes per task** — append-only, 16 KiB/note bound (a note-tail injection can never
+      exceed ~4k tokens); the harness writes each step's findings here — long-run state lives in the
+      store, not the transcript.
+- [x] **Activity log** — every transition with actor + timestamp + JSON detail (created / updated /
+      completed / auto_completed / cancelled / reopened / acceptance_checked / false_success_claim /
+      replanned / abandoned / imported_blocked). This is the drift post-mortem dataset.
+- [x] **Assignee = agent** — column + `actor` on every activity entry; harness runs stamp
+      `harness`, GUI actions stamp `gui`, migration stamps `todo-v0.1-migration`.
+- [x] **Recurrence via the existing scheduler** — tasks store a 5-field cron expression; a
+      `task_recurrence_sweep` job on the P8 daemon scheduler (every 5 min) reopens completed
+      recurring tasks whose next occurrence has arrived. One recurrence engine: the store holds the
+      expression, the scheduler is the clock.
+- [x] **Tiny tool surface** — todo v0.2.0 exposes `next / add / update / done / note / query / list`
+      (plus the v0.1 `create/remove/clear/clear_all` still accepted); the full repository API is the
+      *store's* capability, reachable via IPC, not the model's tool schema.
+- [x] **JSON migration** — on first use in a session, the skill imports `.nanna-todo-{session}.json`
+      via `tasks.import` (order preserved; v0.1 `blocked` label → `pending` + activity note, since
+      blocked is derived now) and stamps the file `{"migrated": true}`. The skill keeps a full v0.1
+      file fallback for contexts without the daemon task services, and routes
+      `update(status='done')` through the verdict-gated done path.
+- [x] **GUI** — `/tasks` page (Nuxt): task tree with status/blocked/priority/labels, details panel
+      (description, acceptance, notes, activity), filter-language search, create/complete/delete
+      (acceptance-failure verdicts surfaced), and a **long-horizon run panel** — goal + budget,
+      Start/Cancel, live `task-event` feed, final report (items completed, tokens/item, stop
+      reason). This is the "is it still on track?" screen. Full IPC path:
+      `TaskAction` protocol group → `control/task.rs` → daemon_client/backend/commands → page.
 
 ### P16 — Daemon-only consolidation: GUI is a pure daemon client ✅ (landed 2026-07-18, flagship refactor)
 **Landed:** dropped **all** in-process "embedded" execution from the Tauri GUI. It now only attaches to

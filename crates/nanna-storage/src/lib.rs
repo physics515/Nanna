@@ -8,9 +8,12 @@
 mod migrations;
 mod models;
 mod repositories;
+pub mod task_filter;
+mod tasks;
 
 pub use models::*;
 pub use repositories::*;
+pub use tasks::*;
 
 use std::sync::Arc;
 use thiserror::Error;
@@ -28,6 +31,8 @@ pub enum StorageError {
     NotFound(String),
     #[error("Migration error: {0}")]
     Migration(String),
+    #[error("Invalid: {0}")]
+    Invalid(String),
 }
 
 
@@ -157,6 +162,11 @@ impl Storage {
     #[must_use]
     pub fn workspaces(&self) -> WorkspaceRepository {
         WorkspaceRepository::new(self.conn.clone())
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> TaskRepository {
+        TaskRepository::new(self.conn.clone())
     }
 
     // =========================================================================

@@ -9,6 +9,7 @@ mod chunker;
 pub mod compressor;
 mod context;
 pub mod cost;
+pub mod harness;
 pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
@@ -35,9 +36,9 @@ pub use registry::{
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
-    ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions, StreamCallback,
-    TaskComplexity, ThinkingCallback, ThinkingMode, ToolCallRecord, wrapup_nudge_due,
-    wrapup_nudge_message,
+    ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions, StepKind,
+    StreamCallback, TaskComplexity, ThinkingCallback, ThinkingMode, ToolCallRecord,
+    wrapup_nudge_due, wrapup_nudge_message,
 };
 pub use multi::{
     AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,
