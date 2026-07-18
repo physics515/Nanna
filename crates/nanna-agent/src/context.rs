@@ -150,8 +150,8 @@ pub struct AgentContext {
     /// Workspace context (injected into system prompt)
     #[serde(default)]
     pub workspace_context: Option<String>,
-    /// Whether to include MEMORY.md in workspace context (false for group chats)
-    #[serde(default = "default_include_memory")]
+    /// Deprecated no-op (memory is DB-backed; kept for serde compat).
+    #[serde(default = "default_include_memory", alias = "include_workspace_memory")]
     pub include_workspace_memory: bool,
     /// Consolidated summary of all previously summarized messages.
     /// This is prepended to messages when building API requests.
@@ -450,23 +450,20 @@ impl AgentContext {
     pub fn with_workspace(mut self, workspace: &Workspace) -> Self {
         self.workspace_root = Some(workspace.root.clone());
         self.workspace_context = Some(workspace.system_context());
-        self.include_workspace_memory = workspace.config.include_memory;
         self
     }
 
     /// Set workspace from files directly
     #[must_use]
-    pub fn with_workspace_files(mut self, root: PathBuf, files: &WorkspaceFiles, include_memory: bool) -> Self {
+    pub fn with_workspace_files(mut self, root: PathBuf, files: &WorkspaceFiles) -> Self {
         self.workspace_root = Some(root);
-        self.workspace_context = Some(files.to_system_context(include_memory));
-        self.include_workspace_memory = include_memory;
+        self.workspace_context = Some(files.to_system_context());
         self
     }
 
-    /// Set whether to include MEMORY.md in workspace context
+    /// Deprecated no-op kept for call-site compatibility.
     #[must_use]
-    pub fn with_workspace_memory(mut self, include: bool) -> Self {
-        self.include_workspace_memory = include;
+    pub fn with_workspace_memory(mut self, _include: bool) -> Self {
         self
     }
 
@@ -492,7 +489,7 @@ impl AgentContext {
     pub async fn reload_workspace(&mut self) -> Result<(), nanna_workspace::WorkspaceError> {
         if let Some(ref root) = self.workspace_root {
             let files = WorkspaceFiles::load(root).await;
-            self.workspace_context = Some(files.to_system_context(self.include_workspace_memory));
+            self.workspace_context = Some(files.to_system_context());
         }
         Ok(())
     }

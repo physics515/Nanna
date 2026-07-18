@@ -146,6 +146,14 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     /// Personality mode: balanced, professional, casual, minimal
     pub personality_mode: String,
+    /// Who the agent is (formerly per-workspace SOUL.md / IDENTITY.md).
+    /// Injected into every session independent of workspace.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// Who the user is (formerly per-workspace USER.md).
+    /// Injected into every session independent of workspace.
+    #[serde(default)]
+    pub user_profile: Option<String>,
     /// Enable thinking/reasoning mode
     pub thinking_enabled: bool,
     /// Enable streaming responses
@@ -180,6 +188,8 @@ impl Default for AgentConfig {
             name: "Nanna".to_string(),
             system_prompt: None,
             personality_mode: "balanced".to_string(),
+            persona: None,
+            user_profile: None,
             thinking_enabled: false,
             streaming_enabled: true,
             max_iterations: None,

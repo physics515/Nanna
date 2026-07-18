@@ -119,7 +119,7 @@ Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **
 the two ship together). **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
 what it does: **P16** (daemon-only consolidation — delete embedded mode, GUI becomes a pure daemon client,
 iOS deferred) collapses the double-implementation tax behind most P4/P8/P11 "GUI-embedded copy drifted" debt;
-**P17** (drop the bespoke per-workspace `.nanna/` agent markdown — Nanna reads a project's *standard* files
+**P17** ✅ (drop the bespoke per-workspace `.nanna/` agent markdown — Nanna reads a project's *standard* files
 `README`/`AGENTS.md`/`ROADMAP.md`, and persona/user/memory move to global config + the DB).
 Concretely, today Nanna:
 
@@ -1769,30 +1769,52 @@ Nanna's own `ROADMAP.md` stays.)*
   by task definitions).
 - **`TOOLS.md` → dropped.** Tools are discoverable at runtime; a static notes file is redundant.
 
-**Code surface to change** (2026-07-17 inventory):
-- [ ] Retire the file-name constants + context assembly: `crates/nanna-core/src/workspace.rs:32-38`
+**Code surface to change** (2026-07-17 inventory — **all completed 2026-07-18**):
+- [x] Retire the file-name constants + context assembly: `crates/nanna-core/src/workspace.rs:32-38`
       (`AGENTS_FILE`…`HEARTBEAT_FILE`) + the read/assemble at `:87-101,198-…`; the parallel set in
       `crates/nanna-workspace/src/lib.rs:43-49` and the context builder `crates/nanna-workspace/src/files.rs:81-275`
       (emits `## AGENTS.md`…`## HEARTBEAT.md` sections). Re-point context assembly at the standard files.
-- [ ] Stop auto-creating the sidecar: `crates/nanna-workspace/src/manager.rs:164-188` (creates `AGENTS.md`/
+      -> `HEARTBEAT_FILE` and the SOUL/USER/TOOLS/IDENTITY constants are removed; `workspace.rs`/`files.rs`/
+      `lib.rs` now assemble context from `README.md` / `AGENTS.md` / `CONTRIBUTING.md` / `ROADMAP.md` only
+      (`STANDARD_CONTEXT_FILES`). `WorkspaceContext` uses those four optional fields.
+- [x] Stop auto-creating the sidecar: `crates/nanna-workspace/src/manager.rs:164-188` (creates `AGENTS.md`/
       `SOUL.md`) and the templates `crates/nanna-workspace/templates/standard/{AGENTS,SOUL,USER,TOOLS,IDENTITY}.md`
       + `templates.rs:74-78` `include_str!`. Keep only a minimal root `AGENTS.md` (+ optional `ROADMAP.md`)
       template; delete the rest.
-- [ ] **Workspace detection** (`crates/nanna-workspace/src/discovery.rs:12-60`) currently scores `.nanna/` /
+      -> `manager::initialize` writes only root `AGENTS.md` (+ creates the `.nanna/` local-state dir). The five
+      `templates/standard/*.md` and their `include_str!`s are deleted; `templates.rs` exposes `minimal` and
+      `project` templates (AGENTS.md [+ ROADMAP.md]).
+- [x] **Workspace detection** (`crates/nanna-workspace/src/discovery.rs:12-60`) currently scores `.nanna/` /
       `SOUL.md` / `AGENTS.md`. Re-key on standard project signals: `.git`, `README.md`, root `AGENTS.md`,
       `ROADMAP.md`, `Cargo.toml` / `package.json` / `pyproject.toml`, etc.
-- [ ] **Global persona/user config:** add persona + user-profile fields to the global agent config (the source of
+      -> `WORKSPACE_MARKERS` now leads with `.git`, `AGENTS.md`, `ROADMAP.md`, `README.md`, `Cargo.toml`,
+      `package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, then `.nanna/`/`nanna.toml` as weak legacy signals.
+- [x] **Global persona/user config:** add persona + user-profile fields to the global agent config (the source of
       truth), injected into every session's context independent of the workspace.
-- [ ] **Heartbeat:** replace the `HEARTBEAT_FILE` prompt reads (`nanna-core/src/scheduler.rs:105`,
+      -> `nanna-config::AgentSettings` gains `persona` + `user_profile` (`Option<String>`); `GlobalPersona`
+      (in `nanna-core::workspace`) builds the injection; `control/session.rs` injects it into every session
+      system prompt from global config.
+- [x] **Heartbeat:** replace the `HEARTBEAT_FILE` prompt reads (`nanna-core/src/scheduler.rs:105`,
       `nanna-daemon/src/server.rs:795`, `gui/src-tauri/src/lib.rs:534`) with scheduled-task definitions.
-- [ ] **Memory:** re-point the GUI memory reads off `MEMORY.md` / `memory/*.md`
+      -> No `HEARTBEAT_FILE` reads remain anywhere. The daemon's heartbeat stays a *scheduler task* (prompt is a
+      config string, not a file read) — this matches "scheduled-task definitions".
+- [x] **Memory:** re-point the GUI memory reads off `MEMORY.md` / `memory/*.md`
       (`gui/src-tauri/src/commands/workspaces.rs:366-593`) onto the store; drop the `.md` mirror + the
       `include_memory` gating in `files.rs`.
-- [ ] **CLI + GUI + protocol:** update `src/commands/workspace.rs:23-41` (CLI `init` creates the 7 files), the GUI
+      -> The GUI workspace-command memory `.md` mirror is removed; `files.rs` no longer gates on `include_memory`.
+      Memory is DB-backed (Turso) as before.
+- [x] **CLI + GUI + protocol:** update `src/commands/workspace.rs:23-41` (CLI `init` creates the 7 files), the GUI
       workspace-validity check that requires `.nanna` with `SOUL.md`/`AGENTS.md` (`commands/workspaces.rs:672`),
       `workspaces.vue`, and the daemon `protocol.rs` / `control/{session,chat}.rs` filename references.
-- [ ] **`.nanna/` dir fate:** the *markdown* sidecar goes; decide whether `.nanna/` survives for non-md workspace
+      -> CLI `init` scaffolds standard files only; `check_workspace_validity` uses `WORKSPACE_MARKERS` + checks
+      `AGENTS.md`/`ROADMAP.md` (no `.nanna`+SOUL/AGENTS requirement); `workspaces.vue` lists `AGENTS.md`/
+      `ROADMAP.md`; daemon `protocol.rs`/`session.rs`/`chat.rs` reference standard context files.
+- [x] **`.nanna/` dir fate:** the *markdown* sidecar goes; decide whether `.nanna/` survives for non-md workspace
       state (workspace id / local config) or that state moves to the central store. (Minor — surface in impl.)
+      -> **Decision: `.nanna/` survives as a non-markdown local-state dir only** (`WORKSPACE_MARKER_DIR`). It holds
+      workspace id / local config, never agent `.md` sidecar files. `Workspace::ensure_nanna_folder` creates it;
+      `load_context` does a one-shot best-effort legacy import of a stray `.nanna/AGENTS.md` (read-only, not
+      deleted). No SOUL/USER/TOOLS/IDENTITY/HEARTBEAT/MEMORY are ever written there.
 
 **Migration (existing workspaces have `.nanna/` files today):** on first run against a legacy workspace, import
 `SOUL.md`/`USER.md` → global config, confirm memory is in the store (it is), then stop reading `.nanna/*.md`.

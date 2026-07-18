@@ -12,52 +12,34 @@ async fn print_workspace_status() -> anyhow::Result<()> {
     if let Ok(root) = discover_workspace(Some(&cwd)) {
         let workspace = Workspace::load(root.clone()).await?;
 
-        println!("🌙 Workspace Status\n");
+        println!("Workspace Status\n");
         println!("   Root: {}", root.display());
         println!("   Name: {}", workspace.name());
         println!("   Marker: {:?}", workspace.marker);
-        println!("\n📁 Context Files:");
+        println!("\nContext Files:");
 
         let files = &workspace.files;
+        if files.readme.as_ref().is_some_and(|f| f.exists) {
+            println!("   + README.md");
+        }
         if files.agents.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ AGENTS.md");
+            println!("   + AGENTS.md");
         }
-        if files.soul.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ SOUL.md");
+        if files.contributing.as_ref().is_some_and(|f| f.exists) {
+            println!("   + CONTRIBUTING.md");
         }
-        if files.user.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ USER.md");
-        }
-        if files.tools.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ TOOLS.md");
-        }
-        if files.memory.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ MEMORY.md");
-        }
-        if files.identity.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ IDENTITY.md");
-        }
-        if files.heartbeat.as_ref().is_some_and(|f| f.exists) {
-            println!("   ✓ HEARTBEAT.md");
-        }
-        if files.bootstrap.as_ref().is_some_and(|f| f.exists) {
-            println!("   ⚡ BOOTSTRAP.md (fresh workspace)");
+        if files.roadmap.as_ref().is_some_and(|f| f.exists) {
+            println!("   + ROADMAP.md");
         }
 
-        if !files.daily_memories.is_empty() {
-            println!("\n📅 Recent Daily Notes:");
-            for daily in &files.daily_memories {
-                println!("   - {}", daily.name);
-            }
-        }
-
-        println!("\n📊 Context Size:");
-        println!("   {} bytes (~{} tokens)",
+        println!("\nContext Size:");
+        println!(
+            "   {} bytes (~{} tokens)",
             files.total_size(),
             files.estimated_tokens()
         );
     } else {
-        println!("❌ No workspace found in current directory.");
+        println!("No workspace found in current directory.");
         println!("   Run 'nanna workspace init' to create one.");
     }
 
@@ -66,36 +48,36 @@ async fn print_workspace_status() -> anyhow::Result<()> {
 
 /// Handle workspace subcommands
 pub(crate) async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()> {
-    use nanna_agent::nanna_workspace::{
-        create_from_template, discover_workspace, list_templates,
-    };
+    use nanna_agent::nanna_workspace::{create_from_template, discover_workspace, list_templates};
 
     match action {
         WorkspaceAction::Init { template, path } => {
-            let target = path.map_or_else(|| std::env::current_dir().unwrap_or_default(), std::path::PathBuf::from);
+            let target =
+                path.map_or_else(|| std::env::current_dir().unwrap_or_default(), std::path::PathBuf::from);
 
-            println!("🌙 Initializing workspace at {}", target.display());
+            println!("Initializing workspace at {}", target.display());
 
-            // Check if workspace already exists
-            if discover_workspace(Some(&target)).is_ok() {
-                println!("⚠️  Workspace already exists at {}", target.display());
+            // Only treat as existing if standard context is already present
+            if target.join("AGENTS.md").exists() {
+                println!("AGENTS.md already exists at {}", target.display());
                 println!("   Use 'nanna workspace status' to see details.");
                 return Ok(());
             }
 
-            // Create from template
             create_from_template(&target, &template).await?;
 
-            println!("✅ Created workspace with '{template}' template");
-            println!("\n📁 Files created:");
+            println!("Created workspace with '{template}' template");
+            println!("\nFiles created:");
             for e in std::fs::read_dir(&target)?.flatten() {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                if name.ends_with(".md") || name.starts_with('.') {
+                if name.ends_with(".md") || name == ".nanna" {
                     println!("   - {name}");
                 }
             }
-            println!("\n🚀 Run 'nanna chat' to start chatting in this workspace!");
+            println!("\nRun 'nanna chat' to start chatting in this workspace!");
+            println!("Persona/user profile: global config agent.persona / agent.user_profile");
+            println!("Memory: DB store (no MEMORY.md sidecar)");
         }
 
         WorkspaceAction::Status => {
@@ -104,8 +86,8 @@ pub(crate) async fn handle_workspace_command(action: WorkspaceAction) -> anyhow:
 
         WorkspaceAction::Templates => {
             let templates = list_templates();
-            
-            println!("🌙 Available Workspace Templates\n");
+
+            println!("Available Workspace Templates\n");
             for t in templates {
                 println!("   {} - {}", t.id, t.name);
                 println!("      {}", t.description);
@@ -116,15 +98,15 @@ pub(crate) async fn handle_workspace_command(action: WorkspaceAction) -> anyhow:
 
         WorkspaceAction::Reload => {
             let cwd = std::env::current_dir()?;
-            
+
             match discover_workspace(Some(&cwd)) {
                 Ok(root) => {
                     let workspace = Workspace::load(root).await?;
-                    println!("✅ Reloaded workspace: {}", workspace.name());
+                    println!("Reloaded workspace: {}", workspace.name());
                     println!("   {} files loaded", workspace.files.existing_files().len());
                 }
                 Err(_) => {
-                    println!("❌ No workspace found in current directory.");
+                    println!("No workspace found in current directory.");
                 }
             }
         }

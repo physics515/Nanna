@@ -792,7 +792,7 @@ impl DaemonServer {
             let scheduler_config = nanna_core::SchedulerConfig {
                 heartbeat_interval: std::time::Duration::from_secs(1800),
                 heartbeat_enabled: true,
-                heartbeat_prompt: "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
+                heartbeat_prompt: "Run any due scheduled tasks. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
                 max_concurrent: 4,
                 check_interval: std::time::Duration::from_secs(30),
                 default_timezone: "UTC".to_string(),

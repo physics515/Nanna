@@ -55,8 +55,24 @@ impl ControlPlane {
                     Vec::new()
                 };
 
-                // Build system prompt with memory + workspace context
+                // Build system prompt with persona + memory + workspace context
                 let mut system_prompt = self.system_prompt.read().await.clone();
+
+                // Global persona / user profile (config — independent of workspace)
+                {
+                    let cfg = self.config.read().await;
+                    let persona = nanna_core::GlobalPersona {
+                        persona: cfg.agent.persona.clone(),
+                        user_profile: cfg.agent.user_profile.clone(),
+                    };
+                    let inj = persona.build_system_prompt_injection();
+                    if !inj.is_empty() {
+                        system_prompt.push_str("
+
+");
+                        system_prompt.push_str(&inj);
+                    }
+                }
 
                 // Resolve workspace: session's workspace > globally active workspace
                 let effective_ws_id = if session.workspace_id.is_some() {
@@ -89,7 +105,7 @@ impl ControlPlane {
                             Do NOT search in home directory or other locations unless explicitly asked.\n"
                         ));
 
-                        // Add workspace context files (AGENTS.md, SOUL.md, etc.)
+                        // Add workspace context files (README.md, AGENTS.md, ROADMAP.md, …)
                         let ws_context = ws.context.build_system_prompt_injection();
                         if !ws_context.is_empty() {
                             system_prompt.push_str(&format!("\n{}", ws_context));

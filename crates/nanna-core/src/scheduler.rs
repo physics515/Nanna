@@ -102,7 +102,7 @@ impl Default for SchedulerConfig {
         Self {
             heartbeat_interval: Duration::from_secs(1800), // 30 minutes
             heartbeat_enabled: true,
-            heartbeat_prompt: "Read HEARTBEAT.md if it exists. Follow it strictly. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
+            heartbeat_prompt: "Run any due scheduled tasks. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
             max_concurrent: 4,
             check_interval: Duration::from_secs(30),
             default_timezone: "UTC".to_string(),
