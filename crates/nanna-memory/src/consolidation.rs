@@ -382,10 +382,30 @@ pub fn composite_cluster_score(
         / total_weight
 }
 
+/// Two memories may only ever consolidate together when they share the exact
+/// same scope. A memory's `workspace_id` is `None` for a global memory and
+/// `Some(id)` for a workspace-scoped one; recall returns "global + this
+/// workspace" (see [`crate::MemoryService::recall`]), so both a workspace pair
+/// and a global pair are legitimately co-visible and mergeable — but a
+/// cross-workspace pair, or a global↔workspace pair, is not. Merging across a
+/// scope boundary would either **leak** workspace-private content into another
+/// scope or **lose** a memory's scope by re-homing it, silently defeating the
+/// per-workspace memory scoping the `remember`/`recall` tools enforce. Exact
+/// `Option` equality (`None == None`, `Some(a) == Some(a)`) is the safe rule.
+#[must_use]
+fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
+    a.workspace_id == b.workspace_id
+}
+
 /// Cluster memories using the composite score (not just cosine similarity).
 ///
 /// Uses greedy clustering: for each unassigned memory, find all unassigned memories
 /// whose composite score exceeds the threshold and group them.
+///
+/// A cluster is always **scope-homogeneous**: only memories sharing the seed's
+/// `workspace_id` can join it (see [`same_scope`]), so a dream cycle can never
+/// merge across a workspace boundary or fold a global and a workspace memory
+/// into one entry.
 ///
 /// Each cluster is bounded by `config.max_cluster_memories` (member count) and
 /// `config.max_cluster_content_bytes` (total content) so the consolidation prompt
@@ -426,6 +446,11 @@ pub fn cluster_memories(
             if assigned[j] {
                 continue;
             }
+            // Hard scope barrier: never cluster across a workspace boundary
+            // (cheaper than the composite score, so check it first).
+            if !same_scope(&memories[i], &memories[j]) {
+                continue;
+            }
 
             let score = composite_cluster_score(
                 &memories[i],
@@ -460,6 +485,14 @@ pub fn cluster_memories(
             c.len() == 1 || c.iter().map(|m| m.content.len()).sum::<usize>() <= cap_bytes
         }),
         "a multi-member cluster exceeded max_cluster_content_bytes"
+    );
+    // Every cluster is scope-homogeneous: all members share one workspace_id, so
+    // consolidating a cluster can never mix or re-home a memory's scope.
+    debug_assert!(
+        clusters
+            .iter()
+            .all(|c| c.iter().all(|m| m.workspace_id == c[0].workspace_id)),
+        "a cluster mixed memories from different workspaces"
     );
 
     clusters
@@ -526,9 +559,18 @@ pub fn create_consolidated_entry(
         .max()
         .unwrap_or(0) + 1;
 
-    // Inherit workspace_id from cluster (all memories in cluster should have same workspace)
+    // Inherit workspace_id from the cluster. `cluster_memories` guarantees a
+    // cluster is scope-homogeneous (all members share one workspace_id), so
+    // taking the first is exact, not a lossy pick — asserted below.
     let workspace_id = cluster.memories.first()
         .and_then(|m| m.workspace_id.clone());
+    debug_assert!(
+        cluster
+            .memories
+            .iter()
+            .all(|m| m.workspace_id == workspace_id),
+        "consolidating a cluster that spans workspaces would re-home or leak a memory"
+    );
 
     // Postcondition: the merged FSRS scalars are always finite (never NaN/inf),
     // so downstream weight math can't be poisoned.
@@ -785,6 +827,110 @@ mod tests {
         assert_eq!(ids.len(), 25, "every memory appears exactly once");
     }
 
+    /// Like [`similar_entry`] but with an explicit scope, so the workspace
+    /// barrier can be exercised without touching any other cluster signal.
+    fn scoped_entry(id: &str, workspace_id: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            workspace_id: workspace_id.map(str::to_string),
+            ..similar_entry(id, "x")
+        }
+    }
+
+    #[test]
+    fn cluster_never_merges_across_workspaces() {
+        // Two memories identical on every clustering signal (embedding,
+        // importance, recall, age) but in DIFFERENT workspaces must land in
+        // separate clusters — a dream cycle must never fold workspace B's
+        // memory into workspace A's consolidated entry.
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.3,
+            ..Default::default()
+        };
+        let memories = vec![
+            scoped_entry("a", Some("ws-A")),
+            scoped_entry("b", Some("ws-B")),
+        ];
+
+        let clusters = cluster_memories(memories, &config);
+
+        assert_eq!(clusters.len(), 2, "cross-workspace memories must not cluster");
+        assert!(clusters.iter().all(|c| c.len() == 1));
+    }
+
+    #[test]
+    fn cluster_merges_within_one_workspace() {
+        // The barrier must not block a legitimate same-workspace merge: two
+        // similar memories in the SAME workspace still cluster together.
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.3,
+            ..Default::default()
+        };
+        let memories = vec![
+            scoped_entry("a", Some("ws-A")),
+            scoped_entry("b", Some("ws-A")),
+        ];
+
+        let clusters = cluster_memories(memories, &config);
+
+        assert_eq!(clusters.len(), 1, "same-workspace memories must cluster");
+        assert_eq!(clusters[0].len(), 2);
+        assert!(clusters[0].iter().all(|m| m.workspace_id.as_deref() == Some("ws-A")));
+    }
+
+    #[test]
+    fn cluster_never_merges_global_with_workspace() {
+        // A global memory (None) and a workspace memory (Some) are co-visible in
+        // recall but must NOT merge: folding them would either leak the
+        // workspace memory into global scope or hide the global fact inside one
+        // workspace. Both directions are unsafe → exact-Option equality.
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.3,
+            ..Default::default()
+        };
+        let memories = vec![
+            scoped_entry("global", None),
+            scoped_entry("scoped", Some("ws-A")),
+        ];
+
+        let clusters = cluster_memories(memories, &config);
+
+        assert_eq!(clusters.len(), 2, "global and workspace memories must not merge");
+    }
+
+    #[test]
+    fn cluster_partitions_by_workspace_losslessly() {
+        // A mixed pool of three scopes (+ globals) must partition cleanly:
+        // every memory preserved exactly once, and no cluster spans scopes.
+        let config = ConsolidationConfig {
+            cluster_threshold: 0.3,
+            ..Default::default()
+        };
+        let mut memories = Vec::new();
+        for (ws, n) in [(None, 3), (Some("ws-A"), 4), (Some("ws-B"), 2)] {
+            for i in 0..n {
+                memories.push(scoped_entry(&format!("{ws:?}-{i}"), ws));
+            }
+        }
+        let expected_total = memories.len();
+
+        let clusters = cluster_memories(memories, &config);
+
+        // No cluster spans scopes.
+        assert!(
+            clusters
+                .iter()
+                .all(|c| c.iter().all(|m| m.workspace_id == c[0].workspace_id)),
+            "a cluster mixed workspaces"
+        );
+        // Nothing dropped, nothing duplicated.
+        let total: usize = clusters.iter().map(Vec::len).sum();
+        assert_eq!(total, expected_total, "no memory may be dropped");
+        let mut ids: Vec<_> = clusters.iter().flatten().map(|m| m.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), expected_total, "every memory appears exactly once");
+    }
+
     #[test]
     fn cluster_content_bytes_are_bounded_and_lossless() {
         // Ten 100-byte memories with a 300-byte budget → at most 3 per cluster.
@@ -962,6 +1108,24 @@ mod tests {
             out.metadata.get("consolidated_from").map(String::as_str),
             Some("a,b")
         );
+    }
+
+    #[test]
+    fn consolidated_entry_inherits_cluster_workspace() {
+        // A cluster scoped to a workspace produces a consolidated entry in that
+        // same workspace — the merged memory stays put, never re-homed to global.
+        let mut a = entry_with_fsrs("a", 2.0, 0.3, 4);
+        let mut b = entry_with_fsrs("b", 5.0, 0.1, 7);
+        a.workspace_id = Some("ws-A".to_string());
+        b.workspace_id = Some("ws-A".to_string());
+        let cluster = MemoryCluster {
+            memories: vec![a, b],
+            centroid: vec![1.0, 0.0],
+            compression_level: CompressionLevel::Standard,
+            avg_weight: 0.5,
+        };
+        let out = create_consolidated_entry(&cluster, "merged".into(), vec![1.0, 0.0]);
+        assert_eq!(out.workspace_id.as_deref(), Some("ws-A"));
     }
 
     #[test]

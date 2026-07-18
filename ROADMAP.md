@@ -642,6 +642,23 @@ routine should drain first.**
       re-embeds + upserts the whole entry (content and embedding stay consistent). Applied to all three
       ingest paths via the shared `fold_into_memory` helper. See also P13 true-merge.*
 - [x] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through. *(2026-07-14 — GUI adapter now holds a live `Arc<RwLock<WorkspaceRegistry>>` (constructed once, shared with AppState) and every `store`/`search` call scopes to the *current* active workspace via `remember_scoped`/`recall_scoped`. Daemon path already had this via `services_workspace_id` + per-chat update.)*
+- [x] **Dreaming leaked memories across workspaces** — the fix above scopes `remember`/`recall`,
+      but the **dream cycle** silently defeated it. `get_consolidation_bands` pools **all** entries
+      (every workspace + global) into weight bands, `cluster_memories`/`composite_cluster_score` clustered
+      purely on similarity/recall/importance/age with **no `workspace_id` awareness**, and
+      `create_consolidated_entry` blindly inherited `.first()`'s scope — so a consolidation could merge
+      workspace B's memory (or a global memory) into workspace A's summary, **leaking** private content
+      across a scope boundary or **losing** a memory's scope by re-homing it.
+      *(2026-07-18)* Added a hard scope barrier in `cluster_memories` (`nanna-memory::consolidation`): a
+      candidate joins a seed's cluster only when `same_scope` holds — exact `Option` equality on
+      `workspace_id` (`None==None`, `Some(a)==Some(a)`), so a workspace pair and a global pair still merge
+      but a cross-workspace or global↔workspace pair never does. Checked before the composite score (cheaper,
+      short-circuits). Every cluster is now scope-homogeneous (`debug_assert` postcondition in
+      `cluster_memories` + a matching precondition in `create_consolidated_entry`, so the inherited
+      `workspace_id` is exact, not a lossy pick). Lossless: barred candidates stay unassigned and re-cluster
+      within their own scope on a later seed — nothing dropped. 5 tests (cross-workspace never merges,
+      same-workspace still merges, global↔workspace never merges, a 3-scope pool partitions losslessly,
+      consolidated entry inherits the cluster scope); 58 nanna-memory tests green, 0 new clippy warnings.
 - [x] **Context budget for small models** — `truncate_context` used hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model got wrong math. Thread model limits everywhere.
       *(2026-07-13)* **Fixed the compression-threshold ↔ hard-limit inversion for small models** (a concrete
       slice of this item). `ModelInfo::compression_threshold` was a flat 80% of context while `hard_input_limit`
