@@ -12,6 +12,10 @@
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
+**Also 2026-07-18:** the **P11 original backlog is closed** — its four remaining embedded-mode items are
+superseded by P16 (verified against current code) and the last `recall` fix is handed to P12; a **run-log
+triage** then appended a fresh batch of correctness findings (top of that section) as the next things to
+drain — headed by a **multi-tool-call streaming collapse** on the OpenAI-compat/OpenRouter path.
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -103,7 +107,7 @@ tool use, embeddings, and dreaming-time summarization on-device. Cloud providers
 existing cross-provider complexity router (P10) is extended so **"local" is simply the
 top-priority, zero-cost tier** and cloud is an opt-in escalation.
 
-**Ports:** health HTTP `5148` (`/health`, `/healthz`, `/readyz`, `/status`) · WebSocket IPC `5149` · daemon sidecar (GUI-spawned) `9833`.
+**Ports:** health HTTP `5148` (`/health`, `/healthz`, `/readyz`, `/status`) · WebSocket IPC `5149`. The GUI-spawned daemon sidecar binds this **same** `5149` IPC port (`daemon_manager.rs:47,109` → `daemon_client.rs:69` connects `ws://127.0.0.1:5149`); the old `9833` sidecar port was never real and is retired.
 
 ---
 
@@ -597,9 +601,27 @@ message-level dedup, per-model stats tracker + persistence + stats-informed rout
       `input_tokens`/`cache_read`/`cache_creation` (from Anthropic `message_start` usage), captured into
       `LlmResult` instead of placeholders.
 
-### P11 — Correctness, Security & Architecture Debt 🚧 (new — cross-cutting)
+### P11 — Correctness, Security & Architecture Debt 🚧 (cross-cutting; original backlog closed 2026-07-18)
 Concrete, actionable items with `file:line` anchors. **This is the near-term backlog the daily
 routine should drain first.**
+
+> **Status summary (2026-07-18).** The entire original P11 backlog is now **resolved** — every item is
+> either fixed with tests, **superseded by P16** (the daemon-only consolidation that landed the same day
+> *deleted embedded mode outright*, so the cluster of "GUI-embedded copy of X drifted / broke" items no
+> longer has a code path to be wrong in), or **handed to its owning flagship phase** (the last real
+> `recall` fix — a local offline embedder — is P12 "Local embeddings in Burn", not P11 work). The
+> **four embedded-mode items** below (GUI embedding-dimension probe, silent daemon→embedded fallback,
+> `recall` broken in embedded, "only three tools in embedded") are closed by P16 and **verified against
+> current code**: `gui/src-tauri/src/{embedded,tool_authoring}.rs` and `llm/` are gone, `setup_state` no
+> longer builds a local `LlmClient`/`MemoryService`/embedding probe, and `BackendMode` is now
+> `{Daemon, Disconnected}` with *no* in-process fallback — a failed connect is an explicit `Disconnected`
+> status, not a silent three-tool degrade. The daemon (the only agent path now) loads all 39 skills and
+> two-tier `discover_tools` activation round-trips — proven in the same run log that motivated this pass.
+> **One residual, intentionally deferred:** measuring the Python interpreter's *setup* stack cost to
+> right-size `PYTHON_STACK_BYTES` — a measurement with no functional payoff (the 256 MiB is a
+> lazily-committed, effectively-free reservation that is already measured-good), left low-priority.
+> **Run-log triage (2026-07-18)** then surfaced a fresh batch of correctness findings, appended at the
+> end of this section as the new top-of-backlog.
 
 **Security (do first):**
 - [x] **User-tool path traversal** — `UserToolManager::save_tool` joins `{name}.json` unsanitized; a
@@ -886,10 +908,13 @@ routine should drain first.**
       **This also unblocks unattended real-binary daemon verification**, which had been forcing runs to fall
       back to unit tests. Not yet exercised end-to-end: the all-providers-unreachable degrade path (needs a
       host with no Ollama *and* no key) — covered by unit test rather than a live boot.
-      - [ ] **The GUI-embedded path still has the same bug.** `gui/src-tauri/src/lib.rs:217` and `:297` each
-            build their own embedding client and `?` on `Failed to discover embedding dimension`, exactly as
-            the daemon did before this fix. Apply the same treatment (probe through the shared router;
-            degrade instead of fail). Almost certainly related to the two embedded-mode reports below.
+      - [x] **The GUI-embedded path still has the same bug.** ~~`gui/src-tauri/src/lib.rs:217` and `:297` each
+            build their own embedding client and `?` on `Failed to discover embedding dimension`.~~
+            **Superseded by P16 (2026-07-18):** the embedding-dimension probe was deleted with the rest of the
+            embedded path — `setup_state` no longer constructs a local `LlmClient`/`MemoryService` and the GUI
+            never probes a dimension (the daemon owns memory). Verified against current code: a grep for
+            `discover.*dimension`/`EmbeddingRouter`/`MemoryService` under `gui/src-tauri/src/` returns nothing
+            but a settings-copy string. Nothing to degrade because nothing probes.
 > **The three embedded-mode reports below are one bug, not three** *(investigated 2026-07-17)*. The GUI is
 > not *choosing* embedded mode — it is **falling back** to it because the daemon dies at boot, and everything
 > else follows from being in a mode that was never finished:
@@ -907,15 +932,21 @@ routine should drain first.**
 > verified on the real binary with no env key: `Primary embeddings: OpenRouter` → `probed dimension 2048` →
 > `Daemon ready`. **The GUI needs a rebuilt sidecar to pick it up** (`pnpm build:daemon` bundles the daemon
 > binary into `gui/src-tauri/binaries/`), so a GUI built before that commit keeps falling back.
-> - [ ] **The silent fallback is its own bug.** Losing the daemon costs the user every script tool and all of
->       memory, and it is reported only as a `warn!` in a log nobody reads — the UI says nothing. Surface it:
->       show the mode and *why* the daemon was unreachable, so a dead daemon cannot masquerade as a working
->       app with three tools. This is what let a two-day outage go undiagnosed.
-> - [ ] **Ports note:** the `9833` "daemon sidecar (GUI-spawned)" in *Core Model* is **stale** — the GUI
->       spawns with `--port 5149` (`daemon_manager.rs:47,109`) and connects to `ws://127.0.0.1:5149`
->       (`daemon_client.rs:69`). They agree; fix the doc, and fold this into the P1 port-unification item.
+> - [x] **The silent fallback is its own bug.** **Resolved by P16 (2026-07-18):** there is no silent
+>       fallback anymore. The GUI can no longer run embedded, so a failed daemon connect is now a hard,
+>       explicit `BackendMode::Disconnected` (`backend.rs` — "There is no in-process fallback"), surfaced with
+>       a `fallback_reason`, instead of a `warn!`-only degrade into a three-tool app. A dead daemon can no
+>       longer masquerade as working. (Making the *disconnected UI* richer — mode + why — is captured in P16's
+>       deferred follow-ups.)
+> - [x] **Ports note:** ~~the `9833` "daemon sidecar (GUI-spawned)" in *Core Model* is stale.~~ **Fixed
+>       (2026-07-18):** the *Core Model* ports line now states the GUI-spawned sidecar binds the same `5149`
+>       IPC port and retires `9833`.
 
-- [ ] **`recall` is broken in embedded mode: "IO error: No embedding function configured".**
+- [x] **`recall` is broken in embedded mode: "IO error: No embedding function configured".**
+      *(Embedded mode itself is gone as of P16, 2026-07-18 — there is no "embedded `recall`" path left to
+      break. The daemon `recall`, now the only path, already soft-degrades with the actionable
+      `NoEmbeddingProvider` message and a non-error result, per the two done sub-items below; the sole true
+      remainder — a local offline embedder — is P12, not P11.)*
       *(user-reported 2026-07-16, with a live transcript)* The agent's `recall` tool fails outright in the
       GUI's embedded mode, so memory search is unavailable exactly where local-first is supposed to work.
       Same root theme as the daemon's boot failure (`OPENROUTER_API_KEY is required for embedding
@@ -946,8 +977,15 @@ routine should drain first.**
             through the same `RecallTool`). Writes (`remember`/`reflect`) still hard-error on the same
             condition by design: the model must know a store did not happen. 3 tests pin the soft
             degrade, that genuine storage failures still fail, and the marker prefix itself.
-      - [ ] Remaining: the real fix — a local embedder (P12 / Mummu).
-- [ ] **Agent reports only `remember`/`recall`/`reflect` are available in embedded mode.**
+      - Remaining (owned by **P12**, not P11): the real fix is a local offline embedder — tracked as P12
+        "Local embeddings in Burn" (Immediate next actions #4). The P11 soft-degrade halves above are done.
+- [x] **Agent reports only `remember`/`recall`/`reflect` are available in embedded mode.**
+      *(Superseded by P16, 2026-07-18: embedded mode is deleted, so the GUI's skill-less registry no longer
+      exists. The daemon — now the only agent path — loads all 39 skills via `load_skills_with_services` and
+      registers `discover_tools` + `ask_parent`, and two-tier activation round-trips. Proven in the very run
+      log that motivated this pass: "Loaded 39 tools", "Tool registry: 44 tools (including aliases)", then
+      "Activating tool via discover_tools tool=read_file/exec/…". The GUI-side skill-loading rewrite this item
+      described is moot.)*
       **ROOT-CAUSED 2026-07-17 — the report is accurate and the cause is worse than "discover_tools is
       missing": the GUI never loads the default skills at all.** `grep load_skills gui/src-tauri/src/`
       returns **nothing**. The daemon populates its registry at `server.rs:1773` with
@@ -1044,6 +1082,10 @@ routine should drain first.**
       - [ ] Measure interpreter **setup** stack cost separately (the only term that actually justifies the
             size), then right-size `PYTHON_STACK_BYTES` and its `const _` floor against *that* number instead
             of the disproved per-frame model. Re-measure in `--release`.
+            *(2026-07-18 — the sole intentionally-deferred P11 residual. Low priority, **no functional
+            payoff**: 256 MiB is a lazily-committed, effectively-free reservation that is already
+            measured-good, so this only tightens a number that costs nothing to leave large. Left for a run
+            that can spend a full `--release` build on stack instrumentation.)*
       - [x] **Residual: `sys.setrecursionlimit` could abort the process.** **(fixed 2026-07-16 — clamped.)**
             The item was **right that the DoS is real, wrong about why**, and an intermediate attempt this run
             wrongly "disproved" it on release-only evidence. The corrected picture, all measured:
@@ -1095,7 +1137,7 @@ routine should drain first.**
       385 passed, 0 failed, 0 overflows.** (`nanna-gui` needs the sidecar + built frontend staged first — see
       the build-env note under *Immediate next actions* #2 — so a bare `cargo test --workspace` still fails in
       its build script, not in a test.)
-- [ ] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. ~~Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.~~
+- [x] **Latent test/compile drift** — as of 2026-07-06 the full-workspace `cargo test` didn't even compile: `nanna-workspace`/`nanna-daemon` used `tempfile` without a dev-dep; `nanna-channels::queue` test lacked a `ChannelId` import; `nanna-memory` `VectorStoreConfig`/`MemoryEntry` test initializers were stale (`AtomicUsize`, `expires_at`); `src/main.rs` `run_daemon()` omitted the new `DaemonConfig.channels` field (a **production** build break). All repaired this run. ~~Add a lightweight `cargo test --no-run` smoke check so test-code drift can't rot silently.~~
       *(2026-07-17)* **Smoke check added** — `.github/workflows/test-compile.yml`, the repo's **first CI
       workflow**: `cargo test --no-run --workspace --exclude nanna-gui --locked` on every PR and every push to
       master. `--no-run` builds every test target without executing it, so it catches drift cheaply and cannot
@@ -1171,6 +1213,66 @@ routine should drain first.**
       dispatch) + `src/setup.rs` (component wiring: `ensure_api_key`/`create_scheduler`/`init_components`)
       + `src/commands/{serve,cli,workspace,credentials,daemon}.rs`. Legacy `run_daemon()` now lives in
       `src/commands/serve.rs`, behavior untouched. `--help` output byte-identical; check/tests match baseline.
+
+**Run-log triage (2026-07-18) — newly surfaced correctness items (next to drain):**
+Triaged from a real daemon + GUI run log (grok-4.5 via OpenRouter, a few PRs behind current master). Each
+item names the code path and the observed symptom; root causes were re-verified against current master where
+noted. Ordered by severity.
+
+- [ ] **[HIGH] Multi-tool-call streaming collapse (OpenAI-compat / OpenRouter path).** When the model emits
+      **≥2 tool calls in one turn**, they collapse into a single mis-attributed call. Root cause verified in
+      current master: the OpenAI-compat streaming adapter (`crates/nanna-llm/src/lib.rs:~2946-3005`) emits one
+      `ContentBlockStart` + `ToolUseDelta` per `tool_calls[].index` but batches **all** `ContentBlockStop`s
+      together at `finish_reason`, while the agent stream accumulator (`crates/nanna-agent/src/loop_runner.rs:~1538-1717`)
+      keeps a **single** `current_tool_id`/`current_tool_name`/`current_tool_json`, **ignores** the `index` on
+      `ToolUseDelta`, and finalizes only on the *first* `ContentBlockStop`. So a second `ContentBlockStart`
+      overwrites the id/name without clearing the JSON buffer and every tool's argument fragments concatenate
+      into one buffer — e.g. `{"action":"create",…(todo)}{"command":…(exec)}`. The JSON healer then salvages
+      the **first** object (often *another* tool's args) and the trailing call(s) are silently dropped.
+      Observed downstream in the log: `read_file`→"Missing required parameter: file_path",
+      `code_search`→"Missing required parameter: pattern", `exec`→empty command, and "Executing 1 tools in
+      parallel" where several were intended. Anthropic-native streaming is unaffected (it interleaves per-block
+      Start/Stop). **Fix:** accumulate tool-call state keyed by `index` (a map `index → (id, name, json)`) and
+      finalize each block independently — and/or interleave `ContentBlockStop` before the next block's Start in
+      the adapter. Add a regression test driving a two-tool-call OpenAI-compat stream end-to-end.
+- [ ] **[MED] The JSON healer masks the collapse above.** `nanna_llm::heal_json` takes the *first* balanced
+      top-level object and silently discards trailing ones, logged only as `WARN "Healed malformed tool_use
+      JSON from stream"` — so a systematic cross-tool mis-execution reads as benign healing (the log shows it
+      firing on nearly every turn). When a `tool_use` buffer contains **multiple** balanced top-level objects,
+      that is the streaming-collapse signal, not a heal-the-first case: treat it as an error/split, not silent
+      first-object salvage. Do together with the HIGH item above.
+- [ ] **[MED] Tool-stats import is all-or-nothing — a drifted/legacy field wipes every model's stats.** Boot
+      logged `Failed to import tool stats: invalid type: integer 202, expected a map`
+      (`crates/nanna-agent/src/tool_stats.rs` → `import_json` does a whole-blob
+      `serde_json::from_value::<ToolStatsInner>`); one schema-drifted field aborts the **entire** import and
+      drops all persisted tool stats (model_stats imported fine the same boot — this is tool_stats-specific).
+      Make import tolerant: per-entry deserialize with skip-and-log on bad entries, a `version` tag, and a
+      migration for the old shape, so a legacy blob degrades gracefully instead of zeroing the dashboard.
+- [ ] **[MED] Corrupted Turso memories table is unreadable with no repair path or user-visible signal.** The
+      boot `inconsistent overflow chain observed during payload read` warning (already **non-fatal** since the
+      `turso 0.4.4→0.6.1` bump — the daemon reaches "ready") means the **whole** memories table loads as 0 and
+      silently re-accumulates: permanent, unsurfaced data loss. Add (a) **surfacing** — report a corrupt store
+      via status/health, not just a `WARN` nobody reads; and (b) a **salvage path** — read rows individually
+      skipping the corrupt overflow chain, quarantine the bad btree and rebuild, or re-embed from an export —
+      instead of dropping the entire table. Related to P13 (Turso-only memory moat).
+- [ ] **[LOW] Tool-failure log line drops the error detail.** The registry logs `Tool exec failed in 1ms:`
+      with nothing after the colon (`crates/nanna-tools` registry) when a collapsed/empty-arg call gives
+      `exec` no `command`, so the actual reason is invisible in logs. Propagate the tool's error message into
+      the failure log line (and ideally into the model-facing result).
+- [ ] **[LOW] Windows `exec` ergonomics: cmd.exe idioms fail under Git Bash routing.** The model repeatedly
+      emitted `cd /d <path>` (→ `cd: too many arguments`) and `rg …` (→ `rg: command not found`) because
+      `exec` routes through Git Bash / POSIX on Windows (not cmd.exe). Reject/translate the
+      most common cmd-isms with an actionable message, ensure ripgrep is available (or steer the model to
+      `code_search`/`search_file`), and tighten the `exec` description + system prompt so the model targets
+      POSIX. Pure UX-hardening; the tool itself works.
+- [ ] **[LOW] Heartbeat reads a bespoke `HEARTBEAT.md` from the home dir and hard-errors.** During the
+      heartbeat cycle `read_file` failed on `C:\Users\physi\HEARTBEAT.md` (os error 2) — the heartbeat points
+      at a bespoke file in `~`, not the workspace, and it doesn't exist, surfacing `ERROR` + `WARN`. Fold into
+      **P17** (retire the bespoke per-workspace agent files incl. `HEARTBEAT_FILE`); until then the heartbeat
+      should treat a missing optional file as empty and resolve it workspace-relative, not from home.
+- [x] **[LOW] Remove committed debris `gui/src-tauri/src/_patch.py`.** A one-off patch script (hardcodes an
+      absolute `D:\…\lib.rs` path and pre-P16 line numbers 927/7851) was tracked in git under the Tauri source
+      dir. **Deleted in this PR.**
 
 ### P12 — Local Model Runner (Burn) 🌱 flagship (the pivot)
 **Goal:** a new `nanna-infer` crate that runs small open models **natively in Rust on a single
