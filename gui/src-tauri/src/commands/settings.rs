@@ -68,6 +68,7 @@ pub async fn set_api_key(
 
     // Update config
     state_guard.config.llm.api_key = Some(api_key.clone());
+    crate::llm::routing::invalidate_llm_client_cache();
 
     // Recreate LLM client with new key
     let llm = match state_guard.config.llm.provider.as_str() {
@@ -330,6 +331,7 @@ pub async fn set_provider_api_key(
         "anthropic" => {
             state_guard.config.llm.api_key = Some(api_key.clone());
             unsafe { std::env::set_var("ANTHROPIC_API_KEY", &api_key); }
+            crate::llm::routing::invalidate_llm_client_cache();
 
             // Recreate LLM client if this is the active provider
             if state_guard.config.llm.provider == "anthropic" {
@@ -339,6 +341,7 @@ pub async fn set_provider_api_key(
         "openai" => {
             state_guard.config.llm.openai_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("OPENAI_API_KEY", &api_key); }
+            crate::llm::routing::invalidate_llm_client_cache();
 
             if state_guard.config.llm.provider == "openai" {
                 state_guard.llm = Arc::new(LlmClient::openai(&api_key));
@@ -354,6 +357,7 @@ pub async fn set_provider_api_key(
         "openrouter" => {
             state_guard.config.llm.openrouter_api_key = Some(api_key.clone());
             unsafe { std::env::set_var("OPENROUTER_API_KEY", &api_key); }
+            crate::llm::routing::invalidate_llm_client_cache();
 
             if state_guard.config.llm.provider == "openrouter" {
                 state_guard.llm = Arc::new(LlmClient::openrouter(&api_key));
@@ -362,6 +366,7 @@ pub async fn set_provider_api_key(
         "github" => {
             state_guard.config.llm.github_token = Some(api_key.clone());
             unsafe { std::env::set_var("GITHUB_TOKEN", &api_key); }
+            crate::llm::routing::invalidate_llm_client_cache();
 
             if state_guard.config.llm.provider == "github" {
                 state_guard.llm = Arc::new(LlmClient::github_models(&api_key));
@@ -425,6 +430,7 @@ pub async fn run_claude_setup_token(
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
+    crate::llm::routing::invalidate_llm_client_cache();
 
     if state_guard.config.llm.provider == "anthropic" {
         state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&loaded.credential.access_token));
@@ -470,6 +476,7 @@ pub async fn import_claude_code_credentials(
             let mut state_guard = state.write().await;
             state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
             state_guard.config.llm.anthropic_use_oauth = true;
+            crate::llm::routing::invalidate_llm_client_cache();
 
             if state_guard.config.llm.provider == "anthropic" {
                 state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&refreshed.access_token));
@@ -495,6 +502,7 @@ pub async fn import_claude_code_credentials(
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
+    crate::llm::routing::invalidate_llm_client_cache();
 
     // Recreate LLM client with OAuth token
     if state_guard.config.llm.provider == "anthropic" {
@@ -526,6 +534,7 @@ pub async fn save_anthropic_oauth_token(
     // Save the token and enable OAuth mode
     state_guard.config.llm.anthropic_oauth_token = Some(token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
+    crate::llm::routing::invalidate_llm_client_cache();
 
     // Recreate LLM client with OAuth token if anthropic is active provider
     if state_guard.config.llm.provider == "anthropic" {
@@ -550,6 +559,7 @@ pub async fn logout_anthropic_oauth(
 
     state_guard.config.llm.anthropic_oauth_token = None;
     state_guard.config.llm.anthropic_use_oauth = false;
+    crate::llm::routing::invalidate_llm_client_cache();
 
     // If using anthropic, switch back to API key if available
     if state_guard.config.llm.provider == "anthropic" {
@@ -646,6 +656,7 @@ pub async fn refresh_oauth_token(
     // Update app state
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
+    crate::llm::routing::invalidate_llm_client_cache();
 
     if state_guard.config.llm.provider == "anthropic" && state_guard.config.llm.anthropic_use_oauth {
         state_guard.llm = Arc::new(LlmClient::anthropic_oauth(&refreshed.access_token));
@@ -782,6 +793,7 @@ pub async fn set_ollama_host(
     let host = host.trim_end_matches('/').to_string();
 
     *state_guard.ollama_host.write().await = host.clone();
+    crate::llm::routing::invalidate_llm_client_cache();
 
     // Save to config file
     state_guard.config.memory.ollama_host = host.clone();
@@ -810,6 +822,7 @@ pub async fn set_ollama_api_key(
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
     state_guard.config.llm.ollama_api_key = if key.is_empty() { None } else { Some(key.clone()) };
+    crate::llm::routing::invalidate_llm_client_cache();
     match state_guard.config.save() {
         Ok(()) => {
             info!("Ollama API key saved");
