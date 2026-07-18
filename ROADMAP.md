@@ -635,6 +635,17 @@ routine should drain first.**
 - [x] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama). *(2026-07-06: the **daemon** already infers correctly via `ProviderId::from_model` + unit tests. 2026-07-14: **GUI** `parse_model_id` now matches — explicit `openrouter/`/`github/`/`ollama/`/`openai/`/`anthropic/` prefixes first, then family-prefix inference (`gpt-*`/`o1`/`o3`→openai, `claude*`→anthropic, `:tag`→ollama), historical Anthropic default for unknowns. 2 unit tests.)*
 - [x] **Atomic memory persistence** — `save_memories` writes in place; a crash mid-write corrupts the store. Use `tempfile` → write → `fs::rename`.
       *(2026-07-06) `VectorStore::save` now writes to a sibling `.json.tmp` and `fs::rename`s it over the target (atomic on the same filesystem), so a crash mid-write can't leave a truncated store. Test: save→load round-trips and no temp file is left behind. (This JSON path is the deprecated JSON→Turso migration writer; the live path is Turso write-through.)*
+- [x] **Dream consolidation could lose a whole cluster on a failed add** — `consolidate_cluster`
+      (`memory/service.rs`) **removed the cluster's source memories first, then** did
+      `store.add(consolidated).await?`. If the add failed (e.g. the summary embedded to the wrong
+      dimension), the sources were already gone and no replacement was stored — irreversible data loss for
+      every memory in the cluster. Same atomicity gap as *Atomic memory persistence* above, on the live
+      dreaming path. *(2026-07-18)* Reordered to **add-then-remove**: the consolidated entry (a fresh uuid,
+      so no id collision) is stored first, and only then are the superseded sources removed (best-effort). A
+      failed add now returns before any removal, so the worst case is a transient duplicate a later dream
+      cycle re-consolidates — never lost content. Regression test forces `store.add` to fail via a
+      wrong-dimension summary embedding and asserts both sources survive (verified it fails on the old
+      remove-then-add order); 59 nanna-memory tests green.
 - [x] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
       *(2026-07-07) `smart_ingest`'s `Update` band (0.75–0.92 sim) now folds the incoming content into the
       existing memory (pure `merge_memory_content`: superset-dedup, else bounded append ≤4096 B) and
