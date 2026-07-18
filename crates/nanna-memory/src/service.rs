@@ -1104,7 +1104,24 @@ impl MemoryService {
 
         // Only update if expansion added meaningful content
         if expanded.len() > memory.content.len() {
-            self.store.update_content(&memory.id, &expanded).await?;
+            // Re-embed the enriched content so the vector matches it. Updating
+            // content alone (the old `update_content` path) left the embedding
+            // pointing at the pre-expansion text, so recall matched the stale
+            // vector and the enrichment made the memory *harder* to find — the
+            // opposite of expansion's intent. Mirror the merge path, which
+            // re-embeds via `update_content_and_embedding` to keep content and
+            // embedding consistent. A failed re-embed returns before any write,
+            // so content and embedding never diverge.
+            let embed_fn = self
+                .embed_fn
+                .as_ref()
+                .ok_or(MemoryError::NoEmbeddingProvider)?;
+            let embedding = (embed_fn)(&expanded)
+                .await
+                .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+            self.store
+                .update_content_and_embedding(&memory.id, &expanded, embedding)
+                .await?;
             debug!("Expanded memory {}: {} -> {} chars", memory.id, memory.content.len(), expanded.len());
         }
 
@@ -1388,6 +1405,77 @@ mod tests {
         );
         assert!(service.get("a").await.is_some(), "source a survives");
         assert!(service.get("b").await.is_some(), "source b survives");
+    }
+
+    #[tokio::test]
+    async fn expand_memory_reembeds_the_enriched_content() {
+        use std::sync::Arc;
+
+        // The original content embeds to [1,0,0]; the enriched content embeds to
+        // an ORTHOGONAL [0,1,0]. After expansion the stored embedding must be the
+        // enriched vector, not the stale original — otherwise recall matches the
+        // pre-expansion text and the enrichment hurts retrievability.
+        const ORIGINAL: &str = "short";
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = if text == ORIGINAL {
+                vec![1.0_f32, 0.0, 0.0]
+            } else {
+                vec![0.0_f32, 1.0, 0.0] // any enriched text
+            };
+            Box::pin(async move { Ok(v) })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let entry = MemoryEntry {
+            id: "m".to_string(),
+            content: ORIGINAL.to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        };
+        service.add_entry(entry.clone()).await.unwrap();
+
+        // summarize_fn returns a strictly longer, enriched version.
+        let enriched = format!("{ORIGINAL} with a lot more explanatory context added");
+        let summarize = {
+            let enriched = enriched.clone();
+            move |_p: String| {
+                let enriched = enriched.clone();
+                async move { Ok::<_, String>(enriched) }
+            }
+        };
+
+        service
+            .expand_memory(&entry, &summarize)
+            .await
+            .expect("expansion must succeed");
+
+        // A raw search by the ENRICHED vector [0,1,0] must strongly match the
+        // memory — proving its stored embedding was re-generated from the
+        // enriched content, not left at the stale original [1,0,0].
+        let by_enriched = service.search_by_embedding(&[0.0, 1.0, 0.0], 1).await;
+        assert_eq!(by_enriched.len(), 1);
+        let (hit, score) = &by_enriched[0];
+        assert_eq!(hit.content, enriched, "content must be the enriched text");
+        assert!(
+            *score > 0.99,
+            "enriched vector must strongly match the re-embedded memory, got {score}"
+        );
+
+        // Conversely, the stale original vector [1,0,0] must NOT match well — if
+        // it did, the embedding was never refreshed (the bug this guards).
+        let by_stale = service.search_by_embedding(&[1.0, 0.0, 0.0], 1).await;
+        assert!(
+            by_stale[0].1 < 0.01,
+            "the pre-expansion vector must no longer match, got {}",
+            by_stale[0].1
+        );
     }
 
     #[tokio::test]

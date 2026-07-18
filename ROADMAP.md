@@ -646,6 +646,17 @@ routine should drain first.**
       cycle re-consolidates — never lost content. Regression test forces `store.add` to fail via a
       wrong-dimension summary embedding and asserts both sources survive (verified it fails on the old
       remove-then-add order); 59 nanna-memory tests green.
+- [x] **Dream expansion left a stale embedding (enriched memory got *harder* to recall)** — the
+      dreaming "expand high-value memory" phase (`expand_memory`) called `store.update_content`, which
+      replaces the text but **keeps the old embedding**, so after enrichment a memory's vector still
+      pointed at its pre-expansion content: recall matched the stale vector and the enrichment reduced
+      retrievability — the opposite of the phase's intent, and the same content/embedding divergence the
+      merge path already fixed via `update_content_and_embedding`. *(2026-07-18)* `expand_memory` now
+      re-embeds the enriched content and writes both via `update_content_and_embedding` (a failed re-embed
+      returns before any write, so content and embedding never diverge). Regression test expands a memory
+      whose enriched content embeds ORTHOGONALLY to the original, then asserts a raw search by the enriched
+      vector strongly matches while the stale original vector no longer does (verified it fails on the old
+      `update_content` path); 60 nanna-memory tests green.
 - [x] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
       *(2026-07-07) `smart_ingest`'s `Update` band (0.75–0.92 sim) now folds the incoming content into the
       existing memory (pure `merge_memory_content`: superset-dedup, else bounded append ≤4096 B) and
