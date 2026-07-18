@@ -508,16 +508,41 @@ fn peek_significant(block: &str, mut i: usize) -> Option<u8> {
 }
 
 fn extract_number_field(source: &str, field: &str) -> Option<u64> {
-    // Match: timeout: 300 or timeout:300
-    let patterns = [format!("{field}: "), format!("{field}:")];
-    for pattern in &patterns {
-        if let Some(start) = source.find(pattern) {
-            let value_start = start + pattern.len();
-            let rest = &source[value_start..];
-            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(n) = num_str.parse::<u64>() {
-                return Some(n);
-            }
+    // Match `field: 300` / `field:300` at an identifier boundary, returning the
+    // first occurrence that is actually followed by digits.
+    //
+    // Scanning *every* occurrence (not just the first) matters: a manifest may
+    // declare the same key as a *parameter* too — e.g. the `exec` skill has both
+    // a top-level `timeout: 180` and a `timeout: { type: "integer" }` inside
+    // `parameters`. The numeric top-level value must win regardless of which
+    // appears first in the source. The boundary check also stops `read_timeout:`
+    // from matching a search for `timeout`.
+    let bytes = source.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = source[from..].find(field) {
+        let idx = from + rel;
+        from = idx + field.len();
+
+        let prev_ok = idx == 0 || !is_ident_char(bytes[idx - 1]);
+        if !prev_ok {
+            continue;
+        }
+
+        // Expect: optional ws, ':', optional ws, then a run of digits.
+        let mut j = idx + field.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b':') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let num_str: String = source[j..].chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Some(n);
         }
     }
     None
@@ -772,6 +797,33 @@ mod tests {
             params["properties"]["note"]["description"],
             "café — déjà vu ✓"
         );
+    }
+
+    #[test]
+    fn timeout_field_prefers_numeric_over_parameter_declaration() {
+        // Mirrors the exec skill: a numeric top-level `timeout` alongside a
+        // `timeout` *parameter*. The numeric one must be picked regardless of
+        // order, and `read_timeout:` must not be mistaken for `timeout:`.
+        let source = r#"
+            export default {
+                name: "exec",
+                read_timeout: 999,
+                parameters: {
+                    properties: {
+                        timeout: { type: "integer", description: "secs" }
+                    }
+                },
+                timeout: 180,
+                execute(i) {}
+            }
+        "#;
+        assert_eq!(extract_number_field(source, "timeout"), Some(180));
+    }
+
+    #[test]
+    fn timeout_field_absent_yields_none() {
+        let source = r#"export default { name: "t", description: "d", execute(i) {} }"#;
+        assert_eq!(extract_number_field(source, "timeout"), None);
     }
 
     #[test]

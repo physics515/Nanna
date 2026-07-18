@@ -2,6 +2,13 @@ export default {
   name: "exec",
   version: "0.1.0",
   output: "context",
+  // Script-engine deadline (seconds). This is only a backstop for a hung script:
+  // the shell bridge owns the real per-command timeout — the `timeout` parameter
+  // below, or an auto-detected 30s/120s — and kills the child when it fires. This
+  // ceiling must stay ABOVE the bridge's widest auto-detect (120s) so a long
+  // build/VCS command is never preempted by the engine (which would orphan the
+  // child). A larger explicit `timeout` extends this deadline automatically.
+  timeout: 180,
   description: "Execute a shell command in a POSIX shell (Git Bash on Windows, sh on Unix) and return its output. Use bash syntax: pipes, &&, [ -f x ], cat/grep/tail, forward-slash paths. Use for build commands, scripts, git operations, etc.",
   parameters: {
     type: "object",

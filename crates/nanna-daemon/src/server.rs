@@ -994,6 +994,21 @@ impl DaemonServer {
                     }
                     if let Some(id) = active_id {
                         registry.set_active(&id);
+                        // Seed the tool working directory from the persisted active
+                        // workspace so tools resolve against it from boot — not just
+                        // after an interactive SetActive or the first workspace-scoped
+                        // chat. Without this, a fresh daemon with a persisted active
+                        // workspace left `default_workdir` at None until the user
+                        // re-selected it, so tools fell back to the home dir instead of
+                        // running "in the workspace you're in".
+                        let active_path = registry.get(&id).map(|ws| ws.path.clone());
+                        drop(registry);
+                        if let (Some(tools), Some(path)) = (control.tools(), active_path) {
+                            tools.set_default_workdir(Some(path.clone())).await;
+                            info!("Seeded tool working directory from active workspace: {:?}", path);
+                        }
+                    } else {
+                        drop(registry);
                     }
                     info!("Restored {} workspaces from database", records.len());
                 }

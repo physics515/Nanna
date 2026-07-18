@@ -338,6 +338,11 @@ impl ControlPlane {
     pub fn user_tools(&self) -> Option<&Arc<UserToolManager>> {
         self.user_tools.as_ref()
     }
+
+    /// Get a reference to the tool registry.
+    pub fn tools(&self) -> Option<&Arc<ToolRegistry>> {
+        self.tools.as_ref()
+    }
     
     /// Load user tools and register them with the tool registry
     pub async fn load_user_tools(&self) -> Result<usize, String> {

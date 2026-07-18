@@ -143,11 +143,20 @@ impl UserToolManager {
             enabled: true,
         };
 
-        // Save to disk
+        // Hold the write lock across the duplicate check + disk write + insert so a
+        // concurrent create with the same name can't race between them and clobber
+        // an existing tool + its `.json`. `create` is a rare admin op, so blocking
+        // here is fine.
+        let mut tools = self.tools.write().await;
+        if tools.contains_key(&name) {
+            return Err(format!(
+                "A tool named '{name}' already exists; update or delete it first"
+            ));
+        }
         self.save_tool(&meta).map_err(|e| e.to_string())?;
-
-        // Add to in-memory cache
-        self.tools.write().await.insert(name.clone(), meta.clone());
+        tools.insert(name.clone(), meta.clone());
+        debug_assert!(tools.contains_key(&name));
+        drop(tools); // release the write lock now that the critical section is done
 
         info!("Created user tool: {}", name);
         Ok(meta)
@@ -164,35 +173,49 @@ impl UserToolManager {
         enabled: Option<bool>,
     ) -> Result<UserToolMeta, String> {
         let mut tools = self.tools.write().await;
-        let meta = tools.get_mut(name).ok_or_else(|| format!("Tool not found: {name}"))?;
+        // Mutate a *clone*, persist it, and only swap it into the cache on a
+        // successful write. Mutating the live entry in place (the old behavior)
+        // left RAM diverged from disk if source validation failed mid-way or the
+        // disk write errored.
+        let mut updated = tools
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("Tool not found: {name}"))?;
+
+        // Validate the new source BEFORE applying any field, so a bad edit is a
+        // clean no-op rather than a partial mutation.
+        if let Some(ref src) = source {
+            if extract_manifest(src).is_none() {
+                return Err(
+                    "Invalid source: must export default with name and description".to_string(),
+                );
+            }
+        }
 
         if let Some(desc) = description {
-            meta.description = desc;
+            updated.description = desc;
         }
         if let Some(src) = source {
-            // Validate new source
-            if extract_manifest(&src).is_none() {
-                return Err("Invalid source: must export default with name and description".to_string());
-            }
-            meta.source = src;
+            updated.source = src;
         }
         if let Some(params) = parameters {
-            meta.parameters = Some(params);
+            updated.parameters = Some(params);
         }
         if let Some(perms) = permissions {
-            meta.permissions = perms;
+            updated.permissions = perms;
         }
         if let Some(en) = enabled {
-            meta.enabled = en;
+            updated.enabled = en;
         }
+        updated.updated_at = chrono::Utc::now().timestamp();
+        debug_assert_eq!(updated.name, name, "update must not rename the tool");
 
-        meta.updated_at = chrono::Utc::now().timestamp();
-
-        // Save to disk
-        self.save_tool(meta).map_err(|e| e.to_string())?;
+        // Persist first; publish to the cache only after the write succeeds.
+        self.save_tool(&updated).map_err(|e| e.to_string())?;
+        tools.insert(name.to_string(), updated.clone());
 
         info!("Updated user tool: {}", name);
-        Ok(meta.clone())
+        Ok(updated)
     }
 
     /// Delete a tool
@@ -341,16 +364,29 @@ impl Tool for UserToolWrapper {
     }
 }
 
+/// Convert a JSON Schema `enum` entry to its string form. Preserves non-string
+/// scalars (numbers, booleans, null) that the previous `as_str`-only path silently
+/// dropped — e.g. `"enum": [1, 2, 3]` or `[true, false]` now survive.
+fn enum_value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Parse parameters from a JSON Schema value
 fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
     let mut params = Vec::new();
-    
+
     if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
         let required: Vec<&str> = schema.get("required")
             .and_then(|r| r.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        
+
         for (name, prop) in properties {
             let param_type = match prop.get("type").and_then(|t| t.as_str()) {
                 Some("string") => ParameterType::String,
@@ -361,16 +397,16 @@ fn parse_params_from_schema(schema: &Value) -> Vec<ToolParameter> {
                 Some("object") => ParameterType::Object,
                 _ => ParameterType::String,
             };
-            
+
             let description = prop.get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .to_string();
-            
+
             let enum_values = prop.get("enum")
                 .and_then(|e| e.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-            
+                .map(|arr| arr.iter().map(enum_value_to_string).collect());
+
             params.push(ToolParameter {
                 name: name.clone(),
                 description,
@@ -528,10 +564,28 @@ impl Tool for CreateToolTool {
             permissions,
         ).await.map_err(|e| ToolError::ExecutionFailed(e))?;
 
-        // Register it immediately
-        if let Ok(tool_impl) = self.manager.create_tool_impl(&meta) {
-            self.registry.register_boxed(tool_impl).await;
-        }
+        // Register it immediately.
+        //
+        // A failure here used to be swallowed by `if let Ok(..)`: the tool was
+        // written to disk and reported created, but never registered — so it
+        // showed up in the UI and silently was not callable until the next
+        // restart. Roll the creation back instead, so disk and registry cannot
+        // disagree, and report the real error. `create_tool_impl` is infallible
+        // today; this is about the swallow not outliving that.
+        let tool_impl = match self.manager.create_tool_impl(&meta) {
+            Ok(tool_impl) => tool_impl,
+            Err(e) => {
+                // Best-effort rollback: if it also fails, the tool is left on disk
+                // and will register on the next start, so surface the original error.
+                if let Err(cleanup_err) = self.manager.delete_tool(&name).await {
+                    warn!("Failed to roll back tool '{name}' after a registration error: {cleanup_err}");
+                }
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Tool '{name}' could not be activated: {e}"
+                )));
+            }
+        };
+        self.registry.register_boxed(tool_impl).await;
 
         Ok(ToolResult::success(format!(
             "✓ Tool '{}' created successfully and is now available for use.\n\nYou can now call it with: {{\n  \"name\": \"{}\",\n  \"parameters\": {{ ... }}\n}}",
@@ -588,7 +642,7 @@ impl Tool for ListUserToolsTool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_tool_name;
+    use super::*;
 
     #[test]
     fn validate_tool_name_accepts_valid() {
@@ -614,5 +668,130 @@ mod tests {
         ] {
             assert!(validate_tool_name(bad).is_err(), "should reject {bad:?}");
         }
+        let too_long = "a".repeat(TOOL_NAME_LEN_MAX + 1);
+        assert!(validate_tool_name(&too_long).is_err());
+    }
+
+    fn sample_source(name: &str) -> String {
+        format!(
+            "export default {{ name: \"{name}\", description: \"d\", execute() {{ return \"ok\"; }} }}"
+        )
+    }
+
+    #[tokio::test]
+    async fn create_tool_rejects_traversal_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        let res = mgr
+            .create_tool(
+                "../escaped".to_string(),
+                "d".to_string(),
+                sample_source("x"),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(res.is_err());
+        // Nothing must have been written outside the tools dir.
+        assert!(!dir.path().parent().unwrap().join("escaped.json").exists());
+    }
+
+    #[tokio::test]
+    async fn create_tool_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+
+        mgr.create_tool(
+            "greet".to_string(),
+            "first".to_string(),
+            sample_source("greet"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first create succeeds");
+
+        // A second create with the same name must be rejected, not silently clobber.
+        let dup = mgr
+            .create_tool(
+                "greet".to_string(),
+                "second".to_string(),
+                sample_source("greet"),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(dup.is_err(), "duplicate name must be rejected");
+
+        // The original tool is untouched (description not overwritten).
+        assert_eq!(mgr.get_tool("greet").await.unwrap().description, "first");
+    }
+
+    #[tokio::test]
+    async fn update_tool_bad_source_leaves_ram_and_disk_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = UserToolManager::new(dir.path().to_path_buf());
+        mgr.create_tool(
+            "keep".to_string(),
+            "original".to_string(),
+            sample_source("keep"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An update carrying a new description AND an invalid source must fail
+        // whole — the description change must NOT leak into RAM or disk.
+        let res = mgr
+            .update_tool(
+                "keep",
+                Some("changed".to_string()),
+                Some("this is not a valid tool module".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(res.is_err(), "invalid source must fail the update");
+
+        // RAM is unchanged.
+        assert_eq!(mgr.get_tool("keep").await.unwrap().description, "original");
+
+        // Disk is unchanged: a fresh manager reloading from the same dir sees the
+        // original description (proves nothing was persisted mid-mutation).
+        let reloaded = UserToolManager::new(dir.path().to_path_buf());
+        reloaded.load_all().await.unwrap();
+        assert_eq!(
+            reloaded.get_tool("keep").await.unwrap().description,
+            "original"
+        );
+    }
+
+    #[test]
+    fn parse_params_preserves_non_string_enums() {
+        // Integer/boolean enum values must survive schema parsing (were dropped).
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "retries": { "type": "integer", "enum": [0, 1, 5] },
+                "verbose": { "type": "boolean", "enum": [true, false] }
+            }
+        });
+        let params = parse_params_from_schema(&schema);
+        let retries = params.iter().find(|p| p.name == "retries").unwrap();
+        assert_eq!(
+            retries.enum_values.as_deref(),
+            Some(&["0".to_string(), "1".to_string(), "5".to_string()][..])
+        );
+        let verbose = params.iter().find(|p| p.name == "verbose").unwrap();
+        assert_eq!(
+            verbose.enum_values.as_deref(),
+            Some(&["true".to_string(), "false".to_string()][..])
+        );
     }
 }

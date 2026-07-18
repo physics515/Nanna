@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-18 (GUI testing + UI/UX quality track; prior: 2026-07-15 response healing + stop-context)
+**Last updated:** 2026-07-18 (GUI testing + UI/UX quality track; P11 tool-manager consistency closed + scripted-exec timeout/tree-kill + tools resolve against the active workspace dir; **added P16 daemon-only consolidation + P17 repo-restructure directional phases**; prior: 2026-07-15 response healing + stop-context retention)
 **Repo:** local Cargo workspace, branch `master` — one Rust workspace + a Tauri 2 / Nuxt 4 GUI.
 **Stack:** Rust 2024 (rustc 1.85+) · Tokio · **Burn** (wgpu + ndarray) for on-device inference · wgpu 24 · Tauri 2 · Nuxt 4 / Vue 3 / Tailwind 4 · **Turso** (embedded, SQLite-compatible) · Boa + Deno scripting.
 
@@ -109,7 +109,11 @@ top-priority, zero-cost tier** and cloud is an opt-in escalation.
 Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **8** are partial;
 **9** is greenfield. The new local-first phases (**P12**, **P13**) are greenfield, as are **P14**
 (long-horizon autonomy on a small local model) and **P15** (the agent-grade task store that P14 runs on —
-the two ship together). Concretely, today Nanna:
+the two ship together). **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
+what it does: **P16** (daemon-only consolidation — delete embedded mode, GUI becomes a pure daemon client,
+iOS deferred) collapses the double-implementation tax behind most P4/P8/P11 "GUI-embedded copy drifted" debt;
+**P17** (retire the bespoke `ROADMAP.md`/agent docs for standard GitHub Issues/Projects + community-health files).
+Concretely, today Nanna:
 
 - Runs as a **headless daemon** (Windows service / systemd / launchd) with WebSocket IPC, PID
   lockfile, health endpoints, and session persistence to **Turso**; the **GUI attaches** as a client
@@ -792,7 +796,7 @@ routine should drain first.**
       descriptions, `}`-in-string balance, absent→None) **plus a real-data integration test that parses all
       39 shipped default skills** (0 failures). Note: bare object *keys* must be ASCII identifiers (all
       parameter names are); non-ASCII belongs in quoted string values, which decode correctly.
-- [ ] Tool-manager consistency: ~~`update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap)~~ / ~~no duplicate-name check~~ **(done 2026-07-10 — daemon `UserToolManager`, see below)**; `create_user_tool` swallows registration errors in `if let Ok`; ~~`enabled:false` tools still execute~~ / ~~no `ToolRegistry::unregister` (deleted tools stay callable until restart)~~ **(done 2026-07-09 — see below)**; ~~non-string enums dropped in `parse_params_from_schema`~~ **(done 2026-07-06 — `enum_value_to_string` preserves integer/boolean/null enum values in both the daemon and nanna-tools copies; tests each)**.
+- [x] Tool-manager consistency: ~~`update_tool` mutates memory before save (diverges on write failure → clone/mutate/save/swap)~~ / ~~no duplicate-name check~~ **(done 2026-07-10 — daemon `UserToolManager`, see below)**; `create_user_tool` swallows registration errors in `if let Ok`; ~~`enabled:false` tools still execute~~ / ~~no `ToolRegistry::unregister` (deleted tools stay callable until restart)~~ **(done 2026-07-09 — see below)**; ~~non-string enums dropped in `parse_params_from_schema`~~ **(done 2026-07-06 — `enum_value_to_string` preserves integer/boolean/null enum values in both the daemon and nanna-tools copies; tests each)**.
       *(2026-07-10)* Daemon `UserToolManager` hardened: **`update_tool` now clone→validate→mutate→save→swap** —
       it validates the new source *before* touching any field and mutates a clone, publishing to the cache
       only after the disk write succeeds, so a bad edit or a failed write can no longer leave RAM diverged
@@ -801,8 +805,23 @@ routine should drain first.**
       dup-check→save→insert (atomic vs a racing create), instead of silently clobbering an existing tool +
       its `.json`. 2 tests: duplicate-create rejected + original untouched; a bad-source update fails whole
       and a fresh manager reloading from disk still sees the original. clippy unchanged (2057). Remaining
-      here: ~~`create_user_tool`'s `if let Ok` swallow~~ **(done 2026-07-17)** + the GUI-embedded
-      `tool_authoring.rs` copy (needs a GUI build).
+      here: ~~`create_user_tool`'s `if let Ok` swallow~~ **(done 2026-07-17)** + ~~the GUI-embedded
+      `tool_authoring.rs` copy~~ **(done 2026-07-17 — see below)**.
+      *(2026-07-17)* **GUI-embedded copy brought to parity + registry reconciliation wired.**
+      `gui/src-tauri/src/tool_authoring.rs` now mirrors the daemon exactly: `create_tool` holds the write
+      lock across dup-check→save→insert (rejects a duplicate name instead of clobbering an existing tool +
+      its `.json`); `update_tool` is clone→validate→mutate→save→swap (a bad source or failed write can no
+      longer leave RAM diverged from disk); `parse_params_from_schema` preserves non-string enum values via
+      `enum_value_to_string` (integer/boolean enums were dropped); and the agent-facing `CreateToolTool`'s
+      `if let Ok(..)` registration swallow now propagates the error and rolls the creation back (`delete_tool`,
+      best-effort) so disk and registry can't disagree. The missing **registry wiring** is now in
+      `commands/tools.rs`: `delete_user_tool` calls `ToolRegistry::unregister` after deleting (a deleted tool
+      stops being callable without a restart), and `update_user_tool` **reconciles** — `unregister` then
+      re-register only if still enabled — so a `disable` actually stops execution (the old path only ever
+      *added*) and an edit's new source goes live immediately. Verified end-to-end: **nanna-gui compiles
+      clean** (with the daemon sidecar staged) and 6 `tool_authoring` unit tests pass (dup-create rejected +
+      original untouched, bad-source update fails whole and a reloaded manager still sees the original,
+      non-string enums survive, traversal-name rejected). This closes the whole tool-manager-consistency item.
       *(2026-07-17)* `create_user_tool`'s `if let Ok(tool_impl) = ..create_tool_impl(..)` swallowed a
       registration failure: the tool was written to disk and **reported created**, but never registered — so
       it appeared in the UI and silently was not callable until the next restart. It now propagates the error
@@ -811,11 +830,18 @@ routine should drain first.**
       register on the next start). `create_tool_impl` is infallible today, so this is about the swallow not
       outliving that.
       *(2026-07-09)* Replaced the naive one-line `ToolRegistry::unregister` (removed only the primary key, so a deleted tool stayed reachable through its own alias entry) with a cascading version: deleting a canonical tool also drops every alias whose target is it and purges the `alias_targets` reverse-map; deleting an alias leaves the canonical intact. Returns the entry-count removed. Wired into the **daemon** control plane: `ToolAction::Delete` now `unregister`s the live tool (deletion takes effect without a restart), and `ToolAction::Update` reconciles the registry with the new `enabled` flag — unregister then re-register only if still enabled, so a disabled tool stops executing and an edit's new source goes live immediately. 4 registry unit tests (uncallable-after-delete, alias cascade, alias-only removal leaves canonical, unknown-name no-op). Remaining: the GUI-embedded `UserToolManager` copy (`tool_authoring.rs`) still needs the same wiring (needs a GUI build to verify).
-- [ ] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
+- [x] Leaked `embedded_run_states` entries on failed/panicked runs (only removed on success).
       *(2026-07-12: verified the **daemon** analog `AgentService.active_chats` is NOT leaky — the only exits
       between insert and cleanup are the success path (cleans up before returning) and the all-models-exhausted
       path (cleans up); no early `?`/`return`/`unwrap` between them. Only an external panic in `agent.run()`
       would leak, which async-`Drop` can't cleanly cover. The leak is GUI-embedded-only.)*
+      *(2026-07-17: resolved by the PR #31 unification — the separate GUI-embedded run-state map is **gone**.
+      `grep embedded_run_states gui/src-tauri/src/` returns nothing; the GUI's `get_session_run_state` now
+      routes to `AgentService::get_run_state`, i.e. embedded mode shares the daemon's `active_chats`, which
+      was already verified non-leaky on every non-panic exit (success `remove` at `agent_service.rs:745`,
+      all-models-exhausted `remove` at `:833`; the `Err` arm continues the loop rather than returning). The
+      only residual is the same acknowledged external-panic-in-`agent.run()` vector — unchanged, and one that
+      async-`Drop` can't cleanly cover — so no risky panic-handling was added to the critical daemon path.)*
 - [x] **`parse_retry_after` non-ASCII byte-offset bug** (`agent_service.rs`) — it `find`s the prefix in the
       **lowercased** string but sliced the **original** at that offset; a lowercase that changes byte length
       before the prefix (e.g. `İ`→`i̇`, 2→3 bytes) shifts the offset, extracting the wrong digits or slicing
@@ -949,6 +975,24 @@ routine should drain first.**
       told it can activate more. Verify the embedded tool registry actually carries `discover_tools`
       (it is registered manually with a `Weak<ToolRegistry>` per entry point — an easy path to miss)
       and that activation round-trips in embedded mode.
+      *(refinement 2026-07-17)* Re-read against current `lib.rs`: `setup_state` **does** register Rust
+      built-in `ReadFileTool`/`WriteFileTool`/`ListDirTool`/`ExecTool`/`WebFetchTool`/web-search (+ read/
+      write/bash/glob/ls aliases) at `lib.rs:156-186` — so the embedded registry isn't empty of
+      filesystem/shell/web tools, they're just Rust built-ins (cmd.exe exec, not the Git-Bash JS `exec`).
+      So the precise failure is the **two-tier gating**, not an empty registry: the agent loop offers only
+      *core* tools (`remember`/`recall`/`reflect` + `discover_tools`) until `discover_tools` activates the
+      rest — and `discover_tools` isn't registered in a release GUI (`resolve_tools_dir` → `None`), so the
+      model can neither see nor activate the built-ins and reports only the three memory tools. The fix
+      still stands (give the GUI a non-`None` tools dir + bootstrap + load skills so `discover_tools`
+      registers), with the added wrinkle that a loaded JS `exec` skill would then shadow the Rust `ExecTool`
+      by name — intended (Git-Bash routing supersedes cmd.exe) but worth confirming live.
+      **Deliberately still deferred this run:** the change is entangled with GUI startup + cross-crate
+      service wiring (`build_script_services` is private and typed against the daemon's `MemoryService`,
+      while `setup_state` wires the `MemoryStorage`-trait tools), and its whole point — the tool list the
+      model sees — can only be validated in a live embedded session, which is unavailable here. Shipping a
+      compile-only GUI-startup rewrite would risk making embedded mode worse (startup panic on a failed
+      bootstrap, or duplicate-registration surprises) with no way to confirm the fix. Left for a session
+      that can run the app.
 - [x] **Workspace `cargo test` overflows the stack (unattended-red).** *(discovered 2026-07-11; root-caused
       + fixed 2026-07-16)* **The 2026-07-11 diagnosis was wrong on both the culprit and the blast radius.**
       It is **not** deno/V8: `cargo test -p nanna-scripting --features deno` passes 20/20 clean. The
@@ -1068,7 +1112,9 @@ routine should drain first.**
             the cache); the original 60 was a guess. Warm-cache runs should be far shorter — re-measure before
             raising it, and never raise it to paper over a hang.
 
-- [ ] **Scripted `exec` tool ignores its `timeout` parameter and orphans the child process on engine timeout** (found while working inside nanna, 2026-07-17). Three layers disagree about how long a command may run: the model passes `timeout: 600` and the bridge (`NannaBridge::exec_with_timeout`) would honor it, but the Boa engine wraps the whole script in `tokio::time::timeout(tool.timeout_ms)` with a fixed 30_000 ms default (`ScriptedTool::new`/`from_file`), and the exec skill's manifest sets no override — so every scripted `exec` dies at exactly 30 s with "Script execution failed: Timeout after 30000ms" no matter what the model asked for. Worse, `nanna_exec` runs the bridge on a detached `std::thread`, so when the engine timeout fires the script is abandoned but the bridge thread *and its child process keep running*: repeated `cargo test` calls each orphaned a cargo.exe, all holding the workspace build lock and deadlocking each other until killed by hand. (The bridge's own 120 s auto-detect for cargo/git/npm is equally unreachable — it never gets 120 s because the engine kills it at 30 s.) Fix direction: the scripted engine's timeout should be at least the requested exec timeout (plumb `input.timeout` up, or set the exec skill's manifest timeout to a real ceiling and let the bridge own the real timeout), and engine-timeout should cancel/kill the child process tree rather than detach it.
+- [x] **Scripted `exec` tool ignores its `timeout` parameter and orphans the child process on engine timeout** (found while working inside nanna, 2026-07-17; fixed 2026-07-17). Three layers disagreed about how long a command may run: the model passes `timeout: 600` and the bridge (`NannaBridge::exec_with_timeout`) would honor it, but the Boa engine wraps the whole script in `tokio::time::timeout(tool.timeout_ms)` with a fixed 30_000 ms default (`ScriptedTool::new`/`from_file`), and the exec skill's manifest set no override — so every scripted `exec` died at exactly 30 s with "Script execution failed: Timeout after 30000ms" no matter what the model asked for. Worse, `nanna_exec` runs the bridge on a detached `std::thread`, so when the engine timeout fired the script was abandoned but the bridge thread *and its child process kept running*: repeated `cargo test` calls each orphaned a cargo.exe, all holding the workspace build lock and deadlocking each other until killed by hand.
+      **Fix, three parts.** (1) **Engine deadline now outlives the command deadline.** `ScriptEngine::execute_*` computes an `effective_timeout_ms(base, input)` (`engine.rs`) that extends the script deadline to any integer `timeout` (seconds) in the tool input plus a 10 s handoff margin — only ever *extending*, never shortening. So an explicit `timeout: 600` gives the engine ~610 s while the bridge enforces 600 s and fires first. (2) **Auto-detect is reachable again.** The exec skill's manifest now declares a top-level `timeout: 180` engine ceiling (above the bridge's widest auto-detect, 120 s), so a `cargo`/`git` command with no explicit timeout is no longer preempted at 30 s. The bridge's auto-detect closure was extracted to a pure, unit-tested `default_exec_timeout_secs(command)` + `EXEC_MAX_AUTODETECT_SECS`, and `extract_number_field` was hardened to scan *all* occurrences at an identifier boundary (so the numeric top-level `timeout` wins over the `timeout` *parameter* declaration regardless of order, and `read_timeout:` can't be mistaken for `timeout:`). (3) **Timeout kills the process tree, not just the shell.** `exec_with_timeout` now `spawn`s + `select!`s `wait_with_output` against a `sleep(timeout)`; on overrun it runs `taskkill /T /F /PID` (Windows) to kill the shell *and* any grandchild (cargo/git) while the child is still live, and `kill_on_drop(true)` reaps the direct child as a backstop when the future drops. 8 new nanna-scripting tests (timeout classification, effective-deadline extend/never-shorten/ignore-absent, a real overrun returns `Timeout` promptly, number-field scan-all). 30 nanna-scripting tests green; daemon + GUI build clean. Remaining: a dedicated Unix process-group kill (today Unix relies on `kill_on_drop` reaping the exec-optimized single child).
+- [x] **Tools defaulted to the user's home dir instead of the active workspace dir** (investigated + fixed 2026-07-17). Root cause: the tool registry's `default_workdir` is what the bridge resolves bare relative paths and no-`workdir` shell commands against, and it is set to the active workspace path on an interactive `WorkspaceAction::SetActive` (`workspace.rs:127`) and per-chat (`chat.rs:146`) — **but not at daemon boot.** `server.rs` restores persisted workspaces and calls `registry.set_active(&id)` for the persisted active one **without** propagating its path to `set_default_workdir`, so a freshly-booted daemon left `default_workdir` at `None` until the user re-selected the workspace → the bridge fell back to `home_dir()` and tools ran in the *user directory* rather than the workspace (the "project_structure / default CWD resolved to the user home" symptom). Fix: seed `default_workdir` from the persisted active workspace at boot (new `ControlPlane::tools()` accessor + a `set_default_workdir(Some(ws.path))` right after `set_active` in `server.rs`). The bridge fallback order is now workspace `default_workdir` → home, and home is only ever hit in genuine global mode (no active workspace). (An earlier draft made the bridge fall back to the process CWD; corrected to the active-workspace dir per the intended behavior — "run in whatever workspace you're in.") 3 bridge unit tests (relative→workspace, `~`→home, absolute-unchanged); daemon builds clean. Note: the GUI-embedded path's own boot seeding is moot under the daemon-only consolidation (see P16).
 
 **Architecture debt:**
 - [x] **Decompose `gui/src-tauri/src/lib.rs`** (8,163-line monolith) into `commands/{chat,sessions,memory,settings,channels,workspaces,scheduler,tools,system}.rs`, `llm/{routing,truncation,summarization}.rs`, `state.rs`.
@@ -1554,6 +1600,132 @@ not 1:1, and the differences matter more than the similarities:
       (`extract_version_from_source`/`bootstrap_default_skills` already handle skill upgrades).
 - [ ] **GUI**: a task view is the natural place to *watch* a 4-hour run — the "is it still on track?"
       screen. Pairs with the P13 dream-log as demoable surface.
+
+### P16 — Daemon-only consolidation: delete embedded mode, GUI becomes a thin client 🌱 (new — 2026-07-17, flagship refactor)
+**Directional change (owner-requested):** drop **all** in-process "embedded" execution from the GUI. Today the
+Tauri app runs in one of two modes — attach to the headless `nanna-daemon` over IPC, **or** fall back to an
+in-process backend that runs the whole agent loop, tools, memory, scheduler, and LLM routing inside the GUI
+process. Maintaining both is a permanent double-implementation tax (every feature written twice, every bug
+reproduced in two places — the recurring "daemon has X, embedded copy of X drifted" P11 items are the symptom).
+**Go daemon-only: one codebase (the daemon), one agent loop, one event path; the GUI is purely a daemon client.**
+A failed daemon connect becomes a hard error, not a fallback. **Explicitly dropping planned iOS/mobile for now —
+that's an acceptable cost of one codebase.** (This retroactively simplifies the many P4/P8/P11 "GUI-embedded copy
+needs the same fix" items — they evaporate.)
+
+**Framing correction from the inventory (2026-07-17):** the GUI's IPC layer is **not** `nanna-client` — it's the
+self-contained `gui/src-tauri/src/daemon_client.rs` (+ `daemon_manager.rs` sidecar lifecycle), which speaks
+WebSocket via `tokio-tungstenite` and imports no daemon internals. **Keep** those two; the sidecar binary in
+`gui/src-tauri/binaries/` stays. The daemon's `ControlPlane::handle` already dispatches Chat/Session/Memory/
+Config/Tool/Scheduler/Channel/System/Workspace actions and runs a real heartbeat+cron scheduler, so the core
+control plane already backs every proxy the GUI needs.
+
+**Prerequisites — control-plane gaps the daemon MUST gain before embedded is deleted** (these features today work
+*only* in the embedded path; removing embedded without them = regressions):
+- [ ] **Skill directory CRUD + test** — `list/create/update/delete/test_skill` (`commands/tools.rs:328-607`) do
+      direct local-filesystem I/O on the workspace `skills/` dir with no daemon routing. Add daemon actions (or
+      fold into the existing `tool_*` actions) so the GUI edits the daemon's `tools_dir`, not a divergent local one.
+- [ ] **Memory tuning knobs** — `set_dreaming_enabled` / `set_max_compression_ratio` / `set_min_remaining_memories`
+      / `apply_memory_updates` / `save_memories` / `get|set_similarity_threshold` (`commands/memory.rs`) mutate the
+      local `MemoryService` only; the daemon exposes memory CRUD/consolidate but not these. Add control actions or
+      drop the UI knobs.
+- [ ] **Scheduler/heartbeat runtime toggles** — `set_scheduler_enabled` / `set_heartbeat_enabled` /
+      `set_heartbeat_interval` (`commands/scheduler.rs:8/30/42`) flip local flags; the daemon has cron CRUD but no
+      enable/interval action. Add one, else these become dead toggles.
+- [ ] **Agent visualization feed** — the `/agents` page reads an in-process `AgentRegistry` (`src/agents.rs`,
+      `AgentRegistryState`) populated by local runs; in daemon mode nothing populates it. Daemon must emit an
+      agent-registry/visualization feed (events or a query action) or the page goes blank.
+- [ ] **Relocate `log_buffer`** out of `nanna-daemon` (e.g. into `nanna-core`) — the GUI's own tracing capture
+      (`LogBuffer`/`LogBufferLayer`/`LogEntry`/`LogSource`, `lib.rs:32,957-965`; `system.rs` merge) is the one
+      non-embedded reason the GUI links `nanna-daemon`. Relocating it is the prerequisite to dropping that dep.
+- [ ] Decide **workspace-mirror** and **config-ownership**: `list_workspaces` reads a local `WorkspaceRegistry`
+      mirror even in daemon mode; settings write `config.toml` locally *and* push via `config_set`. Pick one
+      source of truth (daemon) with a thin client cache, to avoid two writers / stale state.
+
+**Delete immediately (no daemon dependency needed):**
+- [ ] `src/embedded.rs` (whole — `build_embedded_agent_service`, `build_llm_router`, `spawn_event_bridge`).
+- [ ] `src/tool_authoring.rs` (whole — daemon has `crates/nanna-daemon/src/user_tools.rs`; **the P11 tool-manager
+      parity work just done on this file becomes moot once it's deleted** — that's fine, it was correctness debt
+      that this phase erases wholesale).
+- [ ] `src/llm/` (whole — `routing.rs` `create_llm_client_for_model` + cache is used only by the embedded executor).
+- [ ] `src/state.rs`: `MemoryServiceAdapter` + the embedded-only `AppState` fields (`storage`, `llm`, `tools`,
+      `memory`, `memory_path`, `scheduler`, `last_consolidation`, `embedding_*`, `extraction_model`, `active_model`,
+      `rate_limited_models`, `user_tools`, `agent_service`, dreaming flags) — prune to what client commands need.
+- [ ] In `setup_state` (`lib.rs:65-938`): the embedded `Storage` open, the in-process `LlmClient` match, the
+      `ToolRegistry` + Rust built-in tool registrations (`lib.rs:153-187`), the `MemoryService`+embedding adapters
+      (`189-389`), the memory tools, `UserToolManager` + `CreateToolTool`/`discover_tools` wiring (`484-528`), and
+      the **entire `Scheduler` + `TaskExecutor` closure** (`531-857`) — the daemon already runs heartbeat+cron.
+- [ ] `memories.json` load + exit-handler save (`lib.rs:377-389, 1216-1235`).
+- [ ] The embedded arms of every dual-path command (delete the `else`, keep the daemon body):
+      `commands/{chat,memory,scheduler,sessions,settings,system,workspaces,tools}.rs` — each has an
+      `if is_daemon_mode() { … } else { /* embedded */ }`; the inventory lists every one with file:line.
+- [ ] **iOS/mobile:** remove `#[cfg_attr(mobile, tauri::mobile_entry_point)]` (`lib.rs:947`) and
+      `gui/src-tauri/icons/android/**`. (No real mobile project exists — it's scaffolding only.)
+
+**Collapse the abstraction (after the deletes):**
+- [ ] `src/backend.rs`: drop `BackendMode::Embedded`, `is_daemon_mode()`, the `init()` fallback ladder, and every
+      `Err("EMBEDDED_MODE")`/`else` arm in the `daemon_proxies!` macro (`backend.rs:396-542`) — each ~70 proxy
+      becomes an unconditional forward to `daemon_client`. A failed daemon connect is now a hard, user-visible error
+      (with a "start the daemon" affordance), not a silent embedded fallback.
+- [ ] Prune `gui/src-tauri/Cargo.toml` `nanna-*` deps: **drop** `nanna-storage`, `nanna-memory`, `nanna-scripting`,
+      `nanna-agent`, `nanna-workspace` (directly unused), and `nanna-daemon` (once `log_buffer` is relocated);
+      re-evaluate `nanna-tools`/`nanna-llm`/`nanna-core`/`nanna-channels` (kept only for cron parsing, model-listing,
+      folder constants, channel test/config — move server-side where cheap). **Keep** `nanna-config`.
+
+**Ordering (safe, incremental):** (1) add the missing daemon control actions for the prerequisites + relocate
+`log_buffer`; (2) repoint the skill/agent/memory-knob/scheduler-toggle commands to those actions; (3) delete
+`embedded.rs`/`llm/`/`tool_authoring.rs` + the embedded arms + the scheduler executor; (4) prune `AppState` +
+`Cargo.toml`; (5) collapse `backend.rs` to unconditional daemon forwarding. Each step compiles and ships on its own.
+**Payoff:** one agent loop, one memory system, one tool registry, one scheduler — every future feature and bugfix
+lands once. (Trade-off consciously accepted: the GUI now requires a running daemon; iOS is deferred.)
+
+### P17 — Repository restructure: standard GitHub conventions (retire ROADMAP.md + agent docs) 🌱 (new — 2026-07-17)
+**Directional change (owner-requested):** stop running the repo's *own* development on bespoke markdown — the
+custom single-source-of-truth `ROADMAP.md` and any agent-specific docs — and use **only standard GitHub files
+the way they're intended**, with **GitHub Issues + Projects + Milestones** as the planning surface. One
+conventional structure any contributor (human or agent) already understands. **This is the last thing
+`ROADMAP.md` is used for** — P16/P17 themselves migrate into Issues, then the file is deleted.
+
+**Inventory (2026-07-17):** 14 tracked `.md`, no `docs/`. `ROADMAP.md` = ~1,682 lines, phases P0–P17;
+coupled to exactly **two** files — `README.md` (3 links) and `.claude/skills/daily-dev/SKILL.md` (reads **and
+writes** it) — nothing in code/CI/Cargo references it. There is **no** root `CLAUDE.md`/`.cursorrules`/
+`AGENTS.md`, so "agent docs" here means the `ROADMAP.md`↔`daily-dev` coupling and `.claude/` dev tooling, not a
+pile of instruction files. **Do NOT touch product-feature markdown:** the `.nanna/` workspace context files
+(SOUL/USER/AGENTS/TOOLS/MEMORY) are a runtime feature (constants in `nanna-core/src/workspace.rs`,
+`nanna-workspace/src/{lib,files,templates,manager}.rs`, templates `include_str!`-embedded), and
+`crates/nanna-tools/default-skills/**` are shipped product assets.
+
+**Add the missing community-health files** (several also close standing P0.2/P1 items):
+- [ ] `LICENSE` (MIT) — closes P0.2 "Commit LICENSE file (MIT) — appears absent despite README reference".
+- [ ] `SECURITY.md` (vulnerability disclosure) — closes the P1 "No SECURITY.md" items.
+- [ ] `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`.
+- [ ] `.github/ISSUE_TEMPLATE/` (bug_report, feature_request, `config.yml`) + `.github/PULL_REQUEST_TEMPLATE.md`.
+
+**Move durable narrative out of ROADMAP.md into `docs/`** (so the vision/architecture/perf content survives the
+file's deletion):
+- [ ] `docs/architecture.md` ← "Core Model" (crate tiers, governing "channels as control-plane clients").
+- [ ] `docs/performance.md` ← "Performance & Benchmarking" methodology + the `bench/BASELINE.md` pointer. Fix
+      `README.md`'s `ROADMAP.md#performance--benchmarking-governing-concern` anchor to target this page.
+- [ ] `docs/north-star.md` ← the North Star / local-first pivot narrative.
+
+**Move planning to GitHub** and cut the coupling in one final change:
+- [ ] Create a **GitHub Project (v2)** + **Milestones** seeded from the phase headings (P0…P16 → milestones or
+      labels). Convert each *open* `- [ ]` item into an Issue with milestone/label; leave the *done* `- [x]`
+      history in git as the record (the ROADMAP's final committed state) rather than re-creating closed Issues.
+- [ ] **Retire/rewrite `.claude/skills/daily-dev/SKILL.md`** — it currently reads+writes `ROADMAP.md`; it must
+      instead pull the next item from the Project/Issues, or be retired for issue-driven work. Do this in the
+      SAME change that deletes `ROADMAP.md` so nothing points at a missing file.
+- [ ] Repoint `README.md`'s 3 `ROADMAP.md` links at the Project board + `docs/`; fold the user-facing README
+      rewrite (P0.2) in here.
+- [ ] **Delete `ROADMAP.md`** (after the above).
+
+**Housekeeping surfaced by the inventory:**
+- [ ] `.claude/settings.local.json` carries stale `clawdbot-rs` (old repo name) paths; the P1 item "Remove or
+      gitignore `.claude/settings.local.json`" already flags it — resolve here.
+- [ ] The repo commits a **live root `.nanna/` dogfood workspace** (SOUL/USER/AGENTS/TOOLS/MEMORY). Gitignore it
+      so product-runtime context stops intermixing with repo docs (keeps the *feature*, drops the in-repo instance).
+
+**Sequencing:** land community files + `docs/` + Project seeding first (all additive, zero breakage); then, in
+one final commit, flip README links, retire the `daily-dev`↔`ROADMAP` coupling, and delete `ROADMAP.md`.
 
 ---
 

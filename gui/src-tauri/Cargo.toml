@@ -73,3 +73,6 @@ nanna-daemon = { path = "../../crates/nanna-daemon" }
 default = ["custom-protocol", "devtools"]
 custom-protocol = ["tauri/custom-protocol"]
 devtools = ["tauri/devtools"]
+
+[dev-dependencies]
+tempfile = "3"
