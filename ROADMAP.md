@@ -635,6 +635,28 @@ routine should drain first.**
 - [x] `parse_model_id("gpt-4o")` returns `("anthropic","gpt-4o")` and fails silently — infer provider from name prefix (`gpt-*`→openai, `claude-*`→anthropic, `llama*`/`:tag`→ollama). *(2026-07-06: the **daemon** already infers correctly via `ProviderId::from_model` + unit tests. 2026-07-14: **GUI** `parse_model_id` now matches — explicit `openrouter/`/`github/`/`ollama/`/`openai/`/`anthropic/` prefixes first, then family-prefix inference (`gpt-*`/`o1`/`o3`→openai, `claude*`→anthropic, `:tag`→ollama), historical Anthropic default for unknowns. 2 unit tests.)*
 - [x] **Atomic memory persistence** — `save_memories` writes in place; a crash mid-write corrupts the store. Use `tempfile` → write → `fs::rename`.
       *(2026-07-06) `VectorStore::save` now writes to a sibling `.json.tmp` and `fs::rename`s it over the target (atomic on the same filesystem), so a crash mid-write can't leave a truncated store. Test: save→load round-trips and no temp file is left behind. (This JSON path is the deprecated JSON→Turso migration writer; the live path is Turso write-through.)*
+- [x] **Dream consolidation could lose a whole cluster on a failed add** — `consolidate_cluster`
+      (`memory/service.rs`) **removed the cluster's source memories first, then** did
+      `store.add(consolidated).await?`. If the add failed (e.g. the summary embedded to the wrong
+      dimension), the sources were already gone and no replacement was stored — irreversible data loss for
+      every memory in the cluster. Same atomicity gap as *Atomic memory persistence* above, on the live
+      dreaming path. *(2026-07-18)* Reordered to **add-then-remove**: the consolidated entry (a fresh uuid,
+      so no id collision) is stored first, and only then are the superseded sources removed (best-effort). A
+      failed add now returns before any removal, so the worst case is a transient duplicate a later dream
+      cycle re-consolidates — never lost content. Regression test forces `store.add` to fail via a
+      wrong-dimension summary embedding and asserts both sources survive (verified it fails on the old
+      remove-then-add order); 59 nanna-memory tests green.
+- [x] **Dream expansion left a stale embedding (enriched memory got *harder* to recall)** — the
+      dreaming "expand high-value memory" phase (`expand_memory`) called `store.update_content`, which
+      replaces the text but **keeps the old embedding**, so after enrichment a memory's vector still
+      pointed at its pre-expansion content: recall matched the stale vector and the enrichment reduced
+      retrievability — the opposite of the phase's intent, and the same content/embedding divergence the
+      merge path already fixed via `update_content_and_embedding`. *(2026-07-18)* `expand_memory` now
+      re-embeds the enriched content and writes both via `update_content_and_embedding` (a failed re-embed
+      returns before any write, so content and embedding never diverge). Regression test expands a memory
+      whose enriched content embeds ORTHOGONALLY to the original, then asserts a raw search by the enriched
+      vector strongly matches while the stale original vector no longer does (verified it fails on the old
+      `update_content` path); 60 nanna-memory tests green.
 - [x] **Memory merge** (`memory/service.rs:207`) — `Update` creates a new memory instead of merging.
       *(2026-07-07) `smart_ingest`'s `Update` band (0.75–0.92 sim) now folds the incoming content into the
       existing memory (pure `merge_memory_content`: superset-dedup, else bounded append ≤4096 B) and
@@ -642,6 +664,23 @@ routine should drain first.**
       re-embeds + upserts the whole entry (content and embedding stay consistent). Applied to all three
       ingest paths via the shared `fold_into_memory` helper. See also P13 true-merge.*
 - [x] **Tool-memory workspace scope** — `MemoryServiceAdapter::store()` always creates global memories; the `remember` tool ignores workspace scope. Thread workspace context through. *(2026-07-14 — GUI adapter now holds a live `Arc<RwLock<WorkspaceRegistry>>` (constructed once, shared with AppState) and every `store`/`search` call scopes to the *current* active workspace via `remember_scoped`/`recall_scoped`. Daemon path already had this via `services_workspace_id` + per-chat update.)*
+- [x] **Dreaming leaked memories across workspaces** — the fix above scopes `remember`/`recall`,
+      but the **dream cycle** silently defeated it. `get_consolidation_bands` pools **all** entries
+      (every workspace + global) into weight bands, `cluster_memories`/`composite_cluster_score` clustered
+      purely on similarity/recall/importance/age with **no `workspace_id` awareness**, and
+      `create_consolidated_entry` blindly inherited `.first()`'s scope — so a consolidation could merge
+      workspace B's memory (or a global memory) into workspace A's summary, **leaking** private content
+      across a scope boundary or **losing** a memory's scope by re-homing it.
+      *(2026-07-18)* Added a hard scope barrier in `cluster_memories` (`nanna-memory::consolidation`): a
+      candidate joins a seed's cluster only when `same_scope` holds — exact `Option` equality on
+      `workspace_id` (`None==None`, `Some(a)==Some(a)`), so a workspace pair and a global pair still merge
+      but a cross-workspace or global↔workspace pair never does. Checked before the composite score (cheaper,
+      short-circuits). Every cluster is now scope-homogeneous (`debug_assert` postcondition in
+      `cluster_memories` + a matching precondition in `create_consolidated_entry`, so the inherited
+      `workspace_id` is exact, not a lossy pick). Lossless: barred candidates stay unassigned and re-cluster
+      within their own scope on a later seed — nothing dropped. 5 tests (cross-workspace never merges,
+      same-workspace still merges, global↔workspace never merges, a 3-scope pool partitions losslessly,
+      consolidated entry inherits the cluster scope); 58 nanna-memory tests green, 0 new clippy warnings.
 - [x] **Context budget for small models** — `truncate_context` used hardcoded `MAX_CONVERSATION_TOKENS` (132k) while `calculate_dynamic_tool_budget` is model-aware, so a 32k Ollama model got wrong math. Thread model limits everywhere.
       *(2026-07-13)* **Fixed the compression-threshold ↔ hard-limit inversion for small models** (a concrete
       slice of this item). `ModelInfo::compression_threshold` was a flat 80% of context while `hard_input_limit`
@@ -1190,6 +1229,18 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
 - [ ] **Fast decode** — per-layer KV cache (+ conv-state cache for hybrid models like LFM2); on-device `argmax` so only the winning index syncs to CPU; sampling (temp/top-p) beyond greedy; **streaming tokens** to Tauri events + channels; cooperative interrupt check between tokens (cancellation).
 - [ ] **Single-GPU VRAM budgeting** — a size-tier picker (larger model on GPU, smaller on CPU) and an opt-in **f16** path (`Wgpu<half::f16, i32>`) to ~halve VRAM; account for KV cache + display headroom (3B f32 ~12GB is tight on 16GB).
 - [ ] **Local embeddings** — a from-scratch MiniLM-class sentence-embedder in Burn (ndarray/CPU) to serve the memory `embed_fn` fully offline (replaces the API `EmbeddingClient` on the local path). Fixes the "no local embeddings" gap.
+      - [ ] *(research 2026-07-18)* **MiniLM may be an outdated target — evaluate a 2026 on-device embedder
+            instead.** Concrete candidates, smallest-first: **Nomic Embed v2 (137M, CPU-friendly, best
+            quality-to-size)**; **EmbeddingGemma-300M** (Google, derived from Gemma 3, runs <200 MB quantized,
+            ~22 ms/embed on EdgeTPU, strong multilingual + MTEB-Code 68.76 — a natural fit since Mummu will
+            already port Gemma/Qwen-class decoders, so the tokenizer/weight-loading path is shared); and
+            **Qwen3-Embedding-0.6B** (matryoshka dims, 100+ languages incl. code, pairs with the Qwen3.5
+            generation tier). Decision inputs: pick by (a) whether Mummu can reuse the model's decoder blocks,
+            (b) output dimension vs the memory store's dimension-agnostic path (already handled by
+            `probe_and_align_dimension`), (c) CPU decode latency for the dreaming `embed_fn` batch. This is
+            the real fix for the P11 "recall broken in embedded mode / no local embedder" gap. Sources:
+            [EmbeddingGemma](https://www.bentoml.com/blog/a-guide-to-open-source-embedding-models),
+            [Ollama embedding models 2026](https://www.morphllm.com/ollama-embedding-models).
 - [ ] **Wire in as `Provider::Local`** — add the variant to `nanna-llm::Provider`, dispatch `complete`/stream/tool-calling to `nanna-infer`; make it the **top-priority tier** in the P10 complexity router so cloud is opt-in escalation. Parse tool-calls from local model output into the existing `ContentBlock::ToolUse` shape.
 - [ ] **Correctness gate** — parity-test each Burn port against a reference (Candle or a local Ollama run of the same model): single-forward top-k logits + a short greedy sequence must match. This is how laurelane trusts its reimplementations.
 - [ ] **Model management UX** — GUI: browse/download/select model, tier + f16 toggles, VRAM estimate, download progress; config `[infer]` section (model repo, cache dir, device override, f16).

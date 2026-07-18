@@ -1054,18 +1054,24 @@ impl MemoryService {
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
-        // Create consolidated entry
+        // Create consolidated entry (a fresh uuid, so it never collides with a
+        // source memory).
         let consolidated = create_consolidated_entry(cluster, summary, embedding);
 
-        // Remove old memories
+        // Add the consolidated memory FIRST, then remove the sources. If the add
+        // fails (e.g. a dimension mismatch), `?` returns before any removal, so
+        // the cluster's memories are never lost — the worst case is a transient
+        // duplicate (consolidated + a source whose removal failed), which a later
+        // dream cycle re-consolidates. The reverse order (remove-then-add) would
+        // delete every source and then lose them all on a failed add.
+        self.store.add(consolidated).await?;
+
+        // Remove the now-superseded source memories (best-effort).
         for memory in &cluster.memories {
             if let Err(e) = self.store.remove(&memory.id).await {
                 warn!("Failed to remove old memory {}: {}", memory.id, e);
             }
         }
-
-        // Add consolidated memory
-        self.store.add(consolidated).await?;
 
         debug!(
             "Consolidated {} memories into 1 ({:?})",
@@ -1098,7 +1104,24 @@ impl MemoryService {
 
         // Only update if expansion added meaningful content
         if expanded.len() > memory.content.len() {
-            self.store.update_content(&memory.id, &expanded).await?;
+            // Re-embed the enriched content so the vector matches it. Updating
+            // content alone (the old `update_content` path) left the embedding
+            // pointing at the pre-expansion text, so recall matched the stale
+            // vector and the enrichment made the memory *harder* to find — the
+            // opposite of expansion's intent. Mirror the merge path, which
+            // re-embeds via `update_content_and_embedding` to keep content and
+            // embedding consistent. A failed re-embed returns before any write,
+            // so content and embedding never diverge.
+            let embed_fn = self
+                .embed_fn
+                .as_ref()
+                .ok_or(MemoryError::NoEmbeddingProvider)?;
+            let embedding = (embed_fn)(&expanded)
+                .await
+                .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+            self.store
+                .update_content_and_embedding(&memory.id, &expanded, embedding)
+                .await?;
             debug!("Expanded memory {}: {} -> {} chars", memory.id, memory.content.len(), expanded.len());
         }
 
@@ -1322,6 +1345,137 @@ mod tests {
         let merged = merge_memory_content(&existing, &incoming);
         assert_eq!(merged, existing);
         assert!(merged.len() <= MEMORY_MERGE_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn consolidate_cluster_never_loses_memories_on_failed_add() {
+        use std::sync::Arc;
+
+        // The consolidated summary embeds to the WRONG dimension (2, not the
+        // store's 3), so `store.add(consolidated)` fails with a dimension
+        // mismatch — the exact partial failure the add-then-remove ordering
+        // guards against. The sources must survive: losing them would be
+        // irreversible data loss.
+        const SUMMARY: &str = "CONSOLIDATED";
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = if text == SUMMARY {
+                vec![1.0_f32, 0.0] // wrong dimension → add fails
+            } else {
+                vec![1.0_f32, 0.0, 0.0]
+            };
+            Box::pin(async move { Ok(v) })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let mk = |id: &str| MemoryEntry {
+            id: id.to_string(),
+            content: format!("memory {id}"),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        };
+        service.add_entry(mk("a")).await.unwrap();
+        service.add_entry(mk("b")).await.unwrap();
+        assert_eq!(service.count().await, 2);
+
+        let cluster = MemoryCluster::new(
+            vec![mk("a"), mk("b")],
+            CompressionLevel::Compressed,
+            &service.config.fsrs,
+        );
+        let summarize = |_p: String| async move { Ok::<_, String>(SUMMARY.to_string()) };
+
+        let result = service.consolidate_cluster(&cluster, &summarize).await;
+        assert!(
+            result.is_err(),
+            "a dimension-mismatched summary embedding must fail the add"
+        );
+
+        // The critical assertion: a failed add must NOT have deleted the sources.
+        assert_eq!(
+            service.count().await,
+            2,
+            "consolidation must never lose memories when the add fails"
+        );
+        assert!(service.get("a").await.is_some(), "source a survives");
+        assert!(service.get("b").await.is_some(), "source b survives");
+    }
+
+    #[tokio::test]
+    async fn expand_memory_reembeds_the_enriched_content() {
+        use std::sync::Arc;
+
+        // The original content embeds to [1,0,0]; the enriched content embeds to
+        // an ORTHOGONAL [0,1,0]. After expansion the stored embedding must be the
+        // enriched vector, not the stale original — otherwise recall matches the
+        // pre-expansion text and the enrichment hurts retrievability.
+        const ORIGINAL: &str = "short";
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = if text == ORIGINAL {
+                vec![1.0_f32, 0.0, 0.0]
+            } else {
+                vec![0.0_f32, 1.0, 0.0] // any enriched text
+            };
+            Box::pin(async move { Ok(v) })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(embed);
+
+        let entry = MemoryEntry {
+            id: "m".to_string(),
+            content: ORIGINAL.to_string(),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        };
+        service.add_entry(entry.clone()).await.unwrap();
+
+        // summarize_fn returns a strictly longer, enriched version.
+        let enriched = format!("{ORIGINAL} with a lot more explanatory context added");
+        let summarize = {
+            let enriched = enriched.clone();
+            move |_p: String| {
+                let enriched = enriched.clone();
+                async move { Ok::<_, String>(enriched) }
+            }
+        };
+
+        service
+            .expand_memory(&entry, &summarize)
+            .await
+            .expect("expansion must succeed");
+
+        // A raw search by the ENRICHED vector [0,1,0] must strongly match the
+        // memory — proving its stored embedding was re-generated from the
+        // enriched content, not left at the stale original [1,0,0].
+        let by_enriched = service.search_by_embedding(&[0.0, 1.0, 0.0], 1).await;
+        assert_eq!(by_enriched.len(), 1);
+        let (hit, score) = &by_enriched[0];
+        assert_eq!(hit.content, enriched, "content must be the enriched text");
+        assert!(
+            *score > 0.99,
+            "enriched vector must strongly match the re-embedded memory, got {score}"
+        );
+
+        // Conversely, the stale original vector [1,0,0] must NOT match well — if
+        // it did, the embedding was never refreshed (the bug this guards).
+        let by_stale = service.search_by_embedding(&[1.0, 0.0, 0.0], 1).await;
+        assert!(
+            by_stale[0].1 < 0.01,
+            "the pre-expansion vector must no longer match, got {}",
+            by_stale[0].1
+        );
     }
 
     #[tokio::test]
