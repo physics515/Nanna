@@ -738,7 +738,13 @@ routine should drain first.**
       Also added the first tests for the three resilience parsers (`is_rate_limit_error`,
       `is_context_length_error`, `parse_retry_after`) + `truncate`'s char-boundary backoff — 5 tests incl. an
       `İ` regression guard (old code returned `Some(2)` instead of `Some(42)`). 39 daemon tests green.
-- [ ] `create_llm_client_for_model` builds a fresh HTTP client every call — cache `LlmClient` by model ID, invalidate on credential change.
+- [x] **`create_llm_client_for_model` builds a fresh HTTP client every call** — cache `LlmClient` by model ID, invalidate on credential change.
+      *(fixed 2026-07-17)* Process-wide cache in `gui/.../llm/routing.rs` keyed by model ID with a hashed credential fingerprint (keys/tokens/oauth mode, claude-proxy URL, ollama host). A hit is returned only when the fingerprint still matches, so rotating a key, toggling OAuth, or changing the ollama host rebuilds even without an explicit flush. `invalidate_llm_client_cache()` clears the map eagerly and is wired into every GUI credential-mutation path (`set_api_key`, provider keys, OAuth login/refresh/clear, ollama host / API key). 6 unit tests cover hit, credential miss, distinct models, explicit invalidate, ollama host change, and missing-key `None`.
+      **Correctness / tooling note (2026-07-17, this PR):** the agent shell hard-caps at ~30s, so long
+      `cargo test -p nanna-gui` runs must be detached to an alternate `CARGO_TARGET_DIR` when the default
+      target dir is locked by other cargo processes. `project_structure` / default CWD also resolved to the
+      user home rather than the workspace until an explicit `D:/Development/nanna` chdir — treat as infra, not
+      product defects, but they blocked the intended offline red/green loop for this item.
 - [x] **Daemon boot hard-fails without an embedding API key — contradicts "offline-capable by default".**
       *(discovered 2026-07-16 during a real `nanna-daemon run` on an isolated port/data-dir; fixed 2026-07-16)*
       Boot got all the way through storage + migrations + `LLM router initialized with 3 providers` + tools dir,
