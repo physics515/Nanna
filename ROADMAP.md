@@ -1732,7 +1732,7 @@ Nanna's own `ROADMAP.md` stays.)*
 
 **Migration (existing workspaces have `.nanna/` files today):** on first run against a legacy workspace, import
 `SOUL.md`/`USER.md` → global config, confirm memory is in the store (it is), then stop reading `.nanna/*.md`.
-**Leave the old files on disk** (never delete user data) — just ignore them.
+delete the old files.
 
 **Payoff:** Nanna works in any existing repo from its standard files with zero bespoke scaffolding;
 persona/user/memory stop being duplicated into every project; one planning convention (`ROADMAP.md`) shared with
