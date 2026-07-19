@@ -463,8 +463,12 @@ pub struct LongHorizonConfig {
     /// step, so iterations past the re-anchor window only grow context —
     /// which is exactly what P14 exists to prevent.
     pub step_iterations: usize,
-    /// Token budget per step. A step that burns more than this has lost the
-    /// O(1) property; forcing a step boundary re-anchors it.
+    /// Optional token budget per step. None by default: the re-anchor
+    /// cadence is already enforced by `step_iterations`, and a token cap
+    /// proved to truncate PRODUCTIVE steps mid-work once the artifact under
+    /// construction grew (observed live: steps dying at exactly the budget on
+    /// later features, feeding stall → replan pressure). Set it only when a
+    /// hard per-step spend ceiling matters more than step completion.
     pub step_token_budget: Option<u64>,
     /// Consecutive runner errors before the run stops (circuit breaker for a
     /// dead model endpoint).
@@ -481,7 +485,7 @@ impl Default for LongHorizonConfig {
             max_steps_per_item: 5,
             max_replans_per_item: 2,
             step_iterations: 8,
-            step_token_budget: Some(20_000),
+            step_token_budget: None,
             max_consecutive_errors: 3,
             actor: "harness".to_string(),
         }
