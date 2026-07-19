@@ -270,6 +270,13 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ]  Add Dependabot/Renovate config.
 - [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
 - [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
+- [ ]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
+       `cargo test --workspace` run failed 9/9 `python::tests::*` with `Timeout(10000)` because each test spins a
+       RustPython interpreter that initializes the frozen stdlib (CPU-heavy); 9 in parallel on a busy machine
+       exceed the 10 s wall-clock guard. They all pass single-threaded (13/13 in 35.9 s, ~2.7 s each). Fix options:
+       raise the per-exec timeout for the test build, mark the python tests `#[serial]` (serial_test crate), or
+       gate their parallelism — so CI `cargo test` is deterministic. Not a product bug (real execs set their own
+       timeout); a test-harness determinism gap.
 
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
@@ -958,6 +965,25 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
             `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
 - [ ] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
+- [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
+      Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
+      (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
+      papers) points at the next lever: during idle, don't *only* rank-similar→concatenate→summarize — also
+      **rewrite raw context into "learned context"** (pre-organize/pre-answer likely future queries) so wake-time
+      responses are cheaper. Reported effect: ~5x less test-time compute for equal accuracy, ~2.5x lower cost/query
+      when amortized across related queries. Two concrete, in-reach steps for Nanna: (a) a dream phase that
+      **promotes recurring episodic memories to semantic/fact memories** (maps onto the P13 "episodes consolidate
+      into facts" line and the DSP peak-detection item), and (b) let the dream cycle use a **stronger model than the
+      chat model** — it has no latency constraint — which our `summarization_priority` list already allows; make the
+      dream path prefer it explicitly. Gate any change through the retention harness. Sources:
+      [Letta sleep-time compute](https://www.letta.com/blog/sleep-time-compute/),
+      [arXiv:2504.13171](https://arxiv.org/abs/2504.13171).
+- [ ] *(research 2026-07-19)* **The idle gate should also cover channel + heartbeat activity, not just IPC chat.**
+      The 2026-07-19 wiring stamps `ActivityClock` on `Action::Chat` (which channels route through), but the daemon's
+      own **heartbeat/cron agent runs** execute in the scheduler executor *without* going through `control.handle`,
+      so an autonomous agent run does not count as "activity". That is deliberate for now (heartbeats are brief and
+      infrequent) but revisit if proactive/heartbeat workloads grow: a long autonomous run should probably defer the
+      dream cycle too. Cheap fix when needed: stamp the shared clock at the top of the executor's agent-prompt arm.
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
 - [ ] **`nanna-timeline` crate + append-only event log** — `MemoryEvent { id, ts, kind, workspace_id, content, embedding, salience, source_ids }` in a new Turso migration; the raw episodic stream (messages, tool calls, recalls, outcomes) on a wall-clock axis. `MemoryEntry` stays the semantic/fact layer; episodes consolidate *into* facts during dreaming.
