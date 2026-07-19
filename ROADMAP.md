@@ -978,12 +978,12 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       dream path prefer it explicitly. Gate any change through the retention harness. Sources:
       [Letta sleep-time compute](https://www.letta.com/blog/sleep-time-compute/),
       [arXiv:2504.13171](https://arxiv.org/abs/2504.13171).
-- [ ] *(research 2026-07-19)* **The idle gate should also cover channel + heartbeat activity, not just IPC chat.**
-      The 2026-07-19 wiring stamps `ActivityClock` on `Action::Chat` (which channels route through), but the daemon's
-      own **heartbeat/cron agent runs** execute in the scheduler executor *without* going through `control.handle`,
-      so an autonomous agent run does not count as "activity". That is deliberate for now (heartbeats are brief and
-      infrequent) but revisit if proactive/heartbeat workloads grow: a long autonomous run should probably defer the
-      dream cycle too. Cheap fix when needed: stamp the shared clock at the top of the executor's agent-prompt arm.
+- [x] *(2026-07-19)* **Idle gate covers autonomous agent runs too, not just IPC chat.** The wiring stamps
+      `ActivityClock` on `Action::Chat` (channels route through it) **and** at the top of the scheduler executor's
+      agent-prompt arm, so the daemon's own **heartbeat/cron/task agent runs** also count as activity — a dream
+      cycle defers while an autonomous run is in progress. Safe against starvation: heartbeats are infrequent
+      (30 min) vs the 5-min idle threshold, and the memory-pressure trigger still overrides. (The
+      `memory_consolidation` task itself is a separate named arm, so it never self-stamps.)
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
 - [ ] **`nanna-timeline` crate + append-only event log** — `MemoryEvent { id, ts, kind, workspace_id, content, embedding, salience, source_ids }` in a new Turso migration; the raw episodic stream (messages, tool calls, recalls, outcomes) on a wall-clock axis. `MemoryEntry` stays the semantic/fact layer; episodes consolidate *into* facts during dreaming.

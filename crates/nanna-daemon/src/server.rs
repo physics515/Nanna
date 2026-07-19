@@ -1153,6 +1153,13 @@ impl DaemonServer {
                             // (tools, memory, model fallback) in a task-scoped
                             // session that is not persisted to the session store.
                             let session_id = format!("scheduled-{}", task.id);
+                            // An autonomous agent run (heartbeat / cron / task
+                            // prompt) is the daemon actively using the model, so
+                            // it counts as activity too — defer the dream cycle
+                            // while it runs. Heartbeats are infrequent (30 min)
+                            // vs the 5-min idle threshold, and memory pressure
+                            // still overrides, so dreaming is not starved.
+                            activity.record();
                             match agent.chat(&session_id, &task.payload, None, &[]).await {
                                 Ok(result) => {
                                     let heartbeat_ok = task.name == "heartbeat"
