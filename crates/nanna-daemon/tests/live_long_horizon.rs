@@ -762,6 +762,44 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
     ids
 }
 
+/// Last-resort healer for the sticky degraded Ollama server state: after
+/// sustained load the server starts ABORTING every generation (~31 tokens of
+/// degenerate output, `done: false`, no eval stats). Model unloads do not
+/// clear it; a server restart does (verified live). Gated by
+/// `NANNA_EVAL_ALLOW_OLLAMA_RESTART=1` because restarting a shared local
+/// service is an operator decision, not a test default.
+async fn restart_ollama_server() -> bool {
+    if std::env::var("NANNA_EVAL_ALLOW_OLLAMA_RESTART").as_deref() != Ok("1") {
+        return false;
+    }
+    println!("[heal] restarting the Ollama server (degraded runner state)");
+    // Kill only ollama.exe (the server); the "ollama app" tray supervisor
+    // respawns it.
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "ollama.exe"])
+        .output();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("pkill")
+        .args(["-x", "ollama"])
+        .output();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let up = reqwest::Client::new()
+            .get("http://localhost:11434/api/version")
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if up {
+            println!("[heal] Ollama is back");
+            return true;
+        }
+    }
+    println!("[heal] Ollama did not come back within 60s");
+    false
+}
+
 /// The endurance run: 42 dependency-chained fail-to-pass features. Progress
 /// prints every 2 minutes so a multi-hour run is observable from the log.
 #[tokio::test(flavor = "multi_thread")]
@@ -832,10 +870,12 @@ async fn live_endurance() {
         }
         resumes += 1;
         println!(
-            "[resume {resumes}/{ENDURANCE_RESUMES_MAX}] provider incident at t={}m — resetting runner and resuming the plan",
+            "[resume {resumes}/{ENDURANCE_RESUMES_MAX}] provider incident at t={}m — healing and resuming the plan",
             started.elapsed().as_secs() / 60
         );
-        env.runner.reset_ollama_runner().await;
+        if !restart_ollama_server().await {
+            env.runner.reset_ollama_runner().await;
+        }
         tokio::time::sleep(Duration::from_secs(15)).await;
     };
     progress.abort();
