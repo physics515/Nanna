@@ -790,6 +790,25 @@ fn is_transient_llm_error(message: &str) -> bool {
         || message.contains("connection")
 }
 
+/// Forensics: append the exact prompt of an empty-completion step to a temp
+/// file so the deterministic trigger can be replayed and minimized offline.
+fn dump_empty_step(request: &StepRequest, attempt: usize) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("nanna_empty_step_prompts.log");
+    let entry = format!(
+        "==== {} item#{} kind={:?} attempt={attempt} ====\n{}\n\n",
+        chrono::Utc::now().to_rfc3339(),
+        request.item_id,
+        request.step_kind,
+        request.prompt,
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
+}
+
 /// An "empty completion": HTTP success but no text, no tool calls, and ~no
 /// generated tokens. Observed live from Ollama (a whole 42-item plan was
 /// burned by 462 such no-op steps in 9 minutes — each one "succeeded", made
@@ -819,6 +838,7 @@ impl StepRunner for AgentStepRunner {
             // there is no partial transcript worth salvaging.
             match self.try_run_step(&request).await {
                 Ok(outcome) if is_empty_completion(&outcome) => {
+                    dump_empty_step(&request, attempt);
                     last_err =
                         "empty completion (no text, no tool calls, ~0 tokens) from provider"
                             .to_string();
