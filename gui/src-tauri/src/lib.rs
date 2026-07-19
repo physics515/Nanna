@@ -321,9 +321,6 @@ pub fn run() {
             commands::workspaces::discover_workspaces_in_path,
             commands::workspaces::find_workspace_root_from_path,
             commands::workspaces::save_workspace_file,
-            commands::workspaces::append_workspace_memory,
-            commands::workspaces::get_workspace_recent_memory,
-            commands::workspaces::list_workspace_memory_files,
             commands::workspaces::init_workspace,
             commands::workspaces::read_workspace_file,
             commands::workspaces::check_workspace_validity,
@@ -376,6 +373,18 @@ pub fn run() {
             commands::scheduler::run_cron_job_now,
             commands::scheduler::get_cron_job_history,
             commands::scheduler::validate_cron_expression,
+            // Tasks (P15 store + P14 long-horizon runs)
+            commands::tasks::list_tasks,
+            commands::tasks::get_task,
+            commands::tasks::create_task,
+            commands::tasks::update_task,
+            commands::tasks::complete_task,
+            commands::tasks::delete_task,
+            commands::tasks::add_task_note,
+            commands::tasks::query_tasks,
+            commands::tasks::start_task_run,
+            commands::tasks::get_task_run_status,
+            commands::tasks::cancel_task_run,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

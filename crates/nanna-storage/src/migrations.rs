@@ -12,6 +12,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("008_workspace_registry", MIGRATION_008),
     ("009_memory_fsrs", MIGRATION_009),
     ("010_checkpoints", MIGRATION_010),
+    ("011_tasks", MIGRATION_011),
 ];
 
 const MIGRATION_001: &str = r"
@@ -294,4 +295,60 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+";
+
+const MIGRATION_011: &str = r"
+-- Agent-grade task store (P15): hierarchy, dependencies, acceptance criteria.
+-- No triggers (the migration runner splits statements on semicolons) --
+-- parent auto-completion, dependency cycle checks, and the activity log are
+-- enforced in TaskRepository.
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id INTEGER,
+    scope TEXT NOT NULL DEFAULT 'session',
+    scope_id TEXT,
+    project TEXT,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 3,
+    labels TEXT NOT NULL DEFAULT '[]',
+    tool_scope TEXT NOT NULL DEFAULT '[]',
+    due_at TEXT,
+    recurrence TEXT,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    acceptance TEXT,
+    assignee TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_scope ON tasks(scope, scope_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+-- Append-only working notes: where a sub-agent leaves findings for its parent.
+CREATE TABLE IF NOT EXISTS task_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    author TEXT,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_notes_task ON task_notes(task_id);
+
+-- Activity log: every transition with actor + timestamp (drift post-mortems).
+CREATE TABLE IF NOT EXISTS task_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    actor TEXT,
+    action TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_activity_task ON task_activity(task_id);
 ";

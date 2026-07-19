@@ -25,52 +25,166 @@ pub enum Action {
     // =========================================================================
     /// Send a message to the agent
     Chat(ChatAction),
-    
+
     // =========================================================================
     // Session Management
     // =========================================================================
     Session(SessionAction),
-    
+
     // =========================================================================
     // Memory
     // =========================================================================
     Memory(MemoryAction),
-    
+
     // =========================================================================
     // Configuration
     // =========================================================================
     Config(ConfigAction),
-    
+
     // =========================================================================
     // Tools
     // =========================================================================
     Tool(ToolAction),
-    
+
     // =========================================================================
     // Scheduler / Cron
     // =========================================================================
     Scheduler(SchedulerAction),
-    
+
     // =========================================================================
     // Channels
     // =========================================================================
     Channel(ChannelAction),
-    
+
     // =========================================================================
     // System
     // =========================================================================
     System(SystemAction),
-    
+
     // =========================================================================
     // Workspaces
     // =========================================================================
     Workspace(WorkspaceAction),
-    
+
+    // =========================================================================
+    // Tasks (P15 agent-grade task store + P14 long-horizon runs)
+    // =========================================================================
+    Task(TaskAction),
+
     // =========================================================================
     // Subscriptions
     // =========================================================================
     Subscribe(SubscribeAction),
     Unsubscribe(UnsubscribeAction),
+}
+
+// =============================================================================
+// Task Actions (P15 store + P14 long-horizon runs)
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TaskAction {
+    /// List tasks in a scope
+    List {
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        include_closed: Option<bool>,
+    },
+    /// Get one task with notes + activity
+    Get { id: i64 },
+    /// The one actionable item
+    Next {
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Create a task (full field surface)
+    Create {
+        title: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        parent_id: Option<i64>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        priority: Option<i64>,
+        #[serde(default)]
+        labels: Option<Vec<String>>,
+        #[serde(default)]
+        tools: Option<Vec<String>>,
+        #[serde(default)]
+        due_at: Option<String>,
+        #[serde(default)]
+        recurrence: Option<String>,
+        #[serde(default)]
+        depends_on: Option<Vec<i64>>,
+        #[serde(default)]
+        acceptance: Option<serde_json::Value>,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        assignee: Option<String>,
+    },
+    /// Partial update (status accepts pending|in_progress|cancelled)
+    Update {
+        id: i64,
+        #[serde(default)]
+        patch: serde_json::Value,
+    },
+    /// Complete with acceptance verification
+    Done {
+        id: i64,
+        #[serde(default)]
+        workdir: Option<String>,
+    },
+    /// Delete a task subtree
+    Delete { id: i64 },
+    /// Append a working note
+    Note { id: i64, content: String },
+    /// Filter-language query
+    Query {
+        filter: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Start a long-horizon run over a scope's plan (P14)
+    StartRun {
+        goal: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        workdir: Option<String>,
+        #[serde(default)]
+        max_wall_clock_secs: Option<u64>,
+        #[serde(default)]
+        max_total_tokens: Option<u64>,
+    },
+    /// Status of the scope's run (live or last report)
+    RunStatus {
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Cancel the scope's active run
+    CancelRun {
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
 }
 
 // =============================================================================
@@ -117,7 +231,10 @@ pub enum SessionAction {
     /// Create a new session
     Create { name: Option<String> },
     /// Create a new session in a specific workspace
-    CreateInWorkspace { name: Option<String>, workspace_id: Option<String> },
+    CreateInWorkspace {
+        name: Option<String>,
+        workspace_id: Option<String>,
+    },
     /// Rename a session
     Rename { id: String, name: String },
     /// Delete a session
@@ -127,7 +244,11 @@ pub enum SessionAction {
     /// Clear session history
     Clear { id: String },
     /// Get session history
-    History { id: String, limit: Option<usize>, before: Option<String> },
+    History {
+        id: String,
+        limit: Option<usize>,
+        before: Option<String>,
+    },
     /// Switch active session (for this client)
     Switch { id: String },
     /// Fork a session (create copy)
@@ -135,10 +256,12 @@ pub enum SessionAction {
     /// Get current execution state (in-flight streaming text, active tools)
     GetRunState { id: String },
     /// Set/change the workspace for a session (None = make global)
-    SetWorkspace { id: String, workspace_id: Option<String> },
+    SetWorkspace {
+        id: String,
+        workspace_id: Option<String>,
+    },
 
     // --- Sub-Agent Sessions (#72) ---
-    
     /// Spawn a sub-agent session
     SpawnSubSession {
         /// Task description / initial prompt for the sub-agent
@@ -190,13 +313,25 @@ pub enum MemoryAction {
     /// List all memories
     List { scope: Option<String> },
     /// Search memories (optionally scoped to workspace)
-    Search { query: String, limit: Option<usize>, scope: Option<String> },
+    Search {
+        query: String,
+        limit: Option<usize>,
+        scope: Option<String>,
+    },
     /// Get a specific memory
     Get { id: String },
     /// Create a memory
-    Create { content: String, tags: Option<Vec<String>>, importance: Option<u8> },
+    Create {
+        content: String,
+        tags: Option<Vec<String>>,
+        importance: Option<u8>,
+    },
     /// Update a memory
-    Update { id: String, content: Option<String>, tags: Option<Vec<String>> },
+    Update {
+        id: String,
+        content: Option<String>,
+        tags: Option<Vec<String>>,
+    },
     /// Delete a memory
     Delete { id: String },
     /// Clear all memories
@@ -246,9 +381,19 @@ pub enum ToolAction {
     /// Execute a tool directly
     Execute { name: String, input: Value },
     /// Create a user tool
-    Create { name: String, description: String, code: String, needs_shell: Option<bool> },
+    Create {
+        name: String,
+        description: String,
+        code: String,
+        needs_shell: Option<bool>,
+    },
     /// Update a user tool
-    Update { name: String, description: Option<String>, code: Option<String>, needs_shell: Option<bool> },
+    Update {
+        name: String,
+        description: Option<String>,
+        code: Option<String>,
+        needs_shell: Option<bool>,
+    },
     /// Delete a user tool
     Delete { name: String },
     /// Test a user tool (without saving)
@@ -271,9 +416,18 @@ pub enum SchedulerAction {
     /// Get job details
     Get { id: String },
     /// Add a cron job
-    Add { schedule: String, task: String, name: Option<String> },
+    Add {
+        schedule: String,
+        task: String,
+        name: Option<String>,
+    },
     /// Update a job
-    Update { id: String, schedule: Option<String>, task: Option<String>, enabled: Option<bool> },
+    Update {
+        id: String,
+        schedule: Option<String>,
+        task: Option<String>,
+        enabled: Option<bool>,
+    },
     /// Remove a job
     Remove { id: String },
     /// Run a job immediately
@@ -300,7 +454,11 @@ pub enum ChannelAction {
     /// Test channel connection
     Test { id: String },
     /// Send a message via channel
-    Send { channel_id: String, target: String, content: String },
+    Send {
+        channel_id: String,
+        target: String,
+        content: String,
+    },
 }
 
 // =============================================================================
@@ -324,10 +482,14 @@ pub enum WorkspaceAction {
     ClearActive,
     /// Reload workspace context files
     Reload { id: String },
-    /// Get workspace context (SOUL.md, USER.md, etc.)
+    /// Get workspace context (README.md, AGENTS.md, ROADMAP.md, …)
     GetContext { id: String },
     /// Update workspace context file
-    UpdateContext { id: String, file: String, content: String },
+    UpdateContext {
+        id: String,
+        file: String,
+        content: String,
+    },
 }
 
 // =============================================================================
@@ -350,7 +512,10 @@ pub enum SystemAction {
     /// Apply update
     Update,
     /// Get logs
-    Logs { lines: Option<usize>, level: Option<String> },
+    Logs {
+        lines: Option<usize>,
+        level: Option<String>,
+    },
     /// Health check
     Health,
     /// Get model performance statistics (routing, latency, cache hits, etc.)
@@ -360,11 +525,20 @@ pub enum SystemAction {
     /// Get global tool + session dashboard stats
     GlobalStats,
     /// Get hourly tool stats time-series (for graphs)
-    ToolStatsHourly { tool_name: Option<String>, hours: Option<u32> },
+    ToolStatsHourly {
+        tool_name: Option<String>,
+        hours: Option<u32>,
+    },
     /// Get daily tool stats time-series (for graphs)
-    ToolStatsDaily { tool_name: Option<String>, days: Option<u32> },
+    ToolStatsDaily {
+        tool_name: Option<String>,
+        days: Option<u32>,
+    },
     /// Get recent tool call log entries
-    ToolCallLog { tool_name: Option<String>, limit: Option<u32> },
+    ToolCallLog {
+        tool_name: Option<String>,
+        limit: Option<u32>,
+    },
 }
 
 // =============================================================================
@@ -420,7 +594,7 @@ impl Response {
             },
         }
     }
-    
+
     pub fn error(id: RequestId, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             id,
@@ -430,12 +604,12 @@ impl Response {
             },
         }
     }
-    
+
     /// Check if this response is an error
     pub fn is_error(&self) -> bool {
         matches!(self.result, ResponseResult::Error { .. })
     }
-    
+
     /// Get the data if successful
     pub fn data(&self) -> Option<&Value> {
         match &self.result {
@@ -443,7 +617,7 @@ impl Response {
             ResponseResult::Error { .. } => None,
         }
     }
-    
+
     /// Get the error message if failed
     pub fn error_message(&self) -> Option<&str> {
         match &self.result {
@@ -462,33 +636,89 @@ impl Response {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     // Chat events
-    MessageStart { session_id: String, message_id: String },
-    MessageDelta { session_id: String, message_id: String, delta: String },
-    MessageEnd { session_id: String, message_id: String, content: String },
-    
+    MessageStart {
+        session_id: String,
+        message_id: String,
+    },
+    MessageDelta {
+        session_id: String,
+        message_id: String,
+        delta: String,
+    },
+    MessageEnd {
+        session_id: String,
+        message_id: String,
+        content: String,
+    },
+
     // Thinking/reasoning events
-    ThinkingDelta { session_id: String, delta: String },
+    ThinkingDelta {
+        session_id: String,
+        delta: String,
+    },
 
     // Tool events
-    ToolStart { session_id: String, call_id: String, name: String, input: Value, #[serde(skip_serializing_if = "Option::is_none")] model: Option<String> },
-    ToolEnd { session_id: String, call_id: String, output: String, success: bool, duration_ms: u64, #[serde(skip_serializing_if = "Option::is_none")] data: Option<Value> },
-    
+    ToolStart {
+        session_id: String,
+        call_id: String,
+        name: String,
+        input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    ToolEnd {
+        session_id: String,
+        call_id: String,
+        output: String,
+        success: bool,
+        duration_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+    },
+
     // Session events
-    SessionCreated { id: String, name: Option<String> },
-    SessionDeleted { id: String },
-    SessionRenamed { id: String, name: String },
-    
+    SessionCreated {
+        id: String,
+        name: Option<String>,
+    },
+    SessionDeleted {
+        id: String,
+    },
+    SessionRenamed {
+        id: String,
+        name: String,
+    },
+
     // Memory events
-    MemoryCreated { id: String, content: String },
-    MemoryUpdated { id: String },
-    MemoryDeleted { id: String },
-    
+    MemoryCreated {
+        id: String,
+        content: String,
+    },
+    MemoryUpdated {
+        id: String,
+    },
+    MemoryDeleted {
+        id: String,
+    },
+
     // Channel events
-    ChannelConnected { id: String },
-    ChannelDisconnected { id: String, reason: Option<String> },
-    ChannelError { id: String, error: String },
-    ChannelMessage { channel_id: String, sender: String, content: String },
-    
+    ChannelConnected {
+        id: String,
+    },
+    ChannelDisconnected {
+        id: String,
+        reason: Option<String>,
+    },
+    ChannelError {
+        id: String,
+        error: String,
+    },
+    ChannelMessage {
+        channel_id: String,
+        sender: String,
+        content: String,
+    },
+
     // Sub-session lifecycle events
     SubSessionSpawned {
         session_id: String,
@@ -522,15 +752,48 @@ pub enum Event {
     },
 
     // Model events
-    ModelSwitch { model: String, reason: Option<String> },
+    ModelSwitch {
+        model: String,
+        reason: Option<String>,
+    },
 
     // System events
-    StatusChange { status: String },
-    Error { code: String, message: String },
-    
+    StatusChange {
+        status: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+
     // Client connection events
-    Connected { client_id: String },
-    Disconnected { client_id: String },
+    Connected {
+        client_id: String,
+    },
+    Disconnected {
+        client_id: String,
+    },
+
+    // Task events (P15 store mutations + P14 long-horizon run lifecycle)
+    TaskRunStarted {
+        scope: String,
+        scope_id: Option<String>,
+        goal: String,
+    },
+    TaskRunProgress {
+        scope: String,
+        scope_id: Option<String>,
+        task_id: Option<i64>,
+        /// started | completed | abandoned | acceptance_checked | replanned | ...
+        kind: String,
+        detail: serde_json::Value,
+    },
+    TaskRunCompleted {
+        scope: String,
+        scope_id: Option<String>,
+        /// Serialized `LongHorizonReport`
+        report: serde_json::Value,
+    },
 }
 
 // =============================================================================
@@ -545,18 +808,18 @@ pub enum ControlAction {
     ListSessions,
     CreateSession { name: Option<String> },
     SwitchSession { id: String },
-    
+
     // Memory shortcuts
     MemorySearch { query: String, limit: Option<usize> },
-    
+
     // Config shortcuts
     GetConfig,
     SetConfig { path: String, value: Value },
-    
+
     // Tool shortcuts
     ListTools,
     RunTool { name: String, input: Value },
-    
+
     // System shortcuts
     Status,
     Restart,
@@ -567,13 +830,23 @@ impl From<ControlAction> for Action {
     fn from(action: ControlAction) -> Self {
         match action {
             ControlAction::ListSessions => Action::Session(SessionAction::List),
-            ControlAction::CreateSession { name } => Action::Session(SessionAction::Create { name }),
+            ControlAction::CreateSession { name } => {
+                Action::Session(SessionAction::Create { name })
+            }
             ControlAction::SwitchSession { id } => Action::Session(SessionAction::Switch { id }),
-            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search { query, limit, scope: None }),
+            ControlAction::MemorySearch { query, limit } => Action::Memory(MemoryAction::Search {
+                query,
+                limit,
+                scope: None,
+            }),
             ControlAction::GetConfig => Action::Config(ConfigAction::Get { path: None }),
-            ControlAction::SetConfig { path, value } => Action::Config(ConfigAction::Set { path, value }),
+            ControlAction::SetConfig { path, value } => {
+                Action::Config(ConfigAction::Set { path, value })
+            }
             ControlAction::ListTools => Action::Tool(ToolAction::List),
-            ControlAction::RunTool { name, input } => Action::Tool(ToolAction::Execute { name, input }),
+            ControlAction::RunTool { name, input } => {
+                Action::Tool(ToolAction::Execute { name, input })
+            }
             ControlAction::Status => Action::System(SystemAction::Status),
             ControlAction::Restart => Action::System(SystemAction::Restart),
             ControlAction::Shutdown => Action::System(SystemAction::Shutdown),

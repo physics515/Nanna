@@ -297,8 +297,9 @@ impl AgentService {
         *cached = None;
     }
     
-    /// Create agent config from service config
-    async fn agent_config(&self) -> AgentConfig {
+    /// Create agent config from service config (pub: the long-horizon
+    /// step runner builds fresh per-step agents from the same config)
+    pub async fn agent_config(&self) -> AgentConfig {
         let config = self.config.read().await;
         AgentConfig {
             model: config.model.clone(),

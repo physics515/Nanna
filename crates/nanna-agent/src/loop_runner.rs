@@ -2,10 +2,10 @@
 
 use crate::{AgentContext, AgentError, ContextSummarizationConfig, prompts};
 use nanna_llm::{
-    AnthropicMessage, AnthropicRequest, CacheControl, ContentBlock, ImageSource, LlmClient, StreamEvent,
-    ToolDefinition as LlmToolDef,
+    AnthropicMessage, AnthropicRequest, CacheControl, ContentBlock, ImageSource, LlmClient,
+    StreamEvent, ToolDefinition as LlmToolDef,
 };
-use nanna_tools::{ToolCall, ToolRegistry, OutputTarget};
+use nanna_tools::{OutputTarget, ToolCall, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -129,10 +129,16 @@ impl ModelTier {
                 _ => None, // Not a tier, treat whole thing as model name
             };
             if let Some(tier) = tier {
-                return Self { model: model.to_string(), tier };
+                return Self {
+                    model: model.to_string(),
+                    tier,
+                };
             }
         }
-        Self { model: spec.to_string(), tier: TaskComplexity::Complex }
+        Self {
+            model: spec.to_string(),
+            tier: TaskComplexity::Complex,
+        }
     }
 }
 
@@ -174,7 +180,11 @@ impl Default for AgentConfig {
 pub type StreamCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Callback for storing extracted memories
-pub type MemoryCallback = Box<dyn Fn(ExtractedMemory) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type MemoryCallback = Box<
+    dyn Fn(ExtractedMemory) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Callback for streaming thinking chunks
 pub type ThinkingCallback = Box<dyn Fn(&str) + Send + Sync>;
@@ -231,6 +241,37 @@ pub struct RunOptions {
     /// If true, all registered tools are available from iteration 1 (skip discover_tools).
     /// Used for sub-agents that have a specific task and shouldn't waste a turn on discovery.
     pub all_tools_active: bool,
+    /// Step-kind hint for model routing (P14 harness runs). Plan/replan steps
+    /// deserve the biggest model, verification a mid model, execution the
+    /// cheap local path. None = classic structural heuristic.
+    pub step_kind: Option<StepKind>,
+    /// Tools to pre-activate for this run on top of the core set (P14
+    /// per-item tool scoping: the active set is the current task's `tools:`
+    /// hint, not the whole registry — small models degrade past 5-10
+    /// definitions). Ignored when `all_tools_active` is set.
+    pub initial_active_tools: Vec<String>,
+    /// Wall-clock budget for this run (P14 bounded blast radius).
+    /// Exceeding it ends the run with `truncated = true`.
+    pub max_wall_clock: Option<std::time::Duration>,
+    /// Tool-call budget for this run (P14 bounded blast radius).
+    /// Exceeding it ends the run with `truncated = true`.
+    pub max_tool_calls: Option<usize>,
+}
+
+/// What kind of work a harness-driven step is doing (P14).
+///
+/// Far more predictive of required model capability than message length:
+/// decompose/replan rarely on a big model, execute constantly on the local
+/// model, verify in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepKind {
+    /// Decomposing or re-planning a task — route to the most capable tier.
+    Plan,
+    /// Advancing one concrete step — the cheap-model fast path.
+    Execute,
+    /// Judging results / acceptance context — mid tier.
+    Verify,
 }
 
 /// Response from an agent run
@@ -319,6 +360,24 @@ struct LlmResult {
     error_tool_results: Vec<ContentBlock>,
 }
 
+/// Detect a literal tool-call loop: the two most recent tool calls used the
+/// same tool with the same arguments and got the same result (P14).
+///
+/// Identical result twice means the environment did not change — repeating
+/// the call cannot make progress. Text-level detectors miss this because the
+/// surrounding narration usually varies.
+fn detect_tool_call_loop(records: &[ToolCallRecord]) -> bool {
+    let [.., prev, last] = records else {
+        return false;
+    };
+    // Write-tool inputs are size-stubbed in the records ("[N bytes written]"),
+    // so two distinct same-length writes would look identical — exempt them.
+    if matches!(last.name.as_str(), "write_file" | "write" | "Write") {
+        return false;
+    }
+    last.name == prev.name && last.input == prev.input && last.output == prev.output
+}
+
 /// Detect degenerate narration loops in streaming text.
 ///
 /// Returns `true` if the text shows signs of the model narrating tool usage
@@ -368,8 +427,14 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
             "let me rewrite",
             "now let me",
         ];
-        let completion_hits = COMPLETION_CLAIMS_ACTIVE.iter().filter(|p| lower.contains(*p)).count();
-        let action_hits = ACTION_CLAIMS_ACTIVE.iter().filter(|p| lower.contains(*p)).count();
+        let completion_hits = COMPLETION_CLAIMS_ACTIVE
+            .iter()
+            .filter(|p| lower.contains(*p))
+            .count();
+        let action_hits = ACTION_CLAIMS_ACTIVE
+            .iter()
+            .filter(|p| lower.contains(*p))
+            .count();
         // Much higher bar: need strong phantom-completion evidence
         return completion_hits >= 2 && action_hits >= 3;
     }
@@ -435,7 +500,11 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     // Need a high density of narration phrases relative to text length.
     // Short texts (< 500 chars) need 4+ hits; longer texts need proportionally more
     // to avoid false positives on legitimate planning/thinking text.
-    let threshold = if lower.len() < 500 { 4 } else { 6 + (lower.len() / 1000) };
+    let threshold = if lower.len() < 500 {
+        4
+    } else {
+        6 + (lower.len() / 1000)
+    };
     if total_hits >= threshold {
         return true;
     }
@@ -489,7 +558,10 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
         "now let me",
     ];
 
-    let completion_hits = COMPLETION_CLAIMS.iter().filter(|p| lower.contains(*p)).count();
+    let completion_hits = COMPLETION_CLAIMS
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
     let action_hits = ACTION_CLAIMS.iter().filter(|p| lower.contains(*p)).count();
 
     // If the model both narrates actions AND claims completion, it hallucinated the workflow
@@ -539,7 +611,10 @@ pub fn wrapup_nudge_due(
         1 => NudgeLevel::Firm,
         _ => NudgeLevel::Urgent,
     };
-    debug_assert!(iteration >= nudge_after, "nudge must not fire before nudge_after");
+    debug_assert!(
+        iteration >= nudge_after,
+        "nudge must not fire before nudge_after"
+    );
     Some(level)
 }
 
@@ -897,6 +972,7 @@ impl Agent {
 
         // Resolve effective max_iterations: run option > config > unlimited
         let max_iterations = options.max_iterations.or(self.config.max_iterations);
+        let run_started = std::time::Instant::now();
         let mut state = RunState::new();
 
         // Add user message with optional budget awareness
@@ -908,7 +984,20 @@ impl Agent {
             for name in all_names {
                 state.active_tools.insert(name);
             }
-            info!(count = state.active_tools.len(), "Pre-activated all tools for sub-agent");
+            info!(
+                count = state.active_tools.len(),
+                "Pre-activated all tools for sub-agent"
+            );
+        } else if !options.initial_active_tools.is_empty() {
+            // Per-item tool scoping (P14): activate exactly what the current
+            // task names; discover_tools stays available for escape hatches.
+            for name in &options.initial_active_tools {
+                state.active_tools.insert(name.clone());
+            }
+            info!(
+                count = state.active_tools.len(),
+                "Pre-activated scoped tools for harness step"
+            );
         }
 
         // Agent loop
@@ -917,6 +1006,41 @@ impl Agent {
             if let Some(ref flag) = options.cancellation_flag {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     return self.finish_cancelled(state, &options).await;
+                }
+            }
+
+            // Bounded blast radius (P14): a per-run wall-clock cap set by the
+            // caller (never a default) ends the run cleanly instead of letting
+            // a stuck run burn a GPU for hours.
+            if let Some(cap) = options.max_wall_clock {
+                if run_started.elapsed() >= cap {
+                    warn!(
+                        elapsed_secs = run_started.elapsed().as_secs(),
+                        cap_secs = cap.as_secs(),
+                        "Wall-clock budget exhausted, stopping agent"
+                    );
+                    state.final_text = format!(
+                        "{}\n\n[Wall-clock budget exhausted: {}s of {}s used]",
+                        state.final_text,
+                        run_started.elapsed().as_secs(),
+                        cap.as_secs()
+                    );
+                    return Ok(state.into_response(true));
+                }
+            }
+
+            // Budget visibility (P14): once past 80% of the token budget, tell
+            // the model — an agent that knows its budget plans around it.
+            if let Some(budget) = options.token_budget {
+                let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
+                if !state.budget_warned && cumulative * 100 / budget.max(1) >= 80 {
+                    state.budget_warned = true;
+                    let note = format!(
+                        "[SYSTEM: token budget status — {cumulative} of {budget} tokens used \
+                         (over 80%). Finish the current step and wrap up within budget.]"
+                    );
+                    let mut ctx = self.context.write().await;
+                    ctx.messages.push(AnthropicMessage::user_text(&note));
                 }
             }
 
@@ -998,9 +1122,8 @@ impl Agent {
                         "Tier 1: proactive compression triggered"
                     );
 
-                    let compressed_results = self
-                        .compress_older_context_tool_results(&mut ctx, 20)
-                        .await;
+                    let compressed_results =
+                        self.compress_older_context_tool_results(&mut ctx, 20).await;
 
                     if compressed_results == 0 {
                         let dropped = ctx.drop_oldest(20);
@@ -1035,9 +1158,16 @@ impl Agent {
                             tier = "standard",
                             "Tier 2: standard summarization triggered"
                         );
-                        match ctx.enforce_limits_with_summarization(&summarization_config).await {
+                        match ctx
+                            .enforce_limits_with_summarization(&summarization_config)
+                            .await
+                        {
                             Ok(iterations) if iterations > 0 => {
-                                info!(iterations = iterations, new_tokens = ctx.estimate_tokens(), "Tier 2 summarization complete");
+                                info!(
+                                    iterations = iterations,
+                                    new_tokens = ctx.estimate_tokens(),
+                                    "Tier 2 summarization complete"
+                                );
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -1074,9 +1204,16 @@ impl Agent {
                             tier = "hard_cap",
                             "Tier 3: hard limit exceeded, aggressive summarization"
                         );
-                        match ctx.enforce_limits_with_summarization(&summarization_config).await {
+                        match ctx
+                            .enforce_limits_with_summarization(&summarization_config)
+                            .await
+                        {
                             Ok(iterations) if iterations > 0 => {
-                                info!(iterations = iterations, new_tokens = ctx.estimate_tokens(), "Tier 3 summarization complete");
+                                info!(
+                                    iterations = iterations,
+                                    new_tokens = ctx.estimate_tokens(),
+                                    "Tier 3 summarization complete"
+                                );
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -1097,10 +1234,12 @@ impl Agent {
             }
 
             // Model routing: classify complexity and pick cheapest capable model
-            let routed_model = self.route_model(&state).await;
+            let routed_model = self.route_model(&state, options.step_kind).await;
 
             // Build and execute LLM request
-            let mut request = self.build_request_with_thinking(options.thinking_mode, &state.active_tools).await;
+            let mut request = self
+                .build_request_with_thinking(options.thinking_mode, &state.active_tools)
+                .await;
             if let Some(ref routed) = routed_model {
                 // Strip provider prefix for the API request model field
                 // but keep the full spec for client routing
@@ -1117,14 +1256,15 @@ impl Agent {
                 };
             }
             let complexity = if routed_model.is_some() {
-                Some(self.classify_complexity(&state).await)
+                Some(self.classify_complexity(&state, options.step_kind).await)
             } else {
                 None
             };
 
             // If there's already streamed text from a previous iteration, emit a
             // space separator so the next text block doesn't merge with the last one.
-            if state.iterations > 1 && !state.final_text.is_empty()
+            if state.iterations > 1
+                && !state.final_text.is_empty()
                 && !state.final_text.ends_with(' ')
                 && !state.final_text.ends_with('\n')
             {
@@ -1152,7 +1292,9 @@ impl Agent {
                     let escalation_reason = match &result {
                         Err(e) => format!("error: {}", e),
                         Ok(r) => {
-                            let bad_tools: Vec<_> = r.tool_uses.iter()
+                            let bad_tools: Vec<_> = r
+                                .tool_uses
+                                .iter()
                                 .filter(|(_, name, _)| name.is_empty())
                                 .map(|(id, _, _)| id.as_str())
                                 .collect();
@@ -1166,17 +1308,19 @@ impl Agent {
                     );
                     // Record failure on the cheap model
                     if let Some(ref tracker) = self.stats {
-                        tracker.record(crate::model_stats::RequestObservation {
-                            model: request.model.clone(),
-                            success: false,
-                            latency: llm_latency,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_read_tokens: 0,
-                            cache_creation_tokens: 0,
-                            tier: complexity,
-                            escalated: false,
-                        }).await;
+                        tracker
+                            .record(crate::model_stats::RequestObservation {
+                                model: request.model.clone(),
+                                success: false,
+                                latency: llm_latency,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_creation_tokens: 0,
+                                tier: complexity,
+                                escalated: false,
+                            })
+                            .await;
                     }
                     // Rebuild request with primary model
                     request.model = self.config.model.clone();
@@ -1236,34 +1380,38 @@ impl Agent {
                 complexity.map_or("primary".to_string(), |c| format!("{c:?}").to_lowercase())
             };
 
-            state.model_stats.push(crate::model_stats::RequestModelStats {
-                model: actual_model.clone(),
-                was_routed,
-                tier: tier_label,
-                latency_ms: llm_latency.as_millis() as u64,
-                throughput_tps: if llm_latency.as_millis() > 0 {
-                    f64::from(result.output_tokens) / llm_latency.as_secs_f64()
-                } else {
-                    0.0
-                },
-                cache_read_tokens: result.cache_read_tokens,
-                cache_creation_tokens: result.cache_creation_tokens,
-                input_tokens: result.input_tokens,
-                output_tokens: result.output_tokens,
-            });
-
-            if let Some(ref tracker) = self.stats {
-                tracker.record(crate::model_stats::RequestObservation {
-                    model: actual_model,
-                    success: true,
-                    latency: llm_latency,
-                    input_tokens: result.input_tokens,
-                    output_tokens: result.output_tokens,
+            state
+                .model_stats
+                .push(crate::model_stats::RequestModelStats {
+                    model: actual_model.clone(),
+                    was_routed,
+                    tier: tier_label,
+                    latency_ms: llm_latency.as_millis() as u64,
+                    throughput_tps: if llm_latency.as_millis() > 0 {
+                        f64::from(result.output_tokens) / llm_latency.as_secs_f64()
+                    } else {
+                        0.0
+                    },
                     cache_read_tokens: result.cache_read_tokens,
                     cache_creation_tokens: result.cache_creation_tokens,
-                    tier: complexity,
-                    escalated,
-                }).await;
+                    input_tokens: result.input_tokens,
+                    output_tokens: result.output_tokens,
+                });
+
+            if let Some(ref tracker) = self.stats {
+                tracker
+                    .record(crate::model_stats::RequestObservation {
+                        model: actual_model,
+                        success: true,
+                        latency: llm_latency,
+                        input_tokens: result.input_tokens,
+                        output_tokens: result.output_tokens,
+                        cache_read_tokens: result.cache_read_tokens,
+                        cache_creation_tokens: result.cache_creation_tokens,
+                        tier: complexity,
+                        escalated,
+                    })
+                    .await;
             }
 
             state.input_tokens += result.input_tokens;
@@ -1290,7 +1438,7 @@ impl Agent {
                      You have tools available — use `discover_tools` to see all of them. \
                      It unlocks file operations (read_file, write_file, list_dir, explore), \
                      shell commands (exec), web access (web_search, web_fetch), and more. \
-                     Call discover_tools NOW, then use the appropriate tool to answer the question."
+                     Call discover_tools NOW, then use the appropriate tool to answer the question.",
                 );
                 {
                     let mut ctx = self.context.write().await;
@@ -1331,7 +1479,8 @@ impl Agent {
             // Tool result eviction: once the LLM has responded referencing tool results,
             // replace old large tool results with compact stubs since the information
             // has been synthesized into the assistant's response.
-            self.evict_referenced_tool_results(&result.content_blocks).await;
+            self.evict_referenced_tool_results(&result.content_blocks)
+                .await;
 
             // Update final text
             if !result.text.is_empty() {
@@ -1350,7 +1499,9 @@ impl Agent {
             if result.tool_uses.is_empty() {
                 // Detect narration loop: model talked about using tools but never called them
                 let has_tool_history = !state.tool_records.is_empty();
-                if detect_narration_loop(&state.final_text, has_tool_history) && !state.narration_nudged {
+                if detect_narration_loop(&state.final_text, has_tool_history)
+                    && !state.narration_nudged
+                {
                     warn!(
                         text_len = state.final_text.len(),
                         iteration = state.iterations,
@@ -1367,7 +1518,7 @@ impl Agent {
                          NOTHING you described actually happened — no files were read or written. \
                          You MUST use tool calls (read_file, write_file, exec, etc.) to perform actions. \
                          Describing an action in text does NOT execute it. \
-                         Start over: call the tools directly with NO narration."
+                         Start over: call the tools directly with NO narration.",
                     );
                     {
                         let mut ctx = self.context.write().await;
@@ -1395,7 +1546,7 @@ impl Agent {
                         "[SYSTEM] Your last response repeated the same line(s) over and over — \
                          you appear to be stuck in a generation loop. Do not repeat yourself. \
                          Take stock of what you actually know, then either call a tool to make \
-                         real progress or give your final answer in one concise pass."
+                         real progress or give your final answer in one concise pass.",
                     );
                     {
                         let mut ctx = self.context.write().await;
@@ -1430,7 +1581,7 @@ impl Agent {
                          You have tools available — use `discover_tools` to see all of them. \
                          It unlocks file operations (read_file, write_file, list_dir, explore), \
                          shell commands (exec), web access (web_search, web_fetch), and more. \
-                         Call discover_tools NOW, then use the appropriate tool to answer the question."
+                         Call discover_tools NOW, then use the appropriate tool to answer the question.",
                     );
                     {
                         let mut ctx = self.context.write().await;
@@ -1470,13 +1621,61 @@ impl Agent {
             }
 
             // Execute tools and continue loop
-            let mut tool_results = self.execute_tools(&result.tool_uses, &mut state, &options, routed_model.as_deref()).await;
+            let mut tool_results = self
+                .execute_tools(
+                    &result.tool_uses,
+                    &mut state,
+                    &options,
+                    routed_model.as_deref(),
+                )
+                .await;
             // Merge in any error results from malformed tool call JSON.
             // These tell the model its call was unparseable so it can retry.
             if !result.error_tool_results.is_empty() {
                 tool_results.extend(result.error_tool_results);
             }
             self.store_tool_results(tool_results).await;
+
+            // Bounded blast radius (P14): per-run tool-call cap set by the
+            // caller. Checked after results are stored so the transcript is
+            // coherent for salvage.
+            if let Some(cap) = options.max_tool_calls {
+                if state.tool_records.len() >= cap {
+                    warn!(
+                        tool_calls = state.tool_records.len(),
+                        cap = cap,
+                        "Tool-call budget exhausted, stopping agent"
+                    );
+                    state.final_text = format!(
+                        "{}\n\n[Tool-call budget exhausted: {} of {} calls used]",
+                        state.final_text,
+                        state.tool_records.len(),
+                        cap
+                    );
+                    return Ok(state.into_response(true));
+                }
+            }
+
+            // Tool-call loop detector (P14): same tool + same args + same
+            // result twice in a row means the model is grinding, not
+            // progressing. Small models loop; this is cheap to detect and
+            // expensive to ignore.
+            if !state.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
+                state.tool_loop_nudged = true;
+                warn!(
+                    iteration = state.iterations,
+                    last_tool = state.tool_records.last().map_or("", |r| r.name.as_str()),
+                    "🔂 Tool-call loop detected — injecting nudge"
+                );
+                let nudge = AnthropicMessage::user_text(
+                    "[SYSTEM] You called the same tool with the same arguments twice and got \
+                     the identical result both times. Repeating the call will not change the \
+                     outcome. Change your approach: use a different tool, different arguments, \
+                     or report what is blocking you.",
+                );
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(nudge);
+            }
 
             // Progressive context distillation: rolling summary every N iterations
             if self.config.distillation_interval > 0
@@ -1496,10 +1695,7 @@ impl Agent {
             }
 
             // Periodic memory extraction every 10 iterations
-            if options.auto_extract_memories
-                && state.iterations > 0
-                && state.iterations % 10 == 0
-            {
+            if options.auto_extract_memories && state.iterations > 0 && state.iterations % 10 == 0 {
                 if let Some(ref on_memory) = options.on_memory {
                     info!(iteration = state.iterations, "Periodic memory extraction");
                     if let Ok(memories) = self.extract_memories().await {
@@ -1626,7 +1822,8 @@ impl Agent {
                     options.on_thinking.as_ref(),
                     state,
                     options.cancellation_flag.as_ref(),
-                ).await
+                )
+                .await
             } else {
                 self.call_llm_sync(request, state).await
             };
@@ -1808,7 +2005,11 @@ impl Agent {
         })
     }
 
-    async fn call_llm_sync(&self, request: &AnthropicRequest, state: &mut RunState) -> Result<LlmResult, AgentError> {
+    async fn call_llm_sync(
+        &self,
+        request: &AnthropicRequest,
+        state: &mut RunState,
+    ) -> Result<LlmResult, AgentError> {
         let response = self.llm.complete_anthropic(request).await?;
         let mut tool_uses = Vec::new();
         let mut response_text = String::new();
@@ -1845,8 +2046,7 @@ impl Agent {
     async fn store_assistant_response(&self, content_blocks: &[ContentBlock]) {
         let mut ctx = self.context.write().await;
         let stripped = Self::strip_write_content_from_blocks(content_blocks);
-        ctx.messages
-            .push(AnthropicMessage::assistant(stripped));
+        ctx.messages.push(AnthropicMessage::assistant(stripped));
     }
 
     /// Strip large content from write_file/write tool_use blocks before storing in context.
@@ -1902,37 +2102,51 @@ impl Agent {
                 cb(id, name, input, routed_model);
             }
 
-            let params: HashMap<String, Value> = input.as_object().map_or_else(HashMap::new, |obj| {
-                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-            });
+            let params: HashMap<String, Value> =
+                input.as_object().map_or_else(HashMap::new, |obj| {
+                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                });
 
-            tool_calls_with_meta.push((id.clone(), name.clone(), input.clone(), ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                parameters: params,
-            }));
+            tool_calls_with_meta.push((
+                id.clone(),
+                name.clone(),
+                input.clone(),
+                ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    parameters: params,
+                },
+            ));
         }
 
         // Phase 2: Execute all tools in parallel
-        info!("🚀 Executing {} tools in parallel", tool_calls_with_meta.len());
-        let tool_futures: Vec<_> = tool_calls_with_meta.iter().map(|(_, name, _, call)| {
-            let name = name.clone();
-            let call = call.clone();
-            let tools = Arc::clone(&self.tools);
-            async move {
-                let start = std::time::Instant::now();
-                info!(tool = %name, "Executing tool");
-                let response = tools.execute(call).await;
-                let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                (response, duration_ms)
-            }
-        }).collect();
+        info!(
+            "🚀 Executing {} tools in parallel",
+            tool_calls_with_meta.len()
+        );
+        let tool_futures: Vec<_> = tool_calls_with_meta
+            .iter()
+            .map(|(_, name, _, call)| {
+                let name = name.clone();
+                let call = call.clone();
+                let tools = Arc::clone(&self.tools);
+                async move {
+                    let start = std::time::Instant::now();
+                    info!(tool = %name, "Executing tool");
+                    let response = tools.execute(call).await;
+                    let duration_ms =
+                        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    (response, duration_ms)
+                }
+            })
+            .collect();
 
         let results = futures::future::join_all(tool_futures).await;
 
         // Phase 3: Process results sequentially (callbacks, state updates, memory)
-        for ((id, name, input, _), (response, duration_ms)) in tool_calls_with_meta.into_iter().zip(results.into_iter()) {
-
+        for ((id, name, input, _), (response, duration_ms)) in
+            tool_calls_with_meta.into_iter().zip(results.into_iter())
+        {
             if duration_ms > 10_000 {
                 warn!(
                     tool = %name,
@@ -1958,14 +2172,16 @@ impl Agent {
                 } else {
                     None
                 };
-                tracker.record(crate::tool_stats::ToolObservation {
-                    tool_name: name.clone(),
-                    success: response.result.success,
-                    duration_ms,
-                    output_size: response.result.content.len(),
-                    error: error_msg,
-                    session_id: None, // Session ID not available at this level
-                }).await;
+                tracker
+                    .record(crate::tool_stats::ToolObservation {
+                        tool_name: name.clone(),
+                        success: response.result.success,
+                        duration_ms,
+                        output_size: response.result.content.len(),
+                        error: error_msg,
+                        session_id: None, // Session ID not available at this level
+                    })
+                    .await;
             }
 
             // Notify via callback after execution
@@ -1975,7 +2191,14 @@ impl Agent {
                 } else {
                     response.result.error.as_deref().unwrap_or("Unknown error")
                 };
-                cb(&id, &name, result_content, response.result.success, duration_ms, response.result.data.as_ref());
+                cb(
+                    &id,
+                    &name,
+                    result_content,
+                    response.result.success,
+                    duration_ms,
+                    response.result.data.as_ref(),
+                );
             }
 
             // Check for activate_tools in structured data (from discover_tools)
@@ -1997,10 +2220,9 @@ impl Agent {
                 let mut input = input.clone();
                 if let Some(obj) = input.as_object_mut() {
                     if let Some(content_val) = obj.get("content") {
-                        let size = content_val.as_str().map_or_else(
-                            || content_val.to_string().len(),
-                            str::len,
-                        );
+                        let size = content_val
+                            .as_str()
+                            .map_or_else(|| content_val.to_string().len(), str::len);
                         obj.insert(
                             "content".to_string(),
                             Value::String(format!("[content omitted from context — {size} bytes were written successfully to disk]")),
@@ -2064,25 +2286,32 @@ impl Agent {
                                     original_len = result_content.len(),
                                     compressed_len = compressed.len(),
                                     "🗜️ Compressed tool output ({} → {} chars)",
-                                    result_content.len(), compressed.len()
+                                    result_content.len(),
+                                    compressed.len()
                                 );
                                 compressed
-                            } else if let Some(summarized) = self.summarize_tool_output(&name, &result_content).await {
+                            } else if let Some(summarized) =
+                                self.summarize_tool_output(&name, &result_content).await
+                            {
                                 summarized
                             } else {
                                 let end = truncate_boundary(&result_content, threshold);
                                 format!(
                                     "{}...\n\n[truncated — showing {end} of {} chars.]",
-                                    &result_content[..end], result_content.len()
+                                    &result_content[..end],
+                                    result_content.len()
                                 )
                             }
-                        } else if let Some(summarized) = self.summarize_tool_output(&name, &result_content).await {
+                        } else if let Some(summarized) =
+                            self.summarize_tool_output(&name, &result_content).await
+                        {
                             info!(
                                 tool = name,
                                 original_len = result_content.len(),
                                 summarized_len = summarized.len(),
                                 "📝 Summarized tool output ({} → {} chars)",
-                                result_content.len(), summarized.len()
+                                result_content.len(),
+                                summarized.len()
                             );
                             summarized
                         } else {
@@ -2113,13 +2342,17 @@ impl Agent {
                             let mut tags = HashMap::new();
                             tags.insert("tool".to_string(), name.clone());
                             tags.insert("source_id".to_string(), source_id.clone());
-                            tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
+                            tags.insert(
+                                "chunk".to_string(),
+                                format!("{}/{}", idx + 1, total_chunks),
+                            );
 
                             on_memory(ExtractedMemory {
                                 content: format!("[Tool: {name}] {chunk_content}"),
                                 category: "tool_result".to_string(),
                                 tags: Some(tags),
-                            }).await;
+                            })
+                            .await;
                         }
                     }
 
@@ -2128,7 +2361,11 @@ impl Agent {
                         format!(
                             "[Result from '{}' stored in memory (source_id={}, {} chunks, {} chars). \
                              Use recall('query about {}') to retrieve specific sections.]",
-                            name, source_id, chunk_count, result_content.len(), name
+                            name,
+                            source_id,
+                            chunk_count,
+                            result_content.len(),
+                            name
                         )
                     } else {
                         result_content
@@ -2230,13 +2467,18 @@ impl Agent {
         if let Some((provider, model)) = model_spec.split_once('/') {
             let client = match provider.to_lowercase().as_str() {
                 "ollama" => {
-                    let url = self.config.summarization_ollama_url
+                    let url = self
+                        .config
+                        .summarization_ollama_url
                         .as_deref()
                         .unwrap_or("http://localhost:11434");
                     LlmClient::ollama(url)
                 }
                 "openai" => {
-                    let api_key = self.config.openai_api_key.as_ref()
+                    let api_key = self
+                        .config
+                        .openai_api_key
+                        .as_ref()
                         .ok_or("OpenAI summarization requires API key configuration")?;
                     LlmClient::openai(api_key)
                 }
@@ -2245,7 +2487,10 @@ impl Agent {
                     (*self.llm).clone()
                 }
                 "openrouter" => {
-                    let api_key = self.config.openrouter_api_key.as_ref()
+                    let api_key = self
+                        .config
+                        .openrouter_api_key
+                        .as_ref()
                         .ok_or("OpenRouter summarization requires API key configuration")?;
                     LlmClient::openrouter(api_key)
                 }
@@ -2262,18 +2507,22 @@ impl Agent {
 
     /// Classify the current iteration's complexity and route to the cheapest capable model.
     /// Returns None if routing is disabled or the primary model should be used.
-    async fn route_model(&self, state: &RunState) -> Option<String> {
+    async fn route_model(&self, state: &RunState, step_kind: Option<StepKind>) -> Option<String> {
         if self.config.model_routing.is_empty() {
             return None;
         }
 
-        // First iteration: always use primary model if configured
-        if state.iterations <= 1 && self.config.routing_first_turn_primary {
+        // First iteration: always use primary model if configured — unless a
+        // harness declared this an execute step, which never needs the primary.
+        if state.iterations <= 1
+            && self.config.routing_first_turn_primary
+            && step_kind != Some(StepKind::Execute)
+        {
             debug!("Model routing: first turn, using primary model");
             return None;
         }
 
-        let complexity = self.classify_complexity(state).await;
+        let complexity = self.classify_complexity(state, step_kind).await;
 
         // Find cheapest model whose tier >= required complexity
         // The routing list is in priority order (cheapest first)
@@ -2311,7 +2560,21 @@ impl Agent {
     }
 
     /// Classify the complexity of the current iteration based on context signals.
-    async fn classify_complexity(&self, state: &RunState) -> TaskComplexity {
+    ///
+    /// A harness-declared step kind (P14) overrides the structural heuristic:
+    /// the step kind is far more predictive than message shape.
+    async fn classify_complexity(
+        &self,
+        state: &RunState,
+        step_kind: Option<StepKind>,
+    ) -> TaskComplexity {
+        match step_kind {
+            Some(StepKind::Plan) => return TaskComplexity::Complex,
+            Some(StepKind::Verify) => return TaskComplexity::Medium,
+            // Execute steps fall through to the structural heuristic, which
+            // is biased Simple once tool cycling is underway.
+            Some(StepKind::Execute) | None => {}
+        }
         let ctx = self.context.read().await;
         let messages = &ctx.messages;
 
@@ -2326,8 +2589,14 @@ impl Agent {
         // If the last assistant message was entirely tool calls with no text,
         // the next iteration is likely just continuing tool execution — simple
         if let Some(assistant_msg) = last_assistant {
-            let has_text = assistant_msg.content.iter().any(|b| matches!(b, ContentBlock::Text { .. }));
-            let has_tools = assistant_msg.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+            let has_text = assistant_msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. }));
+            let has_tools = assistant_msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
 
             if has_tools && !has_text {
                 // Pure tool-calling iteration: the model just needs to decide what tool to call next
@@ -2338,7 +2607,10 @@ impl Agent {
         // Look at the last user message (which may contain tool results)
         let last_user = messages.iter().rev().find(|m| m.role == "user");
         if let Some(user_msg) = last_user {
-            let has_tool_results = user_msg.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+            let has_tool_results = user_msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
 
             if has_tool_results {
                 // We're in a tool result → next LLM call cycle
@@ -2366,10 +2638,11 @@ impl Agent {
             return;
         }
 
-        let (client, model_name) = match self.create_client_for_model(&self.config.summarization_priority[0]) {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
+        let (client, model_name) =
+            match self.create_client_for_model(&self.config.summarization_priority[0]) {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
 
         let ctx = self.context.read().await;
         // Only distill if we have enough messages
@@ -2378,20 +2651,42 @@ impl Agent {
         }
 
         // Build a summary of the last N messages (not the whole context)
-        let recent_messages: Vec<String> = ctx.messages.iter().rev().take(10).rev().map(|m| {
-            let role = &m.role;
-            let content_preview: String = m.content.iter().take(3).map(|b| match b {
-                ContentBlock::Text { text } => {
-                    if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() }
-                }
-                ContentBlock::ToolUse { name, .. } => format!("[tool_use: {name}]"),
-                ContentBlock::ToolResult { content, .. } => {
-                    if content.len() > 100 { let end = content.floor_char_boundary(100); format!("[result: {}...]", &content[..end]) } else { format!("[result: {content}]") }
-                }
-                _ => "[...]".to_string(),
-            }).collect::<Vec<_>>().join(" ");
-            format!("{role}: {content_preview}")
-        }).collect();
+        let recent_messages: Vec<String> = ctx
+            .messages
+            .iter()
+            .rev()
+            .take(10)
+            .rev()
+            .map(|m| {
+                let role = &m.role;
+                let content_preview: String = m
+                    .content
+                    .iter()
+                    .take(3)
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => {
+                            if text.len() > 200 {
+                                format!("{}...", &text[..200])
+                            } else {
+                                text.clone()
+                            }
+                        }
+                        ContentBlock::ToolUse { name, .. } => format!("[tool_use: {name}]"),
+                        ContentBlock::ToolResult { content, .. } => {
+                            if content.len() > 100 {
+                                let end = content.floor_char_boundary(100);
+                                format!("[result: {}...]", &content[..end])
+                            } else {
+                                format!("[result: {content}]")
+                            }
+                        }
+                        _ => "[...]".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{role}: {content_preview}")
+            })
+            .collect();
 
         let prompt = format!(
             "Distill the following conversation into structured key-value facts. \
@@ -2415,15 +2710,21 @@ impl Agent {
 
         match client.complete_anthropic(&request).await {
             Ok(response) => {
-                let facts: String = response.content.iter().filter_map(|b| {
-                    if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
-                }).collect();
+                let facts: String = response
+                    .content
+                    .iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::Text { text } = b {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 if !facts.is_empty() {
                     let mut ctx = self.context.write().await;
                     // Update consolidated summary with latest facts
-                    ctx.consolidated_summary = Some(format!(
-                        "[DISTILLED FACTS]\n{facts}"
-                    ));
+                    ctx.consolidated_summary = Some(format!("[DISTILLED FACTS]\n{facts}"));
                     info!(
                         facts_len = facts.len(),
                         "🧬 Progressive distillation complete"
@@ -2448,13 +2749,21 @@ impl Agent {
         let mut to_stub: Vec<(usize, String)> = Vec::new(); // (message_idx, tool_use_id)
 
         for (msg_idx, msg) in ctx.messages.iter().enumerate() {
-            if msg.role != "user" { continue; }
+            if msg.role != "user" {
+                continue;
+            }
             for block in &msg.content {
-                if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                {
                     // Skip already-stubbed results
                     if content.starts_with("[superseded")
                         || content.starts_with("[evicted")
-                        || content.starts_with("[Result from") {
+                        || content.starts_with("[Result from")
+                    {
                         continue;
                     }
 
@@ -2479,7 +2788,8 @@ impl Agent {
                     if let ContentBlock::ToolResult { content, .. } = block {
                         if !content.starts_with("[superseded") {
                             let old_len = content.len();
-                            *content = format!("[superseded by later call — {old_len} chars removed]");
+                            *content =
+                                format!("[superseded by later call — {old_len} chars removed]");
                         }
                     }
                 }
@@ -2489,8 +2799,7 @@ impl Agent {
         if stub_count > 0 {
             info!(
                 deduped = stub_count,
-                "🔁 Semantic dedup: evicted {} superseded tool results",
-                stub_count
+                "🔁 Semantic dedup: evicted {} superseded tool results", stub_count
             );
         }
     }
@@ -2504,9 +2813,17 @@ impl Agent {
         const MIN_EVICT_SIZE: usize = 1000; // Only evict results larger than this
 
         // Extract text from the assistant's response
-        let response_text: String = response_blocks.iter().filter_map(|b| {
-            if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
-        }).collect::<Vec<_>>().join("\n");
+        let response_text: String = response_blocks
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::Text { text } = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         if response_text.is_empty() {
             return;
@@ -2524,9 +2841,16 @@ impl Agent {
         let mut bytes_saved = 0usize;
 
         for msg in ctx.messages[..eviction_range].iter_mut() {
-            if msg.role != "user" { continue; }
+            if msg.role != "user" {
+                continue;
+            }
             for block in &mut msg.content {
-                if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                {
                     // Skip already-stubbed results
                     if content.len() < MIN_EVICT_SIZE
                         || content.starts_with("[superseded")
@@ -2541,10 +2865,8 @@ impl Agent {
                     // substring from the tool result, it's been "consumed"
                     let is_referenced = {
                         // Sample a few lines from the tool result
-                        let lines: Vec<&str> = content.lines()
-                            .filter(|l| l.len() > 20)
-                            .take(5)
-                            .collect();
+                        let lines: Vec<&str> =
+                            content.lines().filter(|l| l.len() > 20).take(5).collect();
                         // If response mentions any distinctive line, consider it referenced
                         lines.iter().any(|line| {
                             let sample = if line.len() > 60 {
@@ -2578,27 +2900,44 @@ impl Agent {
                 evicted_count = evicted,
                 bytes_saved = bytes_saved,
                 "🗑️ Evicted {} referenced tool results (~{} chars saved)",
-                evicted, bytes_saved
+                evicted,
+                bytes_saved
             );
         }
     }
 
     /// Find a dedup key for a tool result by looking up its corresponding tool_use block.
     /// Returns "tool_name:primary_arg" for dedup-eligible tools.
-    fn find_tool_dedup_key(&self, messages: &[AnthropicMessage], tool_use_id: &str) -> Option<String> {
+    fn find_tool_dedup_key(
+        &self,
+        messages: &[AnthropicMessage],
+        tool_use_id: &str,
+    ) -> Option<String> {
         for msg in messages {
-            if msg.role != "assistant" { continue; }
+            if msg.role != "assistant" {
+                continue;
+            }
             for block in &msg.content {
                 if let ContentBlock::ToolUse { id, name, input } = block {
                     if id == tool_use_id {
                         // Extract primary argument for dedup
                         let primary_arg = match name.as_str() {
-                            "read_file" | "read" => input.get("file_path").or_else(|| input.get("path"))
-                                .and_then(|v| v.as_str()).map(String::from),
-                            "web_fetch" => input.get("url").and_then(|v| v.as_str()).map(String::from),
-                            "list_dir" | "glob" => input.get("path").and_then(|v| v.as_str()).map(String::from),
-                            "code_outline" => input.get("file_path").or_else(|| input.get("path"))
-                                .and_then(|v| v.as_str()).map(String::from),
+                            "read_file" | "read" => input
+                                .get("file_path")
+                                .or_else(|| input.get("path"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            "web_fetch" => {
+                                input.get("url").and_then(|v| v.as_str()).map(String::from)
+                            }
+                            "list_dir" | "glob" => {
+                                input.get("path").and_then(|v| v.as_str()).map(String::from)
+                            }
+                            "code_outline" => input
+                                .get("file_path")
+                                .or_else(|| input.get("path"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
                             _ => None,
                         };
                         return primary_arg.map(|arg| format!("{name}:{arg}"));
@@ -2616,19 +2955,32 @@ impl Agent {
             return None;
         }
 
-        let (client, model_name) = match self.create_client_for_model(&self.config.summarization_priority[0]) {
-            Ok(pair) => pair,
-            Err(_) => return None,
-        };
+        let (client, model_name) =
+            match self.create_client_for_model(&self.config.summarization_priority[0]) {
+                Ok(pair) => pair,
+                Err(_) => return None,
+            };
 
         // Tool-type-aware summarization prompts
         let instruction = match tool_name {
-            "read_file" | "read" => "Summarize the key content of this file. Keep function signatures, struct definitions, important constants, and any content that seems directly relevant to the current task. Omit boilerplate, imports, and obvious code.",
-            "web_fetch" | "web_search" => "Extract the key information from this web content. Keep facts, data, and answer-relevant paragraphs. Remove navigation, ads, and boilerplate.",
-            "exec" | "bash" => "Summarize this command output. Keep the exit status, key results, errors, and important data. For long listings, keep only the most relevant entries.",
-            "list_dir" | "glob" => "Compact this directory listing. Show the structure concisely, grouping similar files. Keep file names but remove metadata unless unusual.",
-            "code_search" | "grep" => "Summarize these search results. Keep the matching lines with file paths. Remove redundant context lines.",
-            _ => "Summarize this tool output concisely. Keep all important information, data, and results. Remove redundancy and verbose formatting.",
+            "read_file" | "read" => {
+                "Summarize the key content of this file. Keep function signatures, struct definitions, important constants, and any content that seems directly relevant to the current task. Omit boilerplate, imports, and obvious code."
+            }
+            "web_fetch" | "web_search" => {
+                "Extract the key information from this web content. Keep facts, data, and answer-relevant paragraphs. Remove navigation, ads, and boilerplate."
+            }
+            "exec" | "bash" => {
+                "Summarize this command output. Keep the exit status, key results, errors, and important data. For long listings, keep only the most relevant entries."
+            }
+            "list_dir" | "glob" => {
+                "Compact this directory listing. Show the structure concisely, grouping similar files. Keep file names but remove metadata unless unusual."
+            }
+            "code_search" | "grep" => {
+                "Summarize these search results. Keep the matching lines with file paths. Remove redundant context lines."
+            }
+            _ => {
+                "Summarize this tool output concisely. Keep all important information, data, and results. Remove redundancy and verbose formatting."
+            }
         };
 
         let prompt = format!(
@@ -2650,9 +3002,17 @@ impl Agent {
 
         match client.complete_anthropic(&request).await {
             Ok(response) => {
-                let text: String = response.content.iter().filter_map(|b| {
-                    if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
-                }).collect();
+                let text: String = response
+                    .content
+                    .iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::Text { text } = b {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 if text.is_empty() { None } else { Some(text) }
             }
             Err(e) => {
@@ -2667,7 +3027,11 @@ impl Agent {
         ctx.messages.push(AnthropicMessage::user(tool_results));
     }
 
-    async fn build_request_with_thinking(&self, thinking_override: Option<ThinkingMode>, active_tools: &HashSet<String>) -> AnthropicRequest {
+    async fn build_request_with_thinking(
+        &self,
+        thinking_override: Option<ThinkingMode>,
+        active_tools: &HashSet<String>,
+    ) -> AnthropicRequest {
         let ctx = self.context.read().await;
 
         // Build the set of tool names to send: core + any activated via discover_tools
@@ -2691,7 +3055,9 @@ impl Agent {
 
         // Determine thinking mode (override takes precedence)
         let thinking_mode = thinking_override.unwrap_or(self.config.thinking_mode);
-        let thinking = thinking_mode.budget_tokens().map(nanna_llm::ThinkingConfig::new);
+        let thinking = thinking_mode
+            .budget_tokens()
+            .map(nanna_llm::ThinkingConfig::new);
 
         // Get effective system prompt (includes workspace context if set)
         let system_prompt = ctx.effective_system_prompt();
@@ -2729,16 +3095,21 @@ impl Agent {
         };
 
         let model_info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
-        let max_tokens = self.config.max_tokens.min(
-            u32::try_from(model_info.max_output_tokens).unwrap_or(u32::MAX),
-        );
+        let max_tokens = self
+            .config
+            .max_tokens
+            .min(u32::try_from(model_info.max_output_tokens).unwrap_or(u32::MAX));
 
         AnthropicRequest {
             model: self.config.model.clone(),
             messages,
             max_tokens,
             // Anthropic requires temperature=1 (or None) when thinking is enabled
-            temperature: if thinking.is_some() { None } else { Some(self.config.temperature) },
+            temperature: if thinking.is_some() {
+                None
+            } else {
+                Some(self.config.temperature)
+            },
             system: if system_prompt.is_empty() {
                 None
             } else {
@@ -2772,8 +3143,7 @@ impl Agent {
         let mut ctx = self.context.write().await;
         ctx.workspace_root = Some(workspace.root.clone());
         ctx.workspace_context = Some(workspace.system_context());
-        ctx.include_workspace_memory = workspace.config.include_memory;
-    }
+        }
 
     /// Reload workspace context from disk
     pub async fn reload_workspace(&self) -> Result<(), nanna_workspace::WorkspaceError> {
@@ -2870,11 +3240,56 @@ impl Agent {
 
         // Emotion detection heuristics
         let emotions = [
-            ("frustrated", vec!["frustrated", "annoyed", "ugh", "why won't", "doesn't work", "broken", "useless", "terrible", "hate"]),
-            ("confused", vec!["confused", "don't understand", "what do you mean", "huh", "?", "lost", "unclear"]),
-            ("excited", vec!["excited", "amazing", "awesome", "love it", "fantastic", "great", "wonderful", "!", "can't wait"]),
-            ("grateful", vec!["thank", "thanks", "appreciate", "grateful", "helped"]),
-            ("anxious", vec!["worried", "anxious", "nervous", "scared", "urgent", "asap", "hurry"]),
+            (
+                "frustrated",
+                vec![
+                    "frustrated",
+                    "annoyed",
+                    "ugh",
+                    "why won't",
+                    "doesn't work",
+                    "broken",
+                    "useless",
+                    "terrible",
+                    "hate",
+                ],
+            ),
+            (
+                "confused",
+                vec![
+                    "confused",
+                    "don't understand",
+                    "what do you mean",
+                    "huh",
+                    "?",
+                    "lost",
+                    "unclear",
+                ],
+            ),
+            (
+                "excited",
+                vec![
+                    "excited",
+                    "amazing",
+                    "awesome",
+                    "love it",
+                    "fantastic",
+                    "great",
+                    "wonderful",
+                    "!",
+                    "can't wait",
+                ],
+            ),
+            (
+                "grateful",
+                vec!["thank", "thanks", "appreciate", "grateful", "helped"],
+            ),
+            (
+                "anxious",
+                vec![
+                    "worried", "anxious", "nervous", "scared", "urgent", "asap", "hurry",
+                ],
+            ),
             ("neutral", vec![]),
         ];
 
@@ -2892,14 +3307,12 @@ impl Agent {
         // Calculate intensity based on punctuation and caps
         let exclamations = user_text.matches('!').count();
         let _questions = user_text.matches('?').count(); // Reserved for future use
-        let caps_ratio = user_text
-            .chars()
-            .filter(|c| c.is_uppercase())
-            .count() as f32
+        let caps_ratio = user_text.chars().filter(|c| c.is_uppercase()).count() as f32
             / user_text.len().max(1) as f32;
 
-        let intensity = (0.3 + (exclamations as f32 * 0.1) + (caps_ratio * 0.3) + (max_matches as f32 * 0.1))
-            .clamp(0.0, 1.0);
+        let intensity =
+            (0.3 + (exclamations as f32 * 0.1) + (caps_ratio * 0.3) + (max_matches as f32 * 0.1))
+                .clamp(0.0, 1.0);
 
         // Suggest tone adjustment
         let suggested_tone = match detected_emotion {
@@ -2960,7 +3373,10 @@ impl Agent {
             let mut found = None;
             for model_spec in &self.config.summarization_priority {
                 match self.create_client_for_model(model_spec) {
-                    Ok(pair) => { found = Some(pair); break; }
+                    Ok(pair) => {
+                        found = Some(pair);
+                        break;
+                    }
                     Err(e) => {
                         debug!("Skipping summarization model {}: {}", model_spec, e);
                     }
@@ -3137,6 +3553,10 @@ struct RunState {
     repetition_nudged: bool,
     /// Whether we've already injected a thinking-spiral nudge (only retry once)
     thinking_spiral_nudged: bool,
+    /// Whether we've already injected a tool-call-loop nudge (only once)
+    tool_loop_nudged: bool,
+    /// Whether the 80% token-budget status has been surfaced to the model
+    budget_warned: bool,
     /// How many wrap-up nudges have been injected (escalates over time)
     wrapup_nudge_count: usize,
 }
@@ -3161,6 +3581,8 @@ impl RunState {
             narration_nudged: false,
             repetition_nudged: false,
             thinking_spiral_nudged: false,
+            tool_loop_nudged: false,
+            budget_warned: false,
             wrapup_nudge_count: 0,
         }
     }
@@ -3228,9 +3650,7 @@ fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usi
         let end = snap_char((pos + target_chars).min(text.len()));
         // Snap to nearest newline after target (prefer not splitting mid-line)
         let snap_end = if end < text.len() {
-            text[pos..end]
-                .rfind('\n')
-                .map_or(end, |nl| pos + nl + 1)
+            text[pos..end].rfind('\n').map_or(end, |nl| pos + nl + 1)
         } else {
             end
         };
@@ -3283,7 +3703,10 @@ mod tests {
         assert_eq!(wrapup_nudge_due(600, 500, 100, 1), Some(NudgeLevel::Firm));
         // Third and beyond are urgent.
         assert_eq!(wrapup_nudge_due(700, 500, 100, 2), Some(NudgeLevel::Urgent));
-        assert_eq!(wrapup_nudge_due(1500, 500, 100, 9), Some(NudgeLevel::Urgent));
+        assert_eq!(
+            wrapup_nudge_due(1500, 500, 100, 9),
+            Some(NudgeLevel::Urgent)
+        );
     }
 
     #[test]
@@ -3314,7 +3737,9 @@ mod tests {
     fn repetition_not_detected_in_varied_text() {
         // 12 distinct substantial lines — a normal multi-line answer.
         let text: String = (0..12)
-            .map(|i| format!("Step {i}: this line describes a distinct part of the work being done.\n"))
+            .map(|i| {
+                format!("Step {i}: this line describes a distinct part of the work being done.\n")
+            })
             .collect();
         assert!(!detect_repetition(&text));
     }
@@ -3325,6 +3750,83 @@ mod tests {
         // the 40-char floor — never flagged, regardless of count.
         let text = vec!["| --- | --- |"; 40].join("\n");
         assert!(!detect_repetition(&text));
+    }
+
+    fn record(name: &str, input: serde_json::Value, output: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "t".to_string(),
+            name: name.to_string(),
+            input,
+            output: output.to_string(),
+            success: true,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn tool_loop_fires_on_identical_consecutive_calls() {
+        let records = vec![
+            record("read_file", serde_json::json!({"path": "a.rs"}), "content"),
+            record("read_file", serde_json::json!({"path": "a.rs"}), "content"),
+        ];
+        assert!(detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_does_not_fire_when_args_differ() {
+        let records = vec![
+            record("read_file", serde_json::json!({"path": "a.rs"}), "content"),
+            record("read_file", serde_json::json!({"path": "b.rs"}), "content"),
+        ];
+        assert!(!detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_does_not_fire_when_result_changes() {
+        // Same call, different result: the environment moved — polling a
+        // build or tailing a log is progress, not a loop.
+        let records = vec![
+            record(
+                "exec",
+                serde_json::json!({"command": "git status"}),
+                "dirty",
+            ),
+            record(
+                "exec",
+                serde_json::json!({"command": "git status"}),
+                "clean",
+            ),
+        ];
+        assert!(!detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_needs_two_records() {
+        assert!(!detect_tool_call_loop(&[]));
+        let one = vec![record("exec", serde_json::json!({}), "ok")];
+        assert!(!detect_tool_call_loop(&one));
+    }
+
+    #[test]
+    fn tool_loop_exempts_write_tools_with_stubbed_inputs() {
+        // Write inputs are size-stubbed in records; two distinct writes of
+        // the same length would look identical — never flag them.
+        let records = vec![
+            record("write_file", serde_json::json!({"content": "[42 bytes written]"}), "ok"),
+            record("write_file", serde_json::json!({"content": "[42 bytes written]"}), "ok"),
+        ];
+        assert!(!detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_only_compares_the_last_two() {
+        // An identical pair earlier in the run must not fire retroactively.
+        let records = vec![
+            record("read_file", serde_json::json!({"path": "a.rs"}), "x"),
+            record("read_file", serde_json::json!({"path": "a.rs"}), "x"),
+            record("exec", serde_json::json!({"command": "ls"}), "files"),
+        ];
+        assert!(!detect_tool_call_loop(&records));
     }
 
     #[test]

@@ -17,12 +17,12 @@ use crate::session::{MessageRole, SessionManager, SubSessionInfo, SubSessionStat
 use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
 use nanna_config::Config;
-use nanna_core::{Scheduler, WorkspaceRegistry, Workspace};
+use nanna_core::{Scheduler, Workspace, WorkspaceRegistry};
 use nanna_llm::RequestBuilder;
 use nanna_memory::{ConsolidationConfig, MemoryService};
 use nanna_storage::{Storage, StoredModelStats};
 use nanna_tools::ToolRegistry;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -35,6 +35,7 @@ mod memory;
 mod scheduler;
 mod session;
 mod system;
+mod task;
 mod tool;
 mod workspace;
 
@@ -76,6 +77,8 @@ pub struct ControlPlane {
     /// `None` until ChannelManager attaches a status manager at daemon boot,
     /// or in minimal test constructions that never start channels.
     status_manager: Option<Arc<StatusManager>>,
+    /// Long-horizon task run manager (P14). None in minimal constructions.
+    task_runs: Option<Arc<crate::tasks::TaskRunManager>>,
 }
 
 impl ControlPlane {
@@ -103,6 +106,7 @@ impl ControlPlane {
             services_workspace_id: None,
             started_at: std::time::Instant::now(),
             status_manager: None,
+            task_runs: None,
         }
     }
 
@@ -154,6 +158,7 @@ impl ControlPlane {
             services_workspace_id: None,
             started_at: std::time::Instant::now(),
             status_manager: None,
+            task_runs: None,
         }
     }
 
@@ -173,15 +178,15 @@ impl ControlPlane {
                 let path = data.as_ref().map(|d| d.join("config.toml"));
                 (cfg.with_env_overrides(), path, data)
             }
-            Err(_) => (Config::default().with_env_overrides(), None, None)
+            Err(_) => (Config::default().with_env_overrides(), None, None),
         };
-        
+
         // Initialize user tools manager
         let user_tools = data_dir.as_ref().map(|d| {
             let tools_dir = d.join("user_tools");
             Arc::new(UserToolManager::new(tools_dir))
         });
-        
+
         Self {
             sessions,
             agent: Some(agent),
@@ -204,6 +209,7 @@ impl ControlPlane {
             services_workspace_id: None,
             started_at: std::time::Instant::now(),
             status_manager: None,
+            task_runs: None,
         }
     }
 
@@ -216,6 +222,12 @@ impl ControlPlane {
     /// Set the event broadcaster for pushing events to clients
     pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Attach the long-horizon task run manager (P14).
+    pub fn with_task_runs(mut self, task_runs: Arc<crate::tasks::TaskRunManager>) -> Self {
+        self.task_runs = Some(task_runs);
         self
     }
 
@@ -248,9 +260,13 @@ impl ControlPlane {
     pub async fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         match storage.load_model_stats().await {
             Ok(stored) if !stored.is_empty() => {
-                let storable: Vec<nanna_agent::model_stats::StorableModelStats> = stored.into_iter().map(From::from).collect();
+                let storable: Vec<nanna_agent::model_stats::StorableModelStats> =
+                    stored.into_iter().map(From::from).collect();
                 self.model_stats.import_from_storage(storable).await;
-                info!("Loaded model stats from storage ({} models)", self.model_stats.summaries().await.len());
+                info!(
+                    "Loaded model stats from storage ({} models)",
+                    self.model_stats.summaries().await.len()
+                );
             }
             Ok(_) => debug!("No persisted model stats found"),
             Err(e) => warn!("Failed to load model stats from storage: {e}"),
@@ -302,7 +318,10 @@ impl ControlPlane {
             }
             let stored_stats: Vec<StoredModelStats> = stats.into_iter().map(From::from).collect();
             match storage.save_model_stats(&stored_stats).await {
-                Ok(()) => info!("Saved model stats for {} models to storage", stored_stats.len()),
+                Ok(()) => info!(
+                    "Saved model stats for {} models to storage",
+                    stored_stats.len()
+                ),
                 Err(e) => warn!("Failed to save model stats: {e}"),
             }
         }
@@ -318,7 +337,7 @@ impl ControlPlane {
             }
         }
     }
-    
+
     /// Get a reference to the LLM router
     pub fn router(&self) -> Option<&Arc<LlmRouter>> {
         self.router.as_ref()
@@ -328,12 +347,12 @@ impl ControlPlane {
     pub fn workspaces(&self) -> &Arc<RwLock<WorkspaceRegistry>> {
         &self.workspaces
     }
-    
+
     /// Get a reference to the scheduler
     pub fn scheduler(&self) -> Option<&Arc<RwLock<Scheduler>>> {
         self.scheduler.as_ref()
     }
-    
+
     /// Get a reference to the user tool manager
     pub fn user_tools(&self) -> Option<&Arc<UserToolManager>> {
         self.user_tools.as_ref()
@@ -343,16 +362,16 @@ impl ControlPlane {
     pub fn tools(&self) -> Option<&Arc<ToolRegistry>> {
         self.tools.as_ref()
     }
-    
+
     /// Load user tools and register them with the tool registry
     pub async fn load_user_tools(&self) -> Result<usize, String> {
         let Some(ref user_tools) = self.user_tools else {
             return Err("User tools manager not initialized".to_string());
         };
-        
+
         // Load from disk
         let count = user_tools.load_all().await.map_err(|e| e.to_string())?;
-        
+
         // Register with tool registry
         if let Some(ref tools) = self.tools {
             user_tools.register_with_registry(tools).await;
@@ -412,7 +431,7 @@ impl ControlPlane {
     // NOTE: save_memories_if_needed() removed — memory is now persisted
     // via Turso write-through on every mutation (add/remove/update).
     // No explicit save calls are required.
-    
+
     /// Handle an action and return a response
     pub async fn handle(&self, client_id: &str, action: Action) -> Value {
         match action {
@@ -425,19 +444,24 @@ impl ControlPlane {
             Action::Channel(channel) => self.handle_channel(client_id, channel).await,
             Action::System(system) => self.handle_system(client_id, system).await,
             Action::Workspace(workspace) => self.handle_workspace(client_id, workspace).await,
+            Action::Task(task) => self.handle_task(client_id, task).await,
             Action::Subscribe(sub) => self.handle_subscribe(client_id, sub).await,
             Action::Unsubscribe(unsub) => self.handle_unsubscribe(client_id, unsub).await,
         }
     }
-    
+
     // =========================================================================
     // Subscription Handlers
     // =========================================================================
-    
+
     async fn handle_subscribe(&self, client_id: &str, action: SubscribeAction) -> Value {
         match action {
             SubscribeAction::Session { session_id } => {
-                if self.sessions.subscribe(&session_id, client_id.to_string()).await {
+                if self
+                    .sessions
+                    .subscribe(&session_id, client_id.to_string())
+                    .await
+                {
                     json!({ "status": "subscribed", "session_id": session_id })
                 } else {
                     json!({ "error": "not_found", "session_id": session_id })
@@ -454,7 +478,7 @@ impl ControlPlane {
             }
         }
     }
-    
+
     async fn handle_unsubscribe(&self, client_id: &str, action: UnsubscribeAction) -> Value {
         match action {
             UnsubscribeAction::Session { session_id } => {

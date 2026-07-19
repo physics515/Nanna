@@ -2,7 +2,7 @@
 
 use crate::{
     discover_workspace, find_workspace_root, WorkspaceError, WorkspaceFiles, WorkspaceMarker,
-    AGENTS_FILE, MEMORY_FOLDER, SOUL_FILE, WORKSPACE_MARKER_DIR,
+    AGENTS_FILE, README_FILE, ROADMAP_FILE, WORKSPACE_MARKER_DIR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,14 +12,11 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-/// Configuration for a workspace
+/// Configuration for a workspace (local non-md state in `.nanna/config.toml`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     /// Workspace name (defaults to directory name)
     pub name: Option<String>,
-    /// Whether this workspace should include MEMORY.md in context
-    /// (false for group chats, true for main sessions)
-    pub include_memory: bool,
     /// Maximum context tokens from workspace files
     pub max_context_tokens: Option<usize>,
     /// Custom file loading order/selection
@@ -30,7 +27,6 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             name: None,
-            include_memory: true,
             max_context_tokens: None,
             file_priority: None,
         }
@@ -57,18 +53,18 @@ impl Workspace {
             return Err(WorkspaceError::NotFound(root));
         }
 
-        // Determine marker
         let marker = find_workspace_root(&root)
             .map(|(_, m)| m)
             .unwrap_or(WorkspaceMarker::AgentsFile);
 
-        // Load workspace files
         let files = WorkspaceFiles::load(&root).await;
-
-        // Load workspace config from .nanna/config.toml if it exists
         let config = Self::load_config(&root).await.unwrap_or_default();
 
-        info!("Loaded workspace from {} ({} files)", root.display(), files.existing_files().len());
+        info!(
+            "Loaded workspace from {} ({} files)",
+            root.display(),
+            files.existing_files().len()
+        );
 
         Ok(Self {
             root,
@@ -122,76 +118,18 @@ impl Workspace {
     /// Generate system prompt context from workspace files
     #[must_use]
     pub fn system_context(&self) -> String {
-        self.files.to_system_context(self.config.include_memory)
+        self.files.to_system_context()
     }
 
-    /// Get path to the memory folder
-    #[must_use]
-    pub fn memory_folder(&self) -> PathBuf {
-        self.root.join(MEMORY_FOLDER)
-    }
-
-    /// Ensure the memory folder exists
-    pub async fn ensure_memory_folder(&self) -> Result<PathBuf, WorkspaceError> {
-        let path = self.memory_folder();
-        fs::create_dir_all(&path).await?;
-        Ok(path)
-    }
-
-    /// Check if this is a fresh workspace (has BOOTSTRAP.md)
-    #[must_use]
-    pub fn is_fresh(&self) -> bool {
-        self.files.is_fresh()
-    }
-
-    /// Append content to today's daily memory file
-    pub async fn append_to_daily_memory(&self, content: &str) -> Result<(), WorkspaceError> {
-        let mut file = WorkspaceFiles::load_or_create_today(&self.root).await?;
-        file.content.push_str(content);
-        file.content.push('\n');
-        file.save().await
-    }
-
-    /// Initialize workspace with basic files if they don't exist
+    /// Initialize workspace with a minimal root AGENTS.md (+ optional ROADMAP.md)
     pub async fn initialize(&self) -> Result<(), WorkspaceError> {
-        // Create .nanna directory
+        // Optional local-state dir (non-md)
         let marker_dir = self.root.join(WORKSPACE_MARKER_DIR);
         fs::create_dir_all(&marker_dir).await?;
 
-        // Create memory folder
-        fs::create_dir_all(self.memory_folder()).await?;
-
-        // Create minimal AGENTS.md if it doesn't exist
         let agents_path = self.root.join(AGENTS_FILE);
         if !agents_path.exists() {
-            let default_agents = r#"# AGENTS.md - Your Workspace
-
-This folder is your workspace. Treat it as home.
-
-## Memory
-
-- **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs of what happened
-- **Long-term:** `MEMORY.md` — your curated memories
-
-## Safety
-
-- Don't exfiltrate private data
-- Ask before destructive operations
-- When in doubt, ask
-"#;
-            fs::write(&agents_path, default_agents).await?;
-        }
-
-        // Create minimal SOUL.md if it doesn't exist
-        let soul_path = self.root.join(SOUL_FILE);
-        if !soul_path.exists() {
-            let default_soul = r#"# SOUL.md - Who You Are
-
-Be genuinely helpful, not performatively helpful.
-Have opinions. Be resourceful before asking.
-Earn trust through competence.
-"#;
-            fs::write(&soul_path, default_soul).await?;
+            fs::write(&agents_path, crate::templates::DEFAULT_AGENTS_MD).await?;
         }
 
         info!("Initialized workspace at {}", self.root.display());
@@ -243,7 +181,6 @@ impl WorkspaceManager {
             std::env::current_dir()?.join(path)
         };
 
-        // Check cache first
         {
             let cache = self.cache.read().await;
             if let Some(ws) = cache.get(&canonical) {
@@ -254,16 +191,13 @@ impl WorkspaceManager {
             }
         }
 
-        // Load workspace
         let workspace = Workspace::load(canonical.clone()).await?;
 
-        // Cache it
         {
             let mut cache = self.cache.write().await;
             cache.insert(canonical, workspace.clone());
         }
 
-        // Set as active
         {
             let mut active = self.active.write().await;
             *active = Some(workspace.clone());
@@ -314,20 +248,14 @@ impl WorkspaceManager {
 
     /// Create and initialize a new workspace
     pub async fn create(&self, path: &Path) -> Result<Workspace, WorkspaceError> {
-        // Create directory if it doesn't exist
         fs::create_dir_all(path).await?;
 
-        // Load (creates default config)
         let workspace = Workspace::load(path.to_path_buf()).await?;
-
-        // Initialize with default files
         workspace.initialize().await?;
 
-        // Reload to pick up new files
         let mut workspace = workspace;
         workspace.reload().await?;
 
-        // Cache it
         {
             let mut cache = self.cache.write().await;
             cache.insert(path.to_path_buf(), workspace.clone());
@@ -362,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn test_workspace_manager_activate() {
         let dir = tempdir().unwrap();
-        write(dir.path().join(AGENTS_FILE), "# Test").unwrap();
+        write(dir.path().join(README_FILE), "# Test").unwrap();
 
         let manager = WorkspaceManager::new();
         let workspace = manager.activate(dir.path()).await.unwrap();
@@ -379,8 +307,8 @@ mod tests {
         workspace.initialize().await.unwrap();
 
         assert!(dir.path().join(AGENTS_FILE).exists());
-        assert!(dir.path().join(SOUL_FILE).exists());
         assert!(dir.path().join(WORKSPACE_MARKER_DIR).exists());
-        assert!(dir.path().join(MEMORY_FOLDER).exists());
+        assert!(!dir.path().join("SOUL.md").exists());
+        assert!(!dir.path().join("memory").exists());
     }
 }

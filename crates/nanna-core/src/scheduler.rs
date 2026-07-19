@@ -103,9 +103,10 @@ impl Default for SchedulerConfig {
             heartbeat_interval: Duration::from_secs(1800), // 30 minutes
             heartbeat_enabled: true,
             // Do not command a `Read HEARTBEAT.md` here — that drove a read_file
-            // tool call that hard-errored on a missing file (resolved to ~ with no
-            // active workspace). Workspace HEARTBEAT.md is surfaced via context.
-            heartbeat_prompt: "Heartbeat check-in. If heartbeat instructions are present in your context, follow them. Otherwise review your current state. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
+            // tool call that hard-errored on a missing file (resolved to ~ with
+            // no active workspace), and P17 retired the bespoke HEARTBEAT.md
+            // entirely (recurrence lives in scheduled-task config now).
+            heartbeat_prompt: "Heartbeat check-in. Run any due scheduled tasks. Do not read files from disk looking for instructions, and do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
             max_concurrent: 4,
             check_interval: Duration::from_secs(30),
             default_timezone: "UTC".to_string(),
