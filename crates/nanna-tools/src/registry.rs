@@ -495,9 +495,13 @@ impl ToolRegistry {
     /// Load user-authored skills from a directory with service functions
     ///
     /// Like `load_skills` but attaches service functions to scripted tools.
+    ///
+    /// Takes `Arc<Self>` so every scripted tool gets a weak registry handle —
+    /// that handle is how tools see the active workspace workdir and session
+    /// id at execute time (without it relative paths fall back to HOME).
     #[cfg(feature = "scripting")]
     pub async fn load_skills_with_services(
-        &self,
+        self: &Arc<Self>,
         skills_dir: &Path,
         services: &HashMap<String, nanna_scripting::ServiceFn>,
     ) -> usize {
@@ -506,7 +510,8 @@ impl ToolRegistry {
         let mut loaded = 0;
 
         for skill in discovered {
-            match load_skill_with_services(&skill.path, services).await {
+            match load_skill_with_services(&skill.path, services, Some(Arc::downgrade(self))).await
+            {
                 Ok(tool) => {
                     let name = tool.definition().name.clone();
                     self.register_boxed(tool).await;

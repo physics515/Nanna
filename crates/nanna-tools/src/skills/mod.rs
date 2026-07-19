@@ -63,18 +63,27 @@ pub async fn load_skill(skill_dir: &Path) -> Result<Arc<dyn Tool>, ToolError> {
     }
 }
 
-/// Load a skill from a directory with service functions attached
+/// Load a skill from a directory with service functions attached.
+///
+/// `registry` is the weak handle scripted tools read their working directory
+/// and session id from at execute time — without it, `Nanna.workdir()` is
+/// null and relative paths in file/exec tools silently resolve to the HOME
+/// directory instead of the active workspace.
 #[cfg(feature = "scripting")]
 pub async fn load_skill_with_services(
     skill_dir: &Path,
     services: &HashMap<String, nanna_scripting::ServiceFn>,
+    registry: Option<std::sync::Weak<crate::ToolRegistry>>,
 ) -> Result<Arc<dyn Tool>, ToolError> {
     let source = discovery::detect_skill_source(skill_dir)?;
 
     match source {
         SkillSource::Script(path) => {
-            let tool = scripted::ScriptedToolWrapper::from_file(&path).await?
+            let mut tool = scripted::ScriptedToolWrapper::from_file(&path).await?
                 .with_services(services.clone());
+            if let Some(registry) = registry {
+                tool = tool.with_registry(registry);
+            }
             Ok(Arc::new(tool))
         }
         SkillSource::Manifest(path) => {

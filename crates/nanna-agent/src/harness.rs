@@ -291,10 +291,46 @@ async fn run_shell(
     Ok((output.status.code(), combined))
 }
 
+/// Locate Git-for-Windows `bash.exe`, cached. Mirrors the exec tool's routing
+/// in `nanna-scripting/src/bridge.rs` — explicitly NOT WSL's
+/// `C:\Windows\System32\bash.exe` (different filesystem semantics).
+#[cfg(windows)]
+fn git_bash_path() -> Option<&'static Path> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+                if let Ok(base) = std::env::var(var) {
+                    candidates.push(PathBuf::from(base).join("Git").join("bin").join("bash.exe"));
+                }
+            }
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                candidates.push(
+                    PathBuf::from(local)
+                        .join("Programs")
+                        .join("Git")
+                        .join("bin")
+                        .join("bash.exe"),
+                );
+            }
+            candidates.into_iter().find(|p| p.is_file())
+        })
+        .as_deref()
+}
+
 #[cfg(windows)]
 fn shell_command(command: &str) -> tokio::process::Command {
-    // Git Bash provides sh.exe on most dev machines; POSIX commands are the
-    // repo convention for exec. Fall back to cmd when absent.
+    // Acceptance commands are POSIX like every other command in this repo.
+    // Route exactly like the exec tool: Git Bash first — a bare `sh` on PATH
+    // is rare on Windows, and cmd cannot run `test`/`$(...)` at all, so a
+    // silent cmd fallback makes POSIX checks unwinnable.
+    if let Some(bash) = git_bash_path() {
+        let mut cmd = tokio::process::Command::new(bash);
+        cmd.arg("-c").arg(command);
+        return cmd;
+    }
     let sh_available = std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("sh.exe").exists()));
     if sh_available {
@@ -1196,6 +1232,30 @@ mod tests {
         assert!(pass.run(dir.path()).await.passed);
         let fail = AcceptanceCheck::Command {
             command: "exit 1".to_string(),
+            timeout_secs: None,
+        };
+        assert!(!fail.run(dir.path()).await.passed);
+    }
+
+    #[tokio::test]
+    async fn command_check_runs_posix_syntax() {
+        // Regression from the first live eval: `test`/`$(...)` checks were
+        // silently unwinnable when the shell fell back to cmd.exe because a
+        // bare `sh` was not on PATH. The runner must route through Git Bash.
+        #[cfg(windows)]
+        if git_bash_path().is_none() {
+            eprintln!("skipping command_check_runs_posix_syntax: Git Bash not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pass = AcceptanceCheck::Command {
+            command: "test \"$(echo 4)\" = \"4\"".to_string(),
+            timeout_secs: None,
+        };
+        let verdict = pass.run(dir.path()).await;
+        assert!(verdict.passed, "POSIX check must pass: {}", verdict.detail);
+        let fail = AcceptanceCheck::Command {
+            command: "test \"$(echo 5)\" = \"4\"".to_string(),
             timeout_secs: None,
         };
         assert!(!fail.run(dir.path()).await.passed);
