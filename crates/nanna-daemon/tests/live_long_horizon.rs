@@ -805,27 +805,61 @@ async fn live_endurance() {
         }
     });
 
-    let config = LongHorizonConfig {
-        max_wall_clock: Duration::from_secs_f64(hours * 3600.0),
-        max_replans_per_item: 1,
-        ..LongHorizonConfig::default()
+    // The store IS the checkpoint: a run stopped by a provider incident is
+    // resumed by simply starting again — next() picks up exactly where the
+    // plan stands (the P14 resume property, exercised for real here).
+    // Bound: 8 resumes over the window tolerates an incident every ~40
+    // minutes without letting a permanently dead provider spin forever.
+    const ENDURANCE_RESUMES_MAX: usize = 8;
+    let cap = Duration::from_secs_f64(hours * 3600.0);
+    let mut resumes = 0usize;
+    let mut segment_reports: Vec<LongHorizonReport> = Vec::new();
+    let report = loop {
+        let remaining = cap.saturating_sub(started.elapsed());
+        let config = LongHorizonConfig {
+            max_wall_clock: remaining,
+            max_replans_per_item: 1,
+            ..LongHorizonConfig::default()
+        };
+        let source = source_for(&env.storage);
+        let report = LongHorizonRunner::new(config)
+            .run(MINIDB_GOAL, &source, &env.runner, &workdir, None)
+            .await;
+        let provider_died = matches!(report.stop, StopReason::RunnerErrors { .. });
+        segment_reports.push(report.clone());
+        if !provider_died || resumes >= ENDURANCE_RESUMES_MAX || started.elapsed() >= cap {
+            break report;
+        }
+        resumes += 1;
+        println!(
+            "[resume {resumes}/{ENDURANCE_RESUMES_MAX}] provider incident at t={}m — resetting runner and resuming the plan",
+            started.elapsed().as_secs() / 60
+        );
+        env.runner.reset_ollama_runner().await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
     };
-    let source = source_for(&env.storage);
-    let report = LongHorizonRunner::new(config)
-        .run(MINIDB_GOAL, &source, &env.runner, &workdir, None)
-        .await;
     progress.abort();
 
-    print_report("ENDURANCE RUN", &report, &env.storage, &plan_ids, false).await;
+    print_report("ENDURANCE RUN (final segment)", &report, &env.storage, &plan_ids, false).await;
+    let agg_steps: usize = segment_reports.iter().map(|r| r.steps_taken).sum();
+    let agg_in: u64 = segment_reports.iter().map(|r| r.input_tokens).sum();
+    let agg_out: u64 = segment_reports.iter().map(|r| r.output_tokens).sum();
+    let agg_completed: usize = segment_reports.iter().map(|r| r.items_completed).sum();
+    println!(
+        "aggregate over {} segment(s), {resumes} resume(s): steps={agg_steps} completed={agg_completed} tokens={}",
+        segment_reports.len(),
+        agg_in + agg_out
+    );
     // Preserve the built artifact for post-mortems.
     if let Ok(minidb) = std::fs::read_to_string(workdir.join("minidb")) {
         println!("---- final ./minidb ({} bytes) ----\n{minidb}\n----", minidb.len());
     }
     let seeded_done = assert_seeded_verified(&env.storage, &plan_ids).await;
+    let elapsed = started.elapsed();
     println!(
-        "endurance summary: {seeded_done}/{total} features verified in {}s ({:.1}h)",
-        report.wall_clock_secs,
-        report.wall_clock_secs as f64 / 3600.0
+        "endurance summary: {seeded_done}/{total} features verified in {}s ({:.2}h), {resumes} resume(s)",
+        elapsed.as_secs(),
+        elapsed.as_secs_f64() / 3600.0
     );
     assert!(
         !matches!(report.stop, StopReason::SourceError { .. }),

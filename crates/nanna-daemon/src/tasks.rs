@@ -771,12 +771,18 @@ pub struct AgentStepRunner {
 
 /// In-step retries for transient provider errors.
 ///
-/// Bound justification: local models occasionally corrupt their own tool-call
-/// template mid-generation (observed: Ollama 500 "XML syntax error … element
-/// \<parameter\> closed by \</function\>" from qwen3.5); a fresh generation
-/// usually parses. Two retries absorb that without masking a dead endpoint —
-/// the harness circuit breaker still sees persistent failure.
-const STEP_LLM_RETRIES: usize = 2;
+/// Bound justification: local models corrupt their own tool-call template
+/// mid-generation (observed: Ollama 500s from qwen3.5), and Ollama's runner
+/// intermittently enters a degraded state where a stale KV "context
+/// checkpoint" restore sends generation straight to a stop token (observed:
+/// 200s with ~33 generated tokens and empty output, recurring ~1h into a
+/// sustained run). Three retries with escalating backoff — and a runner
+/// reset before the last — absorb both without masking a dead endpoint; the
+/// harness circuit breaker still sees persistent failure.
+const STEP_LLM_RETRIES: usize = 3;
+
+/// Backoff before retry attempts 1..=3.
+const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
 fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
@@ -801,7 +807,13 @@ impl StepRunner for AgentStepRunner {
         for attempt in 0..=STEP_LLM_RETRIES {
             if attempt > 0 {
                 tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                // The degraded-runner state (empty 200s) survives plain
+                // retries — force a model unload/reload before the last try.
+                if attempt == STEP_LLM_RETRIES && last_err.contains("empty completion") {
+                    self.reset_ollama_runner().await;
+                }
             }
             // A fresh context per attempt: the re-anchor makes retries free —
             // there is no partial transcript worth salvaging.
@@ -821,6 +833,32 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// Force Ollama to unload the model (`keep_alive: 0`), clearing runner
+    /// state — the observed degraded mode restores a stale KV context
+    /// checkpoint that sends every generation straight to a stop token, and
+    /// only a fresh runner clears it. No-op for non-Ollama models.
+    pub async fn reset_ollama_runner(&self) {
+        let model = &self.agent_config.model;
+        if !model.contains(':') && !model.starts_with("ollama/") {
+            return;
+        }
+        let base =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after empty completions");
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("{base}/api/generate"))
+            .json(&serde_json::json!({
+                "model": LlmRouter::strip_model_prefix(model),
+                "keep_alive": 0
+            }))
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await;
+        // Give the runner a moment to tear down before the reload request.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
     async fn try_run_step(&self, request: &StepRequest) -> Result<StepOutcome, String> {
         use nanna_agent::{Agent, AgentContext, RunOptions};
 
