@@ -32,9 +32,11 @@ fn eval_model() -> String {
 }
 
 fn init_tracing() {
-    // warn-only: a multi-hour run at info would produce a gigabyte log.
-    // Progress lines below use println! and bypass the filter.
-    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+    // Default warn-only: a multi-hour run at info would produce a huge log.
+    // NANNA_EVAL_LOG overrides for diagnosis. Progress lines use println!
+    // and bypass the filter either way.
+    let filter = std::env::var("NANNA_EVAL_LOG").unwrap_or_else(|_| "warn".to_string());
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 // ---------------------------------------------------------------------------
@@ -713,7 +715,14 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
     let tests_dir = workdir.join("tests");
     std::fs::create_dir_all(&tests_dir).expect("tests dir");
 
-    let features = minidb_features();
+    let mut features = minidb_features();
+    // NANNA_EVAL_FEATURES truncates the ladder for cheap diagnosis runs.
+    if let Some(limit) = std::env::var("NANNA_EVAL_FEATURES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        features.truncate(limit.max(1));
+    }
     let repo = storage.tasks();
     let mut ids = Vec::new();
     let mut prev: Option<i64> = None;

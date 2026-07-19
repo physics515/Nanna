@@ -784,6 +784,16 @@ fn is_transient_llm_error(message: &str) -> bool {
         || message.contains("connection")
 }
 
+/// An "empty completion": HTTP success but no text, no tool calls, and ~no
+/// generated tokens. Observed live from Ollama (a whole 42-item plan was
+/// burned by 462 such no-op steps in 9 minutes — each one "succeeded", made
+/// no progress, and marched every item to abandonment). Treat as a transient
+/// provider failure, never as a step result. The token bound distinguishes
+/// this from a legitimate thinking-only step, whose reasoning tokens count.
+fn is_empty_completion(outcome: &StepOutcome) -> bool {
+    outcome.tool_calls.is_empty() && outcome.text.trim().is_empty() && outcome.output_tokens <= 8
+}
+
 #[async_trait::async_trait]
 impl StepRunner for AgentStepRunner {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
@@ -796,6 +806,11 @@ impl StepRunner for AgentStepRunner {
             // A fresh context per attempt: the re-anchor makes retries free —
             // there is no partial transcript worth salvaging.
             match self.try_run_step(&request).await {
+                Ok(outcome) if is_empty_completion(&outcome) => {
+                    last_err =
+                        "empty completion (no text, no tool calls, ~0 tokens) from provider"
+                            .to_string();
+                }
                 Ok(outcome) => return Ok(outcome),
                 Err(e) if is_transient_llm_error(&e) => last_err = e,
                 Err(e) => return Err(e),
