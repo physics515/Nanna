@@ -223,15 +223,36 @@ pub fn build_task_services(
                     // A subtask always lives in its parent's scope — replan
                     // steps only know the parent id, not the run's scope.
                     let parent_id = get_i64(&params, "parent_id");
-                    let (scope, scope_id) = if let Some(parent_id) = parent_id {
+                    let (scope, scope_id, parent_sort) = if let Some(parent_id) = parent_id {
                         let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
-                        (parent.scope, parent.scope_id)
+                        (parent.scope, parent.scope_id, Some(parent.sort_order))
                     } else {
-                        resolve_scope(&params, &workspace_id).await?
+                        let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+                        (scope, scope_id, None)
                     };
                     let title = opt_string(&params, "title")
                         .or_else(|| opt_string(&params, "text"))
                         .ok_or_else(|| "title is required".to_string())?;
+                    // Ordering: a subtask inherits its parent's ladder
+                    // position; a new root task appends AFTER everything
+                    // (defaulting to 0 would jump the whole queue — observed
+                    // live as a task explosion drowning the seeded plan).
+                    let sort_order = match get_i64(&params, "sort_order") {
+                        Some(explicit) => explicit,
+                        None => match parent_sort {
+                            Some(parent_sort) => parent_sort,
+                            None => storage
+                                .tasks()
+                                .list(&scope, scope_id.as_deref(), true)
+                                .await
+                                .map_err(err_str)?
+                                .iter()
+                                .map(|t| t.sort_order)
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1),
+                        },
+                    };
                     let new = NewTask {
                         parent_id,
                         scope,
@@ -247,7 +268,7 @@ pub fn build_task_services(
                         depends_on: i64_vec(params.get("depends_on")),
                         acceptance: canonical_acceptance(&params)?,
                         assignee: opt_string(&params, "assignee"),
-                        sort_order: get_i64(&params, "sort_order").unwrap_or(0),
+                        sort_order,
                     };
                     let task = storage.tasks().create(new).await.map_err(err_str)?;
                     Ok(json!({ "task": task_to_json(&task) }))
@@ -771,17 +792,42 @@ pub struct AgentStepRunner {
 
 /// In-step retries for transient provider errors.
 ///
-/// Bound justification: local models occasionally corrupt their own tool-call
-/// template mid-generation (observed: Ollama 500 "XML syntax error … element
-/// \<parameter\> closed by \</function\>" from qwen3.5); a fresh generation
-/// usually parses. Two retries absorb that without masking a dead endpoint —
-/// the harness circuit breaker still sees persistent failure.
-const STEP_LLM_RETRIES: usize = 2;
+/// Bound justification: local models corrupt their own tool-call template
+/// mid-generation (observed: Ollama 500s from qwen3.5), and Ollama's runner
+/// intermittently enters a degraded state where a stale KV "context
+/// checkpoint" restore sends generation straight to a stop token (observed:
+/// 200s with ~33 generated tokens and empty output, recurring ~1h into a
+/// sustained run). Three retries with escalating backoff — and a runner
+/// reset before the last — absorb both without masking a dead endpoint; the
+/// harness circuit breaker still sees persistent failure.
+const STEP_LLM_RETRIES: usize = 3;
+
+/// Backoff before retry attempts 1..=3.
+const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
 fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
         || message.contains("timed out")
         || message.contains("connection")
+}
+
+/// Forensics: append the exact prompt of an empty-completion step to a temp
+/// file so the deterministic trigger can be replayed and minimized offline.
+fn dump_empty_step(request: &StepRequest, attempt: usize) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("nanna_empty_step_prompts.log");
+    let entry = format!(
+        "==== {} item#{} kind={:?} attempt={attempt} ====\n{}\n\n",
+        chrono::Utc::now().to_rfc3339(),
+        request.item_id,
+        request.step_kind,
+        request.prompt,
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
 }
 
 /// An "empty completion": HTTP success but no text, no tool calls, and ~no
@@ -801,12 +847,19 @@ impl StepRunner for AgentStepRunner {
         for attempt in 0..=STEP_LLM_RETRIES {
             if attempt > 0 {
                 tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                // The degraded-runner state (empty 200s) survives plain
+                // retries — force a model unload/reload before the last try.
+                if attempt == STEP_LLM_RETRIES && last_err.contains("empty completion") {
+                    self.reset_ollama_runner().await;
+                }
             }
             // A fresh context per attempt: the re-anchor makes retries free —
             // there is no partial transcript worth salvaging.
             match self.try_run_step(&request).await {
                 Ok(outcome) if is_empty_completion(&outcome) => {
+                    dump_empty_step(&request, attempt);
                     last_err =
                         "empty completion (no text, no tool calls, ~0 tokens) from provider"
                             .to_string();
@@ -821,6 +874,32 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// Force Ollama to unload the model (`keep_alive: 0`), clearing runner
+    /// state — the observed degraded mode restores a stale KV context
+    /// checkpoint that sends every generation straight to a stop token, and
+    /// only a fresh runner clears it. No-op for non-Ollama models.
+    pub async fn reset_ollama_runner(&self) {
+        let model = &self.agent_config.model;
+        if !model.contains(':') && !model.starts_with("ollama/") {
+            return;
+        }
+        let base =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after empty completions");
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("{base}/api/generate"))
+            .json(&serde_json::json!({
+                "model": LlmRouter::strip_model_prefix(model),
+                "keep_alive": 0
+            }))
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await;
+        // Give the runner a moment to tear down before the reload request.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
     async fn try_run_step(&self, request: &StepRequest) -> Result<StepOutcome, String> {
         use nanna_agent::{Agent, AgentContext, RunOptions};
 

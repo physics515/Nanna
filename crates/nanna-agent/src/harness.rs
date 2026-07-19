@@ -463,8 +463,12 @@ pub struct LongHorizonConfig {
     /// step, so iterations past the re-anchor window only grow context —
     /// which is exactly what P14 exists to prevent.
     pub step_iterations: usize,
-    /// Token budget per step. A step that burns more than this has lost the
-    /// O(1) property; forcing a step boundary re-anchors it.
+    /// Optional token budget per step. None by default: the re-anchor
+    /// cadence is already enforced by `step_iterations`, and a token cap
+    /// proved to truncate PRODUCTIVE steps mid-work once the artifact under
+    /// construction grew (observed live: steps dying at exactly the budget on
+    /// later features, feeding stall → replan pressure). Set it only when a
+    /// hard per-step spend ceiling matters more than step completion.
     pub step_token_budget: Option<u64>,
     /// Consecutive runner errors before the run stops (circuit breaker for a
     /// dead model endpoint).
@@ -481,7 +485,7 @@ impl Default for LongHorizonConfig {
             max_steps_per_item: 5,
             max_replans_per_item: 2,
             step_iterations: 8,
-            step_token_budget: Some(20_000),
+            step_token_budget: None,
             max_consecutive_errors: 3,
             actor: "harness".to_string(),
         }
@@ -673,6 +677,18 @@ pub fn steps_repeat(previous: &[StepToolCall], current: &[StepToolCall]) -> bool
 // The runner
 // ---------------------------------------------------------------------------
 
+/// Errors from the step runner charged to ONE item before that item is
+/// abandoned as poisoned.
+///
+/// Bound justification: the runner already retries transient provider
+/// failures internally, so an `Err` here means several consecutive failed
+/// generations. When that happens twice on the same item while other items
+/// proceed, the failure follows the item (something in its prompt/notes
+/// deterministically breaks the model) — containing it at item granularity
+/// costs one feature instead of the whole run. Provider-wide death still
+/// trips the run-level breaker, whose counter spans items.
+pub const ITEM_RUNNER_ERRORS_MAX: usize = 2;
+
 /// Per-item progress bookkeeping.
 #[derive(Debug, Default, Clone)]
 struct ItemProgress {
@@ -681,6 +697,7 @@ struct ItemProgress {
     tokens_spent: u64,
     last_result: Option<String>,
     last_tool_calls: Vec<StepToolCall>,
+    runner_errors: usize,
 }
 
 /// The long-horizon control loop.
@@ -800,6 +817,23 @@ impl LongHorizonRunner {
                 }
                 Err(message) => {
                     consecutive_errors += 1;
+                    let item = progress.entry(step.id).or_default();
+                    item.runner_errors += 1;
+                    // Poison containment: when the failure follows one item
+                    // (its prompt/notes deterministically break the model),
+                    // abandon that item and keep the run alive. Provider-wide
+                    // death still trips the run-level breaker below, whose
+                    // counter spans items.
+                    if item.runner_errors >= ITEM_RUNNER_ERRORS_MAX {
+                        let reason =
+                            format!("abandoned after persistent runner errors: {message}");
+                        if let Err(message) = source.abandon(step.id, &reason).await {
+                            break StopReason::SourceError { message };
+                        }
+                        items_abandoned += 1;
+                        progress.remove(&step.id);
+                        continue;
+                    }
                     if consecutive_errors >= cfg.max_consecutive_errors {
                         break StopReason::RunnerErrors { message };
                     }
@@ -1640,10 +1674,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_runner_errors_trip_the_circuit_breaker() {
+    async fn poisoned_item_is_abandoned_and_the_run_continues() {
+        // An item whose prompt deterministically breaks the model must cost
+        // one feature, not the whole run: errors follow the item, the item
+        // gets abandoned, and the next item proceeds.
         let dir = tempfile::tempdir().unwrap();
         let source = MemorySource::default();
-        source.push(step(1, "any", None)).await;
+        source.push(step(1, "poisoned", None)).await;
+        source.push(step(2, "healthy", None)).await;
+        let runner = ScriptedRunner::new(vec![
+            Err("empty completion".to_string()),
+            Err("empty completion".to_string()),
+            Ok(outcome("TASK COMPLETE")),
+        ]);
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone, "{report:?}");
+        assert_eq!(report.items_abandoned, 1, "poisoned item abandoned");
+        assert_eq!(report.items_completed, 1, "healthy item still completed");
+    }
+
+    #[tokio::test]
+    async fn consecutive_runner_errors_trip_the_circuit_breaker() {
+        // Provider-wide death: errors SPAN items (poison containment first
+        // abandons the item they follow), so the run-level breaker trips
+        // once the error streak crosses into a second item.
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "first", None)).await;
+        source.push(step(2, "second", None)).await;
         let runner = ScriptedRunner::new(vec![
             Err("boom".to_string()),
             Err("boom".to_string()),
@@ -1652,8 +1712,9 @@ mod tests {
         let report = LongHorizonRunner::new(fast_config())
             .run("goal", &source, &runner, dir.path(), None)
             .await;
-        assert!(matches!(report.stop, StopReason::RunnerErrors { .. }));
+        assert!(matches!(report.stop, StopReason::RunnerErrors { .. }), "{report:?}");
         assert_eq!(report.steps_taken, 0, "failed steps are not progress");
+        assert_eq!(report.items_abandoned, 1, "first item was contained as poisoned");
     }
 
     #[tokio::test]

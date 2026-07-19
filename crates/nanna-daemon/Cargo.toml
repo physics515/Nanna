@@ -61,6 +61,9 @@ hex = "0.4"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Ollama runner reset (keep_alive=0) in the long-horizon step runner
+reqwest.workspace = true
+
 # Test-only helpers
 [dev-dependencies]
 tempfile = "3"

@@ -3966,6 +3966,17 @@ fn strip_think_tags(text: &str) -> String {
 }
 
 fn ollama_response_to_anthropic(model: &str, response: &serde_json::Value) -> Result<AnthropicResponse, LlmError> {
+    // A non-streaming response with done=false is an ABORTED generation, not
+    // a completion (observed live: a degraded Ollama runner emits ~31 tokens
+    // of degenerate output and gives up, with no eval stats and no
+    // done_reason). Parsing it as an empty success poisons every layer above;
+    // surface it as a retryable server error instead.
+    if response.get("done").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err(LlmError::from_api_response(
+            502,
+            "Ollama aborted generation mid-response (done=false)".to_string(),
+        ));
+    }
     let message = &response["message"];
     let mut content = Vec::new();
 

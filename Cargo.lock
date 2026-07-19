@@ -5492,6 +5492,7 @@ dependencies = [
  "nanna-storage",
  "nanna-tools",
  "nix 0.31.3",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
