@@ -50,10 +50,32 @@ Budget: **false-success completions admitted must stay 0** (correctness fixture 
 anti-drift keystone), and drift containment must stay **≤ 6000 tokens** on the fixed script.
 The compliant-run rows are exact bookkeeping fixtures, not tunable budgets.
 
-Still open for this suite: the live "4-hour task" eval on the 8 GB reference tier against a
-real 7–9B Ollama model (needs the P-&-B agent-eval task set — reuse Terminal-Bench easy-tier /
-SWE-bench Lite per the P14 research note rather than inventing tasks). The deterministic rows
-above gate the harness logic; the live eval will gate the end-to-end number.
+### Live run — first datapoint (2026-07-18)
+
+Instrument: `nanna-daemon/tests/live_long_horizon.rs` (`#[ignore]`d; needs Ollama). Five
+minutes-scale tasks with real acceptance checks (regex-on-file ×3, command-exit-0 ×2, one
+dependency edge) in a temp workspace, driven end-to-end: harness → fresh agent per step →
+Ollama → real file/exec tools → harness-run verification. Run with
+`NANNA_EVAL_MODEL=qwen3.5:9b cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture`.
+
+| Metric | Value | Notes |
+| --- | --- | --- |
+| Task success | **3/5 (0.60)** | qwen3.5:9b (9.7B) via Ollama — RTX 4070 Ti SUPER 16 GB |
+| Tokens per completed item | **129,093** | 375k in + 12k out; input dominates (each step's ≤8 internal iterations re-send the step context) |
+| Wall clock | **252 s** (19 steps) | run ended by the runner-error circuit breaker: 3 consecutive Ollama 500s ("XML syntax error … \<parameter\> closed by \</function\>" — model-side tool-call template corruption) with task #5 in progress |
+| False-success claims admitted | **0** | harness integrity held on a real model |
+| Unverified completions | **0** | every task carried a machine check |
+| Dependency ordering | ✅ | the depends_on pair completed in order (data file → row count) |
+
+These are recorded datapoints, **not budgets yet** — they will move with model choice, retry
+policy, and task set. The first run of this eval also immediately caught a real production bug
+(scripted tools loaded without a registry handle resolved relative paths to `$HOME` instead of
+the workspace — every artifact landed in the wrong directory and 0/5 verified), which is
+exactly the class of evidence this suite exists to produce.
+
+Still open: expand to a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite
+per the P14 research note), report pass^k (k=3–5), run the 8 GB reference tier, and tune the
+step-runner retry policy so a transient provider 500 does not end an otherwise-progressing run.
 
 ---
 

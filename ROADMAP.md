@@ -120,8 +120,9 @@ Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **
 (long-horizon autonomy on a small local model) and **P15** (the agent-grade task store P14 runs on)
 **landed together 2026-07-18**: Turso task store with hierarchy/dependencies/derived-blocked/`next()`/
 filter language, harness-run acceptance checks, the re-anchored O(1) step loop with progress-or-replan
-and budget caps, todo v0.2 + `TaskAction` IPC + GUI `/tasks` run monitor — only P14's live on-model
-"4-hour task" eval remains open (needs the agent-eval task set). **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
+and budget caps, todo v0.2 + `TaskAction` IPC + GUI `/tasks` run monitor. The live on-model eval
+has its first datapoint (qwen3.5:9b: 3/5 tasks verified @ 129k tokens/item, 0 false successes
+admitted); the full eval suite (published task set, pass^k, 8 GB tier) is the open remainder. **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
 what it does: **P16** (daemon-only consolidation — delete embedded mode, GUI becomes a pure daemon client,
 iOS deferred) collapses the double-implementation tax behind most P4/P8/P11 "GUI-embedded copy drifted" debt;
 **P17** ✅ (drop the bespoke per-workspace `.nanna/` agent markdown — Nanna reads a project's *standard* files
@@ -952,7 +953,7 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
 - [ ] Also from backlog: HNSW persistent vector index (avoid full `bulk_load` into RAM); emotional valence; memory-graph edges; dedup-before-store; ~~extraction filtering (<50 chars)~~ **(done 2026-07-06 — `is_storable_memory` drops sub-50-char extractions in `loop_runner::extract_memories`; 2 tests)**.
 - [ ] add correlation tool that requires time-series data + event timestamps to use DSP to make predictions.
 
-### P14 — Long-Horizon Autonomy on a Small Local Model ✅ (harness landed 2026-07-18; live on-model eval open)
+### P14 — Long-Horizon Autonomy on a Small Local Model ✅ (harness + first live on-model baseline landed 2026-07-18; full eval suite open)
 
 **Goal:** a 7–9B local model that stays on task for **hours**, not 2–3 tool calls, at a token cost that a
 single GPU can actually sustain. P12 gives us a model that *runs*; this phase is what makes it *useful*.
@@ -975,8 +976,9 @@ tokens spent. Not tok/s, not context size. A run that finishes in 40k tokens bea
 deterministically testable without a model — 20+ tests incl. the Suite 4 fixtures) with daemon
 production impls in `nanna-daemon/src/tasks.rs` (`TursoTaskSource`, `AgentStepRunner` = fresh
 `Agent` + empty context per step, `TaskRunManager` for background runs) and IPC surface
-`TaskAction::StartRun/RunStatus/CancelRun` + `TaskRun*` events. What remains open is exactly one
-item: the *live* on-model eval (last checkbox).
+`TaskAction::StartRun/RunStatus/CancelRun` + `TaskRun*` events. The live on-model eval has its
+first recorded datapoint (3/5 verified @ 129k tokens/item on qwen3.5:9b — see the benchmark
+items below); what remains open is the full eval build-out (published task set, pass^k, 8 GB tier).
 
 **Design spine — externalize state, keep the window tiny:**
 - [x] **The todo store *is* the agent's working memory** (P15) — *(2026-07-18)* a run is a loop over
@@ -1043,11 +1045,18 @@ item: the *live* on-model eval (last checkbox).
       task-success @ tokens rows from scripted-model fixtures (`cargo test -p nanna-agent harness`):
       compliant runs complete 3/3 at exactly 1200 tokens/item, a perma-false-claiming model admits
       **0** completions and costs ≤ 6000 tokens before abandonment, loops abandon in < 4 steps.
-- [ ] **Benchmark (live half):** the "4-hour task" eval against a real 7–9B Ollama model on the 8 GB
-      reference tier — needs the P-&-B agent-eval task set; per the research below, reuse
-      Terminal-Bench easy-tier tasks (Docker + end-state verifier) or SWE-bench Lite rather than
-      inventing tasks, report pass^k (k=3–5) alongside task-success @ tokens, and calibrate hard:
-      raw 7B agents resolve ~0.7% of SWE-bench, so minutes-scale tasks are the right grain.
+- [x] **Benchmark (live half — first datapoint):** *(2026-07-18)* the harness ran end-to-end against
+      a real local model: qwen3.5:9b via Ollama, 5 minutes-scale tasks with machine acceptance
+      checks (`nanna-daemon/tests/live_long_horizon.rs`, `#[ignore]`d). **3/5 verified-complete @
+      129k tokens/item, 252 s, 0 false-success claims admitted, dependency ordering exercised** —
+      recorded in `bench/BASELINE.md` Suite 4 (datapoints, not budgets yet). The first run also
+      caught a real production bug: scripted tools were loaded without a registry handle, so
+      relative paths resolved to `$HOME` instead of the workspace (fixed in
+      `load_skills_with_services` — every skill now gets the weak registry ref).
+  - [ ] **Live half, full build-out:** reuse a published task set (Terminal-Bench easy-tier /
+        SWE-bench Lite per the research note), report pass^k (k=3–5), run the 8 GB reference tier,
+        and tune the step-runner retry policy (the first run ended on 3 consecutive Ollama 500s —
+        tool-call template corruption — while a task was still progressing).
 
 - [x] *(research 2026-07-17 → done 2026-07-18)* Cross-checked against published work; the design held
       up and got sharper. Key findings: long-task failure is execution/context, not reasoning —
