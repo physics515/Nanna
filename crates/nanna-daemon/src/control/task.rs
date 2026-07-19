@@ -103,22 +103,37 @@ impl ControlPlane {
                 project,
                 assignee,
             } => {
-                // A subtask always lives in its parent's scope.
-                let (scope, scope_id) = if let Some(parent_id) = parent_id {
+                // A subtask always lives in its parent's scope and inherits
+                // its ladder position; a new root task appends after
+                // everything (sort_order 0 would jump the whole queue).
+                let (scope, scope_id, sort_order) = if let Some(parent_id) = parent_id {
                     match repo.get(parent_id).await {
-                        Ok(parent) => (parent.scope, parent.scope_id),
+                        Ok(parent) => (parent.scope, parent.scope_id, parent.sort_order),
                         Err(e) => {
                             return json!({"error": "task_not_found", "message": e.to_string()});
                         }
                     }
                 } else {
-                    match self
+                    let (scope, scope_id) = match self
                         .resolve_task_scope(scope.as_deref(), session_id.as_deref())
                         .await
                     {
                         Ok(resolved) => resolved,
                         Err(message) => return json!({"error": "bad_scope", "message": message}),
-                    }
+                    };
+                    let append_after = repo
+                        .list(&scope, scope_id.as_deref(), true)
+                        .await
+                        .map(|tasks| {
+                            tasks
+                                .iter()
+                                .map(|t| t.sort_order)
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                        })
+                        .unwrap_or(0);
+                    (scope, scope_id, append_after)
                 };
                 // Canonicalize through the harness parser: a shape that would
                 // fail at run time is rejected here, not mid-run.
@@ -150,7 +165,7 @@ impl ControlPlane {
                     depends_on: depends_on.unwrap_or_default(),
                     acceptance,
                     assignee,
-                    sort_order: 0,
+                    sort_order,
                 };
                 match repo.create(new).await {
                     Ok(task) => {

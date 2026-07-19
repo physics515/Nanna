@@ -223,15 +223,36 @@ pub fn build_task_services(
                     // A subtask always lives in its parent's scope — replan
                     // steps only know the parent id, not the run's scope.
                     let parent_id = get_i64(&params, "parent_id");
-                    let (scope, scope_id) = if let Some(parent_id) = parent_id {
+                    let (scope, scope_id, parent_sort) = if let Some(parent_id) = parent_id {
                         let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
-                        (parent.scope, parent.scope_id)
+                        (parent.scope, parent.scope_id, Some(parent.sort_order))
                     } else {
-                        resolve_scope(&params, &workspace_id).await?
+                        let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+                        (scope, scope_id, None)
                     };
                     let title = opt_string(&params, "title")
                         .or_else(|| opt_string(&params, "text"))
                         .ok_or_else(|| "title is required".to_string())?;
+                    // Ordering: a subtask inherits its parent's ladder
+                    // position; a new root task appends AFTER everything
+                    // (defaulting to 0 would jump the whole queue — observed
+                    // live as a task explosion drowning the seeded plan).
+                    let sort_order = match get_i64(&params, "sort_order") {
+                        Some(explicit) => explicit,
+                        None => match parent_sort {
+                            Some(parent_sort) => parent_sort,
+                            None => storage
+                                .tasks()
+                                .list(&scope, scope_id.as_deref(), true)
+                                .await
+                                .map_err(err_str)?
+                                .iter()
+                                .map(|t| t.sort_order)
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1),
+                        },
+                    };
                     let new = NewTask {
                         parent_id,
                         scope,
@@ -247,7 +268,7 @@ pub fn build_task_services(
                         depends_on: i64_vec(params.get("depends_on")),
                         acceptance: canonical_acceptance(&params)?,
                         assignee: opt_string(&params, "assignee"),
-                        sort_order: get_i64(&params, "sort_order").unwrap_or(0),
+                        sort_order,
                     };
                     let task = storage.tasks().create(new).await.map_err(err_str)?;
                     Ok(json!({ "task": task_to_json(&task) }))
