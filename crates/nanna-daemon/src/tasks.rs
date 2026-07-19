@@ -816,6 +816,14 @@ impl AgentStepRunner {
         }
 
         let mut config = self.agent_config.clone();
+        // Execution/verification wants determinism (pass^k reliability on a
+        // small model); planning keeps the configured creative temperature.
+        if matches!(
+            request.step_kind,
+            nanna_agent::harness::StepKind::Execute | nanna_agent::harness::StepKind::Verify
+        ) {
+            config.temperature = config.temperature.min(0.3);
+        }
         let model_display = config.model.clone();
         let llm_client = self
             .router
