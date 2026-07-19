@@ -769,9 +769,44 @@ pub struct AgentStepRunner {
     pub stats: Option<nanna_agent::ModelStatsTracker>,
 }
 
+/// In-step retries for transient provider errors.
+///
+/// Bound justification: local models occasionally corrupt their own tool-call
+/// template mid-generation (observed: Ollama 500 "XML syntax error … element
+/// \<parameter\> closed by \</function\>" from qwen3.5); a fresh generation
+/// usually parses. Two retries absorb that without masking a dead endpoint —
+/// the harness circuit breaker still sees persistent failure.
+const STEP_LLM_RETRIES: usize = 2;
+
+fn is_transient_llm_error(message: &str) -> bool {
+    message.contains("API error: 5")
+        || message.contains("timed out")
+        || message.contains("connection")
+}
+
 #[async_trait::async_trait]
 impl StepRunner for AgentStepRunner {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
+        let mut last_err = String::new();
+        for attempt in 0..=STEP_LLM_RETRIES {
+            if attempt > 0 {
+                tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            // A fresh context per attempt: the re-anchor makes retries free —
+            // there is no partial transcript worth salvaging.
+            match self.try_run_step(&request).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) if is_transient_llm_error(&e) => last_err = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
+    }
+}
+
+impl AgentStepRunner {
+    async fn try_run_step(&self, request: &StepRequest) -> Result<StepOutcome, String> {
         use nanna_agent::{Agent, AgentContext, RunOptions};
 
         let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())

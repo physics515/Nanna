@@ -50,7 +50,7 @@ Budget: **false-success completions admitted must stay 0** (correctness fixture 
 anti-drift keystone), and drift containment must stay **≤ 6000 tokens** on the fixed script.
 The compliant-run rows are exact bookkeeping fixtures, not tunable budgets.
 
-### Live run — first datapoint (2026-07-18)
+### Live run (2026-07-18, after harness tuning)
 
 Instrument: `nanna-daemon/tests/live_long_horizon.rs` (`#[ignore]`d; needs Ollama). Five
 minutes-scale tasks with real acceptance checks (regex-on-file ×3, command-exit-0 ×2, one
@@ -60,22 +60,32 @@ Ollama → real file/exec tools → harness-run verification. Run with
 
 | Metric | Value | Notes |
 | --- | --- | --- |
-| Task success | **3/5 (0.60)** | qwen3.5:9b (9.7B) via Ollama — RTX 4070 Ti SUPER 16 GB |
-| Tokens per completed item | **129,093** | 375k in + 12k out; input dominates (each step's ≤8 internal iterations re-send the step context) |
-| Wall clock | **252 s** (19 steps) | run ended by the runner-error circuit breaker: 3 consecutive Ollama 500s ("XML syntax error … \<parameter\> closed by \</function\>" — model-side tool-call template corruption) with task #5 in progress |
+| Task success | **5/5 (1.00)** | qwen3.5:9b (9.7B) via Ollama — RTX 4070 Ti SUPER 16 GB |
+| Tokens per completed item | **22,564** | 109k in + 3.4k out over 6 steps |
+| Wall clock | **72 s** (6 steps) | run ended `all_tasks_done` |
+| Replans / abandonments | **0 / 0** | verdict feedback worked: task #4's first check failed, the fed-back verdict fixed it next step |
 | False-success claims admitted | **0** | harness integrity held on a real model |
 | Unverified completions | **0** | every task carried a machine check |
 | Dependency ordering | ✅ | the depends_on pair completed in order (data file → row count) |
 
-These are recorded datapoints, **not budgets yet** — they will move with model choice, retry
-policy, and task set. The first run of this eval also immediately caught a real production bug
-(scripted tools loaded without a registry handle resolved relative paths to `$HOME` instead of
-the workspace — every artifact landed in the wrong directory and 0/5 verified), which is
-exactly the class of evidence this suite exists to produce.
+These are recorded datapoints, **not budgets yet** — they will move with model choice and task
+set. The tuning trail is itself the evidence this suite exists to produce — each run caught a
+real harness/production bug:
+
+- **Run 1 — 0/5.** The model did every task correctly; every artifact landed in `$HOME`.
+  Production bug: scripted tools loaded via `load_skills_with_services` never got the registry
+  handle, so relative paths silently resolved to the home directory. Fixed.
+- **Run 2 — 3/5 @ 129k tokens/item.** Both command-based checks were unwinnable: no bare `sh`
+  on PATH ⇒ the acceptance runner silently fell back to `cmd.exe`, which cannot run
+  `test`/`$(...)`. Also 3 consecutive Ollama 500s (model-side tool-call template corruption)
+  tripped the error breaker mid-task. Fixed: acceptance commands route through Git Bash like
+  the exec tool (regression-tested), and the step runner retries transient 5xx with a fresh
+  re-anchored context.
+- **Run 3 — 5/5 @ 22.6k tokens/item, 72 s.** Above.
 
 Still open: expand to a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite
-per the P14 research note), report pass^k (k=3–5), run the 8 GB reference tier, and tune the
-step-runner retry policy so a transient provider 500 does not end an otherwise-progressing run.
+per the P14 research note), report pass^k (k=3–5) since single-run success on a small model is
+noisy, and run the 8 GB reference tier.
 
 ---
 

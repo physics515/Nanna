@@ -184,6 +184,17 @@ async fn live_task_success_at_tokens() {
     for id in plan_ids {
         let t = repo.get(id).await.expect("task");
         per_task.push(format!("  #{} [{}] {}", t.id, t.status, t.title));
+        // Activity tail: the verdict evidence for post-mortems.
+        for entry in repo.activity(id, 8).await.unwrap_or_default() {
+            let detail = entry
+                .detail
+                .map(|d| d.to_string())
+                .unwrap_or_default()
+                .chars()
+                .take(220)
+                .collect::<String>();
+            per_task.push(format!("      {} {}", entry.action, detail));
+        }
     }
     println!("\n================ LIVE LONG-HORIZON EVAL ================");
     println!("model: {model}");

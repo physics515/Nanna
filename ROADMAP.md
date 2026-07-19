@@ -121,8 +121,8 @@ Phases **1–5** and **7** are complete; **10** is mostly complete; **6** and **
 **landed together 2026-07-18**: Turso task store with hierarchy/dependencies/derived-blocked/`next()`/
 filter language, harness-run acceptance checks, the re-anchored O(1) step loop with progress-or-replan
 and budget caps, todo v0.2 + `TaskAction` IPC + GUI `/tasks` run monitor. The live on-model eval
-has its first datapoint (qwen3.5:9b: 3/5 tasks verified @ 129k tokens/item, 0 false successes
-admitted); the full eval suite (published task set, pass^k, 8 GB tier) is the open remainder. **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
+passes **5/5 verified @ 22.6k tokens/item, 72 s (qwen3.5:9b, 0 false successes admitted)** after
+same-day tuning; the full eval suite (published task set, pass^k, 8 GB tier) is the open remainder. **Two 2026-07-17 directional phases** reshape *how* the project is built rather than
 what it does: **P16** (daemon-only consolidation — delete embedded mode, GUI becomes a pure daemon client,
 iOS deferred) collapses the double-implementation tax behind most P4/P8/P11 "GUI-embedded copy drifted" debt;
 **P17** ✅ (drop the bespoke per-workspace `.nanna/` agent markdown — Nanna reads a project's *standard* files
@@ -976,9 +976,9 @@ tokens spent. Not tok/s, not context size. A run that finishes in 40k tokens bea
 deterministically testable without a model — 20+ tests incl. the Suite 4 fixtures) with daemon
 production impls in `nanna-daemon/src/tasks.rs` (`TursoTaskSource`, `AgentStepRunner` = fresh
 `Agent` + empty context per step, `TaskRunManager` for background runs) and IPC surface
-`TaskAction::StartRun/RunStatus/CancelRun` + `TaskRun*` events. The live on-model eval has its
-first recorded datapoint (3/5 verified @ 129k tokens/item on qwen3.5:9b — see the benchmark
-items below); what remains open is the full eval build-out (published task set, pass^k, 8 GB tier).
+`TaskAction::StartRun/RunStatus/CancelRun` + `TaskRun*` events. The live on-model eval passes
+**5/5 @ 22.6k tokens/item on qwen3.5:9b** after same-day harness tuning (see the benchmark items
+below); what remains open is the full eval build-out (published task set, pass^k, 8 GB tier).
 
 **Design spine — externalize state, keep the window tiny:**
 - [x] **The todo store *is* the agent's working memory** (P15) — *(2026-07-18)* a run is a loop over
@@ -1045,18 +1045,20 @@ items below); what remains open is the full eval build-out (published task set, 
       task-success @ tokens rows from scripted-model fixtures (`cargo test -p nanna-agent harness`):
       compliant runs complete 3/3 at exactly 1200 tokens/item, a perma-false-claiming model admits
       **0** completions and costs ≤ 6000 tokens before abandonment, loops abandon in < 4 steps.
-- [x] **Benchmark (live half — first datapoint):** *(2026-07-18)* the harness ran end-to-end against
-      a real local model: qwen3.5:9b via Ollama, 5 minutes-scale tasks with machine acceptance
-      checks (`nanna-daemon/tests/live_long_horizon.rs`, `#[ignore]`d). **3/5 verified-complete @
-      129k tokens/item, 252 s, 0 false-success claims admitted, dependency ordering exercised** —
-      recorded in `bench/BASELINE.md` Suite 4 (datapoints, not budgets yet). The first run also
-      caught a real production bug: scripted tools were loaded without a registry handle, so
-      relative paths resolved to `$HOME` instead of the workspace (fixed in
-      `load_skills_with_services` — every skill now gets the weak registry ref).
+- [x] **Benchmark (live half):** *(2026-07-18, tuned to 5/5 same day)* the harness runs end-to-end
+      against a real local model: qwen3.5:9b via Ollama, 5 minutes-scale tasks with machine
+      acceptance checks (`nanna-daemon/tests/live_long_horizon.rs`, `#[ignore]`d). Final:
+      **5/5 verified-complete @ 22,564 tokens/item in 72 s (6 steps), 0 replans, 0 false-success
+      claims admitted** — recorded in `bench/BASELINE.md` Suite 4 with the full tuning trail.
+      The eval earned its keep immediately: run 1 (0/5) caught scripted tools loading without the
+      registry handle (relative paths silently resolved to `$HOME` — production bug, fixed); run 2
+      (3/5) caught the acceptance runner silently falling back to `cmd.exe` when no bare `sh` is on
+      PATH (POSIX checks unwinnable — now routed through Git Bash like the exec tool,
+      regression-tested) plus Ollama 500s tripping the error breaker (now retried with a fresh
+      re-anchored context); run 3 = 5/5.
   - [ ] **Live half, full build-out:** reuse a published task set (Terminal-Bench easy-tier /
-        SWE-bench Lite per the research note), report pass^k (k=3–5), run the 8 GB reference tier,
-        and tune the step-runner retry policy (the first run ended on 3 consecutive Ollama 500s —
-        tool-call template corruption — while a task was still progressing).
+        SWE-bench Lite per the research note), report pass^k (k=3–5) — single-run success on a
+        small model is noisy — and run the 8 GB reference tier.
 
 - [x] *(research 2026-07-17 → done 2026-07-18)* Cross-checked against published work; the design held
       up and got sharper. Key findings: long-task failure is execution/context, not reasoning —
