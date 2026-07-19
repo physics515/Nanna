@@ -79,6 +79,10 @@ pub struct ControlPlane {
     status_manager: Option<Arc<StatusManager>>,
     /// Long-horizon task run manager (P14). None in minimal constructions.
     task_runs: Option<Arc<crate::tasks::TaskRunManager>>,
+    /// Shared activity clock, stamped on every chat/agent request so the
+    /// scheduled dream cycle can tell whether the system is in active use.
+    /// `None` in minimal test constructions that never dream.
+    activity: Option<Arc<crate::activity::ActivityClock>>,
 }
 
 impl ControlPlane {
@@ -107,6 +111,7 @@ impl ControlPlane {
             started_at: std::time::Instant::now(),
             status_manager: None,
             task_runs: None,
+            activity: None,
         }
     }
 
@@ -159,6 +164,7 @@ impl ControlPlane {
             started_at: std::time::Instant::now(),
             status_manager: None,
             task_runs: None,
+            activity: None,
         }
     }
 
@@ -210,6 +216,7 @@ impl ControlPlane {
             started_at: std::time::Instant::now(),
             status_manager: None,
             task_runs: None,
+            activity: None,
         }
     }
 
@@ -223,6 +230,13 @@ impl ControlPlane {
     pub fn with_event_tx(mut self, tx: tokio::sync::broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    /// Attach the shared activity clock the scheduled dream cycle reads to gate
+    /// on idleness. The control plane stamps it on every chat request (see
+    /// [`Self::handle`]); the scheduler reads its idle duration.
+    pub fn set_activity_clock(&mut self, clock: Arc<crate::activity::ActivityClock>) {
+        self.activity = Some(clock);
     }
 
     /// Attach the long-horizon task run manager (P14).
@@ -435,7 +449,17 @@ impl ControlPlane {
     /// Handle an action and return a response
     pub async fn handle(&self, client_id: &str, action: Action) -> Value {
         match action {
-            Action::Chat(chat) => self.handle_chat(client_id, chat).await,
+            Action::Chat(chat) => {
+                // A chat request is the daemon doing real work — stamp the
+                // activity clock so the scheduled dream cycle knows the system
+                // is in use and defers consolidation to a genuine lull. Only
+                // chat counts: status/log/config polls must not reset the idle
+                // gate, or a GUI polling once a second would keep it shut.
+                if let Some(clock) = &self.activity {
+                    clock.record();
+                }
+                self.handle_chat(client_id, chat).await
+            }
             Action::Session(session) => self.handle_session(client_id, session).await,
             Action::Memory(memory) => self.handle_memory(client_id, memory).await,
             Action::Config(config) => self.handle_config(client_id, config).await,

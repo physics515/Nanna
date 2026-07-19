@@ -169,6 +169,8 @@ pub(crate) async fn run_daemon(config: &Config, host: String, port: u16) -> anyh
         channels: None,
         memory_max_compression_ratio: config.memory.max_compression_ratio,
         memory_min_remaining_memories: config.memory.min_remaining_memories,
+        dream_idle_threshold_secs: config.memory.dream_idle_threshold_secs,
+        dream_memory_pressure_count: config.memory.dream_memory_pressure_count,
     };
 
     info!("Initializing daemon server...");

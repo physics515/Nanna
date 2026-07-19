@@ -11,6 +11,7 @@
 //! - Tool management
 //! - Scheduler/cron
 
+pub mod activity;
 pub mod agent_service;
 pub mod channels;
 pub mod control;
@@ -42,6 +43,7 @@ pub use protocol::{Request, Response, Event, Action, SessionAction, MemoryAction
 pub use server::{DaemonServer, DaemonConfig};
 pub use session::{Session, SessionManager, SessionId};
 pub use control::ControlPlane;
+pub use activity::ActivityClock;
 pub use health::{PidFile, PidFileError, HealthServer, HealthState, DEFAULT_HEALTH_PORT};
 pub use webhook::{WebhookServer, WebhookConfig, WebhookEvent, WebhookMessage, DEFAULT_WEBHOOK_PORT};
 pub use log_buffer::{LogBuffer, LogEntry, LogSource};

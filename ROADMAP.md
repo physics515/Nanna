@@ -816,6 +816,22 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       the new cluster-size defaults; `DaemonConfig::default` mirrors `ConsolidationConfig::default`); 41 daemon
       lib tests green, zero new clippy warnings (2067 baseline unchanged), real daemon boot reaches "Daemon
       ready" + schedules the consolidation task cleanly.
+      *(2026-07-19)* **Idle gate now WIRED into the daemon scheduler** (closes the "trigger exists but nothing
+      calls it" half). The scheduled `memory_consolidation` task ran `MemoryService::consolidate()`
+      **unconditionally every hour** regardless of activity — the shipped `dream_if_idle` gate was dead code
+      from the daemon's view. Now: a lock-free monotonic `ActivityClock` (`nanna-daemon::activity`, 8-byte
+      `AtomicU64` from a base `Instant`) is stamped by the control plane on **every `Action::Chat`** (user +
+      channel; status/log/config polls deliberately excluded so a 1 Hz GUI poll can't hold the gate shut), and
+      the scheduled dream cycle gates on `nanna_memory::dream_trigger(clock.idle(), memory.count(), cfg)` — the
+      **same pure policy** `DreamingService::dream_if_idle` uses (exported from `nanna-memory`, one source of
+      truth, no drift). Skips with a `"Skipped (active; idle Ns, N memories)"` task result while in use; runs on
+      `Idle`/`MemoryPressure`. Two config knobs (`[memory] dream_idle_threshold_secs`=300,
+      `dream_memory_pressure_count`=5000) thread through `DaemonConfig` (both construction sites + `from_nanna_config`
+      + legacy `serve.rs`). 4 `ActivityClock` tests (fresh≈0 idle, idle grows, record resets, shared-Arc monotonic)
+      + a `DaemonConfig`-mirrors-`DreamingConfig` mapping test + the 3 existing `dream_trigger` tests still green;
+      hermetic `e2e_daemon` (4/4) proves `DaemonServer::run()` boots with the new wiring. Remaining on this item:
+      the multi-phase dream *body* (merge/cluster-by-band/expand/DSP) and unifying onto one `DreamingService`
+      orchestrator (its own item) so the daemon dreams *through* it rather than the low-level `consolidate()`.
 - [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
       *(2026-07-07) Done for **all three ingest paths** (`smart_ingest`, `remember_with_importance`,
       the scoped variant) via a shared `fold_into_memory` helper: `merge_memory_content` +

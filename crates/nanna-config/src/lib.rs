@@ -332,6 +332,20 @@ pub struct MemoryConfig {
     #[serde(default = "default_min_remaining_memories")]
     pub min_remaining_memories: usize,
 
+    /// Seconds the daemon must be idle (no chat activity) before the scheduled
+    /// dream cycle is allowed to run. Dreaming competes with the live agent for
+    /// the summarizer model and rewrites the store mid-conversation, so it waits
+    /// for a genuine lull. Default: 300 (5 min).
+    #[serde(default = "default_dream_idle_threshold_secs")]
+    pub dream_idle_threshold_secs: u64,
+
+    /// Live memory count at/above which the scheduled dream cycle runs
+    /// **regardless** of idle time (memory-pressure relief, so a continuously
+    /// busy daemon still consolidates before the store grows unbounded). `0`
+    /// disables the pressure override. Default: 5000.
+    #[serde(default = "default_dream_memory_pressure_count")]
+    pub dream_memory_pressure_count: usize,
+
     // -----------------------------------------------------------------------
     // OCR settings
     // -----------------------------------------------------------------------
@@ -356,6 +370,8 @@ pub struct MemoryConfig {
 
 fn default_max_compression_ratio() -> f32 { 0.50 }
 fn default_min_remaining_memories() -> usize { 20 }
+fn default_dream_idle_threshold_secs() -> u64 { 300 }
+fn default_dream_memory_pressure_count() -> usize { 5000 }
 fn default_use_embedded_ocr() -> bool { true }
 
 impl Default for MemoryConfig {
@@ -373,6 +389,8 @@ impl Default for MemoryConfig {
             ],
             max_compression_ratio: default_max_compression_ratio(),
             min_remaining_memories: default_min_remaining_memories(),
+            dream_idle_threshold_secs: default_dream_idle_threshold_secs(),
+            dream_memory_pressure_count: default_dream_memory_pressure_count(),
             ocr_model_priority: vec![],
             use_embedded_ocr: default_use_embedded_ocr(),
         }

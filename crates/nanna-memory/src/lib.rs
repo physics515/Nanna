@@ -19,7 +19,7 @@ pub use consolidation::{
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
 };
 pub use dreaming::{
-    DreamingConfig, DreamingService, DreamingStats, MemoryFeedback,
+    dream_trigger, DreamTrigger, DreamingConfig, DreamingService, DreamingStats, MemoryFeedback,
     make_summarize_fn, LlmSummarizer,
 };
 pub use fsrs::{
