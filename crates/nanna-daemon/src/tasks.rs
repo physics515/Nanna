@@ -18,7 +18,7 @@ use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
 use nanna_agent::harness::{
     AcceptanceCheck, LongHorizonConfig, LongHorizonReport, LongHorizonRunner, StepOutcome,
-    StepRequest, StepRunner, StepToolCall, TaskSource, TaskStep,
+    StepRequest, StepRunner, StepToolCall, StopReason, TaskSource, TaskStep,
 };
 use nanna_scripting::ServiceFn;
 use nanna_storage::{NewTask, Storage, StorageError, Task, TaskPatch};
@@ -1042,6 +1042,151 @@ fn digest(content: &str) -> String {
 // Run manager
 // ---------------------------------------------------------------------------
 
+/// Restart the local Ollama server: kill `ollama.exe` only (the tray
+/// supervisor respawns it) and wait for the API to come back.
+///
+/// This is the cure for the sticky degraded-runner state (every generation
+/// aborted with `done:false`; model unloads do not clear it — verified live).
+/// Callers gate it: bouncing a shared local service is an operator decision.
+pub async fn restart_ollama_server() -> bool {
+    tracing::warn!("restarting the Ollama server (degraded runner state)");
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "ollama.exe"])
+        .output();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("pkill")
+        .args(["-x", "ollama"])
+        .output();
+    let base =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let up = reqwest::Client::new()
+            .get(format!("{base}/api/version"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if up {
+            info!("Ollama is back after restart");
+            return true;
+        }
+    }
+    tracing::warn!("Ollama did not come back within 60s of restart");
+    false
+}
+
+/// Whether runs may restart the Ollama server as last-resort healing.
+/// ON by default (owner decision): the degraded state bricks every client of
+/// the server anyway, and a restart is the only known cure. Set
+/// `NANNA_OLLAMA_RESTART_ON_DEGRADED=0` to opt out on setups where bouncing
+/// the shared server is unacceptable.
+fn ollama_restart_allowed() -> bool {
+    std::env::var("NANNA_OLLAMA_RESTART_ON_DEGRADED").as_deref() != Ok("0")
+}
+
+/// Fold per-segment reports into one run-level report: counters sum, the
+/// stop reason is the final segment's, and tokens-per-item is recomputed
+/// over the aggregate.
+fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
+    let mut folded = segments.last().cloned().unwrap_or(LongHorizonReport {
+        stop: StopReason::AllTasksDone,
+        steps_taken: 0,
+        items_completed: 0,
+        items_completed_unverified: 0,
+        items_abandoned: 0,
+        replans: 0,
+        false_success_claims: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        wall_clock_secs: 0,
+        tokens_per_completed_item: None,
+    });
+    folded.steps_taken = segments.iter().map(|r| r.steps_taken).sum();
+    folded.items_completed = segments.iter().map(|r| r.items_completed).sum();
+    folded.items_completed_unverified =
+        segments.iter().map(|r| r.items_completed_unverified).sum();
+    folded.items_abandoned = segments.iter().map(|r| r.items_abandoned).sum();
+    folded.replans = segments.iter().map(|r| r.replans).sum();
+    folded.false_success_claims = segments.iter().map(|r| r.false_success_claims).sum();
+    folded.input_tokens = segments.iter().map(|r| r.input_tokens).sum();
+    folded.output_tokens = segments.iter().map(|r| r.output_tokens).sum();
+    folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
+    folded.tokens_per_completed_item = if folded.items_completed > 0 {
+        Some((folded.input_tokens + folded.output_tokens) / folded.items_completed as u64)
+    } else {
+        None
+    };
+    folded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(
+        steps: usize,
+        completed: usize,
+        tokens_in: u64,
+        tokens_out: u64,
+        stop: StopReason,
+    ) -> LongHorizonReport {
+        LongHorizonReport {
+            stop,
+            steps_taken: steps,
+            items_completed: completed,
+            items_completed_unverified: 0,
+            items_abandoned: 0,
+            replans: 0,
+            false_success_claims: 0,
+            input_tokens: tokens_in,
+            output_tokens: tokens_out,
+            wall_clock_secs: 60,
+            tokens_per_completed_item: None,
+        }
+    }
+
+    #[test]
+    fn fold_sums_counters_and_keeps_the_final_stop() {
+        let folded = fold_reports(&[
+            seg(
+                10,
+                3,
+                1000,
+                100,
+                StopReason::RunnerErrors {
+                    message: "x".to_string(),
+                },
+            ),
+            seg(5, 2, 500, 50, StopReason::AllTasksDone),
+        ]);
+        assert_eq!(folded.steps_taken, 15);
+        assert_eq!(folded.items_completed, 5);
+        assert_eq!(folded.input_tokens, 1500);
+        assert_eq!(folded.wall_clock_secs, 120);
+        assert_eq!(folded.stop, StopReason::AllTasksDone, "final segment's stop wins");
+        assert_eq!(
+            folded.tokens_per_completed_item,
+            Some(330),
+            "recomputed over the aggregate (1650/5)"
+        );
+    }
+
+    #[test]
+    fn fold_with_zero_completions_has_no_per_item_rate() {
+        let folded = fold_reports(&[seg(4, 0, 100, 10, StopReason::WallClockExhausted)]);
+        assert_eq!(folded.tokens_per_completed_item, None);
+    }
+
+    #[test]
+    fn fold_of_nothing_is_a_benign_empty_report() {
+        let folded = fold_reports(&[]);
+        assert_eq!(folded.steps_taken, 0);
+        assert_eq!(folded.stop, StopReason::AllTasksDone);
+    }
+}
+
 /// A live long-horizon run.
 struct ActiveRun {
     cancel: Arc<AtomicBool>,
@@ -1056,6 +1201,8 @@ pub struct RunStatus {
     pub goal: Option<String>,
     pub started_at: Option<String>,
     pub last_report: Option<LongHorizonReport>,
+    /// Provider incidents healed by resuming the plan (0 when none).
+    pub resumes: usize,
 }
 
 /// Starts, cancels, and reports background long-horizon runs — one per scope
@@ -1064,7 +1211,7 @@ pub struct RunStatus {
 #[derive(Default)]
 pub struct TaskRunManager {
     runs: RwLock<HashMap<String, ActiveRun>>,
-    reports: RwLock<HashMap<String, LongHorizonReport>>,
+    reports: RwLock<HashMap<String, (LongHorizonReport, usize)>>,
 }
 
 impl TaskRunManager {
@@ -1119,14 +1266,60 @@ impl TaskRunManager {
 
         let manager = self.clone();
         tokio::spawn(async move {
-            let report = LongHorizonRunner::new(config)
-                .run(&goal, &source, &runner, &workdir, Some(cancel))
-                .await;
+            // Bounded auto-resume (standard for every model): the task store
+            // IS the checkpoint, so a run stopped by a provider incident is
+            // resumed by simply starting again — next() picks up exactly
+            // where the plan stands. Bound: 8 resumes tolerates an incident
+            // every ~40 minutes of a long run without letting a permanently
+            // dead provider spin forever.
+            const RUN_RESUMES_MAX: usize = 8;
+            let started = std::time::Instant::now();
+            let mut segments: Vec<LongHorizonReport> = Vec::new();
+            let mut resumes = 0usize;
+            loop {
+                let remaining = config.max_wall_clock.saturating_sub(started.elapsed());
+                let segment_config = LongHorizonConfig {
+                    max_wall_clock: remaining,
+                    ..config.clone()
+                };
+                let report = LongHorizonRunner::new(segment_config)
+                    .run(&goal, &source, &runner, &workdir, Some(cancel.clone()))
+                    .await;
+                let provider_died = matches!(report.stop, StopReason::RunnerErrors { .. });
+                segments.push(report);
+                if !provider_died
+                    || resumes >= RUN_RESUMES_MAX
+                    || started.elapsed() >= config.max_wall_clock
+                {
+                    break;
+                }
+                resumes += 1;
+                tracing::warn!(
+                    scope = %scope,
+                    resumes,
+                    "provider incident — healing and resuming the plan"
+                );
+                let _ = event_tx.send(Event::TaskRunProgress {
+                    scope: scope.clone(),
+                    scope_id: scope_id.clone(),
+                    task_id: None,
+                    kind: "resumed".to_string(),
+                    detail: serde_json::json!({ "resumes": resumes }),
+                });
+                // Healing ladder: server restart only when the operator
+                // allowed it; otherwise a model-runner reset.
+                if !(ollama_restart_allowed() && restart_ollama_server().await) {
+                    runner.reset_ollama_runner().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+            let report = fold_reports(&segments);
             info!(
                 scope = %scope,
                 stop = ?report.stop,
                 items_completed = report.items_completed,
                 tokens_per_item = ?report.tokens_per_completed_item,
+                resumes,
                 "Long-horizon run finished"
             );
             let _ = event_tx.send(Event::TaskRunCompleted {
@@ -1135,7 +1328,7 @@ impl TaskRunManager {
                 report: serde_json::to_value(&report).unwrap_or(Value::Null),
             });
             manager.runs.write().await.remove(&key);
-            manager.reports.write().await.insert(key, report);
+            manager.reports.write().await.insert(key, (report, resumes));
         });
         Ok(())
     }
@@ -1155,18 +1348,23 @@ impl TaskRunManager {
         let key = Self::scope_key(scope, scope_id);
         let runs = self.runs.read().await;
         let reports = self.reports.read().await;
+        let (last_report, resumes) = reports
+            .get(&key)
+            .map_or((None, 0), |(report, resumes)| (Some(report.clone()), *resumes));
         runs.get(&key).map_or_else(
             || RunStatus {
                 running: false,
                 goal: None,
                 started_at: None,
-                last_report: reports.get(&key).cloned(),
+                last_report: last_report.clone(),
+                resumes,
             },
             |run| RunStatus {
                 running: true,
                 goal: Some(run.goal.clone()),
                 started_at: Some(run.started_at.to_rfc3339()),
-                last_report: reports.get(&key).cloned(),
+                last_report: last_report.clone(),
+                resumes,
             },
         )
     }

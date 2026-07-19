@@ -773,31 +773,12 @@ async fn restart_ollama_server() -> bool {
         return false;
     }
     println!("[heal] restarting the Ollama server (degraded runner state)");
-    // Kill only ollama.exe (the server); the "ollama app" tray supervisor
-    // respawns it.
-    #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "ollama.exe"])
-        .output();
-    #[cfg(not(windows))]
-    let _ = std::process::Command::new("pkill")
-        .args(["-x", "ollama"])
-        .output();
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let up = reqwest::Client::new()
-            .get("http://localhost:11434/api/version")
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success());
-        if up {
-            println!("[heal] Ollama is back");
-            return true;
-        }
-    }
-    println!("[heal] Ollama did not come back within 60s");
-    false
+    let healed = nanna_daemon::tasks::restart_ollama_server().await;
+    println!(
+        "[heal] {}",
+        if healed { "Ollama is back" } else { "Ollama did not come back within 60s" }
+    );
+    healed
 }
 
 /// The endurance run: 42 dependency-chained fail-to-pass features. Progress
