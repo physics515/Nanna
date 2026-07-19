@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum MemoryError {
@@ -78,6 +78,27 @@ pub enum MemoryError {
 /// Implementors are responsible for durably storing and retrieving memory entries.
 /// The in-memory vector cache remains the primary store for search; this layer
 /// provides crash-safe persistence.
+/// Result of loading the durable store, including any rows skipped as corrupt.
+#[derive(Debug, Default)]
+pub struct LoadReport {
+    pub entries: Vec<MemoryEntry>,
+    /// Rows that existed but could not be read (corrupt payload / overflow chain).
+    pub corrupt_rows: usize,
+    /// Total rows the table reported (`entries.len() + corrupt_rows` on a salvage).
+    pub expected: usize,
+}
+
+/// Health of the durable memory store after the startup load. `degraded` is true
+/// when any row was unreadable, so it can be surfaced instead of the silent
+/// "loaded 0 of N" that a whole-table corruption used to cause.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryStoreHealth {
+    pub degraded: bool,
+    pub corrupt_rows: usize,
+    pub loaded: usize,
+    pub expected: usize,
+}
+
 #[async_trait]
 pub trait MemoryPersistence: Send + Sync {
     /// Persist (insert or update) a single entry.
@@ -90,6 +111,17 @@ pub trait MemoryPersistence: Send + Sync {
     async fn update_entry_content(&self, id: &str, content: &str) -> Result<(), MemoryError>;
     /// Load all persisted entries (called on startup to populate the in-memory cache).
     async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError>;
+
+    /// Load all entries with a corruption report (rows skipped as unreadable).
+    ///
+    /// The default delegates to [`load_all`](Self::load_all) and reports zero
+    /// corruption; a backing store able to salvage individual rows overrides this
+    /// so one bad row no longer aborts the whole load.
+    async fn load_all_report(&self) -> Result<LoadReport, MemoryError> {
+        let entries = self.load_all().await?;
+        let expected = entries.len();
+        Ok(LoadReport { entries, corrupt_rows: 0, expected })
+    }
 }
 
 /// A memory entry with embedding, metadata, and FSRS cognitive state
@@ -168,10 +200,13 @@ pub struct VectorStore {
     /// When set, writes (add/remove/update) are mirrored to the backing store.
     /// Search always operates purely in-memory.
     db: Option<Arc<dyn MemoryPersistence + Send + Sync>>,
+    /// Durable-store health from the last `load_from_db` (degraded if any row was
+    /// unreadable). Surfaced so a corrupt store isn't a silent empty one.
+    store_health: RwLock<MemoryStoreHealth>,
 }
 
 impl VectorStore {
-    #[must_use] 
+    #[must_use]
     pub fn new(config: VectorStoreConfig) -> Self {
         Self {
             config,
@@ -179,6 +214,7 @@ impl VectorStore {
             gpu: None,
             gpu_pipeline: None,
             db: None,
+            store_health: RwLock::new(MemoryStoreHealth::default()),
         }
     }
 
@@ -198,6 +234,7 @@ impl VectorStore {
                             gpu: Some(ctx),
                             gpu_pipeline: Some(pipeline),
                             db: None,
+                            store_health: RwLock::new(MemoryStoreHealth::default()),
                         }
                     }
                     Err(e) => {
@@ -236,15 +273,51 @@ impl VectorStore {
             return Err(MemoryError::Persistence("No persistence backend attached".to_string()));
         };
 
-        let loaded = db.load_all().await?;
-        let count = loaded.len();
+        let report = match db.load_all_report().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Whole-store load failed (e.g. btree corruption the salvage could
+                // not localize to a single row). Mark the store degraded so
+                // `/status` doesn't report a corrupt store as healthy-but-empty,
+                // then surface the error as before.
+                *self.store_health.write().await = MemoryStoreHealth {
+                    degraded: true,
+                    corrupt_rows: 0,
+                    loaded: 0,
+                    expected: 0,
+                };
+                error!("Memory store load FAILED ({e}); marked degraded (0 loaded)");
+                return Err(e);
+            }
+        };
+        let count = report.entries.len();
 
-        let mismatched = loaded.iter()
+        // Record + surface durable-store health. A salvage load skips only the
+        // corrupt rows rather than dropping the whole table, so make any loss
+        // loud instead of the silent "loaded 0 of N" a corrupt store used to give.
+        // `degraded` tracks genuine corruption (data loss); benign no-embedding
+        // rows (readable, just not searchable) don't count.
+        let degraded = report.corrupt_rows > 0;
+        *self.store_health.write().await = MemoryStoreHealth {
+            degraded,
+            corrupt_rows: report.corrupt_rows,
+            loaded: count,
+            expected: report.expected,
+        };
+        if degraded {
+            error!(
+                "Memory store DEGRADED: loaded {} of {} rows; {} unreadable (corrupt). \
+                 Those memories are lost until the store is repaired.",
+                count, report.expected, report.corrupt_rows
+            );
+        }
+
+        let mismatched = report.entries.iter()
             .filter(|e| e.embedding.len() != self.config.get_dimension())
             .count();
 
         if mismatched > 0 {
-            let sample_dim = loaded.iter()
+            let sample_dim = report.entries.iter()
                 .find(|e| e.embedding.len() != self.config.get_dimension())
                 .map(|e| e.embedding.len())
                 .unwrap_or(0);
@@ -256,9 +329,15 @@ impl VectorStore {
         }
 
         let mut entries = self.entries.write().await;
-        *entries = loaded;
+        *entries = report.entries;
         info!("Loaded {} entries from persistence backend", count);
         Ok(count)
+    }
+
+    /// Durable-store health recorded by the last [`load_from_db`](Self::load_from_db).
+    /// `degraded` is true if any row was unreadable (corrupt).
+    pub async fn store_health(&self) -> MemoryStoreHealth {
+        *self.store_health.read().await
     }
 
     /// Check if GPU acceleration is available.
@@ -847,6 +926,113 @@ mod tests {
             .await;
         assert_eq!(results.len(), 1);
         assert!(results[0].1 > 0.99);  // Should be very similar
+    }
+
+    fn health_test_entry(id: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: "c".to_string(),
+            embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        }
+    }
+
+    // A persistence whose salvage load reports corruption — proves store_health
+    // surfacing without needing a real corrupt DB.
+    struct DegradedDb;
+    #[async_trait]
+    impl MemoryPersistence for DegradedDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![health_test_entry("ok0"), health_test_entry("ok1")])
+        }
+        async fn load_all_report(&self) -> Result<LoadReport, MemoryError> {
+            Ok(LoadReport {
+                entries: vec![health_test_entry("ok0"), health_test_entry("ok1")],
+                corrupt_rows: 3,
+                expected: 5,
+            })
+        }
+    }
+
+    // A persistence with no salvage override — the default load_all_report reports
+    // zero corruption.
+    struct CleanDb;
+    #[async_trait]
+    impl MemoryPersistence for CleanDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Ok(vec![health_test_entry("ok")])
+        }
+    }
+
+    #[tokio::test]
+    async fn store_health_reflects_salvage_report() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config).with_persistence(Arc::new(DegradedDb));
+        let loaded = store.load_from_db().await.unwrap();
+        assert_eq!(loaded, 2);
+        let h = store.store_health().await;
+        assert!(h.degraded);
+        assert_eq!(h.corrupt_rows, 3);
+        assert_eq!(h.loaded, 2);
+        assert_eq!(h.expected, 5);
+    }
+
+    #[tokio::test]
+    async fn store_health_clean_when_no_corruption() {
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config).with_persistence(Arc::new(CleanDb));
+        store.load_from_db().await.unwrap();
+        let h = store.store_health().await;
+        assert!(!h.degraded);
+        assert_eq!(h.corrupt_rows, 0);
+        assert_eq!(h.loaded, 1);
+        assert_eq!(h.expected, 1);
+    }
+
+    // A persistence whose whole load fails (e.g. btree corruption the salvage
+    // can't localize to a row).
+    struct FailingDb;
+    #[async_trait]
+    impl MemoryPersistence for FailingDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+            Err(MemoryError::Persistence("inconsistent overflow chain".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn store_health_degraded_when_whole_load_fails() {
+        // A whole-store load failure must still mark the store degraded, so
+        // /status can't report a corrupt store as healthy-but-empty.
+        let config = VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        };
+        let store = VectorStore::new(config).with_persistence(Arc::new(FailingDb));
+        assert!(store.load_from_db().await.is_err());
+        let h = store.store_health().await;
+        assert!(h.degraded, "a whole-store load failure must mark degraded");
+        assert_eq!(h.loaded, 0);
     }
 
     #[tokio::test]

@@ -441,13 +441,9 @@ impl ToolRegistry {
             }
         }
 
-        // Log result summary
-        let output_preview = if result.content.len() > 200 {
-            let end = truncate_boundary(&result.content, 200);
-            format!("{}...", &result.content[..end])
-        } else {
-            result.content.clone()
-        };
+        // Log result summary. On failure the error text lives in `result.error`
+        // (`ToolResult::error` leaves `content` empty), so the preview prefers it.
+        let output_preview = result_log_preview(&result);
         
         if result.success {
             debug!("Tool {} completed in {}ms: {}", call.name, duration_ms, output_preview);
@@ -640,6 +636,31 @@ fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// Build a bounded, char-boundary-safe log preview for a tool result.
+///
+/// On failure the message lives in `error` (`ToolResult::error` leaves
+/// `content` empty), so prefer it; fall back to `content` for tools that set
+/// `success = false` with their own content and no `error`. Without this the
+/// failure log line rendered empty (`"Tool exec failed in 1ms: "`), hiding the
+/// actual reason.
+fn result_log_preview(result: &ToolResult) -> String {
+    let source = if result.success {
+        result.content.as_str()
+    } else {
+        result
+            .error
+            .as_deref()
+            .filter(|e| !e.is_empty())
+            .unwrap_or(result.content.as_str())
+    };
+    if source.len() > 200 {
+        let end = truncate_boundary(source, 200);
+        format!("{}...", &source[..end])
+    } else {
+        source.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -878,5 +899,40 @@ mod tests {
 
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "e");
+    }
+
+    // --- result_log_preview (failure log detail) ---
+
+    #[test]
+    fn result_log_preview_uses_error_on_failure() {
+        // Regression: previously the failure log rendered `content` (empty for
+        // `ToolResult::error`), so the reason was invisible.
+        let r = ToolResult::error("connection refused");
+        assert_eq!(result_log_preview(&r), "connection refused");
+    }
+
+    #[test]
+    fn result_log_preview_uses_content_on_success() {
+        let r = ToolResult::success("ok output");
+        assert_eq!(result_log_preview(&r), "ok output");
+    }
+
+    #[test]
+    fn result_log_preview_falls_back_to_content_when_no_error() {
+        let r = ToolResult {
+            success: false,
+            content: "partial".into(),
+            error: None,
+            data: None,
+        };
+        assert_eq!(result_log_preview(&r), "partial");
+    }
+
+    #[test]
+    fn result_log_preview_truncates_on_char_boundary() {
+        let r = ToolResult::error("é".repeat(300)); // multi-byte, well over 200 bytes
+        let preview = result_log_preview(&r);
+        assert!(preview.ends_with("..."));
+        assert!(preview.len() <= 203);
     }
 }

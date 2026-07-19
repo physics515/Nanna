@@ -82,6 +82,117 @@ fn classify_windows_command(trimmed: &str) -> WinShell {
     }
 }
 
+/// Rewrite the small set of cmd.exe idioms that Git Bash rejects.
+///
+/// Currently only `cd /d <path>` → `cd <path>`. `/d` is a cmd.exe-only flag
+/// ("also change drive"); Git Bash's `cd` treats it as a second argument and
+/// dies with "cd: too many arguments" (observed in a real run log). We strip
+/// `/d` (case-insensitive) ONLY when it is a whole token immediately after a
+/// command-boundary `cd` AND a further token follows — the exact cmd idiom. A
+/// bare `cd /d`, `cd /data`, `cd /d/x`, a quoted occurrence, or a non-boundary
+/// `cd` are all left alone, so no currently-working command changes. Handles the
+/// idiom at every command boundary in a compound command (`cd /d D:\x && …`).
+///
+/// Pure (no IO). Windows-only: on Unix `cd /d` legitimately means dir `/d`.
+#[cfg(windows)]
+fn normalize_cmdisms(command: &str) -> std::borrow::Cow<'_, str> {
+    if !(command.contains("/d") || command.contains("/D")) {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    let b = command.as_bytes();
+    let n = b.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut changed = false;
+    let mut i = 0usize;
+    let mut at_boundary = true; // start of string is a command boundary
+    let mut quote: u8 = 0; // 0 = none, else b'\'' / b'"'
+    while i < n {
+        let c = b[i];
+        if quote != 0 {
+            out.push(c);
+            if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            quote = c;
+            out.push(c);
+            i += 1;
+            at_boundary = false;
+            continue;
+        }
+        if at_boundary {
+            if c == b' ' || c == b'\t' {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if let Some(path_off) = match_cd_slash_d(&b[i..]) {
+                out.extend_from_slice(b"cd ");
+                i += path_off; // resume at the path token
+                changed = true;
+                at_boundary = false;
+                continue;
+            }
+            at_boundary = false;
+        }
+        out.push(c);
+        // These open a new command boundary for the NEXT char.
+        if matches!(c, b';' | b'\n' | b'(' | b'|' | b'&') {
+            at_boundary = true;
+        }
+        i += 1;
+    }
+    if changed {
+        // Safe: we only ever copied original bytes verbatim plus ASCII "cd ".
+        std::borrow::Cow::Owned(String::from_utf8(out).unwrap_or_else(|_| command.to_string()))
+    } else {
+        std::borrow::Cow::Borrowed(command)
+    }
+}
+
+/// If `s` begins with the cmd idiom `cd /d <path…>`, return the byte offset of
+/// the path token (so the caller can emit `cd ` then resume there). Requires
+/// `cd`+ws, then `/d` or `/D` as a whole token (ws after), then a following
+/// token. Otherwise `None`.
+#[cfg(windows)]
+fn match_cd_slash_d(s: &[u8]) -> Option<usize> {
+    // `cd` (case-insensitive) then whitespace.
+    if s.len() < 3 {
+        return None;
+    }
+    if !(s[0] | 0x20 == b'c' && s[1] | 0x20 == b'd') {
+        return None;
+    }
+    if !(s[2] == b' ' || s[2] == b'\t') {
+        return None;
+    }
+    let mut j = 3;
+    while j < s.len() && (s[j] == b' ' || s[j] == b'\t') {
+        j += 1;
+    }
+    // `/d` or `/D` as a whole token.
+    if j + 2 >= s.len() {
+        return None;
+    }
+    if s[j] != b'/' || (s[j + 1] | 0x20) != b'd' {
+        return None;
+    }
+    if !(s[j + 2] == b' ' || s[j + 2] == b'\t') {
+        return None; // must be a whole token, not `/data` or `/d/x`
+    }
+    let mut k = j + 3;
+    while k < s.len() && (s[k] == b' ' || s[k] == b'\t') {
+        k += 1;
+    }
+    if k >= s.len() {
+        return None; // no path token follows → not the idiom
+    }
+    Some(k)
+}
+
 /// Locate Git-for-Windows `bash.exe`, cached. Explicitly **not** WSL's
 /// `C:\Windows\System32\bash.exe` (different filesystem semantics), only a real
 /// Git Bash under a `Git\bin` install. Returns `None` if Git Bash isn't installed.
@@ -316,6 +427,15 @@ impl NannaBridge {
                 "Shell execution is not available on mobile platforms".to_string(),
             ));
         }
+
+        // Rewrite cmd.exe idioms Git Bash rejects (e.g. `cd /d`) before routing,
+        // so a model that emits cmd.exe habits doesn't hit "cd: too many arguments".
+        // Every downstream use of `command` (python detect, classify, shell args,
+        // timeout auto-detect, tracing) transparently sees the normalized string.
+        #[cfg(windows)]
+        let normalized = normalize_cmdisms(command);
+        #[cfg(windows)]
+        let command: &str = normalized.as_ref();
 
         // Determine shell based on OS.
         // On Windows, route commands to the appropriate shell:
@@ -847,6 +967,45 @@ fn strip_ansi_escapes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_strips_cd_slash_d_idiom() {
+        for (input, want) in [
+            ("cd /d D:/x", "cd D:/x"),
+            ("cd /D D:/x", "cd D:/x"),
+            (
+                "cd /d D:/Development/nanna && cargo build",
+                "cd D:/Development/nanna && cargo build",
+            ),
+            ("  cd /d D:/x", "  cd D:/x"),                 // leading ws preserved
+            ("git fetch && cd /d D:/x", "git fetch && cd D:/x"),
+            ("cd /d D:\\x", "cd D:\\x"),                   // backslash path still stripped
+        ] {
+            assert_eq!(normalize_cmdisms(input).as_ref(), want, "input: {input}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_leaves_legit_commands_untouched() {
+        for input in [
+            "cd /d",                           // bare: POSIX cd into dir /d
+            "cd /data",                        // path starting /d, not the /d token
+            "cd /d/x",                         // dir /d/x
+            "ls -la | head -20",
+            "cargo build",
+            "echo cd /d not-command-initial",  // cd not at a boundary
+            "echo \"cd /d x\"",                // inside quotes
+        ] {
+            assert_eq!(normalize_cmdisms(input).as_ref(), input, "input: {input}");
+            // Borrowed (no allocation) when unchanged.
+            assert!(
+                matches!(normalize_cmdisms(input), std::borrow::Cow::Borrowed(_)),
+                "input: {input}"
+            );
+        }
+    }
 
     #[cfg(windows)]
     #[test]

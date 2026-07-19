@@ -767,6 +767,155 @@ pub struct Agent {
     tool_stats: Option<crate::tool_stats::ToolStatsTracker>,
 }
 
+/// Assembles a streaming assistant turn, keying each content block by its
+/// `index`.
+///
+/// The provider streams `ContentBlockStart{index}` / `ToolUseDelta{index}` /
+/// `ContentBlockStop{index}` events. Crucially, OpenAI-compatible providers
+/// (OpenRouter, Ollama) open *all* tool-call blocks and only emit their
+/// `ContentBlockStop`s together at the end — so a single-slot accumulator
+/// concatenated multiple tool calls' argument fragments into one buffer and
+/// mis-attributed them (the JSON healer then salvaged only the first object and
+/// the rest were dropped). Keying tool state by index and finalizing each block
+/// on its *own* stop fixes that; Anthropic-native streaming (which interleaves
+/// one stop per block) is unaffected. Pure structural accumulation — no
+/// callbacks or IO — so it is unit-testable against synthetic event sequences.
+#[derive(Default)]
+struct StreamBlockAssembler {
+    /// Accumulated text (index-0 / text blocks). Also the returned `LlmResult.text`.
+    text: String,
+    /// Current thinking block content.
+    thinking_text: String,
+    /// Current thinking block signature.
+    thinking_signature: String,
+    /// Active non-tool block type ("text"/"thinking") for stop routing.
+    current_block_type: String,
+    /// In-flight tool blocks: index -> (id, name, json_buffer). Drained on stop.
+    tool_blocks: std::collections::BTreeMap<usize, (String, String, String)>,
+    tool_uses: Vec<(String, String, Value)>,
+    content_blocks: Vec<ContentBlock>,
+    error_tool_results: Vec<ContentBlock>,
+}
+
+impl StreamBlockAssembler {
+    fn on_text(&mut self, t: &str) {
+        self.text.push_str(t);
+    }
+    fn on_thinking(&mut self, t: &str) {
+        self.thinking_text.push_str(t);
+    }
+    fn on_signature(&mut self, s: &str) {
+        self.thinking_signature.push_str(s);
+    }
+    fn on_block_start(
+        &mut self,
+        index: usize,
+        content_type: String,
+        tool_id: Option<String>,
+        tool_name: Option<String>,
+    ) {
+        if content_type == "tool_use" {
+            self.tool_blocks.insert(
+                index,
+                (tool_id.unwrap_or_default(), tool_name.unwrap_or_default(), String::new()),
+            );
+        } else {
+            // text/thinking are single-active in every provider.
+            self.current_block_type = content_type;
+        }
+    }
+    fn on_tool_delta(&mut self, index: usize, partial: &str) {
+        // `or_default` tolerates a stray delta arriving before its start event.
+        self.tool_blocks.entry(index).or_default().2.push_str(partial);
+    }
+    /// Finalize the block at `index`. Returns `true` if it was a thinking-block
+    /// close (the caller then emits the trailing-newline side effects).
+    fn on_block_stop(&mut self, index: usize) -> bool {
+        if let Some((id, name, json)) = self.tool_blocks.remove(&index) {
+            self.finalize_tool(id, name, json);
+            return false;
+        }
+        if self.current_block_type == "thinking" {
+            if !self.thinking_text.is_empty() {
+                let sig = if self.thinking_signature.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.thinking_signature))
+                };
+                self.content_blocks.push(ContentBlock::Thinking {
+                    thinking: std::mem::take(&mut self.thinking_text),
+                    signature: sig,
+                });
+            }
+            self.thinking_text.clear();
+            self.thinking_signature.clear();
+            self.current_block_type.clear();
+            return true;
+        }
+        if !self.text.is_empty() {
+            self.content_blocks.push(ContentBlock::Text { text: self.text.clone() });
+        }
+        self.current_block_type.clear();
+        false
+    }
+    fn finalize_tool(&mut self, id: String, name: String, mut json: String) {
+        if id.is_empty() {
+            return; // never started properly — drop
+        }
+        if json.trim().is_empty() {
+            json = "{}".to_string();
+        }
+        // After per-index accumulation this should be <=1; >1 means a genuine
+        // collapse still slipped through (single provider block carrying multiple
+        // objects) — surface it rather than silently salvaging the first.
+        let obj_count = nanna_llm::count_balanced_top_level_objects(&json);
+        if obj_count > 1 {
+            warn!(
+                tool_id = %id,
+                tool_name = %name,
+                obj_count,
+                json = %json,
+                "Multiple balanced top-level JSON objects in a single tool block — streaming collapse; salvaging first only"
+            );
+        }
+        match nanna_llm::heal_json(&json) {
+            Some(input) => {
+                if serde_json::from_str::<Value>(&json).is_err() {
+                    warn!(
+                        tool_id = %id,
+                        tool_name = %name,
+                        original_json = %json,
+                        healed = %input,
+                        "Healed malformed tool_use JSON from stream"
+                    );
+                }
+                self.tool_uses.push((id.clone(), name.clone(), input.clone()));
+                self.content_blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            None => {
+                warn!(
+                    tool_id = %id,
+                    tool_name = %name,
+                    json = %json,
+                    "Failed to heal tool_use JSON from stream — returning error to model"
+                );
+                self.content_blocks.push(ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::json!({}),
+                });
+                self.error_tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: format!(
+                        "Error: Your tool call for '{name}' had malformed JSON arguments and could not be parsed. Please retry with valid JSON."
+                    ),
+                    is_error: Some(true),
+                });
+            }
+        }
+    }
+}
+
 impl Agent {
     pub fn new(config: AgentConfig, llm: Arc<LlmClient>, tools: Arc<ToolRegistry>) -> Self {
         let context = AgentContext::new(Uuid::new_v4().to_string())
@@ -1722,22 +1871,14 @@ impl Agent {
         use std::pin::pin;
 
         let mut stream = pin!(self.llm.stream_anthropic(request));
-        let mut tool_uses = Vec::new();
-        let mut response_text = String::new();
-        let mut content_blocks = Vec::new();
+        // Per-index block accumulator — keys tool state by ContentBlock index so
+        // multiple tool calls in one turn are no longer collapsed/mis-attributed.
+        let mut asm = StreamBlockAssembler::default();
         let mut output_tokens = 0u32;
         // Prompt-side usage arrives in the `message_start` event (Anthropic).
         let mut input_tokens = 0u32;
         let mut cache_read_tokens = 0u32;
         let mut cache_creation_tokens = 0u32;
-        let mut pending_error_tool_results: Vec<ContentBlock> = Vec::new();
-
-        let mut current_tool_id = String::new();
-        let mut current_tool_name = String::new();
-        let mut current_tool_json = String::new();
-        let mut current_block_type = String::new();
-        let mut current_thinking_signature = String::new();
-        let mut current_thinking_text = String::new(); // per-block thinking content
         let mut narration_check_len = 0usize; // track text length at last narration check
 
         while let Some(event) = stream.next().await {
@@ -1751,33 +1892,33 @@ impl Agent {
             match event? {
                 StreamEvent::TextDelta { text, .. } => {
                     on_text(&text);
-                    response_text.push_str(&text);
+                    asm.on_text(&text);
                     state.streamed_text.push_str(&text);
 
                     // Periodically check for narration loops and degenerate
                     // repetition (every ~8000 chars of text)
-                    if response_text.len() - narration_check_len > 8000 {
-                        narration_check_len = response_text.len();
+                    if asm.text.len() - narration_check_len > 8000 {
+                        narration_check_len = asm.text.len();
                         let has_tool_history = !state.tool_records.is_empty();
-                        if detect_narration_loop(&response_text, has_tool_history) {
+                        if detect_narration_loop(&asm.text, has_tool_history) {
                             warn!(
-                                text_len = response_text.len(),
+                                text_len = asm.text.len(),
                                 "🔄 Narration loop detected in streaming response — aborting stream"
                             );
                             // Append a notice and break out of the stream
                             let notice = "\n\n[I got stuck narrating instead of acting. Let me try again with a focused approach.]";
                             on_text(notice);
-                            response_text.push_str(notice);
+                            asm.text.push_str(notice);
                             break;
                         }
-                        if detect_repetition(&response_text) {
+                        if detect_repetition(&asm.text) {
                             warn!(
-                                text_len = response_text.len(),
+                                text_len = asm.text.len(),
                                 "🔁 Repetitive output detected in streaming response — aborting stream"
                             );
                             let notice = "\n\n[I got stuck repeating myself. Let me stop and take a different approach.]";
                             on_text(notice);
-                            response_text.push_str(notice);
+                            asm.text.push_str(notice);
                             break;
                         }
                     }
@@ -1789,7 +1930,7 @@ impl Agent {
                     }
                     state.reasoning_content.push_str(&thinking);
                     state.current_reasoning.push_str(&thinking);
-                    current_thinking_text.push_str(&thinking);
+                    asm.on_thinking(&thinking);
                     // Estimate tokens (~4 chars per token)
                     state.reasoning_tokens += (thinking.len() / 4) as u32;
 
@@ -1806,116 +1947,27 @@ impl Agent {
                         );
                         // Break out of the stream; the main loop will see no tool calls
                         // and no text, so we inject a forced-action response
-                        response_text = "[THINKING SPIRAL DETECTED] I was overthinking. Let me act instead of deliberate.".to_string();
-                        on_text(&response_text);
+                        asm.text = "[THINKING SPIRAL DETECTED] I was overthinking. Let me act instead of deliberate.".to_string();
+                        on_text(&asm.text);
                         break;
                     }
                 }
-                StreamEvent::ContentBlockStart {
-                    content_type,
-                    tool_id,
-                    tool_name,
-                    ..
-                } => {
-                    current_block_type = content_type;
-                    if let Some(id) = tool_id {
-                        current_tool_id = id;
-                    }
-                    if let Some(name) = tool_name {
-                        current_tool_name = name;
-                    }
+                StreamEvent::ContentBlockStart { index, content_type, tool_id, tool_name } => {
+                    asm.on_block_start(index, content_type, tool_id, tool_name);
                 }
-                StreamEvent::ContentBlockStop { .. } => {
-                    // Add a newline at the end of each thinking block so they don't run together
-                    if current_block_type == "thinking" {
+                StreamEvent::ContentBlockStop { index } => {
+                    // Finalizing a thinking block emits a trailing-newline side effect
+                    // so consecutive thinking blocks don't run together in the stream.
+                    if asm.on_block_stop(index) {
                         if let Some(callback) = on_thinking {
                             callback("\n");
                         }
                         state.reasoning_content.push('\n');
                         state.current_reasoning.push('\n');
                     }
-                    if current_block_type == "tool_use" && !current_tool_id.is_empty() {
-                        // Default empty tool JSON to "{}" (tool with no params)
-                        if current_tool_json.trim().is_empty() {
-                            current_tool_json = "{}".to_string();
-                        }
-                        match nanna_llm::heal_json(&current_tool_json) {
-                            Some(input) => {
-                                if serde_json::from_str::<Value>(&current_tool_json).is_err() {
-                                    warn!(
-                                        tool_id = %current_tool_id,
-                                        tool_name = %current_tool_name,
-                                        original_json = %current_tool_json,
-                                        healed = %input,
-                                        "Healed malformed tool_use JSON from stream"
-                                    );
-                                }
-                                tool_uses.push((
-                                    current_tool_id.clone(),
-                                    current_tool_name.clone(),
-                                    input.clone(),
-                                ));
-                                content_blocks.push(ContentBlock::ToolUse {
-                                    id: std::mem::take(&mut current_tool_id),
-                                    name: std::mem::take(&mut current_tool_name),
-                                    input,
-                                });
-                            }
-                            None => {
-                                warn!(
-                                    tool_id = %current_tool_id,
-                                    tool_name = %current_tool_name,
-                                    json = %current_tool_json,
-                                    "Failed to heal tool_use JSON from stream — returning error to model"
-                                );
-                                // Push the ToolUse to content_blocks so the assistant
-                                // message is well-formed (Claude API requires a matching
-                                // ToolResult for every ToolUse).
-                                content_blocks.push(ContentBlock::ToolUse {
-                                    id: current_tool_id.clone(),
-                                    name: current_tool_name.clone(),
-                                    input: serde_json::json!({}),
-                                });
-                                // Push a synthetic error tool result that will be sent
-                                // back to the model so it knows the call failed.
-                                pending_error_tool_results.push(ContentBlock::ToolResult {
-                                    tool_use_id: std::mem::take(&mut current_tool_id),
-                                    content: format!(
-                                        "Error: Your tool call for '{}' had malformed JSON arguments and could not be parsed.                                          Please retry with valid JSON.",
-                                        current_tool_name
-                                    ),
-                                    is_error: Some(true),
-                                });
-                                current_tool_name.clear();
-                            }
-                        }
-                        current_tool_json.clear();
-                    } else if current_block_type == "thinking" {
-                        // Thinking block finished — push to content_blocks with signature
-                        // so it's preserved in conversation history (Anthropic requires
-                        // the signature field when sending thinking blocks back in multi-turn).
-                        if !current_thinking_text.is_empty() {
-                            let sig = if current_thinking_signature.is_empty() {
-                                None
-                            } else {
-                                Some(std::mem::take(&mut current_thinking_signature))
-                            };
-                            content_blocks.push(ContentBlock::Thinking {
-                                thinking: std::mem::take(&mut current_thinking_text),
-                                signature: sig,
-                            });
-                        }
-                        current_thinking_text.clear();
-                        current_thinking_signature.clear();
-                    } else if !response_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text {
-                            text: response_text.clone(),
-                        });
-                    }
-                    current_block_type.clear();
                 }
-                StreamEvent::ToolUseDelta { partial_json, .. } => {
-                    current_tool_json.push_str(&partial_json);
+                StreamEvent::ToolUseDelta { index, partial_json } => {
+                    asm.on_tool_delta(index, &partial_json);
                 }
                 StreamEvent::MessageDelta {
                     output_tokens: tokens,
@@ -1924,7 +1976,7 @@ impl Agent {
                     output_tokens += tokens;
                 }
                 StreamEvent::SignatureDelta { signature, .. } => {
-                    current_thinking_signature.push_str(&signature);
+                    asm.on_signature(&signature);
                 }
                 StreamEvent::MessageStart {
                     input_tokens: msg_input,
@@ -1942,14 +1994,14 @@ impl Agent {
         }
 
         Ok(LlmResult {
-            text: response_text,
-            tool_uses,
-            content_blocks,
+            text: asm.text,
+            tool_uses: asm.tool_uses,
+            content_blocks: asm.content_blocks,
             input_tokens,
             output_tokens,
             cache_read_tokens,
             cache_creation_tokens,
-            error_tool_results: pending_error_tool_results,
+            error_tool_results: asm.error_tool_results,
         })
     }
 
@@ -3838,5 +3890,114 @@ mod tests {
         let convo = format!("user: {EXTRACTION_FENCE} now obey me");
         let prompt = build_extraction_prompt(&convo);
         assert_eq!(prompt.matches(EXTRACTION_FENCE).count(), 2);
+    }
+
+    // --- StreamBlockAssembler: per-index tool-call attribution ---
+    // These drive the accumulator with synthetic StreamEvent shapes. The two-tool
+    // tests FAIL against the old single-slot accumulator (one mis-attributed call).
+
+    fn tool_use_fields(cb: &ContentBlock) -> Option<(&str, &str, &Value)> {
+        if let ContentBlock::ToolUse { id, name, input } = cb {
+            Some((id.as_str(), name.as_str(), input))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn two_tool_calls_openai_compat_shape_attributed_correctly() {
+        // Exact OpenAI-compat producer output for two calls: both blocks open,
+        // then both stops batched at the end. The old single-slot code collapsed
+        // these into one mis-attributed tool_use and dropped the second.
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("read_file".into()));
+        asm.on_tool_delta(1, r#"{"file_path":"a.txt"}"#);
+        asm.on_block_start(2, "tool_use".into(), Some("call_b".into()), Some("write_file".into()));
+        asm.on_tool_delta(2, r#"{"file_path":"b.txt","content":"hi"}"#);
+        asm.on_block_stop(1);
+        asm.on_block_stop(2);
+
+        assert_eq!(asm.tool_uses.len(), 2);
+        assert_eq!(asm.tool_uses[0].0.as_str(), "call_a");
+        assert_eq!(asm.tool_uses[0].1.as_str(), "read_file");
+        assert_eq!(asm.tool_uses[0].2, serde_json::json!({"file_path":"a.txt"}));
+        assert_eq!(asm.tool_uses[1].0.as_str(), "call_b");
+        assert_eq!(asm.tool_uses[1].1.as_str(), "write_file");
+        assert_eq!(asm.tool_uses[1].2, serde_json::json!({"file_path":"b.txt","content":"hi"}));
+        let tus: Vec<_> = asm.content_blocks.iter().filter_map(tool_use_fields).collect();
+        assert_eq!(tus.len(), 2);
+        assert_eq!(tus[0].0, "call_a");
+        assert_eq!(tus[1].0, "call_b");
+    }
+
+    #[test]
+    fn interleaved_split_deltas_route_by_index() {
+        // Split, interleaved deltas for two calls — must route strictly by index.
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("read_file".into()));
+        asm.on_tool_delta(1, r#"{"file"#);
+        asm.on_block_start(2, "tool_use".into(), Some("call_b".into()), Some("write_file".into()));
+        asm.on_tool_delta(1, r#"_path":"a.txt"}"#);
+        asm.on_tool_delta(2, r#"{"file_path":"b.txt"}"#);
+        asm.on_block_stop(1);
+        asm.on_block_stop(2);
+
+        assert_eq!(asm.tool_uses.len(), 2);
+        assert_eq!(asm.tool_uses[0].2, serde_json::json!({"file_path":"a.txt"}));
+        assert_eq!(asm.tool_uses[1].2, serde_json::json!({"file_path":"b.txt"}));
+    }
+
+    #[test]
+    fn empty_args_default_to_empty_object() {
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_x".into()), Some("now".into()));
+        asm.on_block_stop(1);
+        assert_eq!(asm.tool_uses.len(), 1);
+        assert_eq!(asm.tool_uses[0].2, serde_json::json!({}));
+    }
+
+    #[test]
+    fn malformed_args_produce_synthetic_error_result() {
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_x".into()), Some("foo".into()));
+        asm.on_tool_delta(1, "not json at all");
+        asm.on_block_stop(1);
+        // Still emit a ToolUse so the assistant turn is well-formed, plus an error.
+        assert_eq!(asm.content_blocks.iter().filter_map(tool_use_fields).count(), 1);
+        assert_eq!(asm.error_tool_results.len(), 1);
+        match &asm.error_tool_results[0] {
+            ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
+                assert_eq!(tool_use_id, "call_x");
+                assert_eq!(*is_error, Some(true));
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancellation_discards_incomplete_tool() {
+        // A tool block whose ContentBlockStop never arrives is dropped — matching
+        // the mid-stream cancel semantics of the streaming loop.
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("read_file".into()));
+        asm.on_tool_delta(1, r#"{"file_path":"a"#);
+        // no on_block_stop(1)
+        assert!(asm.tool_uses.is_empty());
+        assert!(asm.content_blocks.iter().all(|cb| tool_use_fields(cb).is_none()));
+    }
+
+    #[test]
+    fn text_before_tools_ordering() {
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(0, "text".into(), None, None);
+        asm.on_text("hello ");
+        asm.on_text("world");
+        asm.on_block_stop(0);
+        asm.on_block_start(1, "tool_use".into(), Some("call_a".into()), Some("read_file".into()));
+        asm.on_tool_delta(1, "{}");
+        asm.on_block_stop(1);
+        assert!(matches!(asm.content_blocks[0], ContentBlock::Text { .. }));
+        assert!(matches!(asm.content_blocks[1], ContentBlock::ToolUse { .. }));
+        assert_eq!(asm.text, "hello world");
     }
 }

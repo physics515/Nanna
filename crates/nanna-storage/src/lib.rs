@@ -385,6 +385,65 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&db_path);
     }
+
+    fn sample_new_memory(id: &str, content: &str) -> NewMemory {
+        NewMemory {
+            memory_id: id.into(),
+            content: content.into(),
+            embedding: Some(vec![0.1, 0.2, 0.3]),
+            embedding_model: Some("test".into()),
+            session_id: None,
+            metadata: None,
+            tags: vec![],
+            workspace_id: None,
+            fsrs_stability: 1.0,
+            fsrs_difficulty: 5.0,
+            fsrs_last_access: 0,
+            fsrs_access_count: 0,
+            fsrs_importance: 1.0,
+            fsrs_storage_strength: 1.0,
+            fsrs_generation: 0,
+        }
+    }
+
+    #[test]
+    fn is_corruption_error_matches_corruption_messages() {
+        // The classifier's contract is a case-insensitive substring match on the
+        // rendered message (the form it takes once it crosses into
+        // `MemoryError::Persistence(String)`). NotFound is just a convenient
+        // String-carrying variant to exercise that contract.
+        assert!(is_corruption_error(&StorageError::NotFound(
+            "inconsistent overflow chain observed during payload read".into()
+        )));
+        assert!(is_corruption_error(&StorageError::NotFound(
+            "database disk image is CORRUPT".into()
+        )));
+        assert!(is_corruption_error(&StorageError::NotFound("malformed database page".into())));
+        assert!(!is_corruption_error(&StorageError::NotFound("session xyz missing".into())));
+    }
+
+    #[tokio::test]
+    async fn bulk_load_salvage_matches_bulk_load_on_clean_db() {
+        let storage = Storage::in_memory().await.unwrap();
+        let repo = storage.memories();
+        for i in 0..5 {
+            repo.create(sample_new_memory(&format!("m{i}"), &format!("content {i}")))
+                .await
+                .unwrap();
+        }
+        let bulk = repo.bulk_load().await.unwrap();
+        let report = repo.bulk_load_salvage().await.unwrap();
+
+        assert_eq!(report.expected, 5);
+        assert!(report.corrupt_ids.is_empty());
+        assert_eq!(report.memories.len(), bulk.len());
+        // Same memory_ids in the same order (both ORDER BY id ASC) — the per-id
+        // reconstruction is lossless on a clean DB.
+        let bulk_ids: Vec<_> = bulk.iter().map(|m| m.memory_id.clone()).collect();
+        let salv_ids: Vec<_> = report.memories.iter().map(|m| m.memory_id.clone()).collect();
+        assert_eq!(bulk_ids, salv_ids);
+        assert_eq!(report.memories[0].embedding, bulk[0].embedding);
+    }
 }
 
 // =============================================================================

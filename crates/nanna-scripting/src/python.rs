@@ -74,11 +74,21 @@ const PYTHON_STACK_BYTES: usize = 256 * 1024 * 1024;
 /// can reach: at the measured ~2 KiB/frame, this floor is ~65,000 frames, versus a
 /// default `recursion_limit` of 1000 (release) / 256 (debug).
 ///
-/// The floor is deliberately conservative rather than tight. `python.exec` demonstrably
-/// could not even run `print('hello')` on Tokio's 2 MiB stack, so interpreter setup
-/// costs far more stack than the per-frame figure alone predicts, and that setup cost
-/// has not been measured separately. Until it is, do not shrink this toward the
-/// `1000 x 2 KiB` the recursion limit implies — the two are not the same budget.
+/// The floor is deliberately conservative rather than tight, and it is derived from the
+/// **empirical overflow bisection**, not a round number: the `runaway_recursion` /
+/// raised-limit guards below overflowed at **16 MiB (debug)** and **64 MiB (release)**
+/// and passed at **128 MiB** — so 128 MiB is the measured "passes" point and
+/// `PYTHON_STACK_BYTES` (256 MiB) is 2x it, all lazily committed (free).
+///
+/// Interpreter *setup* is the only term that could justify shrinking further (recursion
+/// alone needs ~`1000 x 2 KiB` ≈ 2 MiB, and `python.exec` could not run `print('hello')`
+/// on Tokio's 2 MiB stack, so setup dominates). But that setup high-water **cannot be
+/// measured cheaply in-process on Windows** — a paint-and-scan probe faults
+/// (`STATUS_ACCESS_VIOLATION`, verified) because a thread stack is *reserved* but
+/// committed lazily through a guard page, so a deep write lands in uncommitted memory;
+/// and a genuine overflow aborts the process uncatchably, defeating a binary-search
+/// probe too. So the size stays anchored to the bisection above rather than a separate
+/// setup number. Do not shrink toward the recursion-only budget.
 const _: () = assert!(PYTHON_STACK_BYTES >= 128 * 1024 * 1024);
 
 /// Result of executing Python code.

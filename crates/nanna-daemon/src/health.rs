@@ -159,6 +159,10 @@ pub struct HealthState {
     pub client_count: Arc<RwLock<usize>>,
     /// Memory service status
     pub memory_available: bool,
+    /// Durable memory store degraded (a corrupt row was skipped on load).
+    pub memory_degraded: bool,
+    /// Number of memory rows that were unreadable (corrupt) at load.
+    pub memory_corrupt_rows: usize,
     /// Agent service status
     pub agent_available: bool,
     /// Last error message (if any)
@@ -172,11 +176,23 @@ impl HealthState {
             session_count: Arc::new(RwLock::new(0)),
             client_count: Arc::new(RwLock::new(0)),
             memory_available,
+            memory_degraded: false,
+            memory_corrupt_rows: 0,
             agent_available,
             last_error: Arc::new(RwLock::new(None)),
         }
     }
-    
+
+    /// Seed the durable-memory-store health (from `MemoryService::store_health`).
+    /// Builder-style so a corrupt store is visible on `/status` and `/health`
+    /// instead of only a boot `error!` log.
+    #[must_use]
+    pub fn with_memory_health(mut self, degraded: bool, corrupt_rows: usize) -> Self {
+        self.memory_degraded = degraded;
+        self.memory_corrupt_rows = corrupt_rows;
+        self
+    }
+
     pub async fn set_session_count(&self, count: usize) {
         *self.session_count.write().await = count;
     }
@@ -207,6 +223,8 @@ pub struct StatusResponse {
     pub sessions: usize,
     pub clients: usize,
     pub memory_available: bool,
+    pub memory_degraded: bool,
+    pub memory_corrupt_rows: usize,
     pub agent_available: bool,
     pub last_error: Option<String>,
 }
@@ -248,6 +266,8 @@ async fn status(State(state): State<Arc<HealthState>>) -> Json<StatusResponse> {
         sessions,
         clients,
         memory_available: state.memory_available,
+        memory_degraded: state.memory_degraded,
+        memory_corrupt_rows: state.memory_corrupt_rows,
         agent_available: state.agent_available,
         last_error,
     })
@@ -431,6 +451,24 @@ mod tests {
         assert_eq!(status.sessions, 3);
         assert_eq!(status.clients, 2);
         assert_eq!(status.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_memory_degraded() {
+        // A degraded store (corrupt rows skipped on load) must show on /status,
+        // not just in a boot log.
+        let shared = Arc::new(HealthState::new(true, true).with_memory_health(true, 2));
+        let server = HealthServer::from_shared(shared, "127.0.0.1", 0);
+        let Json(s) = status(State(server.state())).await;
+        assert!(s.memory_degraded);
+        assert_eq!(s.memory_corrupt_rows, 2);
+
+        // A healthy store reports the negative.
+        let clean = Arc::new(HealthState::new(true, true));
+        let server2 = HealthServer::from_shared(clean, "127.0.0.1", 0);
+        let Json(s2) = status(State(server2.state())).await;
+        assert!(!s2.memory_degraded);
+        assert_eq!(s2.memory_corrupt_rows, 0);
     }
 
     #[tokio::test]

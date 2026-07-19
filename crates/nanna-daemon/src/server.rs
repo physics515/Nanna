@@ -28,6 +28,16 @@ use nanna_tools::{AgentSpawner, ParentChannel, SpawnResult, ToolRegistry};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Heartbeat check-in prompt for the daemon scheduler.
+///
+/// Deliberately does **not** command the model to `Read HEARTBEAT.md` — that
+/// drove a `read_file` tool call which, with no active workspace, resolved to
+/// `~/HEARTBEAT.md` and hard-errored (`os error 2`) every heartbeat. P17 has
+/// since retired the bespoke `HEARTBEAT.md` entirely (recurrence lives in
+/// scheduled-task config), so the prompt now frames the heartbeat as running
+/// due scheduled work — never reading instruction files off disk.
+const DAEMON_HEARTBEAT_PROMPT: &str = "Heartbeat check-in. Run any due scheduled tasks. Do not read files from disk looking for instructions, and do not infer or repeat old tasks from prior chats. Review your current state, and if nothing needs attention, reply HEARTBEAT_OK.";
+
 /// Concrete implementation of AgentSpawner that lives in the daemon
 /// where it can create Agent instances with isolated context.
 struct AgentSpawnerImpl {
@@ -938,7 +948,7 @@ impl DaemonServer {
             let scheduler_config = nanna_core::SchedulerConfig {
                 heartbeat_interval: std::time::Duration::from_secs(1800),
                 heartbeat_enabled: true,
-                heartbeat_prompt: "Run any due scheduled tasks. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
+                heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
                 max_concurrent: 4,
                 check_interval: std::time::Duration::from_secs(30),
                 default_timezone: "UTC".to_string(),
@@ -1246,10 +1256,19 @@ impl DaemonServer {
 
         // Spawn health HTTP server if enabled
         let _health_state = if self.config.enable_health_server {
+            // Seed durable-memory-store health (load already ran in init_services),
+            // so a corrupt/degraded store shows on /status, not just a boot log.
+            let (mem_degraded, mem_corrupt) = if let Some(ref m) = memory {
+                let h = m.store_health().await;
+                (h.degraded, h.corrupt_rows)
+            } else {
+                (false, 0)
+            };
             let state = HealthState::new(
                 memory.is_some(),
                 true, // agent is available
-            );
+            )
+            .with_memory_health(mem_degraded, mem_corrupt);
             let health_state = Arc::new(state);
 
             // Update session count
@@ -2578,6 +2597,16 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_heartbeat_prompt_does_not_command_file_read() {
+        // The daemon overrides the scheduler default with its own prompt; guard
+        // it too so neither site reintroduces the erroring `Read HEARTBEAT.md`.
+        let p = DAEMON_HEARTBEAT_PROMPT.to_lowercase();
+        assert!(!p.contains("read heartbeat"), "must not command a file read: {p}");
+        assert!(!p.contains(".md"), "must not reference a bespoke .md file: {p}");
+        assert!(p.contains("heartbeat_ok"), "must keep the HEARTBEAT_OK sentinel: {p}");
+    }
 
     /// Serve exactly one HTTP request with a canned body, then exit.
     ///

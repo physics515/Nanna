@@ -9,7 +9,7 @@ export default {
   // build/VCS command is never preempted by the engine (which would orphan the
   // child). A larger explicit `timeout` extends this deadline automatically.
   timeout: 180,
-  description: "Execute a shell command in a POSIX shell (Git Bash on Windows, sh on Unix) and return its output. Use bash syntax: pipes, &&, [ -f x ], cat/grep/tail, forward-slash paths. Use for build commands, scripts, git operations, etc.",
+  description: "Execute a shell command in a POSIX shell (Git Bash on Windows, sh on Unix) and return its output. Use bash syntax: pipes, &&, [ -f x ], cat/grep/tail, forward-slash paths. Do not use cmd.exe idioms (no 'cd /d'; prefer forward slashes over backslashes). To search code, use the code_search tool — rg/ripgrep is not guaranteed on PATH. Use for build commands, scripts, git operations, etc.",
   parameters: {
     type: "object",
     properties: {

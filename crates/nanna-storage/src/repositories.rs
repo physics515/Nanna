@@ -314,6 +314,27 @@ fn decode_embedding(bytes: Option<Vec<u8>>) -> Option<Vec<f32>> {
     })
 }
 
+/// Result of a salvaging bulk load: the rows that decoded, the ids skipped as
+/// corrupt, and the total row count the table reported.
+#[derive(Debug, Default)]
+pub struct BulkLoadReport {
+    pub memories: Vec<Memory>,
+    pub corrupt_ids: Vec<i64>,
+    pub expected: usize,
+}
+
+/// True if `err` looks like an on-disk corruption error — e.g. turso's
+/// "inconsistent overflow chain observed during payload read".
+///
+/// Matched on the *rendered* message so it survives the `StorageError` →
+/// `String` boundary that `MemoryError::Persistence` crosses (the enum variant
+/// isn't visible there). Pure, unit-testable.
+#[must_use]
+pub fn is_corruption_error(err: &StorageError) -> bool {
+    let s = err.to_string().to_lowercase();
+    s.contains("overflow chain") || s.contains("corrupt") || s.contains("malformed")
+}
+
 impl MemoryRepository {
     pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
@@ -455,6 +476,77 @@ impl MemoryRepository {
         }
 
         Ok(memories)
+    }
+
+    /// Load all entries, skipping only the rows whose payload is corrupt.
+    ///
+    /// [`bulk_load`](Self::bulk_load) aborts the whole table on the first corrupt
+    /// row (a single `?` on `rows.next()`), so one bad overflow chain silently
+    /// zeroes the entire memory store. This variant first reads just the rowids —
+    /// the rowid lives in the cell header and needs no record-body / overflow
+    /// read, so `SELECT id` survives the corruption — then loads each row on its
+    /// own and skips + records the ones that fail. If even the id scan fails
+    /// (whole-btree corruption) it returns `Err`, so the caller can surface a
+    /// fully-degraded store rather than a silent empty one.
+    pub async fn bulk_load_salvage(&self) -> Result<BulkLoadReport, StorageError> {
+        let conn = self.conn.lock().await;
+
+        // rowid-only scan survives a corrupt payload/overflow chain.
+        let mut id_rows = conn.query("SELECT id FROM memories ORDER BY id ASC", ()).await?;
+        let mut ids: Vec<i64> = Vec::new();
+        while let Some(row) = id_rows.next().await? {
+            ids.push(row.get(0)?);
+        }
+        drop(id_rows);
+
+        let expected = ids.len();
+        let mut memories = Vec::with_capacity(expected);
+        let mut corrupt_ids = Vec::new();
+
+        for id in ids {
+            let loaded: Result<Option<Memory>, StorageError> = async {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, memory_id, content, embedding, embedding_model, session_id, created_at, updated_at, metadata,
+                                workspace_id,
+                                fsrs_stability, fsrs_difficulty, fsrs_last_access, fsrs_access_count,
+                                fsrs_importance, fsrs_storage_strength, fsrs_generation
+                         FROM memories WHERE id = ?1",
+                        turso::params![id],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    let embedding_bytes: Option<Vec<u8>> = row.get(3)?;
+                    let embedding = decode_embedding(embedding_bytes);
+                    let metadata_str: Option<String> = row.get(8)?;
+                    Ok(Some(decode_memory_row(&row, embedding, metadata_str, Vec::new())?))
+                } else {
+                    Ok(None)
+                }
+            }
+            .await;
+
+            match loaded {
+                Ok(Some(mem)) => memories.push(mem),
+                Ok(None) => {} // row vanished between the id scan and the fetch — ignore
+                Err(e) => {
+                    corrupt_ids.push(id);
+                    tracing::warn!(id, error = %e, "Skipping corrupt memory row during salvage load");
+                }
+            }
+        }
+
+        if !corrupt_ids.is_empty() {
+            tracing::warn!(
+                salvaged = memories.len(),
+                expected,
+                corrupt = corrupt_ids.len(),
+                "Salvaged memories table with corrupt rows skipped: {:?}",
+                corrupt_ids
+            );
+        }
+
+        Ok(BulkLoadReport { memories, corrupt_ids, expected })
     }
 
     /// Count total memories in the database.

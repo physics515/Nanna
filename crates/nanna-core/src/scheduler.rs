@@ -102,7 +102,11 @@ impl Default for SchedulerConfig {
         Self {
             heartbeat_interval: Duration::from_secs(1800), // 30 minutes
             heartbeat_enabled: true,
-            heartbeat_prompt: "Run any due scheduled tasks. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
+            // Do not command a `Read HEARTBEAT.md` here — that drove a read_file
+            // tool call that hard-errored on a missing file (resolved to ~ with
+            // no active workspace), and P17 retired the bespoke HEARTBEAT.md
+            // entirely (recurrence lives in scheduled-task config now).
+            heartbeat_prompt: "Heartbeat check-in. Run any due scheduled tasks. Do not read files from disk looking for instructions, and do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.".to_string(),
             max_concurrent: 4,
             check_interval: Duration::from_secs(30),
             default_timezone: "UTC".to_string(),
@@ -828,5 +832,15 @@ mod tests {
         assert_eq!(parse_interval("every_300s"), Some(300));
         assert_eq!(parse_interval("every_60s"), Some(60));
         assert_eq!(parse_interval("invalid"), None);
+    }
+
+    #[test]
+    fn default_heartbeat_prompt_does_not_command_file_read() {
+        // Guards against reintroducing the imperative "Read HEARTBEAT.md" that
+        // hard-errored on a missing file (os error 2) during the heartbeat cycle.
+        let p = SchedulerConfig::default().heartbeat_prompt.to_lowercase();
+        assert!(!p.contains("read heartbeat"), "must not command a file read: {p}");
+        assert!(!p.contains(".md"), "must not reference a bespoke .md file: {p}");
+        assert!(p.contains("heartbeat_ok"), "must keep the HEARTBEAT_OK sentinel: {p}");
     }
 }
