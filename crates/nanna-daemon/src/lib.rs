@@ -30,6 +30,7 @@ pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod session;
+pub mod tasks;
 pub mod user_tools;
 pub mod webhook;
 

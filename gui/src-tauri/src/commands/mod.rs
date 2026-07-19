@@ -7,5 +7,6 @@ pub mod scheduler;
 pub mod sessions;
 pub mod settings;
 pub mod system;
+pub mod tasks;
 pub mod tools;
 pub mod workspaces;

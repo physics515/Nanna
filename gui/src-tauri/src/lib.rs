@@ -373,6 +373,18 @@ pub fn run() {
             commands::scheduler::run_cron_job_now,
             commands::scheduler::get_cron_job_history,
             commands::scheduler::validate_cron_expression,
+            // Tasks (P15 store + P14 long-horizon runs)
+            commands::tasks::list_tasks,
+            commands::tasks::get_task,
+            commands::tasks::create_task,
+            commands::tasks::update_task,
+            commands::tasks::complete_task,
+            commands::tasks::delete_task,
+            commands::tasks::add_task_note,
+            commands::tasks::query_tasks,
+            commands::tasks::start_task_run,
+            commands::tasks::get_task_run_status,
+            commands::tasks::cancel_task_run,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
