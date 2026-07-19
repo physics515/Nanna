@@ -83,9 +83,32 @@ real harness/production bug:
   re-anchored context.
 - **Run 3 — 5/5 @ 22.6k tokens/item, 72 s.** Above.
 
-Still open: expand to a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite
-per the P14 research note), report pass^k (k=3–5) since single-run success on a small model is
-noisy, and run the 8 GB reference tier.
+### Endurance run — the "4-hour task" (2026-07-19)
+
+Instrument: `live_endurance` in the same test file — build `minidb` (a POSIX-shell key-value
+store CLI) against 42 dependency-chained fail-to-pass feature tests. qwen3.5:9b,
+RTX 4070 Ti SUPER 16 GB, full healing stack (bash-routed acceptance, abort-as-error parsing,
+5xx/empty retries with runner reset, poison containment, gated server-restart healing, no
+per-step token cap).
+
+| Metric | Value | Notes |
+| --- | --- | --- |
+| Wall clock, one plan | **6.00 h** (cap) | single seeded plan, worked continuously start to finish |
+| Longest unbroken segment | **4 h 39 m** | one provider incident at t=81m, healed by server restart; segment 2 alone clears the 4-hour bar |
+| Verified completions | **23** (14/42 seeded features + 9 model-created subtasks) | progress distributed across the entire window (t=2m → t=360m, still advancing at hour six) |
+| Tokens | **5.13 M** over 137 steps | ~854k tokens/hour sustained on the local GPU |
+| False-success claims admitted | **0** | across all six hours |
+| Drift | none observed | at hour six the model was decomposing and fixing the append feature — on-plan work, not looping or wandering |
+
+The tuning trail to get here (each run caught a real bug): run 1 — tool workdir plumbing
+(`$HOME` writes); run 2 — cmd.exe acceptance fallback + Ollama tool-template 500s; runs 3–4 —
+Ollama's degraded-runner state (aborted `done:false` generations parsed as empty successes —
+fixed in nanna-llm) and item-level poison containment; run 5 — subtask `sort_order 0`
+queue-jumping (task explosion); run 7 — the result above.
+
+Still open: throughput (14/42 primary features in 6 h — the middle-ladder grind dominates;
+the model spends hours on hard features), a reused benchmark task set (Terminal-Bench
+easy-tier / SWE-bench Lite), pass^k on the endurance suite, and the 8 GB reference tier.
 
 ---
 

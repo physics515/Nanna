@@ -1056,9 +1056,17 @@ below); what remains open is the full eval build-out (published task set, pass^k
       PATH (POSIX checks unwinnable — now routed through Git Bash like the exec tool,
       regression-tested) plus Ollama 500s tripping the error breaker (now retried with a fresh
       re-anchored context); run 3 = 5/5.
-  - [ ] **Live half, full build-out:** reuse a published task set (Terminal-Bench easy-tier /
-        SWE-bench Lite per the research note), report pass^k (k=3–5) — single-run success on a
-        small model is noisy — and run the 8 GB reference tier.
+  - [x] **The "4-hour task", run for real:** *(2026-07-19)* qwen3.5:9b worked ONE seeded plan
+        (build `minidb` against 42 fail-to-pass feature tests) for the full **6-hour** wall-clock
+        cap — longest unbroken segment **4h39m** after a single healed provider incident — with
+        23 verified completions distributed across the whole window, **0 false successes in six
+        hours**, and on-plan work still happening at hour six. 5.13M tokens, 137 steps
+        (`bench/BASELINE.md` Suite 4, endurance section, incl. the seven-run tuning trail: every
+        failed run exposed a real bug — tool workdir plumbing, cmd.exe acceptance fallback,
+        Ollama aborted-generation parsing, poison containment, subtask queue-jumping).
+  - [ ] **Live half, remaining:** throughput (14/42 primary features in 6h — the middle-ladder
+        grind dominates), a published task set (Terminal-Bench easy-tier / SWE-bench Lite),
+        pass^k on the endurance suite, and the 8 GB reference tier.
 
 - [x] *(research 2026-07-17 → done 2026-07-18)* Cross-checked against published work; the design held
       up and got sharper. Key findings: long-task failure is execution/context, not reasoning —
