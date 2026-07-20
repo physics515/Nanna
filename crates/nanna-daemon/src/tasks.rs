@@ -874,13 +874,21 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// Whether this runner's model is served by the local Ollama instance.
+    /// Healing must be provider-aware: a `:free` suffix on an OpenRouter
+    /// model id must never trigger local-server surgery.
+    pub fn is_ollama_model(&self) -> bool {
+        crate::llm_router::ProviderId::from_model(&self.agent_config.model)
+            == crate::llm_router::ProviderId::Ollama
+    }
+
     /// Force Ollama to unload the model (`keep_alive: 0`), clearing runner
     /// state — the observed degraded mode restores a stale KV context
     /// checkpoint that sends every generation straight to a stop token, and
     /// only a fresh runner clears it. No-op for non-Ollama models.
     pub async fn reset_ollama_runner(&self) {
         let model = &self.agent_config.model;
-        if !model.contains(':') && !model.starts_with("ollama/") {
+        if !self.is_ollama_model() {
             return;
         }
         let base =
@@ -1306,9 +1314,14 @@ impl TaskRunManager {
                     kind: "resumed".to_string(),
                     detail: serde_json::json!({ "resumes": resumes }),
                 });
-                // Healing ladder: server restart only when the operator
-                // allowed it; otherwise a model-runner reset.
-                if !(ollama_restart_allowed() && restart_ollama_server().await) {
+                // Healing ladder — provider-aware. Local Ollama: server
+                // restart (unless opted out), else runner reset. Cloud
+                // providers (incl. the openrouter/free auto-router, where the
+                // serving model varies per request): nothing local to heal —
+                // the pause + resume + in-step retries ARE the healing.
+                if runner.is_ollama_model()
+                    && !(ollama_restart_allowed() && restart_ollama_server().await)
+                {
                     runner.reset_ollama_runner().await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
