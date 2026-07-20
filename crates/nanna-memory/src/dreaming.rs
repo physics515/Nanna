@@ -72,8 +72,12 @@ pub enum DreamTrigger {
 /// Memory pressure takes priority so a continuously-busy system still
 /// consolidates before the store grows without bound; otherwise idle time
 /// governs. Pure (no clock/IO) so the policy is exhaustively testable.
+///
+/// Exported so the daemon scheduler gates its (standalone-`MemoryService`)
+/// dream cycle on the **same** policy `DreamingService::dream_if_idle` uses —
+/// one source of truth, no drift between the two consolidation paths.
 #[must_use]
-fn dream_trigger(idle: Duration, memory_count: usize, cfg: &DreamingConfig) -> DreamTrigger {
+pub fn dream_trigger(idle: Duration, memory_count: usize, cfg: &DreamingConfig) -> DreamTrigger {
     if cfg.memory_pressure_count > 0 && memory_count >= cfg.memory_pressure_count {
         DreamTrigger::MemoryPressure
     } else if idle >= Duration::from_secs(cfg.idle_threshold_secs) {

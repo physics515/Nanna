@@ -270,6 +270,13 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ]  Add Dependabot/Renovate config.
 - [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
 - [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
+- [ ]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
+       `cargo test --workspace` run failed 9/9 `python::tests::*` with `Timeout(10000)` because each test spins a
+       RustPython interpreter that initializes the frozen stdlib (CPU-heavy); 9 in parallel on a busy machine
+       exceed the 10 s wall-clock guard. They all pass single-threaded (13/13 in 35.9 s, ~2.7 s each). Fix options:
+       raise the per-exec timeout for the test build, mark the python tests `#[serial]` (serial_test crate), or
+       gate their parallelism — so CI `cargo test` is deterministic. Not a product bug (real execs set their own
+       timeout); a test-harness determinism gap.
 
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
@@ -816,6 +823,22 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       the new cluster-size defaults; `DaemonConfig::default` mirrors `ConsolidationConfig::default`); 41 daemon
       lib tests green, zero new clippy warnings (2067 baseline unchanged), real daemon boot reaches "Daemon
       ready" + schedules the consolidation task cleanly.
+      *(2026-07-19)* **Idle gate now WIRED into the daemon scheduler** (closes the "trigger exists but nothing
+      calls it" half). The scheduled `memory_consolidation` task ran `MemoryService::consolidate()`
+      **unconditionally every hour** regardless of activity — the shipped `dream_if_idle` gate was dead code
+      from the daemon's view. Now: a lock-free monotonic `ActivityClock` (`nanna-daemon::activity`, 8-byte
+      `AtomicU64` from a base `Instant`) is stamped by the control plane on **every `Action::Chat`** (user +
+      channel; status/log/config polls deliberately excluded so a 1 Hz GUI poll can't hold the gate shut), and
+      the scheduled dream cycle gates on `nanna_memory::dream_trigger(clock.idle(), memory.count(), cfg)` — the
+      **same pure policy** `DreamingService::dream_if_idle` uses (exported from `nanna-memory`, one source of
+      truth, no drift). Skips with a `"Skipped (active; idle Ns, N memories)"` task result while in use; runs on
+      `Idle`/`MemoryPressure`. Two config knobs (`[memory] dream_idle_threshold_secs`=300,
+      `dream_memory_pressure_count`=5000) thread through `DaemonConfig` (both construction sites + `from_nanna_config`
+      + legacy `serve.rs`). 4 `ActivityClock` tests (fresh≈0 idle, idle grows, record resets, shared-Arc monotonic)
+      + a `DaemonConfig`-mirrors-`DreamingConfig` mapping test + the 3 existing `dream_trigger` tests still green;
+      hermetic `e2e_daemon` (4/4) proves `DaemonServer::run()` boots with the new wiring. Remaining on this item:
+      the multi-phase dream *body* (merge/cluster-by-band/expand/DSP) and unifying onto one `DreamingService`
+      orchestrator (its own item) so the daemon dreams *through* it rather than the low-level `consolidate()`.
 - [x] **Implement the missing true merge** — `IngestAction::Update` currently falls back to create/reinforce (`service.rs:300`); add content-level merge so dreaming deduplicates instead of accreting near-duplicates.
       *(2026-07-07) Done for **all three ingest paths** (`smart_ingest`, `remember_with_importance`,
       the scoped variant) via a shared `fold_into_memory` helper: `merge_memory_content` +
@@ -942,6 +965,25 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
             `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
 - [ ] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
+- [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
+      Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
+      (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
+      papers) points at the next lever: during idle, don't *only* rank-similar→concatenate→summarize — also
+      **rewrite raw context into "learned context"** (pre-organize/pre-answer likely future queries) so wake-time
+      responses are cheaper. Reported effect: ~5x less test-time compute for equal accuracy, ~2.5x lower cost/query
+      when amortized across related queries. Two concrete, in-reach steps for Nanna: (a) a dream phase that
+      **promotes recurring episodic memories to semantic/fact memories** (maps onto the P13 "episodes consolidate
+      into facts" line and the DSP peak-detection item), and (b) let the dream cycle use a **stronger model than the
+      chat model** — it has no latency constraint — which our `summarization_priority` list already allows; make the
+      dream path prefer it explicitly. Gate any change through the retention harness. Sources:
+      [Letta sleep-time compute](https://www.letta.com/blog/sleep-time-compute/),
+      [arXiv:2504.13171](https://arxiv.org/abs/2504.13171).
+- [x] *(2026-07-19)* **Idle gate covers autonomous agent runs too, not just IPC chat.** The wiring stamps
+      `ActivityClock` on `Action::Chat` (channels route through it) **and** at the top of the scheduler executor's
+      agent-prompt arm, so the daemon's own **heartbeat/cron/task agent runs** also count as activity — a dream
+      cycle defers while an autonomous run is in progress. Safe against starvation: heartbeats are infrequent
+      (30 min) vs the 5-min idle threshold, and the memory-pressure trigger still overrides. (The
+      `memory_consolidation` task itself is a separate named arm, so it never self-stamps.)
 
 **DSP-backed time-series / event-timeline memory (compression-as-dreaming):**
 - [ ] **`nanna-timeline` crate + append-only event log** — `MemoryEvent { id, ts, kind, workspace_id, content, embedding, salience, source_ids }` in a new Turso migration; the raw episodic stream (messages, tool calls, recalls, outcomes) on a wall-clock axis. `MemoryEntry` stays the semantic/fact layer; episodes consolidate *into* facts during dreaming.
