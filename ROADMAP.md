@@ -600,9 +600,19 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       per Mtok (was wrongly seeded with the legacy Opus-3 $15/$75), Haiku 4.5 is **$1/$5**; cache-read = 0.1x
       input, cache-write = 1.25x input (5-min TTL). Sonnet unchanged at $3/$15. Source:
       [Claude pricing docs](https://platform.claude.com/docs/en/about-claude/pricing).
-      - [ ] Add **Fable 5** (`claude-fable-5`) to the pricing table once its per-Mtok rate is published.
-      - [ ] Config-overridable pricing (`[pricing]` TOML or a fetched table) so rates don't rot in-code; add a
+      - [x] Add **Fable 5** (`claude-fable-5`) to the pricing table once its per-Mtok rate is published.
+            *(2026-07-21)* Added `("claude-fable", 10.00, 50.00, 1.00, 12.50)` — $10 input / $50 output (≈2× Opus
+            4.8), cache-read 0.1× input ($1.00), 5-min cache-write 1.25× input ($12.50). Placed **before** the
+            generic `claude` prefix so `claude-fable-5` resolves to its own row, not the Sonnet fallback (a
+            regression test pins exactly this). Sources: platform.claude.com/docs pricing, anthropic.com/claude/fable.
+      - [~] Config-overridable pricing (`[pricing]` TOML or a fetched table) so rates don't rot in-code; add a
             batch-mode (0.5x) + 1-hour-cache (2.0x) multiplier the tracker can apply.
+            *(2026-07-21)* **Multipliers shipped** as pure `ModelPricing` combinators: `with_batch_discount()`
+            (halves input+output, leaves cache rates — the Batch API doesn't cache) and `with_hour_cache_write()`
+            (cache-write → 2× input, anchored to the input rate so it's exact regardless of the stored 5-min
+            write). Both `#[must_use]`, `debug_assert`-guarded (discount only lowers; 1-h write ≥ input), 2 tests.
+            Still open: making the table itself config-overridable (`[pricing]` TOML / fetched) and wiring the
+            multipliers into the tracker per request-mode.
       *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
       already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore
