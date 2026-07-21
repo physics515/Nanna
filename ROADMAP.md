@@ -270,13 +270,18 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ]  Add Dependabot/Renovate config.
 - [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
 - [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
-- [ ]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
+- [x]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
        `cargo test --workspace` run failed 9/9 `python::tests::*` with `Timeout(10000)` because each test spins a
        RustPython interpreter that initializes the frozen stdlib (CPU-heavy); 9 in parallel on a busy machine
-       exceed the 10 s wall-clock guard. They all pass single-threaded (13/13 in 35.9 s, ~2.7 s each). Fix options:
-       raise the per-exec timeout for the test build, mark the python tests `#[serial]` (serial_test crate), or
-       gate their parallelism — so CI `cargo test` is deterministic. Not a product bug (real execs set their own
-       timeout); a test-harness determinism gap.
+       exceed the 10 s wall-clock guard. They all pass single-threaded (13/13 in 35.9 s, ~2.7 s each).
+       *(2026-07-21)* **Fixed by serializing them — zero new deps.** Chose the "gate their parallelism" option
+       over adding `serial_test`: a process-global `static PYTHON_TEST_GUARD: tokio::sync::Mutex<()>` (tokio is
+       already a dep; its guard is `Send`, `.await`-safe so no `await_holding_lock`, runtime-agnostic across each
+       `#[tokio::test]`'s own runtime incl. the `current_thread` one, and non-poisoning so a failing test still
+       releases it) locked as the first statement of all 13 python tests forces one interpreter to build+run at a
+       time. Each test's wall-clock then tracks its solo cost (~2.4 s, well under the smallest 10 s guard)
+       regardless of `--test-threads`. Verified: 13/13 green in 31.2 s, clippy clean (no new warnings), and it is
+       test-only — production `python.exec` sets its own per-call timeout and is untouched.
 
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),

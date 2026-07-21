@@ -411,6 +411,26 @@ fn python_string_literal(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the Python interpreter tests so `cargo test` is deterministic.
+    ///
+    /// Every test here spins a **fresh** `RustPython` interpreter, whose frozen-stdlib
+    /// initialization is CPU-heavy (~2.7 s each, measured). Run in parallel — the
+    /// `cargo test` default — a handful of them contend for cores, and a single
+    /// `execute()` can then blow past its own `timeout_secs` wall-clock guard purely
+    /// from scheduler starvation, surfacing a spurious `ScriptError::Timeout`. That is a
+    /// **test-harness artifact, not a product bug**: a real `python.exec` sets its own
+    /// per-call timeout and is unaffected by how many tests a CI box runs at once.
+    ///
+    /// A process-global async mutex forces one interpreter to build+run at a time, so
+    /// each test's wall-clock tracks its solo cost (well under the smallest 10 s guard)
+    /// and the suite passes regardless of `--test-threads`. `tokio::sync::Mutex` (not
+    /// `std`): the guard is held across `.await`, so it must stay `Send` and must not
+    /// trip clippy's `await_holding_lock`; it is also runtime-agnostic, so locking it
+    /// from each `#[tokio::test]`'s own runtime (including the `current_thread` one) is
+    /// fine, and it does **not** poison on a panicking test — a failed test releases the
+    /// lock and the rest still run.
+    static PYTHON_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Runaway recursion must surface as a catchable Python `RecursionError`, never a
     /// native stack overflow (which aborts the whole process, uncatchably).
     ///
@@ -421,6 +441,7 @@ mod tests {
     /// that catches a debug-only sizing mistake.
     #[tokio::test]
     async fn runaway_recursion_errors_cleanly_without_aborting() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute(
@@ -459,6 +480,7 @@ f(0)",
     /// Must hold under `--release` too: the release recursion default is 4x debug's.
     #[tokio::test]
     async fn raising_the_recursion_limit_cannot_abort_the_process() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute(
@@ -473,7 +495,10 @@ f(0)",
             .await
             .expect("a raised recursion limit must still return a result, not kill the process");
 
-        assert!(!result.success, "infinite recursion must not report success");
+        assert!(
+            !result.success,
+            "infinite recursion must not report success"
+        );
         let error = result.error.unwrap_or_default();
         assert!(
             error.contains("RecursionError"),
@@ -489,6 +514,7 @@ f(0)",
     /// that default is profile-dependent (256 debug / 1000 release).
     #[tokio::test]
     async fn raising_the_recursion_limit_is_clamped_to_the_interpreter_default() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute(
@@ -502,7 +528,11 @@ print(sys.getrecursionlimit() == _default, sys.getrecursionlimit())",
             .await
             .expect("execution completes");
 
-        assert!(result.success, "clamping must not raise: {:?}", result.error);
+        assert!(
+            result.success,
+            "clamping must not raise: {:?}",
+            result.error
+        );
         assert!(
             result.stdout.starts_with("True"),
             "an over-large request is pinned to the startup default, got: {}",
@@ -514,6 +544,7 @@ print(sys.getrecursionlimit() == _default, sys.getrecursionlimit())",
     /// clamp is a ceiling, not a rewrite. 100 is under both profiles' defaults.
     #[tokio::test]
     async fn lowering_the_recursion_limit_is_untouched() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute(
@@ -526,8 +557,16 @@ print(sys.getrecursionlimit())",
             .await
             .expect("execution completes");
 
-        assert!(result.success, "lowering the limit must work: {:?}", result.error);
-        assert_eq!(result.stdout.trim(), "100", "a limit under the cap passes through");
+        assert!(
+            result.success,
+            "lowering the limit must work: {:?}",
+            result.error
+        );
+        assert_eq!(
+            result.stdout.trim(),
+            "100",
+            "a limit under the cap passes through"
+        );
     }
 
     /// A single-threaded Tokio runtime is the worst case for the old design: there is
@@ -535,6 +574,7 @@ print(sys.getrecursionlimit())",
     /// proves the interpreter's stack is independent of the runtime's.
     #[tokio::test(flavor = "current_thread")]
     async fn executes_under_current_thread_runtime() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute("import json\nprint(json.dumps({'ok': True}))", None, 10)
@@ -547,6 +587,7 @@ print(sys.getrecursionlimit())",
 
     #[tokio::test]
     async fn test_basic_execution() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute("print('hello world')", None, 10)
@@ -558,6 +599,7 @@ print(sys.getrecursionlimit())",
 
     #[tokio::test]
     async fn test_error_handling() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine
             .execute("raise ValueError('test error')", None, 10)
@@ -569,6 +611,7 @@ print(sys.getrecursionlimit())",
 
     #[tokio::test]
     async fn test_multiline() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let code = r#"
 import json
@@ -582,6 +625,7 @@ print(json.dumps(data, indent=2))
 
     #[tokio::test]
     async fn test_stdlib_modules() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let code = r#"
 import os, re, collections, pathlib
@@ -601,6 +645,7 @@ print("Path:", type(pathlib.Path('.')).__name__)
 
     #[tokio::test]
     async fn test_file_operations() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let code = r#"
 import tempfile, os
@@ -618,6 +663,7 @@ os.unlink(name)
 
     #[tokio::test]
     async fn test_isolation() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         // Set a variable in first execution
         let _ = engine.execute("shared_var = 42", None, 10).await.unwrap();
@@ -628,6 +674,7 @@ os.unlink(name)
 
     #[tokio::test]
     async fn test_syntax_error() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let result = engine.execute("def foo(", None, 10).await.unwrap();
         assert!(!result.success);
@@ -636,6 +683,7 @@ os.unlink(name)
 
     #[tokio::test]
     async fn test_code_with_triple_quotes() {
+        let _serialize = PYTHON_TEST_GUARD.lock().await;
         let engine = PythonEngine::new();
         let code = r#"
 msg = '''hello
