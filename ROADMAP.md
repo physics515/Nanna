@@ -341,12 +341,47 @@ health checks). **Shipped**, except:
 - [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
       not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
-- [ ] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
+- [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
       Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not
       auto-dereference external `$ref` URIs**, and **bound schema depth + validation time** (untrusted server
       schemas are a DoS/SSRF surface). Also fold in TOFU description-pinning (see the P6 anti-rug-pull item).
       Source: [MCP 2026-07-28 release candidate](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+      *(2026-07-21)* **Both hard requirements shipped** — new `nanna-mcp::schema_guard`. Every tool
+      `input_schema` returned by a server is gated at the single ingest chokepoint (`refresh_tools`, which all
+      list/refresh paths funnel through) by a pure `validate_tool_schema`: it **rejects any external `$ref`**
+      (external ⇔ the ref does not start with `#`, so absolute URIs / `file://` / relative doc paths are dropped
+      while intra-document fragments — root `#`, JSON-Pointer `#/…`, and 2020-12 plain-name anchors `#node` —
+      pass, since none need a fetch), and **bounds both depth (≤32) and total node count (≤10 000)** so a
+      deep-or-wide hostile schema can't stall later traversals. The walk is **iterative over an explicit,
+      node-bounded work stack** (never recursive → can't itself overflow), and the gate **filters rather than
+      failing the refresh** — one bad tool is logged+dropped, the rest of the server's toolset still loads.
+      Depth/node caps are principled ceilings (a real function-call schema nests a handful of levels / tens of
+      properties; the caps sit ~5×/orders-of-magnitude above that yet below serde_json's 128 parse limit). 10
+      tests (safe-schema, internal-frag accept, https/file/relative/empty reject, deep-nested reject,
+      at-limit accept, wide-node reject, ref-classifier, + a client integration test proving `refresh_tools`
+      drops the external-ref tool and keeps the safe + internal-ref ones in both the returned Vec and the
+      cache). Remaining on this item: `oneOf`/`anyOf`/conditional keyword handling in `schema_to_parameters`,
+      Roots/Sampling/Logging deprecation, and TOFU description-pinning (P6 anti-rug-pull).
+- [ ] *(research 2026-07-21)* **Finish the 2026-07-28 RC client migration (non-security half).** Beyond the
+      `$ref`/depth gate shipped above, the RC also: (1) changes the *missing-resource* error code from the
+      MCP-custom **`-32002`** to the JSON-RPC-standard **`-32602` Invalid Params** — we don't match on `-32002`
+      today (grep-clean), so this is forward-compat only, but any future error-code matching must use `-32602`;
+      (2) lets **`structuredContent` be *any* JSON value**, not only an object — `CallToolResult`/adapter should
+      stop assuming an object when structured output lands; (3) lifts input schemas to **JSON Schema 2020-12
+      composition** (`oneOf`/`anyOf`/`allOf`/conditionals + `$defs`) — `schema_to_parameters` currently only
+      reads a flat top-level `properties`, so a composed schema silently yields zero params. Handle composition
+      (at least surface the union of branch properties). Source:
+      [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+- [ ] *(research 2026-07-21)* **Approved-server registry + signed/pinned tool definitions (defense-in-depth
+      for tool-poisoning, OWASP MCP03 / CVE-2025-54136).** Tool *descriptions* enter the agent context as
+      trusted text, so a poisoned description is prompt-injection with supply-chain reach — worst in
+      auto-approve/unattended mode (Nanna's daemon). Layer on top of the `schema_guard` + P6 TOFU-pinning items:
+      treat every third-party server as untrusted by default, keep a registry of approved servers with explicit
+      **version pinning** (block connect if absent), and hash-pin the description+schema at first approval,
+      re-prompting on drift. Pairs with the "drop ACE grants on entering unattended mode" P6 item. Sources:
+      [OWASP MCP Top 10 — Tool Poisoning](https://owasp.org/www-project-mcp-top-10/2025/MCP03-2025%E2%80%93Tool-Poisoning),
+      [State of MCP Security 2026](https://pipelab.org/blog/state-of-mcp-security-2026/).
 - [ ] *(research 2026-07-20)* **HalluSquatting guard on `discover_tools`/skill-install/fetch paths** — agents
       reach for fabricated names in up to 85% of repo requests / 100% of skill installs, and attackers
       pre-register them. Make name→source resolution mandatory before any clone/install/fetch, flag those
