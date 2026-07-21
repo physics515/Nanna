@@ -3,7 +3,7 @@
 use crate::setup::{create_scheduler, init_components};
 use nanna_config::Config;
 use nanna_core::{LlmClient, Nanna, NannaConfig};
-use nanna_server::{start_server, AppStateBuilder, ServerConfig};
+use nanna_server::{AppStateBuilder, ServerConfig, start_server};
 use tracing::{debug, info, warn};
 
 /// Run the HTTP server
@@ -12,11 +12,11 @@ pub(crate) async fn run_server(config: &Config, host: String, port: u16) -> anyh
 
     // Get API key for bot - default to Anthropic
     let env_var = match config.llm.provider.as_str() {
-        "openai" => "OPENAI_API_KEY", 
+        "openai" => "OPENAI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         _ => "ANTHROPIC_API_KEY", // anthropic or unknown
     };
-    
+
     let api_key = config
         .llm
         .api_key
@@ -126,13 +126,13 @@ pub(crate) async fn run_server(config: &Config, host: String, port: u16) -> anyh
 
 /// Run the daemon server (background mode)
 pub(crate) async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
-    use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig, WebhookConfig};
-    use nanna_daemon::server::{LlmConfig, EmbeddingConfig};
     use nanna_daemon::agent_service::AgentServiceConfig;
+    use nanna_daemon::server::{EmbeddingConfig, LlmConfig};
+    use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig, WebhookConfig};
 
     // Configure daemon
     let data_dir = Config::default_data_dir()?;
-    
+
     let daemon_config = DaemonConfig {
         ipc: IpcServerConfig {
             host: host.clone(),
@@ -164,6 +164,8 @@ pub(crate) async fn run_daemon(config: &Config, host: String, port: u16) -> anyh
         webhook: WebhookConfig::default(),
         use_script_tools: config.tools.use_script_tools,
         tools_dir: config.tools.tools_dir.clone(),
+        tool_allowlist: Some(config.tools.enabled.clone()),
+        tool_denylist: config.tools.disabled.clone(),
         // Legacy single-binary path: channels are not started here (matches the
         // field's Default). The daemon path wires channel config separately.
         channels: None,
@@ -174,12 +176,7 @@ pub(crate) async fn run_daemon(config: &Config, host: String, port: u16) -> anyh
     };
 
     info!("Initializing daemon server...");
-    let mut server = DaemonServer::new(
-        daemon_config,
-        EmbeddingConfig::default(),
-        None,
-        None,
-    );
+    let mut server = DaemonServer::new(daemon_config, EmbeddingConfig::default(), None, None);
 
     info!("Daemon listening on {}:{}", host, port);
     info!("WebSocket endpoint: ws://{}:{}/ws", host, port);

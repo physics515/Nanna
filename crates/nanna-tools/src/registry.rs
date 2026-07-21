@@ -1,7 +1,10 @@
 //! Tool registry for managing available tools
 
-use crate::{Tool, ToolCall, ToolDefinition, ToolResponse, ToolResult, OutputTarget, format_tool_output};
-use crate::skills::{load_skill, discover_skills};
+use crate::skills::{discover_skills, load_skill};
+use crate::{
+    OutputTarget, Tool, ToolCall, ToolDefinition, ToolPolicy, ToolResponse, ToolResult,
+    format_tool_output,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -26,10 +29,13 @@ pub struct ToolRegistry {
     session_workdirs: RwLock<HashMap<String, std::path::PathBuf>>,
     /// Current session ID (set when agent session starts)
     session_id: RwLock<Option<String>>,
+    /// Allow/deny policy over canonical tool names. Default permits everything.
+    /// Enforced in `execute` AFTER alias/fuzzy resolution — see `policy` module docs.
+    policy: RwLock<ToolPolicy>,
 }
 
 impl ToolRegistry {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
@@ -38,7 +44,25 @@ impl ToolRegistry {
             default_workdir: RwLock::new(None),
             session_workdirs: RwLock::new(HashMap::new()),
             session_id: RwLock::new(None),
+            policy: RwLock::new(ToolPolicy::allow_all()),
         }
+    }
+
+    /// Replace the active tool policy.
+    ///
+    /// The policy gates execution on *canonical* names, so it survives aliasing
+    /// (`Bash` → `exec`) and fuzzy resolution.
+    pub async fn set_policy(&self, policy: ToolPolicy) {
+        let denied: Vec<&str> = policy.denied().collect();
+        if !denied.is_empty() {
+            info!("Tool policy: {} tool(s) denied: {:?}", denied.len(), denied);
+        }
+        *self.policy.write().await = policy;
+    }
+
+    /// Snapshot the active tool policy.
+    pub async fn policy(&self) -> ToolPolicy {
+        self.policy.read().await.clone()
     }
 
     /// Set the default working directory for tool execution.
@@ -47,7 +71,10 @@ impl ToolRegistry {
         // Also set for the current session if one is active
         if let Some(ref sid) = *self.session_id.read().await {
             if let Some(ref wd) = workdir {
-                self.session_workdirs.write().await.insert(sid.clone(), wd.clone());
+                self.session_workdirs
+                    .write()
+                    .await
+                    .insert(sid.clone(), wd.clone());
             }
         }
         *self.default_workdir.write().await = workdir;
@@ -67,7 +94,10 @@ impl ToolRegistry {
 
     /// Set the working directory for a specific session.
     pub async fn set_session_workdir(&self, session_id: &str, workdir: std::path::PathBuf) {
-        self.session_workdirs.write().await.insert(session_id.to_string(), workdir);
+        self.session_workdirs
+            .write()
+            .await
+            .insert(session_id.to_string(), workdir);
     }
 
     /// Remove a session's workdir (call on session cleanup).
@@ -124,7 +154,10 @@ impl ToolRegistry {
             targets.insert(alias.to_string(), target.to_string());
             info!("Registered tool alias: {} -> {}", alias, target);
         } else {
-            warn!("Cannot create alias '{}': target tool '{}' not found", alias, target);
+            warn!(
+                "Cannot create alias '{}': target tool '{}' not found",
+                alias, target
+            );
         }
     }
 
@@ -208,7 +241,10 @@ impl ToolRegistry {
     /// Returns the alias target if `name` is a known alias, otherwise returns `name` as-is.
     pub async fn canonical_name(&self, name: &str) -> String {
         let targets = self.alias_targets.read().await;
-        targets.get(name).cloned().unwrap_or_else(|| name.to_string())
+        targets
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Multi-step tool resolution: exact → case-insensitive → fuzzy.
@@ -227,7 +263,12 @@ impl ToolRegistry {
         let lower = name.to_lowercase();
         for (key, tool) in tools.iter() {
             if key.to_lowercase() == lower {
-                info!(requested = name, resolved = key, step = "case-insensitive", "Tool resolved");
+                info!(
+                    requested = name,
+                    resolved = key,
+                    step = "case-insensitive",
+                    "Tool resolved"
+                );
                 return Some((key.clone(), tool.clone()));
             }
         }
@@ -285,11 +326,21 @@ impl ToolRegistry {
     pub async fn definitions(&self) -> Vec<ToolDefinition> {
         let tools = self.tools.read().await;
         let aliases = self.aliases.read().await;
+        let alias_targets = self.alias_targets.read().await;
+        let policy = self.policy.read().await;
         tools
             .iter()
             .filter(|(name, _)| {
                 // Include non-aliases AND lowercase-only aliases
                 !aliases.contains(name.as_str()) || name.chars().all(|c| !c.is_uppercase())
+            })
+            // Don't advertise a tool the policy will refuse. `execute` is the
+            // actual boundary; this only keeps the prompt honest (and smaller).
+            .filter(|(name, _)| {
+                let canonical = alias_targets
+                    .get(name.as_str())
+                    .map_or(name.as_str(), String::as_str);
+                policy.permits(canonical)
             })
             .map(|(name, t)| {
                 let mut def = t.definition();
@@ -310,8 +361,15 @@ impl ToolRegistry {
         let tools = self.tools.read().await;
         let aliases = self.aliases.read().await;
         let alias_targets = self.alias_targets.read().await;
+        let policy = self.policy.read().await;
         tools
             .iter()
+            .filter(|(name, _tool)| {
+                let canonical = alias_targets
+                    .get(name.as_str())
+                    .map_or(name.as_str(), String::as_str);
+                policy.permits(canonical)
+            })
             .filter(|(name, _tool)| {
                 let is_alias = aliases.contains(name.as_str());
                 let is_capitalized_alias = is_alias && name.chars().any(|c| c.is_uppercase());
@@ -346,7 +404,8 @@ impl ToolRegistry {
     /// Get tool definitions in Anthropic format.
     /// Includes lowercase aliases so the LLM sees correct parameter schemas.
     pub async fn to_anthropic_format(&self) -> Vec<Value> {
-        self.definitions().await
+        self.definitions()
+            .await
             .into_iter()
             .map(|d| d.to_anthropic_format())
             .collect()
@@ -355,10 +414,39 @@ impl ToolRegistry {
     /// Get tool definitions in `OpenAI` format.
     /// Includes lowercase aliases so the LLM sees correct parameter schemas.
     pub async fn to_openai_format(&self) -> Vec<Value> {
-        self.definitions().await
+        self.definitions()
+            .await
             .into_iter()
             .map(|d| d.to_openai_format())
             .collect()
+    }
+
+    /// Enforce the tool policy on an already-resolved call.
+    ///
+    /// `resolved_name` is the registry key `resolve_tool` landed on; it is
+    /// canonicalized here so a denied tool cannot be reached via an alias, a
+    /// case variant, or a fuzzy near-miss. Returns `Some(refusal)` to short-circuit
+    /// `execute`, or `None` when the call is permitted.
+    async fn refuse_by_policy(&self, call: &ToolCall, resolved_name: &str) -> Option<ToolResponse> {
+        let canonical = self.canonical_name(resolved_name).await;
+        // Bind the verdict so the read guard drops before we build the response.
+        let verdict = self.policy.read().await.check(&canonical);
+        let reason = verdict.err()?;
+        warn!(
+            requested = %call.name,
+            canonical = %canonical,
+            "Tool call refused: {}",
+            reason.as_str()
+        );
+        Some(ToolResponse {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            result: ToolResult::error(format!(
+                "Tool '{canonical}' is {} and cannot be called.",
+                reason.as_str()
+            )),
+            output_target: OutputTarget::default(),
+        })
     }
 
     /// Execute a tool call
@@ -371,7 +459,10 @@ impl ToolRegistry {
         } else {
             params_str
         };
-        debug!("Executing tool: {} (id: {}) with params: {}", call.name, call.id, params_preview);
+        debug!(
+            "Executing tool: {} (id: {}) with params: {}",
+            call.name, call.id, params_preview
+        );
 
         let (resolved_name, tool) = match self.resolve_tool(&call.name).await {
             Some(pair) => pair,
@@ -380,7 +471,10 @@ impl ToolRegistry {
                 return ToolResponse {
                     id: call.id,
                     name: call.name.clone(),
-                    result: ToolResult::error(format!("Tool not found: {}. Use discover_tools to see available tools.", call.name)),
+                    result: ToolResult::error(format!(
+                        "Tool not found: {}. Use discover_tools to see available tools.",
+                        call.name
+                    )),
                     output_target: OutputTarget::default(),
                 };
             }
@@ -388,6 +482,14 @@ impl ToolRegistry {
 
         if resolved_name != call.name {
             debug!("Tool '{}' resolved to '{}'", call.name, resolved_name);
+        }
+
+        // Policy gate. Deliberately AFTER resolution: `resolve_tool` matches
+        // exact → case-insensitive → fuzzy, and aliases map onto canonical
+        // tools, so gating on `call.name` would let `Bash`, `EXEC`, or a fuzzy
+        // near-miss slip past a denylist entry for `exec`.
+        if let Some(refusal) = self.refuse_by_policy(&call, &resolved_name).await {
+            return refusal;
         }
 
         let output_target = tool.output_target();
@@ -444,11 +546,17 @@ impl ToolRegistry {
         // Log result summary. On failure the error text lives in `result.error`
         // (`ToolResult::error` leaves `content` empty), so the preview prefers it.
         let output_preview = result_log_preview(&result);
-        
+
         if result.success {
-            debug!("Tool {} completed in {}ms: {}", call.name, duration_ms, output_preview);
+            debug!(
+                "Tool {} completed in {}ms: {}",
+                call.name, duration_ms, output_preview
+            );
         } else {
-            warn!("Tool {} failed in {}ms: {}", call.name, duration_ms, output_preview);
+            warn!(
+                "Tool {} failed in {}ms: {}",
+                call.name, duration_ms, output_preview
+            );
         }
 
         ToolResponse {
@@ -473,7 +581,7 @@ impl ToolRegistry {
         let discovered = discover_skills(skills_dir);
         let total = discovered.len();
         let mut loaded = 0;
-        
+
         for skill in discovered {
             match load_skill(&skill.path).await {
                 Ok(tool) => {
@@ -487,7 +595,7 @@ impl ToolRegistry {
                 }
             }
         }
-        
+
         info!(loaded, total, "Skills loaded from {:?}", skills_dir);
         loaded
     }
@@ -544,7 +652,8 @@ impl ToolRegistry {
     pub async fn tool_names(&self) -> Vec<String> {
         let tools = self.tools.read().await;
         let aliases = self.aliases.read().await;
-        tools.keys()
+        tools
+            .keys()
             .filter(|k| !aliases.contains(k.as_str()))
             .cloned()
             .collect()
@@ -574,9 +683,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         row[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            let val = (row[j + 1] + 1)
-                .min(row[j] + 1)
-                .min(prev + cost);
+            let val = (row[j + 1] + 1).min(row[j] + 1).min(prev + cost);
             prev = row[j + 1];
             row[j + 1] = val;
         }
@@ -614,7 +721,9 @@ fn camel_to_snake(s: &str) -> String {
 ///
 /// Adds snake_case aliases for any camelCase keys without removing originals.
 /// Example: `{"filePath": "x"}` → `{"filePath": "x", "file_path": "x"}`
-fn normalize_param_keys(mut params: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
+fn normalize_param_keys(
+    mut params: HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
     let aliases: Vec<(String, serde_json::Value)> = params
         .iter()
         .filter_map(|(k, v)| {
@@ -939,5 +1048,125 @@ mod tests {
         let preview = result_log_preview(&r);
         assert!(preview.ends_with("..."));
         assert!(preview.len() <= 203);
+    }
+
+    // --- tool policy enforcement ---
+
+    fn call(name: &str) -> ToolCall {
+        let mut parameters = HashMap::new();
+        parameters.insert("text".to_string(), Value::String("hi".to_string()));
+        ToolCall {
+            id: "test-call".to_string(),
+            name: name.to_string(),
+            parameters,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_registry_permits_execution() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+
+        let resp = reg.execute(call("echo")).await;
+        assert!(resp.result.success, "unrestricted registry must execute");
+    }
+
+    #[tokio::test]
+    async fn denied_tool_does_not_execute() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+
+        let resp = reg.execute(call("echo")).await;
+        assert!(!resp.result.success);
+        assert!(
+            resp.result
+                .error
+                .unwrap_or_default()
+                .contains("blocked by tool policy"),
+            "refusal must explain itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_cannot_be_reached_through_an_alias() {
+        // Regression: gating on the *requested* name would let `Echo` (a
+        // capitalized alias) execute a tool denied under its canonical name.
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.register_alias("Echo", "echo").await;
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+
+        let resp = reg.execute(call("Echo")).await;
+        assert!(!resp.result.success, "alias must not bypass the denylist");
+    }
+
+    #[tokio::test]
+    async fn denied_tool_cannot_be_reached_through_fuzzy_resolution() {
+        // `resolve_tool` falls back to fuzzy matching, so a near-miss spelling
+        // resolves to `echo`. The policy gate runs after resolution, so it holds.
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+
+        let resp = reg.execute(call("ech")).await;
+        assert!(
+            !resp.result.success,
+            "fuzzy match must not bypass the denylist"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_blocks_unlisted_tool() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.set_policy(ToolPolicy::allow_only(["read_file"])).await;
+
+        let resp = reg.execute(call("echo")).await;
+        assert!(!resp.result.success);
+        assert!(
+            resp.result
+                .error
+                .unwrap_or_default()
+                .contains("not in the tool allowlist"),
+            "refusal must name the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_is_not_advertised_in_definitions() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        assert_eq!(reg.definitions().await.len(), 1);
+
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+        assert!(
+            reg.definitions().await.is_empty(),
+            "a denied tool must not be offered to the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_canonical_hides_its_lowercase_alias_from_definitions() {
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+        reg.register_alias("say", "echo").await;
+        reg.set_policy(ToolPolicy::deny_only(["echo"])).await;
+
+        let defs = reg.definitions().await;
+        assert!(
+            defs.is_empty(),
+            "denying a canonical tool must also hide aliases pointing at it, got {:?}",
+            defs.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_roundtrips_through_the_registry() {
+        let reg = ToolRegistry::new();
+        assert!(reg.policy().await.is_unrestricted());
+
+        reg.set_policy(ToolPolicy::deny_only(["exec"])).await;
+        assert!(!reg.policy().await.permits("exec"));
     }
 }

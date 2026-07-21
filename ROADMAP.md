@@ -289,7 +289,7 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Tauri CSP is set to null in gui/src-tauri/tauri.conf.json — not acceptable for a desktop app rendering model output and markdown.
 - [ ] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
 - [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
-- [ ] ROADMAP explicitly lists open items: disabled tools still execute, deleted tools remain callable until restart, delete_skill needs hardening against remove_dir_all/symlink races, stronger sandboxing needed.
+- [~] ROADMAP explicitly lists open items: ~~disabled tools still execute~~ **(done 2026-07-20 — `ToolPolicy` gate, P6)**, ~~deleted tools remain callable until restart~~ **(done 2026-07-17 — `unregister` wiring)**, ~~delete_skill needs hardening against remove_dir_all/symlink races~~ **(done — symlink + canonical-escape guards in `commands/tools.rs`)**, stronger sandboxing needed *(open — OS-level sandbox under the policy layer; see research note below)*.
 - [ ] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
 - [ ] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
 - [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
@@ -307,7 +307,10 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Set a restrictive Tauri CSP (not null).
 - [ ] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
 - [ ] Per-tool toggles visible in GUI; audit log for every tool call.
-- [ ] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
+- [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
+      *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
+      denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
+      `ToolRegistry::unregister` wiring (see the P11 tool-manager-consistency note).
 - [ ] Harden delete_skill against remove_dir_all/symlink races.
 - [ ] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
 - [ ] Add authentication for any non-local control plane.
@@ -333,6 +336,17 @@ health checks). **Shipped**, except:
 - [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
       not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
+- [ ] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
+      are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
+      Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not
+      auto-dereference external `$ref` URIs**, and **bound schema depth + validation time** (untrusted server
+      schemas are a DoS/SSRF surface). Also fold in TOFU description-pinning (see the P6 anti-rug-pull item).
+      Source: [MCP 2026-07-28 release candidate](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+- [ ] *(research 2026-07-20)* **HalluSquatting guard on `discover_tools`/skill-install/fetch paths** — agents
+      reach for fabricated names in up to 85% of repo requests / 100% of skill installs, and attackers
+      pre-register them. Make name→source resolution mandatory before any clone/install/fetch, flag those
+      keywords, and never auto-run the resolved target unattended. Source:
+      [HalluSquatting](https://thehackernews.com/2026/07/new-hallusquatting-attack-could-trick.html).
 - [x] Supervisor recovery counts consecutive successes, not first-success (pure `apply_health_result`
       state machine + `consecutive_health_successes` stat; events emit after lock release). *(2026-07-06)*
 
@@ -479,7 +493,49 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
 - [ ] **Runtime config reload** — watch `config.toml` with `notify` (debounce 500ms), validate before
       apply, apply without restart, emit `config-change` events.
 - [ ] **Per-channel config** — `[channels.<name>.agent]` sections (system_prompt/model/max_tokens/tools allowlist).
-- [ ] **Tool allowlists/blocklists** — `ToolPolicy` (global allow/block + per-channel + per-user for multi-user channels).
+- [~] **Tool allowlists/blocklists** — `ToolPolicy` (global allow/block + per-channel + per-user for multi-user channels).
+      *(2026-07-20)* **Core `ToolPolicy` shipped + enforced.** New `nanna-tools::policy` — an allow/deny
+      policy over *canonical* tool names with three security properties: **deny wins** (a name on both lists
+      fails closed), **overlay only narrows** (`ToolPolicy::overlay` unions denials + intersects allowlists,
+      so a per-channel layer can never re-grant a globally-denied tool — the per-channel/per-user layering
+      primitive is in place), and — critically — the registry enforces it in `execute()` **after**
+      alias/fuzzy resolution + `canonical_name()`, so `Bash`→`exec`, `EXEC`, or a fuzzy near-miss cannot
+      slip a denied tool past the gate (this exact bypass class is what Claude Code's permission docs and the
+      2026 MCP tool-shadowing research warn about — [permissions](https://code.claude.com/docs/en/permissions),
+      [CrowdStrike agentic tool-chain attacks](https://www.crowdstrike.com/en-us/blog/how-agentic-tool-chain-attacks-threaten-ai-agent-security/)).
+      Denied tools are also dropped from `definitions()`/`definitions_for_names()` so the model isn't even
+      offered them (and a denied canonical hides its aliases). Wired through `DaemonConfig.{tool_allowlist,
+      tool_denylist}` ← `[tools] enabled`/`disabled`; `build_tool_policy` treats `["*"]`/empty enabled as
+      unrestricted and applies `disabled` as the denylist. **This closes the long-standing "disabled tools
+      still execute" bug** (P1/P6) — the `[tools] disabled` list was parsed into config but never enforced.
+      21 tests (11 policy-unit incl. overlay associativity/identity + regain-prevention, 8 registry incl.
+      alias- and fuzzy-bypass regressions, 6 daemon `build_tool_policy`). Remaining: per-channel/per-user
+      `[channels.<name>.agent]` overlay wiring + a per-tool audit log; refuse-to-compile for unenforceable
+      patterns (Claude-Code style).
+      - [ ] **Per-channel/per-user policy overlay** — `[channels.<name>.agent].tools` allow/deny composed
+            via `ToolPolicy::overlay` (primitive already shipped) so a channel can only *narrow* the global
+            policy. Set on the registry per-session when a channel message enters the agent loop.
+      - [ ] *(research 2026-07-20)* **Merge the permission boundary into an OS-level sandbox.** Claude Code
+            merges `Read`/`Edit` deny rules into a filesystem boundary and `WebFetch(domain:)` into a network
+            allowlist because policy alone never covers subprocesses — a Python/`exec` script opening files
+            directly escapes the tool gate. Nanna's `exec` (Git Bash) has exactly this hole; the policy layer
+            needs an OS sandbox beneath it. Source: [Claude Code permissions](https://code.claude.com/docs/en/permissions).
+      - [ ] *(research 2026-07-20)* **Drop arbitrary-code-execution grants on entering unattended/autonomous
+            mode**, even if configured for interactive use — Anthropic's auto-mode discards blanket shell +
+            wildcarded interpreters (`python`/`node`/`ruby`) + package-manager run commands on entry. A
+            `ToolPolicy` preset the daemon applies when running headless/scheduled. Source:
+            [Claude Code auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode).
+      - [ ] *(research 2026-07-20)* **Reasoning-blind approval + tool-output injection tagging.** For any
+            human-in-the-loop tool approval, feed the classifier only user messages + tool calls (strip
+            assistant text + tool results) so the agent can't argue past its own gate; separately tag
+            tool-*output* content that looks like injected instructions. Maps onto `AgentContext`. Source:
+            [Claude Code auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode).
+      - [ ] *(research 2026-07-20)* **Trust-on-first-use tool-definition pinning (anti-rug-pull).** Hash-pin
+            each tool's description + schema at first approval; re-prompt on drift; require explicit approval
+            for a tool "upgrade". Stops a tool whose definition mutates after approval, and the tool-shadowing
+            class where one tool's description steers another tool's parameters. Applies to MCP-discovered
+            tools and `discover_tools` activation. Source:
+            [CrowdStrike agentic tool-chain attacks](https://www.crowdstrike.com/en-us/blog/how-agentic-tool-chain-attacks-threaten-ai-agent-security/).
 - [x] **Log rotation** — `tracing-appender` daily rotation, max ~7 files (logs currently accumulate unbounded).
       *(2026-07-09)* New `nanna-daemon::log_file` builds a `RollingFileAppender` (DAILY rotation,
       `filename_prefix="nanna-daemon"`, `.log` suffix, `max_log_files(7)`) wrapped in `tracing_appender::non_blocking`;

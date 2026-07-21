@@ -24,7 +24,7 @@ use nanna_config::credentials::{self, SecureStore};
 use nanna_llm::RequestBuilder;
 use nanna_memory::MemoryService;
 use nanna_scripting::ServiceFn;
-use nanna_tools::{AgentSpawner, ParentChannel, SpawnResult, ToolRegistry};
+use nanna_tools::{AgentSpawner, ParentChannel, SpawnResult, ToolPolicy, ToolRegistry};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -610,6 +610,13 @@ pub struct DaemonConfig {
     pub use_script_tools: bool,
     /// Directory containing tool scripts (resolved from env/config/default)
     pub tools_dir: Option<PathBuf>,
+    /// Tool names the agent may call. `None` (or a list containing `"*"`) means
+    /// "no allowlist — every tool is permitted". Mirrors `[tools] enabled`.
+    pub tool_allowlist: Option<Vec<String>>,
+    /// Tool names the agent may never call. Takes precedence over the allowlist.
+    /// Mirrors `[tools] disabled` — this is the setting that makes a disabled
+    /// tool actually stop executing (previously the list was parsed but ignored).
+    pub tool_denylist: Vec<String>,
     /// Channel configurations (Telegram, Discord, Slack, etc.)
     pub channels: Option<nanna_config::ChannelsConfig>,
     /// Max fraction of memories the scheduled dream cycle may merge away in one
@@ -692,6 +699,8 @@ impl Default for DaemonConfig {
             webhook: WebhookConfig::default(),
             use_script_tools: true,
             tools_dir: None,
+            tool_allowlist: None,
+            tool_denylist: Vec::new(),
             channels: None,
             // Mirror ConsolidationConfig::default() (== nanna-config defaults).
             memory_max_compression_ratio: 0.50,
@@ -2246,6 +2255,18 @@ impl DaemonServer {
             info!("Registered ask_parent tool for sub-agent communication");
         }
 
+        // Apply the tool allow/deny policy. Built from `[tools] enabled/disabled`
+        // and enforced by the registry AFTER alias/fuzzy resolution, so a denied
+        // tool cannot be reached via an alias (`Bash` → `exec`), a case variant,
+        // or a fuzzy near-miss. Skipped entirely when unrestricted.
+        let policy = build_tool_policy(
+            self.config.tool_allowlist.as_deref(),
+            &self.config.tool_denylist,
+        );
+        if !policy.is_unrestricted() {
+            tools.set_policy(policy).await;
+        }
+
         // Create agent service with multi-provider router
         let event_tx = self.ipc.event_sender();
         let mut agent_service = AgentService::with_data_dir(
@@ -2274,6 +2295,33 @@ impl DaemonServer {
             workspace_id_for_services,
             model_stats,
         ))
+    }
+}
+
+/// Build a [`ToolPolicy`] from the `[tools] enabled`/`disabled` config lists.
+///
+/// Semantics chosen to match the existing config surface:
+/// - `enabled` acts as an allowlist. The conventional wildcard `"*"` (the
+///   default) means "no allowlist in force" — every tool is permitted. An empty
+///   list would deny everything, which nobody writes by accident because the
+///   default is `["*"]`; we treat an empty allowlist as unrestricted too, so a
+///   caller that forgets to populate it fails *open* on the allow side (the
+///   denylist still applies) rather than silently muting every tool.
+/// - `disabled` is the denylist and always wins (fail closed on conflict).
+fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPolicy {
+    // A real allowlist is a non-empty `enabled` list without the `"*"` wildcard.
+    // Matched by `if let` so there is no `unwrap` on this path.
+    let real_allowlist = enabled.filter(|e| !e.is_empty() && !e.iter().any(|n| n == "*"));
+
+    let base = match real_allowlist {
+        Some(names) => ToolPolicy::allow_only(names.iter().cloned()),
+        None => ToolPolicy::allow_all(),
+    };
+
+    if disabled.is_empty() {
+        base
+    } else {
+        base.with_denied(disabled.iter().cloned())
     }
 }
 
@@ -2421,6 +2469,13 @@ impl DaemonBuilder {
         // Set script tools flag and tools directory
         builder.config.use_script_tools = config.tools.use_script_tools;
         builder.config.tools_dir = config.tools.tools_dir.clone();
+
+        // Tool allow/deny policy — `[tools] enabled` is the allowlist ("*" = all),
+        // `[tools] disabled` is the denylist. This is the wiring that makes a
+        // disabled tool actually stop executing (the lists were previously
+        // parsed into config but never enforced).
+        builder.config.tool_allowlist = Some(config.tools.enabled.clone());
+        builder.config.tool_denylist = config.tools.disabled.clone();
 
         // Load channel configuration (Telegram, Discord, Slack, etc.)
         let has_channels = config.channels.telegram.is_some()
@@ -2670,13 +2725,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_policy_wildcard_enabled_is_unrestricted() {
+        // The default `[tools] enabled = ["*"]` must not gate anything.
+        let p = build_tool_policy(Some(&["*".to_string()]), &[]);
+        assert!(p.is_unrestricted());
+    }
+
+    #[test]
+    fn tool_policy_none_enabled_is_unrestricted() {
+        assert!(build_tool_policy(None, &[]).is_unrestricted());
+    }
+
+    #[test]
+    fn tool_policy_disabled_denies_even_with_wildcard() {
+        // Regression: `disabled` was parsed but never enforced. With the wildcard
+        // allowlist a disabled tool must still be refused.
+        let p = build_tool_policy(Some(&["*".to_string()]), &["exec".to_string()]);
+        assert!(!p.is_unrestricted());
+        assert!(!p.permits("exec"));
+        assert!(p.permits("read_file"));
+    }
+
+    #[test]
+    fn tool_policy_explicit_allowlist_restricts() {
+        let enabled = vec!["read_file".to_string(), "recall".to_string()];
+        let p = build_tool_policy(Some(&enabled), &[]);
+        assert!(p.permits("read_file"));
+        assert!(!p.permits("exec"));
+    }
+
+    #[test]
+    fn tool_policy_deny_wins_over_allow() {
+        let enabled = vec!["exec".to_string(), "read_file".to_string()];
+        let p = build_tool_policy(Some(&enabled), &["exec".to_string()]);
+        assert!(!p.permits("exec"));
+        assert!(p.permits("read_file"));
+    }
+
+    #[test]
+    fn tool_policy_empty_allowlist_fails_open_on_allow_side() {
+        // A forgotten/empty allowlist must not silently mute every tool; only the
+        // denylist should bite.
+        let p = build_tool_policy(Some(&[]), &["exec".to_string()]);
+        assert!(p.permits("read_file"));
+        assert!(!p.permits("exec"));
+    }
+
+    #[test]
     fn daemon_heartbeat_prompt_does_not_command_file_read() {
         // The daemon overrides the scheduler default with its own prompt; guard
         // it too so neither site reintroduces the erroring `Read HEARTBEAT.md`.
         let p = DAEMON_HEARTBEAT_PROMPT.to_lowercase();
-        assert!(!p.contains("read heartbeat"), "must not command a file read: {p}");
-        assert!(!p.contains(".md"), "must not reference a bespoke .md file: {p}");
-        assert!(p.contains("heartbeat_ok"), "must keep the HEARTBEAT_OK sentinel: {p}");
+        assert!(
+            !p.contains("read heartbeat"),
+            "must not command a file read: {p}"
+        );
+        assert!(
+            !p.contains(".md"),
+            "must not reference a bespoke .md file: {p}"
+        );
+        assert!(
+            p.contains("heartbeat_ok"),
+            "must keep the HEARTBEAT_OK sentinel: {p}"
+        );
     }
 
     /// Serve exactly one HTTP request with a canned body, then exit.

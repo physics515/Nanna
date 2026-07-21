@@ -14,16 +14,18 @@
 //! See [`skills`] module for details.
 
 mod builtin;
+mod output;
+mod policy;
 mod registry;
 mod schema;
-mod output;
 pub mod skills;
 
 pub use builtin::*;
+pub use output::{format_tool_output, schemas as output_schemas, wants_json_output};
+pub use policy::{DenyReason, ToolPolicy};
 pub use registry::ToolRegistry;
 pub use schema::{ParameterType, ToolDefinition, ToolParameter, ToolResult};
-pub use output::{format_tool_output, wants_json_output, schemas as output_schemas};
-pub use skills::{discover_skills, load_skill, load_skills_from_dir, DiscoveredSkill, SkillSource};
+pub use skills::{DiscoveredSkill, SkillSource, discover_skills, load_skill, load_skills_from_dir};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -166,7 +168,7 @@ impl ToolResult {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
         self
