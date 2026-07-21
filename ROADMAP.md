@@ -363,7 +363,7 @@ health checks). **Shipped**, except:
       drops the external-ref tool and keeps the safe + internal-ref ones in both the returned Vec and the
       cache). Remaining on this item: `oneOf`/`anyOf`/conditional keyword handling in `schema_to_parameters`,
       Roots/Sampling/Logging deprecation, and TOFU description-pinning (P6 anti-rug-pull).
-- [ ] *(research 2026-07-21)* **Finish the 2026-07-28 RC client migration (non-security half).** Beyond the
+- [~] *(research 2026-07-21)* **Finish the 2026-07-28 RC client migration (non-security half).** Beyond the
       `$ref`/depth gate shipped above, the RC also: (1) changes the *missing-resource* error code from the
       MCP-custom **`-32002`** to the JSON-RPC-standard **`-32602` Invalid Params** — we don't match on `-32002`
       today (grep-clean), so this is forward-compat only, but any future error-code matching must use `-32602`;
@@ -373,6 +373,16 @@ health checks). **Shipped**, except:
       reads a flat top-level `properties`, so a composed schema silently yields zero params. Handle composition
       (at least surface the union of branch properties). Source:
       [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+      *(2026-07-21)* **Point (3) shipped** — `schema_to_parameters` is now composition-aware: it folds the
+      `properties` of each `allOf`/`anyOf`/`oneOf` branch (one level deep) into the parameter list on top of the
+      top-level `properties`, so a 2020-12 composed tool no longer yields **zero** params (which would make the
+      model call it with no arguments). A property is required only when the root or an `allOf` branch (all must
+      hold) requires it; `anyOf`/`oneOf` branch props are optional (only one branch applies). Order is root-first
+      then branch order, first-definition-of-a-name-wins; bounded by the finite, already-`schema_guard`-capped
+      schema. Refactored into pure helpers (`collect_schema_object`/`property_to_parameter`) and fixed the old
+      buggy required-lookup in passing. 5 tests (flat props+required, allOf hard-required, anyOf/oneOf optional,
+      first-wins dedup, empty/typeless→String). Remaining: points (1) `-32602` and (2) any-JSON
+      `structuredContent`, plus nested/conditional composition (`if`/`then`/`$defs`).
 - [ ] *(research 2026-07-21)* **Approved-server registry + signed/pinned tool definitions (defense-in-depth
       for tool-poisoning, OWASP MCP03 / CVE-2025-54136).** Tool *descriptions* enter the agent context as
       trusted text, so a poisoned description is prompt-injection with supply-chain reach — worst in

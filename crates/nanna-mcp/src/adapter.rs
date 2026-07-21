@@ -31,6 +31,7 @@ mod tools_impl {
     use async_trait::async_trait;
     use nanna_tools::{Tool, ToolDefinition, ToolError, ToolParameter, ToolResult, ParameterType};
     use serde_json::Value;
+    use std::collections::HashSet;
 
     /// Wrapper that adapts an MCP tool to the nanna-tools `Tool` trait
     pub struct McpToolWrapper<T: Transport + 'static> {
@@ -62,73 +63,130 @@ mod tools_impl {
             }
         }
 
-        /// Convert MCP JSON Schema to nanna-tools parameters
-        fn schema_to_parameters(schema: &Value) -> Vec<ToolParameter> {
-            let mut params = Vec::new();
+    }
 
-            let properties = schema
-                .get("properties")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
+    /// Convert an MCP tool `input_schema` (JSON Schema 2020-12) into nanna-tools
+    /// parameters.
+    ///
+    /// Reads the top-level `properties`/`required`, and — because the 2026-07-28 spec
+    /// lifts input schemas to full 2020-12 composition — also folds in the properties of
+    /// each `allOf`/`anyOf`/`oneOf` branch (one level deep). Without this, a tool that
+    /// describes its inputs via composition would silently yield **zero** parameters, so
+    /// the model would call it with no arguments.
+    ///
+    /// A property is marked required only when the root schema or an `allOf` branch (all
+    /// of which must hold) requires it; `anyOf`/`oneOf` branches contribute *optional*
+    /// properties, since only one branch applies to any given call. Property order is
+    /// root-first, then branch order, first definition of a name winning — bounded by the
+    /// finite schema (already depth/size-capped at ingest by `schema_guard`).
+    fn schema_to_parameters(schema: &Value) -> Vec<ToolParameter> {
+        // Ordered accumulation so parameter order is stable; `seen` enforces first-wins.
+        let mut ordered_props: Vec<(String, Value)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut required: HashSet<String> = HashSet::new();
 
-            let required: Vec<String> = schema
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
+        // Root schema: its properties and its hard requireds.
+        collect_schema_object(schema, &mut ordered_props, &mut seen, &mut required, true);
 
+        // Composition branches, one level deep. `allOf` requireds are hard (every branch
+        // must hold); `anyOf`/`oneOf` requireds are not, since only one branch applies.
+        for (keyword, requireds_are_hard) in [("allOf", true), ("anyOf", false), ("oneOf", false)]
+        {
+            if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+                for branch in branches {
+                    collect_schema_object(
+                        branch,
+                        &mut ordered_props,
+                        &mut seen,
+                        &mut required,
+                        requireds_are_hard,
+                    );
+                }
+            }
+        }
+
+        debug_assert_eq!(
+            ordered_props.len(),
+            seen.len(),
+            "each accumulated property name must be unique"
+        );
+        ordered_props
+            .into_iter()
+            .map(|(name, prop)| {
+                let is_required = required.contains(&name);
+                property_to_parameter(name, &prop, is_required)
+            })
+            .collect()
+    }
+
+    /// Fold one schema object's `properties` (ordered, first-wins via `seen`) and, when
+    /// `requireds_are_hard`, its `required` names into the accumulators. A non-object
+    /// branch or one without `properties` contributes nothing.
+    fn collect_schema_object(
+        schema: &Value,
+        ordered_props: &mut Vec<(String, Value)>,
+        seen: &mut HashSet<String>,
+        required: &mut HashSet<String>,
+        requireds_are_hard: bool,
+    ) {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
             for (name, prop) in properties {
-                let param_type = prop
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(|t| match t {
-                        "string" => ParameterType::String,
-                        "integer" => ParameterType::Integer,
-                        "number" => ParameterType::Number,
-                        "boolean" => ParameterType::Boolean,
-                        "array" => ParameterType::Array,
-                        "object" => ParameterType::Object,
-                        _ => ParameterType::String,
-                    })
-                    .unwrap_or(ParameterType::String);
-
-                let description = prop
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-
-                let enum_values = prop.get("enum").and_then(Value::as_array).map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                });
-
-                let default = prop.get("default").cloned();
-
-                params.push(ToolParameter {
-                    name,
-                    description,
-                    param_type,
-                    required: required.contains(&params.last().map_or(String::new(), |p: &ToolParameter| p.name.clone())),
-                    default,
-                    enum_values,
-                });
+                if seen.insert(name.clone()) {
+                    ordered_props.push((name.clone(), prop.clone()));
+                }
             }
-
-            // Fix required check (we need to check against the actual name)
-            for param in &mut params {
-                param.required = required.contains(&param.name);
+        }
+        if requireds_are_hard
+            && let Some(names) = schema.get("required").and_then(Value::as_array)
+        {
+            for name in names.iter().filter_map(Value::as_str) {
+                required.insert(name.to_string());
             }
+        }
+        debug_assert_eq!(
+            ordered_props.len(),
+            seen.len(),
+            "every pushed property is recorded in `seen`, so the two stay in lockstep"
+        );
+    }
 
-            params
+    /// Build a `ToolParameter` from a single JSON Schema property node. Unknown/absent
+    /// `type` falls back to `String` (the safest wire type for an unconstrained value).
+    fn property_to_parameter(name: String, prop: &Value, required: bool) -> ToolParameter {
+        let param_type = prop
+            .get("type")
+            .and_then(Value::as_str)
+            .map_or(ParameterType::String, |t| match t {
+                "integer" => ParameterType::Integer,
+                "number" => ParameterType::Number,
+                "boolean" => ParameterType::Boolean,
+                "array" => ParameterType::Array,
+                "object" => ParameterType::Object,
+                _ => ParameterType::String,
+            });
+
+        let description = prop
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let enum_values = prop.get("enum").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        });
+
+        let default = prop.get("default").cloned();
+
+        ToolParameter {
+            name,
+            description,
+            param_type,
+            required,
+            default,
+            enum_values,
         }
     }
 
@@ -138,7 +196,7 @@ mod tools_impl {
             ToolDefinition {
                 name: self.full_name(),
                 description: self.tool.description.clone().unwrap_or_default(),
-                parameters: Self::schema_to_parameters(&self.tool.input_schema),
+                parameters: schema_to_parameters(&self.tool.input_schema),
                 output_schema: None,
             }
         }
@@ -320,6 +378,97 @@ mod tools_impl {
     impl<T: Transport + 'static> Default for McpToolsManager<T> {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    mod schema_param_tests {
+        use super::{ParameterType, schema_to_parameters};
+        use serde_json::json;
+
+        fn names_required(schema: &serde_json::Value) -> Vec<(String, bool)> {
+            schema_to_parameters(schema)
+                .into_iter()
+                .map(|p| (p.name, p.required))
+                .collect()
+        }
+
+        #[test]
+        fn reads_flat_object_properties_and_required() {
+            let params = schema_to_parameters(&json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "the path" },
+                    "count": { "type": "integer" }
+                },
+                "required": ["path"]
+            }));
+            let path = params.iter().find(|p| p.name == "path").unwrap();
+            assert!(matches!(path.param_type, ParameterType::String));
+            assert_eq!(path.description, "the path");
+            assert!(path.required, "path is in `required`");
+            let count = params.iter().find(|p| p.name == "count").unwrap();
+            assert!(matches!(count.param_type, ParameterType::Integer));
+            assert!(!count.required, "count is not in `required`");
+        }
+
+        #[test]
+        fn folds_allof_branch_properties_with_hard_required() {
+            // A composed schema: base props via allOf, each branch with its own required.
+            let got = names_required(&json!({
+                "type": "object",
+                "allOf": [
+                    { "properties": { "a": { "type": "string" } }, "required": ["a"] },
+                    { "properties": { "b": { "type": "integer" } } }
+                ]
+            }));
+            // Both branch properties surface; only the allOf-required `a` is required.
+            assert!(got.contains(&("a".to_string(), true)), "got {got:?}");
+            assert!(got.contains(&("b".to_string(), false)), "got {got:?}");
+        }
+
+        #[test]
+        fn folds_oneof_and_anyof_branches_as_optional() {
+            let got = names_required(&json!({
+                "type": "object",
+                "properties": { "mode": { "type": "string" } },
+                "required": ["mode"],
+                "oneOf": [
+                    { "properties": { "x": { "type": "number" } }, "required": ["x"] },
+                    { "properties": { "y": { "type": "number" } }, "required": ["y"] }
+                ]
+            }));
+            // Root `mode` stays required; oneOf branch props appear but are NOT required
+            // (only one branch applies to a given call).
+            assert!(got.contains(&("mode".to_string(), true)), "got {got:?}");
+            assert!(got.contains(&("x".to_string(), false)), "got {got:?}");
+            assert!(got.contains(&("y".to_string(), false)), "got {got:?}");
+        }
+
+        #[test]
+        fn first_definition_of_a_name_wins() {
+            // Root defines `p` as string; an allOf branch redefines it as integer.
+            let params = schema_to_parameters(&json!({
+                "properties": { "p": { "type": "string" } },
+                "allOf": [ { "properties": { "p": { "type": "integer" } } } ]
+            }));
+            let p: Vec<_> = params.iter().filter(|q| q.name == "p").collect();
+            assert_eq!(p.len(), 1, "duplicate names collapse to one");
+            assert!(
+                matches!(p[0].param_type, ParameterType::String),
+                "root wins over branch"
+            );
+        }
+
+        #[test]
+        fn empty_or_typeless_schema_yields_no_or_string_params() {
+            assert!(schema_to_parameters(&json!({})).is_empty());
+            // A property with no `type` falls back to String rather than being dropped.
+            let params = schema_to_parameters(&json!({
+                "properties": { "loose": { "description": "anything" } }
+            }));
+            assert_eq!(params.len(), 1);
+            assert!(matches!(params[0].param_type, ParameterType::String));
         }
     }
 }
