@@ -31,6 +31,20 @@ fn eval_model() -> String {
     std::env::var("NANNA_EVAL_MODEL").unwrap_or_else(|_| "qwen3.5:9b".to_string())
 }
 
+fn eval_model_is_ollama() -> bool {
+    use nanna_daemon::llm_router::ProviderId;
+    ProviderId::from_model(&eval_model()) == ProviderId::Ollama
+}
+
+/// OpenRouter key for cloud eval runs: env override first, then the user's
+/// nanna config.
+fn openrouter_key() -> Option<String> {
+    std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| nanna_config::Config::load().ok().and_then(|c| c.llm.openrouter_api_key))
+}
+
 fn init_tracing() {
     // Default warn-only: a multi-hour run at info would produce a huge log.
     // NANNA_EVAL_LOG overrides for diagnosis. Progress lines use println!
@@ -63,7 +77,11 @@ async fn build_env(workdir: &Path) -> EvalEnv {
     let loaded = tools.load_skills_with_services(&tools_dir, &services).await;
     assert!(loaded > 0, "no skills loaded from {tools_dir:?}");
 
-    let router = Arc::new(LlmRouter::new().with_ollama("http://localhost:11434"));
+    let mut router = LlmRouter::new().with_ollama("http://localhost:11434");
+    if let Some(key) = openrouter_key() {
+        router = router.with_openrouter(&key);
+    }
+    let router = Arc::new(router);
     let runner = AgentStepRunner {
         router,
         tools,
@@ -854,7 +872,10 @@ async fn live_endurance() {
             "[resume {resumes}/{ENDURANCE_RESUMES_MAX}] provider incident at t={}m — healing and resuming the plan",
             started.elapsed().as_secs() / 60
         );
-        if !restart_ollama_server().await {
+        // Provider-aware healing: local-server surgery only for Ollama-served
+        // models; for cloud models (incl. openrouter/free, where the serving
+        // model varies per request) the pause + resume IS the healing.
+        if eval_model_is_ollama() && !restart_ollama_server().await {
             env.runner.reset_ollama_runner().await;
         }
         tokio::time::sleep(Duration::from_secs(15)).await;

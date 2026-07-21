@@ -1162,9 +1162,16 @@ below); what remains open is the full eval build-out (published task set, pass^k
         (`bench/BASELINE.md` Suite 4, endurance section, incl. the seven-run tuning trail: every
         failed run exposed a real bug — tool workdir plumbing, cmd.exe acceptance fallback,
         Ollama aborted-generation parsing, poison containment, subtask queue-jumping).
-  - [ ] **Live half, remaining:** throughput (14/42 primary features in 6h — the middle-ladder
-        grind dominates), a published task set (Terminal-Bench easy-tier / SWE-bench Lite),
-        pass^k on the endurance suite, and the 8 GB reference tier.
+  - [x] **Cloud endurance (openrouter/free auto-router):** *(2026-07-20)* the same ladder driven
+        through OpenRouter's free tier, where the serving model varies per request — **33/42
+        verified in 3.30h, one unbroken segment, 0 resumes, 0 false successes, plan drained**
+        (`all_tasks_done`; 12 items abandoned via containment where weak model draws ground out).
+        Healing is provider-aware (`ProviderId::from_model` gates local-server surgery to
+        Ollama-served models; cloud incidents heal by pause+resume+retries). Recorded in
+        `bench/BASELINE.md` Suite 4.
+  - [ ] **Live half, remaining:** local-tier throughput (14/42 primary features in 6h — the
+        middle-ladder grind dominates), a published task set (Terminal-Bench easy-tier /
+        SWE-bench Lite), pass^k on the endurance suite, and the 8 GB reference tier.
 
 - [x] *(research 2026-07-17 → done 2026-07-18)* Cross-checked against published work; the design held
       up and got sharper. Key findings: long-task failure is execution/context, not reasoning —

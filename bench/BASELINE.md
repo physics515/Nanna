@@ -106,9 +106,20 @@ Ollama's degraded-runner state (aborted `done:false` generations parsed as empty
 fixed in nanna-llm) and item-level poison containment; run 5 — subtask `sort_order 0`
 queue-jumping (task explosion); run 7 — the result above.
 
-Still open: throughput (14/42 primary features in 6 h — the middle-ladder grind dominates;
-the model spends hours on hard features), a reused benchmark task set (Terminal-Bench
-easy-tier / SWE-bench Lite), pass^k on the endurance suite, and the 8 GB reference tier.
+**Cloud variant — `openrouter/openrouter/free` (2026-07-20).** The same 42-feature ladder
+driven through OpenRouter's free-model auto-router, where the serving model varies per
+request — the harness must carry ALL continuity. Result: **33/42 features verified in 3.30 h,
+one unbroken segment, 0 resumes, 0 false successes**, 97 steps, 3.36 M tokens
+(~102 k/verified item), stop = `all_tasks_done` (plan drained: 33 verified + 12
+abandoned-with-containment). Abandonments clustered where weak models happened to be serving
+(even trivial features), while stronger draws later carried the ladder — per-request model
+variance handled by design. Smoke on the same router: 5/5 @ 17 k tokens/item. Healing is
+provider-aware: cloud incidents heal by pause+resume+retries only (local-server surgery is
+gated to Ollama-served models via `ProviderId::from_model`).
+
+Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
+grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
+pass^k on the endurance suite, and the 8 GB reference tier.
 
 ---
 
