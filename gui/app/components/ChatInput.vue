@@ -323,7 +323,7 @@ function handleToolbarLeave() {
 const richEditorRef = ref<any>(null)
 const tiptapEditor = computed(() => richEditorRef.value?.editor)
 
-const isEmpty = computed(() => richEditorRef.value?.isEmpty ?? true)
+const isEmpty = computed(() => richEditorRef.value?.isEmpty ?? !props.modelValue.trim())
 
 function handleKeyDown(event: KeyboardEvent) {
   if (event.key === 'p' && (event.ctrlKey || event.metaKey)) {

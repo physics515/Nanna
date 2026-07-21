@@ -380,7 +380,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
 - Every critical flow gets a regression test before calling the bug closed.
 
 ##### GUI automated testing
-- [ ] **Vitest + Vue Test Utils** — unit/component tests for composables, pure helpers, and high-risk widgets
+- [x] **Vitest + Vue Test Utils** — unit/component tests for composables, pure helpers, and high-risk widgets
       (ChatInput stop/send, SessionItem actions, ConnectionStatus / BackendStatus, settings forms, Logs filters).
 - [ ] **Playwright E2E (web/dev shell)** against `pnpm dev` / built Nuxt for fast iteration without a full Tauri shell.
 - [ ] **Tauri WebDriver / tauri-driver smoke** on a packaged or `cargo tauri dev` window: launch → show main

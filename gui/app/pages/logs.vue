@@ -32,12 +32,22 @@
       </div>
     </div>
 
+    <div class="relative z-10 px-4 sm:px-6 py-2 border-b border-white/[0.04] flex flex-wrap gap-2">
+      <input v-model="searchQuery" aria-label="Search logs" placeholder="Search logs" class="bg-white/[0.04] border border-white/[0.08] rounded px-2 py-1 text-xs" />
+      <select v-model="levelFilter" aria-label="Filter by level" class="bg-[#292d3e] border border-white/[0.08] rounded px-2 py-1 text-xs">
+        <option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option>
+      </select>
+      <select v-model="sourceFilter" aria-label="Filter by source" class="bg-[#292d3e] border border-white/[0.08] rounded px-2 py-1 text-xs">
+        <option value="all">All sources</option><option value="daemon">Daemon</option><option value="embedded">Embedded</option>
+      </select>
+    </div>
+
     <!-- Log viewer -->
     <div class="relative z-10 flex-1 overflow-hidden flex flex-col">
       <!-- Status bar -->
       <div class="px-4 sm:px-6 py-2 border-b border-white/[0.04] text-xs text-white/30 flex items-center justify-between">
         <div class="flex items-center gap-4">
-          <span>{{ logs.length }} lines</span>
+          <span>{{ filteredLogs.length }} of {{ logs.length }} lines</span>
           <!-- Which sources are feeding this view. The GUI always logs itself, so
                'embedded' is always live; 'daemon' only when one is attached. -->
           <span class="text-cyan-300/60">&#x25cf; embedded</span>
@@ -57,7 +67,7 @@
         ref="logsContainer"
         class="flex-1 overflow-y-auto font-mono text-sm p-4 space-y-0"
       >
-        <div v-if="logs.length === 0" class="flex items-center justify-center min-h-[300px]">
+        <div v-if="filteredLogs.length === 0" class="flex items-center justify-center min-h-[300px]">
           <div class="text-center">
             <div class="text-4xl mb-3">&#x1f4cb;</div>
             <p class="text-white/30">No logs yet. Embedded and daemon logs will appear here.</p>
@@ -65,7 +75,7 @@
         </div>
 
         <div
-          v-for="(log, idx) in logs"
+          v-for="(log, idx) in filteredLogs"
           :key="idx"
           class="py-1 px-2 rounded transition-colors group cursor-default"
           :class="[
@@ -106,6 +116,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { filterLogs } from '~/lib/logFilters'
 import { ChevronDown, Trash2, Circle, Copy } from 'lucide-vue-next'
 import { toast } from 'vue-sonner'
 
@@ -130,6 +141,10 @@ const logsContainer = ref<HTMLElement | null>(null)
 const autoScroll = ref(true)
 const liveMode = ref(true)
 const isLoading = ref(false)
+const searchQuery = ref('')
+const levelFilter = ref('all')
+const sourceFilter = ref('all')
+const filteredLogs = computed(() => filterLogs(logs.value, levelFilter.value, sourceFilter.value, searchQuery.value))
 const lastUpdate = ref<Date | null>(null)
 const copyLabel = ref('Copy all')
 let copyLabelTimer: ReturnType<typeof setTimeout> | null = null
