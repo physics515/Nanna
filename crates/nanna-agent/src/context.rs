@@ -463,7 +463,7 @@ impl AgentContext {
 
     /// Deprecated no-op kept for call-site compatibility.
     #[must_use]
-    pub fn with_workspace_memory(mut self, _include: bool) -> Self {
+    pub fn with_workspace_memory(self, _include: bool) -> Self {
         self
     }
 

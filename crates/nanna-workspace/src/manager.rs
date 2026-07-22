@@ -2,7 +2,7 @@
 
 use crate::{
     discover_workspace, find_workspace_root, WorkspaceError, WorkspaceFiles, WorkspaceMarker,
-    AGENTS_FILE, README_FILE, ROADMAP_FILE, WORKSPACE_MARKER_DIR,
+    AGENTS_FILE, README_FILE, WORKSPACE_MARKER_DIR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
