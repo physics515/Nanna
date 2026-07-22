@@ -170,10 +170,9 @@ import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle, Activity } from 'lucide-vue-next'
 
-interface ChannelStatus {
 const { isOnline } = useBackend()
-const toast = useToast()
-const { confirm } = useConfirm()
+
+interface ChannelStatus {
   name: string
   configured: boolean
   enabled: boolean
@@ -223,6 +222,7 @@ async function refreshStatus() {
     channels.value = await invoke<ChannelStatus[]>('get_channel_status')
   } catch (e) {
     console.error('Failed to load channel status:', e)
+    loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
     isLoading.value = false
   }

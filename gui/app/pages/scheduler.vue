@@ -258,10 +258,11 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 
-interface CronJob {
 const { isOnline } = useBackend()
 const toast = useToast()
 const { confirm } = useConfirm()
+
+interface CronJob {
   id: string
   name: string
   schedule: string
@@ -497,4 +498,6 @@ function formatDate(date: string | null): string {
   if (!date) return 'N/A'
   return new Date(date).toLocaleString()
 }
+
+
 </script>

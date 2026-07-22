@@ -347,11 +347,12 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+  Plus, RefreshCw, Loader2, ListChecks, Trash2, Check, Play, Square, X
+} from 'lucide-vue-next'
+
 const { isOnline } = useBackend()
 const toast = useToast()
 const { confirm } = useConfirm()
-  Plus, RefreshCw, Loader2, ListChecks, Trash2, Check, Play, Square, X
-} from 'lucide-vue-next'
 
 interface Task {
   id: number
@@ -414,6 +415,8 @@ const filterActive = ref(false)
 
 const selectedTask = ref<Task | null>(null)
 const taskDetails = ref<{ task?: Task; notes?: any[]; activity?: any[] } | null>(null)
+
+
 const loadingDetails = ref(false)
 const verdictMsg = ref<string | null>(null)
 const newNote = ref('')

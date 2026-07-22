@@ -469,11 +469,12 @@ import { ref, computed, onMounted, watch, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
+  Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
+} from 'lucide-vue-next'
+
 const { isOnline } = useBackend()
 const toast = useToast()
 const { confirm } = useConfirm()
-  Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
-} from 'lucide-vue-next'
 
 // Inject tab management functions from layout
 const addWorkspaceTab = inject<(ws: WorkspaceInfo) => void>('addWorkspaceTab')
@@ -783,6 +784,8 @@ async function createSingleFile(ws: WorkspaceInfo, filename: string) {
     isLoading.value = false
   }
 }
+
+
 </script>
 
 <style scoped>
