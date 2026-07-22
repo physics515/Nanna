@@ -7,11 +7,7 @@
     />
 
     <!-- Agent Identity -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <Bot class="w-4 h-4" />
-        Agent Identity
-      </h3>
+    <SettingsSection title="Agent Identity" description="How Nanna refers to itself and the tone it defaults to.">
       <div class="space-y-4">
         <div>
           <label class="block text-sm font-medium text-nanna-text-muted mb-1">Name</label>
@@ -37,19 +33,14 @@
           />
         </div>
       </div>
-    </UiCard>
+    </SettingsSection>
 
     <!-- Model Routing -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <Cpu class="w-4 h-4" />
-        Model Routing
-      </h3>
-      <p class="text-xs text-nanna-text-dim mb-4">
-        Route simpler tasks to cheaper models automatically. The agent classifies each iteration's complexity
-        and picks the cheapest capable model. If the routed model fails, it escalates to the primary model.
-      </p>
-
+    <SettingsSection
+      title="Model Routing"
+      description="Route simpler tasks to cheaper models. Failures escalate to the primary model."
+      advanced
+    >
       <div class="space-y-4">
         <!-- Sub-agent model -->
         <div class="flex items-center justify-between">
@@ -138,14 +129,10 @@
           </div>
         </template>
       </div>
-    </UiCard>
+    </SettingsSection>
 
     <!-- Response Preferences -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <MessageSquare class="w-4 h-4" />
-        Response Preferences
-      </h3>
+    <SettingsSection title="Response Preferences" description="Streaming, thinking, length, and long-run loop controls.">
       <div class="space-y-4">
         <div class="flex items-center justify-between">
           <div>
@@ -187,13 +174,11 @@
             <div>
               <span class="text-sm font-medium text-nanna-text">Agent Loop</span>
               <p class="text-xs text-nanna-text-dim mt-0.5">
-                Nanna can work on a problem for many iterations. It never hard-stops —
-                Stop always ends a run — and only gets gentle "wrap up" nudges once a run gets long.
+                Nanna can work many iterations. Stop always ends a run; gentle wrap-up nudges appear once a run gets long.
               </p>
             </div>
           </div>
 
-          <!-- Unlimited backstop toggle -->
           <label class="flex items-center justify-between cursor-pointer">
             <span class="text-sm text-nanna-text">Unlimited iterations (recommended)</span>
             <input
@@ -204,41 +189,38 @@
             />
           </label>
 
-          <!-- Absolute backstop (only when not unlimited) -->
-          <div v-if="!unlimitedIterations" class="flex items-center justify-between gap-3">
-            <span class="text-sm text-nanna-text-dim">Max iterations (safety backstop)</span>
-            <input
-              type="number" min="1" step="100"
-              v-model.number="maxIterations"
-              @change="saveIterationPolicy"
-              class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
-            />
-          </div>
-
-          <!-- First nudge -->
-          <div class="flex items-center justify-between gap-3">
-            <span class="text-sm text-nanna-text-dim">Nudge after (iterations)</span>
-            <input
-              type="number" min="1" step="50"
-              v-model.number="nudgeAfterIterations"
-              @change="saveIterationPolicy"
-              class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
-            />
-          </div>
-
-          <!-- Nudge interval -->
-          <div class="flex items-center justify-between gap-3">
-            <span class="text-sm text-nanna-text-dim">Then re-nudge every (iterations)</span>
-            <input
-              type="number" min="1" step="25"
-              v-model.number="nudgeIntervalIterations"
-              @change="saveIterationPolicy"
-              class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
-            />
+          <div v-if="showAdvanced" class="space-y-3 pt-1 border-t border-white/[0.04]">
+            <div v-if="!unlimitedIterations" class="flex items-center justify-between gap-3">
+              <span class="text-sm text-nanna-text-dim">Max iterations (safety backstop)</span>
+              <input
+                type="number" min="1" step="100"
+                v-model.number="maxIterations"
+                @change="saveIterationPolicy"
+                class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+              />
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-sm text-nanna-text-dim">Nudge after (iterations)</span>
+              <input
+                type="number" min="1" step="50"
+                v-model.number="nudgeAfterIterations"
+                @change="saveIterationPolicy"
+                class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+              />
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-sm text-nanna-text-dim">Then re-nudge every (iterations)</span>
+              <input
+                type="number" min="1" step="25"
+                v-model.number="nudgeIntervalIterations"
+                @change="saveIterationPolicy"
+                class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+              />
+            </div>
           </div>
         </div>
       </div>
-    </UiCard>
+    </SettingsSection>
   </div>
 </template>
 
@@ -249,7 +231,7 @@ import { Bot, Cpu, MessageSquare, Trash2, Plus } from 'lucide-vue-next'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
 const store = useSettingsPage()
-const { settings, routingModelOptions, loadSettings, showToast } = store
+const { settings, showAdvanced, routingModelOptions, loadSettings, showToast } = store
 
 const agentName = ref('Nanna')
 const personalityMode = ref('balanced')
@@ -349,7 +331,7 @@ async function saveRoutingFirstTurnPrimary(enabled: boolean) {
   try {
     await invoke('set_routing_first_turn_primary', { enabled })
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -379,7 +361,7 @@ async function saveSubAgentModel(model: string) {
     await invoke('set_sub_agent_model', { model: value })
     showToast(value ? `Sub-agent model: ${value}` : 'Sub-agents will use primary model', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -388,7 +370,7 @@ async function saveAgentName() {
     await invoke('set_agent_name', { name: agentName.value })
     showToast('Agent name saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -397,7 +379,7 @@ async function savePersonalityMode() {
     await invoke('set_personality_mode', { mode: personalityMode.value })
     showToast('Personality mode saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -406,7 +388,7 @@ async function setThinkingEnabled(enabled: boolean) {
     await invoke('set_thinking_enabled', { enabled })
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -415,7 +397,7 @@ async function setStreamingEnabled(enabled: boolean) {
     await invoke('set_streaming_enabled', { enabled })
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -424,7 +406,7 @@ async function setMaxTokens(tokens: number) {
     await invoke('set_max_tokens', { tokens })
     maxTokens.value = tokens
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -437,7 +419,7 @@ async function saveIterationPolicy() {
     })
     showToast('Agent loop settings saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 </script>

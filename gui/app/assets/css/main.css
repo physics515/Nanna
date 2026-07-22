@@ -556,3 +556,23 @@ button.icon-only,
 @media (max-width: 1280px) {
   .page-shell__header { padding-inline: 0.75rem; }
 }
+
+
+/* Compact density (command palette toggle) */
+html.density-compact {
+  font-size: 13px;
+}
+html.density-compact .page-shell__header {
+  min-height: 40px;
+}
+html.density-compact .status-bar {
+  height: 24px;
+}
+
+html.density-compact .activity-icon {
+  height: 36px;
+}
+html.density-compact .status-bar {
+  height: 22px;
+}
+

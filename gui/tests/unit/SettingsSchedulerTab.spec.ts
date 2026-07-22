@@ -52,6 +52,7 @@ function mountTab() {
         UiCard: { template: '<section><slot /></section>' },
         UiSwitch: UiSwitchStub,
         Clock: true,
+        SettingsSection: { template: '<section><slot /></section>' },
       },
     },
   })
@@ -106,7 +107,7 @@ describe('SettingsSchedulerTab', () => {
     const wrapper = mountTab()
     await wrapper.findAll('.switch')[0].trigger('click')
     await vi.waitFor(() =>
-      expect(showToast).toHaveBeenCalledWith('Failed: not connected', 'error'),
+      expect(showToast).toHaveBeenCalledWith("Couldn't update scheduler: not connected", 'error'),
     )
   })
 })

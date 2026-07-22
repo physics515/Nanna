@@ -1,69 +1,79 @@
 <template>
   <div class="space-y-6">
-    <!-- Sessions -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <Database class="w-4 h-4" />
-        Data Management
-      </h3>
-      <div class="space-y-4">
-        <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
-          <div>
-            <div class="text-sm font-medium text-nanna-text">Chat Sessions</div>
-            <div class="text-xs text-nanna-text-dim">{{ sessionCount }} sessions stored</div>
-          </div>
-          <UiButton @click="confirmClearSessions" variant="destructive" size="sm">
-            <Trash2 class="w-4 h-4 mr-1" />
-            Clear All
-          </UiButton>
-        </div>
+    <SettingsSection
+      title="Data Management"
+      description="Sessions and memories stored on this machine."
+    >
+      <template #icon>
+        <Database class="w-4 h-4 text-nanna-primary" />
+      </template>
 
-        <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
-          <div>
-            <div class="text-sm font-medium text-nanna-text">Memories</div>
-            <div class="text-xs text-nanna-text-dim">{{ memoryStats?.total_memories || 0 }} memories stored</div>
-          </div>
-          <UiButton @click="confirmClearMemories" variant="destructive" size="sm">
-            <Trash2 class="w-4 h-4 mr-1" />
-            Clear All
-          </UiButton>
+      <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
+        <div>
+          <div class="text-sm font-medium text-nanna-text">Chat Sessions</div>
+          <div class="text-xs text-nanna-text-dim">{{ sessionCount }} sessions stored</div>
         </div>
+        <UiButton @click="confirmClearSessions" variant="destructive" size="sm">
+          <Trash2 class="w-4 h-4 mr-1" />
+          Clear All
+        </UiButton>
       </div>
-    </UiCard>
 
-    <!-- Import/Export -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <FileDown class="w-4 h-4" />
-        Configuration
-      </h3>
-      <div class="space-y-3">
-        <p class="text-sm text-nanna-text-muted">
-          Config file location:
-        </p>
-        <code class="block text-xs bg-nanna-bg-deep text-nanna-accent p-2 rounded font-mono break-all">
-          {{ configPath }}
-        </code>
-        <div class="flex gap-2">
-          <UiButton @click="exportConfig" variant="secondary" size="sm" class="flex-1">
-            <FileDown class="w-4 h-4 mr-1" />
-            Export
-          </UiButton>
-          <UiButton @click="importConfig" variant="secondary" size="sm" class="flex-1">
-            <FileUp class="w-4 h-4 mr-1" />
-            Import
-          </UiButton>
+      <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
+        <div>
+          <div class="text-sm font-medium text-nanna-text">Memories</div>
+          <div class="text-xs text-nanna-text-dim">{{ memoryStats?.total_memories || 0 }} memories stored</div>
         </div>
+        <UiButton @click="confirmClearMemories" variant="destructive" size="sm">
+          <Trash2 class="w-4 h-4 mr-1" />
+          Clear All
+        </UiButton>
       </div>
-    </UiCard>
+    </SettingsSection>
 
-    <!-- About -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <Moon class="w-4 h-4" />
-        About Nanna
-      </h3>
-      <p class="text-sm text-nanna-text-muted italic mb-3">
+    <SettingsSection
+      title="Configuration"
+      description="Export or import your config file."
+    >
+      <template #icon>
+        <FileDown class="w-4 h-4 text-nanna-primary" />
+      </template>
+
+      <p class="text-sm text-nanna-text-muted">Config file location:</p>
+      <code class="block text-xs bg-nanna-bg-deep text-nanna-accent p-2 rounded font-mono break-all">
+        {{ configPath }}
+      </code>
+      <div class="flex gap-2">
+        <UiButton @click="exportConfig" variant="secondary" size="sm" class="flex-1">
+          <FileDown class="w-4 h-4 mr-1" />
+          Export
+        </UiButton>
+        <UiButton @click="importConfig" variant="secondary" size="sm" class="flex-1">
+          <FileUp class="w-4 h-4 mr-1" />
+          Import
+        </UiButton>
+      </div>
+    </SettingsSection>
+
+    <!-- Calm danger zone — always visible, not shouted -->
+    <SettingsSection
+      danger
+      title="Erase data"
+      description="These actions permanently remove local data. Export first if you may need it later."
+    >
+      <template #icon>
+        <Trash2 class="w-4 h-4" />
+      </template>
+      <p class="text-xs text-nanna-text-muted">
+        Use the Clear All actions above. Nothing runs until you confirm.
+      </p>
+    </SettingsSection>
+
+    <SettingsSection title="About Nanna">
+      <template #icon>
+        <Moon class="w-4 h-4 text-nanna-primary" />
+      </template>
+      <p class="text-sm text-nanna-text-muted italic mb-1">
         "I am the light that finds you in darkness, the memory that outlives the flesh."
       </p>
       <div class="space-y-2 text-sm">
@@ -76,7 +86,7 @@
           <span class="text-nanna-text">Tauri v2 + Nuxt v4 + Rust</span>
         </div>
       </div>
-    </UiCard>
+    </SettingsSection>
   </div>
 </template>
 
@@ -113,7 +123,7 @@ async function loadSessions() {
     const sessions = await invoke<{ id: string }[]>('list_sessions')
     sessionCount.value = sessions.length
   } catch (e) {
-    console.error('Failed to load sessions:', e)
+    console.error('Could not load sessions:', e)
   }
 }
 
@@ -132,7 +142,7 @@ async function confirmClearSessions() {
     showToast(`Cleared ${count} sessions`, 'success')
     sessionCount.value = 0
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Could not clear sessions: ${e.message || e}`, 'error')
   }
 }
 
@@ -151,7 +161,7 @@ async function confirmClearMemories() {
     showToast('All memories cleared', 'success')
     await loadMemoryStats()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Could not clear memories: ${e.message || e}`, 'error')
   }
 }
 
@@ -159,7 +169,6 @@ async function exportConfig() {
   try {
     const config = await invoke<string>('export_config')
 
-    // Create a downloadable blob
     const blob = new Blob([config], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -172,13 +181,12 @@ async function exportConfig() {
 
     showToast('Configuration exported', 'success')
   } catch (e: any) {
-    showToast(`Export failed: ${e.message || e}`, 'error')
+    showToast(`Could not export configuration: ${e.message || e}`, 'error')
   }
 }
 
 async function importConfig() {
   try {
-    // Create file input and trigger it
     const input = document.createElement('input')
     input.type = 'file'
     input.accept = '.toml'
@@ -197,7 +205,7 @@ async function importConfig() {
 
     input.click()
   } catch (e: any) {
-    showToast(`Import failed: ${e.message || e}`, 'error')
+    showToast(`Could not import configuration: ${e.message || e}`, 'error')
   }
 }
 </script>

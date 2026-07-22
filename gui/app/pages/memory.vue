@@ -52,8 +52,8 @@
     </div>
 
     <!-- Memory list -->
-    <div class="relative z-10 flex-1 overflow-y-auto overflow-x-hidden">
-      <div class="p-4 sm:p-6">
+    <div class="relative z-10 flex-1 min-h-0 flex flex-col overflow-hidden">
+      <div class="p-4 sm:p-6 flex-1 min-h-0 flex flex-col">
         <!-- Loading / offline / error / empty -->
         <PageState
           v-if="pageKind"
@@ -66,26 +66,29 @@
         />
 
         <!-- Memories -->
-        <div v-else class="space-y-3">
-          <div
-            v-for="memory in filteredMemories"
-            :key="memory.id"
-            class="group"
-          >
+        <VirtualList
+          v-else-if="filteredMemories.length > 80"
+          :items="filteredMemories"
+          :item-height="80"
+          :overscan="6"
+          class="flex-1 min-h-0"
+        >
+          <template #default="{ item: memory }">
+            <div class="group h-full pb-3">
             <!-- Meta row -->
             <div class="flex items-center justify-between gap-3 mb-1 px-1">
-              <div class="flex items-center gap-3 text-xs text-white/20">
-                <span>{{ formatDate(memory.created_at) }}</span>
-                <span v-if="memory.state && memory.state !== 'active'" class="text-amber-300/40">{{ memory.state }}</span>
-                <span v-if="memory.importance" class="text-amber-300/40">
-                  {{ '★'.repeat(Math.min(Math.round(memory.importance), 5)) }}
-                </span>
+              <div class="flex items-center gap-2 text-[11px] text-white/25 min-w-0">
+                <span class="truncate">{{ formatDate(memory.timestamp) }}</span>
+                <span v-if="memory.score" class="text-white/15">·</span>
+                <span v-if="memory.score" class="shrink-0">{{ (memory.score * 100).toFixed(0) }}% match</span>
+                <span v-if="memory.tags?.length" class="text-white/15">·</span>
+                <span v-if="memory.tags?.length" class="truncate">{{ memory.tags.join(', ') }}</span>
               </div>
-              <div class="flex items-center gap-1">
+              <div class="flex items-center gap-1 shrink-0">
                 <button
                   v-if="editingMemoryId !== memory.id"
-                  @click="startEditing(memory)"
-                  class="opacity-0 group-hover:opacity-100 text-white/20 hover:text-white/60 transition-all p-1"
+                  @click="startEditMemory(memory)"
+                  class="opacity-0 group-hover:opacity-100 text-white/20 hover:text-white/50 transition-all p-1"
                   title="Edit memory"
                 >
                   <Pencil class="w-3.5 h-3.5" />
@@ -95,7 +98,7 @@
                   size="xs"
                   color="accent"
                   pill
-                  @click="saveEditing(memory.id)"
+                  @click="saveEditMemory(memory)"
                 >
                   Save
                 </UiGlassButton>
@@ -104,7 +107,68 @@
                   size="xs"
                   color="default"
                   pill
-                  @click="cancelEditing"
+                  @click="cancelEditMemory"
+                >
+                  Cancel
+                </UiGlassButton>
+                <button
+                  @click="deleteMemory(memory.id)"
+                  class="opacity-0 group-hover:opacity-100 text-white/20 hover:text-red-400/60 transition-all p-1"
+                  title="Delete memory"
+                >
+                  <Trash2 class="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+            <!-- Rich text editor -->
+            <MemoryEditor
+              :model-value="editingMemoryId === memory.id ? editBuffers[memory.id] : memory.content"
+              :editable="editingMemoryId === memory.id"
+              placeholder="Write a memory..."
+              @update:model-value="editBuffers[memory.id] = $event"
+            />
+            </div>
+          </template>
+        </VirtualList>
+        <div v-else class="space-y-3 flex-1 min-h-0 overflow-y-auto">
+          <div
+            v-for="memory in filteredMemories"
+            :key="memory.id"
+            class="group"
+          >
+            <!-- Meta row -->
+            <div class="flex items-center justify-between gap-3 mb-1 px-1">
+              <div class="flex items-center gap-2 text-[11px] text-white/25 min-w-0">
+                <span class="truncate">{{ formatDate(memory.timestamp) }}</span>
+                <span v-if="memory.score" class="text-white/15">·</span>
+                <span v-if="memory.score" class="shrink-0">{{ (memory.score * 100).toFixed(0) }}% match</span>
+                <span v-if="memory.tags?.length" class="text-white/15">·</span>
+                <span v-if="memory.tags?.length" class="truncate">{{ memory.tags.join(', ') }}</span>
+              </div>
+              <div class="flex items-center gap-1 shrink-0">
+                <button
+                  v-if="editingMemoryId !== memory.id"
+                  @click="startEditMemory(memory)"
+                  class="opacity-0 group-hover:opacity-100 text-white/20 hover:text-white/50 transition-all p-1"
+                  title="Edit memory"
+                >
+                  <Pencil class="w-3.5 h-3.5" />
+                </button>
+                <UiGlassButton
+                  v-if="editingMemoryId === memory.id"
+                  size="xs"
+                  color="accent"
+                  pill
+                  @click="saveEditMemory(memory)"
+                >
+                  Save
+                </UiGlassButton>
+                <UiGlassButton
+                  v-if="editingMemoryId === memory.id"
+                  size="xs"
+                  color="default"
+                  pill
+                  @click="cancelEditMemory"
                 >
                   Cancel
                 </UiGlassButton>

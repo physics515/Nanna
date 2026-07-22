@@ -1,11 +1,7 @@
 <template>
   <div class="space-y-6">
     <!-- API Keys -->
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <Key class="w-4 h-4" />
-        Providers
-      </h3>
+    <SettingsSection title="Providers" description="API keys and local backends. Primary selection stays visible.">
       <div class="space-y-4">
         <!-- Anthropic (OAuth only, via claude setup-token) -->
         <div class="space-y-3">
@@ -144,31 +140,32 @@
               </UiButton>
             </div>
           </div>
-          <div>
-            <label class="block text-xs text-nanna-text-dim mb-1">Server URL</label>
-            <div class="flex gap-2">
-              <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
-              <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
+          <p class="text-xs text-nanna-text-muted">Local models for offline and private runs.</p>
+          <div v-if="showAdvanced" class="space-y-3 pt-1 border-t border-white/[0.04]">
+            <div>
+              <label class="block text-xs text-nanna-text-dim mb-1">Server URL</label>
+              <div class="flex gap-2">
+                <UiInput v-model="ollamaHostInput" placeholder="http://localhost:11434" class="flex-1" />
+                <UiButton @click="saveOllamaHost" size="sm">Save</UiButton>
+              </div>
+              <p class="text-[11px] text-nanna-text-muted mt-1">Only needed if Ollama is not on the default port.</p>
             </div>
-          </div>
-          <div>
-            <label class="block text-xs text-nanna-text-dim mb-1">API Key <span class="text-nanna-text-dim/60">(optional)</span></label>
-            <div class="flex gap-2">
-              <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="For remote/authenticated instances" class="flex-1" />
-              <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
+            <div>
+              <label class="block text-xs text-nanna-text-dim mb-1">API Key <span class="text-nanna-text-dim/60">(optional)</span></label>
+              <div class="flex gap-2">
+                <UiInput v-model="ollamaApiKeyInput" type="password" placeholder="For remote/authenticated instances" class="flex-1" />
+                <UiButton @click="saveOllamaApiKey" size="sm">Save</UiButton>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </UiCard>
+    </SettingsSection>
 
     <!-- Model Priority (Fallback Chain) -->
-    <UiCard>
+    <SettingsSection title="Chat Models" description="Priority order for chat replies. First working model wins.">
       <div class="flex items-center justify-between mb-4">
-        <h3 class="text-base font-semibold text-nanna-primary flex items-center gap-2">
-          <Brain class="w-4 h-4" />
-          Chat Models
-        </h3>
+        <span class="text-xs text-nanna-text-muted">Drag to reorder fallback priority</span>
         <UiButton aria-label="Refresh models" title="Refresh models" @click="refreshAllModels" :disabled="loadingModels" variant="ghost" size="sm">
           <RefreshCw :class="['w-3 h-3', loadingModels && 'animate-spin']" />
         </UiButton>
@@ -286,7 +283,7 @@
         </div>
       </div>
 
-    </UiCard>
+    </SettingsSection>
   </div>
 </template>
 
@@ -302,6 +299,7 @@ import { useSettingsPage } from '~/composables/useSettingsPage'
 const store = useSettingsPage()
 const {
   settings,
+  showAdvanced,
   ollamaModels, loadingOllamaModels, ollamaStatus, loadingModels,
   claudeProxyHealthy,
   allChatModels, allEmbeddingModels, allSummarizationModels, allOcrModels,
@@ -400,7 +398,7 @@ async function saveChatModelPriority(priority: string[]) {
     await invoke('set_chat_model_priority', { priority })
     showToast('Chat model priority saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -409,7 +407,7 @@ async function saveEmbeddingModelPriority(priority: string[]) {
     await invoke('set_embedding_model_priority', { priority })
     showToast('Embedding model priority saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -418,7 +416,7 @@ async function saveSummarizationModelPriority(priority: string[]) {
     await invoke('set_summarization_model_priority', { priority })
     showToast('Summarization model priority saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -427,7 +425,7 @@ async function saveOcrModelPriority(priority: string[]) {
     await invoke('set_ocr_model_priority', { priority })
     showToast('OCR model priority saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -437,7 +435,7 @@ async function saveUseEmbeddedOcr(enabled: boolean) {
     await invoke('set_use_embedded_ocr', { enabled })
     showToast(`Embedded OCR ${enabled ? 'enabled' : 'disabled'}`, 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -455,7 +453,7 @@ async function toggleClaudeProxy(event: Event) {
     }
     showToast(enabled ? 'Claude Proxy enabled' : 'Claude Proxy disabled', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -465,7 +463,7 @@ async function saveClaudeProxyUrl() {
     await refreshModels()
     showToast('Claude Proxy URL saved', 'success')
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -484,7 +482,7 @@ async function saveOAuthToken() {
     await loadSettings()
     await refreshModels()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -497,7 +495,7 @@ async function runClaudeSetupToken() {
     await loadSettings()
     await refreshModels()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   } finally {
     oauthLoading.value = false
     oauthAction.value = null
@@ -526,7 +524,7 @@ async function logoutAnthropic() {
     showToast('Logged out of Anthropic', 'success')
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -537,7 +535,7 @@ async function setProvider(provider: string) {
     await loadSettings()
     await refreshModels()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -547,7 +545,7 @@ async function updateModel() {
     showToast('Model updated', 'success')
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -558,7 +556,7 @@ async function saveOllamaHost() {
     await refreshOllamaModels()
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -568,7 +566,7 @@ async function saveOllamaApiKey() {
     showToast('Ollama API key saved', 'success')
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -585,7 +583,7 @@ async function setEmbeddingProvider(provider: string) {
     showToast('Embedding config updated', 'success')
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 
@@ -596,7 +594,7 @@ async function updateEmbeddingModel() {
     showToast('Embedding model updated', 'success')
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
   }
 }
 

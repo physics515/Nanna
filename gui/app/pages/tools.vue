@@ -17,7 +17,7 @@
         <UiInput v-model="searchQuery" placeholder="Search tools..." size="sm" class="text-xs" />
       </header>
 
-      <div class="flex-1 overflow-y-auto p-2">
+      <div class="flex-1 min-h-0 flex flex-col p-2">
         <PageState
           v-if="loading || !isOnline || loadError || filteredTools.length === 0"
           :state="loading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
@@ -33,7 +33,28 @@
         />
 
         <!-- Tools list -->
-        <div v-else class="space-y-1">
+        <VirtualList
+          v-else-if="filteredTools.length > 60"
+          :items="filteredTools"
+          :item-height="36"
+          :overscan="8"
+          class="flex-1 min-h-0"
+        >
+          <template #default="{ item: tool }">
+            <div
+              @click="selectTool(tool)"
+              class="group flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer transition-colors h-full"
+              :class="selectedTool?.name === tool.name
+                ? 'bg-nanna-accent/20 text-nanna-accent'
+                : 'hover:bg-nanna-primary/10 text-nanna-text-muted hover:text-nanna-text'"
+            >
+              <Wrench class="w-4 h-4 flex-shrink-0" />
+              <span class="text-sm truncate flex-1">{{ tool.name }}</span>
+              <UiBadge v-if="!tool.enabled" variant="secondary" size="xs">disabled</UiBadge>
+            </div>
+          </template>
+        </VirtualList>
+        <div v-else class="space-y-1 flex-1 min-h-0 overflow-y-auto">
           <div
             v-for="tool in filteredTools"
             :key="tool.name"

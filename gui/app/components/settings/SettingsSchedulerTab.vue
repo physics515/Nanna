@@ -1,10 +1,9 @@
 <template>
   <div class="space-y-6">
-    <UiCard>
-      <h3 class="text-base font-semibold text-nanna-primary mb-4 flex items-center gap-2">
-        <Clock class="w-4 h-4" />
-        Scheduler Settings
-      </h3>
+    <SettingsSection
+      title="Scheduler"
+      description="Background tasks and periodic self-checks while Nanna is running."
+    >
       <div class="space-y-4">
         <div class="flex items-center justify-between">
           <div>
@@ -22,7 +21,6 @@
           <UiSwitch :model-value="settings?.heartbeat_enabled" label="Heartbeat enabled" @update:model-value="setHeartbeatEnabled" />
         </div>
 
-        <!-- Heartbeat Interval -->
         <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
           <div class="flex items-center justify-between mb-2">
             <span class="text-sm font-medium text-nanna-text">Heartbeat Interval</span>
@@ -40,13 +38,12 @@
           </div>
         </div>
       </div>
-    </UiCard>
+    </SettingsSection>
   </div>
 </template>
 
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
-import { Clock } from 'lucide-vue-next'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
 const store = useSettingsPage()
@@ -57,7 +54,7 @@ async function setSchedulerEnabled(enabled: boolean) {
     await invoke('set_scheduler_enabled', { enabled })
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't update scheduler: ${e.message || e}`, 'error')
   }
 }
 
@@ -66,7 +63,7 @@ async function setHeartbeatEnabled(enabled: boolean) {
     await invoke('set_heartbeat_enabled', { enabled })
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't update heartbeats: ${e.message || e}`, 'error')
   }
 }
 
@@ -75,7 +72,7 @@ async function setHeartbeatInterval(seconds: number) {
     await invoke('set_heartbeat_interval', { seconds })
     await loadSettings()
   } catch (e: any) {
-    showToast(`Failed: ${e.message || e}`, 'error')
+    showToast(`Couldn't update heartbeat interval: ${e.message || e}`, 'error')
   }
 }
 

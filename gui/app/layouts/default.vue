@@ -37,7 +37,7 @@
         </button>
 
         <NuxtLink
-          v-for="item in navItems" :key="item.to" :to="item.to"
+          v-for="item in primaryNavItems" :key="item.to" :to="item.to"
           :aria-label="item.label"
           :title="item.label"
           :class="['activity-icon', { active: isNavActive(item.to) }]"
@@ -46,6 +46,32 @@
           <component :is="item.icon" />
           <span class="tooltip">{{ item.label }}</span>
         </NuxtLink>
+
+        <!-- Admin overflow (progressive disclosure) -->
+        <div class="activity-more" ref="adminNavEl">
+          <button
+            type="button"
+            aria-label="More"
+            title="More"
+            :class="['activity-icon', { active: adminNavOpen || adminNavActive }]"
+            @click.stop="adminNavOpen = !adminNavOpen"
+          >
+            <MoreHorizontal />
+            <span class="tooltip">More</span>
+          </button>
+          <div v-if="adminNavOpen" class="admin-flyout" role="menu">
+            <NuxtLink
+              v-for="item in adminNavItems" :key="item.to" :to="item.to"
+              class="admin-flyout-item"
+              :class="{ active: isNavActive(item.to) }"
+              role="menuitem"
+              @click="adminNavOpen = false; chatPanelOpen = false"
+            >
+              <component :is="item.icon" class="admin-flyout-icon" />
+              <span>{{ item.label }}</span>
+            </NuxtLink>
+          </div>
+        </div>
       </nav>
 
       <!-- Bottom: settings + hide -->
@@ -150,30 +176,60 @@
     <!-- Close confirmation dialog -->
     <CloseDialog />
 
+    <CommandPalette
+      :open="paletteOpen"
+      :actions="paletteActions"
+      @close="hidePalette"
+      @run="onPaletteRun"
+    />
+
     <!-- Global confirmation dialog -->
     <ConfirmDialog />
+
+    <!-- First-run onboarding (compressed) -->
+    <OnboardingWizard
+      :open="showOnboarding"
+      :has-api-key="apiKeySet"
+      @close="showOnboarding = false"
+      @finished="onOnboardingFinished"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted, provide } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, provide, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, ListChecks } from 'lucide-vue-next'
+import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, ListChecks, MoreHorizontal } from 'lucide-vue-next'
 import { statusBarLabel } from '~/lib/backendLabels'
+import type { PaletteAction } from '~/lib/commandPalette'
+import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
 
-const navItems = [
+const primaryNavItems = [
   { to: '/memory', label: 'Memory', icon: Brain },
+  { to: '/tasks', label: 'Tasks', icon: ListChecks },
+  { to: '/tools', label: 'Tools', icon: Wrench },
+  { to: '/channels', label: 'Channels', icon: Radio },
+]
+
+const adminNavItems = [
   { to: '/logs', label: 'Logs', icon: FileText },
   { to: '/workspaces', label: 'Workspaces', icon: FolderKanban },
   { to: '/agents', label: 'Agents', icon: Bot },
-  { to: '/channels', label: 'Channels', icon: Radio },
-  { to: '/tools', label: 'Tools', icon: Wrench },
-  { to: '/tasks', label: 'Tasks', icon: ListChecks },
   { to: '/scheduler', label: 'Scheduler', icon: Clock },
   { to: '/model-stats', label: 'Model Stats', icon: BarChart3 },
   { to: '/tool-stats', label: 'Tool Stats', icon: Activity },
 ]
+
+const adminNavOpen = ref(false)
+const adminNavEl = ref<HTMLElement | null>(null)
+const adminNavActive = computed(() => adminNavItems.some(item => isNavActive(item.to)))
+
+function onAdminNavPointerDown(e: MouseEvent) {
+  const root = adminNavEl.value
+  if (!root) return
+  if (!root.contains(e.target as Node)) adminNavOpen.value = false
+}
 
 interface SessionInfo {
   id: string
@@ -209,6 +265,8 @@ const route = useRoute()
 const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
 const apiKeySet = ref(false)
+const showOnboarding = ref(false)
+const ONBOARDING_KEY = 'nanna.onboarding.done'
 const showWorkspacePicker = ref(false)
 const chatPanelOpen = ref(false)
 
@@ -279,16 +337,105 @@ const { checkPermission } = useNotifications()
 const { init: initBackend, status: backendStatus, isDaemon, label: backendLabel } = useBackend()
 const statusBar = computed(() => statusBarLabel(backendStatus.value, apiKeySet.value))
 const { bind: bindShortcut } = useShortcuts()
+const { open: paletteOpen, toggle: togglePalette, hide: hidePalette } = useCommandPalette()
+const { info: toastInfo } = useToast()
 
-// Global shortcuts (Cmd/Ctrl+K reserved for future command palette — swallow for now).
+const SESSION_SWITCH_LIMIT = 8
+
+const paletteActions = computed((): PaletteAction[] => {
+  const sessionActions: PaletteAction[] = sessions.value.slice(0, SESSION_SWITCH_LIMIT).map((s) => ({
+    id: `session:switch:${s.id}`,
+    label: s.name || 'Untitled chat',
+    group: 'Sessions',
+    keywords: ['session', 'chat', 'switch', s.id],
+    action: `session:switch:${s.id}`,
+  }))
+  const workspaceActions: PaletteAction[] = openWorkspaces.value.map((w) => ({
+    id: `workspace:switch:${w.id}`,
+    label: w.name || w.path || w.id,
+    group: 'Workspaces',
+    keywords: ['workspace', 'project', 'switch', w.id, w.path],
+    action: `workspace:switch:${w.id}`,
+  }))
+  return [...NAV_ACTIONS, ...QUICK_ACTIONS, ...sessionActions, ...workspaceActions]
+})
+
+async function onPaletteRun(action: PaletteAction) {
+  hidePalette()
+  if (action.href) {
+    await navigateTo(action.href)
+    if (action.href !== '/') chatPanelOpen.value = false
+    return
+  }
+  const act = action.action
+  if (!act) return
+  if (act === 'new-chat') {
+    await createNewSession()
+    return
+  }
+  if (act === 'toggle-chat-panel') {
+    toggleChatPanel()
+    return
+  }
+  if (act === 'focus-input') {
+    if (route.path !== '/' && route.path !== '') {
+      await navigateTo(currentSessionId.value ? `/?session=${currentSessionId.value}` : '/')
+    }
+    await nextTick()
+    window.dispatchEvent(new CustomEvent('nanna:focus-input'))
+    window.dispatchEvent(new CustomEvent('nanna:focus-chat-input'))
+    return
+  }
+  if (act === 'stop-generation') {
+    window.dispatchEvent(new CustomEvent('nanna:stop-generation'))
+    return
+  }
+  if (act === 'open-settings-models') {
+    await navigateTo('/settings?tab=models')
+    chatPanelOpen.value = false
+    return
+  }
+  if (act === 'toggle-live-logs') {
+    const key = 'nanna.logs.live'
+    let next = false
+    try {
+      const cur = localStorage.getItem(key)
+      const effectiveLive = cur === null ? true : (cur === '1' || cur === 'true')
+      next = !effectiveLive
+      localStorage.setItem(key, next ? '1' : '0')
+    } catch { /* ignore */ }
+    window.dispatchEvent(new CustomEvent('nanna:logs-live', { detail: { live: next } }))
+    toastInfo(next ? 'Live logs on' : 'Live logs paused')
+    return
+  }
+  if (act === 'toggle-compact-mode') {
+    const root = document.documentElement
+    const next = !root.classList.contains('density-compact')
+    root.classList.toggle('density-compact', next)
+    try { localStorage.setItem('nanna.ui.density', next ? 'compact' : 'comfortable') } catch { /* ignore */ }
+    toastInfo(next ? 'Compact mode on' : 'Compact mode off')
+    return
+  }
+  if (act.startsWith('session:switch:')) {
+    const id = act.slice('session:switch:'.length)
+    const session = sessions.value.find((s) => s.id === id)
+    if (session) switchSession(session)
+    return
+  }
+  if (act.startsWith('workspace:switch:')) {
+    const id = act.slice('workspace:switch:'.length)
+    selectWorkspaceTab(id)
+  }
+}
+
+// Global shortcuts
 bindShortcut({
   key: 'k',
   mod: true,
-  priority: 10,
-  description: 'Command palette (reserved)',
-  handler: () => {
-    // Reserved — progressive disclosure palette lands in P4 follow-on.
-  },
+  priority: 50,
+  allowInInput: true,
+  description: 'Command palette',
+  handler: () => { togglePalette() },
 })
 bindShortcut({
   key: 'n',
@@ -329,12 +476,19 @@ const TABS_STORAGE_KEY = 'nanna-workspace-tabs'
 const CURRENT_TAB_KEY = 'nanna-current-tab'
 
 onMounted(async () => {
+  try {
+    if (localStorage.getItem('nanna.ui.density') === 'compact') {
+      document.documentElement.classList.add('density-compact')
+    }
+  } catch { /* ignore */ }
+  document.addEventListener('pointerdown', onAdminNavPointerDown)
   const mode = await initBackend()
   console.log(`Nanna running in ${mode} mode`)
   loadTabsFromStorage()
   await loadOpenWorkspaces()
   await loadSessions()
   await loadConfig()
+  maybeShowOnboarding()
 
   // Sync restored workspace state with daemon
   syncDaemonWorkspace(currentTab.value)
@@ -367,6 +521,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  document.removeEventListener('pointerdown', onAdminNavPointerDown)
   unlistenTrayNewChat?.()
   unlistenCloseRequested?.()
   unlistenSessionsCleared?.()
@@ -463,6 +618,25 @@ async function loadConfig() {
     apiKeySet.value = config.api_key_set
   } catch (e) { console.error('Failed to load config:', e) }
 }
+
+function maybeShowOnboarding() {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem(ONBOARDING_KEY) === '1') {
+      return
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!apiKeySet.value) {
+    showOnboarding.value = true
+  }
+}
+
+function onOnboardingFinished() {
+  showOnboarding.value = false
+  void loadConfig()
+}
+
 
 function selectTab(tab: Tab) {
   currentTab.value = tab
@@ -717,5 +891,58 @@ async function hideToTray() {
 .dot-err { background: #fb7185; }
 .status-label {
   color: #94a3b8;
+}
+
+/* Admin overflow flyout */
+.activity-more {
+  position: relative;
+}
+.admin-flyout {
+  position: absolute;
+  left: calc(100% + 8px);
+  bottom: 0;
+  min-width: 168px;
+  padding: 6px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.admin-flyout-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  color: #a6accd;
+  text-decoration: none;
+  font-size: 12.5px;
+  transition: background 0.12s, color 0.12s;
+}
+.admin-flyout-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #e2e8f0;
+}
+.admin-flyout-item.active {
+  color: #e2e8f0;
+  background: rgba(139, 92, 246, 0.14);
+}
+.admin-flyout-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+/* compact density: tighter activity icons (class on <html>) */
+:global(html.density-compact) .activity-icon {
+  height: 36px;
+}
+:global(html.density-compact) .status-bar {
+  height: 22px;
 }
 </style>

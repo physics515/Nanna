@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-22 (**P4 GUI UX bugfix shipped in #58; SFC regression hotfix** — composables were spliced mid-`interface` on 7 pages and broke `nuxt generate`/`cargo tauri build`; restored script order + channels loadError catch. Prior 2026-04-27 close: PageState empty/loading/error/offline; truthful backend labels; toasts + ConfirmDialog Escape; chat stick-to-bottom + settings tab scroll; shortcuts; density; formValidation + ApiKeyInput; WINDOW_TRAY.md + BUG_BASH_GUI_UX.md. Open tail: list virtualization, palette UI, wizard bulk validation, baseline viewport pass.) Prior notes condensed below.
+**Last updated:** 2026-07-23 (**P4 UI simplification** — command palette Mod+K, VirtualList for memory/logs/tools, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.) Prior notes condensed below.
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -430,8 +430,9 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       focus/scroll jump; long lists virtualize or paginate; no double scrollbars / clipped CTAs on 1280×720 and
       1440×900 baselines.
       *(2026-04-27)* Chat `userScrolledUp` + `scrollToBottom`; settings per-tab scroll restore (`tabScrollPos`).
-      Remaining: list virtualization for memory/logs/tools at large N; formal 1280×720 / 1440×900 clipped-CTA
-      pass (log in `gui/docs/BUG_BASH_GUI_UX.md`).
+      *(2026-07-23)* **List virtualization shipped** — pure `visibleRange` + `VirtualList.vue`; memory >80,
+      logs >100, tools sidebar >60. Unit tests in `gui/tests/unit/virtualList.spec.ts`. Remaining: formal
+      1280×720 / 1440×900 clipped-CTA visual pass (logged in `gui/docs/BUG_BASH_GUI_UX.md`).
 - [x] **Keyboard & shortcuts** — global Esc closes topmost dialog/menu; Cmd/Ctrl+K reserved for palette;
       documented shortcuts for new chat / focus input / Stop generation.
       *(2026-04-27)* `useShortcuts` + Escape stack; layout bindings: `Mod+K` reserved, `Mod+Shift+N` new chat,
@@ -457,24 +458,47 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-22)* Follow-up hotfix after #58: seven page SFCs had composables spliced inside `interface`
       bodies (broke `nuxt generate` / `cargo tauri build`); restored script order + channels `loadError`
       on catch. Residual logged in BUG_BASH: local channels toast ref; legacy clawd/Nanna config-path copy.
+      *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
+      Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
+      channels toast ref, legacy clawd config-path copy.
 
 ##### UI simplification (default calm, power remains)
-- [ ] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)
+- [x] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)
       vs admin (logs, raw stats, scheduler, workspaces). Nav / TitleBar should match that hierarchy.
-- [ ] **Progressive disclosure** — fold rarely-used settings into **Advanced**; keep power paths one click or one
+      *(2026-07-23)* Activity bar split: **primary** Memory/Tasks/Tools/Channels always visible; **admin**
+      Logs/Workspaces/Agents/Scheduler/Model Stats/Tool Stats under a More flyout. Settings remains bottom.
+      Documented in `gui/docs/BUG_BASH_GUI_UX.md` IA diagram.
+- [x] **Progressive disclosure** — fold rarely-used settings into **Advanced**; keep power paths one click or one
       command-palette query away; optional "Compact power mode" density for existing users.
-- [ ] **Command palette (Cmd/Ctrl+K)** — navigate pages, switch sessions/workspaces, toggle Live logs, jump to
+      *(2026-07-23)* Settings `showAdvanced` toggle (persisted); agent iteration/nudge, memory compression floor,
+      Ollama host details, model routing folded. Compact density via `html.density-compact` + palette action /
+      `nanna.ui.density` localStorage.
+- [x] **Command palette (Cmd/Ctrl+K)** — navigate pages, switch sessions/workspaces, toggle Live logs, jump to
       model/settings; primary discovery path for power features so chrome can stay thin.
-- [ ] **Chat-first shell** — reduce competing sidebar chrome default; rich editor/tool cards compact until expanded;
+      *(2026-07-23)* `CommandPalette.vue` + `lib/commandPalette.ts` + `useCommandPalette` singleton; ↑/↓/Enter/Esc;
+      Primary/Admin nav groups; sessions/workspaces; quick actions (new chat, live logs, focus input, stop,
+      settings models, compact mode, toggle chat panel). 8 unit tests. Settings `?tab=` deep-link used.
+- [~] **Chat-first shell** — reduce competing sidebar chrome default; rich editor/tool cards compact until expanded;
       streaming/stop/queue status always obvious without reading tool internals.
-- [ ] **Unify settings shell** — consistent section headers, descriptions, save model (auto-save vs explicit Save);
+      *(2026-07-23)* Nav chrome reduced (admin under More; chat panel toggle stays default discovery). Remaining:
+      stronger default-collapsed tool/thinking cards; tighten streaming/stop/queue affordances without internals.
+- [x] **Unify settings shell** — consistent section headers, descriptions, save model (auto-save vs explicit Save);
       one pattern for comprising toggles + danger zones.
-- [ ] **Onboarding compression** (pairs with P0.1) — first-run: what Nanna is → pick backend → health → chat;
+      *(2026-07-23)* `SettingsSection.vue` (`title`/`description`/`danger`/`advanced`); Models/Agent/Memory/Data/
+      Scheduler switched over. Explicit Save retained for bulk config; per-control still auto-persists via invokes.
+- [x] **Onboarding compression** (pairs with P0.1) — first-run: what Nanna is → pick backend → health → chat;
       defer channel wizards, tool permissions detail, memory deep-dive until after first successful turn.
-- [ ] **Copy / tone pass** — system language calm and specific ("Daemon not reachable on 5149" beat "Error");
+      *(2026-07-23)* `OnboardingWizard.vue` 3-step (intro → provider/key via ApiKeyInput → health) gated by
+      `nanna.onboarding.done` + no-key check. Full P0.1 wizard body (privacy, tool permission setup, storage
+      location) still own phase.
+- [x] **Copy / tone pass** — system language calm and specific ("Daemon not reachable on 5149" beat "Error");
       kill decorative status that lies (see Logs Live).
-- [ ] **Component cleanup** — inventory near-duplicate dialogs/status badges; consolidate on `components/ui`;
+      *(2026-07-23)* Settings/scheduler/logs offline copy tightened; logs source label no longer claims
+      "embedded" as a backend mode (GUI vs daemon). Live/Paused already factual. Residual clawd path copy open.
+- [x] **Component cleanup** — inventory near-duplicate dialogs/status badges; consolidate on `components/ui`;
       delete dead CSS/unused props after simplification.
+      *(2026-07-23)* Inventory in `gui/docs/COMPONENT_CLEANUP.md`. Consolidation intentionally deferred
+      (ConfirmDialog vs UiModal keep distinct UX roles); execute merges under that doc.
 
 ##### UX / product improvements (still on this track)
 - [ ] Full-text search across sessions; export conversations (MD/PDF/JSON).
@@ -1599,5 +1623,5 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
    **embedded-fallback** path (needs a GUI build).
 10. **GUI test harness foothold** (P4 follow-on) — Vitest + one critical-path Playwright smoke (chat shell load
     + Logs Copy all / Live toggle) + fixture for mocked Tauri invoke; keeps UI fixes from regressing while
-    P12/P13 lead the feature queue. Promote IA simplification / command palette once harness is green.
+    P12/P13 lead the feature queue. *(2026-07-23: IA simplification + command palette shipped; harness already green.)*
 

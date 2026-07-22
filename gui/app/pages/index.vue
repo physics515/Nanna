@@ -509,7 +509,17 @@ async function loadSession() {
   }
 }
 
+function onStopGeneration() {
+  void stopSession()
+}
+function onFocusChatInput() {
+  chatInputRef.value?.focus?.()
+}
+
 onMounted(async () => {
+  window.addEventListener('nanna:stop-generation', onStopGeneration)
+  window.addEventListener('nanna:focus-chat-input', onFocusChatInput)
+  window.addEventListener('nanna:focus-input', onFocusChatInput)
   // Load config
   try {
     config.value = await invoke<AppConfig>('get_config')
@@ -674,6 +684,9 @@ watch(messagesContainer, (el) => {
 }, { immediate: true })
 
 onUnmounted(() => {
+  window.removeEventListener('nanna:stop-generation', onStopGeneration)
+  window.removeEventListener('nanna:focus-chat-input', onFocusChatInput)
+  window.removeEventListener('nanna:focus-input', onFocusChatInput)
   if (scrollObserver) scrollObserver.disconnect()
   if (unlistenChunk) unlistenChunk()
   if (unlistenTool) unlistenTool()
