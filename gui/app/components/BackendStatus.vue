@@ -63,12 +63,14 @@ const modeLabel = computed(() => {
 
 const detail = computed(() => {
   if (!status.value) return ''
-  if (status.value.mode === 'daemon' && status.value.daemon_url) {
+  // Connected daemon: show the IPC endpoint.
+  if (status.value.mode === 'daemon' && status.value.connected && status.value.daemon_url) {
     return status.value.daemon_url.replace('ws://', '')
   }
   if (status.value.mode === 'embedded') {
     return 'Direct mode'
   }
+  // Disconnected / degraded: surface daemon_state (stopped, crashed, ...).
   return status.value.daemon_state
 })
 
