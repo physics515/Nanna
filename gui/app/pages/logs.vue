@@ -5,7 +5,7 @@
       <div class="flex items-center justify-between">
         <div>
           <h1 class="text-xl sm:text-2xl font-bold text-white/90">Logs</h1>
-          <p class="text-xs sm:text-sm text-white/30 mt-0.5">Real-time output and diagnostics — embedded backend and daemon</p>
+          <p class="text-xs sm:text-sm text-white/30 mt-0.5">Real-time output and diagnostics from the GUI and attached daemon</p>
         </div>
         <div class="flex items-center gap-2">
           <!-- Auto-scroll button -->
@@ -52,7 +52,7 @@
         <option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option>
       </select>
       <select v-model="sourceFilter" aria-label="Filter by source" class="bg-[#292d3e] border border-white/[0.08] rounded px-2 py-1 text-xs">
-        <option value="all">All sources</option><option value="daemon">Daemon</option><option value="embedded">Embedded</option>
+        <option value="all">All sources</option><option value="daemon">Daemon</option><option value="embedded">GUI</option>
       </select>
     </div>
 
@@ -78,11 +78,10 @@
 
       <!-- Logs container -->
       <div
-        ref="logsContainer"
-        class="flex-1 overflow-y-auto font-mono text-sm p-4 space-y-0"
+        v-if="filteredLogs.length === 0"
+        class="flex-1 overflow-y-auto font-mono text-sm p-4 min-h-0"
       >
         <PageState
-          v-if="filteredLogs.length === 0"
           :state="isLoading ? 'loading' : (!daemonAttached && logs.length === 0 ? 'offline' : 'empty')"
           :title="isLoading ? 'Loading logs…' : (!daemonAttached && logs.length === 0 ? 'Daemon offline' : 'No log lines')"
           :description="isLoading
@@ -95,7 +94,57 @@
           :primary-action="!daemonAttached && logs.length === 0 && !isLoading ? 'Open Settings' : ''"
           @primary="navigateTo('/settings')"
         />
+      </div>
 
+      <VirtualList
+        v-else-if="filteredLogs.length > 100"
+        ref="logsContainer"
+        :items="filteredLogs"
+        :item-height="32"
+        :overscan="10"
+        class="flex-1 font-mono text-sm p-4 min-h-0"
+      >
+        <template #default="{ item: log }">
+          <div
+            class="py-1 px-2 rounded transition-colors group cursor-default h-full"
+            :class="[
+            'hover:bg-white/[0.03]',
+            log.level === 'error' ? 'text-red-400/80' :
+            log.level === 'warn' ? 'text-amber-400/80' :
+            log.level === 'info' ? 'text-emerald-400/70' :
+            'text-white/40'
+          ]"
+          >
+          <span class="text-white/20 text-xs select-none">{{ log.timestamp }}</span>
+          <span :class="[
+            'inline-block w-[4.5rem] text-center text-[10px] font-bold uppercase tracking-wide',
+            'ml-2 px-1 py-px rounded border select-none',
+            sourceOf(log) === 'daemon'
+              ? 'text-violet-300/70 border-violet-400/20 bg-violet-400/[0.06]'
+              : 'text-cyan-300/70 border-cyan-400/20 bg-cyan-400/[0.06]'
+          ]">
+            {{ sourceLabel(log) }}
+          </span>
+          <span :class="[
+            'inline-block w-8 text-xs font-bold ml-2 select-none',
+            log.level === 'error' ? 'text-red-400/80' :
+            log.level === 'warn' ? 'text-amber-400/80' :
+            log.level === 'info' ? 'text-emerald-400/60' :
+            'text-white/30'
+          ]">
+            {{ log.level.toUpperCase().padEnd(5) }}
+          </span>
+          <span class="text-white/20 text-xs select-none">[{{ log.target }}]</span>
+          <span class="ml-2 break-words">{{ log.message }}</span>
+          </div>
+        </template>
+      </VirtualList>
+
+      <div
+        v-else
+        ref="logsContainer"
+        class="flex-1 overflow-y-auto font-mono text-sm p-4 space-y-0 min-h-0"
+      >
         <div
           v-for="(log, idx) in filteredLogs"
           :key="idx"
@@ -160,9 +209,16 @@ const POLL_INTERVAL_MS = 1000
 const LOG_LINE_LIMIT = 2000
 
 const logs = ref<LogEntry[]>([])
-const logsContainer = ref<HTMLElement | null>(null)
+const logsContainer = ref<HTMLElement | { $el?: HTMLElement } | null>(null)
 const autoScroll = ref(true)
-const liveMode = ref(true)
+function readLiveLogsPref(): boolean {
+  try {
+    const v = localStorage.getItem('nanna.logs.live')
+    if (v === null) return true
+    return v === '1' || v === 'true'
+  } catch { return true }
+}
+const liveMode = ref(readLiveLogsPref())
 const isLoading = ref(false)
 const searchQuery = ref('')
 const levelFilter = ref('all')
@@ -203,7 +259,17 @@ async function refreshLogs() {
   }
 }
 
+function onLogsLiveEvent(e: Event) {
+  const detail = (e as CustomEvent<{ live?: boolean }>).detail
+  if (detail && typeof detail.live === 'boolean') {
+    liveMode.value = detail.live
+  } else {
+    liveMode.value = readLiveLogsPref()
+  }
+}
+
 onMounted(async () => {
+  window.addEventListener('nanna:logs-live', onLogsLiveEvent)
   isLoading.value = true
   try {
     await refreshLogs()
@@ -224,6 +290,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('nanna:logs-live', onLogsLiveEvent)
   if (pollTimer) clearInterval(pollTimer)
   if (copyLabelTimer) clearTimeout(copyLabelTimer)
 })
@@ -236,8 +303,11 @@ watch(autoScroll, async () => {
 })
 
 function scrollToBottom() {
-  if (logsContainer.value) {
-    logsContainer.value.scrollTop = logsContainer.value.scrollHeight
+  const el = logsContainer.value as any
+  if (!el) return
+  const node = el.$el ?? el
+  if (node && typeof node.scrollTop === 'number') {
+    node.scrollTop = node.scrollHeight
   }
 }
 
@@ -247,6 +317,7 @@ function toggleAutoScroll() {
 
 function toggleLiveMode() {
   liveMode.value = !liveMode.value
+  try { localStorage.setItem('nanna.logs.live', liveMode.value ? '1' : '0') } catch { /* ignore */ }
 }
 
 async function clearLogs() {

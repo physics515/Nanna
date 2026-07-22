@@ -101,6 +101,8 @@ function isVisionCapable(modelId: string, provider: string): boolean {
 function createSettingsPageStore() {
   const settings = ref<ExtendedSettings | null>(null)
   const toast = ref<{ message: string; type: 'success' | 'error' } | null>(null)
+  /** Power-user knobs; toggled on settings page */
+  const showAdvanced = ref(false)
   const memoryStats = ref<CognitiveMemoryStats | null>(null)
 
   // ── Model catalog ──
@@ -466,7 +468,7 @@ function createSettingsPageStore() {
       showToast(`${formatProvider(provider)} API key saved`, 'success')
       await loadSettings()
     } catch (e: any) {
-      showToast(`Failed: ${e.message || e}`, 'error')
+      showToast(`Couldn't complete that: ${e.message || e}`, 'error')
     }
   }
 
@@ -485,6 +487,7 @@ function createSettingsPageStore() {
   return {
     settings,
     toast,
+    showAdvanced,
     memoryStats,
     ollamaModels,
     loadingOllamaModels,

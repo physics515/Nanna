@@ -23,16 +23,27 @@
 
     <!-- Tabs -->
     <div class="px-4 sm:px-6 pt-4">
-      
-    <div
-      v-if="!isOnline"
-      class="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100 flex items-center justify-between gap-3"
-      role="status"
-    >
-      <span>Daemon not reachable — settings still open locally; saves that need the daemon will retry when it returns.</span>
-    </div>
+      <div
+        v-if="!isOnline"
+        class="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100 flex items-center justify-between gap-3"
+        role="status"
+      >
+        <span>Daemon not reachable — settings still open locally; saves that need the daemon will retry when it returns.</span>
+      </div>
 
       <UiTabs v-model="activeTab" :tabs="tabs" />
+
+      <div class="mt-3 flex items-center justify-between gap-3">
+        <p class="text-[11px] text-nanna-text-muted">
+          Advanced reveals rarely-used knobs (iteration floors, compression ratios, host details).
+        </p>
+        <UiSwitch
+          :model-value="showAdvanced"
+          label="Show advanced settings"
+          class="shrink-0"
+          @update:model-value="showAdvanced = $event"
+        />
+      </div>
     </div>
 
     <!-- Tab Content -->
@@ -102,6 +113,8 @@ import {
 import { provideSettingsPage } from '~/composables/useSettingsPage'
 import { useBackend } from '~/composables/useBackend'
 
+const route = useRoute()
+const router = useRouter()
 
 const tabs = [
   { id: 'models', label: 'Models', icon: Brain },
@@ -112,9 +125,11 @@ const tabs = [
   { id: 'data', label: 'Data', icon: Database },
 ]
 
+const validTabIds = new Set(tabs.map(t => t.id))
+
 // Shared settings-page store, consumed by the tab components via useSettingsPage()
 const store = provideSettingsPage()
-const { toast, showToast } = store
+const { toast, showToast, showAdvanced } = store
 
 const { isOnline } = useBackend()
 const activeTab = ref('models')
@@ -123,6 +138,12 @@ const saving = ref(false)
 const tabScrollEl = ref<HTMLElement | null>(null)
 /** Per-tab scroll offsets so switching tabs doesn't jump. */
 const tabScrollPos = ref<Record<string, number>>({})
+
+function tabFromQuery(raw: unknown): string | null {
+  const v = Array.isArray(raw) ? raw[0] : raw
+  if (typeof v !== 'string') return null
+  return validTabIds.has(v) ? v : null
+}
 
 watch(activeTab, (next, prev) => {
   if (prev && tabScrollEl.value) {
@@ -133,11 +154,34 @@ watch(activeTab, (next, prev) => {
       tabScrollEl.value.scrollTop = tabScrollPos.value[next] ?? 0
     }
   })
+  // Keep ?tab= in sync without stacking history noise
+  if (route.query.tab !== next) {
+    router.replace({ query: { ...route.query, tab: next } })
+  }
 })
 
+watch(
+  () => route.query.tab,
+  (q) => {
+    const t = tabFromQuery(q)
+    if (t && t !== activeTab.value) activeTab.value = t
+  },
+)
+
 onMounted(async () => {
+  const t = tabFromQuery(route.query.tab)
+  if (t) activeTab.value = t
+  try {
+    showAdvanced.value = localStorage.getItem('nanna.settings.showAdvanced') === '1'
+  } catch { /* ignore */ }
   await store.loadSettings()
   await store.loadMemoryStats()
+})
+
+watch(showAdvanced, (v) => {
+  try {
+    localStorage.setItem('nanna.settings.showAdvanced', v ? '1' : '0')
+  } catch { /* ignore */ }
 })
 
 async function saveAllSettings() {
@@ -147,7 +191,7 @@ async function saveAllSettings() {
     showToast('Settings saved', 'success')
     hasChanges.value = false
   } catch (e: any) {
-    showToast(`Failed to save: ${e.message || e}`, 'error')
+    showToast(`Couldn't save settings: ${e.message || e}`, 'error')
   } finally {
     saving.value = false
   }
@@ -165,3 +209,4 @@ async function saveAllSettings() {
   transform: translateY(10px);
 }
 </style>
+
