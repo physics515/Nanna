@@ -4,6 +4,7 @@
       <NuxtPage />
     </NuxtLayout>
   </ErrorBoundary>
+  <ConfirmDialog />
   <UiSonnerSonner />
 </template>
 

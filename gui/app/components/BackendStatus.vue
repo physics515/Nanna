@@ -1,10 +1,10 @@
 <template>
-  <div :class="['backend-status', modeClass]" :title="tooltip">
-    <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg ">
-      <span class="status-indicator">{{ icon }}</span>
-      <div class="flex flex-col">
-        <span class="text-xs font-mono font-semibold">{{ modeLabel }}</span>
-        <span v-if="showDetail" class="text-xs opacity-70">{{ detail }}</span>
+  <div :class="['backend-status', modeClass]" :title="label.tooltip">
+    <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg min-h-8">
+      <span class="status-indicator" aria-hidden="true">{{ icon }}</span>
+      <div class="flex flex-col min-w-0">
+        <span class="text-xs font-mono font-semibold truncate">{{ label.short }}</span>
+        <span v-if="showDetail && label.detail" class="text-xs opacity-80 truncate">{{ label.detail }}</span>
       </div>
     </div>
   </div>
@@ -13,99 +13,59 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-
-interface BackendStatusData {
-  mode: 'daemon' | 'embedded'
-  connected: boolean
-  daemon_url: string | null
-  daemon_state: string
-  version: string
-}
+import { describeBackend, type BackendStatusLike } from '~/lib/backendLabels'
 
 const props = defineProps<{
   showDetail?: boolean
 }>()
 
-const status = ref<BackendStatusData | null>(null)
+const status = ref<BackendStatusLike | null>(null)
 const loading = ref(true)
 let pollInterval: number | null = null
 
+const label = computed(() => describeBackend(status.value, loading.value))
+
 const modeClass = computed(() => {
-  if (!status.value) return 'status-loading'
-  if (status.value.mode === 'daemon' && status.value.connected) {
-    return 'status-daemon'
+  switch (label.value.tone) {
+    case 'ok': return 'status-daemon'
+    case 'loading': return 'status-loading'
+    case 'warn':
+    case 'info': return 'status-warn'
+    case 'error':
+    default: return 'status-disconnected'
   }
-  if (status.value.mode === 'embedded') {
-    return 'status-embedded'
-  }
-  return 'status-disconnected'
 })
 
 const icon = computed(() => {
-  if (loading.value) return '⏳'
-  if (!status.value) return '❓'
-  if (status.value.mode === 'daemon' && status.value.connected) return '🔗'
-  if (status.value.mode === 'embedded') return '📱'
-  return '🔌'
-})
-
-const modeLabel = computed(() => {
-  if (loading.value) return 'Loading...'
-  if (!status.value) return 'Unknown'
-  if (status.value.mode === 'daemon' && status.value.connected) {
-    return 'DAEMON'
+  switch (label.value.tone) {
+    case 'loading': return '⏳'
+    case 'ok': return '🔗'
+    case 'warn':
+    case 'info': return '↻'
+    case 'error': return '🔌'
+    default: return '❓'
   }
-  if (status.value.mode === 'embedded') {
-    return 'EMBEDDED'
-  }
-  return 'DISCONNECTED'
-})
-
-const detail = computed(() => {
-  if (!status.value) return ''
-  // Connected daemon: show the IPC endpoint.
-  if (status.value.mode === 'daemon' && status.value.connected && status.value.daemon_url) {
-    return status.value.daemon_url.replace('ws://', '')
-  }
-  if (status.value.mode === 'embedded') {
-    return 'Direct mode'
-  }
-  // Disconnected / degraded: surface daemon_state (stopped, crashed, ...).
-  return status.value.daemon_state
-})
-
-const tooltip = computed(() => {
-  if (!status.value) return 'Backend status unknown'
-  if (status.value.mode === 'daemon' && status.value.connected) {
-    return `Connected to daemon at ${status.value.daemon_url}\nAll requests routed through background service`
-  }
-  if (status.value.mode === 'embedded') {
-    return 'Running in embedded mode\nDirect LLM/tool access (daemon unavailable)'
-  }
-  return `Daemon state: ${status.value.daemon_state}`
 })
 
 async function fetchStatus() {
   try {
-    const data = await invoke<BackendStatusData>('get_backend_status')
+    const data = await invoke<BackendStatusLike>('get_backend_status')
     status.value = data
-    loading.value = false
   } catch (error) {
     console.error('Failed to fetch backend status:', error)
+    status.value = null
+  } finally {
     loading.value = false
   }
 }
 
 onMounted(() => {
   fetchStatus()
-  // Poll every 5 seconds
   pollInterval = window.setInterval(fetchStatus, 5000)
 })
 
 onUnmounted(() => {
-  if (pollInterval !== null) {
-    clearInterval(pollInterval)
-  }
+  if (pollInterval !== null) clearInterval(pollInterval)
 })
 </script>
 
@@ -128,7 +88,7 @@ onUnmounted(() => {
   box-shadow: 0 0 10px rgba(34, 197, 94, 0.2);
 }
 
-.status-embedded {
+.status-warn {
   background: linear-gradient(135deg, rgba(234, 179, 8, 0.25), rgba(234, 179, 8, 0.15));
   border: 1px solid rgba(234, 179, 8, 0.4);
   color: #fbbf24;
@@ -152,13 +112,7 @@ onUnmounted(() => {
 }
 
 @keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.8;
-    transform: scale(1.05);
-  }
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.05); }
 }
 </style>

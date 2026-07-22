@@ -22,12 +22,19 @@
     <!-- Content -->
     <div class="flex-1 overflow-y-auto p-6 space-y-6">
 
-      <!-- Empty state -->
-      <div v-if="!isLoading && tools.length === 0" class="text-center py-16">
-        <Wrench class="w-12 h-12 text-nanna-text-muted mx-auto mb-4" />
-        <h3 class="text-lg font-medium text-nanna-text mb-2">No tool stats yet</h3>
-        <p class="text-sm text-nanna-text-muted">Stats will appear after tools are executed in agent sessions.</p>
-      </div>
+      <PageState
+        v-if="isLoading || !isOnline || loadError || tools.length === 0"
+        :state="isLoading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
+        :title="isLoading ? 'Loading tool stats…' : (!isOnline ? 'Daemon offline' : (loadError ? 'Could not load tool stats' : 'No tool stats yet'))"
+        :description="isLoading
+          ? 'Reading per-tool counters from the daemon.'
+          : (!isOnline
+            ? 'Tool stats live on the daemon. Reconnect after a few turns with tools to populate this dashboard.'
+            : (loadError || 'Stats will appear after tools are executed in agent sessions.'))"
+        :primary-action="(!isOnline || !!loadError) && !isLoading ? 'Retry' : ''"
+        :primary-busy="isLoading"
+        @primary="fetchAll"
+      />
 
       <!-- Global Dashboard Cards -->
       <div v-if="tools.length > 0" class="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -438,6 +445,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, Wrench, AlertTriangle, Info } from 'lucide-vue-next'
 
+const { isOnline } = useBackend()
+const toast = useToast()
 const { addNotification } = useNotificationCenter()
 
 interface ToolStat {
@@ -632,6 +641,7 @@ function sortIcon(field: string): string {
 
 async function fetchAll() {
   isLoading.value = true
+  loadError.value = null
   const errors: string[] = []
 
   // Fetch each endpoint independently so one failure doesn't block the rest
@@ -669,10 +679,11 @@ async function fetchAll() {
 
   if (errors.length > 0) {
     console.error('Tool stats fetch errors:', errors)
+    loadError.value = `${errors.length} endpoint${errors.length > 1 ? 's' : ''} failed`
     addNotification({
       type: 'error',
       title: 'Tool Stats Error',
-      summary: `${errors.length} endpoint${errors.length > 1 ? 's' : ''} failed`,
+      summary: loadError.value,
       detail: errors.join('\n'),
       source: 'tool-stats',
     })

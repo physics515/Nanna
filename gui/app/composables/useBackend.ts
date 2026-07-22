@@ -1,8 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { computed, onMounted, onUnmounted, readonly, ref } from 'vue'
+import { describeBackend, type BackendStatusLike } from '~/lib/backendLabels'
 
-export interface BackendStatus {
-  mode: 'daemon' | 'embedded'
+export interface BackendStatus extends BackendStatusLike {
+  mode: 'daemon' | 'disconnected' | 'embedded'
   connected: boolean
   daemon_url: string | null
   daemon_state: string
@@ -45,11 +46,13 @@ function releasePolling() {
 
 export function useBackend() {
   /**
-   * Initialize the backend - attempts daemon connection, falls back to embedded
+   * Initialize the backend — attach to the daemon control plane (P16: daemon-only).
    */
-  async function init(): Promise<'daemon' | 'embedded'> {
+  async function init(): Promise<'daemon' | 'disconnected'> {
     if (initialized.value || initializing.value) {
-      return status.value?.mode || 'embedded'
+      const mode = status.value?.mode
+      if (mode === 'daemon' && status.value?.connected) return 'daemon'
+      return 'disconnected'
     }
 
     initializing.value = true
@@ -59,34 +62,35 @@ export function useBackend() {
       await refresh()
       initialized.value = true
       console.log(`Backend initialized: ${mode} mode`)
-      return mode as 'daemon' | 'embedded'
+      if (mode === 'daemon' || status.value?.connected) return 'daemon'
+      return 'disconnected'
     } catch (e) {
       console.error('Failed to initialize backend:', e)
-      // Default to embedded mode on error
+      // P16: no embedded fallback — surface an honest offline state.
       status.value = {
-        mode: 'embedded',
+        mode: 'disconnected',
         connected: false,
-        daemon_url: null,
+        daemon_url: 'ws://127.0.0.1:5149',
         daemon_state: 'not_started',
         version: 'unknown',
       }
       initialized.value = true
-      return 'embedded'
+      return 'disconnected'
     } finally {
       initializing.value = false
       ensurePolling()
     }
   }
 
-  /**
-   * Check if connected to daemon
-   */
-  const isDaemon = computed(() => status.value?.mode === 'daemon')
+  const label = computed(() => describeBackend(status.value, initializing.value && !initialized.value))
 
-  /**
-   * Check if running embedded
-   */
+  /** True when attached to a live daemon. */
+  const isDaemon = computed(() => status.value?.mode === 'daemon' && status.value?.connected === true)
+
+  /** @deprecated P16 removed embedded mode — always false in production. */
   const isEmbedded = computed(() => status.value?.mode === 'embedded')
+
+  const isOnline = computed(() => label.value.online)
 
   onMounted(() => {
     subscribers += 1
@@ -104,6 +108,8 @@ export function useBackend() {
     initializing: readonly(initializing),
     isDaemon,
     isEmbedded,
+    isOnline,
+    label,
     init,
     refresh,
   }

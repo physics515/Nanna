@@ -117,15 +117,23 @@
       <div class="status-bar">
         <div class="status-left">
           <span class="status-version">v0.1.0</span>
-          <span v-if="backendStatus" :class="['status-badge', isDaemon ? 'status-badge-accent' : '']">
-            {{ isDaemon ? 'daemon' : 'embedded' }}
+          <span
+            v-if="backendStatus"
+            :class="['status-badge', backendLabel.online ? 'status-badge-accent' : '']"
+            :title="backendLabel.tooltip"
+          >
+            {{ backendLabel.short }}
           </span>
         </div>
         <div class="status-right">
-          <span :class="['status-dot', backendStatus?.connected ? 'dot-ok' : (apiKeySet ? 'dot-warn' : 'dot-err')]"></span>
-          <span class="status-label">
-            {{ backendStatus?.connected ? 'Connected' : (apiKeySet ? 'Disconnected' : 'No API Key') }}
-          </span>
+          <span
+            :class="[
+              'status-dot',
+              statusBar.tone === 'ok' ? 'dot-ok' : statusBar.tone === 'warn' || statusBar.tone === 'info' ? 'dot-warn' : 'dot-err'
+            ]"
+            :title="backendLabel.tooltip"
+          ></span>
+          <span class="status-label" :title="backendLabel.tooltip">{{ statusBar.text }}</span>
         </div>
       </div>
 
@@ -267,7 +275,53 @@ provide('closeWorkspaceTab', closeWorkspaceTab)
 provide('showWorkspacePicker', showWorkspacePicker)
 
 const { checkPermission } = useNotifications()
-const { init: initBackend, status: backendStatus, isDaemon } = useBackend()
+const { init: initBackend, status: backendStatus, isDaemon, label: backendLabel } = useBackend()
+const statusBar = computed(() => statusBarLabel(backendStatus.value, apiKeySet.value))
+const { bind: bindShortcut } = useShortcuts()
+
+// Global shortcuts (Cmd/Ctrl+K reserved for future command palette — swallow for now).
+bindShortcut({
+  key: 'k',
+  mod: true,
+  priority: 10,
+  description: 'Command palette (reserved)',
+  handler: () => {
+    // Reserved — progressive disclosure palette lands in P4 follow-on.
+  },
+})
+bindShortcut({
+  key: 'n',
+  mod: true,
+  shift: true,
+  priority: 20,
+  description: 'New chat',
+  handler: () => { void createNewSession() },
+})
+bindShortcut({
+  key: 'l',
+  mod: true,
+  shift: true,
+  priority: 20,
+  allowInInput: true,
+  description: 'Focus chat input',
+  handler: () => {
+    if (route.path !== '/' && route.path !== '') {
+      void navigateTo(currentSessionId.value ? `/?session=${currentSessionId.value}` : '/')
+    }
+    // ChatInput listens for this custom event.
+    window.dispatchEvent(new CustomEvent('nanna:focus-chat-input'))
+  },
+})
+bindShortcut({
+  key: '.',
+  mod: true,
+  priority: 20,
+  allowInInput: true,
+  description: 'Stop generation',
+  handler: () => {
+    window.dispatchEvent(new CustomEvent('nanna:stop-generation'))
+  },
+})
 const { handleClose, loadCloseMode } = useCloseHandler()
 
 const TABS_STORAGE_KEY = 'nanna-workspace-tabs'

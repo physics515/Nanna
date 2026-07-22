@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-22 (**P4 GUI automated testing LANDED** — Playwright web E2E 26/26, Tauri IPC mock fixtures, axe a11y on chat+settings, visual goldens, ErrorBoundary, GUI CI workflow with unit + e2e + nightly tauri-driver soft-smoke. Prior: 2026-07-18 (**P16 daemon-only consolidation LANDED** — GUI is now a pure daemon client:)
+**Last updated:** 2026-04-27 (**P4 GUI UX bugfix mostly closed** — PageState empty/loading/error/offline across pages; truthful backend labels (no bare Disconnected); toasts + ConfirmDialog Escape stack; chat stick-to-bottom + settings tab scroll restore; global shortcuts; density hit-targets; formValidation + ApiKeyInput; WINDOW_TRAY.md + BUG_BASH_GUI_UX.md. Open tail: list virtualization, palette UI, wizard bulk validation.) Prior notes condensed below.
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -411,25 +411,49 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       `e2e/error-boundary.spec.ts`.
 
 ##### UI / UX bugfix (known + sweep)
-- [ ] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,
+- [x] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,
       scheduler, workspaces, agents) — no silent blank panels; retry or next-step where recovery exists.
-- [ ] **Connection & backend signalling** — ConnectionStatus / BackendStatus language matches reality (embedded vs
+      *(2026-04-27)* Shared `PageState` + per-page `loadError`/`isOnline`/`empty` wiring across agents, channels,
+      memory, tools, tool-stats, model-stats, scheduler, workspaces, tasks, logs; chat + settings get offline
+      banners (chat stays interactive for local draft). Retry actions call the page refresh.
+- [x] **Connection & backend signalling** — ConnectionStatus / BackendStatus language matches reality (embedded vs
       daemon, reconnecting, degraded); avoid "Disconnected" next to live data (Logs taught this lesson).
-- [ ] **Toasts & destructive confirms** — success/error coverage for copy, save, delete, clear; ConfirmDialog on
+      *(2026-04-27)* `app/lib/backendLabels.ts` is the single source: Daemon / Reconnecting / Starting /
+      Daemon offline (with endpoint) / Daemon crashed / Legacy. Status bar + badges consume it; bare
+      "Disconnected" retired. Unit tests in `gui/tests/unit/backendLabels.spec.ts` + `BackendStatus.spec.ts`.
+- [x] **Toasts & destructive confirms** — success/error coverage for copy, save, delete, clear; ConfirmDialog on
       irreversible actions; Escape / outside-click policy consistent app-wide.
-- [ ] **Focus, scroll, and overflow** — chat sticks to latest unless user scrolled up; settings tabs don't lose
+      *(2026-04-27)* `useToast` helpers; ConfirmDialog teleported in `app.vue` with outside-click cancel +
+      Escape via `pushEscapeHandler` stack; destructive paths (session delete, clear logs, memory wipe,
+      channel/tool/workspace/agent/task delete, settings data danger) go through `useConfirm`.
+- [~] **Focus, scroll, and overflow** — chat sticks to latest unless user scrolled up; settings tabs don't lose
       focus/scroll jump; long lists virtualize or paginate; no double scrollbars / clipped CTAs on 1280×720 and
       1440×900 baselines.
-- [ ] **Keyboard & shortcuts** — global Esc closes topmost dialog/menu; Cmd/Ctrl+K reserved for palette;
+      *(2026-04-27)* Chat `userScrolledUp` + `scrollToBottom`; settings per-tab scroll restore (`tabScrollPos`).
+      Remaining: list virtualization for memory/logs/tools at large N; formal 1280×720 / 1440×900 clipped-CTA
+      pass (log in `gui/docs/BUG_BASH_GUI_UX.md`).
+- [x] **Keyboard & shortcuts** — global Esc closes topmost dialog/menu; Cmd/Ctrl+K reserved for palette;
       documented shortcuts for new chat / focus input / Stop generation.
-- [ ] **Density & contrast sweep** on Palenight — readable secondary text, toolbar icon hit-targets ≥ 32px,
+      *(2026-04-27)* `useShortcuts` + Escape stack; layout bindings: `Mod+K` reserved, `Mod+Shift+N` new chat,
+      `Mod+Shift+L` focus input, `Mod+.` stop; ChatInput Escape stops streaming; `ShortcutsHelp` on Settings → Data.
+      Command *palette UI* still open (see simplification track).
+- [x] **Density & contrast sweep** on Palenight — readable secondary text, toolbar icon hit-targets ≥ 32px,
       consistent spacing scale; no low-contrast badges on logs/stats.
-- [ ] **Forms validation** — API key / channel wizard / settings save: inline errors, disable duplicate submit,
+      *(2026-04-27)* Density tokens + `min-h-8`/`min-w-8` hit targets on toolbar icon buttons; secondary text
+      tokens tightened in `main.css`. Broader token audit can continue under simplification.
+- [x] **Forms validation** — API key / channel wizard / settings save: inline errors, disable duplicate submit,
       don't clear valid fields on partial failure.
-- [ ] **Title bar / tray / window controls** (Windows primary) — min/max/close, tray show/hide, quit vs hide
+      *(2026-04-27)* `app/lib/formValidation.ts` + `ApiKeyInput` inline errors / busy-disable; settings/channel
+      saves keep valid fields on partial failure. Remaining unevenness on multi-step channel wizards logged in
+      the bug-bash file.
+- [x] **Title bar / tray / window controls** (Windows primary) — min/max/close, tray show/hide, quit vs hide
       semantics match user expectation; no orphan daemon on "close to tray" confusion (document + test).
-- [ ] **Bug bash log** — keep a rolling short list in daily-dev notes or issues labelled `gui-ux`; promote
+      *(2026-04-27)* Documented in `gui/docs/WINDOW_TRAY.md` (ask / minimize_to_tray / quit_completely;
+      sidecar lifecycle; close dialog). Close path still driven by `useCloseHandler` + daemon tray IPC.
+- [x] **Bug bash log** — keep a rolling short list in daily-dev notes or issues labelled `gui-ux`; promote
       fixed items to dated `[x]` lines here when closed.
+      *(2026-04-27)* `gui/docs/BUG_BASH_GUI_UX.md` started; open carry-overs: list virtualization, channel-wizard
+      bulk validation, command palette UI, Windows `node_modules`/vitest lock flakiness.
 
 ##### UI simplification (default calm, power remains)
 - [ ] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)

@@ -61,13 +61,17 @@
           <Loader2 class="w-5 h-5 animate-spin text-nanna-text-muted" />
         </div>
 
-        <div v-else-if="treeRows.length === 0" class="text-center py-12 text-nanna-text-muted text-sm">
-          <ListChecks class="w-8 h-8 mx-auto mb-2 opacity-50" />
-          <p>{{ filterActive ? 'No tasks match this filter' : 'No tasks yet' }}</p>
-          <button v-if="!filterActive" @click="showCreateModal = true" class="text-nanna-accent hover:underline mt-2 text-xs">
-            Create a task
-          </button>
-        </div>
+        <PageState
+          v-else-if="!isOnline || loadError || treeRows.length === 0"
+          :state="!isOnline ? 'offline' : (loadError ? 'error' : 'empty')"
+          :title="!isOnline ? 'Daemon offline' : (loadError ? 'Could not load tasks' : (filterActive ? 'No tasks match this filter' : 'No tasks yet'))"
+          :description="!isOnline
+            ? 'The task store lives in Turso on the daemon. Reconnect to plan or resume a run.'
+            : (loadError || (filterActive ? 'Try clearing the filter.' : 'Create a task to start a long-horizon plan.'))"
+          :primary-action="!isOnline || loadError ? 'Retry' : (filterActive ? '' : 'Create task')"
+          @primary="onTasksPrimary"
+          compact
+        />
 
         <div v-else class="space-y-0.5">
           <div
@@ -343,6 +347,9 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
   Plus, RefreshCw, Loader2, ListChecks, Trash2, Check, Play, Square, X
 } from 'lucide-vue-next'
 
@@ -397,6 +404,7 @@ const scope = ref<'workspace' | 'global'>('workspace')
 const includeClosed = ref(false)
 
 const loading = ref(true)
+const loadError = ref<string | null>(null)
 const refreshing = ref(false)
 const actionBusy = ref(false)
 const tasks = ref<Task[]>([])
@@ -519,6 +527,14 @@ function entryTime(e: any): string {
 }
 
 // Task list
+function onTasksPrimary() {
+  if (!isOnline.value || loadError.value) {
+    void refreshTasks()
+    return
+  }
+  showCreateModal.value = true
+}
+
 async function refreshTasks() {
   refreshing.value = true
   try {
@@ -539,6 +555,7 @@ async function refreshTasks() {
     tasks.value = res.tasks || []
   } catch (e) {
     console.error('Failed to load tasks:', e)
+    loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
     refreshing.value = false
     loading.value = false

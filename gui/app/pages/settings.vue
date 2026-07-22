@@ -23,11 +23,20 @@
 
     <!-- Tabs -->
     <div class="px-4 sm:px-6 pt-4">
+      
+    <div
+      v-if="!isOnline"
+      class="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100 flex items-center justify-between gap-3"
+      role="status"
+    >
+      <span>Daemon not reachable — settings still open locally; saves that need the daemon will retry when it returns.</span>
+    </div>
+
       <UiTabs v-model="activeTab" :tabs="tabs" />
     </div>
 
     <!-- Tab Content -->
-    <div class="flex-1 overflow-y-auto p-4 sm:p-6">
+    <div ref="tabScrollEl" class="flex-1 overflow-y-auto p-4 sm:p-6 page-shell__body">
       <div class="max-w-2xl mx-auto">
 
         <!-- Models Tab -->
@@ -58,6 +67,9 @@
         <!-- Data Tab -->
         <UiTabPanel :active="activeTab === 'data'">
           <SettingsDataTab />
+          <div class="mt-8 pt-6 border-t border-white/[0.06]">
+            <ShortcutsHelp />
+          </div>
         </UiTabPanel>
 
       </div>
@@ -81,13 +93,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import {
   ArrowLeft, Save, CheckCircle, XCircle,
   Brain, Bot, BrainCircuit, Wrench, Clock, Database
 } from 'lucide-vue-next'
 import { provideSettingsPage } from '~/composables/useSettingsPage'
+import { useBackend } from '~/composables/useBackend'
+
 
 const tabs = [
   { id: 'models', label: 'Models', icon: Brain },
@@ -102,9 +116,24 @@ const tabs = [
 const store = provideSettingsPage()
 const { toast, showToast } = store
 
+const { isOnline } = useBackend()
 const activeTab = ref('models')
 const hasChanges = ref(false)
 const saving = ref(false)
+const tabScrollEl = ref<HTMLElement | null>(null)
+/** Per-tab scroll offsets so switching tabs doesn't jump. */
+const tabScrollPos = ref<Record<string, number>>({})
+
+watch(activeTab, (next, prev) => {
+  if (prev && tabScrollEl.value) {
+    tabScrollPos.value[prev] = tabScrollEl.value.scrollTop
+  }
+  nextTick(() => {
+    if (tabScrollEl.value) {
+      tabScrollEl.value.scrollTop = tabScrollPos.value[next] ?? 0
+    }
+  })
+})
 
 onMounted(async () => {
   await store.loadSettings()

@@ -55,6 +55,14 @@
 
     <!-- Messages area -->
     <div ref="messagesContainer" @scroll="handleScroll" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+      <ConnectionStatus
+        v-if="!isOnline"
+        status="offline"
+        :visible="true"
+        :can-retry="true"
+        :message="offlineDetail"
+        @retry="onReconnect"
+      />
       <!-- Welcome message -->
       <div v-if="messages.length === 0 && !hasActiveWork" class="flex items-center justify-center h-full">
         <div class="text-center max-w-md px-4">
@@ -217,6 +225,24 @@ import { ref, inject, watch, nextTick, onMounted, onUnmounted, computed, type Re
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit as tauriEmit, type UnlistenFn } from '@tauri-apps/api/event'
 import { useSessionState } from '~/composables/useSessionState'
+import { useBackend } from '~/composables/useBackend'
+
+const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
+const offlineDetail = computed(() => {
+  const url = backendStatus.value?.daemon_url || 'ws://127.0.0.1:5149'
+  const host = String(url).replace(/^wss?:\/\//, '')
+  return 'Daemon not reachable on ' + host + '. Chat needs the control plane.'
+})
+async function onReconnect() {
+  try {
+    await initBackend()
+    await refreshBackend()
+  } catch (e) {
+    console.error('reconnect failed', e)
+  }
+}
+
+
 
 // Notifications
 const { notifyToolComplete, notifyError, notifyMessage } = useNotifications()

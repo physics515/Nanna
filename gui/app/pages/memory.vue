@@ -54,18 +54,16 @@
     <!-- Memory list -->
     <div class="relative z-10 flex-1 overflow-y-auto overflow-x-hidden">
       <div class="p-4 sm:p-6">
-        <!-- Empty state -->
-        <div v-if="filteredMemories.length === 0" class="flex items-center justify-center min-h-[300px] sm:min-h-[400px]">
-          <div class="text-center max-w-md px-4">
-            <div class="text-5xl sm:text-6xl mb-4">🧠</div>
-            <h3 class="text-lg sm:text-xl font-semibold text-white/80 mb-2">
-              {{ memoryFilter ? 'No matching memories' : 'No memories yet' }}
-            </h3>
-            <p class="text-sm text-white/40">
-              {{ memoryFilter ? 'Try a different filter.' : 'Memories are created automatically from conversations and can be added manually.' }}
-            </p>
-          </div>
-        </div>
+        <!-- Loading / offline / error / empty -->
+        <PageState
+          v-if="pageKind"
+          :state="pageKind"
+          :title="pageTitle"
+          :description="pageDescription"
+          :primary-action="pagePrimary"
+          :primary-busy="isLoading"
+          @primary="onPagePrimary"
+        />
 
         <!-- Memories -->
         <div v-else class="space-y-3">
@@ -138,6 +136,10 @@ import { ref, reactive, computed, onMounted, watch, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { Globe, FolderKanban, Trash2, Pencil } from 'lucide-vue-next'
 
+const { status: backendStatus, isOnline } = useBackend()
+const { confirm } = useConfirm()
+const toast = useToast()
+
 // Scope tabs
 const currentWorkspace = inject<any>('currentWorkspace', ref(null))
 const memoryScope = ref<string>('global')
@@ -156,10 +158,42 @@ const scopeItems = computed(() => {
 
 // State
 const memoryFilter = ref('')
+const isLoading = ref(true)
+const loadError = ref<string | null>(null)
 const isDreaming = ref(false)
 const editingMemoryId = ref<string | null>(null)
 const editBuffers = reactive<Record<string, string>>({})
 const semanticMemories = ref<any[]>([])
+
+const pageKind = computed(() => {
+  if (isLoading.value) return 'loading' as const
+  if (!isOnline.value) return 'offline' as const
+  if (loadError.value) return 'error' as const
+  if (filteredMemories.value.length === 0) return 'empty' as const
+  return null
+})
+const pageTitle = computed(() => {
+  if (pageKind.value === 'loading') return 'Loading memories…'
+  if (pageKind.value === 'offline') return 'Daemon offline'
+  if (pageKind.value === 'error') return 'Could not load memories'
+  return memoryFilter.value ? 'No matching memories' : 'No memories yet'
+})
+const pageDescription = computed(() => {
+  if (pageKind.value === 'loading') return 'Pulling the cognitive store from the daemon.'
+  if (pageKind.value === 'offline') return 'Memory is served by the daemon control plane. Reconnect to browse or dream.'
+  if (pageKind.value === 'error') return loadError.value || 'Unknown error'
+  return memoryFilter.value
+    ? 'Try a different filter.'
+    : 'Memories are created automatically from conversations and can be added manually.'
+})
+const pagePrimary = computed(() => {
+  if (pageKind.value === 'offline' || pageKind.value === 'error') return 'Retry'
+  return ''
+})
+function onPagePrimary() {
+  void fetchMemories()
+}
+
 
 function startEditing(memory: any) {
   editingMemoryId.value = memory.id
@@ -177,8 +211,10 @@ async function saveEditing(id: string) {
     await invoke('update_memory', { id, content })
     const mem = semanticMemories.value.find((m: any) => m.id === id)
     if (mem) mem.content = content
+    toast.success('Memory saved')
   } catch (e) {
     console.error('Failed to update memory:', e)
+    toast.error('Save failed', e instanceof Error ? e.message : String(e))
   }
   editingMemoryId.value = null
 }
@@ -192,6 +228,8 @@ const filteredMemories = computed(() => {
 })
 
 async function fetchMemories() {
+  isLoading.value = true
+  loadError.value = null
   try {
     const res = await invoke('list_memories', {
       scope: memoryScope.value,
@@ -200,15 +238,27 @@ async function fetchMemories() {
     semanticMemories.value = res as any[]
   } catch (e) {
     console.error('Failed to fetch memories:', e)
+    loadError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    isLoading.value = false
   }
 }
 
 async function deleteMemory(id: string) {
+  const ok = await confirm({
+    title: 'Delete memory?',
+    message: 'This removes the memory from the cognitive store. It cannot be undone.',
+    confirmLabel: 'Delete',
+    danger: true,
+  })
+  if (!ok) return
   try {
     await invoke('delete_memory', { id })
     semanticMemories.value = semanticMemories.value.filter((m: any) => m.id !== id)
+    toast.success('Memory deleted')
   } catch (e) {
     console.error('Failed to delete memory:', e)
+    toast.error('Delete failed', e instanceof Error ? e.message : String(e))
   }
 }
 
@@ -217,23 +267,33 @@ async function triggerDream() {
   try {
     await invoke('trigger_consolidation')
     await fetchMemories()
+    toast.success('Dream cycle finished')
   } catch (e) {
     console.error('Dream failed:', e)
+    toast.error('Dream failed', e instanceof Error ? e.message : String(e))
   } finally {
     isDreaming.value = false
   }
 }
 
 async function clearAllMemories() {
-  if (!confirm('Are you sure you want to clear all memories? This cannot be undone.')) return
+  const ok = await confirm({
+    title: 'Clear all memories?',
+    message: 'This permanently clears memories in the current scope. It cannot be undone.',
+    confirmLabel: 'Clear all',
+    danger: true,
+  })
+  if (!ok) return
   try {
     await invoke('clear_memories', {
       scope: memoryScope.value,
       workspaceId: currentWorkspace?.value?.id,
     })
     semanticMemories.value = []
+    toast.success('Memories cleared')
   } catch (e) {
     console.error('Failed to clear memories:', e)
+    toast.error('Clear failed', e instanceof Error ? e.message : String(e))
   }
 }
 

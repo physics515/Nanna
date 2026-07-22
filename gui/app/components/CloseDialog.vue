@@ -14,7 +14,7 @@
           <div>
             <div class="font-medium text-nanna-text">Minimize to Tray</div>
             <div class="text-sm text-nanna-text-muted">
-              Hide the window but keep Nanna running in the background
+              Hide the window. The daemon stays running in the tray (no orphan process).
             </div>
           </div>
         </button>
@@ -27,7 +27,7 @@
           <div>
             <div class="font-medium text-nanna-text">Quit Completely</div>
             <div class="text-sm text-nanna-text-muted">
-              Close Nanna and stop all background services
+              Exit the app and stop the managed daemon sidecar.
             </div>
           </div>
         </button>
@@ -41,6 +41,11 @@
         />
         <span>Remember my choice</span>
       </label>
+      <p class="text-xs text-nanna-text-dim leading-relaxed">
+        <strong class="text-nanna-text-muted">Close to tray</strong> hides the window only —
+        the daemon keeps serving channels. <strong class="text-nanna-text-muted">Quit</strong>
+        tears down the managed sidecar. Restore anytime from the tray icon.
+      </p>
     </div>
     
     <template #footer>

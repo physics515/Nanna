@@ -84,26 +84,21 @@
           </div>
         </UiGroundGlass>
 
-        <!-- Empty State -->
-        <div v-if="workspaces.length === 0 && !isLoading" class="flex items-center justify-center min-h-[400px]">
-          <div class="text-center max-w-md px-4">
-            <div class="text-5xl sm:text-6xl mb-4">📂</div>
-            <h3 class="text-lg sm:text-xl font-semibold text-white/80 mb-2">No workspaces open</h3>
-            <p class="text-sm text-white/30 mb-6">
-              Create a new workspace or open an existing folder containing workspace files.
-            </p>
-            <div class="flex gap-3 justify-center">
-              <UiGlassButton pill size="sm" color="accent" @click="showCreateDialog = true">
-                <FolderPlus class="w-4 h-4" />
-                Create Workspace
-              </UiGlassButton>
-              <UiGlassButton pill size="sm" @click="openFolderDialog">
-                <FolderOpen class="w-4 h-4" />
-                Open Existing
-              </UiGlassButton>
-            </div>
-          </div>
-        </div>
+                <PageState
+          v-if="isLoading || !isOnline || loadError || workspaces.length === 0"
+          :state="isLoading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
+          :title="isLoading ? 'Loading workspaces…' : (!isOnline ? 'Daemon offline' : (loadError ? 'Could not load workspaces' : 'No workspaces open'))"
+          :description="isLoading
+            ? 'Reading the workspace registry from the daemon.'
+            : (!isOnline
+              ? 'Workspaces are owned by the daemon. Reconnect to open or create one.'
+              : (loadError || 'Create a new workspace or open an existing folder containing project files (README, AGENTS.md, ROADMAP.md).'))"
+          :primary-action="isLoading ? '' : ((!isOnline || loadError) ? 'Retry' : 'Create workspace')"
+          secondary-action="Open folder"
+          :primary-busy="isLoading"
+          @primary="onWorkspacesPrimary"
+          @secondary="openFolderDialog"
+        />
 
         <!-- Workspace List -->
         <div v-else class="space-y-2">
@@ -474,6 +469,9 @@ import { ref, computed, onMounted, watch, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
   Folder, FolderOpen, FolderPlus, FolderCheck, RefreshCw, X, Play, FileText, Wrench, Globe
 } from 'lucide-vue-next'
 
@@ -507,6 +505,7 @@ interface WorkspaceValidity {
 
 const workspaces = ref<WorkspaceInfo[]>([])
 const isLoading = ref(false)
+const loadError = ref<string | null>(null)
 const selectedWorkspace = ref<WorkspaceInfo | null>(null)
 
 // Create dialog state
@@ -580,8 +579,18 @@ watch(createPath, async (path) => {
   }
 })
 
+function onWorkspacesPrimary() {
+  if (!isOnline.value || loadError.value) {
+    void loadWorkspaces()
+    return
+  }
+  showCreateDialog.value = true
+}
+
+
 async function loadWorkspaces() {
   isLoading.value = true
+  loadError.value = null
   try {
     workspaces.value = await invoke<WorkspaceInfo[]>('list_workspaces')
   } catch (e) {

@@ -313,7 +313,19 @@ const {
 
 // Prevent mount animation
 const ready = ref(false)
-onMounted(() => { setTimeout(() => { ready.value = true }, 200) })
+function onFocusEvent() { focus() }
+function onStopEvent() { if (props.isActive) emit('stop') }
+
+onMounted(() => {
+  setTimeout(() => { ready.value = true }, 200)
+  window.addEventListener('nanna:focus-chat-input', onFocusEvent)
+  window.addEventListener('nanna:stop-generation', onStopEvent)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('nanna:focus-chat-input', onFocusEvent)
+  window.removeEventListener('nanna:stop-generation', onStopEvent)
+})
 
 function handleToolbarEnter() {
   if (ready.value) glassEnter()
@@ -329,6 +341,13 @@ const tiptapEditor = computed(() => richEditorRef.value?.editor)
 const isEmpty = computed(() => richEditorRef.value?.isEmpty ?? !props.modelValue.trim())
 
 function handleKeyDown(event: KeyboardEvent) {
+  // Escape stops generation when a turn is active (documented Stop shortcut).
+  if (event.key === 'Escape' && props.isActive) {
+    event.preventDefault()
+    event.stopPropagation()
+    emit('stop')
+    return
+  }
   if (event.key === 'p' && (event.ctrlKey || event.metaKey)) {
     event.preventDefault()
     showPreview.value = !showPreview.value
