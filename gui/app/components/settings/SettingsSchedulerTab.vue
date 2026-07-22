@@ -11,7 +11,7 @@
             <div class="text-sm font-medium text-nanna-text">Enable Scheduler</div>
             <div class="text-xs text-nanna-text-dim">Background tasks</div>
           </div>
-          <UiSwitch :model-value="settings?.scheduler_enabled" @update:model-value="setSchedulerEnabled" />
+          <UiSwitch :model-value="settings?.scheduler_enabled" label="Scheduler enabled" @update:model-value="setSchedulerEnabled" />
         </div>
 
         <div class="flex items-center justify-between">
@@ -19,7 +19,7 @@
             <div class="text-sm font-medium text-nanna-text">Enable Heartbeats</div>
             <div class="text-xs text-nanna-text-dim">Periodic self-checks</div>
           </div>
-          <UiSwitch :model-value="settings?.heartbeat_enabled" @update:model-value="setHeartbeatEnabled" />
+          <UiSwitch :model-value="settings?.heartbeat_enabled" label="Heartbeat enabled" @update:model-value="setHeartbeatEnabled" />
         </div>
 
         <!-- Heartbeat Interval -->

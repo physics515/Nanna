@@ -18,7 +18,7 @@ const emit = defineEmits<{
 
 <template>
   <DialogRoot :open="props.open" @update:open="emit('update:open', $event)">
-    <DialogTrigger as-child>
+    <DialogTrigger v-if="$slots.trigger" as-child>
       <slot name="trigger" />
     </DialogTrigger>
     <DialogPortal>

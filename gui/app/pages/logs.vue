@@ -14,17 +14,31 @@
             {{ autoScroll ? 'Auto-scroll' : 'Manual' }}
           </UiGlassButton>
           <!-- Copy all logs button -->
-          <UiGlassButton pill size="xs" :disabled="logs.length === 0" @click="copyAllLogs">
+          <UiGlassButton
+            pill
+            size="xs"
+            :disabled="logs.length === 0"
+            :aria-label="copyLabel"
+            :title="copyLabel"
+            @click="copyAllLogs"
+          >
             <Copy class="w-3.5 h-3.5" />
             {{ copyLabel }}
           </UiGlassButton>
           <!-- Clear button -->
-          <UiGlassButton pill size="xs" @click="clearLogs">
+          <UiGlassButton pill size="xs" aria-label="Clear" title="Clear" @click="clearLogs">
             <Trash2 class="w-3.5 h-3.5" />
             Clear
           </UiGlassButton>
           <!-- Live mode button -->
-          <UiGlassButton pill size="xs" :color="liveMode ? 'accent' : 'default'" @click="toggleLiveMode">
+          <UiGlassButton
+            pill
+            size="xs"
+            :color="liveMode ? 'accent' : 'default'"
+            :aria-label="liveMode ? 'Live' : 'Paused'"
+            :title="liveMode ? 'Live' : 'Paused'"
+            @click="toggleLiveMode"
+          >
             <Circle class="w-2.5 h-2.5" :class="liveMode ? 'fill-current' : ''" />
             {{ liveMode ? 'Live' : 'Paused' }}
           </UiGlassButton>

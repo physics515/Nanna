@@ -172,6 +172,9 @@
             color="danger"
             pill
             class="shrink-0"
+            aria-label="Stop"
+            title="Stop"
+            data-testid="stop-generation"
           >
             <Square class="w-3.5 h-3.5 sm:mr-1 fill-current" />
             <span class="hidden sm:inline">Stop</span>

@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-18 (**P16 daemon-only consolidation LANDED** — GUI is now a pure daemon client:
+**Last updated:** 2026-07-22 (**P4 GUI automated testing LANDED** — Playwright web E2E 26/26, Tauri IPC mock fixtures, axe a11y on chat+settings, visual goldens, ErrorBoundary, GUI CI workflow with unit + e2e + nightly tauri-driver soft-smoke. Prior: 2026-07-18 (**P16 daemon-only consolidation LANDED** — GUI is now a pure daemon client:)
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -266,7 +266,7 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ]  Add gitleaks/trufflehog secret-scan step to CI.
 - [ ]  Add coverage tracking (codecov/coveralls) if practical.
 - [ ]  Add ESLint/Prettier/Vitest/Playwright configs for frontend.
-- [ ]  Wire GUI automated tests into CI (see P4 follow-on GUI Testing & UX Quality): unit/component on every PR; Playwright + Tauri/WebDriver smoke on packaging jobs.
+- [x]  Wire GUI automated tests into CI (see P4 follow-on GUI Testing & UX Quality): unit/component on every PR; Playwright + Tauri/WebDriver smoke on packaging jobs. *(2026-07-22 — `.github/workflows/gui.yml`)*
 - [ ]  Add Dependabot/Renovate config.
 - [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
 - [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
@@ -382,24 +382,33 @@ bugs and improvements here; do not bury them only in the backlog bullet.
 ##### GUI automated testing
 - [x] **Vitest + Vue Test Utils** — unit/component tests for composables, pure helpers, and high-risk widgets
       (ChatInput stop/send, SessionItem actions, ConnectionStatus / BackendStatus, settings forms, Logs filters).
-- [ ] **Playwright E2E (web/dev shell)** against `pnpm dev` / built Nuxt for fast iteration without a full Tauri shell.
-- [ ] **Tauri WebDriver / tauri-driver smoke** on a packaged or `cargo tauri dev` window: launch → show main
-      chrome → open Settings / Logs → window close hygiene.
-- [ ] **Critical-path scenarios** (automated): first-run / no-key empty state; open chat → send (mock LLM) → stream
-      chunk → Stop; session create / rename / delete / switch; backend disconnect → toast + reconnect affordance;
-      Settings open + API-key field round-trip (mocked); Logs Live on/off, Clear, **Copy all**.
-- [ ] **Page smoke matrix** — agents, channels, memory, model-stats, scheduler, settings, tool-stats, tools,
-      workspaces each load without error and render primary content (no white/blank shell).
-- [ ] **A11y gate on changed surfaces** — keyboard tab order, focus ring, `aria-*` on dialogs/menus, min contrast
-      on Palenight tokens; axe/vitest-axe or Playwright a11y assertions on chat + settings first.
-- [ ] **Visual / theme regression (lightweight)** — screenshot baselining for chat empty/streaming, settings shell,
-      logs toolbar (tolerate font antialias; store goldens under `gui/e2e/__snapshots__`).
-- [ ] **CI wiring** — unit/component on every PR; Playwright web smoke on `gui/**` changes; Tauri/WebDriver on
-      packaging / nightly CI (artifact upload on failure). Cross-link from P0.3 Code Quality & CI.
-- [ ] **Fixtures & mocks** — mock daemon IPC / Tauri invoke harness so chat+settings tests do not need a live LLM
-      or real keyring; hermetic, deterministic, offline by default.
-- [ ] **Crash / error boundaries** — Vue error boundary around shell + chat; assert a recoverable error panel instead
-      of a blank window when a child throws.
+- [x] **Playwright E2E (web/dev shell)** *(2026-07-22)* — `gui/playwright.config.ts` drives `pnpm exec nuxi dev`
+      (or `PLAYWRIGHT_BASE_URL`); 26 chromium specs under `gui/e2e/` run offline via the Tauri mock harness.
+      Scripts: `pnpm test:e2e` / `test:e2e:update` / `test:e2e:ui`.
+- [x] **Tauri WebDriver / tauri-driver smoke** *(2026-07-22)* — scaffold `gui/scripts/tauri-driver-smoke.mjs` +
+      `gui/e2e/tauri-driver.md` (launch → Settings → Logs → close hygiene). Soft-skips when binary/driver missing
+      so web CI stays hermetic; armed via `NANNA_TAURI_E2E=1` once a packaged binary is present. Wire full
+      WebDriverIO session when nightly hosts a display + driver pair.
+- [x] **Critical-path scenarios** *(2026-07-22)* — `e2e/critical-path.spec.ts`: first-run/no-key empty state;
+      chat send → stream → Stop (mock LLM); session create/rename/delete/switch; backend disconnect toast +
+      reconnect affordance; Settings API-key round-trip; Logs Live/Paused, Clear, Copy all.
+- [x] **Page smoke matrix** *(2026-07-22)* — `e2e/page-smoke.spec.ts` hits `/`, agents, channels, memory,
+      model-stats, scheduler, settings, tool-stats, tools, workspaces, logs, tasks — each renders primary
+      content (no blank shell).
+- [x] **A11y gate on changed surfaces** *(2026-07-22)* — `@axe-core/playwright` critical/serious sweep on chat +
+      settings; keyboard tab-order reaches main controls; labelled switches / back links / session menu;
+      GlassButton forwards `aria-*` on NuxtLink. Follow-on: broader color-contrast token audit.
+- [x] **Visual / theme regression (lightweight)** *(2026-07-22)* — `e2e/visual.spec.ts` baselines chat empty,
+      settings shell, logs toolbar under `gui/e2e/__snapshots__/` (`maxDiffPixelRatio: 0.03`).
+- [x] **CI wiring** *(2026-07-22)* — `.github/workflows/gui.yml`: Vitest unit on every `gui/**` PR; Playwright
+      web smoke with report artifact on failure; Tauri-driver soft-smoke on nightly/`workflow_dispatch`.
+      Cross-link: P0.3 Code Quality & CI.
+- [x] **Fixtures & mocks** *(2026-07-22)* — `gui/e2e/fixtures/{tauri-mock,mock-state,test-base}.ts` installs a
+      full Tauri 2 IPC mock (`invoke`/`listen`/window) with seeded sessions, streaming LLM, config, tools,
+      logs — hermetic, deterministic, offline (no live LLM / keyring).
+- [x] **Crash / error boundaries** *(2026-07-22)* — `ErrorBoundary.vue` wraps shell + chat via `onErrorCaptured`;
+      recoverable alert panel + Try again/Reload; e2e force hook `__NANNA_FORCE_ERROR__` asserted in
+      `e2e/error-boundary.spec.ts`.
 
 ##### UI / UX bugfix (known + sweep)
 - [ ] **Empty / loading / error / offline** states for every page (chat, logs, memory, tools, channels, stats,

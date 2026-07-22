@@ -44,7 +44,7 @@ const isUsingFallback = computed(() => {
 })
 
 const rateLimitedCount = computed(() => {
-  return status.value?.rate_limited_models.length ?? 0
+  return status.value?.rate_limited_models?.length ?? 0
 })
 
 const statusTitle = computed(() => {
@@ -53,7 +53,7 @@ const statusTitle = computed(() => {
   if (status.value.fallback_reason) {
     title += `\nFallback reason: ${status.value.fallback_reason}`
   }
-  if (status.value.rate_limited_models.length > 0) {
+  if ((status.value.rate_limited_models?.length ?? 0) > 0) {
     title += `\nRate limited: ${status.value.rate_limited_models.join(', ')}`
   }
   return title

@@ -4,6 +4,7 @@ import { cn } from '~/lib/utils'
 interface Props {
   modelValue?: boolean
   disabled?: boolean
+  label?: string
   class?: string
 }
 
@@ -30,16 +31,17 @@ watch(() => props.modelValue, (on) => {
   <button
     type="button"
     role="switch"
-    :aria-checked="modelValue"
-    :disabled="disabled"
+    :aria-label="props.label || ($attrs['aria-label'] as string | undefined)"
+    :aria-checked="props.modelValue"
+    :disabled="props.disabled"
     :class="cn('switch', {
-      'switch--on': modelValue,
-      'switch--disabled': disabled,
+      'switch--on': props.modelValue,
+      'switch--disabled': props.disabled,
     }, props.class)"
-    :style="modelValue ? containerStyle : undefined"
+    :style="props.modelValue ? containerStyle : undefined"
     @click="toggle"
   >
-    <span class="switch__mesh" :style="modelValue ? { background: meshBg } : undefined" />
+    <span class="switch__mesh" :style="props.modelValue ? { background: meshBg } : undefined" />
     <span class="switch__glass" />
     <span class="switch__thumb" />
   </button>

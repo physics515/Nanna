@@ -273,7 +273,7 @@ async function close() {
     <div class="flex-1" data-tauri-drag-region></div>
 
     <!-- Notification bell -->
-    <button class="titlebar-btn notification-bell" @click="notifOpen = !notifOpen" title="Notifications">
+    <button type="button" class="titlebar-btn notification-bell" aria-label="Notifications" title="Notifications" @click="notifOpen = !notifOpen">
       <Bell class="w-[13px] h-[13px]" />
       <span v-if="unreadCount > 0" class="notif-badge">
         {{ unreadCount > 9 ? '9+' : unreadCount }}
@@ -282,17 +282,16 @@ async function close() {
 
     <!-- Notification Center sheet -->
     <UiSheet :open="notifOpen" side="right" @update:open="notifOpen = $event">
-      <template #trigger><span /></template>
       <NotificationCenter />
     </UiSheet>
 
     <!-- Window controls -->
-    <button class="titlebar-btn" @click="minimize">
+    <button type="button" class="titlebar-btn" aria-label="Minimize" title="Minimize" @click="minimize">
       <svg class="w-[10px] h-[10px]" viewBox="0 0 10 10" fill="currentColor">
         <rect x="1" y="5" width="8" height="1" />
       </svg>
     </button>
-    <button class="titlebar-btn" @click="toggleMaximize">
+    <button type="button" class="titlebar-btn" aria-label="Maximize" title="Maximize" @click="toggleMaximize">
       <svg v-if="!maximized" class="w-[10px] h-[10px]" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1">
         <rect x="1" y="1" width="8" height="8" />
       </svg>
@@ -301,7 +300,7 @@ async function close() {
         <rect x="0.5" y="2.5" width="7" height="7" />
       </svg>
     </button>
-    <button class="titlebar-btn titlebar-close" @click="close">
+    <button type="button" class="titlebar-btn titlebar-close" aria-label="Close" title="Close" @click="close">
       <svg class="w-[10px] h-[10px]" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.2">
         <line x1="1" y1="1" x2="9" y2="9" />
         <line x1="9" y1="1" x2="1" y2="9" />

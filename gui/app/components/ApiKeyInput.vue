@@ -14,6 +14,8 @@
         />
         <button
           type="button"
+          :aria-label="showKey ? 'Hide API key' : 'Show API key'"
+          :title="showKey ? 'Hide API key' : 'Show API key'"
           @click="showKey = !showKey"
           class="absolute right-2 top-1/2 -translate-y-1/2 text-nanna-text-dim hover:text-nanna-text transition-colors p-1"
         >

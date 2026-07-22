@@ -71,7 +71,7 @@
             <div class="text-sm font-medium text-nanna-text">Enable Routing</div>
             <div class="text-xs text-nanna-text-dim">Use cheaper models for simpler iterations</div>
           </div>
-          <UiSwitch :model-value="routingEnabled" @update:model-value="toggleRouting" />
+          <UiSwitch :model-value="routingEnabled" label="Complexity-based routing" @update:model-value="toggleRouting" />
         </div>
 
         <template v-if="routingEnabled">
@@ -81,7 +81,7 @@
               <div class="text-sm font-medium text-nanna-text">Primary on First Turn</div>
               <div class="text-xs text-nanna-text-dim">Always use primary model for the initial response</div>
             </div>
-            <UiSwitch :model-value="routingFirstTurnPrimary" @update:model-value="saveRoutingFirstTurnPrimary" />
+            <UiSwitch :model-value="routingFirstTurnPrimary" label="First turn uses primary model" @update:model-value="saveRoutingFirstTurnPrimary" />
           </div>
 
           <!-- Route table -->
@@ -152,7 +152,7 @@
             <div class="text-sm font-medium text-nanna-text">Thinking Mode</div>
             <div class="text-xs text-nanna-text-dim">Show reasoning process</div>
           </div>
-          <UiSwitch :model-value="settings?.thinking_enabled" @update:model-value="setThinkingEnabled" />
+          <UiSwitch :model-value="settings?.thinking_enabled" label="Thinking enabled" @update:model-value="setThinkingEnabled" />
         </div>
 
         <div class="flex items-center justify-between">
@@ -160,7 +160,7 @@
             <div class="text-sm font-medium text-nanna-text">Streaming</div>
             <div class="text-xs text-nanna-text-dim">Stream responses token by token</div>
           </div>
-          <UiSwitch :model-value="settings?.streaming_enabled ?? true" @update:model-value="setStreamingEnabled" />
+          <UiSwitch :model-value="settings?.streaming_enabled ?? true" label="Streaming enabled" @update:model-value="setStreamingEnabled" />
         </div>
 
         <!-- Max Tokens -->

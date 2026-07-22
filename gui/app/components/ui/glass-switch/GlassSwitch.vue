@@ -25,12 +25,13 @@ watch(model, (on) => {
   <button
     type="button"
     role="switch"
+    :aria-label="props.label || ($attrs['aria-label'] as string | undefined)"
     :aria-checked="model"
-    :disabled="disabled"
+    :disabled="props.disabled"
     class="switch"
     :class="{
       'switch--on': model,
-      'switch--disabled': disabled,
+      'switch--disabled': props.disabled,
     }"
     :style="model ? containerStyle : undefined"
     @click="toggle"
