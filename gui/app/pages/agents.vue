@@ -33,17 +33,19 @@
     <div class="flex-1 overflow-y-auto p-4 sm:p-6">
       <div class="max-w-6xl mx-auto space-y-6">
 
-        <!-- Empty state -->
-        <div v-if="!isLoading && clusters.length === 0" class="text-center py-16">
-          <div class="w-20 h-20 mx-auto mb-4 rounded-full bg-nanna-bg-elevated flex items-center justify-center">
-            <Bot class="w-10 h-10 text-nanna-text-dim" />
-          </div>
-          <h3 class="text-xl font-semibold text-nanna-text mb-2">No agents running</h3>
-          <p class="text-sm text-nanna-text-muted max-w-md mx-auto">
-            Start a chat session or run a task to see agents appear here.
-            Each workspace can have its own main agent with sub-agents.
-          </p>
-        </div>
+        <PageState
+          v-if="isLoading || !isOnline || loadError || clusters.length === 0"
+          :state="isLoading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
+          :title="isLoading ? 'Loading agents…' : (!isOnline ? 'Daemon offline' : (loadError ? 'Could not load agents' : 'No agents running'))"
+          :description="isLoading
+            ? 'Checking sub-sessions on the daemon.'
+            : (!isOnline
+              ? 'Agent status is owned by the daemon control plane. Reconnect to see the swarm.'
+              : (loadError || 'Start a chat session or run a task to see agents appear here. Each workspace can have its own main agent with sub-agents.'))"
+          :primary-action="(!isOnline || !!loadError) && !isLoading ? 'Retry' : ''"
+          :primary-busy="isLoading"
+          @primary="refreshAgents"
+        />
 
         <!-- Global stats bar -->
         <div v-if="stats && stats.total_agents > 0" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -258,6 +260,9 @@ import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { 
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
   Bot, RefreshCw, FolderOpen, ChevronDown, X, StopCircle, 
   Activity, Clock, Cpu, Zap
 } from 'lucide-vue-next'
@@ -337,6 +342,7 @@ onUnmounted(() => {
 
 async function refreshAgents() {
   isLoading.value = true
+  loadError.value = null
   try {
     const [clustersResult, statsResult] = await Promise.all([
       invoke<WorkspaceCluster[]>('get_agent_clusters'),
@@ -346,6 +352,7 @@ async function refreshAgents() {
     stats.value = statsResult
   } catch (e) {
     console.error('Failed to load agents:', e)
+    loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
     isLoading.value = false
   }

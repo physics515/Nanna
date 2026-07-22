@@ -21,12 +21,19 @@
 
     <!-- Content -->
     <div class="flex-1 overflow-y-auto p-6 space-y-6">
-      <!-- Empty state -->
-      <div v-if="!isLoading && models.length === 0" class="text-center py-16">
-        <BarChart3 class="w-12 h-12 text-nanna-text-muted mx-auto mb-4" />
-        <h3 class="text-lg font-medium text-nanna-text mb-2">No model stats yet</h3>
-        <p class="text-sm text-nanna-text-muted">Stats will appear after models process requests.</p>
-      </div>
+      <PageState
+        v-if="isLoading || !isOnline || loadError || models.length === 0"
+        :state="isLoading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
+        :title="isLoading ? 'Loading model stats…' : (!isOnline ? 'Daemon offline' : (loadError ? 'Could not load stats' : 'No model stats yet'))"
+        :description="isLoading
+          ? 'Pulling per-model counters from the daemon.'
+          : (!isOnline
+            ? 'Model stats live on the daemon. Reconnect to inspect latency, tokens, and cost.'
+            : (loadError || 'Stats will appear after models process requests.'))"
+        :primary-action="(!isOnline || !!loadError) && !isLoading ? 'Retry' : ''"
+        :primary-busy="isLoading"
+        @primary="fetchStats"
+      />
 
       <!-- Model cards -->
       <div v-for="model in sortedModels" :key="model.model" class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-5">
@@ -158,6 +165,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, BarChart3 } from 'lucide-vue-next'
 
 interface ModelStat {
+const { isOnline } = useBackend()
+const toast = useToast()
   model: string
   total_requests: number
   success_rate: number
@@ -183,11 +192,13 @@ const sortedModels = computed(() => {
 
 async function fetchStats() {
   isLoading.value = true
+  loadError.value = null
   try {
     const result = await invoke<{ models: ModelStat[] }>('get_model_stats')
     models.value = result.models || []
   } catch (e) {
     console.error('Failed to fetch model stats:', e)
+    loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
     isLoading.value = false
   }

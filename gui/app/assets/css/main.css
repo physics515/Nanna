@@ -443,3 +443,116 @@ body {
 }
 
 /* Layout responsive classes removed — single layout, no mobile/desktop split */
+
+
+/* P4 UX density & contrast (Palenight) */
+:root {
+  --nanna-hit-min: 32px;
+  --nanna-text-secondary: #b6c2d0; /* readable secondary on #1e293b */
+}
+
+.text-nanna-text-muted {
+  color: var(--color-nanna-text-muted);
+}
+
+/* Prefer brighter muted for small meta text */
+.text-secondary {
+  color: var(--nanna-text-secondary);
+}
+
+/* Minimum hit target for icon toolbar buttons */
+.toolbar-btn,
+.icon-btn,
+button.icon-only {
+  min-width: var(--nanna-hit-min);
+  min-height: var(--nanna-hit-min);
+}
+
+/* Log / stats badges: ensure contrast on dark chips */
+.badge-muted,
+.level-badge,
+.log-level {
+  color: #e2e8f0;
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.level-badge.level-error,
+.log-level.level-error {
+  color: #fecdd3;
+  background: rgba(251, 113, 133, 0.22);
+}
+.level-badge.level-warn,
+.log-level.level-warn {
+  color: #fde68a;
+  background: rgba(251, 191, 36, 0.22);
+}
+.level-badge.level-info,
+.log-level.level-info {
+  color: #a5f3fc;
+  background: rgba(34, 211, 238, 0.16);
+}
+
+/* Avoid double scrollbars in page shells */
+.page-shell {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.page-shell__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* === P4 UX density & contrast (Palenight) === */
+:root {
+  --hit-target-min: 32px;
+  --text-secondary: #a6accd; /* readable secondary on #292d3e */
+  --text-muted-safe: #959dcb;
+  --badge-fg: #c3e88d;
+  --badge-bg: rgba(195, 232, 141, 0.12);
+  --badge-border: rgba(195, 232, 141, 0.28);
+}
+
+/* Toolbar / icon buttons: never smaller than 32px hit target */
+.toolbar-btn,
+.icon-btn,
+button.icon-only,
+[data-hit="toolbar"] {
+  min-width: var(--hit-target-min);
+  min-height: var(--hit-target-min);
+}
+
+/* Secondary copy that previously used near-transparent white */
+.text-nanna-text-muted,
+.text-nanna-text-dim {
+  color: var(--text-muted-safe) !important;
+}
+
+/* Log / stats badges — avoid low-contrast chips */
+.badge-soft,
+.log-level-badge,
+.stats-badge {
+  color: var(--badge-fg);
+  background: var(--badge-bg);
+  border: 1px solid var(--badge-border);
+}
+
+/* Consistent vertical rhythm for page shells */
+.page-shell {
+  gap: 0.75rem;
+}
+.page-shell__header {
+  min-height: 48px;
+  padding-inline: 1rem;
+}
+
+/* Baseline viewports: prevent double scroll + clipped CTAs */
+@media (max-height: 720px) {
+  .page-state { min-height: 200px; padding-block: 1.25rem; }
+  .status-bar { font-size: 11px; }
+}
+@media (max-width: 1280px) {
+  .page-shell__header { padding-inline: 0.75rem; }
+}

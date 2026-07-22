@@ -18,10 +18,19 @@
       </header>
 
       <div class="flex-1 overflow-y-auto p-2">
-        <!-- Loading -->
-        <div v-if="loading" class="flex items-center justify-center py-8">
-          <Loader2 class="w-5 h-5 animate-spin text-nanna-text-muted" />
-        </div>
+        <PageState
+          v-if="loading || !isOnline || loadError || filteredTools.length === 0"
+          :state="loading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
+          :title="loading ? 'Loading tools…' : (!isOnline ? 'Daemon offline' : (loadError ? 'Could not load tools' : 'No tools found'))"
+          :description="loading
+            ? 'Asking the daemon for the skill registry.'
+            : (!isOnline
+              ? 'Tools are loaded by the daemon. Reconnect to browse or author skills.'
+              : (loadError || 'No tools match the current filter.'))"
+          :primary-action="loading ? '' : ((!isOnline || loadError) ? 'Retry' : 'Create tool')"
+          :primary-busy="loading"
+          @primary="onToolsPrimary"
+        />
 
         <!-- Tools list -->
         <div v-else class="space-y-1">
@@ -37,15 +46,6 @@
             <Wrench class="w-4 h-4 flex-shrink-0" />
             <span class="text-sm truncate flex-1">{{ tool.name }}</span>
             <UiBadge v-if="!tool.enabled" variant="secondary" size="xs">disabled</UiBadge>
-          </div>
-
-          <!-- Empty state -->
-          <div v-if="filteredTools.length === 0 && !loading" class="text-center py-8 text-nanna-text-muted text-sm">
-            <Wrench class="w-8 h-8 mx-auto mb-2 opacity-50" />
-            <p>No tools found</p>
-            <button @click="openCreateModal" class="text-nanna-accent hover:underline mt-2 text-xs">
-              Create a new tool
-            </button>
           </div>
         </div>
       </div>
@@ -330,6 +330,9 @@ import { ref, computed, watch, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
 import {
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
   Plus, RefreshCw, Loader2, FileCode2, Wrench, Play, Save, Trash2, X
 } from 'lucide-vue-next'
 
@@ -361,6 +364,7 @@ interface Template {
 
 // State
 const loading = ref(true)
+const loadError = ref<string | null>(null)
 const refreshing = ref(false)
 const saving = ref(false)
 const deleting = ref(false)
@@ -537,6 +541,15 @@ const isEditable = computed(() => {
 })
 
 // Methods
+function onToolsPrimary() {
+  if (!isOnline.value || loadError.value) {
+    void refreshTools()
+    return
+  }
+  openCreateModal()
+}
+
+
 async function refreshTools() {
   refreshing.value = true
   try {

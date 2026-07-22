@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils'
+﻿import { mount } from '@vue/test-utils'
 import ConnectionStatus from '~/components/ConnectionStatus.vue'
 
 describe('ConnectionStatus', () => {
@@ -9,9 +9,13 @@ describe('ConnectionStatus', () => {
   })
 
   it('shows reconnecting progress with its message', () => {
-    const wrapper = mount(ConnectionStatus, { props: { status: 'reconnecting', visible: true, message: 'Attempt 3 of 10' } })
-    expect(wrapper.text()).toContain('Reconnecting...')
+    const wrapper = mount(ConnectionStatus, {
+      props: { status: 'reconnecting', visible: true, message: 'Attempt 3 of 10' },
+    })
+    // Title comes from truthful backend copy (see ConnectionStatus.vue).
+    expect(wrapper.text()).toMatch(/Reconnecting to daemon/)
     expect(wrapper.text()).toContain('Attempt 3 of 10')
+    expect(wrapper.classes()).toContain('status-connecting')
   })
 
   it('emits retry and disables retry while one is running', async () => {

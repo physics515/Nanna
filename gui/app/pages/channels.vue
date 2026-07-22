@@ -19,6 +19,20 @@
     <div class="flex-1 overflow-y-auto p-4 sm:p-6">
       <div class="max-w-3xl mx-auto space-y-4">
         
+        <PageState
+          v-if="isLoading || !isOnline || loadError"
+          :state="isLoading ? 'loading' : (!isOnline ? 'offline' : 'error')"
+          :title="isLoading ? 'Loading channels…' : (!isOnline ? 'Daemon offline' : 'Could not load channels')"
+          :description="isLoading
+            ? 'Reading channel onboarding state from the daemon.'
+            : (!isOnline
+              ? 'Channel listeners run inside the daemon. Reconnect to configure Telegram, Discord, Slack, Signal, or WhatsApp.'
+              : (loadError || 'Unknown error'))"
+          :primary-action="isLoading ? '' : 'Retry'"
+          :primary-busy="isLoading"
+          @primary="refreshStatus"
+        />
+
         <!-- Channel Cards -->
         <UiCard
           v-for="channel in channelConfigs"
@@ -157,6 +171,9 @@ import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, ChevronDown, FileCode, CheckCircle, XCircle, Activity } from 'lucide-vue-next'
 
 interface ChannelStatus {
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
   name: string
   configured: boolean
   enabled: boolean
@@ -181,6 +198,7 @@ const channelConfigs: ChannelConfig[] = [
 
 const channels = ref<ChannelStatus[]>([])
 const isLoading = ref(false)
+const loadError = ref<string | null>(null)
 const expandedChannel = ref<string | null>(null)
 const toast = ref<{ message: string; type: 'success' | 'error' } | null>(null)
 
@@ -200,6 +218,7 @@ onMounted(async () => {
 
 async function refreshStatus() {
   isLoading.value = true
+  loadError.value = null
   try {
     channels.value = await invoke<ChannelStatus[]>('get_channel_status')
   } catch (e) {

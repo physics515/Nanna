@@ -1,58 +1,84 @@
-import { ref } from 'vue'
+import { readonly, ref } from 'vue'
+import { pushEscapeHandler } from '~/composables/useShortcuts'
 
-interface ConfirmOptions {
-  title?: string
+export interface ConfirmOptions {
+  title: string
   message: string
-  confirmText?: string
-  cancelText?: string
-  destructive?: boolean
+  confirmLabel?: string
+  cancelLabel?: string
+  danger?: boolean
 }
 
-interface ConfirmState {
-  isOpen: boolean
-  options: ConfirmOptions
+interface ConfirmState extends ConfirmOptions {
+  open: boolean
   resolve: ((value: boolean) => void) | null
 }
 
 const state = ref<ConfirmState>({
-  isOpen: false,
-  options: { message: '' },
-  resolve: null
+  open: false,
+  title: '',
+  message: '',
+  confirmLabel: 'Confirm',
+  cancelLabel: 'Cancel',
+  danger: false,
+  resolve: null,
 })
 
-export function useConfirm() {
-  function confirm(options: ConfirmOptions | string): Promise<boolean> {
-    const opts = typeof options === 'string' ? { message: options } : options
+let escapeCleanup: (() => void) | null = null
 
-    return new Promise((resolve) => {
+function clearEscape() {
+  if (escapeCleanup) {
+    escapeCleanup()
+    escapeCleanup = null
+  }
+}
+
+function finish(result: boolean) {
+  const resolve = state.value.resolve
+  state.value = {
+    ...state.value,
+    open: false,
+    resolve: null,
+  }
+  clearEscape()
+  resolve?.(result)
+}
+
+export function useConfirm() {
+  function confirm(options: ConfirmOptions): Promise<boolean> {
+    // If a previous confirm is still open, cancel it first.
+    if (state.value.open && state.value.resolve) {
+      state.value.resolve(false)
+      clearEscape()
+    }
+
+    return new Promise<boolean>((resolve) => {
       state.value = {
-        isOpen: true,
-        options: opts,
-        resolve
+        open: true,
+        title: options.title,
+        message: options.message,
+        confirmLabel: options.confirmLabel ?? 'Confirm',
+        cancelLabel: options.cancelLabel ?? 'Cancel',
+        danger: options.danger ?? false,
+        resolve,
       }
+      // Topmost Esc dismisses as cancel.
+      escapeCleanup = pushEscapeHandler(() => finish(false))
     })
   }
 
   function handleConfirm() {
-    if (state.value.resolve) {
-      state.value.resolve(true)
-    }
-    state.value.isOpen = false
-    state.value.resolve = null
+    finish(true)
   }
 
   function handleCancel() {
-    if (state.value.resolve) {
-      state.value.resolve(false)
-    }
-    state.value.isOpen = false
-    state.value.resolve = null
+    finish(false)
   }
 
   return {
-    state,
+    state: readonly(state),
     confirm,
     handleConfirm,
-    handleCancel
+    handleCancel,
   }
 }

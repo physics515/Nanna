@@ -22,26 +22,19 @@
     <!-- Content -->
     <div class="flex-1 overflow-y-auto p-4 sm:p-6">
       <!-- Loading state -->
-      <div v-if="loading" class="flex items-center justify-center min-h-[300px]">
-        <div class="text-nanna-text-muted">Loading jobs...</div>
-      </div>
-
-      <!-- Empty state -->
-      <div v-else-if="jobs.length === 0" class="flex items-center justify-center min-h-[300px]">
-        <div class="text-center max-w-md px-4">
-          <div class="text-5xl sm:text-6xl mb-4">⏰</div>
-          <h3 class="text-lg sm:text-xl font-semibold text-nanna-text mb-2">
-            No Scheduled Jobs
-          </h3>
-          <p class="text-sm text-nanna-text-muted mb-6">
-            Create cron jobs to run tasks on a schedule. Jobs can trigger prompts,
-            run tools, or send messages to channels.
-          </p>
-          <UiButton @click="openCreateModal" :disabled="!schedulerEnabled">
-            ➕ Create Your First Job
-          </UiButton>
-        </div>
-      </div>
+            <PageState
+        v-if="loading || !isOnline || loadError || jobs.length === 0"
+        :state="loading ? 'loading' : (!isOnline ? 'offline' : (loadError ? 'error' : 'empty'))"
+        :title="loading ? 'Loading scheduler…' : (!isOnline ? 'Daemon offline' : (loadError ? 'Could not load jobs' : 'No scheduled jobs'))"
+        :description="loading
+          ? 'Reading cron jobs from the daemon scheduler.'
+          : (!isOnline
+            ? 'The scheduler lives in the daemon. Reconnect to create or inspect jobs.'
+            : (loadError || 'Create cron jobs to run tasks on a schedule. Jobs can trigger prompts, run tools, or send channel messages.'))"
+        :primary-action="loading ? '' : ((!isOnline || loadError) ? 'Retry' : 'Create job')"
+        :primary-busy="loading"
+        @primary="onSchedulerPrimary"
+      />
 
       <!-- Job list -->
       <div v-else class="space-y-3 sm:space-y-4">
@@ -266,6 +259,9 @@
 import { invoke } from '@tauri-apps/api/core'
 
 interface CronJob {
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
   id: string
   name: string
   schedule: string
@@ -290,6 +286,7 @@ interface JobRun {
 }
 
 const loading = ref(true)
+const loadError = ref<string | null>(null)
 const jobs = ref<CronJob[]>([])
 const schedulerEnabled = ref(true)
 
@@ -330,8 +327,18 @@ onMounted(async () => {
   await loadSchedulerState()
 })
 
+function onSchedulerPrimary() {
+  if (!isOnline.value || loadError.value) {
+    void loadJobs()
+    return
+  }
+  openCreateModal()
+}
+
+
 async function loadJobs() {
   loading.value = true
+  loadError.value = null
   try {
     jobs.value = await invoke<CronJob[]>('list_cron_jobs')
   } catch (e) {

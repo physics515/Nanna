@@ -64,9 +64,9 @@
           <span>{{ filteredLogs.length }} of {{ logs.length }} lines</span>
           <!-- Which sources are feeding this view. The GUI always logs itself, so
                'embedded' is always live; 'daemon' only when one is attached. -->
-          <span class="text-cyan-300/60">&#x25cf; embedded</span>
-          <span :class="daemonAttached ? 'text-violet-300/60' : 'text-white/25'">
-            {{ daemonAttached ? '\u25cf daemon' : '\u25cb daemon (not attached)' }}
+          <span class="text-cyan-300/70">&#x25cf; gui</span>
+          <span :class="daemonAttached ? 'text-violet-300/70' : 'text-white/35'" :title="daemonAttached ? 'Daemon attached — live daemon logs' : 'Daemon not attached; GUI logs only'">
+            {{ daemonAttached ? '\u25cf daemon' : '\u25cb daemon offline' }}
           </span>
           <span v-if="lastUpdate">{{ formatTime(lastUpdate) }}</span>
         </div>
@@ -81,12 +81,20 @@
         ref="logsContainer"
         class="flex-1 overflow-y-auto font-mono text-sm p-4 space-y-0"
       >
-        <div v-if="filteredLogs.length === 0" class="flex items-center justify-center min-h-[300px]">
-          <div class="text-center">
-            <div class="text-4xl mb-3">&#x1f4cb;</div>
-            <p class="text-white/30">No logs yet. Embedded and daemon logs will appear here.</p>
-          </div>
-        </div>
+        <PageState
+          v-if="filteredLogs.length === 0"
+          :state="isLoading ? 'loading' : (!daemonAttached && logs.length === 0 ? 'offline' : 'empty')"
+          :title="isLoading ? 'Loading logs…' : (!daemonAttached && logs.length === 0 ? 'Daemon offline' : 'No log lines')"
+          :description="isLoading
+            ? 'Reading the in-process buffers.'
+            : (!daemonAttached && logs.length === 0
+              ? 'GUI logs will appear here. Attach the daemon on 5149 for daemon-side lines.'
+              : (searchQuery || levelFilter !== 'all' || sourceFilter !== 'all'
+                ? 'Nothing matches the current filters.'
+                : 'GUI and daemon log lines will appear here as they arrive.'))"
+          :primary-action="!daemonAttached && logs.length === 0 && !isLoading ? 'Open Settings' : ''"
+          @primary="navigateTo('/settings')"
+        />
 
         <div
           v-for="(log, idx) in filteredLogs"
@@ -108,7 +116,7 @@
               ? 'text-violet-300/70 border-violet-400/20 bg-violet-400/[0.06]'
               : 'text-cyan-300/70 border-cyan-400/20 bg-cyan-400/[0.06]'
           ]">
-            {{ sourceOf(log) }}
+            {{ sourceLabel(log) }}
           </span>
           <span :class="[
             'inline-block w-8 text-xs font-bold ml-2 select-none',
@@ -132,7 +140,8 @@ import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { filterLogs } from '~/lib/logFilters'
 import { ChevronDown, Trash2, Circle, Copy } from 'lucide-vue-next'
-import { toast } from 'vue-sonner'
+const toastApi = useToast()
+const { confirm } = useConfirm()
 
 type LogSource = 'embedded' | 'daemon'
 
@@ -176,6 +185,11 @@ const daemonAttached = computed(() => backendStatus.value?.connected === true)
 
 function sourceOf(log: LogEntry): LogSource {
   return log.source ?? 'daemon'
+}
+
+function sourceLabel(log: LogEntry): string {
+  const s = sourceOf(log)
+  return s === 'embedded' ? 'gui' : s
 }
 
 async function refreshLogs() {
@@ -235,12 +249,20 @@ function toggleLiveMode() {
   liveMode.value = !liveMode.value
 }
 
-function clearLogs() {
+async function clearLogs() {
+  const ok = await confirm({
+    title: 'Clear logs?',
+    message: 'Clears the visible log buffer for this session. Daemon files on disk are untouched.',
+    confirmLabel: 'Clear',
+    danger: true,
+  })
+  if (!ok) return
   // Remember how far we cleared, otherwise the next poll re-fetches the same
   // history straight back into the view.
   const newest = logs.value[logs.value.length - 1]
   if (newest) clearedBefore.value = newest.timestamp
   logs.value = []
+  toastApi.success('Logs cleared')
 }
 
 async function copyAllLogs() {
@@ -259,10 +281,10 @@ async function copyAllLogs() {
       copyLabel.value = 'Copy all'
       copyLabelTimer = null
     }, 1500)
-    toast.success(`Copied ${logs.value.length} log lines`)
+    toastApi.success(`Copied ${logs.value.length} log lines`)
   } catch (e) {
     console.error('Failed to copy logs:', e)
-    toast.error('Failed to copy logs')
+    toastApi.error('Failed to copy logs')
   }
 }
 
