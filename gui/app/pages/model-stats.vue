@@ -164,9 +164,10 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw, BarChart3 } from 'lucide-vue-next'
 
-interface ModelStat {
 const { isOnline } = useBackend()
 const toast = useToast()
+
+interface ModelStat {
   model: string
   total_requests: number
   success_rate: number
@@ -184,6 +185,7 @@ const toast = useToast()
 
 const models = ref<ModelStat[]>([])
 const isLoading = ref(false)
+const loadError = ref<string | null>(null)
 let refreshInterval: ReturnType<typeof setInterval> | null = null
 
 const sortedModels = computed(() => {
@@ -233,4 +235,6 @@ onMounted(async () => {
 onUnmounted(() => {
   if (refreshInterval) clearInterval(refreshInterval)
 })
+
+
 </script>

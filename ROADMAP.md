@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-04-27 (**P4 GUI UX bugfix mostly closed** — PageState empty/loading/error/offline across pages; truthful backend labels (no bare Disconnected); toasts + ConfirmDialog Escape stack; chat stick-to-bottom + settings tab scroll restore; global shortcuts; density hit-targets; formValidation + ApiKeyInput; WINDOW_TRAY.md + BUG_BASH_GUI_UX.md. Open tail: list virtualization, palette UI, wizard bulk validation.) Prior notes condensed below.
+**Last updated:** 2026-07-22 (**P4 GUI UX bugfix shipped in #58; SFC regression hotfix** — composables were spliced mid-`interface` on 7 pages and broke `nuxt generate`/`cargo tauri build`; restored script order + channels loadError catch. Prior 2026-04-27 close: PageState empty/loading/error/offline; truthful backend labels; toasts + ConfirmDialog Escape; chat stick-to-bottom + settings tab scroll; shortcuts; density; formValidation + ApiKeyInput; WINDOW_TRAY.md + BUG_BASH_GUI_UX.md. Open tail: list virtualization, palette UI, wizard bulk validation, baseline viewport pass.) Prior notes condensed below.
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -454,6 +454,9 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       fixed items to dated `[x]` lines here when closed.
       *(2026-04-27)* `gui/docs/BUG_BASH_GUI_UX.md` started; open carry-overs: list virtualization, channel-wizard
       bulk validation, command palette UI, Windows `node_modules`/vitest lock flakiness.
+      *(2026-07-22)* Follow-up hotfix after #58: seven page SFCs had composables spliced inside `interface`
+      bodies (broke `nuxt generate` / `cargo tauri build`); restored script order + channels `loadError`
+      on catch. Residual logged in BUG_BASH: local channels toast ref; legacy clawd/Nanna config-path copy.
 
 ##### UI simplification (default calm, power remains)
 - [ ] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)

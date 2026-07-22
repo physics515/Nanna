@@ -260,12 +260,13 @@ import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { 
-const { isOnline } = useBackend()
-const toast = useToast()
-const { confirm } = useConfirm()
   Bot, RefreshCw, FolderOpen, ChevronDown, X, StopCircle, 
   Activity, Clock, Cpu, Zap
 } from 'lucide-vue-next'
+
+const { isOnline } = useBackend()
+const toast = useToast()
+const { confirm } = useConfirm()
 
 interface AgentInfo {
   id: string
@@ -313,6 +314,7 @@ interface AgentEvent {
 const clusters = ref<WorkspaceCluster[]>([])
 const stats = ref<AgentStats | null>(null)
 const isLoading = ref(false)
+const loadError = ref<string | null>(null)
 const selectedAgent = ref<AgentInfo | null>(null)
 const collapsedClusters = ref<Record<string, boolean>>({})
 
@@ -485,4 +487,6 @@ function formatTime(timestamp: number): string {
   const date = new Date(timestamp * 1000)
   return date.toLocaleTimeString()
 }
+
+
 </script>
