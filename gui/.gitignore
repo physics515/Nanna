@@ -27,3 +27,13 @@ logs
 # (scripts/build-daemon.js compiles nanna-daemon and copies it here)
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
+
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+# Keep e2e screenshot goldens, ignore local failure diffs
+/e2e/__snapshots__/*-diff.png
+/e2e/__snapshots__/*-actual.png

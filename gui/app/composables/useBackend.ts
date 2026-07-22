@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { computed, onMounted, onUnmounted, readonly, ref } from 'vue'
 
 export interface BackendStatus {
   mode: 'daemon' | 'embedded'
@@ -8,10 +9,39 @@ export interface BackendStatus {
   version: string
 }
 
-// Global reactive state
+// Global reactive state (shared across callers)
 const status = ref<BackendStatus | null>(null)
 const initialized = ref(false)
 const initializing = ref(false)
+let pollHandle: ReturnType<typeof setInterval> | null = null
+let subscribers = 0
+
+const POLL_MS = 2000
+
+async function refresh(): Promise<BackendStatus | null> {
+  try {
+    status.value = await invoke<BackendStatus>('get_backend_status')
+    return status.value
+  } catch (e) {
+    console.error('Failed to get backend status:', e)
+    return null
+  }
+}
+
+function ensurePolling() {
+  if (pollHandle !== null) return
+  pollHandle = setInterval(() => {
+    void refresh()
+  }, POLL_MS)
+}
+
+function releasePolling() {
+  if (subscribers > 0) return
+  if (pollHandle !== null) {
+    clearInterval(pollHandle)
+    pollHandle = null
+  }
+}
 
 export function useBackend() {
   /**
@@ -21,9 +51,9 @@ export function useBackend() {
     if (initialized.value || initializing.value) {
       return status.value?.mode || 'embedded'
     }
-    
+
     initializing.value = true
-    
+
     try {
       const mode = await invoke<string>('init_backend')
       await refresh()
@@ -44,32 +74,30 @@ export function useBackend() {
       return 'embedded'
     } finally {
       initializing.value = false
+      ensurePolling()
     }
   }
-  
-  /**
-   * Refresh the backend status
-   */
-  async function refresh(): Promise<BackendStatus | null> {
-    try {
-      status.value = await invoke<BackendStatus>('get_backend_status')
-      return status.value
-    } catch (e) {
-      console.error('Failed to get backend status:', e)
-      return null
-    }
-  }
-  
+
   /**
    * Check if connected to daemon
    */
   const isDaemon = computed(() => status.value?.mode === 'daemon')
-  
+
   /**
    * Check if running embedded
    */
   const isEmbedded = computed(() => status.value?.mode === 'embedded')
-  
+
+  onMounted(() => {
+    subscribers += 1
+    ensurePolling()
+  })
+
+  onUnmounted(() => {
+    subscribers = Math.max(0, subscribers - 1)
+    releasePolling()
+  })
+
   return {
     status: readonly(status),
     initialized: readonly(initialized),

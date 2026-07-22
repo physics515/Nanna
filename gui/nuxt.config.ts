@@ -24,6 +24,9 @@ export default defineNuxtConfig({
   
   app: {
     head: {
+      htmlAttrs: {
+        lang: 'en',
+      },
       title: 'Nanna',
       meta: [
         { name: 'description', content: 'Nanna AI Assistant' },

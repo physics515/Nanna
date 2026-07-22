@@ -3,8 +3,13 @@
     <!-- Header -->
     <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
       <div class="flex items-center gap-3 sm:gap-4">
-        <NuxtLink to="/" class="text-nanna-text-muted hover:text-nanna-text transition-colors">
-          <ArrowLeft class="w-5 h-5" />
+        <NuxtLink
+          to="/"
+          class="text-nanna-text-muted hover:text-nanna-text transition-colors"
+          aria-label="Back to chat"
+          title="Back to chat"
+        >
+          <ArrowLeft class="w-5 h-5" aria-hidden="true" />
         </NuxtLink>
         <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Settings</h2>
         <div class="ml-auto flex gap-2">

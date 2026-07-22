@@ -12,6 +12,9 @@
       <nav class="activity-nav">
         <!-- Chat (toggles session panel) -->
         <button
+          type="button"
+          aria-label="Chats"
+          title="Chats"
           :class="['activity-icon', { active: chatPanelOpen || route.path === '/' }]"
           @click="toggleChatPanel"
         >
@@ -35,6 +38,8 @@
 
         <NuxtLink
           v-for="item in navItems" :key="item.to" :to="item.to"
+          :aria-label="item.label"
+          :title="item.label"
           :class="['activity-icon', { active: isNavActive(item.to) }]"
           @click="chatPanelOpen = false"
         >
@@ -45,11 +50,11 @@
 
       <!-- Bottom: settings + hide -->
       <div class="activity-bottom">
-        <NuxtLink to="/settings" :class="['activity-icon', { active: route.path === '/settings' }]" @click="chatPanelOpen = false">
+        <NuxtLink to="/settings" aria-label="Settings" title="Settings" :class="['activity-icon', { active: route.path === '/settings' }]" @click="chatPanelOpen = false">
           <Settings />
           <span class="tooltip">Settings</span>
         </NuxtLink>
-        <button class="activity-icon" @click="hideToTray">
+        <button type="button" class="activity-icon" aria-label="Hide to Tray" title="Hide to Tray" @click="hideToTray">
           <ChevronDown />
           <span class="tooltip">Hide to Tray</span>
         </button>

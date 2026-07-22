@@ -1,11 +1,11 @@
 <template>
-  <div class="session-item-wrap">
+  <div class="session-item-wrap" @mouseenter="!isActive && meshEnter()" @mouseleave="!isActive && meshLeave()">
     <button
+      type="button"
       @click="$emit('select', session)"
       @contextmenu.prevent="showMenu = true"
       :class="['session-btn', { active: isActive }]"
-      @mouseenter="!isActive && meshEnter()"
-      @mouseleave="!isActive && meshLeave()"
+      :aria-current="isActive ? 'true' : undefined"
     >
       <!-- Splatter mesh (visible when active, hover preview when inactive) -->
       <span class="session-mesh" :style="{ background: splatterBg, opacity: isActive ? 1 : 0 }" />
@@ -15,20 +15,24 @@
           <span class="session-name">{{ session.name }}</span>
           <div class="session-actions">
             <SessionActivityBadge :session-id="session.id" compact />
-            <button
-              @click.stop="showMenu = !showMenu"
-              class="session-menu-btn"
-            >
-              <svg viewBox="0 0 4 16" fill="currentColor" style="width: 4px; height: 12px;">
-                <circle cx="2" cy="2" r="1.5" />
-                <circle cx="2" cy="8" r="1.5" />
-                <circle cx="2" cy="14" r="1.5" />
-              </svg>
-            </button>
           </div>
         </div>
         <div class="session-date">{{ formatDate(session.updated_at) }}</div>
       </div>
+    </button>
+    <button
+      type="button"
+      @click.stop="showMenu = !showMenu"
+      class="session-menu-btn"
+      aria-label="Session menu"
+      title="Session menu"
+      :aria-expanded="showMenu ? 'true' : 'false'"
+    >
+      <svg viewBox="0 0 4 16" fill="currentColor" style="width: 4px; height: 12px;" aria-hidden="true">
+        <circle cx="2" cy="2" r="1.5" />
+        <circle cx="2" cy="8" r="1.5" />
+        <circle cx="2" cy="14" r="1.5" />
+      </svg>
     </button>
 
     <!-- Context Menu -->
@@ -187,6 +191,11 @@ const vClickOutside = {
 .session-item-wrap {
   position: relative;
 }
+.session-item-wrap:hover .session-menu-btn,
+.session-item-wrap:focus-within .session-menu-btn,
+.session-btn.active + .session-menu-btn {
+  opacity: 1;
+}
 
 .session-btn {
   position: relative;
@@ -258,6 +267,10 @@ const vClickOutside = {
 }
 
 .session-menu-btn {
+  position: absolute;
+  top: 10px;
+  right: 8px;
+  z-index: 2;
   opacity: 0;
   padding: 4px 6px;
   border-radius: 4px;

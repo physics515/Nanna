@@ -28,3 +28,6 @@ config.toml
 rustc-ice-*.txt
 
 nul
+
+# Local Playwright run scratch
+playwright-run/

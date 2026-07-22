@@ -109,6 +109,7 @@
                 :checked="settings?.claude_proxy_enabled"
                 @change="toggleClaudeProxy"
                 class="sr-only peer"
+                aria-label="Claude OAuth proxy"
               >
               <div class="w-9 h-5 bg-nanna-bg-elevated peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-nanna-text-muted after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-nanna-primary peer-checked:after:bg-white"></div>
             </label>
@@ -138,7 +139,7 @@
               <span v-else-if="ollamaStatus === 'error'" class="flex items-center gap-1 text-xs text-red-400">
                 <XCircle class="w-3 h-3" /> Offline
               </span>
-              <UiButton @click="refreshOllamaModels" size="sm" variant="ghost" :disabled="loadingOllamaModels">
+              <UiButton aria-label="Refresh Ollama models" title="Refresh Ollama models" @click="refreshOllamaModels" size="sm" variant="ghost" :disabled="loadingOllamaModels">
                 <RefreshCw class="w-3 h-3" :class="{ 'animate-spin': loadingOllamaModels }" />
               </UiButton>
             </div>
@@ -168,7 +169,7 @@
           <Brain class="w-4 h-4" />
           Chat Models
         </h3>
-        <UiButton @click="refreshAllModels" :disabled="loadingModels" variant="ghost" size="sm">
+        <UiButton aria-label="Refresh models" title="Refresh models" @click="refreshAllModels" :disabled="loadingModels" variant="ghost" size="sm">
           <RefreshCw :class="['w-3 h-3', loadingModels && 'animate-spin']" />
         </UiButton>
       </div>
@@ -258,6 +259,7 @@
           </div>
           <UiSwitch
             :model-value="useEmbeddedOcr"
+            label="Embedded OCR"
             @update:model-value="saveUseEmbeddedOcr"
           />
         </div>

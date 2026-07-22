@@ -18,7 +18,9 @@ const props = withDefaults(defineProps<Props>(), {
   <TooltipProvider :delay-duration="props.delayDuration">
     <TooltipRoot>
       <TooltipTrigger as-child>
-        <slot />
+        <button type="button" class="tooltip-trigger-host">
+          <slot />
+        </button>
       </TooltipTrigger>
       <TooltipPortal>
         <TooltipContent
@@ -35,6 +37,12 @@ const props = withDefaults(defineProps<Props>(), {
 </template>
 
 <style scoped>
+.tooltip-trigger-host {
+  all: unset;
+  display: inline-flex;
+  cursor: inherit;
+}
+
 .tooltip-content {
   z-index: 50;
   overflow: hidden;

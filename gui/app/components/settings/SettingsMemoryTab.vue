@@ -50,7 +50,7 @@
               <div class="text-sm font-medium text-nanna-text">Enable Dreaming</div>
               <div class="text-xs text-nanna-text-dim">Memory consolidation</div>
             </div>
-            <UiSwitch :model-value="settings?.dreaming_enabled" @update:model-value="setDreamingEnabled" />
+            <UiSwitch :model-value="settings?.dreaming_enabled" label="Dreaming enabled" @update:model-value="setDreamingEnabled" />
           </div>
         </div>
 

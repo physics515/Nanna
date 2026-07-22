@@ -55,6 +55,9 @@
 
             <!-- Remove Button -->
             <button
+              type="button"
+              aria-label="Remove model from priority list"
+              title="Remove model"
               @click.stop="removeModel(index)"
               class="p-1 rounded hover:bg-nanna-error/20 text-nanna-text-dim hover:text-nanna-error transition-colors"
             >

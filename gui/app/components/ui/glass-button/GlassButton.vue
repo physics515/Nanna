@@ -1,4 +1,5 @@
 <script setup lang="ts">
+defineOptions({ inheritAttrs: false })
 import { useGroundGlass } from '~/composables/useGroundGlass'
 
 export type ButtonVariant = 'solid' | 'outline' | 'ghost' | 'text'
@@ -100,6 +101,7 @@ function onLeave() {
 <template>
   <NuxtLink
     v-if="props.to"
+    v-bind="$attrs"
     :to="props.to"
     :class="[
       'ui-btn',
@@ -131,6 +133,7 @@ function onLeave() {
   </NuxtLink>
   <button
     v-else
+    v-bind="$attrs"
     :type="props.type"
     :disabled="props.disabled || undefined"
     :class="[

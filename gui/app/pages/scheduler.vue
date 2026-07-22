@@ -10,7 +10,7 @@
           </p>
         </div>
         <div class="flex items-center gap-2">
-          <UiSwitch v-model="schedulerEnabled" @update:modelValue="toggleScheduler" />
+          <UiSwitch v-model="schedulerEnabled" label="Scheduler enabled" @update:modelValue="toggleScheduler" />
           <span class="text-sm text-nanna-text-muted">{{ schedulerEnabled ? 'Enabled' : 'Disabled' }}</span>
           <UiButton @click="openCreateModal" size="sm" :disabled="!schedulerEnabled">
             ➕ New Job
