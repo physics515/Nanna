@@ -552,8 +552,25 @@ impl AgentService {
             let agent = {
                 let mut context = nanna_agent::AgentContext::new(session_id.to_string());
 
-                // Configure context limits based on model capabilities
-                context.configure_for_model(&model_info);
+                // Configure context limits from model capabilities AND this
+                // agent's actual output budget — the reserve tracks
+                // max_tokens instead of the provider's max_output claim, so
+                // small-output agents keep most of the window for input.
+                // Claude interleaved thinking generates ON TOP of max_tokens;
+                // its budget joins the reserve (Ollama bounds thinking inside
+                // num_predict and needs no extra).
+                let thinking_reserve_tokens = if agent_config.model.starts_with("claude") {
+                    agent_config
+                        .thinking_mode
+                        .budget_tokens()
+                        .unwrap_or(0) as usize
+                } else {
+                    0
+                };
+                context.configure_for_model_with_output(
+                    &model_info,
+                    agent_config.max_tokens as usize + thinking_reserve_tokens,
+                );
 
                 // Set system prompt if provided
                 if let Some(ref prompt) = system_prompt {

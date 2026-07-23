@@ -114,21 +114,67 @@ impl ModelInfo {
         threshold
     }
 
-    /// Hard limit for input (leaves room for output).
+    /// Compression threshold paired with a concrete output reservation —
+    /// same 80%-of-context / 90%-of-hard-limit rule as
+    /// [`Self::compression_threshold`], but tracking
+    /// [`Self::hard_input_limit_for`] so proactive summarization still fires
+    /// before the (now larger) dynamic hard cap.
+    #[must_use]
+    pub fn compression_threshold_for(&self, output_reserve_tokens: usize) -> usize {
+        let by_context = (self.context_window * 80) / 100;
+        let below_hard = (self.hard_input_limit_for(output_reserve_tokens) * 90) / 100;
+        let threshold = by_context.min(below_hard);
+        debug_assert!(
+            threshold <= self.hard_input_limit_for(output_reserve_tokens),
+            "compression must trigger before the hard input cap"
+        );
+        threshold
+    }
+
+    /// Hard limit for input (leaves room for output), static variant.
     ///
-    /// The output reservation is capped at 25% of the window: agent-loop
-    /// completions are bounded by the per-request `max_tokens` (typically
-    /// ≤4k), while several providers — Ollama among them — report
-    /// `max_output_tokens >= context_window`. Subtracting that claim
-    /// verbatim halved a 32k local model to 16k of usable input (observed
-    /// live: the user's own prompt was emergency-truncated). The 50% floor
-    /// stays as the final guard so this can never return 0.
+    /// Reserves `min(max_output_tokens, context/4)` — several providers
+    /// (Ollama among them) report `max_output_tokens >= context_window`, and
+    /// subtracting that claim verbatim halved a 32k local model to 16k of
+    /// usable input (observed live: the user's own prompt was
+    /// emergency-truncated). Callers that know their per-request `max_tokens`
+    /// should prefer [`Self::hard_input_limit_for`] with
+    /// [`Self::effective_output_budget`] — the reserve then shrinks to what
+    /// the request can actually generate, freeing the rest for input.
     #[must_use]
     pub fn hard_input_limit(&self) -> usize {
-        let output_reserve = self.max_output_tokens.min(self.context_window / 4);
-        let raw = self.context_window.saturating_sub(output_reserve);
+        self.hard_input_limit_for(self.max_output_tokens.min(self.context_window / 4))
+    }
+
+    /// Hard input limit paired with a concrete output reservation.
+    ///
+    /// The reserve is capped at half the window (output must not starve
+    /// input) and the result is floored at half the window (a degenerate
+    /// reserve must not zero the input side) — so this never returns 0 and
+    /// `input + reserve` never exceeds `context_window`.
+    #[must_use]
+    pub fn hard_input_limit_for(&self, output_reserve_tokens: usize) -> usize {
+        // Windows below 2 tokens are out of contract (no provider reports
+        // one; the universal floor is 32k) — the pairing invariant needs
+        // ctx/2 to be nonzero.
+        debug_assert!(self.context_window >= 2, "context window must be >= 2");
+        let reserve = output_reserve_tokens.min(self.context_window / 2);
         let floor = self.context_window / 2;
-        raw.max(floor)
+        self.context_window.saturating_sub(reserve).max(floor)
+    }
+
+    /// The output-token budget a request should actually use: the caller's
+    /// `max_tokens`, bounded by the model's reported maximum and by half the
+    /// window. Pairing a request's `max_tokens` with
+    /// [`Self::hard_input_limit_for`] of this same value makes the split
+    /// dynamic — a 2k-output agent keeps ~94% of a 32k window for input —
+    /// while input + output provably never over-commit the window.
+    #[must_use]
+    pub fn effective_output_budget(&self, requested_max_tokens: usize) -> usize {
+        requested_max_tokens
+            .min(self.max_output_tokens)
+            .min(self.context_window / 2)
+            .max(1)
     }
 
     /// Output-token budget paired with [`Self::hard_input_limit`]: the slice
@@ -4451,6 +4497,27 @@ mod tests {
         // A modest, honest output claim is reserved in full.
         let honest = model_info(32_000, 4_096);
         assert_eq!(honest.hard_input_limit(), 32_000 - 4_096);
+    }
+
+    #[test]
+    fn dynamic_output_reserve_frees_input_for_small_budgets() {
+        // The reserve tracks the actual request budget, not the provider's
+        // max_output claim: a 2k-output agent on a 32k window keeps ~94%
+        // for input, and the pair never over-commits.
+        let m = model_info(32_000, 32_000);
+        assert_eq!(m.effective_output_budget(2_048), 2_048);
+        assert_eq!(m.hard_input_limit_for(2_048), 29_952);
+        // Degenerate request budgets are bounded by half the window.
+        assert_eq!(m.effective_output_budget(30_000), 16_000);
+        assert_eq!(m.hard_input_limit_for(16_000), 16_000);
+        for requested in [1_usize, 2_048, 8_192, 30_000, 64_000] {
+            let out = m.effective_output_budget(requested);
+            assert!(
+                m.hard_input_limit_for(out) + out <= 32_000,
+                "over-commit at requested={requested}"
+            );
+            assert!(m.compression_threshold_for(out) <= m.hard_input_limit_for(out));
+        }
     }
 
     #[test]

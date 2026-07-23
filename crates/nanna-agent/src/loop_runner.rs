@@ -968,7 +968,25 @@ impl Agent {
             .llm
             .get_model_info(&self.config.model, model_cache.as_ref())
             .await;
-        self.context.write().await.configure_for_model(&model_info);
+        // Reserve output room from the ACTUAL request budget, not the
+        // provider's max_output claim — a small-output agent keeps most of
+        // the window for input (the request clamp below pairs with this).
+        // Claude interleaved thinking generates ON TOP of max_tokens, so its
+        // budget joins the reserve; Ollama bounds thinking inside num_predict
+        // and needs no extra.
+        let thinking_reserve_tokens = if self.config.model.starts_with("claude") {
+            options
+                .thinking_mode
+                .unwrap_or(self.config.thinking_mode)
+                .budget_tokens()
+                .unwrap_or(0) as usize
+        } else {
+            0
+        };
+        self.context.write().await.configure_for_model_with_output(
+            &model_info,
+            self.config.max_tokens as usize + thinking_reserve_tokens,
+        );
 
         // Resolve effective max_iterations: run option > config > unlimited
         let max_iterations = options.max_iterations.or(self.config.max_iterations);
@@ -3095,14 +3113,15 @@ impl Agent {
         };
 
         let model_info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
-        let max_tokens = self
-            .config
-            .max_tokens
-            .min(u32::try_from(model_info.max_output_tokens).unwrap_or(u32::MAX))
-            // Never over-commit the window: input is bounded by
-            // hard_input_limit, output by the remainder — the sum can't
-            // exceed context_window.
-            .min(u32::try_from(model_info.output_token_budget()).unwrap_or(u32::MAX));
+        // Paired with configure_for_model_with_output at run start: the
+        // context's hard input limit reserved this budget (plus the Claude
+        // thinking budget), so input + output can't over-commit THIS model's
+        // window. Routed cheaper tiers with smaller windows remain the
+        // pre-existing escalate-on-reject path.
+        let max_tokens = u32::try_from(
+            model_info.effective_output_budget(self.config.max_tokens as usize),
+        )
+        .unwrap_or(u32::MAX);
 
         AnthropicRequest {
             model: self.config.model.clone(),
