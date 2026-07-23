@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.4",
+  version: "0.1.5",
   output: "context",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. Use force=true to override.",
   parameters: {
@@ -50,7 +50,7 @@ export default {
           var nl = detail.indexOf("\n");
           if (nl !== -1) detail = detail.substring(0, nl);
           if (detail.length > 160) detail = detail.substring(0, 160);
-          return "WRITE REFUSED — the content you sent for " + path + " is NOT valid Python (" + detail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text. Pass force=true only to write broken code on purpose.";
+          return detail;
         }
         return null;
       } catch (e) {
@@ -120,8 +120,27 @@ export default {
         return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite is always accepted). Pass force=true only if this genuinely is a new standalone file.");
       }
 
-      var syntaxRefusal = pythonSyntaxRefusal(filePath, fileContent);
-      if (syntaxRefusal) return fail(syntaxRefusal);
+      // Draft PARKING (round-8 lesson): refusing a broken whole-file write
+      // outright sends the model into a regeneration lottery — each retry
+      // regenerates everything and rolls new errors (observed live: 21
+      // refusals, every one a different line). Instead the rejected draft
+      // is SAVED to the buffer beside the target, where the model repairs
+      // the one named error with a small edit_file delta and commits.
+      var syntaxDetail = pythonSyntaxRefusal(filePath, fileContent);
+      if (syntaxDetail) {
+        var parkPath = filePath + ".__buffer__";
+        var parked = false;
+        try {
+          Nanna.writeFile(parkPath, fileContent);
+          parked = true;
+        } catch (ePark) {
+          // Fall through to the plain refusal below.
+        }
+        if (parked) {
+          return fail("WRITE PARKED — your content for " + filePath + " has a SYNTAX ERROR (" + syntaxDetail + "), so the file was NOT changed. Nothing was lost: the draft IS SAVED at " + parkPath + ". Fix ONLY that error with edit_file(file_path=\"" + parkPath + "\", old_string=<the broken text>, new_string=<the fix>), then run file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). Do NOT regenerate the whole file.");
+        }
+        return fail("WRITE REFUSED — the content you sent for " + filePath + " is NOT valid Python (" + syntaxDetail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text. Pass force=true only to write broken code on purpose.");
+      }
     }
 
     try {
