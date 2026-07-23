@@ -1658,6 +1658,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **unused dependency** (zero references anywhere in `gui/` outside `package.json`/lockfile —
            the editor's drag-drop is Tiptap's own). Bumping dead weight is noise; dropped it. `pnpm build`
            green after removal, confirming it was genuinely unreferenced.
+     - [ ] *(2026-07-23)* **`nuxt 4.4.8 → 4.5.0` is a build-layer major in a minor's clothing** — 4.5
+           moves the Vite builder to **Vite 8** (Rolldown internals), the Rspack builder to **Rspack 2 on
+           `@rsbuild/core`**, and switches Nuxt's own build to `tsdown` (plus unhead v3 / unctx v3). Treat
+           it as a migration item, not a sweep bump: needs a full `pnpm build` + `pnpm tauri dev` boot +
+           `cargo tauri build` + WebDriver pass. Also note **Nuxt 3 EOL 2026-07-31** (we are on 4.x, so
+           informational). Source: [Nuxt 4.5](https://nuxt.com/blog/v4-5).
+     - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
+           `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
+           and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
+           Nuxt/Vite type-check tooling depend on. Blocked on the toolchain catching up; re-check when 7.1
+           ships. Source: [Announcing TypeScript 7.0](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/).
+     - [ ] *(2026-07-23)* **`vuedraggable` `latest` dist-tag is a trap (same class as the lucide tombstone).**
+           `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
+           points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
+           it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
@@ -1668,6 +1683,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `nanna-gui`** builds green; scripting 19+1 / llm 28 / agent 61 tests pass; clippy clean on the
      bumped crates. Frontend: `tailwindcss`/`@tailwindcss/postcss 4.3.3`, `postcss 8.5.19`,
      `vue 3.5.40` applied green (`pnpm build` → nitro + client, 2.25 MB / 502 kB gzip).
+   - *(2026-07-23 sweep)* `cargo update` → 7 compatible bumps (`clap`/`clap_derive 4.6.4`,
+     `foreign-types-macros 0.2.4`, `glob 0.3.4`, `libc 0.2.189`, `syn 3.0.3`, `tokio-util 0.7.19`).
+     `cargo upgrade --incompatible` → **nothing to do**: all 71 non-local packages already sit at their
+     latest req, with only the intentional `turso`/`aegis` pins held back. Workspace (excl. `nanna-gui`)
+     builds green; **597 tests pass, 0 failures**; clippy 2341 warnings / **0 errors** (this run's
+     baseline). Frontend: `@tauri-apps/plugin-dialog 2.7.2`, `monaco-editor 0.56.0`,
+     `happy-dom 20.11.1`, `postcss 8.5.22` applied green (56/56 Vitest, `pnpm build` clean).
+     `nuxt 4.5.0` / `typescript 7.0` deferred with migration notes above.
+     **`monaco-editor 0.55 → 0.56` needed a real migration, not just a req bump:** 0.56 added an
+     `exports` map (`"./*": "./esm/vs/*.js"`), so the five deep worker specifiers in
+     `gui/app/plugins/monaco.client.ts` (`monaco-editor/esm/vs/...`) stopped resolving — they now
+     expand to `esm/vs/esm/vs/...` and `nuxt build` fails with *"Rollup failed to resolve import
+     …editor.worker?worker"*. Fixed by importing through the exports map
+     (`monaco-editor/editor/editor.worker?worker`, `monaco-editor/language/<lang>/<lang>.worker?worker`).
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
