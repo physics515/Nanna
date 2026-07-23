@@ -104,7 +104,7 @@ async fn versioned_copy_names_are_refused() {
         .await;
         assert!(err.contains("WRITE REFUSED"), "{name}: {err}");
         assert!(err.contains("versioned copy"), "{name}: {err}");
-        assert!(err.contains("force"), "{name}: {err}");
+        assert!(!err.contains("force"), "must not advertise force: {err}");
         assert!(!dir.path().join(name).exists(), "{name} must not be created");
     }
 

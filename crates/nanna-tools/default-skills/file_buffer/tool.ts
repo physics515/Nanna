@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.2",
+  version: "0.1.3",
   output: "context",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit.",
   parameters: {
@@ -9,7 +9,6 @@ export default {
       action: { type: "string", enum: ["append", "commit", "show", "clear"], description: "REQUIRED. append = add the next chunk to the pending buffer; commit = write the whole buffer to file_path and clear it; show = preview the pending buffer; clear = discard the pending buffer." },
       file_path: { type: "string", description: "REQUIRED. The REAL file being built. The pending buffer is kept beside it until commit." },
       content: { type: "string", description: "REQUIRED for append: the NEXT chunk of the file, continuing exactly where the buffer ended. A newline is inserted between chunks automatically if missing." },
-      force: { type: "boolean", description: "commit only: skip the Python syntax check and the shrink safety check." }
     },
     required: ["action", "file_path"]
   },
@@ -159,7 +158,7 @@ export default {
           // New file.
         }
         if (existingLen > 500 && buffered.length < existingLen * 0.3) {
-          return fail("COMMIT REFUSED — the buffer holds only " + buffered.length + " chars but " + filePath + " currently holds " + existingLen + ". The file is UNCHANGED and the buffer is KEPT — it looks incomplete. Keep appending the rest, or commit with force=true to intentionally replace the file with this smaller version.");
+          return fail("COMMIT REFUSED — the buffer holds only " + buffered.length + " chars but " + filePath + " currently holds " + existingLen + ". The file is UNCHANGED and the buffer is KEPT — it looks incomplete. Keep appending the rest of the file, then commit again.");
         }
       }
       try {
@@ -212,7 +211,7 @@ export default {
               steer = " The current draft has exactly one blocking error (" + clearDetail + ") — fixing that one line is faster than regenerating.";
             }
           }
-          return fail("CLEAR REFUSED — you already discarded one draft for " + filePath + "; discarding again is the regeneration loop." + steer + " Repair the draft: edit_file(file_path=\"" + bufPath + "\", old_string=<the broken line>, new_string=<the fix>), then file_buffer(action=\"commit\"). Pass force=true to discard anyway.");
+          return fail("CLEAR REFUSED — you already discarded one draft for " + filePath + "; discarding again is the regeneration loop." + steer + " Repair the draft: edit_file(file_path=\"" + bufPath + "\", old_string=<the broken line>, new_string=<the fix>), then file_buffer(action=\"commit\").");
         }
         try { Nanna.writeFile(clearMarker, "1"); } catch (eWk) { /* best effort */ }
       }
@@ -221,7 +220,7 @@ export default {
       } catch (eRm2) {
         try { Nanna.writeFile(bufPath, ""); } catch (eZ2) { /* best effort */ }
       }
-      return { content: "Buffer for " + filePath + " discarded. The real file was not touched. NOTE: the next discard for this file will require force=true — repair drafts instead of regenerating them.", success: true };
+      return { content: "Buffer for " + filePath + " discarded. The real file was not touched. NOTE: this file cannot be discarded again — repair the next draft instead of regenerating it.", success: true };
     }
 
     return fail("file_buffer failed: unknown action '" + action + "'. Use append (add the next chunk), commit (write the file), show (preview), or clear (discard). Nothing was changed.");
