@@ -757,9 +757,23 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       with 4 unit tests; verified by a real `nanna-daemon run` boot writing a prefixed file. Note:
       `tracing-appender` 0.2.5 supports only time-based rotation (no per-file size cap) — if size-bounding is
       wanted later, use a custom writer or the `clia/tracing-appender` fork.
-- [ ] Reach **0 clippy warnings** — 3 deferred items remain: refactor `handle_daemon_command`
+- [x] Reach **0 clippy warnings** — ~~3 deferred items remain: refactor `handle_daemon_command`
       (main.rs ~1442-1636, `too_many_lines`), move mid-function `use nanna_client::…` to top (main.rs ~1576,
-      `items_after_statements`), drop unused `async` on `is_daemon_running` (main.rs ~1694, `unused_async`).
+      `items_after_statements`), drop unused `async` on `is_daemon_running` (main.rs ~1694, `unused_async`).~~
+      *(2026-07-23)* **The `nanna` binary crate is now at 0 clippy warnings** (was 17). Two findings:
+      (1) all **three** deferred items were already gone — the P11 decomposition that split `main.rs` into
+      `src/commands/*` resolved them; verified by grepping the live clippy output for `too_many_lines` /
+      `items_after_statements` / `unused_async` under `src/`, which returns nothing. The roadmap was stale,
+      not the code. (2) What actually remained was 16 instances of `redundant_pub_crate` /
+      "pub(crate) module inside private module": `mod commands;` is private in a *binary* crate, so
+      `pub(crate)` inside it exports nothing extra and clippy asks for plain `pub`. Swept
+      `src/commands/*` + `src/setup.rs`, plus one `redundant reference in println!`. Nothing changed
+      visibility in practice — a binary's private module tree is unreachable from outside the crate either
+      way. Build green; `nanna mcp serve` re-verified live (2/2 protocol lines, 39 tools).
+      Remaining for the workspace-wide goal (this item only covers the `nanna` bin): the library crates
+      still carry ~2300 warnings, dominated by `missing # Errors` docs, `missing backticks`, and
+      `significant_drop_tightening` — a mechanical sweep, best done crate-by-crate before `-D warnings`
+      can be enforced in CI (P0.3).
 
 ### P7 — Rich Input & Editor ✅
 Tiptap editor with Monaco code blocks replacing the chat textarea: formatting, headings, lists,

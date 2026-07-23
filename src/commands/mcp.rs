@@ -30,7 +30,7 @@ use tracing::{info, warn};
 ///
 /// Returns an error if no tools directory can be resolved, or if the stdio loop
 /// fails to read or write.
-pub(crate) async fn serve(
+pub async fn serve(
     config: &Config,
     tools_dir_override: Option<PathBuf>,
 ) -> anyhow::Result<()> {
