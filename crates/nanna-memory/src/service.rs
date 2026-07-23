@@ -979,14 +979,17 @@ impl MemoryService {
                 continue;
             }
 
-            // Skip detailed level (no compression needed)
-            if compression_level == CompressionLevel::Detailed {
-                result.memories_processed += memories.len();
-                continue;
-            }
-
             // Phase (b): fold true duplicates deterministically FIRST, so the
             // summarizer is only ever paid for genuinely distinct content.
+            //
+            // This runs in EVERY band, including `Detailed`. Detailed is skipped
+            // for *compression* below because those are the highest-weight
+            // memories and paraphrasing your best-established facts is exactly
+            // what you do not want — but deduplication is **lossless** (guarded:
+            // a fold is committed only when no content is dropped), so there is
+            // no reason to let exact restatements of your most important facts
+            // accumulate forever. It also removes the most valuable memories
+            // from the drift-exposed path entirely.
             let deduped_before = result.memories_deduped;
             let memories = self
                 .fold_near_duplicates(memories, removal_budget, &mut result)
@@ -995,6 +998,12 @@ impl MemoryService {
             removal_budget = removal_budget.saturating_sub(folded_here);
             result.memories_processed += folded_here;
             if removal_budget == 0 {
+                continue;
+            }
+
+            // Detailed level is never summarized — deduped above, never paraphrased.
+            if compression_level == CompressionLevel::Detailed {
+                result.memories_processed += memories.len();
                 continue;
             }
 
@@ -1889,6 +1898,67 @@ mod tests {
         // …and inherits the union of the recall history, not just its own.
         assert!((survivor.fsrs.importance - 5.0).abs() < f32::EPSILON);
         assert_eq!(survivor.fsrs.access_count, 9);
+    }
+
+    /// The `Detailed` band (weight 0.8..=1.0 — the freshest, most important
+    /// memories) is never summarized, but it **is** deduplicated: exact
+    /// restatements of your best-established facts are precisely the ones worth
+    /// collapsing, and the fold is lossless so it cannot cost anything.
+    #[tokio::test]
+    async fn detailed_band_is_deduplicated_but_never_summarized() {
+        let service = dedup_service();
+
+        // Fresh + importance 1.0 => weight lands in the Detailed band.
+        for index in 0..4 {
+            let mut entry = dedup_entry(
+                &format!("hot{index}"),
+                "the deploy key lives in the vault",
+                vec![1.0, 0.0, 0.0],
+                None,
+            );
+            entry.fsrs.importance = 1.0;
+            entry.fsrs.stability = 100.0;
+            service.add_entry(entry).await.expect("seed");
+        }
+
+        // Sanity: these really are in Detailed, not a compressible band.
+        let bands = service.get_consolidation_bands().await;
+        assert_eq!(bands.detailed.len(), 4, "fixture must populate Detailed");
+
+        let summarizer_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&summarizer_calls);
+        let result = service
+            .consolidate(
+                &ConsolidationConfig {
+                    min_remaining_memories: 1,
+                    max_compression_ratio: 0.9,
+                    ..ConsolidationConfig::default()
+                },
+                move |_prompt| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(String::from("summary"))
+                    }
+                },
+            )
+            .await
+            .expect("consolidate");
+
+        assert!(
+            result.memories_deduped > 0,
+            "Detailed duplicates must still be folded: {result:?}"
+        );
+        assert_eq!(
+            result.clusters_formed, 0,
+            "Detailed must never be summarized: {result:?}"
+        );
+        assert_eq!(
+            summarizer_calls.load(Ordering::SeqCst),
+            0,
+            "no LLM call may be made for the Detailed band"
+        );
+        assert!(service.count().await < 4, "the band must have compressed");
     }
 
     #[tokio::test]

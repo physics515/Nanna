@@ -1117,9 +1117,32 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       Reinforce-band-only, never-cross-workspace, and degenerate embeddings (dimension mismatch / empty)
       match nothing rather than panicking). nanna-memory 75 tests green, full workspace suite green,
       clippy 2147 (−6 vs the 2153 origin baseline; zero warnings in the new code), zero new rustfmt
-      violations. **Remaining:** the `Detailed` (highest-weight) band still skips consolidation entirely,
-      so duplicates there are not folded — worth revisiting, since exact restatements of an *important*
-      fact are precisely the ones worth collapsing.
+      violations.
+      *(2026-07-23, same run)* **Extended to the `Detailed` band — dedup now runs in *every* band.** The
+      band loop skipped `Detailed` (FSRS weight 0.8–1.0: the freshest, most important memories) entirely
+      on the grounds that "no compression is needed" there. That reasoning is right for *summarization*
+      — paraphrasing your best-established facts is exactly what you don't want — but wrong for
+      *deduplication*, which is **lossless** by construction here (a fold is committed only when no
+      content is dropped). So exact restatements of your most important facts were accumulating forever,
+      and those memories were the ones with the most to lose. Phase (b) now runs before the `Detailed`
+      check; the band is deduplicated and still never summarized. This also removes the highest-value
+      memories from the drift-exposed path entirely (see the drift fixture below). 1 test asserting the
+      exact contract: Detailed duplicates fold, `clusters_formed == 0`, and the summarizer is invoked
+      **zero** times (counted with an `AtomicUsize`, not inferred). nanna-memory 78 tests green.
+- [ ] *(discovered 2026-07-23)* **STATED vs OBSERVED provenance is not actually recorded — the
+      `fact_type` metadata key is read but never written.** Chasing the drift mitigation "verbatim-pin
+      user-stated memories" turned up that the distinction the reference notes describe under extraction
+      ("importance 1–5, STATED vs OBSERVED") does not exist in the code: `fact_type` appears only in
+      `nanna-daemon/src/control/memory.rs`, twice, both times *reading* it with
+      `.unwrap_or("stated")` for display — so **every memory reports itself as user-stated regardless of
+      origin**, and `ExtractedMemory` (`loop_runner.rs`) carries only `content`/`category`/`tags` with no
+      provenance field at all. Consequences: the GUI's fact-type column is decorative; the survey's
+      "source attribution (user statement > agent inference)" precedence rule has nothing to run on; and
+      the drift mitigation that would pin user-stated memories verbatim is **blocked** until provenance
+      is genuinely captured. Fix = add a provenance field to `ExtractedMemory`, have the extraction
+      prompt classify it, persist it into memory metadata, and only then build the pin on top. Note the
+      safe default when it lands: **absent provenance must NOT be treated as "stated"** (absence of
+      evidence isn't evidence of a user statement) — the current display default has it backwards.
 - [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
       `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
       `importance`/`storage_strength` is NaN.
