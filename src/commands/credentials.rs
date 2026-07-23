@@ -243,7 +243,7 @@ fn clear_credentials() {
 }
 
 /// Handle credentials subcommands
-pub(crate) async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result<()> {
+pub async fn handle_credentials_command(action: CredentialsAction) -> anyhow::Result<()> {
     use nanna_config::ClaudeCredentialManager;
 
     let manager = ClaudeCredentialManager::new();

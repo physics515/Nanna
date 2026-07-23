@@ -1,13 +1,18 @@
-//! Daemon activity clock — the "is the system in use right now?" signal that
-//! gates the scheduled dream cycle.
+//! Activity clock — the "is the system in use right now?" signal that gates a
+//! dream cycle.
 //!
 //! Dreaming (memory consolidation) competes with the live agent for the
 //! summarizer model and rewrites the memory store mid-conversation, so it must
-//! only run during a genuine lull. The scheduler reads [`ActivityClock::idle`]
-//! and feeds it to the pure `dream_trigger` policy in `nanna-memory`; the
-//! control plane stamps [`ActivityClock::record`] on every chat/agent request
-//! (and nothing else — a status/log poll must **not** count as activity, or the
-//! gate would never open on a GUI that polls once a second).
+//! only run during a genuine lull. [`crate::DreamingService`] reads
+//! [`ActivityClock::idle`] and feeds it to the pure [`crate::dream_trigger`]
+//! policy; the embedder (the daemon's control plane) stamps
+//! [`ActivityClock::record`] on every chat/agent request — and nothing else, as
+//! a status/log poll must **not** count as activity, or the gate would never
+//! open on a GUI that polls once a second.
+//!
+//! This lives beside the dreaming code rather than in the daemon so that the
+//! service and its host share **one** clock instead of each keeping a private
+//! notion of "last activity" that can drift apart.
 //!
 //! The clock is monotonic (backed by [`Instant`], immune to wall-clock jumps)
 //! and lock-free on both the stamp and the read path: a single `AtomicU64`
@@ -46,10 +51,10 @@ impl ActivityClock {
     /// the past so `elapsed()` only grows).
     #[must_use]
     fn now_ms(&self) -> u64 {
-        // u128 → u64: the daemon would have to run ~584 million years for the
-        // millisecond count to overflow u64, so the cast is lossless in
-        // practice; `min` makes it total regardless.
-        self.base.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+        // `try_from` rather than `as`: the daemon would have to run ~584 million
+        // years for the millisecond count to exceed u64, but saturating on the
+        // impossible case keeps this total with no lossy cast at all.
+        u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Stamp "activity happened now". Call from the chat/agent chokepoint only.

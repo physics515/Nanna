@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 /// Ensure API key is configured, prompt if not.
-pub(crate) fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
+pub fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
     if !onboarding::has_api_key(&config) {
         onboarding::quick_setup(&mut config)?;
     }
@@ -23,7 +23,7 @@ pub(crate) fn ensure_api_key(mut config: Config) -> anyhow::Result<Config> {
 }
 
 /// Create the scheduler with a task executor that runs tasks through an agent.
-pub(crate) fn create_scheduler(
+pub fn create_scheduler(
     config: &Config,
     llm: Arc<LlmClient>,
     tools: Arc<ToolRegistry>,
@@ -138,7 +138,7 @@ pub(crate) fn create_scheduler(
 }
 
 /// Initialize common components
-pub(crate) async fn init_components(
+pub async fn init_components(
     config: &Config,
 ) -> anyhow::Result<(Arc<LlmClient>, Arc<ToolRegistry>, Arc<Storage>)> {
     // Get API key - default to Anthropic

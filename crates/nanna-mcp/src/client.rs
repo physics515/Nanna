@@ -22,6 +22,25 @@ use crate::schema_guard::validate_tool_schema;
 /// MCP protocol version
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Map a `resources/read` failure onto a typed error.
+///
+/// A missing resource arrives as a JSON-RPC error whose code depends on the
+/// server's spec revision — `-32002` before 2026-07-28, the standard `-32602`
+/// after it. Both mean the same thing to a caller, so both collapse to
+/// [`McpError::ResourceNotFound`]; every other failure passes through unchanged
+/// so a transport/protocol fault is never mistaken for a missing URI.
+fn resource_error_for(uri: &str, error: McpError) -> McpError {
+    match error {
+        McpError::JsonRpc { code, .. }
+            if crate::protocol::error_codes::is_resource_missing(code) =>
+        {
+            debug_assert!(!uri.is_empty(), "a resource read always carries a URI");
+            McpError::ResourceNotFound(uri.to_string())
+        }
+        other => other,
+    }
+}
+
 /// MCP client for connecting to tool servers
 pub struct McpClient<T: Transport> {
     transport: Arc<T>,
@@ -331,6 +350,7 @@ impl<T: Transport> McpClient<T> {
 
         self.request("resources/read", Some(serde_json::to_value(&params)?))
             .await
+            .map_err(|e| resource_error_for(uri, e))
     }
 
     // ========================================================================
@@ -675,5 +695,70 @@ mod tests {
         // The cache reflects the gated set too (not just the returned Vec).
         let cached = client.list_tools().await.unwrap();
         assert_eq!(cached.len(), 2, "cache must hold only the safe tools");
+    }
+
+    /// A transport that answers every request with a fixed JSON-RPC error code,
+    /// so a test can pin how `read_resource` classifies each spec revision.
+    struct ErrorCodeTransport(i32);
+
+    #[async_trait::async_trait]
+    impl Transport for ErrorCodeTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: None,
+                error: Some(crate::protocol::JsonRpcError {
+                    code: self.0,
+                    message: "nope".to_string(),
+                    data: None,
+                }),
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+        fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+            None
+        }
+    }
+
+    async fn read_missing(code: i32) -> McpError {
+        let client = McpClient::new(ErrorCodeTransport(code));
+        *client.initialized.write().await = true;
+        client
+            .read_resource("file:///gone.txt")
+            .await
+            .expect_err("an error response must surface as an error")
+    }
+
+    #[tokio::test]
+    async fn read_resource_maps_both_missing_codes_to_resource_not_found() {
+        // Legacy (-32002) and 2026-07-28 (-32602) must be indistinguishable to
+        // the caller, and the URI must be carried through.
+        for code in [
+            crate::protocol::error_codes::LEGACY_RESOURCE_NOT_FOUND,
+            crate::protocol::error_codes::INVALID_PARAMS,
+        ] {
+            match read_missing(code).await {
+                McpError::ResourceNotFound(uri) => {
+                    assert_eq!(uri, "file:///gone.txt", "code {code} must carry the URI");
+                }
+                other => panic!("code {code} should map to ResourceNotFound, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_resource_leaves_unrelated_errors_untouched() {
+        // Negative space: a real protocol fault must NOT be laundered into
+        // "resource not found" — that would hide a broken server as an empty read.
+        match read_missing(-32601).await {
+            McpError::JsonRpc { code, .. } => assert_eq!(code, -32601),
+            other => panic!("method-not-found must pass through, got {other:?}"),
+        }
     }
 }

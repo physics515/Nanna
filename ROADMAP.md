@@ -234,9 +234,14 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
 - [ ] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
 - [ ] Add per-OS installation docs.
-- [ ] Commit LICENSE file (MIT) — appears absent despite README reference.
+- [x] Commit LICENSE file (MIT) — appears absent despite README reference.
+      *(2026-07-23)* Added. Both `Cargo.toml` manifests already declared `license = "MIT"` and the
+      README claimed MIT, but the file itself was missing — so every published crate asserted a licence
+      with no text behind it. Copyright line reads `2026 physics515` (the repo owner); change it if you
+      want a legal name there.
 - [ ] Add CONTRIBUTING.md and CODE_OF_CONDUCT.md.
-- [ ] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
+- [x] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
+      *(2026-07-23)* Fixed in both the root package and `[workspace.package]`.
 - [ ] Add GitHub repo description and topics.
 - [ ] Unify port documentation (README says 5149; CLI defaults to 9999) — pick one, update both code and docs.
 
@@ -295,7 +300,9 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
 - [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
 - [~] ROADMAP explicitly lists open items: ~~disabled tools still execute~~ **(done 2026-07-20 — `ToolPolicy` gate, P6)**, ~~deleted tools remain callable until restart~~ **(done 2026-07-17 — `unregister` wiring)**, ~~delete_skill needs hardening against remove_dir_all/symlink races~~ **(done — symlink + canonical-escape guards in `commands/tools.rs`)**, stronger sandboxing needed *(open — OS-level sandbox under the policy layer; see research note below)*.
-- [ ] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
+- [x] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
+      *(2026-07-23)* Fixed together with the webhook receiver — see the "Bind local services to localhost
+      by default" item below.
 - [ ] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
 - [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
 - [ ] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
@@ -317,7 +324,25 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
       `ToolRegistry::unregister` wiring (see the P11 tool-manager-consistency note).
 - [ ] Harden delete_skill against remove_dir_all/symlink races.
-- [ ] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
+- [x] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
+      *(2026-07-23)* **Done.** Audit found three surfaces defaulting to `0.0.0.0` — the webhook receiver
+      (`WebhookConfig::default`), the legacy HTTP server (`ServerConfig::default`), and the `nanna server
+      --host` flag — i.e. an unauthenticated, LAN-visible control surface on any machine that joins a café
+      or hotel network. All three now default to `127.0.0.1`. (The **health server and IPC were already
+      loopback** — health inherits `ipc.host`, which defaults to `127.0.0.1` — so no change was needed
+      there; verified rather than assumed.)
+      Exposure is now an explicit act: set `host` yourself. New `nanna_config::bind` provides the single
+      `LOOPBACK_HOST` constant plus a pure `is_loopback_host(host)`, and **both servers log a `warn!` on a
+      non-loopback bind** so publishing is always visible in the log, not just in a config file someone
+      edited months ago. The predicate recognises the whole `127/8` block, `::1` bare **and bracketed**,
+      and case-insensitive `localhost`; anything unparseable or unfamiliar **fails safe to "public"** —
+      being wrong in the direction of an extra warning is the only acceptable direction here.
+      4 tests (the default constant satisfies its own predicate — so a stock install never warns about
+      itself; loopback spellings incl. `127.0.0.2`/`[::1]`/whitespace; wildcards `0.0.0.0` and `::` plus
+      routable addresses read as public; unparseable input fails safe).
+      **Note for tunnel users:** this is not a regression — cloudflared/ngrok/reverse proxies connect *to*
+      loopback. Only a setup relying on the old `0.0.0.0` default for direct inbound webhooks needs to set
+      `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
 - [ ] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
@@ -338,8 +363,43 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
 spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
 health checks). **Shipped**, except:
-- [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
-      not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
+- [~] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+      not exist and no MCP refs found under `nanna-server/src`.
+      *(2026-07-23)* **Located: the server lives at `crates/nanna-mcp/src/server.rs`** (532 lines —
+      `McpServer` with tool/resource/prompt registration, `handle_request` covering initialize/tools/
+      resources/prompts/ping, stdio transport, and a `ToolRegistry` bridge that exposes every Nanna tool).
+      The doc pointer was simply wrong, not the feature. But nothing *started* it — no daemon or CLI entry
+      point — so it was reachable only from Rust.
+      *(2026-07-23)* **Wired up: `nanna mcp serve` now exposes Nanna's tool surface over stdio JSON-RPC**,
+      the transport every MCP client speaks. It loads the filesystem JS/TS skills (`--tools-dir`, else
+      `[tools] tools_dir` / `NANNA_TOOLS_DIR` / the dev tree), applies the user's `[tools]`
+      enabled/disabled policy, and serves `McpServer::run_stdio`. The registry bridge
+      `_register_tools_from_registry` was dead code behind its underscore; it is now
+      `register_tools_from_registry` and actually called.
+      **stdout is the protocol** — a stdout-writing log layer corrupts the JSON-RPC stream and the client
+      drops the connection, so `main` installs a **stderr** writer for this command (and only this one, so
+      every other command keeps its console behaviour); the startup banner follows the same writer.
+      **Policy is enforced on both sides:** `definitions()` filters denied tools out of the advertised
+      list, and `execute()` re-checks *after* alias/fuzzy resolution — so a disabled tool is neither
+      offered nor invocable by a guessed name. To guarantee the CLI and the daemon read `[tools]`
+      identically, the daemon's private `build_tool_policy` moved into `nanna-tools` as
+      `ToolPolicy::from_config_lists(enabled, disabled)` (a second copy is a security bug waiting to
+      happen); the daemon fn is now a thin wrapper and its tests still pin the behaviour.
+      5 new policy tests (`enabled=["*"]` and empty/absent mean unrestricted; a real allowlist restricts;
+      deny beats allow when a name is on both lists; `disabled` applies under a wildcard).
+      **Verified against the real binary:** piping JSON-RPC into `nanna mcp serve` returned a valid
+      `initialize` result, a `tools/list` advertising all **39** skills (every one carrying an
+      `inputSchema`), and a `tools/call` of `list_dir` that really executed and returned directory
+      contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
+      Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
+      services, which this standalone path does not build — see the new item below.
+- [ ] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
+      `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
+      `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
+      (a) build the script services in the CLI path (needs storage + an embedding provider), or
+      (b) add a daemon IPC action so `mcp serve` proxies to the running daemon and inherits its live
+      store — (b) matches the "channels as control-plane clients" architecture and avoids a second
+      process owning `nanna.db`. Until then, document the standalone surface as filesystem/shell/web only.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
@@ -381,8 +441,37 @@ health checks). **Shipped**, except:
       then branch order, first-definition-of-a-name-wins; bounded by the finite, already-`schema_guard`-capped
       schema. Refactored into pure helpers (`collect_schema_object`/`property_to_parameter`) and fixed the old
       buggy required-lookup in passing. 5 tests (flat props+required, allOf hard-required, anyOf/oneOf optional,
-      first-wins dedup, empty/typeless→String). Remaining: points (1) `-32602` and (2) any-JSON
-      `structuredContent`, plus nested/conditional composition (`if`/`then`/`$defs`).
+      first-wins dedup, empty/typeless→String).
+      *(2026-07-23)* **Points (1) and (2) shipped — this item's RC migration is now complete.**
+      **(1) Error codes:** new `protocol::error_codes` module names the codes the client recognises —
+      `INVALID_PARAMS` (-32602), `LEGACY_RESOURCE_NOT_FOUND` (-32002), and the three MCP-reserved
+      "modern server" codes `HEADER_MISMATCH` (-32020) / `MISSING_REQUIRED_CLIENT_CAPABILITY` (-32021) /
+      `UNSUPPORTED_PROTOCOL_VERSION` (-32022) — plus a pure `const fn is_resource_missing(code)` that
+      accepts **both** revisions' spellings. `read_resource` now runs its failures through
+      `resource_error_for(uri, err)`, so a missing resource surfaces as the typed
+      `McpError::ResourceNotFound(uri)` whether the server is pre- or post-RC, while **every other code
+      passes through unchanged** (a `-32601`/transport fault must never be laundered into "not found",
+      which would read as an empty resource).
+      **(2) `structuredContent`:** added to `CallToolResult` as a bare `Option<serde_json::Value>` — the
+      RC allows *any* JSON value, so narrowing it to a map would drop conforming results. Threaded
+      through both directions: the client-side `McpToolWrapper` attaches it via `ToolResult::with_data`
+      on the success path (an errored call has no result to report), `McpToolResult` gained a
+      `structured` field, and the **server** side mirrors it — a registry tool's `ToolResult::data` is
+      emitted as `structuredContent`. Decision pinned by test: an explicit `null` collapses to absent
+      (a null payload carries no information; keeping them apart would only let an always-emitting
+      server attach `data: null` to every result). 8 new tests (any-JSON round-trip incl. array/string/
+      number/bool, absent-stays-absent on the wire, null-collapse, both-codes→ResourceNotFound carrying
+      the URI, unrelated-code passthrough, reserved-range bounds). 33/33 `nanna-mcp` tests green, zero
+      net new clippy warnings (44 lib / 42 lib-test, unchanged).
+      Remaining on the RC: nested/conditional composition (`if`/`then`/`$defs`) in `schema_to_parameters`,
+      and the client still advertises `PROTOCOL_VERSION = "2024-11-05"` — see the new item below.
+- [ ] *(2026-07-23)* **Bump `McpClient::PROTOCOL_VERSION` off `2024-11-05`.** The client still negotiates
+      the Nov-2024 revision, so a 2026-07-28 server may legitimately answer `-32022
+      UnsupportedProtocolVersion` (constant now defined) or fall back to legacy behaviour. Bumping it is a
+      capability commitment, not a string edit — it requires the Roots/Sampling/Logging deprecation
+      handling and the stateless/multi-round-trip + routable-header semantics of the RC. Do it as its own
+      increment once those land. Source:
+      [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
 - [ ] *(research 2026-07-21)* **Approved-server registry + signed/pinned tool definitions (defense-in-depth
       for tool-poisoning, OWASP MCP03 / CVE-2025-54136).** Tool *descriptions* enter the agent context as
       trusted text, so a poisoned description is prompt-injection with supply-chain reach — worst in
@@ -673,9 +762,23 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       with 4 unit tests; verified by a real `nanna-daemon run` boot writing a prefixed file. Note:
       `tracing-appender` 0.2.5 supports only time-based rotation (no per-file size cap) — if size-bounding is
       wanted later, use a custom writer or the `clia/tracing-appender` fork.
-- [ ] Reach **0 clippy warnings** — 3 deferred items remain: refactor `handle_daemon_command`
+- [x] Reach **0 clippy warnings** — ~~3 deferred items remain: refactor `handle_daemon_command`
       (main.rs ~1442-1636, `too_many_lines`), move mid-function `use nanna_client::…` to top (main.rs ~1576,
-      `items_after_statements`), drop unused `async` on `is_daemon_running` (main.rs ~1694, `unused_async`).
+      `items_after_statements`), drop unused `async` on `is_daemon_running` (main.rs ~1694, `unused_async`).~~
+      *(2026-07-23)* **The `nanna` binary crate is now at 0 clippy warnings** (was 17). Two findings:
+      (1) all **three** deferred items were already gone — the P11 decomposition that split `main.rs` into
+      `src/commands/*` resolved them; verified by grepping the live clippy output for `too_many_lines` /
+      `items_after_statements` / `unused_async` under `src/`, which returns nothing. The roadmap was stale,
+      not the code. (2) What actually remained was 16 instances of `redundant_pub_crate` /
+      "pub(crate) module inside private module": `mod commands;` is private in a *binary* crate, so
+      `pub(crate)` inside it exports nothing extra and clippy asks for plain `pub`. Swept
+      `src/commands/*` + `src/setup.rs`, plus one `redundant reference in println!`. Nothing changed
+      visibility in practice — a binary's private module tree is unreachable from outside the crate either
+      way. Build green; `nanna mcp serve` re-verified live (2/2 protocol lines, 39 tools).
+      Remaining for the workspace-wide goal (this item only covers the `nanna` bin): the library crates
+      still carry ~2300 warnings, dominated by `missing # Errors` docs, `missing backticks`, and
+      `significant_drop_tightening` — a mechanical sweep, best done crate-by-crate before `-D warnings`
+      can be enforced in CI (P0.3).
 
 ### P7 — Rich Input & Editor ✅
 Tiptap editor with Monaco code blocks replacing the chat textarea: formatting, headings, lists,
@@ -946,7 +1049,39 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       matching the "prefer pure-Rust, no-C where avoidable" doctrine and keeping stock-MSVC builds green.*
 
 **Best-in-class dreaming:**
-- [ ] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
+- [x] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
+      *(2026-07-23)* **Done — `DreamingService` is now the daemon's single dreaming orchestrator, and it is
+      no longer dead code.** The daemon built one `Arc<DreamingService>` at boot (over the live shared
+      store) and hands it to **both** consolidation paths: the scheduled cycle and the IPC
+      `MemoryAction::Consolidate` handler. That closes a real behavioural gap, not just a structural one —
+      both paths previously called `MemoryService::consolidate()` directly, i.e. they ran **only the
+      clustering phase** and silently skipped the cycle's first three: pending-feedback
+      promote/demote, the **testing-effect FSRS flush** (`apply_pending_updates`), and the
+      `min_memories_for_consolidation` floor. Those now run on every dream.
+      **One clock, not two.** `ActivityClock` moved from `nanna-daemon` to `nanna-memory` (beside the
+      dreaming code that reads it; the daemon re-exports it) and `DreamingService` gates on an injected
+      `Arc<ActivityClock>` instead of a private `RwLock<Instant>` — so the service reads *exactly* the
+      clock the control plane stamps on each chat, with no second bookkeeping call to drift. Side effect:
+      `record_activity`/`idle_duration` are now lock-free and non-`async`, so the hot request path never
+      takes a lock.
+      **Per-run consolidation config.** The cluster byte budget must be sized to the *summarizer model's*
+      context window, which only the router knows at fire time — so a long-lived service must not freeze
+      one at construction. Added `dream_with(&ConsolidationConfig, ..)` / `dream_if_idle_with(..)` as the
+      single implementations; the old `dream`/`dream_if_idle` delegate with the service's own config.
+      `dream_if_idle*` now returns `Option<DreamOutcome>` (trigger + stats) so a caller can log *why* a
+      cycle ran; a skip stays `Ok(None)`, so the type cannot represent "ran because it didn't".
+      The IPC path deliberately uses the **ungated** `dream_with` (the user asked for it, so the idle gate
+      must not veto) and falls back to the low-level call when no orchestrator is attached, so this can
+      never regress a minimal construction. The ~85-line inline scheduler block became a bounded
+      `run_scheduled_dream_cycle(..)`.
+      6 new tests (host-side clock opens/shuts the gate without `record_activity`; outcome reports
+      `MemoryPressure` vs `Idle`; per-run config overrides the construction-time one; daemon-side
+      same-`Arc` clock invariant) — the fixture bug they caught is worth noting: the old dim-3 test
+      embedder returned one vector for every text, so `remember` deduped everything into a single memory;
+      a `distinct_embed_fn` with pairwise-cosine ≤ 0 directions was needed to store them separately.
+      70 nanna-memory + 61 nanna-daemon tests green.
+      Still open (their own items): the multi-phase dream **body** (true merge / cluster-by-band / expand /
+      DSP timeline), and nothing yet calls `record_feedback`, so the feedback phase is wired but unfed.
 > **Dreaming model (do not drift from this):** memories **never expire**. A dream cycle = **semantically
 > rank "like" memories → concatenate them → summarize the concatenation into a single memory**
 > (`composite_cluster_score` → `MemoryCluster::concatenated_content()` → `create_consolidated_entry`).
@@ -1037,6 +1172,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      - [ ] *(research 2026-07-23)* **Three pure-Rust HNSW crates to choose between** (all no-C, matching the
+            dependency doctrine): **`hnswlib-rs`** decouples the graph from vector storage (`Hnsw<K, M>` owns the
+            graph + an external-key→`NodeId` map, you supply a `VectorStore`) and supports **concurrent search
+            *and* concurrent mutation** with lock-free reads — the best structural fit, since Nanna's vectors
+            already live in the in-RAM store after `bulk_load` and dreaming mutates while the agent searches;
+            **`hnsw_rs`** offers serde reload-of-graph-only and **filtered search** (predicate applied *during*
+            traversal, not as a post-filter) — directly relevant because our searches are **workspace-scoped**,
+            and post-filtering an ANN result set silently under-returns; **`instant-distance`** is the smallest
+            and most battle-tested (powers InstantDomainSearch) but is the least featureful. Decision inputs:
+            (a) does the crate let clustering reuse one index across a dream cycle, (b) is scope-filtering
+            in-traversal, (c) recall@k vs the current exact SIMD scan on the retention harness — gate the swap
+            on `nanna-memory::retention` holding `recall_retention`, since an ANN index trades exactness for
+            speed and that trade must be *measured*, not assumed. Sources:
+            [hnswlib-rs](https://crates.io/crates/hnswlib-rs), [hnsw_rs](https://crates.io/crates/hnsw_rs),
+            [instant-distance](https://crates.io/crates/instant-distance).
       - *(2026-07-12, partial)* Interim: the clusterer's per-pair `cosine_similarity` (called O(N²) times per
         band) now delegates to `nanna_simd::cosine_similarity_f32` (AVX-512/AVX2/NEON) — the same primitive the
         vector-search path already uses — instead of a private scalar loop, removing the duplication. Guards
@@ -1658,6 +1808,21 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
            **unused dependency** (zero references anywhere in `gui/` outside `package.json`/lockfile —
            the editor's drag-drop is Tiptap's own). Bumping dead weight is noise; dropped it. `pnpm build`
            green after removal, confirming it was genuinely unreferenced.
+     - [ ] *(2026-07-23)* **`nuxt 4.4.8 → 4.5.0` is a build-layer major in a minor's clothing** — 4.5
+           moves the Vite builder to **Vite 8** (Rolldown internals), the Rspack builder to **Rspack 2 on
+           `@rsbuild/core`**, and switches Nuxt's own build to `tsdown` (plus unhead v3 / unctx v3). Treat
+           it as a migration item, not a sweep bump: needs a full `pnpm build` + `pnpm tauri dev` boot +
+           `cargo tauri build` + WebDriver pass. Also note **Nuxt 3 EOL 2026-07-31** (we are on 4.x, so
+           informational). Source: [Nuxt 4.5](https://nuxt.com/blog/v4-5).
+     - [ ] *(2026-07-23)* **`typescript 5.9 → 7.0` (GA 2026-07-08, the Go-native `tsgo` port).** Breaking:
+           `--strict` on by default, `--target es5` / `--baseUrl` / `--moduleResolution node10` removed —
+           and critically **no stable programmatic compiler API until 7.1**, which `vue-tsc` and the
+           Nuxt/Vite type-check tooling depend on. Blocked on the toolchain catching up; re-check when 7.1
+           ships. Source: [Announcing TypeScript 7.0](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/).
+     - [ ] *(2026-07-23)* **`vuedraggable` `latest` dist-tag is a trap (same class as the lucide tombstone).**
+           `pnpm outdated` reports `4.1.0 → 2.24.3` — the v4 line is published under `next`, so `latest`
+           points at the *older* Vue-2 package. **Never let `pnpm update --latest` "upgrade" this one**;
+           it would silently downgrade to a Vue-2-only release. Keep the explicit `^4.1.0` req.
    - Pins now: `turso =0.6.1`, `aegis =0.9.12` (exact — pre-1.0), boa git rev `4f98f644` (until a
      crates.io boa ships icu 2.2). The old `wgpu` pin is dropped (see the wgpu 30 note above).
    - *(2026-07-16 sweep)* `cargo update` → 12 compatible bumps (`tokio 1.52.4`, `uuid 1.24.0`,
@@ -1668,6 +1833,20 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `nanna-gui`** builds green; scripting 19+1 / llm 28 / agent 61 tests pass; clippy clean on the
      bumped crates. Frontend: `tailwindcss`/`@tailwindcss/postcss 4.3.3`, `postcss 8.5.19`,
      `vue 3.5.40` applied green (`pnpm build` → nitro + client, 2.25 MB / 502 kB gzip).
+   - *(2026-07-23 sweep)* `cargo update` → 7 compatible bumps (`clap`/`clap_derive 4.6.4`,
+     `foreign-types-macros 0.2.4`, `glob 0.3.4`, `libc 0.2.189`, `syn 3.0.3`, `tokio-util 0.7.19`).
+     `cargo upgrade --incompatible` → **nothing to do**: all 71 non-local packages already sit at their
+     latest req, with only the intentional `turso`/`aegis` pins held back. Workspace (excl. `nanna-gui`)
+     builds green; **597 tests pass, 0 failures**; clippy 2341 warnings / **0 errors** (this run's
+     baseline). Frontend: `@tauri-apps/plugin-dialog 2.7.2`, `monaco-editor 0.56.0`,
+     `happy-dom 20.11.1`, `postcss 8.5.22` applied green (56/56 Vitest, `pnpm build` clean).
+     `nuxt 4.5.0` / `typescript 7.0` deferred with migration notes above.
+     **`monaco-editor 0.55 → 0.56` needed a real migration, not just a req bump:** 0.56 added an
+     `exports` map (`"./*": "./esm/vs/*.js"`), so the five deep worker specifiers in
+     `gui/app/plugins/monaco.client.ts` (`monaco-editor/esm/vs/...`) stopped resolving — they now
+     expand to `esm/vs/esm/vs/...` and `nuxt build` fails with *"Rollup failed to resolve import
+     …editor.worker?worker"*. Fixed by importing through the exports map
+     (`monaco-editor/editor/editor.worker?worker`, `monaco-editor/language/<lang>/<lang>.worker?worker`).
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
@@ -1679,9 +1858,16 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - [ ] Decide the line-ending policy: add a `.gitattributes` (`*.rs text eol=lf`) and land one
            tree-wide `cargo fmt` normalization commit, so future runs can use `fmt`/`fmt --check` normally.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
+   **Blocked here by design (checked 2026-07-23): `physics515/Mummu` is still an empty repo** — only
+   `.git`/`.claude`, no crates — so there is no runner surface for Nanna to consume. Items 3–5 stay
+   blocked until Mummu exposes one; runner code must NOT be written in this repo.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
-6. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
+6. **Unify + upgrade dreaming** (P13) — ~~one `DreamingService` orchestrator~~ **(done 2026-07-23 — the
+   daemon's scheduled cycle *and* the IPC `Consolidate` handler both dream through one shared
+   `DreamingService` over one shared `ActivityClock`; the feedback + testing-effect-flush phases the
+   daemon used to skip now run)**; ~~idle-gated~~ (done 2026-07-19); remaining: the multi-phase **body**
+   (true merge / cluster-by-band / expand), and a local `summarize_fn` (blocked on P12/Mummu).
 7. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
 8. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
 9. **End-to-end daemon test** (P8) — ~~the daemon/embedded/reconnect story is still unverified~~ **mostly

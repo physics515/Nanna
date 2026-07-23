@@ -88,7 +88,11 @@ pub struct WebhookConfig {
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            // Loopback by default: this receiver is unauthenticated apart from
+            // per-provider signature checks, so it must not be published to
+            // every interface unless the user asks. Front it with a tunnel or a
+            // reverse proxy, or set `host` explicitly to expose it.
+            host: nanna_config::LOOPBACK_HOST.to_string(),
             port: 3000,
             telegram_token: None,
             telegram_secret: None,
@@ -883,8 +887,21 @@ impl WebhookServer {
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         
-        info!("Webhook server listening on http://{}", addr);
-        
+        // A public bind must be visible in the log, every time. The default is
+        // loopback, so reaching this branch means someone set `host` on purpose
+        // — but "on purpose" and "understood the consequence" are not the same.
+        if nanna_config::is_loopback_host(&self.config.host) {
+            info!("Webhook server listening on http://{}", addr);
+        } else {
+            warn!(
+                "Webhook server listening on http://{addr} — this is reachable from \
+                 OTHER MACHINES. Only inbound requests carrying a valid provider \
+                 signature are accepted, but prefer binding to {} behind a tunnel \
+                 or reverse proxy.",
+                nanna_config::LOOPBACK_HOST
+            );
+        }
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, self.router()).await
     }

@@ -7,7 +7,7 @@ use nanna_server::{AppStateBuilder, ServerConfig, start_server};
 use tracing::{debug, info, warn};
 
 /// Run the HTTP server
-pub(crate) async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
+pub async fn run_server(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     let (llm, tools, storage) = init_components(config).await?;
 
     // Get API key for bot - default to Anthropic
@@ -125,7 +125,7 @@ pub(crate) async fn run_server(config: &Config, host: String, port: u16) -> anyh
 }
 
 /// Run the daemon server (background mode)
-pub(crate) async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
+pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Result<()> {
     use nanna_daemon::agent_service::AgentServiceConfig;
     use nanna_daemon::server::{EmbeddingConfig, LlmConfig};
     use nanna_daemon::{DaemonConfig, DaemonServer, IpcServerConfig, WebhookConfig};

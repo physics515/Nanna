@@ -82,7 +82,14 @@ pub struct ControlPlane {
     /// Shared activity clock, stamped on every chat/agent request so the
     /// scheduled dream cycle can tell whether the system is in active use.
     /// `None` in minimal test constructions that never dream.
-    activity: Option<Arc<crate::activity::ActivityClock>>,
+    activity: Option<Arc<nanna_memory::ActivityClock>>,
+    /// The single dreaming orchestrator, shared with the scheduler (P13
+    /// unification) so a user-triggered consolidation runs the **same**
+    /// multi-phase cycle the scheduled one does — and accumulates its pending
+    /// feedback in one place instead of two. `None` in minimal test
+    /// constructions and when memory is disabled; the handler then falls back to
+    /// the low-level `MemoryService::consolidate`.
+    dreaming: Option<Arc<nanna_memory::DreamingService>>,
 }
 
 impl ControlPlane {
@@ -112,6 +119,7 @@ impl ControlPlane {
             status_manager: None,
             task_runs: None,
             activity: None,
+            dreaming: None,
         }
     }
 
@@ -165,6 +173,7 @@ impl ControlPlane {
             status_manager: None,
             task_runs: None,
             activity: None,
+            dreaming: None,
         }
     }
 
@@ -217,6 +226,7 @@ impl ControlPlane {
             status_manager: None,
             task_runs: None,
             activity: None,
+            dreaming: None,
         }
     }
 
@@ -235,8 +245,16 @@ impl ControlPlane {
     /// Attach the shared activity clock the scheduled dream cycle reads to gate
     /// on idleness. The control plane stamps it on every chat request (see
     /// [`Self::handle`]); the scheduler reads its idle duration.
-    pub fn set_activity_clock(&mut self, clock: Arc<crate::activity::ActivityClock>) {
+    pub fn set_activity_clock(&mut self, clock: Arc<nanna_memory::ActivityClock>) {
         self.activity = Some(clock);
+    }
+
+    /// Attach the shared dreaming orchestrator so an IPC-triggered consolidation
+    /// runs the same multi-phase cycle the scheduler does. Must be the *same*
+    /// `Arc` the scheduler holds — a second instance would split the pending
+    /// feedback the cycle applies.
+    pub fn set_dreaming(&mut self, dreaming: Arc<nanna_memory::DreamingService>) {
+        self.dreaming = Some(dreaming);
     }
 
     /// Attach the long-horizon task run manager (P14).

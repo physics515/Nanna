@@ -47,7 +47,7 @@ async fn print_workspace_status() -> anyhow::Result<()> {
 }
 
 /// Handle workspace subcommands
-pub(crate) async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()> {
+pub async fn handle_workspace_command(action: WorkspaceAction) -> anyhow::Result<()> {
     use nanna_agent::nanna_workspace::{create_from_template, discover_workspace, list_templates};
 
     match action {

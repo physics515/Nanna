@@ -3,8 +3,8 @@
 //! Provides a bridge between MCP tool servers and the nanna-tools registry,
 //! allowing MCP tools to be used seamlessly in the agent loop.
 
-use crate::{McpClient, McpError, Tool as McpTool, ToolContent};
 use crate::transport::Transport;
+use crate::{McpClient, McpError, Tool as McpTool, ToolContent};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,6 +19,9 @@ pub struct McpToolResult {
     pub is_error: bool,
     /// Raw content blocks from MCP
     pub raw: Vec<ToolContent>,
+    /// The server's machine-readable payload, if it sent one. Any JSON value
+    /// (2026-07-28 lifted the object-only restriction), passed through verbatim.
+    pub structured: Option<serde_json::Value>,
 }
 
 // ============================================================================
@@ -29,7 +32,7 @@ pub struct McpToolResult {
 mod tools_impl {
     use super::*;
     use async_trait::async_trait;
-    use nanna_tools::{Tool, ToolDefinition, ToolError, ToolParameter, ToolResult, ParameterType};
+    use nanna_tools::{ParameterType, Tool, ToolDefinition, ToolError, ToolParameter, ToolResult};
     use serde_json::Value;
     use std::collections::HashSet;
 
@@ -62,7 +65,6 @@ mod tools_impl {
                 format!("{}:{}", self.prefix, self.tool.name)
             }
         }
-
     }
 
     /// Convert an MCP tool `input_schema` (JSON Schema 2020-12) into nanna-tools
@@ -90,8 +92,7 @@ mod tools_impl {
 
         // Composition branches, one level deep. `allOf` requireds are hard (every branch
         // must hold); `anyOf`/`oneOf` requireds are not, since only one branch applies.
-        for (keyword, requireds_are_hard) in [("allOf", true), ("anyOf", false), ("oneOf", false)]
-        {
+        for (keyword, requireds_are_hard) in [("allOf", true), ("anyOf", false), ("oneOf", false)] {
             if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
                 for branch in branches {
                     collect_schema_object(
@@ -136,8 +137,7 @@ mod tools_impl {
                 }
             }
         }
-        if requireds_are_hard
-            && let Some(names) = schema.get("required").and_then(Value::as_array)
+        if requireds_are_hard && let Some(names) = schema.get("required").and_then(Value::as_array)
         {
             for name in names.iter().filter_map(Value::as_str) {
                 required.insert(name.to_string());
@@ -153,17 +153,17 @@ mod tools_impl {
     /// Build a `ToolParameter` from a single JSON Schema property node. Unknown/absent
     /// `type` falls back to `String` (the safest wire type for an unconstrained value).
     fn property_to_parameter(name: String, prop: &Value, required: bool) -> ToolParameter {
-        let param_type = prop
-            .get("type")
-            .and_then(Value::as_str)
-            .map_or(ParameterType::String, |t| match t {
-                "integer" => ParameterType::Integer,
-                "number" => ParameterType::Number,
-                "boolean" => ParameterType::Boolean,
-                "array" => ParameterType::Array,
-                "object" => ParameterType::Object,
-                _ => ParameterType::String,
-            });
+        let param_type =
+            prop.get("type")
+                .and_then(Value::as_str)
+                .map_or(ParameterType::String, |t| match t {
+                    "integer" => ParameterType::Integer,
+                    "number" => ParameterType::Number,
+                    "boolean" => ParameterType::Boolean,
+                    "array" => ParameterType::Array,
+                    "object" => ParameterType::Object,
+                    _ => ParameterType::String,
+                });
 
         let description = prop
             .get("description")
@@ -201,10 +201,7 @@ mod tools_impl {
             }
         }
 
-        async fn execute(
-            &self,
-            params: HashMap<String, Value>,
-        ) -> Result<ToolResult, ToolError> {
+        async fn execute(&self, params: HashMap<String, Value>) -> Result<ToolResult, ToolError> {
             debug!(tool = %self.full_name(), "Executing MCP tool");
 
             // Convert HashMap to Value for MCP
@@ -230,23 +227,30 @@ mod tools_impl {
                     ToolContent::Image { data, mime_type } => {
                         Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
                     }
-                    ToolContent::Resource { resource } => {
-                        resource.text.clone().or_else(|| {
-                            resource
-                                .blob
-                                .as_ref()
-                                .map(|b| format!("[Blob: {} bytes]", b.len()))
-                        })
-                    }
+                    ToolContent::Resource { resource } => resource.text.clone().or_else(|| {
+                        resource
+                            .blob
+                            .as_ref()
+                            .map(|b| format!("[Blob: {} bytes]", b.len()))
+                    }),
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            if result.is_error {
-                Ok(ToolResult::error(content))
+            // A server's `structuredContent` is the machine-readable twin of the
+            // text blocks; surface it as the tool result's `data` so downstream
+            // consumers (agent loop, scripted tools) can use it without
+            // re-parsing prose. Attached on the success path only — an errored
+            // call's payload is not a result.
+            let tool_result = if result.is_error {
+                ToolResult::error(content)
             } else {
-                Ok(ToolResult::success(content))
-            }
+                match result.structured_content {
+                    Some(data) => ToolResult::success(content).with_data(data),
+                    None => ToolResult::success(content),
+                }
+            };
+            Ok(tool_result)
         }
 
         fn timeout_secs(&self) -> Option<u64> {
@@ -534,11 +538,12 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
                 ToolContent::Image { data, mime_type } => {
                     Some(format!("[Image: {mime_type}, {} bytes]", data.len()))
                 }
-                ToolContent::Resource { resource } => {
-                    resource.text.clone().or_else(|| {
-                        resource.blob.as_ref().map(|b| format!("[Blob: {} bytes]", b.len()))
-                    })
-                }
+                ToolContent::Resource { resource } => resource.text.clone().or_else(|| {
+                    resource
+                        .blob
+                        .as_ref()
+                        .map(|b| format!("[Blob: {} bytes]", b.len()))
+                }),
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -547,6 +552,7 @@ impl<T: Transport + 'static> McpToolAdapter<T> {
             content,
             is_error: result.is_error,
             raw: result.content,
+            structured: result.structured_content,
         })
     }
 }
