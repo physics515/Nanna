@@ -514,6 +514,23 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-22)* Follow-up hotfix after #58: seven page SFCs had composables spliced inside `interface`
       bodies (broke `nuxt generate` / `cargo tauri build`); restored script order + channels `loadError`
       on catch. Residual logged in BUG_BASH: local channels toast ref; legacy clawd/Nanna config-path copy.
+      *(2026-07-23)* **`/tool-stats` was crashing at render — fixed.** `loadError` is referenced five
+      times in the template's `PageState` block and assigned twice in `loadStats()`, but was **never
+      declared**, so the page threw `loadError is not defined` and `ErrorBoundary` swallowed the whole
+      panel ("Something went wrong"). A leftover from the 2026-07-22 script-order hotfix that reached the
+      other pages but not this one. Added `const loadError = ref<string | null>(null)` alongside the
+      other refs, matching `model-stats`/`memory`/`tools`. The `e2e/page-smoke.spec.ts` suite was already
+      catching this — 12/12 green after the fix.
+- [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
+      pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
+      the current branch it fails 1). Diagnosis from the trace: the step's locator
+      `getByRole('button', {name: /delete|confirm|yes/i})` is **ambiguous** — it matches both the context
+      menu's `Delete` item and the `ConfirmDialog`'s `Confirm` button, so after the menu detaches
+      Playwright re-resolves onto `Confirm` and then spins on
+      `confirm-overlay … intercepts pointer events` until the 60 s timeout. Fix is test-side: scope the
+      confirmation click to the dialog rather than the page, and wait for the overlay's transition to
+      settle. Deliberately **not** patched under time pressure in the run that found it — loosening an
+      assertion to get green is how a real regression gets hidden later.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
