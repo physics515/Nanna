@@ -217,9 +217,18 @@ impl AgentContext {
         let raw = if let Some(ref summary) = self.consolidated_summary {
             let mut messages = Vec::with_capacity(deduped_messages.len() + 2);
 
-            // Inject summary as first user message with clear framing
+            // Inject summary as first user message with clear framing. The
+            // framing must state what a summary is NOT: the model has been
+            // observed reading compressed context as evidence that work was
+            // lost or files corrupted, then restarting from scratch.
             let summary_message = format!(
-                "<previous_context>\nThe following is a summary of earlier conversation that has been compressed to save context space:\n\n{}\n</previous_context>",
+                "<previous_context>\nThe following is a COMPRESSED SUMMARY of earlier \
+                 conversation. WHY: the conversation grew longer than your context window \
+                 can hold, so older messages were condensed to make room to keep working. \
+                 Everything it describes already happened and SUCCEEDED unless it explicitly \
+                 says otherwise — no work was lost. It is lossy shorthand, not literal \
+                 messages: files on disk and recent tool results are the ground truth over \
+                 anything here.\n\n{}\n</previous_context>",
                 summary
             );
             messages.push(AnthropicMessage::user_text(summary_message));
@@ -1293,7 +1302,19 @@ impl AgentContext {
                 }) = msg.content.get_mut(block_idx)
                 {
                     let original_len = slot.len();
-                    *slot = compressed;
+                    // The summary MUST announce itself. Observed live: an
+                    // unmarked compressed result reads as garbled/corrupt
+                    // data — the model concluded its files were damaged and
+                    // rewrote them from the artifacts. A summary that names
+                    // itself is context savings; one that doesn't is a
+                    // hallucination seed.
+                    *slot = format!(
+                        "[COMPRESSED SUMMARY of an older tool result ({original_len} chars \
+                         original). WHY: your context window is limited, and this older \
+                         result was shortened to make room for current work — the tool call \
+                         itself SUCCEEDED in full. The wording below is lossy shorthand, NOT \
+                         the literal output; trust files on disk over this.]\n{compressed}"
+                    );
                     compressed_count += 1;
                     debug!(
                         msg_idx,
