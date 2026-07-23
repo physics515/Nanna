@@ -7,11 +7,13 @@
 
 mod migrations;
 mod models;
+mod recovery;
 mod repositories;
 pub mod task_filter;
 mod tasks;
 
 pub use models::*;
+pub use recovery::*;
 pub use repositories::*;
 pub use tasks::*;
 

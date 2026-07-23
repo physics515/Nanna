@@ -747,6 +747,9 @@ pub struct DaemonServer {
     log_buffer: Option<crate::log_buffer::LogBuffer>,
     /// Shared storage for model stats persistence
     storage: Option<Arc<nanna_storage::Storage>>,
+    /// Set when storage init quarantined + rebuilt a corrupt database file;
+    /// surfaced on /status and broadcast as `Event::MemoryStoreRebuilt`.
+    memory_recovery: Option<Arc<nanna_storage::RecoveryReport>>,
 }
 
 impl DaemonServer {
@@ -805,7 +808,13 @@ impl DaemonServer {
             pid_file,
             log_buffer: None,
             storage: None,
+            memory_recovery: None,
         }
+    }
+
+    /// Recovery report from a startup quarantine + rebuild, if one happened.
+    pub fn memory_recovery(&self) -> Option<Arc<nanna_storage::RecoveryReport>> {
+        self.memory_recovery.clone()
     }
 
     /// Set the storage backend for model stats persistence and session persistence.
@@ -1256,7 +1265,8 @@ impl DaemonServer {
         .with_event_tx(self.ipc.event_sender())
         .with_workspace_id(workspace_id_for_services)
         .with_scheduler(scheduler)
-        .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()));
+        .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
+        .with_memory_recovery(self.memory_recovery.clone());
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
         }
@@ -1377,6 +1387,19 @@ impl DaemonServer {
             }
         });
 
+        // Announce a startup quarantine + rebuild to subscribed clients. Boot
+        // usually precedes any subscriber, so /status (health server + control
+        // plane) carries the same facts for late-connecting clients.
+        if let Some(ref report) = self.memory_recovery {
+            self.ipc
+                .broadcast_event(crate::protocol::Event::MemoryStoreRebuilt {
+                    recovered: report.memories_recovered,
+                    expected: report.memories_expected,
+                    quarantine_path: report.quarantine_path.to_string_lossy().to_string(),
+                })
+                .await;
+        }
+
         // Spawn health HTTP server if enabled
         let _health_state = if self.config.enable_health_server {
             // Seed durable-memory-store health (load already ran in init_services),
@@ -1387,11 +1410,15 @@ impl DaemonServer {
             } else {
                 (false, 0)
             };
-            let state = HealthState::new(
+            let mut state = HealthState::new(
                 memory.is_some(),
                 true, // agent is available
             )
             .with_memory_health(mem_degraded, mem_corrupt);
+            if let Some(ref report) = self.memory_recovery {
+                state = state
+                    .with_memory_rebuild(report.memories_recovered, report.memories_expected);
+            }
             let health_state = Arc::new(state);
 
             // Update session count
@@ -2652,14 +2679,27 @@ impl DaemonBuilder {
         );
         server.log_buffer = self.log_buffer;
 
-        // Initialize Turso storage for model stats persistence
+        // Initialize Turso storage. The recovering open verifies the memories
+        // table is readable; on page-level corruption it quarantines the
+        // damaged file, rebuilds a fresh store at the same path, and salvages
+        // every reachable row — so the daemon boots with a working store
+        // instead of a silently empty one.
         let db_path = server.config.data_dir.join("nanna.db");
         let storage_config = nanna_storage::StorageConfig {
             path: db_path.to_string_lossy().to_string(),
         };
-        match nanna_storage::Storage::new(&storage_config).await {
-            Ok(storage) => {
+        match nanna_storage::open_with_recovery(&storage_config).await {
+            Ok((storage, recovery)) => {
                 info!("Storage initialized at {:?}", db_path);
+                if let Some(report) = recovery {
+                    warn!(
+                        "Memory store was REBUILT after corruption: {} memories recovered \
+                         (corrupt copy: {})",
+                        report.memories_recovered,
+                        report.quarantine_path.display()
+                    );
+                    server.memory_recovery = Some(Arc::new(report));
+                }
                 server.set_storage(Arc::new(storage));
             }
             Err(e) => {

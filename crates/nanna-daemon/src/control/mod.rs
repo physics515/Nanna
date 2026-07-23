@@ -89,6 +89,10 @@ pub struct ControlPlane {
     /// constructions and when memory is disabled; the handler then falls back to
     /// the low-level `MemoryService::consolidate`.
     dreaming: Option<Arc<nanna_memory::DreamingService>>,
+    /// Set when the durable memory store was quarantined + rebuilt after
+    /// page-level corruption at startup, so `SystemAction::Status` keeps
+    /// reporting the rebuild to clients that connected after the boot event.
+    memory_recovery: Option<Arc<nanna_storage::RecoveryReport>>,
 }
 
 impl ControlPlane {
@@ -119,6 +123,7 @@ impl ControlPlane {
             task_runs: None,
             activity: None,
             dreaming: None,
+            memory_recovery: None,
         }
     }
 
@@ -173,6 +178,7 @@ impl ControlPlane {
             task_runs: None,
             activity: None,
             dreaming: None,
+            memory_recovery: None,
         }
     }
 
@@ -226,6 +232,7 @@ impl ControlPlane {
             task_runs: None,
             activity: None,
             dreaming: None,
+            memory_recovery: None,
         }
     }
 
@@ -263,6 +270,16 @@ impl ControlPlane {
     /// Attach the long-horizon task run manager (P14).
     pub fn with_task_runs(mut self, task_runs: Arc<crate::tasks::TaskRunManager>) -> Self {
         self.task_runs = Some(task_runs);
+        self
+    }
+
+    /// Record that the memory store was rebuilt after corruption at startup,
+    /// so `SystemAction::Status` surfaces it for the daemon's lifetime.
+    pub fn with_memory_recovery(
+        mut self,
+        report: Option<Arc<nanna_storage::RecoveryReport>>,
+    ) -> Self {
+        self.memory_recovery = report;
         self
     }
 

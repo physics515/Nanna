@@ -38,6 +38,16 @@ impl ControlPlane {
                     (false, 0)
                 };
 
+                // Startup quarantine + rebuild (page-level corruption): keep it
+                // on /status for the daemon's lifetime — clients that connect
+                // after boot never saw the MemoryStoreRebuilt event.
+                let (memory_rebuilt, memory_recovered_rows, memory_expected_rows) = self
+                    .memory_recovery
+                    .as_ref()
+                    .map_or((false, 0, None), |r| {
+                        (true, r.memories_recovered, r.memories_expected)
+                    });
+
                 json!({
                     "status": "running",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -48,6 +58,9 @@ impl ControlPlane {
                     "memory_available": self.memory.is_some(),
                     "memory_degraded": memory_degraded,
                     "memory_corrupt_rows": memory_corrupt_rows,
+                    "memory_rebuilt": memory_rebuilt,
+                    "memory_recovered_rows": memory_recovered_rows,
+                    "memory_expected_rows": memory_expected_rows,
                     "memory_stats": memory_stats,
                     "tools_available": self.tools.is_some(),
                     "tool_count": tool_count,
