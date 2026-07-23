@@ -18,6 +18,7 @@
 pub mod agent_service;
 pub mod channels;
 pub mod control;
+pub mod dream_summarizer;
 pub mod embedding_router;
 pub mod health;
 pub mod ipc;

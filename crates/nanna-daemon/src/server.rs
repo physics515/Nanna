@@ -21,7 +21,6 @@ use nanna_channels::{
     Sender as ChannelSender, TelegramChannel,
 };
 use nanna_config::credentials::{self, SecureStore};
-use nanna_llm::RequestBuilder;
 use nanna_memory::MemoryService;
 use nanna_scripting::ServiceFn;
 use nanna_tools::{AgentSpawner, ParentChannel, SpawnResult, ToolPolicy, ToolRegistry};
@@ -730,91 +729,6 @@ fn scheduled_consolidation_config(
     .with_summarizer_context_window(summarizer_context_window_tokens)
 }
 
-/// Run the scheduled dream cycle through the [`DreamingService`] orchestrator
-/// and render the outcome as the scheduler's `(success, output, error)` triple.
-///
-/// The service owns the idle/memory-pressure gate (reading the very
-/// `ActivityClock` the control plane stamps) and the multi-phase body; this
-/// function's only jobs are to size the consolidation budget to the summarizer
-/// model's real context window — which is knowable *only* at fire time, since it
-/// comes from the router — and to translate the result into a task record.
-///
-/// [`DreamingService`]: nanna_memory::DreamingService
-async fn run_scheduled_dream_cycle(
-    dreaming: &nanna_memory::DreamingService,
-    router: &Arc<crate::llm_router::LlmRouter>,
-    summarization_model: &str,
-    max_compression_ratio: f32,
-    min_remaining_memories: usize,
-) -> (bool, Option<String>, Option<String>) {
-    let summarizer_info = router.get_model_info(summarization_model).await;
-    let consolidation_config = scheduled_consolidation_config(
-        max_compression_ratio,
-        min_remaining_memories,
-        summarizer_info.hard_input_limit(),
-    );
-    debug_assert!(
-        consolidation_config.max_cluster_content_bytes > 0,
-        "a dream cycle must always get a positive cluster byte budget"
-    );
-
-    let summarize = |prompt: String| {
-        let router = Arc::clone(router);
-        let model = summarization_model.to_string();
-        async move {
-            let request = nanna_llm::CompletionRequest::default()
-                .with_message(nanna_llm::Message::user(&prompt));
-            router
-                .complete(&model, request)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    };
-
-    match dreaming
-        .dream_if_idle_with(&consolidation_config, summarize)
-        .await
-    {
-        Ok(None) => {
-            let idle_secs = dreaming.idle_duration().as_secs();
-            debug!("Skipping scheduled consolidation: system active (idle {idle_secs}s)");
-            (
-                true,
-                Some(format!("Skipped (active; idle {idle_secs}s)")),
-                None,
-            )
-        }
-        Ok(Some(outcome)) => {
-            let consolidation = &outcome.stats.consolidation;
-            info!(
-                "Scheduled dream cycle ({:?}): {} processed, {} merged, {} expanded, \
-                 {} promoted, {} demoted, {} memories remain",
-                outcome.trigger,
-                consolidation.memories_processed,
-                consolidation.memories_merged,
-                consolidation.memories_expanded,
-                outcome.stats.auto_promoted,
-                outcome.stats.auto_demoted,
-                outcome.stats.total_memories,
-            );
-            (
-                true,
-                Some(format!(
-                    "{:?}: processed {} memories, merged {}, {} remain",
-                    outcome.trigger,
-                    consolidation.memories_processed,
-                    consolidation.memories_merged,
-                    outcome.stats.total_memories,
-                )),
-                None,
-            )
-        }
-        Err(e) => {
-            error!("Scheduled dream cycle failed: {e}");
-            (false, None, Some(e.to_string()))
-        }
-    }
-}
 
 /// The main daemon server
 pub struct DaemonServer {
@@ -1082,6 +996,14 @@ impl DaemonServer {
             )
         });
 
+        // Dreaming must observe the very store the agent writes to, never a
+        // private copy — that identity is the whole point of the shared seam.
+        debug_assert_eq!(
+            dreaming.is_some(),
+            memory.is_some(),
+            "dreaming service must exist exactly when the memory store does"
+        );
+
         // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
         // is the cron runner (the GUI scheduler only runs in embedded mode).
         // Loads persisted jobs and runs heartbeat + memory consolidation,
@@ -1140,58 +1062,119 @@ impl DaemonServer {
             }
 
             let agent_for_tasks = agent.clone();
+            let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
             let storage_for_tasks = self.storage.clone();
             // Capture the user's memory-compression settings for the scheduled
             // dream cycle (Copy scalars, moved into the executor closure).
             let consolidation_max_ratio = self.config.memory_max_compression_ratio;
             let consolidation_min_remaining = self.config.memory_min_remaining_memories;
-            // The scheduled cycle dreams *through* the shared orchestrator built
-            // above rather than calling the low-level
-            // `MemoryService::consolidate()` directly, so the daemon gets the
-            // full multi-phase cycle (pending-feedback application, the
-            // testing-effect FSRS flush, the min-memories floor) instead of only
-            // its last phase.
-            let dreaming_for_tasks = dreaming.clone();
-            // The clock is still needed directly here: an autonomous agent run
-            // (heartbeat / cron) stamps activity even when memory — and therefore
-            // the dreaming service — is disabled.
-            let activity_for_tasks = Arc::clone(&activity_clock);
-            let summarization_model = self
-                .config
-                .agent
-                .summarization_priority
-                .first()
-                .cloned()
-                .unwrap_or_else(|| self.config.agent.model.clone());
+            // Idle threshold is captured for the skip log only — the gate
+            // *decision* now lives in the DreamingService (built above with
+            // both thresholds), so there is no second copy of the policy here.
+            let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
+            let activity_for_tasks = activity_clock.clone();
+            // The user's full summarization priority list, not just its head:
+            // the scheduled dream cycle now fails over exactly like the IPC one,
+            // so a single unavailable model no longer kills the nightly cycle.
+            let summarization_models = crate::dream_summarizer::summarization_models(
+                &self.config.agent.summarization_priority,
+                std::slice::from_ref(&self.config.agent.model),
+            );
             let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
                 let agent = agent_for_tasks.clone();
                 let dreaming = dreaming_for_tasks.clone();
-                let activity = activity_for_tasks.clone();
                 let router = router_for_tasks.clone();
                 let storage = storage_for_tasks.clone();
-                let summarization_model = summarization_model.clone();
+                let activity = activity_for_tasks.clone();
+                let summarization_models = summarization_models.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
                     let (success, output, error) = match task.name.as_str() {
-                        "memory_consolidation" => match dreaming {
-                            Some(ref dreaming) => {
-                                run_scheduled_dream_cycle(
-                                    dreaming,
-                                    &router,
-                                    &summarization_model,
+                        "memory_consolidation" => {
+                            if let Some(ref dreaming) = dreaming {
+                                // The idle gate AND the full dream cycle (feedback
+                                // flush -> FSRS testing-effect flush -> consolidate)
+                                // both live in the one `DreamingService`. The daemon
+                                // supplies only what it owns: its lock-free activity
+                                // clock and a consolidation budget sized to *its*
+                                // summarizer model. Dreaming competes with the live
+                                // agent for that model and rewrites the store, so it
+                                // still only runs during a lull (or under pressure).
+                                let idle = activity.idle();
+                                // Size the budget to the SMALLEST window across
+                                // the failover list: one prompt is built and
+                                // then offered to each candidate in turn, so a
+                                // budget fitted to the first model would
+                                // overflow a smaller fallback.
+                                let window_tokens =
+                                    crate::dream_summarizer::summarizer_context_window_tokens(
+                                        &router,
+                                        &summarization_models,
+                                    )
+                                    .await;
+                                let consolidation_config = scheduled_consolidation_config(
                                     consolidation_max_ratio,
                                     consolidation_min_remaining,
+                                    window_tokens,
+                                );
+                                let summarize = crate::dream_summarizer::summarize_with_failover(
+                                    router.clone(),
+                                    summarization_models.clone(),
+                                );
+                                match dreaming
+                                    .dream_if_triggered(idle, &consolidation_config, summarize)
+                                    .await
+                                {
+                                    Ok(None) => {
+                                        let memory_count = dreaming.memory().count().await;
+                                        debug!(
+                                            "Skipping scheduled consolidation: system active \
+                                             (idle {idle:?} < {dream_idle_threshold_secs}s, \
+                                             {memory_count} memories)"
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Skipped (active; idle {}s, {memory_count} memories)",
+                                                idle.as_secs()
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Ok(Some((trigger, stats))) => {
+                                        info!(
+                                            "Scheduled dream ({trigger:?}): {} processed, \
+                                             {} merged, {} deduped, {} promoted, {} demoted",
+                                            stats.consolidation.memories_processed,
+                                            stats.consolidation.memories_merged,
+                                            stats.consolidation.memories_deduped,
+                                            stats.auto_promoted,
+                                            stats.auto_demoted,
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Processed {} memories",
+                                                stats.consolidation.memories_processed
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("Scheduled consolidation failed: {e}");
+                                        (false, None, Some(e.to_string()))
+                                    }
+                                }
+                            } else {
+                                (
+                                    true,
+                                    Some("Skipped (memory service unavailable)".to_string()),
+                                    None,
                                 )
-                                .await
                             }
-                            None => (
-                                true,
-                                Some("Skipped (memory service unavailable)".to_string()),
-                                None,
-                            ),
-                        },
+                        }
                         "task_recurrence_sweep" => {
                             if let Some(ref storage) = storage {
                                 let reopened = crate::tasks::sweep_recurrences(storage).await;

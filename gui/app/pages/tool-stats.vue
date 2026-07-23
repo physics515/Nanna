@@ -519,6 +519,10 @@ const global = ref<GlobalStats>({
 const hourlyBuckets = ref<TimeBucket[]>([])
 const dailyBuckets = ref<TimeBucket[]>([])
 const isLoading = ref(false)
+// Referenced by the PageState block in the template and assigned in loadStats();
+// it was never declared, so rendering this page threw "loadError is not defined"
+// and the ErrorBoundary swallowed the whole panel.
+const loadError = ref<string | null>(null)
 const sortField = ref<string>('call_count')
 const sortAsc = ref(false)
 const searchQuery = ref('')

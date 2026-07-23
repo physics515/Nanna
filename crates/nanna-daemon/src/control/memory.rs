@@ -161,6 +161,18 @@ impl ControlPlane {
                 })
             }
             MemoryAction::Consolidate => {
+                // Route through the daemon's single dreaming orchestrator so a
+                // manual consolidation runs the *same* body as the scheduled
+                // one: apply tallied feedback, flush the pending FSRS
+                // testing-effect queue that every `recall` fills, then
+                // consolidate. Calling `MemoryService::consolidate` directly
+                // (the old shape) skipped both and left that queue to grow for
+                // the daemon's whole uptime.
+                //
+                // Falls back to the low-level `MemoryService::consolidate` when
+                // memory is on but no orchestrator is attached (minimal
+                // constructions), so a manual consolidation can never regress.
+
                 // Trigger memory consolidation (requires LLM for summarization)
                 let Some(ref router) = self.router else {
                     return json!({ "error": "llm_unavailable", "message": "LLM router required for consolidation" });
@@ -168,13 +180,14 @@ impl ControlPlane {
 
                 let router_for_summarize = router.clone();
 
-                // Use the summarization model priority from settings
+                // Summarization models from settings, falling back to the main
+                // model priority. Shared with the scheduled dream cycle so the
+                // two paths cannot drift (see `crate::dream_summarizer`).
                 let cfg = self.config.read().await;
-                let mut summarize_models = cfg.llm.summarization_priority.clone();
-                // Fall back to main model priority if no summarization models configured
-                if summarize_models.is_empty() {
-                    summarize_models = cfg.llm.model_priority.clone();
-                }
+                let summarize_models = crate::dream_summarizer::summarization_models(
+                    &cfg.llm.summarization_priority,
+                    &cfg.llm.model_priority,
+                );
                 let max_compression_ratio = cfg.memory.max_compression_ratio;
                 let min_remaining_memories = cfg.memory.min_remaining_memories;
                 drop(cfg);
@@ -183,61 +196,68 @@ impl ControlPlane {
                     return json!({ "error": "no_models", "message": "No summarization or main models configured." });
                 }
 
-                // Resolve the actual summarizer before deriving consolidation limits.
-                let summarizer_info = router.get_model_info(&summarize_models[0]).await;
+                // Size the budget to the SMALLEST window across the failover
+                // list — one prompt is offered to each candidate in turn, so a
+                // budget fitted to the first would overflow a smaller fallback.
+                let window_tokens = crate::dream_summarizer::summarizer_context_window_tokens(
+                    router,
+                    &summarize_models,
+                )
+                .await;
                 let config = ConsolidationConfig {
                     max_compression_ratio,
                     min_remaining_memories,
                     ..ConsolidationConfig::default()
                 }
-                .with_summarizer_context_window(summarizer_info.hard_input_limit());
+                .with_summarizer_context_window(window_tokens);
 
                 info!("Consolidation summarization priority: {:?}", summarize_models);
 
-                let summarize = move |prompt: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
-                    let router = router_for_summarize.clone();
-                    let models = summarize_models.clone();
-                    Box::pin(async move {
-                        let mut last_err = String::from("No summarization models configured");
-                        for model in &models {
-                            let request = nanna_llm::CompletionRequest::default()
-                                .with_model(model)
-                                .with_message(nanna_llm::Message::user(&prompt));
-                            match router.complete(model, request).await {
-                                Ok(result) => return Ok(result),
-                                Err(e) => {
-                                    tracing::warn!("Summarization model {} failed: {}", model, e);
-                                    last_err = format!("{}: {}", model, e);
-                                }
-                            }
-                        }
-                        Err(format!("All summarization models failed. Last error: {}", last_err))
-                    })
-                };
-                
+                let summarize = crate::dream_summarizer::summarize_with_failover(
+                    router_for_summarize,
+                    summarize_models,
+                );
+
+                // Deliberately NOT idle-gated: the user asked for this one
+                // explicitly, so it runs even while the system is busy.
+                //
                 // P13 unification: dream through the shared `DreamingService`
                 // when one is attached, so a user-triggered consolidation runs
                 // the full multi-phase cycle — pending feedback applied, the
                 // testing-effect FSRS flush, the min-memories floor — and not
-                // just its final clustering phase. Deliberately `dream_with`
-                // (ungated) rather than `dream_if_idle_with`: the user asked for
-                // this one, so the idle gate must not veto it. Falls back to the
-                // low-level call when memory is on but no orchestrator is
-                // attached (minimal constructions), so this can never regress.
-                let consolidation = match self.dreaming {
-                    Some(ref dreaming) => dreaming
-                        .dream_with(&config, summarize)
-                        .await
-                        .map(|stats| stats.consolidation),
-                    None => memory.consolidate(&config, summarize).await,
+                // just its final clustering phase. Falls back to the low-level
+                // call when no orchestrator is attached (minimal
+                // constructions); the fallback reports zero promotions and
+                // demotions because only the orchestrator tallies feedback.
+                let dreamed = match self.dreaming {
+                    Some(ref dreaming) => {
+                        dreaming.dream_with_consolidation(&config, summarize).await
+                    }
+                    None => {
+                        let fallback = memory.consolidate(&config, summarize).await;
+                        let total_memories = memory.count().await;
+                        fallback.map(|consolidation| nanna_memory::DreamingStats {
+                            consolidation,
+                            auto_promoted: 0,
+                            auto_demoted: 0,
+                            total_memories,
+                        })
+                    }
                 };
 
-                match consolidation {
-                    Ok(result) => {
-                        info!("Memory consolidation: {} processed, {} clusters, {} merged, {} expanded, {} errors",
-                              result.memories_processed, result.clusters_formed,
-                              result.memories_merged, result.memories_expanded,
-                              result.errors.len());
+                match dreamed {
+                    Ok(stats) => {
+                        let result = stats.consolidation;
+                        info!(
+                            "Memory consolidation: {} processed, {} clusters, {} merged, {} expanded, {} promoted, {} demoted, {} errors",
+                            result.memories_processed,
+                            result.clusters_formed,
+                            result.memories_merged,
+                            result.memories_expanded,
+                            stats.auto_promoted,
+                            stats.auto_demoted,
+                            result.errors.len()
+                        );
                         for err in &result.errors {
                             warn!("Consolidation error: {}", err);
                         }
@@ -246,7 +266,11 @@ impl ControlPlane {
                             "memories_processed": result.memories_processed,
                             "clusters_formed": result.clusters_formed,
                             "memories_merged": result.memories_merged,
+                            "memories_deduped": result.memories_deduped,
                             "memories_expanded": result.memories_expanded,
+                            "auto_promoted": stats.auto_promoted,
+                            "auto_demoted": stats.auto_demoted,
+                            "total_memories": stats.total_memories,
                             "errors": result.errors,
                         })
                     }
