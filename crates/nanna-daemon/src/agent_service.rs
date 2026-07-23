@@ -15,6 +15,16 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
 
+/// Same-model retries for transient provider faults in the chat/heartbeat
+/// path, before falling down the priority list. Mirrors the task harness's
+/// `STEP_LLM_RETRIES`: a single-model priority list (the common local setup)
+/// must survive a cold Ollama load, a dropped stream, or a degraded runner
+/// without declaring every model exhausted.
+const CHAT_TRANSIENT_RETRIES_MAX: usize = 3;
+
+/// Escalating backoff before same-model retries `1..=CHAT_TRANSIENT_RETRIES_MAX`.
+const CHAT_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
+
 /// Per-session queue that serializes chat processing.
 /// Tokio's Mutex is FIFO-fair, so messages are processed in arrival order.
 struct SessionQueue {
@@ -459,29 +469,61 @@ impl AgentService {
         let mut tried_models = Vec::new();
         let mut rate_limited_providers = HashSet::new();
 
-        for model in &models_to_try {
+        // Index-based walk so a transient provider fault can retry the SAME
+        // model (`continue` without advancing) before falling down the
+        // priority list. `same_model_retries` is bounded by
+        // CHAT_TRANSIENT_RETRIES_MAX, so total attempts are bounded by
+        // models_to_try.len() * (1 + CHAT_TRANSIENT_RETRIES_MAX).
+        let mut model_index = 0usize;
+        let mut same_model_retries = 0usize;
+
+        while model_index < models_to_try.len() {
+            let model = &models_to_try[model_index];
             // Skip models whose provider was already rate-limited (shared bucket).
             // e.g., if Opus was rate-limited, skip Haiku (both Anthropic).
             let provider = crate::llm_router::ProviderId::from_model(model);
             if rate_limited_providers.contains(&provider) {
                 info!("Skipping {} — provider {:?} is rate-limited", model, provider);
                 tried_models.push(format!("{} (skipped: provider rate-limited)", model));
+                model_index += 1;
                 continue;
             }
 
-            tried_models.push(model.clone());
-            info!("Trying model: {} (attempt {})", model, tried_models.len());
+            if same_model_retries == 0 {
+                tried_models.push(model.clone());
+            }
+            info!(
+                "Trying model: {} (attempt {}, same-model retry {})",
+                model,
+                tried_models.len(),
+                same_model_retries
+            );
 
-            // Notify clients which model we're using
-            let fallback_reason = if tried_models.len() > 1 {
-                Some(last_error.clone())
-            } else {
-                None
-            };
-            let _ = self.event_tx.send(Event::ModelSwitch {
-                model: model.clone(),
-                reason: fallback_reason,
-            });
+            // Every attempt (fresh model OR same-model retry) starts from a
+            // clean slate. Without this, a failed attempt's partial stream
+            // stays in the shared buffers, is re-streamed alongside the
+            // retry, and — if every model fails — the all-exhausted path
+            // persists the concatenation of all partial attempts as one
+            // assistant message.
+            accumulated.write().await.clear();
+            accumulated_thinking.write().await.clear();
+            active_tools.write().await.clear();
+            completed_tools.write().await.clear();
+
+            // Notify clients which model we're using. Suppressed on
+            // same-model retries: Event::Error{model_retry} already covers
+            // those, and a re-emit would wipe the shown fallback reason.
+            if same_model_retries == 0 {
+                let fallback_reason = if tried_models.len() > 1 {
+                    Some(last_error.clone())
+                } else {
+                    None
+                };
+                let _ = self.event_tx.send(Event::ModelSwitch {
+                    model: model.clone(),
+                    reason: fallback_reason,
+                });
+            }
 
             // Get the correct LLM client for this model from the router
             let llm_client = match self.router.client_for_model(model) {
@@ -493,6 +535,8 @@ impl AgentService {
                         model, detected, self.router.available_providers()
                     );
                     last_error = format!("No provider for model: {} (detected: {:?})", model, detected);
+                    same_model_retries = 0;
+                    model_index += 1;
                     continue;
                 }
             };
@@ -790,6 +834,57 @@ impl AgentService {
                     warn!("Model {} failed: {}", model, error_str);
                     last_error = error_str.clone();
 
+                    // Transient provider fault (timeout / 5xx / dropped
+                    // stream / aborted generation)? Retry the SAME model with
+                    // escalating backoff before falling down the priority
+                    // list — a single-model list (the common local setup)
+                    // otherwise dies on the first hiccup and heartbeats fail
+                    // for hours. Mirrors the task harness's step-retry
+                    // ladder; Ollama-served models additionally get runner
+                    // surgery (provider-gated — never fires for cloud models).
+                    // Rate-limit/overload errors (429/529) are excluded: the
+                    // branch below honors the provider's Retry-After and the
+                    // shared-bucket skip instead of hammering it. A cancelled
+                    // chat must not heal either — no retry, no server surgery.
+                    if crate::tasks::is_transient_llm_error(&error_str)
+                        && !Self::is_rate_limit_error(&error_str)
+                        && !cancellation_flag.load(Ordering::Relaxed)
+                        && same_model_retries < CHAT_TRANSIENT_RETRIES_MAX
+                    {
+                        same_model_retries += 1;
+                        let backoff_secs = CHAT_RETRY_BACKOFF_SECS[same_model_retries - 1];
+                        warn!(
+                            "Transient failure on {model} — retrying in {backoff_secs}s ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})"
+                        );
+                        let _ = self.event_tx.send(Event::Error {
+                            code: "model_retry".to_string(),
+                            message: format!(
+                                "Transient failure on {model}. Retrying ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})..."
+                            ),
+                        });
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        // Re-check cancellation after the sleep: a cancel
+                        // arriving mid-backoff must not bounce the shared
+                        // Ollama server for a chat nobody is waiting on.
+                        if provider == crate::llm_router::ProviderId::Ollama
+                            && !cancellation_flag.load(Ordering::Relaxed)
+                        {
+                            // Second failure: unload the model to clear a
+                            // degraded runner. Final retry: restart the
+                            // server — the sticky degraded state survives
+                            // unloads (verified live in the endurance runs).
+                            if same_model_retries == 2 {
+                                crate::tasks::reset_ollama_runner_for(model).await;
+                            }
+                            if same_model_retries == CHAT_TRANSIENT_RETRIES_MAX
+                                && crate::tasks::ollama_restart_allowed()
+                            {
+                                crate::tasks::restart_ollama_server().await;
+                            }
+                        }
+                        continue;
+                    }
+
                     // Rate limit? Wait before falling through, and record the
                     // provider so we can skip other models on the same provider
                     // (they share the same rate limit bucket).
@@ -825,6 +920,8 @@ impl AgentService {
                     });
 
                     info!("Model {} failed, trying next model in priority list", model);
+                    same_model_retries = 0;
+                    model_index += 1;
                 }
             }
         }

@@ -116,14 +116,28 @@ impl ModelInfo {
 
     /// Hard limit for input (leaves room for output).
     ///
-    /// Never returns 0 — some providers report `max_output_tokens >= context_window`
-    /// which would produce 0 and cause the context manager to nuke all messages
-    /// on every iteration.  Floor: 50% of context_window.
+    /// The output reservation is capped at 25% of the window: agent-loop
+    /// completions are bounded by the per-request `max_tokens` (typically
+    /// ≤4k), while several providers — Ollama among them — report
+    /// `max_output_tokens >= context_window`. Subtracting that claim
+    /// verbatim halved a 32k local model to 16k of usable input (observed
+    /// live: the user's own prompt was emergency-truncated). The 50% floor
+    /// stays as the final guard so this can never return 0.
     #[must_use]
     pub fn hard_input_limit(&self) -> usize {
-        let raw = self.context_window.saturating_sub(self.max_output_tokens);
+        let output_reserve = self.max_output_tokens.min(self.context_window / 4);
+        let raw = self.context_window.saturating_sub(output_reserve);
         let floor = self.context_window / 2;
         raw.max(floor)
+    }
+
+    /// Output-token budget paired with [`Self::hard_input_limit`]: the slice
+    /// of the window the input side does NOT claim. A request whose
+    /// `max_tokens` is clamped to this can never over-commit the window —
+    /// input ≤ `hard_input_limit` and output ≤ this sum to ≤ `context_window`.
+    #[must_use]
+    pub fn output_token_budget(&self) -> usize {
+        self.context_window.saturating_sub(self.hard_input_limit())
     }
 
     /// Create with current timestamp
@@ -1490,9 +1504,10 @@ impl LlmClient {
         if let Some(temp) = request.temperature {
             options.insert("temperature".to_string(), serde_json::json!(temp));
         }
-        // num_predict=-1 means unlimited output — lets thinking models (qwen3)
-        // use as many tokens as needed for reasoning without starving the response.
-        options.insert("num_predict".to_string(), serde_json::json!(-1));
+        // Bound generation to the request's token budget. num_predict=-1
+        // (unlimited) let a degraded runner emit degenerate tokens without
+        // end; the caller's max_tokens already accounts for thinking room.
+        options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
         // Request 32K context so the agent has room for system prompt + conversation.
         // Ollama models default to small contexts (e.g. 8K) even if they support more.
         options.insert("num_ctx".to_string(), serde_json::json!(32768));
@@ -3036,9 +3051,10 @@ impl LlmClient {
             if let Some(temp) = request.temperature {
                 options.insert("temperature".to_string(), serde_json::json!(temp));
             }
-            // num_predict=-1 means unlimited output — lets thinking models use
-            // as many tokens as needed for reasoning without starving the response.
-            options.insert("num_predict".to_string(), serde_json::json!(-1));
+            // Bound generation to the request's token budget. num_predict=-1
+            // (unlimited) let a degraded runner emit degenerate tokens without
+            // end; the caller's max_tokens already accounts for thinking room.
+            options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
             // Request 32K context (Ollama models default to small contexts).
             options.insert("num_ctx".to_string(), serde_json::json!(32768));
             if !options.is_empty() {
@@ -3224,14 +3240,22 @@ impl LlmClient {
                 }
             }
 
-            // If we get here without done=true, close gracefully
+            // The stream ended with no done=true terminator: an ABORTED
+            // generation. A degraded Ollama runner streams degenerate tokens
+            // and drops the stream with no final message (observed live) —
+            // closing "gracefully" here delivered that garbage to the GUI as
+            // a successful reply. Surface a retryable server error instead,
+            // mirroring the non-streaming done=false check.
             if thinking_block_started {
                 yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
             }
             if text_block_started {
                 yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
             }
-            yield Ok(StreamEvent::MessageStop { stop_reason: "end_turn".to_string() });
+            yield Err(LlmError::from_api_response(
+                502,
+                "Ollama stream ended without completion (no done=true)".to_string(),
+            ));
         }
     }
 
@@ -4388,7 +4412,7 @@ mod tests {
     #[test]
     fn compression_threshold_stays_below_hard_limit_for_small_models() {
         // Small model, large output budget: 80%-of-context (6400) would exceed
-        // the hard input cap (4000), so proactive compression must be pulled
+        // the hard input cap (6000), so proactive compression must be pulled
         // below it instead of never firing.
         let small = model_info(8_000, 4_096);
         assert!(
@@ -4414,6 +4438,41 @@ mod tests {
         // floors at 50% of context; the threshold must still sit at/below it.
         let degenerate = model_info(4_000, 8_000);
         assert!(degenerate.compression_threshold() <= degenerate.hard_input_limit());
+    }
+
+    #[test]
+    fn hard_input_limit_caps_the_output_reservation() {
+        // The live regression: Ollama reports max_output >= context for
+        // qwen3.5:9b (32k window), and subtracting the claim verbatim halved
+        // the input side to 16k — the user's prompt got emergency-truncated.
+        // Reservation is capped at 25% of the window, so 24k stays usable.
+        let qwen_like = model_info(32_000, 32_000);
+        assert_eq!(qwen_like.hard_input_limit(), 24_000);
+        // A modest, honest output claim is reserved in full.
+        let honest = model_info(32_000, 4_096);
+        assert_eq!(honest.hard_input_limit(), 32_000 - 4_096);
+    }
+
+    #[test]
+    fn input_and_output_budgets_never_over_commit_the_window() {
+        // The paired-budget invariant: a request whose input respects
+        // hard_input_limit and whose max_tokens respects output_token_budget
+        // can never exceed the model's context window.
+        for (ctx, out) in [
+            (32_000, 32_000),
+            (32_000, 4_096),
+            (8_000, 4_096),
+            (4_000, 8_000),
+            (2_000, 1_000),
+        ] {
+            let m = model_info(ctx, out);
+            assert!(
+                m.hard_input_limit() + m.output_token_budget() <= ctx,
+                "over-commit at ctx={ctx} out={out}: {} + {} > {ctx}",
+                m.hard_input_limit(),
+                m.output_token_budget()
+            );
+        }
     }
 
     #[test]

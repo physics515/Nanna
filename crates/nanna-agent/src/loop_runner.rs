@@ -3098,7 +3098,11 @@ impl Agent {
         let max_tokens = self
             .config
             .max_tokens
-            .min(u32::try_from(model_info.max_output_tokens).unwrap_or(u32::MAX));
+            .min(u32::try_from(model_info.max_output_tokens).unwrap_or(u32::MAX))
+            // Never over-commit the window: input is bounded by
+            // hard_input_limit, output by the remainder — the sum can't
+            // exceed context_window.
+            .min(u32::try_from(model_info.output_token_budget()).unwrap_or(u32::MAX));
 
         AnthropicRequest {
             model: self.config.model.clone(),
