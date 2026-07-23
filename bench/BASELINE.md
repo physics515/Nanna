@@ -19,14 +19,24 @@ offline, fixed-seed — these are exact, reproducible values, not timing samples
 
 | Metric | Baseline | Source | Notes |
 | --- | --- | --- | --- |
-| Consolidation compression ratio | **0.90** | `retention::tests::dreaming_shrinks_store_while_holding_recall` | 60 → 6 memories, 6 same-topic clusters of 10 each |
+| Consolidation compression ratio | **0.90** | `retention::tests::dreaming_shrinks_store_while_holding_recall` | 60 → 6 memories |
 | Recall retention across a dream cycle | **1.000** (recall@3 1.0 → 1.0) | same test | same-topic merges keep every topic reachable at its centroid |
+| **Summarizer calls per cycle** (this corpus) | **0** (was 6) | same test | *(2026-07-23)* dream phase (b) folds the 54 removable memories deterministically — `memories_deduped: 54`, `clusters_formed: 0` |
 | w20 aged-recall (FSRS-6 `0.0658`) | **6/6 topics** | `retention::tests::w20_experiment_aged_recall` | 800-day-aged corpus, FSRS-gated recall |
 | w20 aged-recall (FSRS-5 `0.5`, the old default) | **0/6 topics** | same test | evidence the shipped constant was wrong; default flipped 2026-07-17 |
 
 Budget: consolidation must not regress **recall retention below 1.0** on this fixed corpus,
 and must hold **compression ≥ 0.90**. The w20 rows are a correctness fixture (they assert the
 FSRS-6 exponent strictly out-recalls the old FSRS-5 one on aged memories), not a tunable budget.
+
+*(2026-07-23)* The summarizer-call row is the newest budget and the point of dream phase (b):
+this corpus's within-topic pairs sit in the `IngestAction::Reinforce` band (cosine > 0.92), so
+they are true restatements and are now folded **deterministically, with zero LLM calls**, where
+the cycle previously paid 6 summarizer prompts to paraphrase them. Compression and recall are
+*unchanged* (0.90 / 1.000) — the win is entirely in the token budget, the governing scarce
+resource on the single-GPU local tier. Do not "fix" a future regression here by lowering the
+similarity threshold: the 0.92 line is the project's existing same-fact definition, and folding
+below it would paraphrase-merge genuinely distinct memories.
 
 ---
 

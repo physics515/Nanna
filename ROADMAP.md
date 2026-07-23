@@ -1070,6 +1070,40 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `update_content_and_embedding` fold related-but-distinct content into the existing memory
       (bounded, superset-dedup) and reinforce FSRS. Next: apply the same merge in the batch
       dreaming/consolidation clusterer (`cluster_memories`), which still creates consolidated copies.*
+      *(2026-07-23)* **Batch half done — dream phase (b) now folds true duplicates with no LLM call.**
+      A dream cycle paid one summarizer prompt for *every* cluster, including clusters that were nothing
+      but restatements of one fact ("user prefers dark mode", stored three times from three sessions).
+      Paraphrasing those through a model is both wasted tokens — the scarcest resource on the single-GPU
+      local tier — and **lossier** than a deterministic fold. New `MemoryService::fold_near_duplicates`
+      runs per band *before* `cluster_memories`, so the summarizer only ever sees genuinely distinct
+      content. Rules, each a guard rather than a heuristic: **scope is absolute** (reuses the clusterer's
+      `same_scope`, so a fold can never leak or re-home across a workspace); **only the
+      `IngestAction::Reinforce` band** (cosine > 0.92 — the project's *existing* same-fact line, reused
+      rather than inventing a threshold); **never lose content** — `merge_memory_content` silently keeps
+      `existing` when the append would breach its byte bound, so folding-then-removing would drop text;
+      a fold is committed only when the merged content demonstrably still contains the incoming content,
+      otherwise both memories go to the clusterer; **strongest survives** (band ranked by FSRS weight
+      descending, so duplicates fold *into* the best-established memory, which inherits `max` importance
+      and the summed access count, mirroring `create_consolidated_entry`); and **update-before-remove**,
+      so a partial failure leaves a transient duplicate the next cycle re-folds, never a hole. Bounded by
+      the cycle's `removal_budget` and the band size; the pairwise scan is the same O(N²) shape the
+      clusterer already has, so no new complexity class. Declines entirely when no embedder is configured
+      (a survivor that cannot be re-embedded would leave content and vector inconsistent). New
+      `ConsolidationResult::memories_deduped` counts it separately from `memories_merged` so the
+      token-free share of a cycle is visible, and it is surfaced on the IPC consolidate response.
+      **Measured on the retention harness (`bench/BASELINE.md` Suite 3): compression 0.90 and recall
+      retention 1.000 are UNCHANGED, while summarizer calls for that corpus went 6 → 0** (54 memories
+      folded deterministically, `clusters_formed: 0`) — a pure token-budget win at identical quality.
+      The harness assertion was corrected from `memories_merged > 0` to `merged + deduped > 0`: it exists
+      to measure compression and recall, not which mechanism achieved them. 8 new tests (folds duplicates
+      without paying the summarizer; budget respected; distinct content left alone; survivor inherits
+      importance + access count; no-op without an embedder; plus 3 pure `find_duplicate_target` tests —
+      Reinforce-band-only, never-cross-workspace, and degenerate embeddings (dimension mismatch / empty)
+      match nothing rather than panicking). nanna-memory 75 tests green, full workspace suite green,
+      clippy 2147 (−6 vs the 2153 origin baseline; zero warnings in the new code), zero new rustfmt
+      violations. **Remaining:** the `Detailed` (highest-weight) band still skips consolidation entirely,
+      so duplicates there are not folded — worth revisiting, since exact restatements of an *important*
+      fact are precisely the ones worth collapsing.
 - [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
       `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
       `importance`/`storage_strength` is NaN.

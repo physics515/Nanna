@@ -249,6 +249,7 @@ impl ControlPlane {
                             "memories_processed": result.memories_processed,
                             "clusters_formed": result.clusters_formed,
                             "memories_merged": result.memories_merged,
+                            "memories_deduped": result.memories_deduped,
                             "memories_expanded": result.memories_expanded,
                             "auto_promoted": stats.auto_promoted,
                             "auto_demoted": stats.auto_demoted,

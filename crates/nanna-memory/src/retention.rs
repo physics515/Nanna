@@ -656,9 +656,15 @@ mod tests {
                 .await
                 .unwrap();
 
-        // The cycle must have actually done work and shrunk the store.
+        // The cycle must have actually done work and shrunk the store. Either
+        // mechanism counts: this corpus's within-topic pairs sit in the
+        // Reinforce band (composite ~1.0), so dream phase (b) folds most of them
+        // deterministically and the summarizer never has to see them — which is
+        // the *better* outcome (identical compression, zero tokens, exact rather
+        // than paraphrased). The harness measures compression and recall, not
+        // which path achieved them.
         assert!(
-            result.memories_merged > 0,
+            result.memories_merged + result.memories_deduped > 0,
             "nothing consolidated: {result:?}"
         );
         assert!(

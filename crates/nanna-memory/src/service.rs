@@ -985,6 +985,19 @@ impl MemoryService {
                 continue;
             }
 
+            // Phase (b): fold true duplicates deterministically FIRST, so the
+            // summarizer is only ever paid for genuinely distinct content.
+            let deduped_before = result.memories_deduped;
+            let memories = self
+                .fold_near_duplicates(memories, removal_budget, &mut result)
+                .await;
+            let folded_here = result.memories_deduped - deduped_before;
+            removal_budget = removal_budget.saturating_sub(folded_here);
+            result.memories_processed += folded_here;
+            if removal_budget == 0 {
+                continue;
+            }
+
             // Cluster using composite score (similarity + recall + importance + age)
             let clusters = cluster_memories(memories, config);
 
@@ -1048,6 +1061,168 @@ impl MemoryService {
         );
 
         Ok(result)
+    }
+
+    /// Dream phase (b): fold near-duplicate memories together **deterministically,
+    /// with no LLM call**, returning the survivors for the summarizing clusterer.
+    ///
+    /// A dream cycle otherwise pays one summarizer call for every cluster —
+    /// including clusters that are nothing but restatements of the same fact
+    /// ("user prefers dark mode", stored three times from three sessions).
+    /// Paraphrasing those through a model is both wasted tokens (the scarcest
+    /// resource on a single-GPU local tier) and *lossier* than a deterministic
+    /// fold. This pass removes them from the clusterer's input first.
+    ///
+    /// Rules, in order of importance:
+    /// - **Scope is absolute**: never fold across a workspace boundary
+    ///   ([`same_scope`]) — that would leak or re-home a memory.
+    /// - **Only truly-duplicate pairs**: the pair must reach
+    ///   [`IngestAction::Reinforce`] (cosine > 0.92), the project's existing
+    ///   "this is the same fact" line, reused rather than inventing a threshold.
+    /// - **Never lose content**: `merge_memory_content` keeps `existing`
+    ///   unchanged when the append would breach its byte bound, so folding then
+    ///   removing the source would silently drop text. A fold is only committed
+    ///   when the merged content demonstrably still contains the incoming
+    ///   content; otherwise both memories are left for the clusterer.
+    /// - **Strongest survives**: the band is processed in descending FSRS
+    ///   weight, so duplicates always fold *into* the best-established memory,
+    ///   which then inherits `max` importance and the summed access count
+    ///   (mirroring `create_consolidated_entry`).
+    /// - **Update before remove**: the survivor is rewritten first; only then is
+    ///   the source dropped. A failure part-way leaves a transient duplicate
+    ///   that the next cycle re-folds, never a hole.
+    ///
+    /// Bounded by `removal_budget_count` (the cycle's compression allowance) and
+    /// by the band size; the pairwise scan is the same O(N²) shape the existing
+    /// clusterer already has, so this adds no new complexity class.
+    async fn fold_near_duplicates(
+        &self,
+        memories: Vec<MemoryEntry>,
+        removal_budget_count: usize,
+        result: &mut ConsolidationResult,
+    ) -> Vec<MemoryEntry> {
+        let memories_count_before = memories.len();
+        if removal_budget_count == 0 || memories_count_before < 2 {
+            return memories;
+        }
+
+        let Some(embed_fn) = self.embed_fn.as_ref() else {
+            // No embedder: folding would be unable to re-embed the survivor and
+            // would leave content and vector inconsistent. Skip, don't guess.
+            return memories;
+        };
+
+        // Strongest first, so a duplicate always folds into the best-established
+        // memory rather than whichever happened to come back first.
+        let mut ranked = memories;
+        ranked.sort_by(|a, b| {
+            let weight_b = b.fsrs.weight(&self.config.fsrs);
+            let weight_a = a.fsrs.weight(&self.config.fsrs);
+            weight_b
+                .partial_cmp(&weight_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut survivors: Vec<MemoryEntry> = Vec::with_capacity(ranked.len());
+        let mut folded_count = 0_usize;
+
+        for candidate in ranked {
+            let target = if folded_count < removal_budget_count {
+                find_duplicate_target(&survivors, &candidate)
+            } else {
+                None
+            };
+
+            let Some(target_index) = target else {
+                survivors.push(candidate);
+                continue;
+            };
+
+            let survivor = &survivors[target_index];
+            let incoming = candidate.content.trim();
+            let merged = merge_memory_content(&survivor.content, incoming);
+
+            // The losslessness guard: a merge that dropped the incoming text
+            // must not be followed by removing its source.
+            if !merged.contains(incoming) {
+                survivors.push(candidate);
+                continue;
+            }
+
+            match self
+                .commit_duplicate_fold(embed_fn, &survivors[target_index], &candidate, &merged)
+                .await
+            {
+                Ok(()) => {
+                    survivors[target_index].content = merged;
+                    survivors[target_index].fsrs.importance = survivors[target_index]
+                        .fsrs
+                        .importance
+                        .max(candidate.fsrs.importance);
+                    survivors[target_index].fsrs.access_count += candidate.fsrs.access_count;
+                    folded_count += 1;
+                    result.memories_deduped += 1;
+                }
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("Dedup fold failed for {}: {e}", candidate.id));
+                    survivors.push(candidate);
+                }
+            }
+        }
+
+        debug_assert!(
+            folded_count <= removal_budget_count,
+            "dedup must respect the removal budget"
+        );
+        debug_assert_eq!(
+            survivors.len() + folded_count,
+            memories_count_before,
+            "every memory must either survive or be folded — none may vanish"
+        );
+
+        if folded_count > 0 {
+            info!("Dream dedup: folded {folded_count} near-duplicate memories (no LLM call)");
+        }
+        survivors
+    }
+
+    /// Persist one duplicate fold: rewrite the survivor (merged content, fresh
+    /// embedding, inherited FSRS), then drop the source. Update-before-remove,
+    /// so a partial failure can only leave a duplicate, never lose content.
+    async fn commit_duplicate_fold(
+        &self,
+        embed_fn: &EmbedFn,
+        survivor: &MemoryEntry,
+        source: &MemoryEntry,
+        merged: &str,
+    ) -> Result<(), MemoryError> {
+        debug_assert_ne!(survivor.id, source.id, "a memory cannot fold into itself");
+        debug_assert!(!merged.is_empty(), "merged content must not be empty");
+
+        // Re-embed only when the text actually changed; a pure superset fold
+        // leaves the survivor's content (and therefore its vector) correct.
+        if merged != survivor.content {
+            let embedding = (embed_fn)(merged)
+                .await
+                .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
+            self.store
+                .update_content_and_embedding(&survivor.id, merged, embedding)
+                .await?;
+        }
+
+        let inherited_importance = survivor.fsrs.importance.max(source.fsrs.importance);
+        let inherited_access = source.fsrs.access_count;
+        self.store
+            .update_fsrs(&survivor.id, |fsrs| {
+                fsrs.importance = inherited_importance;
+                fsrs.access_count += inherited_access;
+            })
+            .await?;
+
+        self.store.remove(&source.id).await?;
+        Ok(())
     }
 
     /// Consolidate a single cluster of memories
@@ -1237,6 +1412,34 @@ const MEMORY_MERGE_MAX_BYTES: usize = 4096;
 ///   the cap, the existing content is kept unchanged (no unbounded growth).
 ///
 /// The returned string is never empty when `existing` is non-empty.
+/// Index of the first memory in `survivors` that `candidate` is a true duplicate
+/// of, or `None` if it is genuinely new information.
+///
+/// Pure (no IO, no clock) so the fold policy is exhaustively testable. Two gates,
+/// cheapest first: identical workspace scope, then cosine similarity past the
+/// [`IngestAction::Reinforce`] line. Embeddings are stored normalized, so the
+/// SIMD cosine is exact here; a dimension mismatch or empty vector yields no
+/// match rather than a panic.
+#[must_use]
+fn find_duplicate_target(survivors: &[MemoryEntry], candidate: &MemoryEntry) -> Option<usize> {
+    if candidate.embedding.is_empty() {
+        return None;
+    }
+
+    survivors.iter().position(|survivor| {
+        if !crate::consolidation::same_scope(survivor, candidate) {
+            return false;
+        }
+        if survivor.embedding.len() != candidate.embedding.len() {
+            return false;
+        }
+        let similarity =
+            nanna_simd::cosine_similarity_f32(&survivor.embedding, &candidate.embedding);
+        similarity.is_finite()
+            && IngestAction::from_similarity(similarity) == IngestAction::Reinforce
+    })
+}
+
 fn merge_memory_content(existing: &str, incoming: &str) -> String {
     // Separator is ASCII so byte math for the length bound is exact.
     const SEPARATOR: &str = "; ";
@@ -1495,6 +1698,216 @@ mod tests {
             "the pre-expansion vector must no longer match, got {}",
             by_stale[0].1
         );
+    }
+
+    // ---- Dream phase (b): deterministic near-duplicate folding -------------
+
+    /// Build a dim-3 service whose embedder is irrelevant to the fold decision
+    /// (entries are inserted with explicit vectors) but is needed to re-embed a
+    /// survivor whose content changed.
+    fn dedup_service() -> MemoryService {
+        let embed: EmbedFn =
+            Arc::new(|_text: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }));
+        MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed)
+    }
+
+    fn dedup_entry(
+        id: &str,
+        content: &str,
+        embedding: Vec<f32>,
+        workspace_id: Option<&str>,
+    ) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            embedding,
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::new(),
+            workspace_id: workspace_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn duplicate_target_requires_the_reinforce_similarity_band() {
+        // Identical vector -> cosine 1.0 -> Reinforce -> a duplicate.
+        let survivor = dedup_entry("a", "x", vec![1.0, 0.0, 0.0], None);
+        let same = dedup_entry("b", "x", vec![1.0, 0.0, 0.0], None);
+        assert_eq!(
+            find_duplicate_target(std::slice::from_ref(&survivor), &same),
+            Some(0)
+        );
+
+        // Merely *related* (~0.85, the Update band) is NOT a duplicate — that
+        // content is distinct and must still reach the summarizer.
+        let related = dedup_entry("c", "y", vec![0.85, 0.53, 0.0], None);
+        assert_eq!(
+            find_duplicate_target(std::slice::from_ref(&survivor), &related),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_target_never_crosses_a_workspace_boundary() {
+        // Byte-identical content and vector, different scope: folding these
+        // would leak private content or re-home a memory.
+        let survivor = dedup_entry("a", "same", vec![1.0, 0.0, 0.0], Some("ws-1"));
+        let other_ws = dedup_entry("b", "same", vec![1.0, 0.0, 0.0], Some("ws-2"));
+        assert_eq!(
+            find_duplicate_target(std::slice::from_ref(&survivor), &other_ws),
+            None
+        );
+
+        // Global vs workspace is also a boundary.
+        let global = dedup_entry("c", "same", vec![1.0, 0.0, 0.0], None);
+        assert_eq!(
+            find_duplicate_target(std::slice::from_ref(&survivor), &global),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_target_tolerates_degenerate_embeddings() {
+        // Negative space: neither a dimension mismatch nor an empty vector may
+        // match (or panic) — both mean "cannot judge", so never fold.
+        let survivor = dedup_entry("a", "x", vec![1.0, 0.0, 0.0], None);
+        let wrong_dims = dedup_entry("b", "x", vec![1.0, 0.0], None);
+        assert_eq!(
+            find_duplicate_target(std::slice::from_ref(&survivor), &wrong_dims),
+            None
+        );
+
+        let empty = dedup_entry("c", "x", Vec::new(), None);
+        assert_eq!(
+            find_duplicate_target(std::slice::from_ref(&survivor), &empty),
+            None
+        );
+    }
+
+    /// The headline: true duplicates are folded away with **no summarizer call**.
+    #[tokio::test]
+    async fn dedup_folds_duplicates_without_paying_the_summarizer() {
+        let service = dedup_service();
+        let mut result = ConsolidationResult::default();
+
+        // Three restatements of one fact (identical vectors => Reinforce band).
+        let band = vec![
+            dedup_entry("m1", "prefers dark mode", vec![1.0, 0.0, 0.0], None),
+            dedup_entry("m2", "prefers dark mode", vec![1.0, 0.0, 0.0], None),
+            dedup_entry("m3", "likes dark themes", vec![1.0, 0.0, 0.0], None),
+        ];
+        for entry in &band {
+            service.add_entry(entry.clone()).await.expect("seed");
+        }
+        assert_eq!(service.count().await, 3);
+
+        let survivors = service.fold_near_duplicates(band, 10, &mut result).await;
+
+        assert_eq!(survivors.len(), 1, "three duplicates collapse to one");
+        assert_eq!(result.memories_deduped, 2);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            service.count().await,
+            1,
+            "sources must be removed from the store"
+        );
+
+        // Losslessness: the exact-duplicate is absorbed by superset dedup, and
+        // the differently-worded restatement is appended, not discarded.
+        let survivor = &survivors[0];
+        assert!(survivor.content.contains("prefers dark mode"));
+        assert!(survivor.content.contains("likes dark themes"));
+    }
+
+    #[tokio::test]
+    async fn dedup_respects_the_removal_budget() {
+        let service = dedup_service();
+        let mut result = ConsolidationResult::default();
+
+        let band: Vec<MemoryEntry> = (0..4)
+            .map(|i| dedup_entry(&format!("m{i}"), "same fact", vec![1.0, 0.0, 0.0], None))
+            .collect();
+        for entry in &band {
+            service.add_entry(entry.clone()).await.expect("seed");
+        }
+
+        // Budget of 1 => exactly one fold, three memories left standing.
+        let survivors = service.fold_near_duplicates(band, 1, &mut result).await;
+        assert_eq!(result.memories_deduped, 1);
+        assert_eq!(survivors.len(), 3);
+        assert_eq!(service.count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn dedup_leaves_distinct_memories_for_the_summarizer() {
+        let service = dedup_service();
+        let mut result = ConsolidationResult::default();
+
+        // Orthogonal vectors: nowhere near the Reinforce band.
+        let band = vec![
+            dedup_entry("m1", "likes tea", vec![1.0, 0.0, 0.0], None),
+            dedup_entry("m2", "owns a bike", vec![0.0, 1.0, 0.0], None),
+        ];
+        for entry in &band {
+            service.add_entry(entry.clone()).await.expect("seed");
+        }
+
+        let survivors = service.fold_near_duplicates(band, 10, &mut result).await;
+        assert_eq!(survivors.len(), 2, "distinct content must not be folded");
+        assert_eq!(result.memories_deduped, 0);
+        assert_eq!(service.count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn dedup_survivor_inherits_importance_and_access_count() {
+        let service = dedup_service();
+        let mut result = ConsolidationResult::default();
+
+        let mut weak = dedup_entry("weak", "fact", vec![1.0, 0.0, 0.0], None);
+        weak.fsrs.importance = 1.0;
+        weak.fsrs.access_count = 2;
+        let mut strong = dedup_entry("strong", "fact restated", vec![1.0, 0.0, 0.0], None);
+        strong.fsrs.importance = 5.0;
+        strong.fsrs.access_count = 7;
+
+        service.add_entry(weak.clone()).await.expect("seed");
+        service.add_entry(strong.clone()).await.expect("seed");
+
+        let survivors = service
+            .fold_near_duplicates(vec![weak, strong], 10, &mut result)
+            .await;
+
+        assert_eq!(result.memories_deduped, 1);
+        assert_eq!(survivors.len(), 1);
+        let survivor = &survivors[0];
+        // The strongest memory survives (ranked first by FSRS weight)…
+        assert_eq!(survivor.id, "strong");
+        // …and inherits the union of the recall history, not just its own.
+        assert!((survivor.fsrs.importance - 5.0).abs() < f32::EPSILON);
+        assert_eq!(survivor.fsrs.access_count, 9);
+    }
+
+    #[tokio::test]
+    async fn dedup_is_a_no_op_without_an_embedder() {
+        // Without an embedder a survivor could not be re-embedded, leaving its
+        // content and vector inconsistent — so the pass must decline entirely.
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        let mut result = ConsolidationResult::default();
+        let band = vec![
+            dedup_entry("m1", "same", vec![1.0, 0.0, 0.0], None),
+            dedup_entry("m2", "same", vec![1.0, 0.0, 0.0], None),
+        ];
+
+        let survivors = service.fold_near_duplicates(band, 10, &mut result).await;
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(result.memories_deduped, 0);
     }
 
     #[tokio::test]
