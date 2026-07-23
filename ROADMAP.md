@@ -981,7 +981,39 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       matching the "prefer pure-Rust, no-C where avoidable" doctrine and keeping stock-MSVC builds green.*
 
 **Best-in-class dreaming:**
-- [ ] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
+- [x] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
+      *(2026-07-23)* **Done — `DreamingService` is now the daemon's single dreaming orchestrator, and it is
+      no longer dead code.** The daemon built one `Arc<DreamingService>` at boot (over the live shared
+      store) and hands it to **both** consolidation paths: the scheduled cycle and the IPC
+      `MemoryAction::Consolidate` handler. That closes a real behavioural gap, not just a structural one —
+      both paths previously called `MemoryService::consolidate()` directly, i.e. they ran **only the
+      clustering phase** and silently skipped the cycle's first three: pending-feedback
+      promote/demote, the **testing-effect FSRS flush** (`apply_pending_updates`), and the
+      `min_memories_for_consolidation` floor. Those now run on every dream.
+      **One clock, not two.** `ActivityClock` moved from `nanna-daemon` to `nanna-memory` (beside the
+      dreaming code that reads it; the daemon re-exports it) and `DreamingService` gates on an injected
+      `Arc<ActivityClock>` instead of a private `RwLock<Instant>` — so the service reads *exactly* the
+      clock the control plane stamps on each chat, with no second bookkeeping call to drift. Side effect:
+      `record_activity`/`idle_duration` are now lock-free and non-`async`, so the hot request path never
+      takes a lock.
+      **Per-run consolidation config.** The cluster byte budget must be sized to the *summarizer model's*
+      context window, which only the router knows at fire time — so a long-lived service must not freeze
+      one at construction. Added `dream_with(&ConsolidationConfig, ..)` / `dream_if_idle_with(..)` as the
+      single implementations; the old `dream`/`dream_if_idle` delegate with the service's own config.
+      `dream_if_idle*` now returns `Option<DreamOutcome>` (trigger + stats) so a caller can log *why* a
+      cycle ran; a skip stays `Ok(None)`, so the type cannot represent "ran because it didn't".
+      The IPC path deliberately uses the **ungated** `dream_with` (the user asked for it, so the idle gate
+      must not veto) and falls back to the low-level call when no orchestrator is attached, so this can
+      never regress a minimal construction. The ~85-line inline scheduler block became a bounded
+      `run_scheduled_dream_cycle(..)`.
+      6 new tests (host-side clock opens/shuts the gate without `record_activity`; outcome reports
+      `MemoryPressure` vs `Idle`; per-run config overrides the construction-time one; daemon-side
+      same-`Arc` clock invariant) — the fixture bug they caught is worth noting: the old dim-3 test
+      embedder returned one vector for every text, so `remember` deduped everything into a single memory;
+      a `distinct_embed_fn` with pairwise-cosine ≤ 0 directions was needed to store them separately.
+      70 nanna-memory + 61 nanna-daemon tests green.
+      Still open (their own items): the multi-phase dream **body** (true merge / cluster-by-band / expand /
+      DSP timeline), and nothing yet calls `record_feedback`, so the feedback phase is wired but unfed.
 > **Dreaming model (do not drift from this):** memories **never expire**. A dream cycle = **semantically
 > rank "like" memories → concatenate them → summarize the concatenation into a single memory**
 > (`composite_cluster_score` → `MemoryCluster::concatenated_content()` → `create_consolidated_entry`).
@@ -1072,6 +1104,21 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      - [ ] *(research 2026-07-23)* **Three pure-Rust HNSW crates to choose between** (all no-C, matching the
+            dependency doctrine): **`hnswlib-rs`** decouples the graph from vector storage (`Hnsw<K, M>` owns the
+            graph + an external-key→`NodeId` map, you supply a `VectorStore`) and supports **concurrent search
+            *and* concurrent mutation** with lock-free reads — the best structural fit, since Nanna's vectors
+            already live in the in-RAM store after `bulk_load` and dreaming mutates while the agent searches;
+            **`hnsw_rs`** offers serde reload-of-graph-only and **filtered search** (predicate applied *during*
+            traversal, not as a post-filter) — directly relevant because our searches are **workspace-scoped**,
+            and post-filtering an ANN result set silently under-returns; **`instant-distance`** is the smallest
+            and most battle-tested (powers InstantDomainSearch) but is the least featureful. Decision inputs:
+            (a) does the crate let clustering reuse one index across a dream cycle, (b) is scope-filtering
+            in-traversal, (c) recall@k vs the current exact SIMD scan on the retention harness — gate the swap
+            on `nanna-memory::retention` holding `recall_retention`, since an ANN index trades exactness for
+            speed and that trade must be *measured*, not assumed. Sources:
+            [hnswlib-rs](https://crates.io/crates/hnswlib-rs), [hnsw_rs](https://crates.io/crates/hnsw_rs),
+            [instant-distance](https://crates.io/crates/instant-distance).
       - *(2026-07-12, partial)* Interim: the clusterer's per-pair `cosine_similarity` (called O(N²) times per
         band) now delegates to `nanna_simd::cosine_similarity_f32` (AVX-512/AVX2/NEON) — the same primitive the
         vector-search path already uses — instead of a private scalar loop, removing the duplication. Guards
@@ -1745,7 +1792,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
-6. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
+6. **Unify + upgrade dreaming** (P13) — ~~one `DreamingService` orchestrator~~ **(done 2026-07-23 — the
+   daemon's scheduled cycle *and* the IPC `Consolidate` handler both dream through one shared
+   `DreamingService` over one shared `ActivityClock`; the feedback + testing-effect-flush phases the
+   daemon used to skip now run)**; ~~idle-gated~~ (done 2026-07-19); remaining: the multi-phase **body**
+   (true merge / cluster-by-band / expand), and a local `summarize_fn` (blocked on P12/Mummu).
 7. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
 8. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
 9. **End-to-end daemon test** (P8) — ~~the daemon/embedded/reconnect story is still unverified~~ **mostly

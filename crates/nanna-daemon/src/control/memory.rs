@@ -215,7 +215,24 @@ impl ControlPlane {
                     })
                 };
                 
-                match memory.consolidate(&config, summarize).await {
+                // P13 unification: dream through the shared `DreamingService`
+                // when one is attached, so a user-triggered consolidation runs
+                // the full multi-phase cycle — pending feedback applied, the
+                // testing-effect FSRS flush, the min-memories floor — and not
+                // just its final clustering phase. Deliberately `dream_with`
+                // (ungated) rather than `dream_if_idle_with`: the user asked for
+                // this one, so the idle gate must not veto it. Falls back to the
+                // low-level call when memory is on but no orchestrator is
+                // attached (minimal constructions), so this can never regress.
+                let consolidation = match self.dreaming {
+                    Some(ref dreaming) => dreaming
+                        .dream_with(&config, summarize)
+                        .await
+                        .map(|stats| stats.consolidation),
+                    None => memory.consolidate(&config, summarize).await,
+                };
+
+                match consolidation {
                     Ok(result) => {
                         info!("Memory consolidation: {} processed, {} clusters, {} merged, {} expanded, {} errors",
                               result.memories_processed, result.clusters_formed,
