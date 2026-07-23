@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.5",
+  version: "0.1.6",
   output: "context",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. Use force=true to override.",
   parameters: {
@@ -137,7 +137,26 @@ export default {
           // Fall through to the plain refusal below.
         }
         if (parked) {
-          return fail("WRITE PARKED — your content for " + filePath + " has a SYNTAX ERROR (" + syntaxDetail + "), so the file was NOT changed. Nothing was lost: the draft IS SAVED at " + parkPath + ". Fix ONLY that error with edit_file(file_path=\"" + parkPath + "\", old_string=<the broken text>, new_string=<the fix>), then run file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). Do NOT regenerate the whole file.");
+          // Quote the offending line verbatim: it is a ready-made
+          // old_string, removing the last excuse to regenerate (observed
+          // live: three parks in a row, each a fresh full regeneration
+          // with a brand-new error line).
+          var lineQuote = "";
+          if (syntaxDetail.indexOf("line ") === 0) {
+            var colonAt = syntaxDetail.indexOf(":");
+            if (colonAt > 5) {
+              var lineNo = parseInt(syntaxDetail.substring(5, colonAt), 10);
+              if (lineNo >= 1) {
+                var draftLines = fileContent.split("\n");
+                if (lineNo <= draftLines.length) {
+                  var lq = draftLines[lineNo - 1];
+                  if (lq.length > 80) lq = lq.substring(0, 80);
+                  lineQuote = " Line " + lineNo + " of your draft is: `" + lq + "` — use exactly that as old_string.";
+                }
+              }
+            }
+          }
+          return fail("WRITE PARKED — your content for " + filePath + " has a SYNTAX ERROR (" + syntaxDetail + "), so the file was NOT changed. Nothing was lost: the draft IS SAVED at " + parkPath + "." + lineQuote + " Your NEXT call must be edit_file(file_path=\"" + parkPath + "\", old_string=<the broken line>, new_string=<the fixed line>), then file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). Do NOT call write_file again for this file and do NOT regenerate it.");
         }
         return fail("WRITE REFUSED — the content you sent for " + filePath + " is NOT valid Python (" + syntaxDetail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text. Pass force=true only to write broken code on purpose.");
       }
