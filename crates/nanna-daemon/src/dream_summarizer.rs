@@ -63,10 +63,18 @@ pub async fn summarizer_context_window_tokens(router: &LlmRouter, models: &[Stri
         "context window must be resolved against at least one model"
     );
 
-    let mut smallest_tokens = usize::MAX;
-    for model in models {
+    // Seed with the floor rather than `usize::MAX`: an empty list must fall back
+    // to the smallest safe window, never leave the budget effectively unbounded.
+    // (Both callers guarantee a non-empty list today — this keeps the bound a
+    // bound if a third one ever forgets.)
+    let mut smallest_tokens = MIN_SUMMARIZER_CONTEXT_TOKENS;
+    for (index, model) in models.iter().enumerate() {
         let limit = router.get_model_info(model).await.hard_input_limit();
-        smallest_tokens = smallest_tokens.min(limit);
+        smallest_tokens = if index == 0 {
+            limit
+        } else {
+            smallest_tokens.min(limit)
+        };
     }
 
     let resolved = smallest_tokens.max(MIN_SUMMARIZER_CONTEXT_TOKENS);
