@@ -24,17 +24,21 @@
 //! let result = client.call_tool("read_file", json!({"path": "/tmp/test.txt"})).await?;
 //! ```
 
-mod protocol;
-mod transport;
-mod client;
 mod adapter;
+mod client;
+mod protocol;
+mod schema_guard;
 mod server;
+mod transport;
 
-pub use protocol::*;
-pub use transport::*;
-pub use client::{McpClient, McpClientBuilder};
 pub use adapter::*;
-pub use server::{McpServer, McpServerBuilder, McpServerConfig, ToolHandler, ResourceHandler};
+pub use client::{McpClient, McpClientBuilder};
+pub use protocol::*;
+pub use schema_guard::{
+    MCP_SCHEMA_DEPTH_MAX, MCP_SCHEMA_NODES_MAX, SchemaViolation, validate_tool_schema,
+};
+pub use server::{McpServer, McpServerBuilder, McpServerConfig, ResourceHandler, ToolHandler};
+pub use transport::*;
 
 /// MCP protocol version
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -45,31 +49,35 @@ use thiserror::Error;
 pub enum McpError {
     #[error("Transport error: {0}")]
     Transport(String),
-    
+
     #[error("Protocol error: {0}")]
     Protocol(String),
-    
+
     #[error("JSON-RPC error {code}: {message}")]
-    JsonRpc { code: i32, message: String, data: Option<serde_json::Value> },
-    
+    JsonRpc {
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("Connection closed")]
     ConnectionClosed,
-    
+
     #[error("Timeout waiting for response")]
     Timeout,
-    
+
     #[error("Server not initialized")]
     NotInitialized,
-    
+
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
-    
+
     #[error("Resource not found: {0}")]
     ResourceNotFound(String),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

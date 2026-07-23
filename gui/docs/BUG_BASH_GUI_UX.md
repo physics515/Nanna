@@ -32,6 +32,12 @@ Rolling list of open polish. Promote closed items into ROADMAP dated `[x]` lines
 - Optional: push-logs channel (avoid 1s 2000-line re-serialize) — leftover from P4 logs poll
 - Legacy clawd/Nanna config-path copy residual (local channels toast ref in bug-bash hotfixes)
 
+## Build / packaging (2026-07-23)
+- **[mitigated] Nuxt generate ENOENT on `dist/client/manifest.json`** — dual client Vite passes + artifacts under `node_modules/.cache/nuxt/.nuxt` raced mid-generate (`ELIFECYCLE` exit 1 while nitro kept prerendering). Mitigations: pin `buildDir: '.nuxt'`, drop crawlLinks prerender to `/` only, and wipe `.nuxt` + `node_modules/.cache/nuxt` before every `pnpm generate` (`scripts/clean-nuxt-cache.mjs`). *Still watch for dual "Building client..." lines after a cold wipe — if they reappear the root is Nuxt 4 running two vite client envs concurrently.*
+- **Clippy noise:** unused `README_FILE` import in `nanna-workspace::manager` (production import) — scoped to `#[cfg(test)]`.
+- **Monaco chunk size** — `DIJMKxcW.js` ~4 MB minified; deferred under GUI backlog (lazy-load Monaco).
+- **Dynamic+static import of `@tauri-apps/api/window`** — TitleBar/default.vue dynamic import unused because `useCloseHandler` already static-imports it. Collapse to one style.
+
 ## Regressions to watch
 - Do not splice script/composables mid-`interface` in SFCs (broke `nuxt generate` post-#58)
 - P16: no embedded fallback — offline must stay honest Disconnected, never silent second backend

@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-23 (**P4 UI simplification** — command palette Mod+K, VirtualList for memory/logs/tools, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.) Prior notes condensed below.
+**Last updated:** 2026-07-23 (**nuxt generate manifest-race mitigation** — pin `buildDir`, prerender `/` only, clean-cache script before generate; unused `README_FILE` import scoped to tests. Open agent-tool loop residual: confirm dual client builders gone.) Prior: **P4 UI simplification** — command palette Mod+K, VirtualList, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -270,13 +270,18 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ]  Add Dependabot/Renovate config.
 - [ ]  Resolve deferred clippy warnings (too_many_lines, etc.) — enforce -D warnings in CI.
 - [ ]  Begin decomposing giant files: loop_runner.rs (~132KB), nanna-llm/src/lib.rs (~159KB), gui/src-tauri/src/lib.rs (8k+ lines) — not all required for 0.1 but plan the split.
-- [ ]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
+- [x]  *(2026-07-19)* **`nanna-scripting` python tests are parallelism-flaky under load.** A full
        `cargo test --workspace` run failed 9/9 `python::tests::*` with `Timeout(10000)` because each test spins a
        RustPython interpreter that initializes the frozen stdlib (CPU-heavy); 9 in parallel on a busy machine
-       exceed the 10 s wall-clock guard. They all pass single-threaded (13/13 in 35.9 s, ~2.7 s each). Fix options:
-       raise the per-exec timeout for the test build, mark the python tests `#[serial]` (serial_test crate), or
-       gate their parallelism — so CI `cargo test` is deterministic. Not a product bug (real execs set their own
-       timeout); a test-harness determinism gap.
+       exceed the 10 s wall-clock guard. They all pass single-threaded (13/13 in 35.9 s, ~2.7 s each).
+       *(2026-07-21)* **Fixed by serializing them — zero new deps.** Chose the "gate their parallelism" option
+       over adding `serial_test`: a process-global `static PYTHON_TEST_GUARD: tokio::sync::Mutex<()>` (tokio is
+       already a dep; its guard is `Send`, `.await`-safe so no `await_holding_lock`, runtime-agnostic across each
+       `#[tokio::test]`'s own runtime incl. the `current_thread` one, and non-poisoning so a failing test still
+       releases it) locked as the first statement of all 13 python tests forces one interpreter to build+run at a
+       time. Each test's wall-clock then tracks its solo cost (~2.4 s, well under the smallest 10 s guard)
+       regardless of `--test-threads`. Verified: 13/13 green in 31.2 s, clippy clean (no new warnings), and it is
+       test-only — production `python.exec` sets its own per-call timeout and is untouched.
 
 ### P1 — Core Infrastructure
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
@@ -336,12 +341,57 @@ health checks). **Shipped**, except:
 - [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
       not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
-- [ ] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
+- [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
       Schema 2020-12 (`oneOf`/`anyOf`/conditionals). Two hard requirements for our client: **must not
       auto-dereference external `$ref` URIs**, and **bound schema depth + validation time** (untrusted server
       schemas are a DoS/SSRF surface). Also fold in TOFU description-pinning (see the P6 anti-rug-pull item).
       Source: [MCP 2026-07-28 release candidate](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+      *(2026-07-21)* **Both hard requirements shipped** — new `nanna-mcp::schema_guard`. Every tool
+      `input_schema` returned by a server is gated at the single ingest chokepoint (`refresh_tools`, which all
+      list/refresh paths funnel through) by a pure `validate_tool_schema`: it **rejects any external `$ref`**
+      (external ⇔ the ref does not start with `#`, so absolute URIs / `file://` / relative doc paths are dropped
+      while intra-document fragments — root `#`, JSON-Pointer `#/…`, and 2020-12 plain-name anchors `#node` —
+      pass, since none need a fetch), and **bounds both depth (≤32) and total node count (≤10 000)** so a
+      deep-or-wide hostile schema can't stall later traversals. The walk is **iterative over an explicit,
+      node-bounded work stack** (never recursive → can't itself overflow), and the gate **filters rather than
+      failing the refresh** — one bad tool is logged+dropped, the rest of the server's toolset still loads.
+      Depth/node caps are principled ceilings (a real function-call schema nests a handful of levels / tens of
+      properties; the caps sit ~5×/orders-of-magnitude above that yet below serde_json's 128 parse limit). 10
+      tests (safe-schema, internal-frag accept, https/file/relative/empty reject, deep-nested reject,
+      at-limit accept, wide-node reject, ref-classifier, + a client integration test proving `refresh_tools`
+      drops the external-ref tool and keeps the safe + internal-ref ones in both the returned Vec and the
+      cache). Remaining on this item: `oneOf`/`anyOf`/conditional keyword handling in `schema_to_parameters`,
+      Roots/Sampling/Logging deprecation, and TOFU description-pinning (P6 anti-rug-pull).
+- [~] *(research 2026-07-21)* **Finish the 2026-07-28 RC client migration (non-security half).** Beyond the
+      `$ref`/depth gate shipped above, the RC also: (1) changes the *missing-resource* error code from the
+      MCP-custom **`-32002`** to the JSON-RPC-standard **`-32602` Invalid Params** — we don't match on `-32002`
+      today (grep-clean), so this is forward-compat only, but any future error-code matching must use `-32602`;
+      (2) lets **`structuredContent` be *any* JSON value**, not only an object — `CallToolResult`/adapter should
+      stop assuming an object when structured output lands; (3) lifts input schemas to **JSON Schema 2020-12
+      composition** (`oneOf`/`anyOf`/`allOf`/conditionals + `$defs`) — `schema_to_parameters` currently only
+      reads a flat top-level `properties`, so a composed schema silently yields zero params. Handle composition
+      (at least surface the union of branch properties). Source:
+      [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
+      *(2026-07-21)* **Point (3) shipped** — `schema_to_parameters` is now composition-aware: it folds the
+      `properties` of each `allOf`/`anyOf`/`oneOf` branch (one level deep) into the parameter list on top of the
+      top-level `properties`, so a 2020-12 composed tool no longer yields **zero** params (which would make the
+      model call it with no arguments). A property is required only when the root or an `allOf` branch (all must
+      hold) requires it; `anyOf`/`oneOf` branch props are optional (only one branch applies). Order is root-first
+      then branch order, first-definition-of-a-name-wins; bounded by the finite, already-`schema_guard`-capped
+      schema. Refactored into pure helpers (`collect_schema_object`/`property_to_parameter`) and fixed the old
+      buggy required-lookup in passing. 5 tests (flat props+required, allOf hard-required, anyOf/oneOf optional,
+      first-wins dedup, empty/typeless→String). Remaining: points (1) `-32602` and (2) any-JSON
+      `structuredContent`, plus nested/conditional composition (`if`/`then`/`$defs`).
+- [ ] *(research 2026-07-21)* **Approved-server registry + signed/pinned tool definitions (defense-in-depth
+      for tool-poisoning, OWASP MCP03 / CVE-2025-54136).** Tool *descriptions* enter the agent context as
+      trusted text, so a poisoned description is prompt-injection with supply-chain reach — worst in
+      auto-approve/unattended mode (Nanna's daemon). Layer on top of the `schema_guard` + P6 TOFU-pinning items:
+      treat every third-party server as untrusted by default, keep a registry of approved servers with explicit
+      **version pinning** (block connect if absent), and hash-pin the description+schema at first approval,
+      re-prompting on drift. Pairs with the "drop ACE grants on entering unattended mode" P6 item. Sources:
+      [OWASP MCP Top 10 — Tool Poisoning](https://owasp.org/www-project-mcp-top-10/2025/MCP03-2025%E2%80%93Tool-Poisoning),
+      [State of MCP Security 2026](https://pipelab.org/blog/state-of-mcp-security-2026/).
 - [ ] *(research 2026-07-20)* **HalluSquatting guard on `discover_tools`/skill-install/fetch paths** — agents
       reach for fabricated names in up to 85% of repo requests / 100% of skill installs, and attackers
       pre-register them. Make name→source resolution mandatory before any clone/install/fetch, flag those
@@ -461,6 +511,14 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
+      *(2026-07-23)* **`nuxt generate` manifest race mitigated** — dual Vite client passes were racing
+      `node_modules/.cache/nuxt/.nuxt/dist/client/manifest.json` (ENOENT mid-generate while nitro still
+      prerendered and Tauri packaging kept going). Pin `buildDir: '.nuxt'`, prerender `/` only
+      (`crawlLinks: false`), wipe `.nuxt` + cache before every `pnpm generate`
+      (`gui/scripts/clean-nuxt-cache.mjs`). Also drop unused `README_FILE` import in
+      `nanna-workspace::manager` (test-only). Residual: confirm dual "Building client..." lines never
+      return after a cold wipe; Monaco ~4 MB chunk + `@tauri-apps/api/window` dual-import style logged
+      in `gui/docs/BUG_BASH_GUI_UX.md`.
 
 ##### UI simplification (default calm, power remains)
 - [x] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)
@@ -542,9 +600,19 @@ jitter, priority message queue, graceful 429 handling, health endpoint, PID file
       per Mtok (was wrongly seeded with the legacy Opus-3 $15/$75), Haiku 4.5 is **$1/$5**; cache-read = 0.1x
       input, cache-write = 1.25x input (5-min TTL). Sonnet unchanged at $3/$15. Source:
       [Claude pricing docs](https://platform.claude.com/docs/en/about-claude/pricing).
-      - [ ] Add **Fable 5** (`claude-fable-5`) to the pricing table once its per-Mtok rate is published.
-      - [ ] Config-overridable pricing (`[pricing]` TOML or a fetched table) so rates don't rot in-code; add a
+      - [x] Add **Fable 5** (`claude-fable-5`) to the pricing table once its per-Mtok rate is published.
+            *(2026-07-21)* Added `("claude-fable", 10.00, 50.00, 1.00, 12.50)` — $10 input / $50 output (≈2× Opus
+            4.8), cache-read 0.1× input ($1.00), 5-min cache-write 1.25× input ($12.50). Placed **before** the
+            generic `claude` prefix so `claude-fable-5` resolves to its own row, not the Sonnet fallback (a
+            regression test pins exactly this). Sources: platform.claude.com/docs pricing, anthropic.com/claude/fable.
+      - [~] Config-overridable pricing (`[pricing]` TOML or a fetched table) so rates don't rot in-code; add a
             batch-mode (0.5x) + 1-hour-cache (2.0x) multiplier the tracker can apply.
+            *(2026-07-21)* **Multipliers shipped** as pure `ModelPricing` combinators: `with_batch_discount()`
+            (halves input+output, leaves cache rates — the Batch API doesn't cache) and `with_hour_cache_write()`
+            (cache-write → 2× input, anchored to the input rate so it's exact regardless of the stored 5-min
+            write). Both `#[must_use]`, `debug_assert`-guarded (discount only lowers; 1-h write ≥ input), 2 tests.
+            Still open: making the table itself config-overridable (`[pricing]` TOML / fetched) and wiring the
+            multipliers into the tracker per request-mode.
       *(2026-07-12)* Completeness: `ModelStatsSummary` now carries `total_cache_creation_tokens` (`record()`
       already accumulated it but `summary()` dropped it, hiding cache-write volume and understating cost);
       populated in `summary()` + a regression test. Backward-compatible (additive field; serde consumers ignore

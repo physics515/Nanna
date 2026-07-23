@@ -39,6 +39,44 @@ impl ModelPricing {
             cache_write_usd_per_mtok,
         }
     }
+
+    /// Batch-API pricing: input and output are billed at **50%** of the interactive
+    /// rate. The Batch API does not combine with prompt caching, so the cache rates
+    /// are carried through unchanged (they simply don't apply to a batched request).
+    #[must_use]
+    pub fn with_batch_discount(&self) -> Self {
+        let discounted = Self::new(
+            self.input_usd_per_mtok * 0.5,
+            self.output_usd_per_mtok * 0.5,
+            self.cache_read_usd_per_mtok,
+            self.cache_write_usd_per_mtok,
+        );
+        debug_assert!(
+            discounted.input_usd_per_mtok <= self.input_usd_per_mtok
+                && discounted.output_usd_per_mtok <= self.output_usd_per_mtok,
+            "the batch rate can only lower input/output"
+        );
+        discounted
+    }
+
+    /// 1-hour prompt-cache pricing: the cache-**write** rate rises to **2x** the
+    /// fresh-input rate (vs 1.25x for the default 5-minute TTL). Cache reads, input,
+    /// and output are unchanged. Anchored to the input rate rather than scaling the
+    /// stored 5-minute write, so it is exact regardless of how the row was seeded.
+    #[must_use]
+    pub fn with_hour_cache_write(&self) -> Self {
+        let hourly = Self::new(
+            self.input_usd_per_mtok,
+            self.output_usd_per_mtok,
+            self.cache_read_usd_per_mtok,
+            self.input_usd_per_mtok * 2.0,
+        );
+        debug_assert!(
+            hourly.cache_write_usd_per_mtok >= self.input_usd_per_mtok,
+            "a 1-hour cache write is never cheaper than a fresh input token"
+        );
+        hourly
+    }
 }
 
 /// Tokens in one pricing unit (rates are quoted per 1M tokens).
@@ -60,7 +98,12 @@ const PRICING_TABLE: &[(&str, f64, f64, f64, f64)] = &[
     ("claude-3-5-haiku", 0.80, 4.00, 0.08, 1.00),
     ("claude-3-opus", 15.00, 75.00, 1.50, 18.75), // legacy Opus 3
     ("claude-opus", 5.00, 25.00, 0.50, 6.25),     // generic Opus → 4.x rate
-    ("claude", 3.00, 15.00, 0.30, 3.75),          // generic Claude → Sonnet rate
+    // Fable 5 (2026-06): $10/$50, ~2x Opus 4.8. Cache read 0.1x input ($1.00);
+    // 5-min cache write 1.25x input ($12.50). Must precede the generic "claude"
+    // fallback below, else "claude-fable-5" resolves to the Sonnet rate.
+    // Source: platform.claude.com/docs pricing; anthropic.com/claude/fable.
+    ("claude-fable", 10.00, 50.00, 1.00, 12.50),
+    ("claude", 3.00, 15.00, 0.30, 3.75), // generic Claude → Sonnet rate
     // OpenAI GPT (cache read ~0.5x input; no separate cache-write charge).
     ("gpt-5", 1.25, 10.00, 0.625, 1.25),
     ("gpt-4o-mini", 0.15, 0.60, 0.075, 0.15),
@@ -172,5 +215,43 @@ mod tests {
         assert!(default_pricing("local-qwen-3.5-9b").is_none());
         assert!(default_pricing("qwen2.5:latest").is_none());
         assert!(default_pricing("some-model-nobody-knows").is_none());
+    }
+
+    // Fable 5 resolves to its own $10/$50 row, NOT the generic "claude" Sonnet
+    // fallback (the row must sit before the generic prefix in the table).
+    #[test]
+    fn fable_5_resolves_to_its_own_rate() {
+        let fable = default_pricing("claude-fable-5").expect("fable is priced");
+        assert!((fable.input_usd_per_mtok - 10.0).abs() < f64::EPSILON);
+        assert!((fable.output_usd_per_mtok - 50.0).abs() < f64::EPSILON);
+        assert!((fable.cache_read_usd_per_mtok - 1.0).abs() < f64::EPSILON);
+        assert!((fable.cache_write_usd_per_mtok - 12.5).abs() < f64::EPSILON);
+        // Dated id resolves the same, and is pricier than the generic claude fallback.
+        let generic = default_pricing("claude-instant-xyz").unwrap();
+        assert!(fable.output_usd_per_mtok > generic.output_usd_per_mtok);
+    }
+
+    // Batch API halves input/output and leaves cache rates alone.
+    #[test]
+    fn batch_discount_halves_input_and_output() {
+        let base = ModelPricing::new(10.0, 50.0, 1.0, 12.5); // Fable 5
+        let batch = base.with_batch_discount();
+        assert!((batch.input_usd_per_mtok - 5.0).abs() < f64::EPSILON);
+        assert!((batch.output_usd_per_mtok - 25.0).abs() < f64::EPSILON);
+        // Cache classes are unchanged (batch does not cache).
+        assert!((batch.cache_read_usd_per_mtok - 1.0).abs() < f64::EPSILON);
+        assert!((batch.cache_write_usd_per_mtok - 12.5).abs() < f64::EPSILON);
+    }
+
+    // 1-hour cache raises the write rate to 2x input; nothing else moves.
+    #[test]
+    fn hour_cache_write_is_twice_input() {
+        let base = ModelPricing::new(10.0, 50.0, 1.0, 12.5); // Fable 5, 5-min write
+        let hourly = base.with_hour_cache_write();
+        assert!((hourly.cache_write_usd_per_mtok - 20.0).abs() < f64::EPSILON);
+        // Input/output/read untouched.
+        assert!((hourly.input_usd_per_mtok - 10.0).abs() < f64::EPSILON);
+        assert!((hourly.output_usd_per_mtok - 50.0).abs() < f64::EPSILON);
+        assert!((hourly.cache_read_usd_per_mtok - 1.0).abs() < f64::EPSILON);
     }
 }

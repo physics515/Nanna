@@ -1,13 +1,23 @@
 //! High-level MCP client implementation
 
 use crate::{
-    protocol::{ServerInfo, ServerCapabilities, Tool, Resource, Prompt, RequestId, JsonRpcRequest, InitializeResult, InitializeParams, ClientCapabilities, RootsCapability, ClientInfo, JsonRpcNotification, ListToolsResult, CallToolResult, CallToolParams, ListResourcesResult, ReadResourceResult, ReadResourceParams, ListPromptsResult, GetPromptResult, GetPromptParams}, transport::{Transport, McpList}, McpError, Result,
+    McpError, Result,
+    protocol::{
+        CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, GetPromptParams,
+        GetPromptResult, InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest,
+        ListPromptsResult, ListResourcesResult, ListToolsResult, Prompt, ReadResourceParams,
+        ReadResourceResult, RequestId, Resource, RootsCapability, ServerCapabilities, ServerInfo,
+        Tool,
+    },
+    transport::{McpList, Transport},
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::schema_guard::validate_tool_schema;
 
 /// MCP protocol version
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -127,22 +137,25 @@ impl<T: Transport> McpClient<T> {
 
         // Pre-fetch tools, resources, and prompts if supported
         if result.capabilities.tools.is_some()
-            && let Ok(tools_result) = self.list_tools_internal().await {
-                let mut tools = self.tools.write().await;
-                *tools = tools_result.tools;
-            }
+            && let Ok(tools_result) = self.list_tools_internal().await
+        {
+            let mut tools = self.tools.write().await;
+            *tools = Self::gate_tool_schemas(tools_result.tools);
+        }
 
         if result.capabilities.resources.is_some()
-            && let Ok(resources_result) = self.list_resources_internal().await {
-                let mut resources = self.resources.write().await;
-                *resources = resources_result.resources;
-            }
+            && let Ok(resources_result) = self.list_resources_internal().await
+        {
+            let mut resources = self.resources.write().await;
+            *resources = resources_result.resources;
+        }
 
         if result.capabilities.prompts.is_some()
-            && let Ok(prompts_result) = self.list_prompts_internal().await {
-                let mut prompts = self.prompts.write().await;
-                *prompts = prompts_result.prompts;
-            }
+            && let Ok(prompts_result) = self.list_prompts_internal().await
+        {
+            let mut prompts = self.prompts.write().await;
+            *prompts = prompts_result.prompts;
+        }
 
         Ok(result)
     }
@@ -198,9 +211,41 @@ impl<T: Transport> McpClient<T> {
     pub async fn refresh_tools(&self) -> Result<Vec<Tool>> {
         self.ensure_initialized().await?;
         let result = self.list_tools_internal().await?;
+        let safe = Self::gate_tool_schemas(result.tools);
         let mut tools = self.tools.write().await;
-        *tools = result.tools.clone();
-        Ok(result.tools)
+        *tools = safe.clone();
+        Ok(safe)
+    }
+
+    /// Drop any tool whose server-supplied `input_schema` breaches the untrusted-schema
+    /// bounds (over-deep, over-large, or carrying an external `$ref` we refuse to fetch).
+    ///
+    /// A single hostile or malformed tool must not deny the whole server's toolset, so
+    /// this filters rather than failing the refresh — the offender is logged and skipped
+    /// while every safe tool still reaches the cache.
+    fn gate_tool_schemas(tools: Vec<Tool>) -> Vec<Tool> {
+        let count_in = tools.len();
+        let safe: Vec<Tool> = tools
+            .into_iter()
+            .filter(|tool| match validate_tool_schema(&tool.input_schema) {
+                Ok(()) => true,
+                Err(violation) => {
+                    warn!(
+                        tool = %tool.name,
+                        %violation,
+                        "Dropping MCP tool with an unsafe input schema"
+                    );
+                    false
+                }
+            })
+            .collect();
+        debug_assert!(
+            safe.len() <= count_in,
+            "gating can only drop tools, never add: {} in, {} out",
+            count_in,
+            safe.len()
+        );
+        safe
     }
 
     /// Call a tool by name
@@ -563,5 +608,72 @@ mod tests {
         // Flag was consumed: a following call serves the refreshed cache, no request.
         let after = client.list_tools().await.unwrap();
         assert_eq!(after[0].name, "tool-1");
+    }
+
+    /// A transport that returns a fixed mix of safe and unsafe tool schemas, so a test
+    /// can assert the ingest gate drops only the unsafe ones.
+    struct MixedSchemaTransport;
+
+    #[async_trait::async_trait]
+    impl Transport for MixedSchemaTransport {
+        async fn request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
+            let result = serde_json::json!({
+                "tools": [
+                    { "name": "safe", "inputSchema": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } }
+                    }},
+                    { "name": "external-ref", "inputSchema": {
+                        "type": "object",
+                        "properties": { "x": { "$ref": "https://evil.example/s.json" } }
+                    }},
+                    { "name": "internal-ref-ok", "inputSchema": {
+                        "type": "object",
+                        "properties": { "y": { "$ref": "#/$defs/y" } }
+                    }},
+                ]
+            });
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            })
+        }
+        async fn notify(&self, _n: JsonRpcNotification) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+        fn list_changed_flags(&self) -> Option<Arc<ListChangedFlags>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_tools_drops_tools_with_unsafe_schemas() {
+        let client = McpClient::new(MixedSchemaTransport);
+        *client.initialized.write().await = true;
+
+        let tools = client.refresh_tools().await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // The external-$ref tool is gated out; the safe tool and the internal-fragment
+        // ref survive (a `#/…` ref needs no fetch).
+        assert!(names.contains(&"safe"), "safe tool must survive: {names:?}");
+        assert!(
+            names.contains(&"internal-ref-ok"),
+            "internal fragment ref must survive: {names:?}"
+        );
+        assert!(
+            !names.contains(&"external-ref"),
+            "external $ref tool must be dropped: {names:?}"
+        );
+        assert_eq!(tools.len(), 2, "exactly one tool should be gated out");
+
+        // The cache reflects the gated set too (not just the returned Vec).
+        let cached = client.list_tools().await.unwrap();
+        assert_eq!(cached.len(), 2, "cache must hold only the safe tools");
     }
 }
