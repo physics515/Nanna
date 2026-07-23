@@ -483,9 +483,14 @@ impl AgentService {
 
         // Index-based walk so a transient provider fault can retry the SAME
         // model (`continue` without advancing) before falling down the
-        // priority list. `same_model_retries` is bounded by
-        // CHAT_TRANSIENT_RETRIES_MAX, so total attempts are bounded by
-        // models_to_try.len() * (1 + CHAT_TRANSIENT_RETRIES_MAX).
+        // priority list. `same_model_retries` counts CONSECUTIVE
+        // no-progress faults: it is bounded by CHAT_TRANSIENT_RETRIES_MAX
+        // and replenished when a failed attempt completed at least one tool
+        // call first (a fault after real forward work is a new burst, not an
+        // escalation of the last one). Total attempts are therefore bounded
+        // by models_to_try.len() * (1 + CHAT_TRANSIENT_RETRIES_MAX) plus one
+        // per completed-tool burst — the loop cannot spin without the model
+        // doing real work between faults.
         let mut model_index = 0usize;
         let mut same_model_retries = 0usize;
 
@@ -880,6 +885,28 @@ impl AgentService {
                     // branch below honors the provider's Retry-After and the
                     // shared-bucket skip instead of hammering it. A cancelled
                     // chat must not heal either — no retry, no server surgery.
+                    // A fault after real forward progress starts a NEW burst:
+                    // replenish the same-model retry budget instead of letting
+                    // it accumulate across the whole message. A single-prompt
+                    // long-horizon mission gets exactly one user message — a
+                    // cumulative budget that survives hours of successful tool
+                    // rounds and then kills the run on the third hiccup is a
+                    // per-mission bound dressed up as a per-fault one. Progress
+                    // means at least one tool call completed this attempt
+                    // (completed_tools is cleared at attempt start), so the
+                    // heal loop cannot spin without real work between faults;
+                    // consecutive no-progress faults still climb the
+                    // unload→restart ladder and exhaust at the max.
+                    if same_model_retries > 0 && crate::tasks::is_transient_llm_error(&error_str) {
+                        let attempt_tool_calls = completed_tools.read().await.len();
+                        if attempt_tool_calls > 0 {
+                            info!(
+                                "Attempt completed {attempt_tool_calls} tool calls before this fault — new transient burst, retry budget replenished"
+                            );
+                            same_model_retries = 0;
+                        }
+                    }
+
                     if crate::tasks::is_transient_llm_error(&error_str)
                         && !Self::is_rate_limit_error(&error_str)
                         && !cancellation_flag.load(Ordering::Relaxed)
