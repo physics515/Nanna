@@ -42,12 +42,14 @@ export default {
 
       if (existingSize > 500 && bytes < existingSize * 0.3) {
         return {
-          content: "❌ BLOCKED: Refusing to write " + bytes + " bytes to " + filePath +
-            " — the existing file is " + existingSize + " bytes (" +
-            Math.round(bytes / existingSize * 100) + "% of original). " +
-            "This looks like accidental truncation. " +
-            "Either re-read the file and write the COMPLETE version, " +
-            "or use force=true if you intentionally want a smaller file.",
+          content: "WRITE REFUSED — the file was NOT modified and is fully intact. " +
+            "You tried to write only " + bytes + " bytes over " + filePath +
+            " which currently holds " + existingSize + " bytes (" +
+            Math.round(bytes / existingSize * 100) + "% of it). That usually means " +
+            "you sent a fragment instead of the whole file. To proceed: " +
+            "(1) read_file " + filePath + ", (2) merge your change into the FULL text, " +
+            "(3) call write_file again with the complete content. " +
+            "Only use force=true if you truly want the file replaced by this smaller version.",
           success: false
         };
       }
