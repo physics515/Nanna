@@ -1,11 +1,14 @@
 // Monaco editor setup - client only
 import { loader } from '@guolao/vue-monaco-editor'
 import * as monaco from 'monaco-editor'
-import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
-import jsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker'
-import cssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker'
-import htmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker'
-import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
+// monaco-editor 0.56 added a package `exports` map (`"./*": "./esm/vs/*.js"`), so the
+// old `monaco-editor/esm/vs/<path>` specifiers now resolve to `esm/vs/esm/vs/<path>.js`
+// and fail. The public subpath is everything *below* `esm/vs/`.
+import editorWorker from 'monaco-editor/editor/editor.worker?worker'
+import jsonWorker from 'monaco-editor/language/json/json.worker?worker'
+import cssWorker from 'monaco-editor/language/css/css.worker?worker'
+import htmlWorker from 'monaco-editor/language/html/html.worker?worker'
+import tsWorker from 'monaco-editor/language/typescript/ts.worker?worker'
 
 export default defineNuxtPlugin(() => {
   // Set up Monaco environment for workers

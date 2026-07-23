@@ -1668,6 +1668,23 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      `nanna-gui`** builds green; scripting 19+1 / llm 28 / agent 61 tests pass; clippy clean on the
      bumped crates. Frontend: `tailwindcss`/`@tailwindcss/postcss 4.3.3`, `postcss 8.5.19`,
      `vue 3.5.40` applied green (`pnpm build` → nitro + client, 2.25 MB / 502 kB gzip).
+   - *(2026-07-23 sweep)* `cargo update` → 8 compatible bumps (`clap`/`clap_derive 4.6.4`, `libc 0.2.189`,
+     `tokio-util 0.7.19`, `syn 3.0.3`, `glob 0.3.4`, `rustls-pki-types 1.15.1`, `foreign-types-macros 0.2.4`).
+     `cargo upgrade --incompatible` → **nothing behind** (71 packages already latest; only the intentional
+     `aegis`/`turso` pins + the boa git rev). Workspace builds green, **~600 tests pass**, clippy clean.
+     Frontend: `nuxt 4.4.8 → 4.5.0`, `postcss 8.5.22`, `happy-dom 20.11.1`, `@tauri-apps/plugin-dialog 2.7.2`,
+     and **`monaco-editor 0.55.1 → 0.56.0`** — the last one is a **real migration**, not a passthrough:
+     0.56 (PR #5155 "exported modules reorganization") added a package `exports` map
+     (`"./*": "./esm/vs/*.js"`), so every pre-existing `monaco-editor/esm/vs/<path>` specifier now resolves
+     to `esm/vs/esm/vs/<path>.js` and `nuxt generate` **fails** ("Rolldown failed to resolve import
+     `monaco-editor/esm/vs/editor/editor.worker?worker`"). Fix: drop the now-implicit `esm/vs/` prefix from
+     all five worker imports in `gui/app/plugins/monaco.client.ts` (`monaco-editor/editor/editor.worker`,
+     `monaco-editor/language/{json,css,html,typescript}/…`). `editor.worker.js` itself did **not** move —
+     only the specifier did. Verified by the five worker chunks still emitting separately
+     (editor 300 kB · json 430 kB · css 1.07 MB · html 740 kB · ts 6.9 MB), `pnpm generate` green, 56 vitest
+     green. **Deferred majors this run** (each needs its own migration): `@tiptap/* 2 → 3.28`, `marked 17 → 18`,
+     `vue-router 4 → 5`, `vue-sonner 1 → 2`, `lucide-vue-next → @lucide/vue` (rename), and newly
+     **`typescript 5.9 → 7.0`** (the Go-port compiler — needs a `vue-tsc` compatible with TS 7 before it can land).
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
