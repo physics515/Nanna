@@ -379,7 +379,10 @@ fn detect_tool_call_loop(records: &[ToolCallRecord]) -> bool {
     };
     // Write-tool inputs are size-stubbed in the records ("[N bytes written]"),
     // so two distinct same-length writes would look identical — exempt them.
-    if matches!(last.name.as_str(), "write_file" | "write" | "Write") {
+    if matches!(
+        last.name.as_str(),
+        "write_file" | "write" | "Write" | "file_buffer"
+    ) {
         return false;
     }
     last.name == prev.name && last.input == prev.input && last.output == prev.output
@@ -2354,7 +2357,7 @@ impl Agent {
                             );
                             obj.insert(
                                 "content".to_string(),
-                                Value::String(format!("[content omitted from context — {size} bytes were written successfully to disk]")),
+                                Value::String(format!("[content omitted here ONLY because your context window is limited — all {size} bytes were written successfully and are intact on disk; read_file to see them]")),
                             );
                         }
                     }
@@ -2585,7 +2588,10 @@ impl Agent {
                             } else {
                                 let end = truncate_boundary(&result_content, threshold);
                                 format!(
-                                    "{}...\n\n[truncated — showing {end} of {} chars.]",
+                                    "{}...\n\n[PREVIEW CUT — the full output ({} chars) would \
+                                     crowd out your limited context window, so only {end} \
+                                     chars are shown. The tool call SUCCEEDED in full and \
+                                     its effect is intact.]",
                                     &result_content[..end],
                                     result_content.len()
                                 )
@@ -2606,7 +2612,11 @@ impl Agent {
                             // Fallback: truncate at a clean boundary
                             let end = truncate_boundary(&result_content, threshold);
                             format!(
-                                "{}...\n\n[truncated — showing {end} of {} chars. Use recall with a more specific query to find particular details.]",
+                                "{}...\n\n[PREVIEW CUT — the full output ({} chars) would \
+                                 crowd out your limited context window, so only {end} chars \
+                                 are shown. The tool call SUCCEEDED in full and its effect \
+                                 is intact. Use recall with a more specific query for \
+                                 particular details.]",
                                 &result_content[..end],
                                 result_content.len()
                             )
@@ -2647,12 +2657,15 @@ impl Agent {
                     if options.on_memory.is_some() && result_content.len() > threshold {
                         let chunk_count = (result_content.len() / 3200).max(1);
                         format!(
-                            "[Result from '{}' stored in memory (source_id={}, {} chunks, {} chars). \
-                             Use recall('query about {}') to retrieve specific sections.]",
+                            "[SUCCEEDED — the full {} -char result from '{}' was stored in \
+                             memory (source_id={}, {} chunks). WHY this stub: the result is \
+                             too large to keep in your limited context window; nothing was \
+                             lost. Use recall('query about {}') to retrieve specific \
+                             sections.]",
+                            result_content.len(),
                             name,
                             source_id,
                             chunk_count,
-                            result_content.len(),
                             name
                         )
                     } else {
@@ -3985,8 +3998,13 @@ fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
 }
 
 /// Check if a tool name is a write-type tool whose content should be stripped from context.
+/// `file_buffer` appends carry 20-40-line chunks that live in the on-disk
+/// buffer after the call — keeping them in context doubles their cost.
 fn is_write_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "write" | "Write" | "create_tool")
+    matches!(
+        name,
+        "write_file" | "write" | "Write" | "create_tool" | "file_buffer"
+    )
 }
 
 #[cfg(test)]

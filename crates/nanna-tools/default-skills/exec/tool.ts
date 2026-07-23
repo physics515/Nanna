@@ -68,6 +68,15 @@ export default {
         nulAt = cmdLower.indexOf(">nul", nulAt + 4);
       }
     }
+    if (!cmdism && cmdLower.indexOf("type ") === 0 && (cmdLower.indexOf(":\\") !== -1 || cmdLower.indexOf(":/") !== -1)) {
+      // cmd.exe `type <file>` prints a file; bash `type` describes a
+      // command, so `type D:\...` just echoes the path back (observed
+      // live twice — the model believed it had read the file).
+      return {
+        content: "NOT EXECUTED — in bash, 'type' does not print files (that is cmd.exe). Use: cat \"" + (input.command.split(" ").slice(1).join(" ").split("|")[0].trim()) + "\" instead. Then call exec again.",
+        success: false
+      };
+    }
     if (cmdism) {
       return {
         content: "NOT EXECUTED — exec runs Git Bash (POSIX), not cmd.exe, and your command contains cmd.exe syntax ('" + cmdism + "'). Rewrite with bash: '[ -d path ]' / '[ -f path ]' to test existence, 'ls' to list, '2>/dev/null' to silence errors, 'mkdir -p' to create dirs. Then call exec again.",

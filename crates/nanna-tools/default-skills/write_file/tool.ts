@@ -132,6 +132,10 @@ export default {
       return fail("write_file failed writing " + filePath + " (" + writeErr + "). Retry the same call; if it fails again, read_file to verify the file state.");
     }
 
-    return { content: "Wrote " + bytes + " bytes to " + filePath, written: fileContent };
+    // Deliberately NO echo of the written content: echoing the whole file
+    // made the result exceed the context threshold, and the model read the
+    // resulting truncation stub as "my write was discarded" (observed
+    // live, round 7). The file on disk is the source of truth.
+    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." };
   }
 }
