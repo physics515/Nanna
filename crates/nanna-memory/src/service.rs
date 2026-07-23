@@ -1162,8 +1162,15 @@ impl MemoryService {
                 .commit_duplicate_fold(embed_fn, &survivors[target_index], &candidate, &merged)
                 .await
             {
-                Ok(()) => {
+                Ok(new_embedding) => {
+                    // Keep the in-memory copy in step with the store — including
+                    // the vector. A survivor left holding its pre-merge embedding
+                    // would be compared (and later clustered) on a vector that no
+                    // longer describes its content.
                     survivors[target_index].content = merged;
+                    if let Some(embedding) = new_embedding {
+                        survivors[target_index].embedding = embedding;
+                    }
                     survivors[target_index].fsrs.importance = survivors[target_index]
                         .fsrs
                         .importance
@@ -1200,26 +1207,35 @@ impl MemoryService {
     /// Persist one duplicate fold: rewrite the survivor (merged content, fresh
     /// embedding, inherited FSRS), then drop the source. Update-before-remove,
     /// so a partial failure can only leave a duplicate, never lose content.
+    ///
+    /// Returns the survivor's **new embedding** when the content changed (so the
+    /// caller's in-memory copy can be kept in step with the store — a stale
+    /// vector on a rewritten entry is the recurring bug class in this path), or
+    /// `None` when a pure superset fold left the content, and thus the vector,
+    /// already correct.
     async fn commit_duplicate_fold(
         &self,
         embed_fn: &EmbedFn,
         survivor: &MemoryEntry,
         source: &MemoryEntry,
         merged: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<Option<Vec<f32>>, MemoryError> {
         debug_assert_ne!(survivor.id, source.id, "a memory cannot fold into itself");
         debug_assert!(!merged.is_empty(), "merged content must not be empty");
 
         // Re-embed only when the text actually changed; a pure superset fold
         // leaves the survivor's content (and therefore its vector) correct.
-        if merged != survivor.content {
+        let new_embedding = if merged == survivor.content {
+            None
+        } else {
             let embedding = (embed_fn)(merged)
                 .await
                 .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
             self.store
-                .update_content_and_embedding(&survivor.id, merged, embedding)
+                .update_content_and_embedding(&survivor.id, merged, embedding.clone())
                 .await?;
-        }
+            Some(embedding)
+        };
 
         let inherited_importance = survivor.fsrs.importance.max(source.fsrs.importance);
         let inherited_access = source.fsrs.access_count;
@@ -1231,7 +1247,7 @@ impl MemoryService {
             .await?;
 
         self.store.remove(&source.id).await?;
-        Ok(())
+        Ok(new_embedding)
     }
 
     /// Consolidate a single cluster of memories
@@ -1959,6 +1975,60 @@ mod tests {
             "no LLM call may be made for the Detailed band"
         );
         assert!(service.count().await < 4, "the band must have compressed");
+    }
+
+    /// A rewritten survivor must not keep its pre-merge vector. Stale embeddings
+    /// on rewritten entries are the recurring bug class in this path: the
+    /// returned survivor is fed straight into `cluster_memories`, so a stale
+    /// vector would cluster it by content it no longer holds.
+    #[tokio::test]
+    async fn dedup_survivor_embedding_tracks_its_rewritten_content() {
+        // An embedder that returns a *distinct* vector for merged content, so a
+        // stale copy is detectable rather than coincidentally equal.
+        let embed: EmbedFn = Arc::new(|text: &str| {
+            let v = if text.contains(';') {
+                vec![0.0_f32, 1.0, 0.0] // merged (the fold joins with "; ")
+            } else {
+                vec![1.0_f32, 0.0, 0.0] // original
+            };
+            Box::pin(async move { Ok(v) })
+        });
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 3,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+        let mut result = ConsolidationResult::default();
+
+        // Distinct wording => the fold appends, so the content really changes.
+        let band = vec![
+            dedup_entry("a", "deploy key in vault", vec![1.0, 0.0, 0.0], None),
+            dedup_entry("b", "key stored in the vault", vec![1.0, 0.0, 0.0], None),
+        ];
+        for entry in &band {
+            service.add_entry(entry.clone()).await.expect("seed");
+        }
+
+        let survivors = service.fold_near_duplicates(band, 10, &mut result).await;
+        assert_eq!(result.memories_deduped, 1);
+
+        let survivor = &survivors[0];
+        assert!(survivor.content.contains(';'), "content must have merged");
+        assert_ne!(
+            survivor.embedding,
+            vec![1.0_f32, 0.0, 0.0],
+            "survivor must not keep its pre-merge embedding"
+        );
+
+        // …and it must match what the store actually persisted.
+        let stored = service
+            .search_by_embedding(&[0.0_f32, 1.0, 0.0], 1)
+            .await
+            .first()
+            .map(|(entry, _)| entry.clone())
+            .expect("survivor must be in the store");
+        assert_eq!(stored.id, survivor.id);
+        assert_eq!(stored.content, survivor.content);
     }
 
     #[tokio::test]

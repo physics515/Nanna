@@ -1132,9 +1132,10 @@ impl DaemonServer {
                                     Ok(Some((trigger, stats))) => {
                                         info!(
                                             "Scheduled dream ({trigger:?}): {} processed, \
-                                             {} merged, {} promoted, {} demoted",
+                                             {} merged, {} deduped, {} promoted, {} demoted",
                                             stats.consolidation.memories_processed,
                                             stats.consolidation.memories_merged,
+                                            stats.consolidation.memories_deduped,
                                             stats.auto_promoted,
                                             stats.auto_demoted,
                                         );
