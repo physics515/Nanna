@@ -121,6 +121,28 @@ async fn versioned_copy_names_are_refused() {
 }
 
 #[tokio::test]
+async fn parked_draft_blocks_further_whole_file_writes() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("a.py").to_string_lossy().into_owned();
+    std::fs::write(dir.path().join("a.py.__buffer__"), "draft = (").unwrap();
+
+    // Round-10 lesson: with a parked draft present, regeneration is not an
+    // option — the rail forces the repair (or explicit clear) path.
+    let err = run_fail(
+        json!({ "file_path": target, "content": "print('regenerated')\n" }),
+        dir.path(),
+    )
+    .await;
+    assert!(err.contains("WRITE BLOCKED"), "got: {err}");
+    assert!(err.contains("edit_file"), "got: {err}");
+    assert!(err.contains("clear"), "got: {err}");
+    assert!(!dir.path().join("a.py").exists(), "target must stay unwritten");
+}
+
+#[tokio::test]
 async fn shrink_guard_still_refuses_fragments() {
     if skill_missing() {
         return;
