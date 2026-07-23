@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.1",
+  version: "0.1.2",
   output: "context",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit.",
   parameters: {
@@ -170,7 +170,7 @@ export default {
         return fail("file_buffer failed writing " + filePath + " (" + cErr + "). The buffer is KEPT — retry the commit.");
       }
       try {
-        Nanna.exec("rm -f '" + bufPath + "'", null, 15);
+        Nanna.exec("rm -f '" + bufPath + "' '" + filePath + ".__cleared__'", null, 15);
       } catch (eRm) {
         try { Nanna.writeFile(bufPath, ""); } catch (eZ) { /* leftovers are harmless */ }
       }
@@ -191,12 +191,37 @@ export default {
     }
 
     if (action === "clear" || action === "discard" || action === "reset") {
+      // Friction on serial discards (round-11 lesson: the model deleted
+      // parked drafts to regenerate — first via shell rm, and clear would
+      // be the same loop with a different name). The first discard per
+      // file is free; the second requires force, and the refusal steers
+      // back to the one-line repair.
+      var clearMarker = filePath + ".__cleared__";
+      if (input.force !== true) {
+        var clearedBefore = null;
+        try {
+          clearedBefore = Nanna.readFile(clearMarker);
+        } catch (eMk) {
+          // First discard.
+        }
+        if (clearedBefore !== null && clearedBefore !== undefined) {
+          var steer = "";
+          if (buffered !== null && buffered !== "") {
+            var clearDetail = pythonSyntaxRefusal(filePath, buffered);
+            if (clearDetail) {
+              steer = " The current draft has exactly one blocking error (" + clearDetail + ") — fixing that one line is faster than regenerating.";
+            }
+          }
+          return fail("CLEAR REFUSED — you already discarded one draft for " + filePath + "; discarding again is the regeneration loop." + steer + " Repair the draft: edit_file(file_path=\"" + bufPath + "\", old_string=<the broken line>, new_string=<the fix>), then file_buffer(action=\"commit\"). Pass force=true to discard anyway.");
+        }
+        try { Nanna.writeFile(clearMarker, "1"); } catch (eWk) { /* best effort */ }
+      }
       try {
         Nanna.exec("rm -f '" + bufPath + "'", null, 15);
       } catch (eRm2) {
         try { Nanna.writeFile(bufPath, ""); } catch (eZ2) { /* best effort */ }
       }
-      return { content: "Buffer for " + filePath + " discarded. The real file was not touched.", success: true };
+      return { content: "Buffer for " + filePath + " discarded. The real file was not touched. NOTE: the next discard for this file will require force=true — repair drafts instead of regenerating them.", success: true };
     }
 
     return fail("file_buffer failed: unknown action '" + action + "'. Use append (add the next chunk), commit (write the file), show (preview), or clear (discard). Nothing was changed.");
