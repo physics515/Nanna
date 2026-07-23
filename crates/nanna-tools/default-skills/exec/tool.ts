@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.0",
+  version: "0.1.1",
   output: "context",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -9,7 +9,7 @@ export default {
   // build/VCS command is never preempted by the engine (which would orphan the
   // child). A larger explicit `timeout` extends this deadline automatically.
   timeout: 180,
-  description: "Execute a shell command in a POSIX shell (Git Bash on Windows, sh on Unix) and return its output. Use bash syntax: pipes, &&, [ -f x ], cat/grep/tail, forward-slash paths. Do not use cmd.exe idioms (no 'cd /d'; prefer forward slashes over backslashes). To search code, use the code_search tool — rg/ripgrep is not guaranteed on PATH. Use for build commands, scripts, git operations, etc.",
+  description: "Execute a shell command in a POSIX bash shell (Git Bash on Windows, sh on Unix) and return its output. ALWAYS bash syntax: pipes, &&, ||, [ -f x ] / [ -d x ], ls, cat/grep/tail, mkdir -p, 2>/dev/null, forward-slash paths. NEVER cmd.exe syntax — 'if exist', '2>nul', 'cd /d', 'errorlevel' all FAIL here. To search code, use the code_search tool — rg/ripgrep is not guaranteed on PATH. Use for build commands, scripts, git operations, etc.",
   parameters: {
     type: "object",
     properties: {
@@ -42,6 +42,37 @@ export default {
       if (cmdLower.indexOf(denylist[i].toLowerCase()) === 0) {
         return "Error: Command blocked by safety check: \"" + denylist[i] + "\"";
       }
+    }
+
+    // This shell is Git Bash, not cmd.exe. Catch unambiguous cmd.exe syntax
+    // BEFORE running it so the model gets a correction instead of a cryptic
+    // bash parse error (observed live: small models mix shells). Markers are
+    // chosen to avoid matching legitimate bash that merely mentions the
+    // words (e.g. grep for "errorlevel" in code is fine; "if errorlevel "
+    // is the cmd.exe conditional).
+    var cmdisms = ["if exist ", "if not exist ", "cd /d ", "if errorlevel "];
+    var cmdism = null;
+    for (var j = 0; j < cmdisms.length; j++) {
+      if (cmdLower.indexOf(cmdisms[j]) !== -1) { cmdism = cmdisms[j].trim(); break; }
+    }
+    if (!cmdism) {
+      // ">nul" only counts as cmd.exe when it stands alone — not as a
+      // prefix of a real filename like ">nul_check.txt".
+      var nulAt = cmdLower.indexOf(">nul");
+      while (nulAt !== -1) {
+        var afterNul = cmdLower.charAt(nulAt + 4);
+        if (afterNul === "" || afterNul === " " || afterNul === "\t" || afterNul === "&" || afterNul === "2") {
+          cmdism = ">nul";
+          break;
+        }
+        nulAt = cmdLower.indexOf(">nul", nulAt + 4);
+      }
+    }
+    if (cmdism) {
+      return {
+        content: "NOT EXECUTED — exec runs Git Bash (POSIX), not cmd.exe, and your command contains cmd.exe syntax ('" + cmdism + "'). Rewrite with bash: '[ -d path ]' / '[ -f path ]' to test existence, 'ls' to list, '2>/dev/null' to silence errors, 'mkdir -p' to create dirs. Then call exec again.",
+        success: false
+      };
     }
 
     var result = Nanna.exec(input.command, input.workdir, input.timeout);

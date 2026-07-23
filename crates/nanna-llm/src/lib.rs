@@ -932,6 +932,33 @@ impl LlmClient {
             .unwrap_or_else(|_| Client::new())
     }
 
+    /// Ollama-specific HTTP client. Local streaming generations legitimately
+    /// run for minutes, so no TOTAL request deadline — a genuine stall is
+    /// caught by the read timeout (silence between chunks) instead, which a
+    /// healthy stream never hits. Idle connections are never pooled: reusing
+    /// a loopback connection the OS/filter stack half-closed surfaces as a
+    /// clean EOF mid-stream (observed live 2026-07-23 as "no done=true"
+    /// faults while the server logged a client cancel of an actively
+    /// decoding task); a fresh connection per request costs sub-millisecond
+    /// on loopback.
+    fn build_ollama_http_client() -> Client {
+        Client::builder()
+            .read_timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    }
+
+    /// Pin an Ollama base URL to IPv4 loopback. "localhost" resolves to ::1
+    /// first on Windows, and the chat stream was the ONLY component talking
+    /// to Ollama over v6 loopback (health probes and runner surgery already
+    /// use 127.0.0.1) — the same v6 path where streams were cut
+    /// mid-generation. Remote hosts pass through untouched.
+    fn normalize_ollama_url(url: String) -> String {
+        url.replacen("://localhost", "://127.0.0.1", 1)
+    }
+
     /// Create a new Anthropic client with API key
     pub fn anthropic(api_key: impl Into<String>) -> Self {
         Self {
@@ -1004,20 +1031,20 @@ impl LlmClient {
     /// Create a new `Ollama` client (local, no API key needed)
     pub fn ollama(base_url: impl Into<String>) -> Self {
         Self {
-            http: Self::build_http_client(),
+            http: Self::build_ollama_http_client(),
             provider: Provider::Ollama,
             api_key: String::new(), // Ollama doesn't need auth
-            base_url: base_url.into(),
+            base_url: Self::normalize_ollama_url(base_url.into()),
         }
     }
 
     /// Create an Ollama client with an API key (for remote/authenticated instances)
     pub fn ollama_with_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http: Self::build_http_client(),
+            http: Self::build_ollama_http_client(),
             provider: Provider::Ollama,
             api_key: api_key.into(),
-            base_url: base_url.into(),
+            base_url: Self::normalize_ollama_url(base_url.into()),
         }
     }
 
@@ -3138,6 +3165,8 @@ impl LlmClient {
             // Ollama streams NDJSON: one JSON per line
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
+            let mut bytes_received = 0usize;
+            let mut lines_parsed = 0usize;
             let mut thinking_block_started = false;
             let mut text_block_started = false;
             let mut tool_block_count = 0usize;
@@ -3154,6 +3183,7 @@ impl LlmClient {
                     }
                 };
 
+                bytes_received += chunk.len();
                 match std::str::from_utf8(&chunk) {
                     Ok(s) => buffer.push_str(s),
                     Err(e) => {
@@ -3174,6 +3204,7 @@ impl LlmClient {
                     let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
                         continue;
                     };
+                    lines_parsed += 1;
 
                     // Check for done
                     let done = obj["done"].as_bool().unwrap_or(false);
@@ -3300,7 +3331,10 @@ impl LlmClient {
             }
             yield Err(LlmError::from_api_response(
                 502,
-                "Ollama stream ended without completion (no done=true)".to_string(),
+                format!(
+                    "Ollama stream ended without completion (no done=true) after \
+                     {bytes_received} bytes / {lines_parsed} NDJSON lines"
+                ),
             ));
         }
     }

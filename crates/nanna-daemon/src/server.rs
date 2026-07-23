@@ -2283,6 +2283,8 @@ impl DaemonServer {
         tools.register_alias("Read", "read_file").await;
         tools.register_alias("write", "write_file").await;
         tools.register_alias("Write", "write_file").await;
+        tools.register_alias("edit", "edit_file").await;
+        tools.register_alias("Edit", "edit_file").await;
         tools.register_alias("bash", "exec").await;
         tools.register_alias("Bash", "exec").await;
         tools.register_alias("glob", "list_dir").await;
