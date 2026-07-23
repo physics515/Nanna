@@ -256,6 +256,13 @@ pub struct RunOptions {
     /// Tool-call budget for this run (P14 bounded blast radius).
     /// Exceeding it ends the run with `truncated = true`.
     pub max_tool_calls: Option<usize>,
+    /// Mission mode ("one path"): when the model stops calling tools without
+    /// declaring the completion contract (`MISSION COMPLETE` on its own
+    /// line), the loop auto-continues it — surfacing each prod in the UI as
+    /// a `mission_control` tool call — until it completes or stalls for
+    /// [`MISSION_STALL_ROUNDS_MAX`] consecutive tool-free rounds. Lets a
+    /// single user prompt drive hours of continuous work.
+    pub mission_mode: bool,
 }
 
 /// What kind of work a harness-driven step is doing (P14).
@@ -570,6 +577,52 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     }
 
     false
+}
+
+/// Mission mode: consecutive auto-continuation rounds with ZERO tool calls
+/// before the loop concludes the model cannot advance and ends the run.
+/// Any round with at least one tool execution resets the count, so a
+/// productive model continues indefinitely — the bound is on grinding, not
+/// on work (no hard cap on productive rounds, matching the loop's design).
+pub const MISSION_STALL_ROUNDS_MAX: usize = 5;
+
+/// The completion contract appended to the system prompt in mission mode.
+pub const MISSION_MODE_CONTRACT: &str = "\n\n[MISSION MODE] This conversation is running a \
+    long-horizon mission. Work continuously using real tool calls. Never stop to ask the \
+    user anything — they will not reply; if you stop without finishing, an automatic \
+    controller will tell you to continue. Verify every part with real commands before \
+    moving on. Only when absolutely everything is done and verified, end your final \
+    message with a line containing exactly: MISSION COMPLETE";
+
+/// Line-anchored mission completion check (mirrors the harness's
+/// `step_claims_completion` contract): `MISSION COMPLETE` must stand on its
+/// own line, so prose *about* the marker doesn't end the run.
+#[must_use]
+pub fn mission_claims_complete(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("MISSION COMPLETE"))
+}
+
+/// Render the escalating auto-continuation prod for mission mode. Injected as
+/// a user-role message AND surfaced in the UI as a `mission_control` tool
+/// call — the automation must be visible, never silent.
+#[must_use]
+pub fn mission_continue_message(round: usize, stall_rounds: usize) -> String {
+    if stall_rounds >= 3 {
+        format!(
+            "[MISSION CONTROL round {round}] You have now stopped {stall_rounds} times without \
+             making tool calls. In ONE short line, state which mission items remain. Then \
+             IMMEDIATELY call the next tool — write_file or exec — to advance the first \
+             remaining item. If a needed tool is missing, call discover_tools. Only output \
+             the line `MISSION COMPLETE` if every item is truly verified done."
+        )
+    } else {
+        format!(
+            "[MISSION CONTROL round {round}] The mission is not complete — continue with the \
+             next unfinished item NOW using real tool calls. Do not summarize or wait. When \
+             everything is verified done, end with a line containing exactly: MISSION COMPLETE"
+        )
+    }
 }
 
 /// Escalating firmness of a wrap-up nudge. The nudge only *steers* a long-running
@@ -987,6 +1040,16 @@ impl Agent {
             &model_info,
             self.config.max_tokens as usize + thinking_reserve_tokens,
         );
+
+        // Mission mode: put the completion contract in the system prompt UP
+        // FRONT — the model must know from turn one that it works until
+        // `MISSION COMPLETE` and that nobody will answer questions.
+        if options.mission_mode {
+            let mut ctx = self.context.write().await;
+            if !ctx.system_prompt.contains("[MISSION MODE]") {
+                ctx.system_prompt.push_str(MISSION_MODE_CONTRACT);
+            }
+        }
 
         // Resolve effective max_iterations: run option > config > unlimited
         let max_iterations = options.max_iterations.or(self.config.max_iterations);
@@ -1608,6 +1671,68 @@ impl Agent {
                     continue;
                 }
 
+                // Mission mode: the model stopped calling tools without
+                // declaring the completion contract. Auto-continue it —
+                // visibly (each prod surfaces through the tool callbacks as a
+                // `mission_control` chip in the UI) — until it completes or
+                // stalls for MISSION_STALL_ROUNDS_MAX tool-free rounds.
+                if options.mission_mode
+                    && !mission_claims_complete(&state.final_text)
+                    && state.mission_stall_rounds < MISSION_STALL_ROUNDS_MAX
+                {
+                    state.mission_rounds += 1;
+                    state.mission_stall_rounds += 1;
+                    // Detectors re-arm each round: a narration relapse three
+                    // hours in must be caught like the first one.
+                    state.narration_nudged = false;
+                    state.repetition_nudged = false;
+                    state.thinking_spiral_nudged = false;
+
+                    // Keep the model's partial answer in context so it builds
+                    // on its own progress instead of restarting.
+                    self.store_assistant_response(&result.content_blocks).await;
+
+                    let prod = mission_continue_message(
+                        state.mission_rounds,
+                        state.mission_stall_rounds,
+                    );
+                    // The automation must be visible to the user: render the
+                    // prod exactly like a tool call.
+                    let call_id = format!("mission-continue-{}", state.mission_rounds);
+                    if let Some(ref cb) = options.on_tool_start {
+                        cb(
+                            &call_id,
+                            "mission_control",
+                            &serde_json::json!({
+                                "round": state.mission_rounds,
+                                "stall_rounds": state.mission_stall_rounds,
+                                "reason": "model stopped without MISSION COMPLETE",
+                            }),
+                            None,
+                        );
+                    }
+                    if let Some(ref cb) = options.on_tool_end {
+                        cb(&call_id, "mission_control", &prod, true, 0, None);
+                    }
+                    {
+                        let mut ctx = self.context.write().await;
+                        ctx.messages.push(AnthropicMessage::user_text(prod));
+                    }
+                    warn!(
+                        round = state.mission_rounds,
+                        stall_rounds = state.mission_stall_rounds,
+                        "🧭 Mission mode: auto-continuation injected"
+                    );
+                    continue;
+                }
+                if options.mission_mode && state.mission_stall_rounds >= MISSION_STALL_ROUNDS_MAX {
+                    warn!(
+                        rounds = state.mission_rounds,
+                        "🧭 Mission mode: {} consecutive tool-free rounds — ending run",
+                        state.mission_stall_rounds
+                    );
+                }
+
                 // Normal exit: no tool calls and not a narration loop
                 // Analyze uncertainty if enabled
                 if options.track_uncertainty {
@@ -1636,6 +1761,9 @@ impl Agent {
             if !result.tool_uses.is_empty() {
                 let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
                 state.finalize_reasoning_block(first_tool);
+                // Real tool activity resets the mission stall counter — the
+                // bound is on grinding, never on productive work.
+                state.mission_stall_rounds = 0;
             }
 
             // Execute tools and continue loop
@@ -3582,6 +3710,12 @@ struct RunState {
     budget_warned: bool,
     /// How many wrap-up nudges have been injected (escalates over time)
     wrapup_nudge_count: usize,
+    /// Mission mode: auto-continuation rounds fired so far (unbounded while
+    /// productive — the stall counter below is the bound).
+    mission_rounds: usize,
+    /// Mission mode: consecutive continuation rounds with zero tool calls.
+    /// Reset by any tool execution; ends the run at MISSION_STALL_ROUNDS_MAX.
+    mission_stall_rounds: usize,
 }
 
 impl RunState {
@@ -3607,6 +3741,8 @@ impl RunState {
             tool_loop_nudged: false,
             budget_warned: false,
             wrapup_nudge_count: 0,
+            mission_rounds: 0,
+            mission_stall_rounds: 0,
         }
     }
 
@@ -3706,6 +3842,30 @@ fn is_write_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mission_complete_is_line_anchored() {
+        assert!(mission_claims_complete("done.\nMISSION COMPLETE\n"));
+        assert!(mission_claims_complete("  mission complete  "));
+        // Prose ABOUT the marker must not end the run.
+        assert!(!mission_claims_complete(
+            "I will say MISSION COMPLETE once feature 12 passes."
+        ));
+        assert!(!mission_claims_complete("The mission is complete-ish"));
+        assert!(!mission_claims_complete(""));
+    }
+
+    #[test]
+    fn mission_prods_escalate_and_number_rounds() {
+        let early = mission_continue_message(1, 1);
+        let late = mission_continue_message(7, 3);
+        assert!(early.contains("round 1"));
+        assert!(early.contains("MISSION COMPLETE"));
+        assert!(late.contains("round 7"));
+        // The escalated prod demands a remaining-items statement.
+        assert!(late.contains("remain"));
+        assert_ne!(early, late);
+    }
 
     #[test]
     fn nudge_does_not_fire_before_threshold() {

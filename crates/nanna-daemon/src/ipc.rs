@@ -17,6 +17,15 @@ use tracing::{debug, error, info, warn};
 /// default 16 MB tungstenite limit, crashing the connection.
 const WS_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
+/// Server-initiated keepalive ping cadence. A live client answers with a pong
+/// (an incoming frame), which resets the read deadline below.
+const WS_PING_INTERVAL_SECS: u64 = 15;
+
+/// Drop a connection whose peer has been silent this long — three missed
+/// ping/pong cycles. Bounds the read await for force-killed clients that never
+/// send a Close frame (Windows TCP keepalive is off by default).
+const WS_READ_DEADLINE_SECS: u64 = 45;
+
 /// Unique identifier for a connected client
 pub type ConnectionId = String;
 
@@ -172,13 +181,13 @@ impl IpcServer {
     }
     
     /// Run the IPC server
-    pub async fn run(&self) -> Result<(), std::io::Error> {
+    pub async fn run(self: &Arc<Self>) -> Result<(), std::io::Error> {
         let addr = self.address();
         let listener = Self::bind_with_reuse(&addr).await?;
         info!("IPC server listening on ws://{}", addr);
-        
+
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -189,11 +198,21 @@ impl IpcServer {
                                 warn!("Connection limit reached, rejecting {}", addr);
                                 continue;
                             }
-                            
+
                             let client_id = uuid::Uuid::new_v4().to_string();
                             info!("New connection from {}: {}", addr, client_id);
-                            
-                            self.handle_connection(client_id, stream, addr).await;
+
+                            // Spawn — NEVER await inline. The old inline await
+                            // served one connection at a time, so a single
+                            // silently-dead peer (force-killed client, no
+                            // Close frame, no read deadline) parked the whole
+                            // accept loop forever: new TCP connects completed
+                            // in the kernel backlog but were never accepted
+                            // (observed live; only a restart cleared it).
+                            let this = Arc::clone(self);
+                            tokio::spawn(async move {
+                                this.handle_connection(client_id, stream, addr).await;
+                            });
                         }
                         Err(e) => {
                             error!("Accept error: {}", e);
@@ -206,7 +225,7 @@ impl IpcServer {
                 }
             }
         }
-        
+
         Ok(())
     }
     
@@ -269,44 +288,76 @@ impl IpcServer {
             }
         });
         
-        // Handle incoming messages
+        // Handle incoming messages. Every await here is bounded: the server
+        // pings every WS_PING_INTERVAL_SECS (the pong resets the read
+        // deadline), and a peer silent past WS_READ_DEADLINE_SECS is dropped.
+        // Without this, a force-killed client (no Close frame, Windows TCP
+        // keepalive off) left `ws_rx.next()` pending forever.
         let client_id_for_incoming = client_id.clone();
-        while let Some(msg) = ws_rx.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<Request>(&text) {
-                        Ok(request) => {
-                            debug!("Request from {}: {:?}", client_id_for_incoming, request.action);
-                            if request_tx.send((client_id_for_incoming.clone(), request)).await.is_err() {
-                                break;
+        let mut ping_interval =
+            tokio::time::interval(std::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        'incoming: loop {
+            tokio::select! {
+                maybe_msg = tokio::time::timeout(
+                    std::time::Duration::from_secs(WS_READ_DEADLINE_SECS),
+                    ws_rx.next(),
+                ) => {
+                    let msg = match maybe_msg {
+                        Err(_elapsed) => {
+                            warn!(
+                                "Read deadline ({WS_READ_DEADLINE_SECS}s) exceeded for {} — dropping dead connection",
+                                client_id_for_incoming
+                            );
+                            break 'incoming;
+                        }
+                        Ok(None) => break 'incoming,
+                        Ok(Some(m)) => m,
+                    };
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match serde_json::from_str::<Request>(&text) {
+                                Ok(request) => {
+                                    debug!("Request from {}: {:?}", client_id_for_incoming, request.action);
+                                    if request_tx.send((client_id_for_incoming.clone(), request)).await.is_err() {
+                                        break 'incoming;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Invalid request from {}: {}", client_id_for_incoming, e);
+                                    // Send error response
+                                    let error_response = Response::error(
+                                        "unknown".to_string(),
+                                        "parse_error",
+                                        format!("Invalid request: {}", e),
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&error_response) {
+                                        let _ = msg_tx.send(Message::Text(json.into())).await;
+                                    }
+                                }
                             }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = msg_tx.send(Message::Pong(data)).await;
+                        }
+                        Ok(Message::Close(_)) => {
+                            debug!("Client {} sent close", client_id_for_incoming);
+                            break 'incoming;
                         }
                         Err(e) => {
-                            warn!("Invalid request from {}: {}", client_id_for_incoming, e);
-                            // Send error response
-                            let error_response = Response::error(
-                                "unknown".to_string(),
-                                "parse_error",
-                                format!("Invalid request: {}", e),
-                            );
-                            if let Ok(json) = serde_json::to_string(&error_response) {
-                                let _ = msg_tx.send(Message::Text(json.into())).await;
-                            }
+                            debug!("WebSocket error for {}: {}", client_id_for_incoming, e);
+                            break 'incoming;
                         }
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    let _ = msg_tx.send(Message::Pong(data)).await;
+                _ = ping_interval.tick() => {
+                    // Server-initiated keepalive: forces the OS to notice a
+                    // dead peer even with TCP keepalive off.
+                    if msg_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break 'incoming;
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    debug!("Client {} sent close", client_id_for_incoming);
-                    break;
-                }
-                Err(e) => {
-                    debug!("WebSocket error for {}: {}", client_id_for_incoming, e);
-                    break;
-                }
-                _ => {}
             }
         }
         

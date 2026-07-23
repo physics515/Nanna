@@ -25,6 +25,18 @@ const CHAT_TRANSIENT_RETRIES_MAX: usize = 3;
 /// Escalating backoff before same-model retries `1..=CHAT_TRANSIENT_RETRIES_MAX`.
 const CHAT_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
+/// A chat message opens mission mode when its first word is MISSION
+/// (case-insensitive; optional trailing colon). An explicit prefix — never a
+/// heuristic — so ordinary chats can never accidentally run long-horizon.
+fn message_is_mission(message: &str) -> bool {
+    let first_word: String = message
+        .trim_start()
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    first_word.trim_end_matches(':').eq_ignore_ascii_case("mission")
+}
+
 /// Per-session queue that serializes chat processing.
 /// Tokio's Mutex is FIFO-fair, so messages are processed in arrival order.
 struct SessionQueue {
@@ -755,6 +767,11 @@ impl AgentService {
                 attachments: attachments.clone(),
                 is_sub_agent,
                 all_tools_active: is_sub_agent,
+                // "One path": a chat whose message opens with MISSION runs
+                // long-horizon — the loop auto-continues the model (visible
+                // as mission_control tool chips) until it declares MISSION
+                // COMPLETE or stalls. One user prompt, continuous work.
+                mission_mode: !is_sub_agent && message_is_mission(message),
                 on_checkpoint: {
                     let checkpoint_session_id = session_id.to_string();
                     let checkpoint_accumulated = accumulated.clone();
@@ -1332,6 +1349,18 @@ mod tests {
             assert!(AgentService::is_context_length_error(s), "should flag: {s}");
         }
         assert!(!AgentService::is_context_length_error("429 rate limit"));
+    }
+
+    #[test]
+    fn mission_detection_is_prefix_only() {
+        assert!(message_is_mission("MISSION: build a CLI"));
+        assert!(message_is_mission("mission build a CLI"));
+        assert!(message_is_mission("  Mission:\ndo the thing"));
+        // Mentioning missions mid-message must not trigger long-horizon.
+        assert!(!message_is_mission("what's our mission statement?"));
+        assert!(!message_is_mission("The MISSION was a success"));
+        assert!(!message_is_mission("missionary"));
+        assert!(!message_is_mission(""));
     }
 
     #[test]

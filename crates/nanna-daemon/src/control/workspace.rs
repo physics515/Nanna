@@ -97,7 +97,15 @@ impl ControlPlane {
                 
                 let mut registry = self.workspaces.write().await;
                 registry.register(ws);
-                
+                // Release before save_workspaces: it takes a READ on this same
+                // non-reentrant RwLock. Holding the write guard across that
+                // call was a guaranteed self-deadlock — observed live, it
+                // wedged every workspace action until a daemon restart AND
+                // silently skipped persistence (the upsert was never reached).
+                // SetActive/ClearActive already drop their guards; Open was
+                // the one caller that didn't.
+                drop(registry);
+
                 info!("Registered workspace: {} ({})", name, id);
                 self.save_workspaces().await;
                 json!({ "status": "opened", "id": id, "name": name })
