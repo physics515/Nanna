@@ -527,6 +527,17 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       other pages but not this one. Added `const loadError = ref<string | null>(null)` alongside the
       other refs, matching `model-stats`/`memory`/`tools`. The `e2e/page-smoke.spec.ts` suite was already
       catching this — 12/12 green after the fix.
+- [ ] *(2026-07-23)* **`<UiSonnerSonner />` fails to resolve at runtime — toasts may never render.**
+      Every Playwright page load logs `[Vue warn]: Failed to resolve component: UiSonnerSonner` from
+      `app.vue`, on **both** this branch and pristine `origin/master`, so it is pre-existing and not a
+      dep-bump fallout. The component *does* exist (`app/components/ui/sonner/Sonner.vue`) and the
+      auto-import name looks correct for its nested path, so the likely cause is the component failing to
+      load rather than being misnamed — e.g. the `vue-sonner` import throwing. Worth chasing because the
+      failure is silent and the blast radius is real: `useToast` drives success/error feedback for copy,
+      save, delete and clear across the app (P4 "Toasts & destructive confirms"), so if the toaster never
+      mounts, none of that feedback reaches the user. Check whether `useToast` renders through this
+      component or an independent path, then fix or delete it. Cross-check against the deferred
+      `vue-sonner 1 → 2` major.
 - [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
       pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
       the current branch it fails 1). Diagnosis from the trace: the step's locator
