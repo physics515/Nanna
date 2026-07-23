@@ -493,19 +493,56 @@ impl AgentContext {
         self
     }
 
-    /// Get the effective system prompt (base + workspace context)
+    /// Get the effective system prompt (base + workspace context).
+    ///
+    /// The workspace slice is BOUNDED by [`Self::workspace_context_cap_chars`]:
+    /// observed live, a workspace injected 330k chars (~60k tokens) into a 32k
+    /// window — truncation can't shrink the system prompt, so Ollama clipped
+    /// the prompt head and the model lost its own tool definitions, reducing
+    /// it to narrated/confabulated tool calls. An oversized workspace context
+    /// is cut at the cap with a visible marker instead.
     #[must_use]
     pub fn effective_system_prompt(&self) -> String {
         match &self.workspace_context {
             Some(ws_ctx) if !ws_ctx.is_empty() => {
-                if self.system_prompt.is_empty() {
-                    ws_ctx.clone()
+                let cap = self.workspace_context_cap_chars();
+                let bounded: std::borrow::Cow<'_, str> = if ws_ctx.len() > cap {
+                    // Cut on a char boundary at/below the cap, keep the head
+                    // (README/AGENTS lead; deep ROADMAP prose is the bulk).
+                    let mut cut = cap;
+                    while cut > 0 && !ws_ctx.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    std::borrow::Cow::Owned(format!(
+                        "{}\n\n[workspace context truncated: {} of {} chars shown — \
+                         the full files are on disk; read them with read_file if needed]",
+                        &ws_ctx[..cut],
+                        cut,
+                        ws_ctx.len()
+                    ))
                 } else {
-                    format!("{}\n\n{}", self.system_prompt, ws_ctx)
+                    std::borrow::Cow::Borrowed(ws_ctx.as_str())
+                };
+                if self.system_prompt.is_empty() {
+                    bounded.into_owned()
+                } else {
+                    format!("{}\n\n{}", self.system_prompt, bounded)
                 }
             }
             _ => self.system_prompt.clone(),
         }
+    }
+
+    /// Maximum chars of workspace context to inject: a quarter of the model's
+    /// hard input limit, converted at ~4 chars/token — the ×4 (chars/token)
+    /// and ÷4 (25% share) cancel, so the cap in chars equals `hard_limit`.
+    /// Derived from the live window (not a magic constant): system prompt,
+    /// tools, and history must all fit under `hard_limit`, so the workspace
+    /// slice may claim at most a quarter of it. Floor of 2_000 chars keeps
+    /// tiny windows functional.
+    #[must_use]
+    pub fn workspace_context_cap_chars(&self) -> usize {
+        self.hard_limit.max(2_000)
     }
 
     /// Reload workspace context from disk
@@ -1524,6 +1561,33 @@ mod tests {
         // Mirrors unknown_model_info floors (no per-model table).
         assert_eq!(ctx.hard_limit, nanna_llm::unknown_model_info("x", "").hard_input_limit());
         assert!(ctx.compression_threshold <= ctx.hard_limit);
+    }
+
+    #[test]
+    fn workspace_context_is_bounded_by_the_model_window() {
+        // The live regression: a 330k-char workspace context on a 32k model
+        // blew past the window; Ollama clipped the prompt head and the model
+        // lost its own tool definitions. The injection must be capped at the
+        // window-derived limit with a visible marker.
+        let mut ctx = AgentContext::new("s");
+        ctx.hard_limit = 23_808; // qwen-like 32k window after output reserve
+        ctx.system_prompt = "BASE".to_string();
+        ctx.workspace_context = Some("x".repeat(330_249));
+
+        let effective = ctx.effective_system_prompt();
+        assert!(
+            effective.len() < 30_000,
+            "oversized workspace context must be truncated (got {} chars)",
+            effective.len()
+        );
+        assert!(effective.contains("[workspace context truncated"));
+        assert!(effective.starts_with("BASE"));
+
+        // A small workspace context passes through untouched.
+        ctx.workspace_context = Some("## README\nsmall".to_string());
+        let effective = ctx.effective_system_prompt();
+        assert!(effective.contains("## README\nsmall"));
+        assert!(!effective.contains("truncated"));
     }
 
     #[test]
