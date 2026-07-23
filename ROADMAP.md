@@ -894,6 +894,22 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             `BinFileRecorder` records are not forward-compatible). Sources:
             [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
             [burn-lm](https://github.com/tracel-ai/burn-lm).
+      - [ ] *(research 2026-07-23)* **Re-confirmed, nothing moved: Qwen3.5-9B is still the 8 GB default, and
+            Burn is still 0.21.** Two checks worth recording because they *prevent* churn rather than cause it.
+            (1) 2026 round-ups still rate **Qwen3.5-9B the best 8 GB function-calling pick "by a significant
+            margin"**, measured at **~55–58 tok/s flat across context sizes up to 16K** and fully GPU-resident
+            at all tested sizes through 32K — so the reference default in the notes above stands, and the
+            text-only-GGUF caveat (2026-07-13) is what keeps it fitting. **LFM2.5-8B-A1B** remains the verified
+            alternative for the 8–12 GB tier. Newer **Qwen 3.6 / Gemma 4** are now named in function-calling
+            guides with better edge-case handling (nested JSON args, missing-parameter errors, and correctly
+            choosing *not* to call a tool), but **no public BFCL-style numbers for 3.6 exist yet** — do not
+            switch the reference default on vibes; wait for a benchmark or run our own. (2) **Burn has still not
+            shipped 0.22** — 0.21.0 remains latest, so every 0.21 note above (no KV-cache API, `burn-lm` still
+            alpha, `attention()`/flash-attention additions, `TensorData::shape` breakage) is current and the
+            Mummu contract needs no revision this run. Sources:
+            [localllm.in 8 GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025),
+            [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/),
+            [Burn releases](https://github.com/tracel-ai/burn/releases).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -1253,6 +1269,64 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       the original item referenced something never built. If worth doing: key on a content hash of the
       cluster's concatenation, store summary + model + timestamp in Turso, and reuse on a later cycle so a
       re-formed cluster doesn't re-pay the summarizer. Gate on measuring how often clusters actually recur.
+- [ ] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
+      guard it before it costs us a safety-critical memory.** The 2026 agent-memory survey warns that repeated
+      compression cycles make **low-frequency details vanish** — precisely the ones most likely to matter; its
+      worked example is that after ~3 summary passes over a week, a rarely-mentioned instruction like
+      "never call the production database directly" can disappear entirely. Nanna is squarely exposed:
+      `consolidate()` re-summarizes surviving memories cycle after cycle and already tracks how many times via
+      `FsrsState::generation`. Three concrete, in-reach mitigations, cheapest first: (a) **the deterministic
+      dedup pass landed 2026-07-23 already removes the biggest drift source** — true restatements are now folded
+      verbatim instead of paraphrased, so re-summarization no longer touches them at all; (b) **cap
+      re-summarization** — refuse to consolidate a memory past a `generation` ceiling, or require a *higher*
+      similarity to re-merge an already-consolidated entry, so gist-of-a-gist-of-a-gist cannot form; (c) **pin
+      the un-drift-able** — mark high-importance/low-frequency memories (and anything user-STATED rather than
+      agent-OBSERVED) as verbatim, excluded from summarizing clusters. Gate all of it on the retention harness
+      with a **new drift fixture**: seed one rare-but-critical memory among many common ones, run N dream cycles,
+      and assert it is still recallable *and* still contains its key clause — the harness already measures topic
+      recall, so this is an added probe, not new machinery. Sources:
+      [Memory for Autonomous LLM Agents (arXiv:2603.07670)](https://arxiv.org/html/2603.07670v1),
+      [SSGM — governing evolving memory (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+- [ ] *(research 2026-07-23)* **Dual-buffer / probation consolidation ("hot" buffer before long-term).** The
+      same survey's recommended write path: a new memory lands in a **hot buffer** and is promoted to long-term
+      storage only after a probation period and quality checks — **re-verification, deduplication, importance
+      scoring** — a computational hippocampal→neocortical transfer. Nanna writes straight to the durable store
+      today, so a one-off mis-extraction is permanent until a dream cycle happens to catch it. Our
+      `smart_ingest` already does dedup + importance at write time, so the missing pieces are the **probation
+      window** and the **promotion/eviction decision** (plus what overflow does). Fits the existing FSRS state
+      machine — probation is arguably just a band. Source:
+      [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1).
+- [ ] *(research 2026-07-23)* **Write-path canonicalization + provenance, and precedence rules for conflicts.**
+      Recommended metadata per record: timestamp, **source**, task label, **confidence**; plus canonicalization
+      that normalizes dates/names/quantities before storage so near-duplicates actually compare equal. Conflict
+      resolution then has principled rules instead of a similarity guess: **temporal versioning** (prefer the
+      newest) and **source attribution** (a *user statement* outranks an *agent inference*). Nanna already
+      distinguishes STATED vs OBSERVED in extraction — that is exactly the precedence signal, currently unused
+      at merge time. This would make the dedup fold landed this run smarter (canonicalized text folds more
+      often) and safer (a user-stated fact never gets overwritten by an inferred one). Sources:
+      [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1),
+      [TOKI — bitemporal contradiction resolution (arXiv:2606.06240)](https://arxiv.org/pdf/2606.06240).
+- [ ] *(research 2026-07-23)* **Fused retrieval score beats pure cosine — reported +29.6 on temporal queries,
+      +23.1 on multi-hop.** 2026 systems combine **semantic similarity + BM25 + entity matching** into one fused
+      score rather than ranking on embedding distance alone. Nanna's `recall` is pure in-RAM cosine over Turso
+      BLOBs, so it is weakest exactly where the fused score helps most (time-anchored and multi-hop questions).
+      A lexical (BM25) leg is cheap and fully local — no model, no network — and composes with the planned HNSW
+      candidate stage: retrieve candidates by vector, re-rank by the fused score. Pairs with the
+      `nanna-timeline` work, which is what makes temporal queries answerable at all. Sources:
+      [state of AI agent memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026),
+      [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1).
+- [ ] *(research 2026-07-23)* **Episodic→semantic promotion is still manual almost everywhere — an opening.**
+      The survey's own example is ours: repeated episodic records ("user corrected the date format", on five
+      different days) should graduate into one semantic fact ("user prefers DD/MM/YYYY"), but in current systems
+      this "rarely automatic" step needs explicit prompting. EverMemOS (Jan 2026) is the closest shipped shape —
+      an engram-inspired three-stage lifecycle: episodic trace formation → semantic consolidation into thematic
+      "MemScenes" → reconstructive recollection that composes context on demand. This is the same arc P13
+      already commits to (`nanna-timeline` episodes consolidating *into* `MemEntry` facts), so the useful part
+      is the staging vocabulary and the fact that **frequency-of-recurrence** is the promotion trigger — which
+      our per-memory access counts and the dedup fold count already measure. Also worth reading before the
+      dreaming overhaul: **RecMem**, recurrence-based consolidation aimed specifically at long-running agents.
+      Sources: [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1),
+      [RecMem (arXiv:2605.16045)](https://arxiv.org/pdf/2605.16045).
 - [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
       Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
       (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
