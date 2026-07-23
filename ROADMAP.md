@@ -437,7 +437,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       documented shortcuts for new chat / focus input / Stop generation.
       *(2026-04-27)* `useShortcuts` + Escape stack; layout bindings: `Mod+K` reserved, `Mod+Shift+N` new chat,
       `Mod+Shift+L` focus input, `Mod+.` stop; ChatInput Escape stops streaming; `ShortcutsHelp` on Settings → Data.
-      Command *palette UI* still open (see simplification track).
+      *(2026-07-23)* Command palette UI landed (see simplification track).
 - [x] **Density & contrast sweep** on Palenight — readable secondary text, toolbar icon hit-targets ≥ 32px,
       consistent spacing scale; no low-contrast badges on logs/stats.
       *(2026-04-27)* Density tokens + `min-h-8`/`min-w-8` hit targets on toolbar icon buttons; secondary text
