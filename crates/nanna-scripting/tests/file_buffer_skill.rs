@@ -163,6 +163,42 @@ async fn clear_discards_without_touching_the_real_file() {
 }
 
 #[tokio::test]
+async fn second_clear_requires_force() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("h.txt").to_string_lossy().into_owned();
+
+    // First discard is free (and warns about the next one).
+    run_ok(
+        json!({ "action": "append", "file_path": target, "content": "draft one" }),
+        dir.path(),
+    )
+    .await;
+    let first = run_ok(json!({ "action": "clear", "file_path": target }), dir.path()).await;
+    assert!(first.contains("force=true"), "got: {first}");
+
+    // Second discard is the regeneration loop — refused without force.
+    run_ok(
+        json!({ "action": "append", "file_path": target, "content": "draft two" }),
+        dir.path(),
+    )
+    .await;
+    let err = run_fail(json!({ "action": "clear", "file_path": target }), dir.path()).await;
+    assert!(err.contains("CLEAR REFUSED"), "got: {err}");
+    assert!(err.contains("edit_file"), "got: {err}");
+
+    // force=true is the escape hatch.
+    let forced = run_ok(
+        json!({ "action": "clear", "file_path": target, "force": true }),
+        dir.path(),
+    )
+    .await;
+    assert!(forced.contains("discarded"), "got: {forced}");
+}
+
+#[tokio::test]
 async fn shrink_guard_keeps_buffer_and_file() {
     if skill_missing() {
         return;

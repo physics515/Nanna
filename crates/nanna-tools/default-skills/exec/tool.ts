@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.1",
+  version: "0.1.2",
   output: "context",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -67,6 +67,16 @@ export default {
         }
         nulAt = cmdLower.indexOf(">nul", nulAt + 4);
       }
+    }
+    // Buffer files are MANAGED state: deleting one with the shell defeats
+    // the parked-draft repair loop (observed live: rm -f '*.__buffer__'
+    // then regenerate, forever). The legal doors are edit_file + commit,
+    // or file_buffer action="clear".
+    if ((cmdLower.indexOf("rm ") !== -1 || cmdLower.indexOf("del ") !== -1 || cmdLower.indexOf("unlink") !== -1) && cmdLower.indexOf(".__buffer__") !== -1) {
+      return {
+        content: "NOT EXECUTED — buffer files (*.__buffer__) are managed drafts; do not delete them with the shell. Either REPAIR the draft (edit_file the broken line, then file_buffer action=\"commit\") or discard it properly with file_buffer(action=\"clear\", file_path=<the real file>).",
+        success: false
+      };
     }
     if (!cmdism && cmdLower.indexOf("type ") === 0 && (cmdLower.indexOf(":\\") !== -1 || cmdLower.indexOf(":/") !== -1)) {
       // cmd.exe `type <file>` prints a file; bash `type` describes a
