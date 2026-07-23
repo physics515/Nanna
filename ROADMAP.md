@@ -234,9 +234,14 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
 - [ ] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
 - [ ] Add per-OS installation docs.
-- [ ] Commit LICENSE file (MIT) — appears absent despite README reference.
+- [x] Commit LICENSE file (MIT) — appears absent despite README reference.
+      *(2026-07-23)* Added. Both `Cargo.toml` manifests already declared `license = "MIT"` and the
+      README claimed MIT, but the file itself was missing — so every published crate asserted a licence
+      with no text behind it. Copyright line reads `2026 physics515` (the repo owner); change it if you
+      want a legal name there.
 - [ ] Add CONTRIBUTING.md and CODE_OF_CONDUCT.md.
-- [ ] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
+- [x] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
+      *(2026-07-23)* Fixed in both the root package and `[workspace.package]`.
 - [ ] Add GitHub repo description and topics.
 - [ ] Unify port documentation (README says 5149; CLI defaults to 9999) — pick one, update both code and docs.
 

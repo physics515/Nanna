@@ -3,7 +3,7 @@ name = "nanna"
 version = "0.1.0"
 edition = "2024"
 description = "High-performance AI assistant - patron deity of your digital realm"
-repository = "https://github.com/clawdbot/nanna"
+repository = "https://github.com/physics515/Nanna"
 license = "MIT"
 
 [[bin]]
@@ -64,7 +64,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/clawdbot/nanna"
+repository = "https://github.com/physics515/Nanna"
 
 [workspace.dependencies]
 # Async runtime
