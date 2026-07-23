@@ -1287,6 +1287,23 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       recall, so this is an added probe, not new machinery. Sources:
       [Memory for Autonomous LLM Agents (arXiv:2603.07670)](https://arxiv.org/html/2603.07670v1),
       [SSGM — governing evolving memory (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+      *(2026-07-23)* **Instrument built and both arms baselined — the mitigation is now a measured
+      decision, not a guess** (same "measure first, then flip" discipline the `w20` change used).
+      New `retention::clause_survives(service, clause)` asks whether any live memory still contains a
+      clause **verbatim** — deliberately content fidelity, not recall, because the two come apart
+      exactly here: in the failing arm the topic stays perfectly recallable while the clause that made
+      it actionable is gone, which is why drift is easy to ship blind. Two fixtures share one corpus
+      shape (an aged, compressible band of 8 memories where exactly one carries "never call the
+      production database directly") and one summarizer, differing *only* in similarity spread, which
+      selects the consolidation path: **summarized arm → clause LOST in a single cycle** (the exposure,
+      reproduced against our own pipeline; `echo_summarize` models a real summarizer faithfully here —
+      it keeps the dominant theme and drops what appears once, precisely the reported failure), and
+      **deduplicated arm → clause SURVIVES verbatim while the store still compresses** — i.e. dream
+      phase (b), landed this same run, is already a working drift mitigation for true restatements.
+      Both rows committed to `bench/BASELINE.md`; the dedup arm is a correctness fixture that must never
+      regress, while the summarized arm is a **baseline to beat** — it asserts the clause *is* lost, so
+      whichever mitigation lands next (generation ceiling / verbatim-pinning STATED memories) will make
+      that test fail loudly, and its message says to flip it. Remaining: implement (b) or (c) above.
 - [ ] *(research 2026-07-23)* **Dual-buffer / probation consolidation ("hot" buffer before long-term).** The
       same survey's recommended write path: a new memory lands in a **hot buffer** and is promoted to long-term
       storage only after a probation period and quality checks — **re-verification, deduplication, importance

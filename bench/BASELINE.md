@@ -29,6 +29,25 @@ Budget: consolidation must not regress **recall retention below 1.0** on this fi
 and must hold **compression ≥ 0.90**. The w20 rows are a correctness fixture (they assert the
 FSRS-6 exponent strictly out-recalls the old FSRS-5 one on aged memories), not a tunable budget.
 
+### Summarization drift (content fidelity, not recall)
+
+Instrument: `nanna-memory::retention::clause_survives` + the two `drift` fixtures. Measures
+whether a **rare, safety-critical clause** survives a dream cycle — deliberately *not* a recall
+metric, because the two come apart exactly here: the topic stays perfectly recallable while the
+one clause that made it actionable is gone. That gap is what makes drift easy to ship blind.
+
+| Metric | Baseline | Source | Notes |
+| --- | --- | --- | --- |
+| Rare clause survives a **summarized** cluster | **NO** (lost in 1 cycle) | `retention::tests::summarized_memories_lose_a_rare_critical_clause_in_one_cycle` | the known exposure, reproduced against our own pipeline |
+| Rare clause survives a **deduplicated** band | **YES** (verbatim) | `retention::tests::deduplicated_memories_keep_their_rare_critical_clause` | dream phase (b) folds without paraphrasing; store still compresses |
+
+Budget: the **dedup arm must never regress to NO** — that is a correctness fixture, and it is the
+concrete payoff of folding restatements deterministically. The summarized arm is a **baseline to
+beat, not a budget to hold**: it currently asserts the clause *is* lost, so when a drift mitigation
+lands (generation ceiling, or verbatim-pinning user-STATED memories — both logged in P13) that test
+will fail loudly and should be flipped to assert survival. A failing baseline arm means the system
+got better, and the assertion says so in its message.
+
 *(2026-07-23)* The summarizer-call row is the newest budget and the point of dream phase (b):
 this corpus's within-topic pairs sit in the `IngestAction::Reinforce` band (cosine > 0.92), so
 they are true restatements and are now folded **deterministically, with zero LLM calls**, where

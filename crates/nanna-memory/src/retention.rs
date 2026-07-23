@@ -212,6 +212,32 @@ where
     Ok((report, result))
 }
 
+/// Does any live memory still contain `clause` verbatim?
+///
+/// The instrument for **summarization drift** — the named failure mode of doing
+/// what dreaming does. A dream cycle rewrites clustered memories through the
+/// summarizer, and a summarizer keeps the dominant theme while dropping
+/// low-frequency detail. That detail is disproportionately the stuff that
+/// matters: the 2026 agent-memory survey's worked example is a rarely-repeated
+/// "never call the production database directly" vanishing after a few passes.
+///
+/// Recall-based measurement cannot see this: the topic stays perfectly
+/// recallable while the one clause that made it *actionable* is gone. So this
+/// checks the surviving **content**, not retrievability — the two come apart
+/// precisely in the drift case, which is what makes drift easy to ship blind.
+///
+/// Exact substring, not similarity: a paraphrase that "means the same thing" is
+/// exactly the loss being measured.
+pub async fn clause_survives(service: &MemoryService, clause: &str) -> bool {
+    debug_assert!(!clause.is_empty(), "clause must not be empty");
+
+    service
+        .list_all()
+        .await
+        .iter()
+        .any(|memory| memory.content.contains(clause))
+}
+
 /// Measure topic recall through the **FSRS-gated** [`MemoryService::recall`] path
 /// — the one an agent actually uses — rather than raw vector search.
 ///
@@ -526,6 +552,162 @@ mod tests {
             |topic| format!("topic:{topic} consolidated"),
         );
         async move { Ok(summary) }
+    }
+
+    // ---- Summarization drift ------------------------------------------------
+
+    /// The rare, safety-critical clause the drift fixture tracks.
+    const CRITICAL_CLAUSE: &str = "never call the production database directly";
+
+    /// Build one aged, compressible band of `count` memories that all sit in the
+    /// same neighbourhood, where exactly one carries [`CRITICAL_CLAUSE`].
+    ///
+    /// `spread` controls how far members sit from the shared centroid, which is
+    /// what selects the consolidation path under test: a tiny spread keeps every
+    /// pair above the `IngestAction::Reinforce` line (cosine > 0.92) so dream
+    /// phase (b) folds them losslessly, while a larger spread drops them into the
+    /// merely-*related* band that only the summarizing clusterer handles.
+    fn drift_band(count: usize, dimension: usize, spread: f32) -> Vec<MemoryEntry> {
+        let aged_last_access = now_secs() - (1_000.0 * 86_400.0) as i64;
+
+        (0..count)
+            .map(|index| {
+                // A single component tilts away from the shared axis; `spread`
+                // scales it, so similarity falls as `spread` grows.
+                let mut embedding = vec![0.0_f32; dimension];
+                embedding[0] = 1.0;
+                embedding[1 + index % (dimension - 1)] = spread * (index as f32 + 1.0);
+
+                let content = if index == 0 {
+                    format!("topic:0 deployment policy — {CRITICAL_CLAUSE}")
+                } else {
+                    format!("topic:0 deployment note {index}")
+                };
+
+                let mut metadata = HashMap::new();
+                metadata.insert(TOPIC_METADATA_KEY.to_string(), "0".to_string());
+
+                MemoryEntry {
+                    id: format!("drift-{index}"),
+                    content,
+                    embedding,
+                    metadata,
+                    timestamp: aged_last_access,
+                    fsrs: FsrsState {
+                        stability: 1.0,
+                        last_access: aged_last_access,
+                        importance: 1.0,
+                        access_count: 0,
+                        ..FsrsState::default()
+                    },
+                    workspace_id: None,
+                }
+            })
+            .collect()
+    }
+
+    /// A service with a constant embedder — consolidation must embed each
+    /// summary it writes, and the dedup fold must re-embed each survivor, so
+    /// both arms need one. The vector it returns is irrelevant to the arm
+    /// selection, which is decided by the *seeded* entry vectors.
+    fn drift_service(dim: usize) -> MemoryService {
+        let mut service = service_for(dim);
+        service.set_embed_fn(std::sync::Arc::new(move |_text: &str| {
+            let mut embedding = vec![0.0_f32; dim];
+            embedding[0] = 1.0;
+            Box::pin(async move { Ok(embedding) })
+        }));
+        service
+    }
+
+    fn drift_consolidation() -> ConsolidationConfig {
+        ConsolidationConfig {
+            min_remaining_memories: 1,
+            max_compression_ratio: 0.9,
+            cluster_threshold: 0.65,
+            ..ConsolidationConfig::default()
+        }
+    }
+
+    /// Baseline arm: a rare clause that reaches the **summarizer** is destroyed
+    /// in a single dream cycle.
+    ///
+    /// This is the exposure the drift research names, reproduced against our own
+    /// pipeline. `echo_summarize` models a real summarizer faithfully for this
+    /// purpose — it keeps the dominant theme (the topic tag) and drops
+    /// everything that appears once, which is exactly the reported failure.
+    ///
+    /// Note what the recall metric says while this happens: the topic stays
+    /// perfectly recallable. Retrievability and *content fidelity* come apart
+    /// here, which is why drift needs its own instrument.
+    #[tokio::test]
+    async fn summarized_memories_lose_a_rare_critical_clause_in_one_cycle() {
+        let dim = 16;
+        let service = drift_service(dim);
+        // Spread large enough to fall below the Reinforce line, so the band is
+        // handled by the summarizing clusterer rather than the dedup fold.
+        let band = drift_band(8, dim, 0.45);
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "fixture must start with the clause present"
+        );
+
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert!(
+            result.clusters_formed > 0,
+            "this arm must exercise the summarizer: {result:?}"
+        );
+        assert!(
+            !clause_survives(&service, CRITICAL_CLAUSE).await,
+            "BASELINE: a summarized rare clause is expected to be lost — if this \
+             now survives, a drift mitigation landed and the baseline improved"
+        );
+    }
+
+    /// Mitigation arm (shipped 2026-07-23): a clause among **true duplicates** is
+    /// folded deterministically by dream phase (b) and survives intact.
+    ///
+    /// Same corpus shape, same summarizer, same cycle — only the similarity band
+    /// differs. This is the measurable value of folding restatements without an
+    /// LLM: the store still compresses, but nothing is paraphrased away.
+    #[tokio::test]
+    async fn deduplicated_memories_keep_their_rare_critical_clause() {
+        let dim = 16;
+        let service = drift_service(dim);
+
+        // Near-identical vectors => every pair clears the Reinforce line.
+        let band = drift_band(8, dim, 0.01);
+        for entry in band {
+            service.add_entry(entry).await.expect("seed");
+        }
+
+        let before_count = service.count().await;
+        let result = service
+            .consolidate(&drift_consolidation(), echo_summarize)
+            .await
+            .expect("consolidate");
+
+        assert!(
+            result.memories_deduped > 0,
+            "this arm must exercise the deterministic fold: {result:?}"
+        );
+        assert!(
+            service.count().await < before_count,
+            "the store must still compress: {before_count} -> {}",
+            service.count().await
+        );
+        assert!(
+            clause_survives(&service, CRITICAL_CLAUSE).await,
+            "a deterministically folded clause must survive verbatim"
+        );
     }
 
     #[test]
