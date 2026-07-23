@@ -1,6 +1,6 @@
 //! Script engine abstraction with automatic fallback
 
-use crate::{Result, ScriptError, ScriptedTool, NannaBridge, bridge::ServiceFn};
+use crate::{Result, ScriptError, ScriptedTool, NannaBridge, bridge::{ServiceFn, ToolSearchFn}};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -106,9 +106,28 @@ impl ScriptEngine {
         default_workdir: Option<std::path::PathBuf>,
         session_id: Option<String>,
     ) -> Result<ExecutionResult> {
+        self.execute_full(tool, input, tool_definitions, services, default_workdir, session_id, None).await
+    }
+
+    /// Execute a scripted tool with every optional bridge capability,
+    /// including the ranked tool search behind `Nanna.searchTools()`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_full(
+        &self,
+        tool: &ScriptedTool,
+        input: Value,
+        tool_definitions: Option<Value>,
+        services: Option<HashMap<String, ServiceFn>>,
+        default_workdir: Option<std::path::PathBuf>,
+        session_id: Option<String>,
+        tool_search: Option<ToolSearchFn>,
+    ) -> Result<ExecutionResult> {
         let mut bridge = NannaBridge::new(tool.permissions.clone());
         if let Some(defs) = tool_definitions {
             bridge = bridge.with_tool_definitions(defs);
+        }
+        if let Some(search) = tool_search {
+            bridge = bridge.with_tool_search(search);
         }
         if let Some(svcs) = services {
             bridge = bridge.with_services(svcs);

@@ -5718,6 +5718,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rten",
+ "rust-stemmers",
  "scraper",
  "serde",
  "serde_json",

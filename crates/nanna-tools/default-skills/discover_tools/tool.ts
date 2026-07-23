@@ -1,6 +1,6 @@
 export default {
   name: "discover_tools",
-  version: "0.1.1",
+  version: "0.2.0",
   description: "Activate tools for file access, shell commands, web browsing, code analysis, and more. Call with no arguments to see all available tools, or with a query (e.g. 'file', 'exec', 'web', 'code') to filter. Activated tools persist for the rest of this conversation. You MUST call this before using any tool beyond remember/recall/reflect.",
   output: "context",
   parameters: {
@@ -28,13 +28,50 @@ export default {
       }
     }
 
-    // Apply query filter if provided. The query is TOKENIZED and matched
-    // per word: "file write" must find the file tools exactly like
-    // "write file" does — the old whole-phrase substring match returned
-    // nothing unless the words happened to appear in that order. Tools
-    // matching more query words rank first.
+    // Apply query filter if provided.
+    //
+    // Preferred path: engine-side ranked search (Nanna.searchTools — BM25 +
+    // Snowball stemming + typo fallback in Rust). It handles word order,
+    // morphology ("replace" matches "replacing") and typos ("wirte file").
+    // The typeof guard keeps this working on engines that don't expose
+    // searchTools; an empty result falls through to the local tokenizer
+    // below so behavior degrades to exactly the old matching.
     var matched = discoverable;
-    if (query && query.length > 0) {
+    var usedRanked = false;
+    if (query && query.length > 0 && typeof Nanna.searchTools === "function") {
+      var ranked = null;
+      try {
+        ranked = Nanna.searchTools(query);
+      } catch (e) {
+        ranked = null;
+      }
+      if (ranked && ranked.length > 0) {
+        // Map ranked names back onto the full definitions (for params),
+        // preserving rank order and dropping core tools.
+        var byName = {};
+        for (var i = 0; i < discoverable.length; i++) {
+          byName[discoverable[i].name] = discoverable[i];
+        }
+        var picked = [];
+        for (var r = 0; r < ranked.length; r++) {
+          var found = byName[ranked[r].name];
+          if (found) {
+            picked.push(found);
+          }
+        }
+        if (picked.length > 0) {
+          matched = picked;
+          usedRanked = true;
+        }
+      }
+    }
+
+    // Fallback path: the query is TOKENIZED and matched per word: "file
+    // write" must find the file tools exactly like "write file" does — the
+    // old whole-phrase substring match returned nothing unless the words
+    // happened to appear in that order. Tools matching more query words
+    // rank first.
+    if (query && query.length > 0 && !usedRanked) {
       var terms = [];
       var cur = "";
       var ql = query.toLowerCase();

@@ -317,19 +317,111 @@ async fn missing_params_return_instructive_failures() {
     .await;
     assert!(err.contains("write_file"), "got: {err}");
 
-    // No-op edit.
-    let err = run_edit_fail(
-        json!({ "file_path": path, "old_string": "hello", "new_string": "hello" }),
-        dir.path(),
-    )
-    .await;
-    assert!(err.contains("identical"), "got: {err}");
-
     assert_eq!(
         read(&path),
         "hello\n",
         "file must be untouched by failed calls"
     );
+}
+
+#[tokio::test]
+async fn identical_old_new_is_a_noop_success_when_text_present() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "a.txt", "hello\nworld\n");
+
+    // The model "confirms" content instead of diffing (observed live). If
+    // the desired state already holds, that is success, not an error.
+    let result = run_edit(
+        json!({ "file_path": path, "old_string": "hello", "new_string": "hello" }),
+        dir.path(),
+    )
+    .await
+    .expect("no-op must succeed");
+    assert_eq!(result["success"], Value::Bool(true));
+    let content = result["content"].as_str().expect("content");
+    assert!(content.contains("No change needed"), "got: {content}");
+    assert_eq!(read(&path), "hello\nworld\n");
+}
+
+#[tokio::test]
+async fn identical_old_new_with_absent_text_names_the_staleness() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(dir.path(), "a.txt", "def real_function():\n    return 42\n");
+
+    let err = run_edit_fail(
+        json!({
+            "file_path": path,
+            "old_string": "def real_function():\n    return 99",
+            "new_string": "def real_function():\n    return 99"
+        }),
+        dir.path(),
+    )
+    .await;
+    assert!(err.contains("differs from your memory"), "got: {err}");
+    assert!(err.contains("read_file"), "got: {err}");
+    // Re-anchoring: the error quotes the closest REAL text.
+    assert!(err.contains("return 42"), "got: {err}");
+}
+
+#[tokio::test]
+async fn indentation_drift_still_matches_via_loose_span() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // File is 4-space indented; the model remembers 2-space. Content is
+    // right, whitespace is wrong — the loose span must match and replace
+    // the ORIGINAL bytes.
+    let path = seed(
+        dir.path(),
+        "a.py",
+        "def foo():\n    x = 1\n    return x\n\nprint(foo())\n",
+    );
+
+    run_edit(
+        json!({
+            "file_path": path,
+            "old_string": "def foo():\n  x = 1\n  return x",
+            "new_string": "def foo():\n    x = 2\n    return x"
+        }),
+        dir.path(),
+    )
+    .await
+    .expect("loose match should succeed");
+
+    assert_eq!(read(&path), "def foo():\n    x = 2\n    return x\n\nprint(foo())\n");
+}
+
+#[tokio::test]
+async fn not_found_error_quotes_closest_real_text() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = seed(
+        dir.path(),
+        "a.py",
+        "def load_notes():\n    notes = []\n    return notes\n",
+    );
+
+    let err = run_edit_fail(
+        json!({
+            "file_path": path,
+            "old_string": "def load_notes(path):\n    result = read(path)\n    return result",
+            "new_string": "x"
+        }),
+        dir.path(),
+    )
+    .await;
+    assert!(err.contains("UNCHANGED"), "got: {err}");
+    assert!(err.contains("Closest ACTUAL text"), "got: {err}");
+    assert!(err.contains("def load_notes():"), "got: {err}");
 }
 
 #[tokio::test]

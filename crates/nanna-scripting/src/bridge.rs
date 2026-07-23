@@ -24,6 +24,19 @@ pub type ServiceFn = Arc<
         + Sync,
 >;
 
+/// A synchronous ranked tool-search function backing `Nanna.searchTools(query)`.
+///
+/// Receives `(query, limit)` and returns a JSON array of
+/// `{name, description, score}` hits, best first. Implementations must never
+/// panic and should return an empty array when the underlying registry is
+/// gone — the script-side contract is "empty results, never a throw".
+pub type ToolSearchFn = Arc<dyn Fn(&str, usize) -> Value + Send + Sync>;
+
+/// Default number of hits `Nanna.searchTools` returns when the script passes
+/// no explicit limit — enough for a discovery response without flooding a
+/// small model's context.
+pub const DEFAULT_TOOL_SEARCH_LIMIT: usize = 10;
+
 /// Bridge providing Nanna capabilities to scripts
 #[derive(Clone)]
 pub struct NannaBridge {
@@ -32,6 +45,8 @@ pub struct NannaBridge {
     logs: Arc<RwLock<Vec<LogEntry>>>,
     /// Tool definitions for `Nanna.listTools()` — set by the script engine when available
     tool_definitions: Option<Value>,
+    /// Ranked tool search for `Nanna.searchTools()` — set by the script engine when available
+    tool_search: Option<ToolSearchFn>,
     /// Service functions callable via `Nanna.service(name, params)`
     services: Arc<HashMap<String, ServiceFn>>,
     /// Default working directory for exec commands (overrides home dir fallback)
@@ -297,6 +312,7 @@ impl NannaBridge {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             logs: Arc::new(RwLock::new(Vec::new())),
             tool_definitions: None,
+            tool_search: None,
             services: Arc::new(HashMap::new()),
             default_workdir: None,
             session_id: None,
@@ -332,6 +348,13 @@ impl NannaBridge {
     #[must_use]
     pub fn with_tool_definitions(mut self, defs: Value) -> Self {
         self.tool_definitions = Some(defs);
+        self
+    }
+
+    /// Set the ranked tool-search function for `Nanna.searchTools()`
+    #[must_use]
+    pub fn with_tool_search(mut self, search: ToolSearchFn) -> Self {
+        self.tool_search = Some(search);
         self
     }
 
@@ -394,6 +417,16 @@ impl NannaBridge {
     /// Get stored tool definitions (for `Nanna.listTools()`)
     pub fn list_tools(&self) -> Option<&Value> {
         self.tool_definitions.as_ref()
+    }
+
+    /// Run the ranked tool search (for `Nanna.searchTools()`).
+    ///
+    /// Returns `None` when no search function was attached (older embedding
+    /// contexts, test harnesses) — the caller maps that to an empty array,
+    /// never a thrown error.
+    #[must_use]
+    pub fn search_tools(&self, query: &str, limit: usize) -> Option<Value> {
+        self.tool_search.as_ref().map(|f| f(query, limit))
     }
 
     /// Call a registered service by name

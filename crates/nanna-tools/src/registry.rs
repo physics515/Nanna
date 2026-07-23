@@ -401,6 +401,35 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Rank canonical tools against `query` — BM25 + porter2 stemming with a
+    /// per-term fuzzy-typo fallback (see [`crate::search`]).
+    ///
+    /// Returns up to `limit` hits, best first, ties broken by name for
+    /// determinism. Alias entries are excluded entirely (canonical names
+    /// only — no duplicate `write`/`write_file` rows), and, mirroring
+    /// [`definitions`](Self::definitions), tools the active policy denies are
+    /// never surfaced.
+    pub async fn search_tools(&self, query: &str, limit: usize) -> Vec<crate::ToolSearchHit> {
+        let docs: Vec<crate::SearchDoc> = {
+            let tools = self.tools.read().await;
+            let aliases = self.aliases.read().await;
+            let policy = self.policy.read().await;
+            tools
+                .iter()
+                // Aliases point at a canonical entry that is also in the map;
+                // dropping every alias (lowercase or capitalized) leaves
+                // exactly the canonical corpus.
+                .filter(|(name, _)| !aliases.contains(name.as_str()))
+                .filter(|(name, _)| policy.permits(name.as_str()))
+                .map(|(name, t)| crate::SearchDoc {
+                    name: name.clone(),
+                    description: t.definition().description,
+                })
+                .collect()
+        };
+        crate::search::search_docs(&docs, query, limit)
+    }
+
     /// Get tool definitions in Anthropic format.
     /// Includes lowercase aliases so the LLM sees correct parameter schemas.
     pub async fn to_anthropic_format(&self) -> Vec<Value> {

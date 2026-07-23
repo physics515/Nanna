@@ -1584,6 +1584,12 @@ impl LlmClient {
         // Request 32K context so the agent has room for system prompt + conversation.
         // Ollama models default to small contexts (e.g. 8K) even if they support more.
         options.insert("num_ctx".to_string(), serde_json::json!(32768));
+        // qwen3.5's Modelfile ships presence_penalty=1.5 (Qwen's thinking-mode
+        // anti-repetition default). Code REQUIRES repetition, and at 1.5 the
+        // model visibly degraded working multi-function files into semicolon
+        // one-liner slop (observed live, round-5 drive). 1.0 keeps a mild
+        // guard; the loop's repetition/spiral detectors cover the rest.
+        options.insert("presence_penalty".to_string(), serde_json::json!(1.0));
         if !options.is_empty() {
             body["options"] = serde_json::Value::Object(options);
         }
@@ -3130,6 +3136,13 @@ impl LlmClient {
             options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
             // Request 32K context (Ollama models default to small contexts).
             options.insert("num_ctx".to_string(), serde_json::json!(32768));
+            // qwen3.5's Modelfile ships presence_penalty=1.5 (Qwen's thinking-
+            // mode anti-repetition default). Code REQUIRES repetition, and at
+            // 1.5 the model visibly degraded working multi-function files into
+            // semicolon one-liner slop (observed live, round-5 drive). 1.0
+            // keeps a mild guard; the loop's repetition/spiral detectors
+            // cover the rest.
+            options.insert("presence_penalty".to_string(), serde_json::json!(1.0));
             if !options.is_empty() {
                 body["options"] = serde_json::Value::Object(options);
             }

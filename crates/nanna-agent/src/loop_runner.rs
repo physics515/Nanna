@@ -607,23 +607,38 @@ pub fn mission_claims_complete(text: &str) -> bool {
 /// a user-role message AND surfaced in the UI as a `mission_control` tool
 /// call — the automation must be visible, never silent.
 ///
-/// `recent_tools` is a short digest of the last few tool outcomes — a
-/// disk-state anchor. Observed live: without it, a small model whose context
-/// was compressed mid-mission concluded its own files were corrupt and
-/// restarted from scratch on every prod, looping forever at feature one.
+/// `recent_tools` is a short digest of the last few tool outcomes and
+/// `dir_listing` a live listing of the working directory — disk-state
+/// anchors. Observed live: without them, a small model whose context was
+/// compressed mid-mission concluded its own files were corrupt and restarted
+/// from scratch on every prod (round 3), then forked versioned copies
+/// (`foo.py.new2`, `foo_fixed_v1.txt`) because it no longer trusted which
+/// file was real (round 5).
 #[must_use]
-pub fn mission_continue_message(round: usize, stall_rounds: usize, recent_tools: &str) -> String {
+pub fn mission_continue_message(
+    round: usize,
+    stall_rounds: usize,
+    recent_tools: &str,
+    dir_listing: &str,
+) -> String {
     let anchor = if recent_tools.is_empty() {
         String::new()
     } else {
         format!("\nYour recent tool results (ground truth):\n{recent_tools}\n")
+    };
+    let files = if dir_listing.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nFiles on disk RIGHT NOW (just listed — trust this over memory):\n{dir_listing}\n"
+        )
     };
     if stall_rounds >= 3 {
         format!(
             "[MISSION CONTROL round {round}] You have now stopped {stall_rounds} times without \
              making tool calls. In ONE short line, state which mission items remain. Then \
              IMMEDIATELY call the next tool to advance the first remaining item. If a needed \
-             tool is missing, call discover_tools.{anchor}\
+             tool is missing, call discover_tools.{anchor}{files}\
              Do NOT rewrite files from scratch — read_file the current file and fix the \
              smallest failing thing. Only output the line `MISSION COMPLETE` when every item \
              is truly verified done."
@@ -634,7 +649,8 @@ pub fn mission_continue_message(round: usize, stall_rounds: usize, recent_tools:
              real tool calls. Your files on disk are INTACT and are the source of truth: \
              read_file the current state, fix the smallest failing thing, verify with exec, \
              then move to the next numbered item. Do NOT start over or rewrite whole files \
-             from scratch.{anchor}\
+             from scratch, and do NOT create versioned copies — edit the real file in \
+             place with edit_file.{anchor}{files}\
              When everything is verified done, end with a line containing exactly: \
              MISSION COMPLETE"
         )
@@ -659,6 +675,51 @@ pub fn mission_verify_message() -> String {
 /// at `MISSION_DIGEST_ERR_CHARS_MAX` chars on a char boundary.
 pub const MISSION_DIGEST_TOOLS_MAX: usize = 5;
 const MISSION_DIGEST_ERR_CHARS_MAX: usize = 100;
+
+/// Entry cap for [`mission_dir_listing`]. Derivation: each line is ~40 chars
+/// (~10 tokens), so 20 entries keep the listing near one prod-paragraph
+/// (~200 tokens) inside a 32k-token window — a mission project directory
+/// that a single prompt drives is one project, not a tree walk.
+pub const MISSION_LISTING_ENTRIES_MAX: usize = 20;
+
+/// Live top-level listing of the mission working directory, embedded in
+/// continuation prods so the model re-anchors on what ACTUALLY exists
+/// instead of a compressed memory of it. Sorted for determinism, bounded by
+/// [`MISSION_LISTING_ENTRIES_MAX`] with an explicit `… and N more` marker
+/// (silent truncation would read as "that's everything"). Unreadable dir →
+/// empty string (the prod simply omits the section).
+#[must_use]
+pub fn mission_dir_listing(dir: &std::path::Path) -> String {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut names: Vec<(String, Option<u64>)> = read
+        .flatten()
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let size = e
+                .metadata()
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|m| m.len());
+            (name, size)
+        })
+        .collect();
+    names.sort();
+    let total = names.len();
+    let mut lines: Vec<String> = names
+        .iter()
+        .take(MISSION_LISTING_ENTRIES_MAX)
+        .map(|(name, size)| match size {
+            Some(s) => format!("- {name} ({s} bytes)"),
+            None => format!("- {name}/"),
+        })
+        .collect();
+    if total > MISSION_LISTING_ENTRIES_MAX {
+        lines.push(format!("… and {} more", total - MISSION_LISTING_ENTRIES_MAX));
+    }
+    lines.join("\n")
+}
 
 #[must_use]
 pub fn mission_tool_digest(records: &[ToolCallRecord]) -> String {
@@ -1757,10 +1818,18 @@ impl Agent {
                     let prod = if claim_unverified {
                         mission_verify_message()
                     } else {
+                        // Live disk anchor: the registry's session-aware
+                        // workdir is where the model is actually working
+                        // (seeded from the active workspace by the daemon).
+                        let listing = match self.tools.default_workdir().await {
+                            Some(dir) => mission_dir_listing(&dir),
+                            None => String::new(),
+                        };
                         mission_continue_message(
                             state.mission_rounds,
                             state.mission_stall_rounds,
                             &mission_tool_digest(&state.tool_records),
+                            &listing,
                         )
                     };
                     // The automation must be visible to the user: render the
@@ -3938,19 +4007,53 @@ mod tests {
 
     #[test]
     fn mission_prods_escalate_and_number_rounds() {
-        let early = mission_continue_message(1, 1, "");
-        let late = mission_continue_message(7, 3, "- exec FAILED: SyntaxError");
+        let early = mission_continue_message(1, 1, "", "");
+        let late = mission_continue_message(7, 3, "- exec FAILED: SyntaxError", "");
         assert!(early.contains("round 1"));
         assert!(early.contains("MISSION COMPLETE"));
         // The anti-restart directive is the round-3 lesson: prods without it
         // sent the model back to feature one every time.
         assert!(early.contains("from scratch"));
+        // The anti-fork directive is the round-5 lesson (foo.py.new2 litter).
+        assert!(early.contains("versioned copies"));
         assert!(late.contains("round 7"));
         // The escalated prod demands a remaining-items statement and carries
         // the ground-truth tool digest.
         assert!(late.contains("remain"));
         assert!(late.contains("SyntaxError"));
         assert_ne!(early, late);
+    }
+
+    #[test]
+    fn mission_prod_embeds_dir_listing_when_present() {
+        let listing = "- notekeeper.py (3159 bytes)\n- test_notekeeper.py (2095 bytes)";
+        let prod = mission_continue_message(2, 1, "- exec ok", listing);
+        assert!(prod.contains("RIGHT NOW"));
+        assert!(prod.contains("notekeeper.py (3159 bytes)"));
+        // Empty listing omits the section entirely.
+        let bare = mission_continue_message(2, 1, "- exec ok", "");
+        assert!(!bare.contains("RIGHT NOW"));
+    }
+
+    #[test]
+    fn mission_dir_listing_is_bounded_sorted_and_marks_overflow() {
+        let dir = std::env::temp_dir().join(format!("nanna_listing_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for i in 0..25 {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+        let listing = mission_dir_listing(&dir);
+        // Bounded with an explicit overflow marker — silent truncation would
+        // read as "that's everything".
+        assert_eq!(listing.lines().count(), MISSION_LISTING_ENTRIES_MAX + 1);
+        assert!(listing.contains("… and 6 more"), "got: {listing}");
+        assert!(listing.contains("- f00.txt (1 bytes)"));
+        // Directories are marked, files carry sizes.
+        assert!(listing.starts_with("- f00.txt"), "sorted first: {listing}");
+        // Missing dir → empty (prod omits the section, never errors).
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mission_dir_listing(&dir), String::new());
     }
 
     #[test]

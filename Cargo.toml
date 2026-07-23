@@ -124,6 +124,9 @@ async-trait = "0.1"
 toml = "1.1"
 directories = "6"
 
+# Snowball (porter2) stemming for tool lexical search (pure Rust, no deps)
+rust-stemmers = "1"
+
 # GUI (Tauri v2)
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
