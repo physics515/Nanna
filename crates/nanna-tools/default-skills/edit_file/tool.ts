@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.4",
+  version: "0.1.5",
   output: "context",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -152,7 +152,7 @@ export default {
           var nl = detail.indexOf("\n");
           if (nl !== -1) detail = detail.substring(0, nl);
           if (detail.length > 160) detail = detail.substring(0, 160);
-          return "REFUSED — after this edit " + path + " would NOT be valid Python (" + detail + "). The file is UNCHANGED. Fix new_string so the whole file parses (if the file has several errors, fix them all in this one edit), then retry. Pass force=true to save broken partial progress on purpose.";
+          return "REFUSED — after this edit " + path + " would NOT be valid Python (" + detail + "). The file is UNCHANGED. Fix new_string so the whole file parses (if the file has several errors, fix them all in this one edit), then retry.";
         }
         return null;
       } catch (e) {

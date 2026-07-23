@@ -1,14 +1,13 @@
 export default {
   name: "write_file",
-  version: "0.1.7",
+  version: "0.1.8",
   output: "context",
-  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. Use force=true to override.",
+  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
     type: "object",
     properties: {
       file_path: { type: "string", description: "REQUIRED. Path to the file to write. Relative paths are resolved against the workspace directory." },
       content: { type: "string", description: "REQUIRED. The complete text to write into the file. Never omit this — a write_file call without content always fails." },
-      force: { type: "boolean", description: "If true, skip the truncation safety check. Use when you intentionally want to write a smaller file." }
     },
     required: ["file_path", "content"]
   },
@@ -93,8 +92,7 @@ export default {
             Math.round(bytes / existingSize * 100) + "% of it). That usually means " +
             "you sent a fragment instead of the whole file. To proceed: " +
             "(1) read_file " + filePath + ", (2) merge your change into the FULL text, " +
-            "(3) call write_file again with the complete content. " +
-            "Only use force=true if you truly want the file replaced by this smaller version.",
+            "(3) call write_file again with the complete content.",
           success: false
         };
       }
@@ -133,7 +131,7 @@ export default {
         }
       }
       if (copyHit) {
-        return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite is always accepted). Pass force=true only if this genuinely is a new standalone file.");
+        return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite is always accepted).");
       }
 
       // Draft PARKING (round-8 lesson): refusing a broken whole-file write
@@ -174,7 +172,7 @@ export default {
           }
           return fail("WRITE PARKED — your content for " + filePath + " has a SYNTAX ERROR (" + syntaxDetail + "), so the file was NOT changed. Nothing was lost: the draft IS SAVED at " + parkPath + "." + lineQuote + " Your NEXT call must be edit_file(file_path=\"" + parkPath + "\", old_string=<the broken line>, new_string=<the fixed line>), then file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). Do NOT call write_file again for this file and do NOT regenerate it.");
         }
-        return fail("WRITE REFUSED — the content you sent for " + filePath + " is NOT valid Python (" + syntaxDetail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text. Pass force=true only to write broken code on purpose.");
+        return fail("WRITE REFUSED — the content you sent for " + filePath + " is NOT valid Python (" + syntaxDetail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text.");
       }
     }
 

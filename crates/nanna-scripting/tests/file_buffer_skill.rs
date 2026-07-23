@@ -170,16 +170,19 @@ async fn second_clear_requires_force() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("h.txt").to_string_lossy().into_owned();
 
-    // First discard is free (and warns about the next one).
+    // First discard is free (and warns about the next one) — but must NOT
+    // advertise the force escape hatch: round 12 showed the model reads
+    // "pass force=true" in refusals and makes forced bypass its habit.
     run_ok(
         json!({ "action": "append", "file_path": target, "content": "draft one" }),
         dir.path(),
     )
     .await;
     let first = run_ok(json!({ "action": "clear", "file_path": target }), dir.path()).await;
-    assert!(first.contains("force=true"), "got: {first}");
+    assert!(first.contains("repair"), "got: {first}");
+    assert!(!first.contains("force"), "must not advertise force: {first}");
 
-    // Second discard is the regeneration loop — refused without force.
+    // Second discard is the regeneration loop — refused, no hatch named.
     run_ok(
         json!({ "action": "append", "file_path": target, "content": "draft two" }),
         dir.path(),
@@ -188,8 +191,9 @@ async fn second_clear_requires_force() {
     let err = run_fail(json!({ "action": "clear", "file_path": target }), dir.path()).await;
     assert!(err.contains("CLEAR REFUSED"), "got: {err}");
     assert!(err.contains("edit_file"), "got: {err}");
+    assert!(!err.contains("force"), "must not advertise force: {err}");
 
-    // force=true is the escape hatch.
+    // force=true still WORKS (an operator escape), it is just unnamed.
     let forced = run_ok(
         json!({ "action": "clear", "file_path": target, "force": true }),
         dir.path(),
@@ -221,7 +225,8 @@ async fn shrink_guard_keeps_buffer_and_file() {
     .await;
     assert!(err.contains("COMMIT REFUSED"), "got: {err}");
     assert!(err.contains("KEPT"), "got: {err}");
-    assert!(err.contains("force"), "got: {err}");
+    assert!(err.contains("appending"), "got: {err}");
+    assert!(!err.contains("force"), "must not advertise force: {err}");
     // Real file untouched, buffer still there for continued appending.
     assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
     let buf = std::fs::read_to_string(dir.path().join("e.txt.__buffer__")).unwrap();
