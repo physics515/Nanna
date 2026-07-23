@@ -326,13 +326,25 @@ pub struct BulkLoadReport {
 /// True if `err` looks like an on-disk corruption error — e.g. turso's
 /// "inconsistent overflow chain observed during payload read".
 ///
-/// Matched on the *rendered* message so it survives the `StorageError` →
-/// `String` boundary that `MemoryError::Persistence` crosses (the enum variant
-/// isn't visible there). Pure, unit-testable.
+/// Checks the typed variant first: turso maps `LimboError::Corrupt` to
+/// `turso::Error::Corrupt`, but that variant *renders as the bare inner
+/// message* (e.g. "Invalid page type: 0" — no "corrupt" substring), which is
+/// exactly how the 2026-07-22 salvage failure slipped past a string-only
+/// match. The string patterns remain for errors that crossed the
+/// `StorageError` → `String` boundary that `MemoryError::Persistence` forces
+/// (the enum variant isn't visible there). Pure, unit-testable.
 #[must_use]
 pub fn is_corruption_error(err: &StorageError) -> bool {
+    if let StorageError::Database(e) = err {
+        if matches!(e, turso::Error::Corrupt(_) | turso::Error::NotAdb(_)) {
+            return true;
+        }
+    }
     let s = err.to_string().to_lowercase();
-    s.contains("overflow chain") || s.contains("corrupt") || s.contains("malformed")
+    s.contains("overflow chain")
+        || s.contains("corrupt")
+        || s.contains("malformed")
+        || s.contains("invalid page")
 }
 
 impl MemoryRepository {

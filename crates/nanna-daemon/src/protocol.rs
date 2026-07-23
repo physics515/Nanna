@@ -694,6 +694,15 @@ pub enum Event {
         id: String,
         content: String,
     },
+    /// The durable memory store had page-level corruption at startup: the
+    /// damaged database file was quarantined and a fresh store rebuilt from
+    /// whatever rows were still reachable. `expected` is `None` when the
+    /// corrupt store's row count could not even be read.
+    MemoryStoreRebuilt {
+        recovered: usize,
+        expected: Option<usize>,
+        quarantine_path: String,
+    },
     MemoryUpdated {
         id: String,
     },

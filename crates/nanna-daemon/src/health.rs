@@ -163,6 +163,12 @@ pub struct HealthState {
     pub memory_degraded: bool,
     /// Number of memory rows that were unreadable (corrupt) at load.
     pub memory_corrupt_rows: usize,
+    /// The store was quarantined and rebuilt after page-level corruption.
+    pub memory_rebuilt: bool,
+    /// Memories salvaged into the rebuilt store (0 unless `memory_rebuilt`).
+    pub memory_recovered_rows: usize,
+    /// Memories the corrupt store held, when countable (None = unknown loss).
+    pub memory_expected_rows: Option<usize>,
     /// Agent service status
     pub agent_available: bool,
     /// Last error message (if any)
@@ -178,6 +184,9 @@ impl HealthState {
             memory_available,
             memory_degraded: false,
             memory_corrupt_rows: 0,
+            memory_rebuilt: false,
+            memory_recovered_rows: 0,
+            memory_expected_rows: None,
             agent_available,
             last_error: Arc::new(RwLock::new(None)),
         }
@@ -190,6 +199,17 @@ impl HealthState {
     pub fn with_memory_health(mut self, degraded: bool, corrupt_rows: usize) -> Self {
         self.memory_degraded = degraded;
         self.memory_corrupt_rows = corrupt_rows;
+        self
+    }
+
+    /// Seed the store-rebuilt-after-corruption facts (from the startup
+    /// `RecoveryReport`) so `/status` keeps reporting the rebuild — clients
+    /// that connect after boot never saw the `MemoryStoreRebuilt` event.
+    #[must_use]
+    pub fn with_memory_rebuild(mut self, recovered: usize, expected: Option<usize>) -> Self {
+        self.memory_rebuilt = true;
+        self.memory_recovered_rows = recovered;
+        self.memory_expected_rows = expected;
         self
     }
 
@@ -225,6 +245,9 @@ pub struct StatusResponse {
     pub memory_available: bool,
     pub memory_degraded: bool,
     pub memory_corrupt_rows: usize,
+    pub memory_rebuilt: bool,
+    pub memory_recovered_rows: usize,
+    pub memory_expected_rows: Option<usize>,
     pub agent_available: bool,
     pub last_error: Option<String>,
 }
@@ -268,6 +291,9 @@ async fn status(State(state): State<Arc<HealthState>>) -> Json<StatusResponse> {
         memory_available: state.memory_available,
         memory_degraded: state.memory_degraded,
         memory_corrupt_rows: state.memory_corrupt_rows,
+        memory_rebuilt: state.memory_rebuilt,
+        memory_recovered_rows: state.memory_recovered_rows,
+        memory_expected_rows: state.memory_expected_rows,
         agent_available: state.agent_available,
         last_error,
     })
@@ -469,6 +495,27 @@ mod tests {
         let Json(s2) = status(State(server2.state())).await;
         assert!(!s2.memory_degraded);
         assert_eq!(s2.memory_corrupt_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_memory_rebuild() {
+        // A store rebuilt after page-level corruption must stay visible on
+        // /status for clients that connected after the boot-time event.
+        let shared =
+            Arc::new(HealthState::new(true, true).with_memory_rebuild(42, Some(50)));
+        let server = HealthServer::from_shared(shared, "127.0.0.1", 0);
+        let Json(s) = status(State(server.state())).await;
+        assert!(s.memory_rebuilt);
+        assert_eq!(s.memory_recovered_rows, 42);
+        assert_eq!(s.memory_expected_rows, Some(50));
+
+        // Without a rebuild the fields stay quiet.
+        let clean = Arc::new(HealthState::new(true, true));
+        let server2 = HealthServer::from_shared(clean, "127.0.0.1", 0);
+        let Json(s2) = status(State(server2.state())).await;
+        assert!(!s2.memory_rebuilt);
+        assert_eq!(s2.memory_recovered_rows, 0);
+        assert_eq!(s2.memory_expected_rows, None);
     }
 
     #[tokio::test]
