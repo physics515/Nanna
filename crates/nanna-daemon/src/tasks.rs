@@ -805,10 +805,17 @@ const STEP_LLM_RETRIES: usize = 3;
 /// Backoff before retry attempts 1..=3.
 const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
-fn is_transient_llm_error(message: &str) -> bool {
+/// Transient provider faults worth retrying in place: 5xx (including the
+/// synthesized 502 for aborted Ollama generations), client timeouts and
+/// connection failures ("error sending request" is reqwest's send-phase
+/// failure), and mid-stream drops ("Stream error:"). Shared by the step
+/// runner and the chat path — both heal with the same ladder.
+pub(crate) fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
         || message.contains("timed out")
         || message.contains("connection")
+        || message.contains("error sending request")
+        || message.contains("Stream error:")
 }
 
 /// Forensics: append the exact prompt of an empty-completion step to a temp
@@ -887,25 +894,7 @@ impl AgentStepRunner {
     /// checkpoint that sends every generation straight to a stop token, and
     /// only a fresh runner clears it. No-op for non-Ollama models.
     pub async fn reset_ollama_runner(&self) {
-        let model = &self.agent_config.model;
-        if !self.is_ollama_model() {
-            return;
-        }
-        let base =
-            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-        tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after empty completions");
-        let client = reqwest::Client::new();
-        let _ = client
-            .post(format!("{base}/api/generate"))
-            .json(&serde_json::json!({
-                "model": LlmRouter::strip_model_prefix(model),
-                "keep_alive": 0
-            }))
-            .timeout(std::time::Duration::from_secs(20))
-            .send()
-            .await;
-        // Give the runner a moment to tear down before the reload request.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        reset_ollama_runner_for(&self.agent_config.model).await;
     }
 
     async fn try_run_step(&self, request: &StepRequest) -> Result<StepOutcome, String> {
@@ -1050,13 +1039,59 @@ fn digest(content: &str) -> String {
 // Run manager
 // ---------------------------------------------------------------------------
 
+/// Minimum spacing between Ollama server restarts across ALL callers —
+/// chat sessions, heartbeats, and task runs share one local server. Bounds
+/// the blast radius when a model is persistently broken (e.g. OOM on every
+/// load): without it, every failing chat re-kills the server out from under
+/// every other client.
+const OLLAMA_RESTART_COOLDOWN_SECS: u64 = 600;
+
+/// Unix-epoch seconds of the last restart this process performed.
+static LAST_OLLAMA_RESTART_EPOCH_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Restart the local Ollama server: kill `ollama.exe` only (the tray
 /// supervisor respawns it) and wait for the API to come back.
 ///
 /// This is the cure for the sticky degraded-runner state (every generation
 /// aborted with `done:false`; model unloads do not clear it — verified live).
 /// Callers gate it: bouncing a shared local service is an operator decision.
+/// Refuses to act when `OLLAMA_HOST` points at a non-local server, and at
+/// most once per [`OLLAMA_RESTART_COOLDOWN_SECS`] process-wide.
 pub async fn restart_ollama_server() -> bool {
+    let base =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let is_local = ["localhost", "127.0.0.1", "[::1]"]
+        .iter()
+        .any(|h| base.contains(h));
+    if !is_local {
+        tracing::warn!(host = %base, "refusing Ollama restart: OLLAMA_HOST is not a local server");
+        return false;
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_OLLAMA_RESTART_EPOCH_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < OLLAMA_RESTART_COOLDOWN_SECS
+        || LAST_OLLAMA_RESTART_EPOCH_SECS
+            .compare_exchange(
+                last,
+                now_secs,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        tracing::warn!(
+            "skipping Ollama restart — one already ran {}s ago (cooldown {}s)",
+            now_secs.saturating_sub(last),
+            OLLAMA_RESTART_COOLDOWN_SECS
+        );
+        return false;
+    }
+
     tracing::warn!("restarting the Ollama server (degraded runner state)");
     #[cfg(windows)]
     let _ = std::process::Command::new("taskkill")
@@ -1066,8 +1101,6 @@ pub async fn restart_ollama_server() -> bool {
     let _ = std::process::Command::new("pkill")
         .args(["-x", "ollama"])
         .output();
-    let base =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let up = reqwest::Client::new()
@@ -1090,8 +1123,35 @@ pub async fn restart_ollama_server() -> bool {
 /// the server anyway, and a restart is the only known cure. Set
 /// `NANNA_OLLAMA_RESTART_ON_DEGRADED=0` to opt out on setups where bouncing
 /// the shared server is unacceptable.
-fn ollama_restart_allowed() -> bool {
+pub(crate) fn ollama_restart_allowed() -> bool {
     std::env::var("NANNA_OLLAMA_RESTART_ON_DEGRADED").as_deref() != Ok("0")
+}
+
+/// Unload an Ollama-served model (`keep_alive: 0`) to clear runner state —
+/// the observed degraded mode restores a stale KV context checkpoint that
+/// sends every generation straight to a stop token, and only a fresh runner
+/// clears it. Free-function variant so the chat path can heal with the same
+/// ladder as the step runner. No-op for non-Ollama models: healing is
+/// provider-gated, a `:free` `OpenRouter` suffix must never trigger it.
+pub(crate) async fn reset_ollama_runner_for(model: &str) {
+    if crate::llm_router::ProviderId::from_model(model) != crate::llm_router::ProviderId::Ollama {
+        return;
+    }
+    let base =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after transient failures");
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("{base}/api/generate"))
+        .json(&serde_json::json!({
+            "model": LlmRouter::strip_model_prefix(model),
+            "keep_alive": 0
+        }))
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await;
+    // Give the runner a moment to tear down before the reload request.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 }
 
 /// Fold per-segment reports into one run-level report: counters sum, the
@@ -1132,6 +1192,28 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_classifier_matches_the_live_failure_strings() {
+        // The exact strings observed in the daemon log the chat-path healing
+        // was built from — each one must be retried, not fatal.
+        assert!(is_transient_llm_error(
+            "LLM error: HTTP error: error sending request for url (http://localhost:11434/api/chat)"
+        ));
+        assert!(is_transient_llm_error(
+            "LLM error: Stream error: error decoding response body"
+        ));
+        assert!(is_transient_llm_error(
+            "API error: 502 - Ollama aborted generation mid-response (done=false)"
+        ));
+        assert!(is_transient_llm_error(
+            "API error: 502 - Ollama stream ended without completion (no done=true)"
+        ));
+        assert!(is_transient_llm_error("request timed out"));
+        // Non-transient failures must fall through to the next model.
+        assert!(!is_transient_llm_error("API error: 401 - invalid api key"));
+        assert!(!is_transient_llm_error("API error: 400 - context length exceeded"));
+    }
 
     fn seg(
         steps: usize,

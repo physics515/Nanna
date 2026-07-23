@@ -1376,9 +1376,21 @@ impl DaemonServer {
 
         // Spawn IPC server
         let ipc_server = self.ipc.clone();
+        let ipc_shutdown = self.shutdown_tx.clone();
         let ipc_handle = tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
-                error!("IPC server error: {}", e);
+                // An IPC-less daemon is unreachable (no control plane) but
+                // would keep running heartbeats and burning the LLM budget —
+                // observed live when a second instance lost the port race.
+                // Take the daemon down instead of zombie-ing.
+                error!(
+                    "IPC server error: {} — shutting down (a daemon without IPC is unreachable)",
+                    e
+                );
+                if ipc_shutdown.send(()).is_err() {
+                    // No shutdown listener yet — exit hard rather than linger.
+                    std::process::exit(1);
+                }
             }
         });
 
