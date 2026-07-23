@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.0",
+  version: "0.1.1",
   output: "context",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit.",
   parameters: {
@@ -130,7 +130,24 @@ export default {
       if (input.force !== true) {
         var syntaxDetail = pythonSyntaxRefusal(filePath, buffered);
         if (syntaxDetail) {
-          return fail("COMMIT REFUSED — the buffered content for " + filePath + " is not valid Python (" + syntaxDetail + "). The real file is UNCHANGED and the buffer is KEPT. Fix it with edit_file on the buffer itself (file_path=\"" + bufPath + "\"), then commit again. Or action=\"clear\" and rebuild.");
+          // Quote the offending line: a ready-made old_string for the
+          // repair edit — regeneration is never the answer here.
+          var lineQuote = "";
+          if (syntaxDetail.indexOf("line ") === 0) {
+            var colonAt = syntaxDetail.indexOf(":");
+            if (colonAt > 5) {
+              var lineNo = parseInt(syntaxDetail.substring(5, colonAt), 10);
+              if (lineNo >= 1) {
+                var bufLines = buffered.split("\n");
+                if (lineNo <= bufLines.length) {
+                  var lq = bufLines[lineNo - 1];
+                  if (lq.length > 80) lq = lq.substring(0, 80);
+                  lineQuote = " Line " + lineNo + " of the buffer is: `" + lq + "` — use exactly that as old_string.";
+                }
+              }
+            }
+          }
+          return fail("COMMIT REFUSED — the buffered content for " + filePath + " is not valid Python (" + syntaxDetail + "). The real file is UNCHANGED and the buffer is KEPT." + lineQuote + " Your NEXT call must be edit_file(file_path=\"" + bufPath + "\", old_string=<the broken line>, new_string=<the fixed line>), then commit again. Do NOT regenerate the file.");
         }
         // Shrink guard, same 30% rule as write_file: a much-smaller commit
         // over an existing file usually means the buffer is incomplete.
