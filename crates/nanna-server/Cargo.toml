@@ -13,6 +13,7 @@ anyhow.workspace = true
 reqwest.workspace = true
 
 nanna-core = { path = "../nanna-core" }
+nanna-config = { path = "../nanna-config" }
 nanna-agent = { path = "../nanna-agent" }
 nanna-tools = { path = "../nanna-tools" }
 nanna-storage = { path = "../nanna-storage" }

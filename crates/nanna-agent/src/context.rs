@@ -399,21 +399,47 @@ impl AgentContext {
     /// - After fetching updated model info from the API
     ///
     /// Returns true if the model changed (and limits were updated).
+    ///
+    /// Static-reserve variant for callers with no request budget in hand;
+    /// prefer [`Self::configure_for_model_with_output`] when the per-request
+    /// `max_tokens` is known — the output reserve then shrinks to what the
+    /// request can actually generate, freeing the rest of the window for
+    /// input.
     pub fn configure_for_model(&mut self, model_info: &ModelInfo) -> bool {
+        self.configure_for_model_with_output(
+            model_info,
+            model_info
+                .max_output_tokens
+                .min(model_info.context_window / 4),
+        )
+    }
+
+    /// Configure context limits from model capabilities AND the caller's
+    /// actual per-request output budget. The reserve is derived via
+    /// [`ModelInfo::effective_output_budget`], so input + output can never
+    /// over-commit the window, and a small-output agent (e.g. 2k
+    /// `max_tokens` on a 32k model) keeps ~94% of the window for input.
+    pub fn configure_for_model_with_output(
+        &mut self,
+        model_info: &ModelInfo,
+        requested_max_output_tokens: usize,
+    ) -> bool {
+        let reserve = model_info.effective_output_budget(requested_max_output_tokens);
         let model_changed = self.current_model.as_ref() != Some(&model_info.id);
 
         if model_changed {
             info!(
                 model = %model_info.id,
                 context_window = model_info.context_window,
-                compression_threshold = model_info.compression_threshold(),
-                hard_limit = model_info.hard_input_limit(),
+                output_reserve = reserve,
+                compression_threshold = model_info.compression_threshold_for(reserve),
+                hard_limit = model_info.hard_input_limit_for(reserve),
                 "Configuring context for model"
             );
         }
 
-        self.compression_threshold = model_info.compression_threshold();
-        self.hard_limit = model_info.hard_input_limit();
+        self.compression_threshold = model_info.compression_threshold_for(reserve);
+        self.hard_limit = model_info.hard_input_limit_for(reserve);
         self.current_model = Some(model_info.id.clone());
 
         model_changed
@@ -1498,5 +1524,35 @@ mod tests {
         // Mirrors unknown_model_info floors (no per-model table).
         assert_eq!(ctx.hard_limit, nanna_llm::unknown_model_info("x", "").hard_input_limit());
         assert!(ctx.compression_threshold <= ctx.hard_limit);
+    }
+
+    #[test]
+    fn output_budget_drives_the_input_limit() {
+        // Dynamic split: the reserve tracks the request's max_tokens, not
+        // the provider's max_output claim. A 2k-output agent on a 32k model
+        // (whose provider claims max_output >= context) keeps ~94% of the
+        // window for input.
+        let info = ModelInfo {
+            id: "qwen-like".into(),
+            context_window: 32_000,
+            max_output_tokens: 32_000,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "ollama".into(),
+        };
+        let mut ctx = AgentContext::new("s");
+        ctx.configure_for_model_with_output(&info, 2_048);
+        assert_eq!(ctx.hard_limit, 32_000 - 2_048);
+        assert!(ctx.compression_threshold <= ctx.hard_limit);
+
+        // The default 8k budget matches the static path's reservation.
+        ctx.configure_for_model_with_output(&info, 8_192);
+        assert_eq!(ctx.hard_limit, 32_000 - 8_192);
+
+        // A degenerate budget can never claim more than half the window.
+        ctx.configure_for_model_with_output(&info, 30_000);
+        assert_eq!(ctx.hard_limit, 16_000);
     }
 }

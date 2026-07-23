@@ -91,6 +91,47 @@ impl ToolPolicy {
         }
     }
 
+    /// Build a policy from the `[tools] enabled` / `[tools] disabled` config
+    /// lists — the single interpretation of those two settings.
+    ///
+    /// `enabled` is treated as a real allowlist only when it is non-empty and
+    /// does not contain the `"*"` wildcard; otherwise it means "no restriction"
+    /// (the default config ships `enabled = ["*"]`). `disabled` always applies
+    /// as a denylist on top, and deny beats allow, so a name on both lists fails
+    /// closed.
+    ///
+    /// Lives here rather than in a host crate so every entry point that exposes
+    /// tools — the daemon, and the `nanna mcp serve` bridge — reads the user's
+    /// configuration identically. A second copy is a security bug waiting to
+    /// happen: the two would drift and one surface would offer a tool the user
+    /// had disabled.
+    #[must_use]
+    pub fn from_config_lists(enabled: Option<&[String]>, disabled: &[String]) -> Self {
+        // Matched by `filter` so there is no `unwrap` on this path.
+        let real_allowlist = enabled.filter(|e| !e.is_empty() && !e.iter().any(|n| n == "*"));
+
+        let base = match real_allowlist {
+            Some(names) => Self::allow_only(names.iter().cloned()),
+            None => Self::allow_all(),
+        };
+
+        let policy = if disabled.is_empty() {
+            base
+        } else {
+            base.with_denied(disabled.iter().cloned())
+        };
+
+        debug_assert!(
+            disabled.iter().all(|name| policy.deny.contains(name)),
+            "every disabled name must end up denied"
+        );
+        debug_assert!(
+            real_allowlist.is_some() || policy.allow.is_none(),
+            "a wildcard or empty `enabled` must not produce an allowlist"
+        );
+        policy
+    }
+
     /// Add denied names to this policy, returning the narrowed policy.
     #[must_use]
     pub fn with_denied<I, S>(mut self, names: I) -> Self
@@ -285,6 +326,58 @@ mod tests {
         let b = ToolPolicy::deny_only(["write_file"]);
         let c = ToolPolicy::deny_only(["fetch"]);
         assert_eq!(a.overlay(&b).overlay(&c), a.overlay(&b.overlay(&c)));
+    }
+
+    /// `[tools] enabled = ["*"]` is the shipped default and must mean "no
+    /// restriction", not "allow a tool literally named `*`".
+    #[test]
+    fn from_config_wildcard_enabled_is_unrestricted() {
+        let enabled = vec!["*".to_string()];
+        let policy = ToolPolicy::from_config_lists(Some(&enabled), &[]);
+        assert!(policy.is_unrestricted());
+        assert!(policy.permits("exec"));
+    }
+
+    #[test]
+    fn from_config_absent_or_empty_enabled_is_unrestricted() {
+        // Neither an absent list nor an empty one is an allowlist — an empty
+        // `enabled` in a config file must not silently lock out every tool.
+        assert!(ToolPolicy::from_config_lists(None, &[]).is_unrestricted());
+        assert!(ToolPolicy::from_config_lists(Some(&[]), &[]).is_unrestricted());
+    }
+
+    #[test]
+    fn from_config_real_allowlist_restricts() {
+        let enabled = vec!["read_file".to_string(), "list_dir".to_string()];
+        let policy = ToolPolicy::from_config_lists(Some(&enabled), &[]);
+        assert!(!policy.is_unrestricted());
+        assert!(policy.permits("read_file"));
+        assert!(
+            !policy.permits("exec"),
+            "a tool outside the allowlist is denied"
+        );
+    }
+
+    #[test]
+    fn from_config_disabled_denies_even_when_also_enabled() {
+        // Deny beats allow: a name on BOTH lists must fail closed, or a typo in
+        // `enabled` could silently re-grant something the user disabled.
+        let enabled = vec!["read_file".to_string(), "exec".to_string()];
+        let disabled = vec!["exec".to_string()];
+        let policy = ToolPolicy::from_config_lists(Some(&enabled), &disabled);
+        assert!(policy.permits("read_file"));
+        assert!(!policy.permits("exec"));
+    }
+
+    #[test]
+    fn from_config_disabled_applies_under_a_wildcard_too() {
+        // The common real-world shape: `enabled = ["*"]` with a few `disabled`.
+        let enabled = vec!["*".to_string()];
+        let disabled = vec!["exec".to_string()];
+        let policy = ToolPolicy::from_config_lists(Some(&enabled), &disabled);
+        assert!(!policy.is_unrestricted());
+        assert!(!policy.permits("exec"));
+        assert!(policy.permits("read_file"));
     }
 
     #[test]

@@ -193,18 +193,28 @@ impl DaemonManager {
         let url = self.ws_url();
         let deadline = tokio::time::Instant::now() + self.config.startup_timeout;
         
+        let mut child_exited = false;
         while tokio::time::Instant::now() < deadline {
-            // The event task flips state to Crashed when the child terminates —
-            // bail immediately instead of polling out the rest of the timeout.
-            if *self.state.read().await == DaemonState::Crashed {
-                warn!("Daemon terminated during startup; aborting ready-wait");
-                return false;
+            // A dead child can still mean a healthy daemon: the sidecar
+            // exits AlreadyRunning when a standalone daemon holds the
+            // PID-file lock (single-instance guard), and that daemon may
+            // still be mid-init (IPC binds late). Keep polling the port
+            // until the deadline; only fail when nobody ever answers.
+            if !child_exited && *self.state.read().await == DaemonState::Crashed {
+                child_exited = true;
+                warn!(
+                    "Sidecar exited during startup — polling {} for an existing daemon instance",
+                    url
+                );
             }
             // Try to connect
             match tokio_tungstenite::connect_async(&url).await {
                 Ok((mut ws, _)) => {
                     // Connected! Close and return success
                     let _ = futures_util::SinkExt::close(&mut ws).await;
+                    if child_exited {
+                        info!("Attached to an existing daemon instance on {}", url);
+                    }
                     return true;
                 }
                 Err(_) => {

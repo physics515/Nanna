@@ -64,7 +64,7 @@ fn print_tool_calls(tool_calls: &[nanna_agent::ToolCallRecord]) {
 }
 
 /// Run interactive CLI mode.
-pub(crate) async fn run_cli(
+pub async fn run_cli(
     config: &Config,
     session_id: Option<String>,
     model: Option<String>,
@@ -257,7 +257,7 @@ async fn run_cli_loop(
 }
 
 /// Run a single prompt and exit
-pub(crate) async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> anyhow::Result<()> {
+pub async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> anyhow::Result<()> {
     let (llm, tools, _storage) = init_components(config).await?;
 
     let agent_config = AgentConfig {
@@ -304,7 +304,7 @@ Be concise and direct.",
 }
 
 /// List recent sessions
-pub(crate) async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
+pub async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result<()> {
     // Initialize storage only (no LLM needed)
     let storage_path = config
         .memory
@@ -337,7 +337,7 @@ pub(crate) async fn list_sessions(config: &Config, limit: i64) -> anyhow::Result
             "{:<38} {:<8} {:<20}",
             session.session_id,
             session.channel,
-            &session.updated_at
+            session.updated_at
         );
     }
 

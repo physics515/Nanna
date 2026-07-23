@@ -6,11 +6,14 @@
 //! Provides vector storage and semantic search with SIMD and GPU acceleration.
 //! Implements FSRS-6 for cognitive memory decay and the "dreaming" consolidation model.
 
+mod activity;
 mod consolidation;
 mod dreaming;
 mod fsrs;
 pub mod retention;
 mod service;
+
+pub use activity::ActivityClock;
 
 pub use consolidation::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
@@ -19,8 +22,8 @@ pub use consolidation::{
     cluster_content_bytes_for_context, FALLBACK_SUMMARIZER_CONTEXT_WINDOW_TOKENS,
 };
 pub use dreaming::{
-    dream_trigger, DreamTrigger, DreamingConfig, DreamingService, DreamingStats, MemoryFeedback,
-    make_summarize_fn, LlmSummarizer,
+    dream_trigger, DreamOutcome, DreamTrigger, DreamingConfig, DreamingService, DreamingStats,
+    MemoryFeedback, make_summarize_fn, LlmSummarizer,
 };
 pub use fsrs::{
     FsrsParameters, FsrsState, MemoryState, Rating, IngestAction,

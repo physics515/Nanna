@@ -115,20 +115,38 @@ pub enum PidFileError {
     Io(String),
 }
 
-/// Check if a process with the given PID is running
+/// Check if a process with the given PID is running.
+///
+/// Uses the Win32 API directly. The previous `tasklist` subprocess check
+/// returned `false` whenever the subprocess itself failed, which let a
+/// second daemon instance treat a LIVE daemon as dead and clobber its PID
+/// file (observed live: a GUI sidecar overwrote the standalone daemon's
+/// lock, then ran on as a storage-less zombie).
 #[cfg(windows)]
 fn is_process_running(pid: u32) -> bool {
-    use std::process::Command;
-    
-    // Use tasklist to check if process exists
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .output()
-        .map(|o| {
-            let output = String::from_utf8_lossy(&o.stdout);
-            output.contains(&pid.to_string())
-        })
-        .unwrap_or(false)
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    // Named locally so a windows-sys reorganization cannot silently change
+    // semantics: these are stable Win32 ABI values.
+    const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT_CODE: u32 = 0x102;
+    const ERROR_ACCESS_DENIED_CODE: u32 = 5;
+
+    // SAFETY: plain Win32 calls; the handle is closed on every path.
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            // Access denied means the process exists but isn't ours (e.g. an
+            // elevated daemon) — that still counts as running. Any other
+            // failure (invalid parameter, not found) means no such process.
+            return GetLastError() == ERROR_ACCESS_DENIED_CODE;
+        }
+        let wait = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        // Not yet signaled → the process is still running.
+        wait == WAIT_TIMEOUT_CODE
+    }
 }
 
 #[cfg(unix)]
@@ -444,6 +462,30 @@ mod tests {
         assert!(!pid_file.path().exists());
     }
     
+    #[test]
+    fn liveness_check_sees_the_current_process() {
+        // The regression that let two daemons run at once: the liveness
+        // check mis-reporting a live PID as dead.
+        assert!(is_process_running(std::process::id()));
+    }
+
+    #[test]
+    fn pid_file_refuses_live_process() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nanna-daemon.pid");
+        // Our own PID is definitionally alive.
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+
+        let pid_file = PidFile::new(&temp_dir.path().to_path_buf());
+        assert!(matches!(
+            pid_file.acquire(),
+            Err(PidFileError::AlreadyRunning(pid)) if pid == std::process::id()
+        ));
+        // The live owner's PID file must be left untouched.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim().parse::<u32>().unwrap(), std::process::id());
+    }
+
     #[test]
     fn test_stale_pid_file() {
         let temp_dir = TempDir::new().unwrap();
