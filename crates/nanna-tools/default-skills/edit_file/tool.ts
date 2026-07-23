@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.3",
+  version: "0.1.4",
   output: "context",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -123,42 +123,36 @@ export default {
       return spans;
     }
 
-    // "Never turn valid Python into invalid Python." Observed live: the
-    // model rewrote a working script into semicolon slop mid-mission. If
-    // the CURRENT text parses and the NEW text does not, refuse. Repairs
-    // of already-broken files pass through, non-.py files pass through,
-    // and ANY checker failure fails OPEN (a missing python interpreter
-    // must never block writes). Returns an error string or null.
-    function pythonSyntaxRefusal(path, currentText, nextText) {
+    // Refuse ANY resulting .py content that does not parse. Round-6
+    // lesson: gating only valid->invalid transitions let a file that was
+    // BORN broken stay broken through repeated equally-broken "repairs".
+    // The error names the line; if the file carries several errors they
+    // must be fixed in one edit (or force=true saves partial progress).
+    // ANY checker failure fails OPEN. Returns an error string or null.
+    function pythonSyntaxRefusal(path, nextText) {
       var lower = path.toLowerCase();
       if (lower.length < 3 || lower.lastIndexOf(".py") !== lower.length - 3) return null;
       try {
         var chk = path + ".__chk.py";
-        var oldTmp = path + ".__chk_old.py";
         var newTmp = path + ".__chk_new.py";
-        Nanna.writeFile(oldTmp, currentText);
         Nanna.writeFile(newTmp, nextText);
         Nanna.writeFile(chk,
           "import ast, sys\n" +
-          "def check(p):\n" +
-          "    try:\n" +
-          "        ast.parse(open(p, encoding='utf-8').read())\n" +
-          "        return None\n" +
-          "    except SyntaxError as e:\n" +
-          "        return 'line ' + str(e.lineno) + ': ' + str(e.msg)\n" +
-          "old_err = check(sys.argv[1])\n" +
-          "new_err = check(sys.argv[2])\n" +
-          "print('OLD_OK' if old_err is None else 'OLD_BAD')\n" +
-          "print('NEW_OK' if new_err is None else 'NEW_BAD ' + new_err)\n");
-        var cmd = "python '" + chk + "' '" + oldTmp + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + oldTmp + "' '" + newTmp + "'; exit $rc";
+          "try:\n" +
+          "    ast.parse(open(sys.argv[1], encoding='utf-8').read())\n" +
+          "    print('NEW_OK')\n" +
+          "except SyntaxError as e:\n" +
+          "    print('NEW_BAD line ' + str(e.lineno) + ': ' + str(e.msg))\n");
+        var cmd = "python '" + chk + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + newTmp + "'; exit $rc";
         var result = Nanna.exec(cmd, null, 30);
         var out = result && result.stdout ? result.stdout : "";
-        if (out.indexOf("OLD_OK") !== -1 && out.indexOf("NEW_BAD") !== -1) {
-          var detail = out.substring(out.indexOf("NEW_BAD") + 8);
+        var bad = out.indexOf("NEW_BAD");
+        if (bad !== -1) {
+          var detail = out.substring(bad + 8);
           var nl = detail.indexOf("\n");
           if (nl !== -1) detail = detail.substring(0, nl);
           if (detail.length > 160) detail = detail.substring(0, 160);
-          return "REFUSED — " + path + " currently contains VALID Python, but your change would introduce a SYNTAX ERROR (" + detail + "). The file is UNCHANGED. Fix the syntax in new_string and call edit_file again. Pass force=true only to write broken code on purpose.";
+          return "REFUSED — after this edit " + path + " would NOT be valid Python (" + detail + "). The file is UNCHANGED. Fix new_string so the whole file parses (if the file has several errors, fix them all in this one edit), then retry. Pass force=true to save broken partial progress on purpose.";
         }
         return null;
       } catch (e) {
@@ -310,7 +304,7 @@ export default {
     }
 
     if (input.force !== true) {
-      var syntaxRefusal = pythonSyntaxRefusal(filePath, content, updated);
+      var syntaxRefusal = pythonSyntaxRefusal(filePath, updated);
       if (syntaxRefusal) return fail(syntaxRefusal);
     }
 

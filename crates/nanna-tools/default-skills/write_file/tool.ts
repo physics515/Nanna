@@ -1,8 +1,8 @@
 export default {
   name: "write_file",
-  version: "0.1.3",
+  version: "0.1.4",
   output: "context",
-  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. SAFETY: the write is blocked if new content is less than 30% of the existing file size (likely truncation). Use force=true to override.",
+  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. Use force=true to override.",
   parameters: {
     type: "object",
     properties: {
@@ -20,42 +20,37 @@ export default {
       return { content: message, success: false };
     }
 
-    // "Never turn valid Python into invalid Python." Observed live: the
-    // model rewrote a working script into semicolon slop mid-mission. If
-    // the CURRENT text parses and the NEW text does not, refuse. Repairs
-    // of already-broken files pass through, non-.py files pass through,
-    // and ANY checker failure fails OPEN (a missing python interpreter
-    // must never block writes). Returns an error string or null.
-    function pythonSyntaxRefusal(path, currentText, nextText) {
+    // Refuse ANY .py content that does not parse — new file or overwrite.
+    // Round-6 lesson: gating only valid->invalid transitions let the model
+    // create a file BORN broken and then "repair" it with equally broken
+    // content forever. Invalid Python on disk is never useful; the error
+    // names the line so the write call becomes a fast syntax feedback
+    // loop. force=true overrides; ANY checker failure fails OPEN (a
+    // missing python interpreter must never block writes).
+    function pythonSyntaxRefusal(path, nextText) {
       var lower = path.toLowerCase();
       if (lower.length < 3 || lower.lastIndexOf(".py") !== lower.length - 3) return null;
       try {
         var chk = path + ".__chk.py";
-        var oldTmp = path + ".__chk_old.py";
         var newTmp = path + ".__chk_new.py";
-        Nanna.writeFile(oldTmp, currentText);
         Nanna.writeFile(newTmp, nextText);
         Nanna.writeFile(chk,
           "import ast, sys\n" +
-          "def check(p):\n" +
-          "    try:\n" +
-          "        ast.parse(open(p, encoding='utf-8').read())\n" +
-          "        return None\n" +
-          "    except SyntaxError as e:\n" +
-          "        return 'line ' + str(e.lineno) + ': ' + str(e.msg)\n" +
-          "old_err = check(sys.argv[1])\n" +
-          "new_err = check(sys.argv[2])\n" +
-          "print('OLD_OK' if old_err is None else 'OLD_BAD')\n" +
-          "print('NEW_OK' if new_err is None else 'NEW_BAD ' + new_err)\n");
-        var cmd = "python '" + chk + "' '" + oldTmp + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + oldTmp + "' '" + newTmp + "'; exit $rc";
+          "try:\n" +
+          "    ast.parse(open(sys.argv[1], encoding='utf-8').read())\n" +
+          "    print('NEW_OK')\n" +
+          "except SyntaxError as e:\n" +
+          "    print('NEW_BAD line ' + str(e.lineno) + ': ' + str(e.msg))\n");
+        var cmd = "python '" + chk + "' '" + newTmp + "'; rc=$?; rm -f '" + chk + "' '" + newTmp + "'; exit $rc";
         var result = Nanna.exec(cmd, null, 30);
         var out = result && result.stdout ? result.stdout : "";
-        if (out.indexOf("OLD_OK") !== -1 && out.indexOf("NEW_BAD") !== -1) {
-          var detail = out.substring(out.indexOf("NEW_BAD") + 8);
+        var bad = out.indexOf("NEW_BAD");
+        if (bad !== -1) {
+          var detail = out.substring(bad + 8);
           var nl = detail.indexOf("\n");
           if (nl !== -1) detail = detail.substring(0, nl);
           if (detail.length > 160) detail = detail.substring(0, 160);
-          return "WRITE REFUSED — " + path + " currently contains VALID Python, but your new content has a SYNTAX ERROR (" + detail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text. Pass force=true only to write broken code on purpose.";
+          return "WRITE REFUSED — the content you sent for " + path + " is NOT valid Python (" + detail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text. Pass force=true only to write broken code on purpose.";
         }
         return null;
       } catch (e) {
@@ -106,16 +101,27 @@ export default {
     }
 
     if (!input.force) {
-      var existingText = null;
-      try {
-        existingText = Nanna.readFile(filePath);
-      } catch (eRead) {
-        // New file — nothing to protect.
+      // Versioned-copy REFUSAL (observed live: models fork foo.py.new2,
+      // new_foo.py, foo_fixed_v1.txt instead of fixing the real file, then
+      // lose track of which copy is real — an advisory did not stop it).
+      var baseName = filePath.split("\\").join("/").split("/").pop().toLowerCase();
+      var copyMarkers = [".new", "_v1", "_v2", "_v3", "_v4", "_v5", "_fixed", "_backup", "_temp", "_copy", "_part", "_old", "_final", "_cleaned", "_scrubbed"];
+      var copyPrefixes = ["new_", "copy_", "old_", "temp_", "backup_"];
+      var copyHit = null;
+      for (var m = 0; m < copyMarkers.length; m++) {
+        if (baseName.indexOf(copyMarkers[m]) !== -1) { copyHit = copyMarkers[m]; break; }
       }
-      if (existingText !== null && existingText !== undefined) {
-        var syntaxRefusal = pythonSyntaxRefusal(filePath, existingText, fileContent);
-        if (syntaxRefusal) return fail(syntaxRefusal);
+      if (!copyHit) {
+        for (var p = 0; p < copyPrefixes.length; p++) {
+          if (baseName.indexOf(copyPrefixes[p]) === 0) { copyHit = copyPrefixes[p]; break; }
+        }
       }
+      if (copyHit) {
+        return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite is always accepted). Pass force=true only if this genuinely is a new standalone file.");
+      }
+
+      var syntaxRefusal = pythonSyntaxRefusal(filePath, fileContent);
+      if (syntaxRefusal) return fail(syntaxRefusal);
     }
 
     try {
@@ -126,20 +132,6 @@ export default {
       return fail("write_file failed writing " + filePath + " (" + writeErr + "). Retry the same call; if it fails again, read_file to verify the file state.");
     }
 
-    var message = "Wrote " + bytes + " bytes to " + filePath;
-
-    // Versioned-copy advisory (observed live: models fork foo.py.new2 /
-    // foo_fixed_v1.txt instead of editing foo.py in place, then lose track
-    // of which copy is real). The write succeeded — this only teaches.
-    var baseName = filePath.split("\\").join("/").split("/").pop().toLowerCase();
-    var copyMarkers = [".new", "_v1", "_v2", "_v3", "_v4", "_v5", "_fixed", "_backup", "_temp", "_copy", "_part", "_old", "_final", "_cleaned", "_scrubbed"];
-    for (var m = 0; m < copyMarkers.length; m++) {
-      if (baseName.indexOf(copyMarkers[m]) !== -1) {
-        message += ". NOTE: this filename looks like a versioned copy. Do NOT fork versions — keep ONE real file and change it in place with edit_file (file_path + old_string + new_string). Delete stray copies when done.";
-        break;
-      }
-    }
-
-    return { content: message, written: fileContent };
+    return { content: "Wrote " + bytes + " bytes to " + filePath, written: fileContent };
   }
 }
