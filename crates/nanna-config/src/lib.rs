@@ -4,7 +4,9 @@
 //! Configuration management for Nanna
 
 pub mod credentials;
+pub mod bind;
 
+pub use bind::{LOOPBACK_HOST, is_loopback_host};
 pub use credentials::{
     ClaudeCredentialManager, CredentialError, CredentialSource, LoadedCredential, OAuthCredential,
 };

@@ -295,7 +295,9 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
 - [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
 - [~] ROADMAP explicitly lists open items: ~~disabled tools still execute~~ **(done 2026-07-20 — `ToolPolicy` gate, P6)**, ~~deleted tools remain callable until restart~~ **(done 2026-07-17 — `unregister` wiring)**, ~~delete_skill needs hardening against remove_dir_all/symlink races~~ **(done — symlink + canonical-escape guards in `commands/tools.rs`)**, stronger sandboxing needed *(open — OS-level sandbox under the policy layer; see research note below)*.
-- [ ] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
+- [x] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
+      *(2026-07-23)* Fixed together with the webhook receiver — see the "Bind local services to localhost
+      by default" item below.
 - [ ] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
 - [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
 - [ ] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
@@ -317,7 +319,25 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
       `ToolRegistry::unregister` wiring (see the P11 tool-manager-consistency note).
 - [ ] Harden delete_skill against remove_dir_all/symlink races.
-- [ ] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
+- [x] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
+      *(2026-07-23)* **Done.** Audit found three surfaces defaulting to `0.0.0.0` — the webhook receiver
+      (`WebhookConfig::default`), the legacy HTTP server (`ServerConfig::default`), and the `nanna server
+      --host` flag — i.e. an unauthenticated, LAN-visible control surface on any machine that joins a café
+      or hotel network. All three now default to `127.0.0.1`. (The **health server and IPC were already
+      loopback** — health inherits `ipc.host`, which defaults to `127.0.0.1` — so no change was needed
+      there; verified rather than assumed.)
+      Exposure is now an explicit act: set `host` yourself. New `nanna_config::bind` provides the single
+      `LOOPBACK_HOST` constant plus a pure `is_loopback_host(host)`, and **both servers log a `warn!` on a
+      non-loopback bind** so publishing is always visible in the log, not just in a config file someone
+      edited months ago. The predicate recognises the whole `127/8` block, `::1` bare **and bracketed**,
+      and case-insensitive `localhost`; anything unparseable or unfamiliar **fails safe to "public"** —
+      being wrong in the direction of an extra warning is the only acceptable direction here.
+      4 tests (the default constant satisfies its own predicate — so a stock install never warns about
+      itself; loopback spellings incl. `127.0.0.2`/`[::1]`/whitespace; wildcards `0.0.0.0` and `::` plus
+      routable addresses read as public; unparseable input fails safe).
+      **Note for tunnel users:** this is not a regression — cloudflared/ngrok/reverse proxies connect *to*
+      loopback. Only a setup relying on the old `0.0.0.0` default for direct inbound webhooks needs to set
+      `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
 - [ ] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.

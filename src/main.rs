@@ -59,8 +59,9 @@ enum Commands {
 
     /// Start the HTTP server
     Server {
-        /// Host to bind to
-        #[arg(short = 'H', long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; pass `0.0.0.0` to expose the
+        /// server to other machines (it has no authentication of its own).
+        #[arg(short = 'H', long, default_value = nanna_config::LOOPBACK_HOST)]
         host: String,
 
         /// Port to listen on
