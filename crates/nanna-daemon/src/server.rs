@@ -965,6 +965,32 @@ impl DaemonServer {
         // control plane (built later); cloning the Arc shares the same clock.
         let activity_clock = Arc::new(crate::activity::ActivityClock::new());
 
+        // The single dreaming orchestrator (P13 "unify the two stacks"). Both
+        // consolidation paths — the scheduled cycle below and the IPC
+        // `MemoryAction::Consolidate` on the control plane — run through this
+        // one service over the daemon's *live* memory store, so a dream cycle
+        // also applies tallied feedback and flushes the pending FSRS
+        // testing-effect queue that `MemoryService::recall` fills. Calling
+        // `MemoryService::consolidate` directly (the old shape) skipped both.
+        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.as_ref().map(|mem| {
+            let dreaming_config = nanna_memory::DreamingConfig {
+                idle_threshold_secs: self.config.dream_idle_threshold_secs,
+                memory_pressure_count: self.config.dream_memory_pressure_count,
+                ..nanna_memory::DreamingConfig::default()
+            };
+            Arc::new(nanna_memory::DreamingService::with_shared_memory(
+                dreaming_config,
+                mem.clone(),
+            ))
+        });
+        // Dreaming must observe the very store the agent writes to, never a
+        // private copy — that identity is the whole point of the shared seam.
+        debug_assert_eq!(
+            dreaming.is_some(),
+            memory.is_some(),
+            "dreaming service must exist exactly when the memory store does"
+        );
+
         // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
         // is the cron runner (the GUI scheduler only runs in embedded mode).
         // Loads persisted jobs and runs heartbeat + memory consolidation,
@@ -1023,17 +1049,17 @@ impl DaemonServer {
             }
 
             let agent_for_tasks = agent.clone();
-            let memory_for_tasks = memory.clone();
+            let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
             let storage_for_tasks = self.storage.clone();
             // Capture the user's memory-compression settings for the scheduled
             // dream cycle (Copy scalars, moved into the executor closure).
             let consolidation_max_ratio = self.config.memory_max_compression_ratio;
             let consolidation_min_remaining = self.config.memory_min_remaining_memories;
-            // Idle-gate thresholds + the shared clock, captured for the dream
-            // cycle's gate decision (Copy scalars + an Arc clone).
+            // Idle threshold is captured for the skip log only — the gate
+            // *decision* now lives in the DreamingService (built above with
+            // both thresholds), so there is no second copy of the policy here.
             let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
-            let dream_memory_pressure_count = self.config.dream_memory_pressure_count;
             let activity_for_tasks = activity_clock.clone();
             let summarization_model = self
                 .config
@@ -1044,7 +1070,7 @@ impl DaemonServer {
                 .unwrap_or_else(|| self.config.agent.model.clone());
             let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
                 let agent = agent_for_tasks.clone();
-                let memory = memory_for_tasks.clone();
+                let dreaming = dreaming_for_tasks.clone();
                 let router = router_for_tasks.clone();
                 let storage = storage_for_tasks.clone();
                 let activity = activity_for_tasks.clone();
@@ -1054,80 +1080,76 @@ impl DaemonServer {
                     let started_at = chrono::Utc::now();
                     let (success, output, error) = match task.name.as_str() {
                         "memory_consolidation" => {
-                            if let Some(ref memory) = memory {
-                                // Idle gate: dreaming competes with the live agent
-                                // for the summarizer model and rewrites the store,
-                                // so only run during a genuine lull (or under
-                                // memory pressure). Same pure policy the
-                                // `DreamingService::dream_if_idle` path uses — one
-                                // source of truth, no drift.
+                            if let Some(ref dreaming) = dreaming {
+                                // The idle gate AND the full dream cycle (feedback
+                                // flush -> FSRS testing-effect flush -> consolidate)
+                                // both live in the one `DreamingService`. The daemon
+                                // supplies only what it owns: its lock-free activity
+                                // clock and a consolidation budget sized to *its*
+                                // summarizer model. Dreaming competes with the live
+                                // agent for that model and rewrites the store, so it
+                                // still only runs during a lull (or under pressure).
                                 let idle = activity.idle();
-                                let memory_count = memory.count().await;
-                                let dreaming_cfg = nanna_memory::DreamingConfig {
-                                    idle_threshold_secs: dream_idle_threshold_secs,
-                                    memory_pressure_count: dream_memory_pressure_count,
-                                    ..nanna_memory::DreamingConfig::default()
+                                let summarizer_info =
+                                    router.get_model_info(&summarization_model).await;
+                                let consolidation_config = scheduled_consolidation_config(
+                                    consolidation_max_ratio,
+                                    consolidation_min_remaining,
+                                    summarizer_info.hard_input_limit(),
+                                );
+                                let summarize = |prompt: String| {
+                                    let router = router.clone();
+                                    let model = summarization_model.clone();
+                                    async move {
+                                        let request = nanna_llm::CompletionRequest::default()
+                                            .with_message(nanna_llm::Message::user(&prompt));
+                                        router
+                                            .complete(&model, request)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                    }
                                 };
-                                let trigger =
-                                    nanna_memory::dream_trigger(idle, memory_count, &dreaming_cfg);
-                                if trigger == nanna_memory::DreamTrigger::Skipped {
-                                    debug!(
-                                        "Skipping scheduled consolidation: system active \
-                                         (idle {idle:?} < {dream_idle_threshold_secs}s, \
-                                         {memory_count} memories)"
-                                    );
-                                    (
-                                        true,
-                                        Some(format!(
-                                            "Skipped (active; idle {}s, {memory_count} memories)",
-                                            idle.as_secs()
-                                        )),
-                                        None,
-                                    )
-                                } else {
-                                    info!(
-                                        "Running scheduled memory consolidation ({trigger:?}; \
-                                         idle {idle:?}, {memory_count} memories)..."
-                                    );
-                                    let summarizer_info =
-                                        router.get_model_info(&summarization_model).await;
-                                    let consolidation_config = scheduled_consolidation_config(
-                                        consolidation_max_ratio,
-                                        consolidation_min_remaining,
-                                        summarizer_info.hard_input_limit(),
-                                    );
-                                    let summarize = |prompt: String| {
-                                        let router = router.clone();
-                                        let model = summarization_model.clone();
-                                        async move {
-                                            let request = nanna_llm::CompletionRequest::default()
-                                                .with_message(nanna_llm::Message::user(&prompt));
-                                            router
-                                                .complete(&model, request)
-                                                .await
-                                                .map_err(|e| e.to_string())
-                                        }
-                                    };
-                                    match memory.consolidate(&consolidation_config, summarize).await
-                                    {
-                                        Ok(result) => {
-                                            info!(
-                                                "Scheduled consolidation: {} processed, {} merged",
-                                                result.memories_processed, result.memories_merged
-                                            );
-                                            (
-                                                true,
-                                                Some(format!(
-                                                    "Processed {} memories",
-                                                    result.memories_processed
-                                                )),
-                                                None,
-                                            )
-                                        }
-                                        Err(e) => {
-                                            error!("Scheduled consolidation failed: {e}");
-                                            (false, None, Some(e.to_string()))
-                                        }
+                                match dreaming
+                                    .dream_if_triggered(idle, &consolidation_config, summarize)
+                                    .await
+                                {
+                                    Ok(None) => {
+                                        let memory_count = dreaming.memory().count().await;
+                                        debug!(
+                                            "Skipping scheduled consolidation: system active \
+                                             (idle {idle:?} < {dream_idle_threshold_secs}s, \
+                                             {memory_count} memories)"
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Skipped (active; idle {}s, {memory_count} memories)",
+                                                idle.as_secs()
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Ok(Some((trigger, stats))) => {
+                                        info!(
+                                            "Scheduled dream ({trigger:?}): {} processed, \
+                                             {} merged, {} promoted, {} demoted",
+                                            stats.consolidation.memories_processed,
+                                            stats.consolidation.memories_merged,
+                                            stats.auto_promoted,
+                                            stats.auto_demoted,
+                                        );
+                                        (
+                                            true,
+                                            Some(format!(
+                                                "Processed {} memories",
+                                                stats.consolidation.memories_processed
+                                            )),
+                                            None,
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("Scheduled consolidation failed: {e}");
+                                        (false, None, Some(e.to_string()))
                                     }
                                 }
                             } else {
@@ -1312,6 +1334,11 @@ impl DaemonServer {
         // Share the activity clock so chat requests stamp the same clock the
         // scheduled dream cycle reads for its idle gate.
         control.set_activity_clock(activity_clock.clone());
+        // Same Arc the scheduled cycle holds: manual and automatic dreaming
+        // share one orchestrator, one feedback tally, one live store.
+        if let Some(ref dreaming) = dreaming {
+            control.set_dreaming(dreaming.clone());
+        }
 
         let control = Arc::new(control);
 

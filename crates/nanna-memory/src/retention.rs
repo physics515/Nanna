@@ -186,8 +186,8 @@ pub async fn run_retention_cycle<F, Fut>(
     summarize_fn: F,
 ) -> Result<(RetentionReport, ConsolidationResult), MemoryError>
 where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<String, String>>,
+    F: Fn(String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
 {
     assert!(k >= 1, "run_retention_cycle needs a positive k");
 

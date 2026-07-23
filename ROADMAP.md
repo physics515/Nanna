@@ -946,7 +946,48 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       matching the "prefer pure-Rust, no-C where avoidable" doctrine and keeping stock-MSVC builds green.*
 
 **Best-in-class dreaming:**
-- [ ] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
+- [x] **Unify the two stacks** — the running app calls low-level `MemoryService::consolidate()` while the richer `DreamingService`/`nanna-core::DreamingRuntime` (feedback, gates, promote/demote) is dead code. Make `DreamingService` the single orchestrator via `create_dreaming_executor`; delete the GUI branch (`lib.rs:8462`) + daemon `MemoryAction::Consolidate` duplication.
+      *(2026-07-23)* **Done — and it was hiding a real correctness bug, not just duplication.** Both daemon
+      paths (the scheduled cycle in `server.rs`, the IPC `MemoryAction::Consolidate` in `control/memory.rs`)
+      called `MemoryService::consolidate()` directly, so **nothing in the running daemon ever called
+      `DreamingService::dream()`** — and `dream()` is the *only* caller of
+      `MemoryService::apply_pending_updates()`. Consequence: every `recall`/`recall_scoped` hit pushes one
+      FSRS `Rating::Good` review onto `pending_updates` (the **testing effect** — recall strengthens memory)
+      and **nothing ever drained it**. So (a) the testing effect was **completely inert in the daemon** —
+      stability/difficulty never reinforced, which skews every consumer of retrievability including the FSRS
+      weight bands the dream cycle clusters by — and (b) that `Vec<(String, Rating)>` grew **monotonically
+      for the whole process uptime** (~72 B/entry: 36-byte UUID + `String` header + padded `Rating`; ~8
+      entries/recall ⇒ ~0.6 MB/day at 1k recalls/day, never released, duplicate-heavy since re-recalling one
+      memory re-queues it every time). Unbounded-by-construction is exactly what Tiger Style forbids.
+      **Fix:** one `Arc<DreamingService>` built in `run()` via the already-existing
+      `with_shared_memory` seam over the daemon's **live** store, handed to *both* the scheduler executor and
+      the `ControlPlane` (`set_dreaming`), so manual and automatic dreaming share one orchestrator, one
+      feedback tally and one FSRS queue. Two new entry points keep the daemon's constraints intact rather
+      than bending them: **`dream_if_triggered(idle, consolidation, f)`** takes the idle duration as a
+      *parameter* so the daemon's lock-free `ActivityClock` (`AtomicU64`) stays the single activity source of
+      truth — no second `RwLock<Instant>` clock on the chat hot path — while the policy (`dream_trigger`)
+      and orchestration stay in one place; and **`dream_with_consolidation(cfg, f)`** parameterizes the
+      consolidation budget so each path keeps sizing its cluster byte budget to *its own* summarizer's
+      context window. `dream()`/`dream_if_idle()` are now thin wrappers (behavior unchanged). The IPC path
+      is deliberately **not** idle-gated (the user asked explicitly) but now flushes feedback + FSRS, and its
+      response gained `auto_promoted`/`auto_demoted`/`total_memories`. The missing-orchestrator check is
+      ordered **before** the LLM check — a wiring fault, not a runtime one — which also makes it reachable
+      without a live model. **7 new tests:** the headline regression
+      (`dream_drains_the_pending_fsrs_queue_that_consolidate_alone_leaks`) pins both halves — `consolidate`
+      alone leaves the queue at its recalled depth, a dream cycle drains it to 0; external-idle honored over
+      the service's own clock; gate skips when the caller reports activity; caller-supplied budget wins over
+      `self.config`; plus 3 control-plane tests (Arc-identity of orchestrator↔store↔scheduler,
+      `dreaming_unavailable` wiring fault, and the hermetic proof that an attached orchestrator gets *past*
+      the gate and stops at `llm_unavailable`). New `MemoryService::pending_update_count()` makes the queue
+      observable instead of silent. **Net −6 clippy warnings** (2153 → 2147 on the two crates): closing
+      `clippy::future_not_send` on the new methods meant adding `F: Send + Sync` / `Fut: Send` through the
+      4 `summarize_fn` bounds in `service.rs`/`retention.rs`, which also removed the 3 pre-existing
+      instances. nanna-memory 67 / nanna-daemon 68 tests green, full workspace suite green (40 binaries, 0
+      failures), zero new rustfmt violations in any touched file (verified per-file against `origin/master`,
+      since the repo is not fmt-clean), and a **real `nanna-daemon run` boot** reaches "Daemon ready" with
+      the memory service initialized and the consolidation task scheduled. Note: `nanna-core::DreamingRuntime`
+      is *not* dead — `nanna-server` (the separate HTTP binary) already drives `DreamingService` through it,
+      so it was left alone; the GUI branch was already gone (P16 made the GUI a pure daemon client).
 > **Dreaming model (do not drift from this):** memories **never expire**. A dream cycle = **semantically
 > rank "like" memories → concatenate them → summarize the concatenation into a single memory**
 > (`composite_cluster_score` → `MemoryCluster::concatenated_content()` → `create_consolidated_entry`).
@@ -1698,7 +1739,10 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
-6. **Unify + upgrade dreaming** (P13) — one `DreamingService` orchestrator, idle-gated multi-phase cycle, true merge, local `summarize_fn`.
+6. **Unify + upgrade dreaming** (P13) — ~~one `DreamingService` orchestrator~~ **(done 2026-07-23 — both
+   daemon paths now dream through one shared orchestrator; fixed the inert testing effect + unbounded
+   `pending_updates` queue this exposed)**; remaining: idle-gated **multi-phase** cycle body
+   (merge/cluster-by-band/expand/DSP), true merge in the batch clusterer, local `summarize_fn`.
 7. **`nanna-timeline` + compression-as-dreaming** (P13) — append-only event log in Turso + lift DSP's `simplify_with_aggressiveness`/`splimes` as the timeline compressor keyed by FSRS retrievability.
 8. ~~**Fix the two path-traversal holes** (P11 security) — user-tool names + workspace file writes.~~ **(done 2026-07-06)**
 9. **End-to-end daemon test** (P8) — ~~the daemon/embedded/reconnect story is still unverified~~ **mostly

@@ -83,6 +83,12 @@ pub struct ControlPlane {
     /// scheduled dream cycle can tell whether the system is in active use.
     /// `None` in minimal test constructions that never dream.
     activity: Option<Arc<crate::activity::ActivityClock>>,
+    /// The daemon's single dreaming orchestrator, over the same live memory
+    /// store as [`Self::memory`] — shared with the scheduled dream cycle so
+    /// manual (IPC) and automatic consolidation run the identical body and
+    /// accumulate feedback into one place. `None` in minimal test
+    /// constructions and whenever memory is disabled.
+    dreaming: Option<Arc<nanna_memory::DreamingService>>,
 }
 
 impl ControlPlane {
@@ -112,6 +118,7 @@ impl ControlPlane {
             status_manager: None,
             task_runs: None,
             activity: None,
+            dreaming: None,
         }
     }
 
@@ -165,6 +172,7 @@ impl ControlPlane {
             status_manager: None,
             task_runs: None,
             activity: None,
+            dreaming: None,
         }
     }
 
@@ -217,6 +225,7 @@ impl ControlPlane {
             status_manager: None,
             task_runs: None,
             activity: None,
+            dreaming: None,
         }
     }
 
@@ -237,6 +246,18 @@ impl ControlPlane {
     /// [`Self::handle`]); the scheduler reads its idle duration.
     pub fn set_activity_clock(&mut self, clock: Arc<crate::activity::ActivityClock>) {
         self.activity = Some(clock);
+    }
+
+    /// Attach the daemon's single dreaming orchestrator (P13). Must be the same
+    /// `Arc` the scheduled dream cycle holds, and must wrap the same live
+    /// memory store passed as `memory`, so manual and automatic consolidation
+    /// share one feedback tally and one pending-FSRS queue.
+    pub fn set_dreaming(&mut self, dreaming: Arc<nanna_memory::DreamingService>) {
+        debug_assert!(
+            self.memory.is_some(),
+            "dreaming orchestrator attached without a memory store"
+        );
+        self.dreaming = Some(dreaming);
     }
 
     /// Attach the long-horizon task run manager (P14).

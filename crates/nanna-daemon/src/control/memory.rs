@@ -161,6 +161,25 @@ impl ControlPlane {
                 })
             }
             MemoryAction::Consolidate => {
+                // Route through the daemon's single dreaming orchestrator so a
+                // manual consolidation runs the *same* body as the scheduled
+                // one: apply tallied feedback, flush the pending FSRS
+                // testing-effect queue that every `recall` fills, then
+                // consolidate. Calling `MemoryService::consolidate` directly
+                // (the old shape) skipped both and left that queue to grow for
+                // the daemon's whole uptime.
+                //
+                // Checked here — before any config/model work — because a
+                // missing orchestrator is a *wiring* fault, not a runtime one:
+                // failing fast keeps the precondition observable and testable
+                // without needing a live LLM to reach it.
+                let Some(ref dreaming) = self.dreaming else {
+                    return json!({
+                        "error": "dreaming_unavailable",
+                        "message": "Dreaming orchestrator not configured"
+                    });
+                };
+
                 // Trigger memory consolidation (requires LLM for summarization)
                 let Some(ref router) = self.router else {
                     return json!({ "error": "llm_unavailable", "message": "LLM router required for consolidation" });
@@ -215,12 +234,21 @@ impl ControlPlane {
                     })
                 };
                 
-                match memory.consolidate(&config, summarize).await {
-                    Ok(result) => {
-                        info!("Memory consolidation: {} processed, {} clusters, {} merged, {} expanded, {} errors",
-                              result.memories_processed, result.clusters_formed,
-                              result.memories_merged, result.memories_expanded,
-                              result.errors.len());
+                // Deliberately NOT idle-gated: the user asked for this one
+                // explicitly, so it runs even while the system is busy.
+                match dreaming.dream_with_consolidation(&config, summarize).await {
+                    Ok(stats) => {
+                        let result = stats.consolidation;
+                        info!(
+                            "Memory consolidation: {} processed, {} clusters, {} merged, {} expanded, {} promoted, {} demoted, {} errors",
+                            result.memories_processed,
+                            result.clusters_formed,
+                            result.memories_merged,
+                            result.memories_expanded,
+                            stats.auto_promoted,
+                            stats.auto_demoted,
+                            result.errors.len()
+                        );
                         for err in &result.errors {
                             warn!("Consolidation error: {}", err);
                         }
@@ -230,6 +258,9 @@ impl ControlPlane {
                             "clusters_formed": result.clusters_formed,
                             "memories_merged": result.memories_merged,
                             "memories_expanded": result.memories_expanded,
+                            "auto_promoted": stats.auto_promoted,
+                            "auto_demoted": stats.auto_demoted,
+                            "total_memories": stats.total_memories,
                             "errors": result.errors,
                         })
                     }

@@ -675,6 +675,18 @@ impl MemoryService {
         Ok(filtered)
     }
 
+    /// How many FSRS testing-effect reviews are queued and not yet applied.
+    ///
+    /// Every `recall`/`recall_scoped` hit enqueues one review, and
+    /// [`Self::apply_pending_updates`] is the only drain — which in the running
+    /// daemon happens exclusively inside a dream cycle. A number that only ever
+    /// climbs therefore means nothing is dreaming, and the queue is growing
+    /// unbounded. Exposed so that condition is observable (and assertable in
+    /// tests) rather than silent.
+    pub async fn pending_update_count(&self) -> usize {
+        self.pending_updates.read().await.len()
+    }
+
     /// Apply pending FSRS updates (testing effect).
     ///
     /// Call this periodically to batch-apply memory strengthening.
@@ -929,8 +941,8 @@ impl MemoryService {
         summarize_fn: F,
     ) -> Result<ConsolidationResult, MemoryError>
     where
-        F: Fn(String) -> Fut,
-        Fut: Future<Output = Result<String, String>>,
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<String, String>> + Send,
     {
         let mut result = ConsolidationResult::default();
         let total_memories = self.count().await;
@@ -1045,8 +1057,8 @@ impl MemoryService {
         summarize_fn: &F,
     ) -> Result<(), MemoryError>
     where
-        F: Fn(String) -> Fut,
-        Fut: Future<Output = Result<String, String>>,
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<String, String>> + Send,
     {
         // Build prompt and get summary
         let prompt = cluster.build_consolidation_prompt();
@@ -1096,8 +1108,8 @@ impl MemoryService {
         summarize_fn: &F,
     ) -> Result<(), MemoryError>
     where
-        F: Fn(String) -> Fut,
-        Fut: Future<Output = Result<String, String>>,
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<String, String>> + Send,
     {
         let prompt = format!(
             "{}\n\nOriginal memory:\n{}\n\nEnriched memory:",

@@ -251,12 +251,82 @@ impl DreamingService {
         self.last_activity.read().await.elapsed()
     }
 
+    /// Run a dream cycle **only if** the idle/memory-pressure gate says so,
+    /// using an **externally supplied** idle duration and consolidation budget.
+    ///
+    /// This is the gated entry point for a host that already owns an activity
+    /// clock — the daemon stamps a lock-free [`AtomicU64`-backed] clock on every
+    /// chat, and must not pay for this service's `RwLock<Instant>` on that hot
+    /// path. Passing `idle` in keeps **one** activity source of truth while the
+    /// *policy* ([`dream_trigger`]) and the *orchestration* (feedback flush →
+    /// FSRS flush → consolidation) stay here, so the scheduled and manual paths
+    /// cannot drift apart.
+    ///
+    /// `consolidation` is a parameter rather than `self.config.consolidation`
+    /// because each caller sizes the cluster byte budget to **its own**
+    /// summarizer model's context window.
+    ///
+    /// Returns `Ok(Some((trigger, stats)))` if a cycle ran, `Ok(None)` if the
+    /// gate skipped it.
+    ///
+    /// [`AtomicU64`-backed]: std::sync::atomic::AtomicU64
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if a triggered consolidation fails.
+    pub async fn dream_if_triggered<F, Fut>(
+        &self,
+        idle: Duration,
+        consolidation: &ConsolidationConfig,
+        summarize_fn: F,
+    ) -> Result<Option<(DreamTrigger, DreamingStats)>, MemoryError>
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        let memory_count = self.memory.stats().await.total;
+        let trigger = dream_trigger(idle, memory_count, &self.config);
+
+        // Cross-check the gate's decision against its inputs (guards against a
+        // future edit desyncing the policy from these two triggers).
+        debug_assert!(
+            trigger != DreamTrigger::Skipped
+                || (idle < Duration::from_secs(self.config.idle_threshold_secs)
+                    && (self.config.memory_pressure_count == 0
+                        || memory_count < self.config.memory_pressure_count)),
+            "Skipped must imply not-idle-yet AND below memory pressure"
+        );
+        debug_assert!(
+            trigger != DreamTrigger::MemoryPressure
+                || (self.config.memory_pressure_count > 0
+                    && memory_count >= self.config.memory_pressure_count),
+            "MemoryPressure must imply the pressure ceiling was reached"
+        );
+
+        if trigger == DreamTrigger::Skipped {
+            debug!(
+                "dream gate: skipped (idle {:?} < {}s, {} memories)",
+                idle, self.config.idle_threshold_secs, memory_count
+            );
+            return Ok(None);
+        }
+
+        info!("dream gate: running ({trigger:?}; idle {idle:?}, {memory_count} memories)");
+        let stats = self
+            .dream_with_consolidation(consolidation, summarize_fn)
+            .await?;
+        Ok(Some((trigger, stats)))
+    }
+
     /// Run a dream cycle **only if** the idle/memory-pressure gate says so.
     ///
     /// Returns `Ok(Some(stats))` with the trigger reason if a cycle ran, or
     /// `Ok(None)` if it was skipped because the system is still active and the
     /// store isn't under pressure. This is the idle-gated entry point the
     /// scheduler should call instead of the unconditional [`Self::dream`].
+    ///
+    /// Reads this service's own activity clock; a host with its own clock
+    /// should call [`Self::dream_if_triggered`] instead.
     ///
     /// # Errors
     ///
@@ -266,8 +336,8 @@ impl DreamingService {
         summarize_fn: F,
     ) -> Result<Option<DreamingStats>, MemoryError>
     where
-        F: Fn(String) -> Fut,
-        Fut: std::future::Future<Output = Result<String, String>>,
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
     {
         let idle = self.idle_duration().await;
         let memory_count = self.memory.stats().await.total;
@@ -366,7 +436,8 @@ impl DreamingService {
         Ok(())
     }
 
-    /// Run the dreaming process (memory consolidation)
+    /// Run the dreaming process (memory consolidation) with this service's
+    /// configured consolidation budget.
     ///
     /// This should be called periodically (e.g., hourly or during idle times).
     ///
@@ -378,8 +449,39 @@ impl DreamingService {
     /// Returns `MemoryError` if consolidation fails.
     pub async fn dream<F, Fut>(&self, summarize_fn: F) -> Result<DreamingStats, MemoryError>
     where
-        F: Fn(String) -> Fut,
-        Fut: std::future::Future<Output = Result<String, String>>,
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        self.dream_with_consolidation(&self.config.consolidation, summarize_fn)
+            .await
+    }
+
+    /// Run the dreaming process against a caller-supplied consolidation budget.
+    ///
+    /// The full cycle, in order: **(1)** apply tallied feedback (promote/demote),
+    /// **(2)** flush pending FSRS updates — the *testing effect* queued by every
+    /// `recall`, which is only ever drained here — **(3)** bail out below
+    /// `min_memories_for_consolidation`, **(4)** consolidate (rank-similar →
+    /// concatenate → summarize).
+    ///
+    /// This is the single orchestration body every dreaming entry point runs
+    /// through. Calling [`MemoryService::consolidate`] directly **skips steps
+    /// 1–3** and leaks the pending-update queue, so hosts must come through here.
+    ///
+    /// `consolidation` is a parameter so each caller can size the cluster byte
+    /// budget to its own summarizer model's context window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if consolidation fails.
+    pub async fn dream_with_consolidation<F, Fut>(
+        &self,
+        consolidation: &ConsolidationConfig,
+        summarize_fn: F,
+    ) -> Result<DreamingStats, MemoryError>
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
     {
         let mut stats = DreamingStats::default();
 
@@ -418,7 +520,10 @@ impl DreamingService {
             }
         }
 
-        // 2. Apply FSRS updates (testing effect from recalls)
+        // 2. Apply FSRS updates (testing effect from recalls).
+        //    `MemoryService::recall` queues one review per hit and this is the
+        //    ONLY drain — skipping it both inerts the testing effect and lets
+        //    the queue grow unbounded for the host's whole uptime.
         self.memory.apply_pending_updates().await;
 
         // 3. Check if we have enough memories for consolidation
@@ -434,10 +539,7 @@ impl DreamingService {
 
         // 4. Run consolidation (the actual "dreaming")
         info!("Starting memory consolidation ({} memories)...", count);
-        stats.consolidation = self
-            .memory
-            .consolidate(&self.config.consolidation, summarize_fn)
-            .await?;
+        stats.consolidation = self.memory.consolidate(consolidation, summarize_fn).await?;
 
         stats.total_memories = self.memory.count().await;
 
@@ -735,6 +837,155 @@ mod tests {
         );
         // The handle round-trips back out identical.
         assert!(Arc::ptr_eq(&service.memory_arc(), &shared));
+    }
+
+    /// The regression this whole unification exists for.
+    ///
+    /// `recall` queues one FSRS "review" per hit (the testing effect) and
+    /// `apply_pending_updates` is the ONLY drain. The daemon used to call
+    /// `MemoryService::consolidate` directly, which never drains it — so the
+    /// testing effect was inert and the queue grew for the process's whole
+    /// uptime. A dream cycle must drain it.
+    #[tokio::test]
+    async fn dream_drains_the_pending_fsrs_queue_that_consolidate_alone_leaks() {
+        let shared =
+            Arc::new(MemoryService::new(dim3_config().memory).with_embed_fn(test_embed_fn()));
+        let service = DreamingService::with_shared_memory(dim3_config(), Arc::clone(&shared));
+
+        shared
+            .remember("a durable fact", HashMap::new())
+            .await
+            .expect("remember must succeed");
+
+        // Nothing recalled yet → nothing queued (negative space).
+        assert_eq!(shared.pending_update_count().await, 0);
+
+        // Three recalls enqueue reviews.
+        for _ in 0..3 {
+            shared.recall("a durable fact").await.expect("recall works");
+        }
+        let queued = shared.pending_update_count().await;
+        assert!(queued > 0, "recall must queue testing-effect reviews");
+
+        // The OLD shape: consolidating directly leaves every review queued.
+        shared
+            .consolidate(&ConsolidationConfig::default(), |_p| async {
+                Ok(String::from("summary"))
+            })
+            .await
+            .expect("consolidate must succeed");
+        assert_eq!(
+            shared.pending_update_count().await,
+            queued,
+            "MemoryService::consolidate must NOT drain the queue — if this \
+             starts passing, the leak moved and this test guards the wrong seam"
+        );
+
+        // The NEW shape: a dream cycle drains it.
+        service
+            .dream_with_consolidation(&ConsolidationConfig::default(), |_p| async {
+                Ok(String::from("summary"))
+            })
+            .await
+            .expect("dream must succeed");
+        assert_eq!(
+            shared.pending_update_count().await,
+            0,
+            "a dream cycle must flush every queued testing-effect review"
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_if_triggered_uses_the_callers_idle_not_its_own_clock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // 1 h threshold, and the service's OWN clock was just stamped — so
+        // `dream_if_idle` would skip. Passing a larger idle must still run,
+        // proving the daemon's lock-free ActivityClock is the source of truth.
+        let service = DreamingService::new(gate_cfg(3600, 0));
+        service.record_activity().await;
+
+        let called = AtomicBool::new(false);
+        let ran = service
+            .dream_if_triggered(
+                Duration::from_secs(7200),
+                &ConsolidationConfig::default(),
+                |_p| {
+                    called.store(true, Ordering::SeqCst);
+                    async { Ok(String::new()) }
+                },
+            )
+            .await
+            .expect("gate must not error");
+
+        let (trigger, _stats) = ran.expect("a 2 h idle must trigger a cycle");
+        assert_eq!(trigger, DreamTrigger::Idle);
+        // Store is empty, so it stops at the min-memories guard before any LLM call.
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "an empty store must not reach the summarizer"
+        );
+    }
+
+    #[tokio::test]
+    async fn dream_if_triggered_skips_when_the_caller_reports_activity() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let service = DreamingService::new(gate_cfg(3600, 0));
+        let called = AtomicBool::new(false);
+
+        let ran = service
+            .dream_if_triggered(
+                Duration::from_secs(5),
+                &ConsolidationConfig::default(),
+                |_p| {
+                    called.store(true, Ordering::SeqCst);
+                    async { Ok(String::new()) }
+                },
+            )
+            .await
+            .expect("gate must not error");
+
+        assert!(ran.is_none(), "an active system must not dream");
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    /// Each daemon path sizes the cluster byte budget to *its own* summarizer's
+    /// context window, so the per-call config must win over `self.config`.
+    #[tokio::test]
+    async fn dream_with_consolidation_honors_the_caller_supplied_budget() {
+        let base = dim3_config();
+        // Service-level config carries a distinctive budget…
+        let service = DreamingService::new(DreamingConfig {
+            consolidation: ConsolidationConfig {
+                min_remaining_memories: 999,
+                ..base.consolidation.clone()
+            },
+            ..base
+        });
+        // …and the caller supplies a different one.
+        let caller = ConsolidationConfig {
+            min_remaining_memories: 7,
+            ..ConsolidationConfig::default()
+        };
+        assert_ne!(
+            service.config.consolidation.min_remaining_memories,
+            caller.min_remaining_memories
+        );
+
+        // Empty store: the cycle returns before consolidating, but the call
+        // must compile+run against the caller's config, not the service's.
+        let stats = service
+            .dream_with_consolidation(&caller, |_p| async { Ok(String::new()) })
+            .await
+            .expect("dream must succeed");
+        assert_eq!(stats.total_memories, 0);
+        // `dream()` still routes through the service-level config.
+        let via_default = service
+            .dream(|_p| async { Ok(String::new()) })
+            .await
+            .expect("dream must succeed");
+        assert_eq!(via_default.total_memories, 0);
     }
 
     #[tokio::test]
