@@ -16,7 +16,11 @@ pub struct JsonRpcRequest {
 }
 
 impl JsonRpcRequest {
-    pub fn new(id: impl Into<RequestId>, method: impl Into<String>, params: Option<serde_json::Value>) -> Self {
+    pub fn new(
+        id: impl Into<RequestId>,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id: id.into(),
@@ -63,6 +67,43 @@ pub struct JsonRpcError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+}
+
+/// JSON-RPC / MCP error codes this client recognises.
+///
+/// The 2026-07-28 revision partitions the JSON-RPC server-error range:
+/// `-32000..=-32019` stays implementation-defined (existing SDK usage is
+/// grandfathered) and `-32020..=-32099` is reserved for the MCP specification.
+/// Matching on named constants keeps that partition legible at the call sites.
+pub mod error_codes {
+    /// JSON-RPC standard "Invalid params". Since the 2026-07-28 revision this is
+    /// also what a server returns for a **missing resource**, replacing the
+    /// MCP-custom [`LEGACY_RESOURCE_NOT_FOUND`].
+    pub const INVALID_PARAMS: i32 = -32602;
+
+    /// Pre-2026-07-28 MCP-custom "resource not found". Still emitted by servers
+    /// pinned to an older revision, so both codes must be accepted.
+    pub const LEGACY_RESOURCE_NOT_FOUND: i32 = -32002;
+
+    /// The server rejected a routable header (2026-07-28, MCP-reserved range).
+    pub const HEADER_MISMATCH: i32 = -32020;
+
+    /// The server requires a client capability this client did not advertise.
+    pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32021;
+
+    /// The server does not support the protocol revision the client offered.
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+
+    /// Does `code` mean "the resource you asked for does not exist"?
+    ///
+    /// Accepts both revisions' spellings so a `resources/read` against an old
+    /// *or* a 2026-07-28 server maps to the same typed error. Pure and total —
+    /// every other code (including the three MCP-reserved "modern server" codes,
+    /// which are explicitly *not* legacy indicators) answers `false`.
+    #[must_use]
+    pub const fn is_resource_missing(code: i32) -> bool {
+        matches!(code, INVALID_PARAMS | LEGACY_RESOURCE_NOT_FOUND)
+    }
 }
 
 /// Request ID (can be string or number)
@@ -241,6 +282,21 @@ pub struct CallToolResult {
     pub content: Vec<ToolContent>,
     #[serde(default)]
     pub is_error: bool,
+    /// Machine-readable result payload, when the server provides one.
+    ///
+    /// The 2026-07-28 revision lifts the restriction that this be an *object* —
+    /// it may be **any** JSON value (object, array, string, number, bool).
+    /// Typing it as a bare [`serde_json::Value`] is therefore the spec-correct
+    /// shape; narrowing it to a map would silently drop a conforming server's
+    /// result.
+    ///
+    /// An explicit `null` deserializes to `None`, i.e. it is treated exactly
+    /// like an omitted field. That collapse is deliberate: a `null` payload
+    /// carries no information, and keeping the two apart would only let a
+    /// server that always emits the key attach a meaningless `data: null` to
+    /// every tool result downstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
 }
 
 /// Content returned by tool
@@ -411,4 +467,115 @@ pub struct LogMessageParams {
 pub struct PaginationParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CallToolResult;
+    use super::error_codes::{
+        HEADER_MISMATCH, INVALID_PARAMS, LEGACY_RESOURCE_NOT_FOUND,
+        MISSING_REQUIRED_CLIENT_CAPABILITY, UNSUPPORTED_PROTOCOL_VERSION, is_resource_missing,
+    };
+    use serde_json::json;
+
+    /// Deserialize a `tools/call` result body.
+    fn parse(body: serde_json::Value) -> CallToolResult {
+        serde_json::from_value(body).expect("a well-formed CallToolResult must parse")
+    }
+
+    #[test]
+    fn structured_content_accepts_any_json_value() {
+        // The 2026-07-28 revision allows ANY JSON value here, not only an object.
+        // Each of these must round-trip verbatim rather than being rejected.
+        // (`null` is covered separately — it collapses to `None` by design.)
+        for payload in [
+            json!({ "rows": 3 }),
+            json!([1, 2, 3]),
+            json!("a bare string"),
+            json!(42),
+            json!(true),
+        ] {
+            let result = parse(json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "structuredContent": payload.clone(),
+            }));
+            assert_eq!(
+                result.structured_content.as_ref(),
+                Some(&payload),
+                "structuredContent must survive as {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_structured_content_is_none_and_is_not_reserialized() {
+        let result = parse(json!({ "content": [{ "type": "text", "text": "ok" }] }));
+        assert!(
+            result.structured_content.is_none(),
+            "absent payload must be None, not Some(null)"
+        );
+        // Absent must stay absent on the wire (skip_serializing_if), so a server
+        // round-tripping our value does not see a spurious null field.
+        let wire = serde_json::to_value(&result).expect("serialize");
+        assert!(wire.get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn explicit_null_structured_content_collapses_to_absent() {
+        // Documented behaviour: an explicit `null` is treated exactly like an
+        // omitted field, so a server that always emits the key cannot attach a
+        // meaningless `data: null` to every tool result. Pinned as a test so the
+        // collapse stays a decision rather than an accident of serde defaults.
+        let result = parse(json!({
+            "content": [],
+            "structuredContent": null,
+        }));
+        assert!(result.structured_content.is_none());
+        // …and it round-trips as absent, not as a null field.
+        let wire = serde_json::to_value(&result).expect("serialize");
+        assert!(wire.get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn resource_missing_matches_both_spec_revisions() {
+        // Pre-2026-07-28 servers send the MCP-custom code…
+        assert!(is_resource_missing(LEGACY_RESOURCE_NOT_FOUND));
+        // …2026-07-28 servers send the JSON-RPC standard one.
+        assert!(is_resource_missing(INVALID_PARAMS));
+    }
+
+    #[test]
+    fn resource_missing_rejects_unrelated_codes() {
+        // Negative space: the three MCP-reserved "modern server" codes are
+        // explicitly not missing-resource indicators, nor is method-not-found or
+        // a generic implementation-defined code.
+        for code in [
+            HEADER_MISMATCH,
+            MISSING_REQUIRED_CLIENT_CAPABILITY,
+            UNSUPPORTED_PROTOCOL_VERSION,
+            -32601, // method not found
+            -32000, // implementation-defined
+            0,
+        ] {
+            assert!(
+                !is_resource_missing(code),
+                "code {code} must not read as a missing resource"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_reserved_codes_sit_inside_the_reserved_range() {
+        // The revision partitions -32020..=-32099 for the spec; keep the named
+        // constants inside it so a future addition cannot silently collide with
+        // the grandfathered -32000..=-32019 implementation-defined band.
+        for code in [
+            HEADER_MISMATCH,
+            MISSING_REQUIRED_CLIENT_CAPABILITY,
+            UNSUPPORTED_PROTOCOL_VERSION,
+        ] {
+            assert!(code <= -32020, "{code} must be at or below -32020");
+            assert!(code >= -32099, "{code} must be at or above -32099");
+        }
+    }
 }

@@ -338,8 +338,14 @@ with send/react/edit/delete/pin/threads/media where supported. **Shipped.**
 MCP client (stdio + HTTP/SSE transports, tool discovery, adapter into nanna-tools), background task
 spawning, agent-to-agent messaging (mailbox), Erlang/OTP-style supervisors (RestartPolicy, strategies,
 health checks). **Shipped**, except:
-- [ ] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
-      not exist and no MCP refs found under `nanna-server/src`. Confirm shipped location or implement.
+- [~] **Verify or build MCP *server* mode** — doc claims `crates/nanna-server/src/mcp.rs`; that file does
+      not exist and no MCP refs found under `nanna-server/src`.
+      *(2026-07-23)* **Located: the server lives at `crates/nanna-mcp/src/server.rs`** (532 lines —
+      `McpServer` with tool/resource/prompt registration, `handle_request` covering initialize/tools/
+      resources/prompts/ping, stdio transport, and a `ToolRegistry` bridge that exposes every Nanna tool).
+      The doc pointer was simply wrong, not the feature. Remaining to close this item: nothing is *wired
+      up* — no daemon/CLI entry point starts it, so it is reachable only from Rust. Add a `nanna mcp serve`
+      command (or a daemon action) and an end-to-end test against a real client.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
@@ -381,8 +387,37 @@ health checks). **Shipped**, except:
       then branch order, first-definition-of-a-name-wins; bounded by the finite, already-`schema_guard`-capped
       schema. Refactored into pure helpers (`collect_schema_object`/`property_to_parameter`) and fixed the old
       buggy required-lookup in passing. 5 tests (flat props+required, allOf hard-required, anyOf/oneOf optional,
-      first-wins dedup, empty/typeless→String). Remaining: points (1) `-32602` and (2) any-JSON
-      `structuredContent`, plus nested/conditional composition (`if`/`then`/`$defs`).
+      first-wins dedup, empty/typeless→String).
+      *(2026-07-23)* **Points (1) and (2) shipped — this item's RC migration is now complete.**
+      **(1) Error codes:** new `protocol::error_codes` module names the codes the client recognises —
+      `INVALID_PARAMS` (-32602), `LEGACY_RESOURCE_NOT_FOUND` (-32002), and the three MCP-reserved
+      "modern server" codes `HEADER_MISMATCH` (-32020) / `MISSING_REQUIRED_CLIENT_CAPABILITY` (-32021) /
+      `UNSUPPORTED_PROTOCOL_VERSION` (-32022) — plus a pure `const fn is_resource_missing(code)` that
+      accepts **both** revisions' spellings. `read_resource` now runs its failures through
+      `resource_error_for(uri, err)`, so a missing resource surfaces as the typed
+      `McpError::ResourceNotFound(uri)` whether the server is pre- or post-RC, while **every other code
+      passes through unchanged** (a `-32601`/transport fault must never be laundered into "not found",
+      which would read as an empty resource).
+      **(2) `structuredContent`:** added to `CallToolResult` as a bare `Option<serde_json::Value>` — the
+      RC allows *any* JSON value, so narrowing it to a map would drop conforming results. Threaded
+      through both directions: the client-side `McpToolWrapper` attaches it via `ToolResult::with_data`
+      on the success path (an errored call has no result to report), `McpToolResult` gained a
+      `structured` field, and the **server** side mirrors it — a registry tool's `ToolResult::data` is
+      emitted as `structuredContent`. Decision pinned by test: an explicit `null` collapses to absent
+      (a null payload carries no information; keeping them apart would only let an always-emitting
+      server attach `data: null` to every result). 8 new tests (any-JSON round-trip incl. array/string/
+      number/bool, absent-stays-absent on the wire, null-collapse, both-codes→ResourceNotFound carrying
+      the URI, unrelated-code passthrough, reserved-range bounds). 33/33 `nanna-mcp` tests green, zero
+      net new clippy warnings (44 lib / 42 lib-test, unchanged).
+      Remaining on the RC: nested/conditional composition (`if`/`then`/`$defs`) in `schema_to_parameters`,
+      and the client still advertises `PROTOCOL_VERSION = "2024-11-05"` — see the new item below.
+- [ ] *(2026-07-23)* **Bump `McpClient::PROTOCOL_VERSION` off `2024-11-05`.** The client still negotiates
+      the Nov-2024 revision, so a 2026-07-28 server may legitimately answer `-32022
+      UnsupportedProtocolVersion` (constant now defined) or fall back to legacy behaviour. Bumping it is a
+      capability commitment, not a string edit — it requires the Roots/Sampling/Logging deprecation
+      handling and the stateless/multi-round-trip + routable-header semantics of the RC. Do it as its own
+      increment once those land. Source:
+      [MCP 2026-07-28 RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/).
 - [ ] *(research 2026-07-21)* **Approved-server registry + signed/pinned tool definitions (defense-in-depth
       for tool-poisoning, OWASP MCP03 / CVE-2025-54136).** Tool *descriptions* enter the agent context as
       trusted text, so a poisoned description is prompt-injection with supply-chain reach — worst in

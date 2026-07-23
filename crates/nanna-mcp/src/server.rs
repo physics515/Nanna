@@ -14,15 +14,21 @@ use tracing::{debug, info, warn};
 
 /// Tool handler function type
 pub type ToolHandler = Arc<
-    dyn Fn(Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CallToolResult>> + Send>>
+    dyn Fn(
+            Value,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CallToolResult>> + Send>>
         + Send
         + Sync,
 >;
 
 /// Resource handler function type  
 pub type ResourceHandler = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReadResourceResult>> + Send>>
-        + Send
+    dyn Fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReadResourceResult>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -87,7 +93,7 @@ impl McpServer {
     {
         let name = tool.name.clone();
         let handler: ToolHandler = Arc::new(move |input| Box::pin(handler(input)));
-        
+
         let mut tools = self.tools.write().await;
         tools.insert(
             name.clone(),
@@ -107,7 +113,7 @@ impl McpServer {
     {
         let uri = resource.uri.clone();
         let handler: ResourceHandler = Arc::new(move |uri| Box::pin(handler(uri)));
-        
+
         let mut resources = self.resources.write().await;
         resources.insert(
             uri.clone(),
@@ -140,7 +146,10 @@ impl McpServer {
             "prompts/list" => self.handle_list_prompts(request.params).await,
             "prompts/get" => self.handle_get_prompt(request.params).await,
             "ping" => Ok(serde_json::json!({})),
-            _ => Err(McpError::Protocol(format!("Unknown method: {}", request.method))),
+            _ => Err(McpError::Protocol(format!(
+                "Unknown method: {}",
+                request.method
+            ))),
         };
 
         match result {
@@ -186,7 +195,9 @@ impl McpServer {
                 tools: if tools.is_empty() {
                     None
                 } else {
-                    Some(ToolsCapability { list_changed: false })
+                    Some(ToolsCapability {
+                        list_changed: false,
+                    })
                 },
                 resources: if resources.is_empty() {
                     None
@@ -199,7 +210,9 @@ impl McpServer {
                 prompts: if prompts.is_empty() {
                     None
                 } else {
-                    Some(PromptsCapability { list_changed: false })
+                    Some(PromptsCapability {
+                        list_changed: false,
+                    })
                 },
                 logging: Some(LoggingCapability {}),
                 experimental: None,
@@ -234,7 +247,9 @@ impl McpServer {
             .get(&params.name)
             .ok_or_else(|| McpError::ToolNotFound(params.name.clone()))?;
 
-        let input = params.arguments.unwrap_or(Value::Object(Default::default()));
+        let input = params
+            .arguments
+            .unwrap_or(Value::Object(Default::default()));
         let result = (tool.handler)(input).await?;
 
         serde_json::to_value(result).map_err(Into::into)
@@ -319,7 +334,7 @@ impl McpServer {
             // Send response
             let response_json = serde_json::to_string(&response)?;
             debug!(response = %response_json, "Sending response");
-            
+
             stdout.write_all(response_json.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
             stdout.flush().await?;
@@ -384,11 +399,17 @@ impl McpServerBuilder {
     /// Build the server
     pub async fn build(self) -> McpServer {
         let server = McpServer::new(self.config);
-        
+
         for (tool, handler) in self.tools {
             let name = tool.name.clone();
             let mut tools = server.tools.write().await;
-            tools.insert(name, RegisteredTool { definition: tool, handler });
+            tools.insert(
+                name,
+                RegisteredTool {
+                    definition: tool,
+                    handler,
+                },
+            );
         }
 
         server
@@ -408,7 +429,7 @@ impl Default for McpServerBuilder {
 #[cfg(feature = "tools-integration")]
 pub mod tools_bridge {
     use super::*;
-    use nanna_tools::{ToolRegistry, ToolCall};
+    use nanna_tools::{ToolCall, ToolRegistry};
     use std::collections::HashMap as StdHashMap;
 
     /// Register all tools from a ToolRegistry with the MCP server
@@ -448,6 +469,7 @@ pub mod tools_bridge {
 
                         let response = registry.execute(call).await;
 
+                        let is_error = !response.result.success;
                         let content = if response.result.success {
                             vec![ToolContent::Text {
                                 text: response.result.content,
@@ -458,9 +480,15 @@ pub mod tools_bridge {
                             }]
                         };
 
+                        // Mirror of the client-side mapping: a tool's structured
+                        // `data` is exactly what `structuredContent` carries, and
+                        // only a successful call has a result to report.
+                        let structured_content = if is_error { None } else { response.result.data };
+
                         Ok(CallToolResult {
                             content,
-                            is_error: !response.result.success,
+                            is_error,
+                            structured_content,
                         })
                     }
                 })
@@ -487,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_tool() {
         let server = McpServer::new(McpServerConfig::default());
-        
+
         let tool = Tool {
             name: "test_tool".to_string(),
             description: Some("A test tool".to_string()),
@@ -497,12 +525,17 @@ mod tests {
             }),
         };
 
-        server.register_tool(tool, |_| async {
-            Ok(CallToolResult {
-                content: vec![ToolContent::Text { text: "success".to_string() }],
-                is_error: false,
+        server
+            .register_tool(tool, |_| async {
+                Ok(CallToolResult {
+                    content: vec![ToolContent::Text {
+                        text: "success".to_string(),
+                    }],
+                    is_error: false,
+                    structured_content: None,
+                })
             })
-        }).await;
+            .await;
 
         let tools = server.tools.read().await;
         assert!(tools.contains_key("test_tool"));
@@ -516,14 +549,18 @@ mod tests {
             instructions: None,
         });
 
-        let request = JsonRpcRequest::new(1, "initialize", Some(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "test-client",
-                "version": "1.0.0"
-            }
-        })));
+        let request = JsonRpcRequest::new(
+            1,
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
+                }
+            })),
+        );
 
         let response = server.handle_request(request).await;
         assert!(response.error.is_none());
