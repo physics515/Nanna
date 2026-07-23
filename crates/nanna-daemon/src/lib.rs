@@ -11,7 +11,10 @@
 //! - Tool management
 //! - Scheduler/cron
 
-pub mod activity;
+// `ActivityClock` now lives in `nanna-memory`, beside the dreaming code that
+// reads it, so the control plane and `DreamingService` share **one** clock
+// instead of each keeping a private notion of "last activity". Re-exported
+// below because the daemon is where it is stamped.
 pub mod agent_service;
 pub mod channels;
 pub mod control;
@@ -44,7 +47,7 @@ pub use protocol::{Request, Response, Event, Action, SessionAction, MemoryAction
 pub use server::{DaemonServer, DaemonConfig};
 pub use session::{Session, SessionManager, SessionId};
 pub use control::ControlPlane;
-pub use activity::ActivityClock;
+pub use nanna_memory::ActivityClock;
 pub use health::{PidFile, PidFileError, HealthServer, HealthState, DEFAULT_HEALTH_PORT};
 pub use webhook::{WebhookServer, WebhookConfig, WebhookEvent, WebhookMessage, DEFAULT_WEBHOOK_PORT};
 pub use log_buffer::{LogBuffer, LogEntry, LogSource};

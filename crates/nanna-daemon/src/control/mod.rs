@@ -81,12 +81,13 @@ pub struct ControlPlane {
     /// Shared activity clock, stamped on every chat/agent request so the
     /// scheduled dream cycle can tell whether the system is in active use.
     /// `None` in minimal test constructions that never dream.
-    activity: Option<Arc<crate::activity::ActivityClock>>,
-    /// The daemon's single dreaming orchestrator, over the same live memory
-    /// store as [`Self::memory`] — shared with the scheduled dream cycle so
-    /// manual (IPC) and automatic consolidation run the identical body and
-    /// accumulate feedback into one place. `None` in minimal test
-    /// constructions and whenever memory is disabled.
+    activity: Option<Arc<nanna_memory::ActivityClock>>,
+    /// The single dreaming orchestrator, shared with the scheduler (P13
+    /// unification) so a user-triggered consolidation runs the **same**
+    /// multi-phase cycle the scheduled one does — and accumulates its pending
+    /// feedback in one place instead of two. `None` in minimal test
+    /// constructions and when memory is disabled; the handler then falls back to
+    /// the low-level `MemoryService::consolidate`.
     dreaming: Option<Arc<nanna_memory::DreamingService>>,
 }
 
@@ -243,14 +244,14 @@ impl ControlPlane {
     /// Attach the shared activity clock the scheduled dream cycle reads to gate
     /// on idleness. The control plane stamps it on every chat request (see
     /// [`Self::handle`]); the scheduler reads its idle duration.
-    pub fn set_activity_clock(&mut self, clock: Arc<crate::activity::ActivityClock>) {
+    pub fn set_activity_clock(&mut self, clock: Arc<nanna_memory::ActivityClock>) {
         self.activity = Some(clock);
     }
 
-    /// Attach the daemon's single dreaming orchestrator (P13). Must be the same
-    /// `Arc` the scheduled dream cycle holds, and must wrap the same live
-    /// memory store passed as `memory`, so manual and automatic consolidation
-    /// share one feedback tally and one pending-FSRS queue.
+    /// Attach the shared dreaming orchestrator so an IPC-triggered consolidation
+    /// runs the same multi-phase cycle the scheduler does. Must be the *same*
+    /// `Arc` the scheduler holds — a second instance would split the pending
+    /// feedback the cycle applies.
     pub fn set_dreaming(&mut self, dreaming: Arc<nanna_memory::DreamingService>) {
         debug_assert!(
             self.memory.is_some(),

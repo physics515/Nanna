@@ -112,20 +112,26 @@ async fn consolidate_without_memory_reports_unavailable() {
     assert_eq!(resp["error"], "memory_unavailable");
 }
 
-/// A memory store with **no** orchestrator attached must be reported as a
-/// wiring fault — and must be reported *before* the LLM check, so the
-/// precondition is reachable without a live model.
+/// A memory store with **no** orchestrator attached must NOT be a hard fault:
+/// the handler falls back to the low-level `MemoryService::consolidate`
+/// (minimal constructions keep working), so the first missing precondition it
+/// reports is the absent LLM — exactly as in the fully-wired case.
 #[tokio::test]
-async fn consolidate_without_dreaming_reports_wiring_fault() {
+async fn consolidate_without_dreaming_falls_back_and_stops_at_the_llm() {
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.memory = Some(Arc::new(nanna_memory::MemoryService::new(
         nanna_memory::MemoryServiceConfig::default(),
     )));
-    // No router either — but the dreaming fault must win, proving the ordering.
+    // No router either — the fallback must carry consolidation past the
+    // (absent) orchestrator to the LLM precondition, never report a fault.
     let resp = cp
         .handle("test", Action::Memory(MemoryAction::Consolidate))
         .await;
-    assert_eq!(resp["error"], "dreaming_unavailable");
+    assert_ne!(
+        resp["error"], "dreaming_unavailable",
+        "a missing orchestrator must fall back, not fail"
+    );
+    assert_eq!(resp["error"], "llm_unavailable");
 }
 
 /// With the orchestrator attached, consolidation gets **past** the dreaming

@@ -46,7 +46,7 @@
     "lucide-vue-next": "^0.577.0",
     "marked": "^17.0.1",
     "monaco-editor": "^0.56.0",
-    "nuxt": "^4.5.0",
+    "nuxt": "^4.4.8",
     "radix-vue": "^1.9.17",
     "tailwind-merge": "^3.6.0",
     "tippy.js": "^6.3.7",

@@ -38,6 +38,10 @@ pub use schema_guard::{
     MCP_SCHEMA_DEPTH_MAX, MCP_SCHEMA_NODES_MAX, SchemaViolation, validate_tool_schema,
 };
 pub use server::{McpServer, McpServerBuilder, McpServerConfig, ResourceHandler, ToolHandler};
+/// Bridge that publishes a `nanna-tools` registry as MCP tools — the seam
+/// `nanna mcp serve` uses to expose the local tool surface.
+#[cfg(feature = "tools-integration")]
+pub use server::tools_bridge;
 pub use transport::*;
 
 /// MCP protocol version

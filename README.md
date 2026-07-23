@@ -55,7 +55,11 @@ Nanna is not a chatbot. It's a *presence*.
   zero-cost tier, with cloud APIs as opt-in escalation (ROADMAP P12).
 - **Tools & MCP.** Every tool is a filesystem JS/TS skill (39 default skills) run by the Boa engine:
   files, shell, web fetch/search, browser control, vision, tiered OCR (pure-Rust `ocrs` → vision-model
-  fallback), audio (TTS/transcription), PDF, memory, scheduling. Plus MCP client integration.
+  fallback), audio (TTS/transcription), PDF, memory, scheduling. Plus MCP client integration — and
+  MCP *server* mode: `nanna mcp serve` publishes the local tool surface over stdio JSON-RPC to any MCP
+  client (Claude Code, editors), honouring the `[tools]` enabled/disabled policy. (The standalone
+  server exposes the filesystem/shell/web tools; the memory- and agent-backed ones still need the
+  daemon — ROADMAP P3.)
 - **Five channels.** Telegram, Discord, Slack, Signal, and WhatsApp — a webhook server + unified
   router receive messages, run them through the agent, and deliver responses back to the origin channel.
 - **Desktop GUI.** Tauri 2 + Nuxt 4 + Tailwind 4 (Palenight theme): streaming chat, Tiptap + Monaco

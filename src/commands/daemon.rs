@@ -9,7 +9,7 @@ use tracing::info;
 use std::os::windows::process::CommandExt;
 
 /// Handle daemon subcommands
-pub(crate) async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> anyhow::Result<()> {
+pub async fn handle_daemon_command(action: DaemonAction, _config: &Config) -> anyhow::Result<()> {
     let pid_file = Config::default_data_dir()?.join("nanna-daemon.pid");
 
     match action {

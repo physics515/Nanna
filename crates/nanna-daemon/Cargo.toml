@@ -71,6 +71,10 @@ tempfile = "3"
 # Platform services
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+# Process-liveness check for the PID-file single-instance guard.
+# (Shelling out to `tasklist` mis-reported live PIDs as dead when the
+# subprocess failed, letting a second daemon clobber the lock.)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }

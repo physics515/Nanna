@@ -169,16 +169,9 @@ impl ControlPlane {
                 // (the old shape) skipped both and left that queue to grow for
                 // the daemon's whole uptime.
                 //
-                // Checked here — before any config/model work — because a
-                // missing orchestrator is a *wiring* fault, not a runtime one:
-                // failing fast keeps the precondition observable and testable
-                // without needing a live LLM to reach it.
-                let Some(ref dreaming) = self.dreaming else {
-                    return json!({
-                        "error": "dreaming_unavailable",
-                        "message": "Dreaming orchestrator not configured"
-                    });
-                };
+                // Falls back to the low-level `MemoryService::consolidate` when
+                // memory is on but no orchestrator is attached (minimal
+                // constructions), so a manual consolidation can never regress.
 
                 // Trigger memory consolidation (requires LLM for summarization)
                 let Some(ref router) = self.router else {
@@ -225,10 +218,34 @@ impl ControlPlane {
                     summarize_models,
                 );
 
-
                 // Deliberately NOT idle-gated: the user asked for this one
                 // explicitly, so it runs even while the system is busy.
-                match dreaming.dream_with_consolidation(&config, summarize).await {
+                //
+                // P13 unification: dream through the shared `DreamingService`
+                // when one is attached, so a user-triggered consolidation runs
+                // the full multi-phase cycle — pending feedback applied, the
+                // testing-effect FSRS flush, the min-memories floor — and not
+                // just its final clustering phase. Falls back to the low-level
+                // call when no orchestrator is attached (minimal
+                // constructions); the fallback reports zero promotions and
+                // demotions because only the orchestrator tallies feedback.
+                let dreamed = match self.dreaming {
+                    Some(ref dreaming) => {
+                        dreaming.dream_with_consolidation(&config, summarize).await
+                    }
+                    None => {
+                        let fallback = memory.consolidate(&config, summarize).await;
+                        let total_memories = memory.count().await;
+                        fallback.map(|consolidation| nanna_memory::DreamingStats {
+                            consolidation,
+                            auto_promoted: 0,
+                            auto_demoted: 0,
+                            total_memories,
+                        })
+                    }
+                };
+
+                match dreamed {
                     Ok(stats) => {
                         let result = stats.consolidation;
                         info!(

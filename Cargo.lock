@@ -5346,6 +5346,7 @@ dependencies = [
  "nanna-core",
  "nanna-daemon",
  "nanna-llm",
+ "nanna-mcp",
  "nanna-server",
  "nanna-storage",
  "nanna-tools",
@@ -5518,6 +5519,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-service",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5654,6 +5656,7 @@ dependencies = [
  "hmac 0.13.0",
  "nanna-agent",
  "nanna-channels",
+ "nanna-config",
  "nanna-core",
  "nanna-llm",
  "nanna-storage",

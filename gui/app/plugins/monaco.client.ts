@@ -1,9 +1,9 @@
 // Monaco editor setup - client only
 import { loader } from '@guolao/vue-monaco-editor'
 import * as monaco from 'monaco-editor'
-// monaco-editor 0.56 added a package `exports` map (`"./*": "./esm/vs/*.js"`), so the
-// old `monaco-editor/esm/vs/<path>` specifiers now resolve to `esm/vs/esm/vs/<path>.js`
-// and fail. The public subpath is everything *below* `esm/vs/`.
+// monaco-editor 0.56 added an `exports` map (`"./*": "./esm/vs/*.js"`), so the
+// old deep `monaco-editor/esm/vs/...` specifiers no longer resolve — they would
+// now expand to `esm/vs/esm/vs/...`. Import through the exports map instead.
 import editorWorker from 'monaco-editor/editor/editor.worker?worker'
 import jsonWorker from 'monaco-editor/language/json/json.worker?worker'
 import cssWorker from 'monaco-editor/language/css/css.worker?worker'

@@ -30,7 +30,10 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            // Loopback by default — this HTTP surface has no authentication of
+            // its own, so publishing it to every interface must be an explicit
+            // choice, not an inherited default.
+            host: nanna_config::LOOPBACK_HOST.to_string(),
             port: 3000,
             webhook_secret: None,
         }
@@ -59,7 +62,16 @@ pub async fn start_server(config: ServerConfig, state: AppState) -> anyhow::Resu
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     
-    info!("🚀 Server listening on {}", addr);
+    if nanna_config::is_loopback_host(&config.host) {
+        info!("🚀 Server listening on {}", addr);
+    } else {
+        tracing::warn!(
+            "🚀 Server listening on {addr} — this HTTP surface has NO authentication \
+             and is reachable from other machines. Bind {} unless you intend to \
+             expose it.",
+            nanna_config::LOOPBACK_HOST
+        );
+    }
     info!("🧠 Memory dreaming enabled");
     
     axum::serve(listener, app).await?;

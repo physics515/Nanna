@@ -7,12 +7,12 @@
 //! - Automatically promoted/demoted based on feedback
 
 use crate::{
-    ConsolidationConfig, ConsolidationResult, EmbedFn, MemoryError, MemoryService,
+    ActivityClock, ConsolidationConfig, ConsolidationResult, EmbedFn, MemoryError, MemoryService,
     MemoryServiceConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -181,15 +181,30 @@ pub struct DreamingStats {
     pub total_memories: usize,
 }
 
+/// Outcome of a gated dream cycle: which trigger fired, and what it did.
+///
+/// Returned instead of a bare `DreamingStats` so a caller can log *why* the
+/// cycle ran (idle lull vs memory pressure) without re-deriving the decision.
+#[derive(Debug, Clone)]
+pub struct DreamOutcome {
+    /// Why the cycle ran. Never [`DreamTrigger::Skipped`] — a skip is reported
+    /// as `Ok(None)`, so this type cannot represent "ran because it didn't".
+    pub trigger: DreamTrigger,
+    /// What the cycle accomplished.
+    pub stats: DreamingStats,
+}
+
 /// The dreaming service - manages memory consolidation and auto-feedback
 pub struct DreamingService {
     config: DreamingConfig,
     memory: Arc<MemoryService>,
     /// Pending feedback to apply (memory_id -> per-variant signal tally)
     pending_feedback: RwLock<HashMap<String, FeedbackTally>>,
-    /// Wall-clock instant of the most recent user/agent activity. Drives the
-    /// idle gate in [`DreamingService::dream_if_idle`].
-    last_activity: RwLock<Instant>,
+    /// Monotonic record of the most recent user/agent activity, driving the idle
+    /// gate in [`DreamingService::dream_if_idle`]. An `Arc` so the host (the
+    /// daemon's control plane) can stamp the **same** clock this service reads —
+    /// see [`Self::with_activity_clock`].
+    activity: Arc<ActivityClock>,
 }
 
 impl DreamingService {
@@ -223,11 +238,36 @@ impl DreamingService {
             config,
             memory,
             pending_feedback: RwLock::new(HashMap::new()),
-            last_activity: RwLock::new(Instant::now()),
+            activity: Arc::new(ActivityClock::new()),
         };
         // The store handle is retained (not dropped) for the service's lifetime.
         debug_assert!(Arc::strong_count(&service.memory) >= 1);
+        // A fresh clock reads as active-at-construction, so a service built at
+        // boot does not immediately consider itself idle-forever.
+        debug_assert!(service.activity.idle() < Duration::from_secs(1));
         service
+    }
+
+    /// Read the idle signal from an **externally shared** clock instead of this
+    /// service's private one.
+    ///
+    /// This is the other half of the P13 unification: the daemon's control plane
+    /// already stamps an [`ActivityClock`] on every chat request, so handing that
+    /// same `Arc` here means the service and its host cannot disagree about
+    /// whether the system is in use. Without it the host would have to call
+    /// [`Self::record_activity`] as a *second* stamp on every request and the two
+    /// notions of "last activity" could drift.
+    #[must_use]
+    pub fn with_activity_clock(mut self, clock: Arc<ActivityClock>) -> Self {
+        self.activity = clock;
+        self
+    }
+
+    /// Clone the activity-clock handle this service gates on, so a host can stamp
+    /// the same clock it reads.
+    #[must_use]
+    pub fn activity_clock(&self) -> Arc<ActivityClock> {
+        Arc::clone(&self.activity)
     }
 
     /// Clone the shared memory-store handle (e.g. to hand the daemon's tools the
@@ -241,14 +281,16 @@ impl DreamingService {
     ///
     /// Call this whenever the agent handles a message or runs a tool so a dream
     /// cycle only fires during a genuine lull (see [`Self::dream_if_idle`]).
-    pub async fn record_activity(&self) {
-        *self.last_activity.write().await = Instant::now();
+    /// Lock-free — safe to call from a hot request path.
+    pub fn record_activity(&self) {
+        self.activity.record();
     }
 
-    /// How long the system has been idle since the last [`Self::record_activity`].
+    /// How long the system has been idle since the last [`Self::record_activity`]
+    /// (or since the shared clock was last stamped by the host).
     #[must_use]
-    pub async fn idle_duration(&self) -> Duration {
-        self.last_activity.read().await.elapsed()
+    pub fn idle_duration(&self) -> Duration {
+        self.activity.idle()
     }
 
     /// Run a dream cycle **only if** the idle/memory-pressure gate says so,
@@ -334,12 +376,36 @@ impl DreamingService {
     pub async fn dream_if_idle<F, Fut>(
         &self,
         summarize_fn: F,
-    ) -> Result<Option<DreamingStats>, MemoryError>
+    ) -> Result<Option<DreamOutcome>, MemoryError>
     where
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Result<String, String>> + Send,
     {
-        let idle = self.idle_duration().await;
+        self.dream_if_idle_with(&self.config.consolidation, summarize_fn)
+            .await
+    }
+
+    /// [`Self::dream_if_idle`] with the consolidation limits supplied per run.
+    ///
+    /// The cluster byte budget must be sized to the *summarizer model's* context
+    /// window, which a long-lived service cannot know at construction time (the
+    /// model is resolved from the router when the cycle fires). Taking the
+    /// config as an argument keeps that decision at the call site instead of
+    /// freezing a stale budget into the service.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if a triggered consolidation fails.
+    pub async fn dream_if_idle_with<F, Fut>(
+        &self,
+        consolidation: &ConsolidationConfig,
+        summarize_fn: F,
+    ) -> Result<Option<DreamOutcome>, MemoryError>
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        let idle = self.idle_duration();
         let memory_count = self.memory.stats().await.total;
         let trigger = dream_trigger(idle, memory_count, &self.config);
 
@@ -368,8 +434,12 @@ impl DreamingService {
         }
 
         info!("dream_if_idle: running ({trigger:?}; idle {idle:?}, {memory_count} memories)");
-        let stats = self.dream(summarize_fn).await?;
-        Ok(Some(stats))
+        let stats = self.dream_with(consolidation, summarize_fn).await?;
+        debug_assert!(
+            trigger != DreamTrigger::Skipped,
+            "a reported outcome must carry the trigger that actually ran"
+        );
+        Ok(Some(DreamOutcome { trigger, stats }))
     }
 
     /// Set the embedding function on the underlying memory store.
@@ -475,6 +545,24 @@ impl DreamingService {
     ///
     /// Returns `MemoryError` if consolidation fails.
     pub async fn dream_with_consolidation<F, Fut>(
+        &self,
+        consolidation: &ConsolidationConfig,
+        summarize_fn: F,
+    ) -> Result<DreamingStats, MemoryError>
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        self.dream_with(consolidation, summarize_fn).await
+    }
+
+    /// [`Self::dream`] with the consolidation limits supplied per run — the
+    /// single implementation both entry points delegate to.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if consolidation fails.
+    pub async fn dream_with<F, Fut>(
         &self,
         consolidation: &ConsolidationConfig,
         summarize_fn: F,
@@ -782,7 +870,7 @@ mod tests {
 
         // High idle threshold so a freshly-created service is never "idle".
         let service = DreamingService::new(gate_cfg(3600, 0));
-        service.record_activity().await;
+        service.record_activity();
 
         let called = AtomicBool::new(false);
         let result = service
@@ -803,6 +891,23 @@ mod tests {
     /// A dimension-3 embedder good enough to let `remember` run in tests.
     fn test_embed_fn() -> EmbedFn {
         Arc::new(|_text: &str| Box::pin(async { Ok(vec![1.0_f32, 0.0, 0.0]) }))
+    }
+
+    /// A dimension-3 embedder that maps texts ending in `0..=3` onto four
+    /// mutually non-similar directions (pairwise cosine ≤ 0), so `remember`
+    /// stores them as **distinct** memories instead of folding them into one by
+    /// the >0.9-similarity dedup rule. Anything else lands on a fifth direction.
+    fn distinct_embed_fn() -> EmbedFn {
+        Arc::new(|text: &str| {
+            let vector = match text.chars().last() {
+                Some('0') => vec![1.0_f32, 0.0, 0.0],
+                Some('1') => vec![0.0_f32, 1.0, 0.0],
+                Some('2') => vec![0.0_f32, 0.0, 1.0],
+                Some('3') => vec![-1.0_f32, 0.0, 0.0],
+                _ => vec![0.0_f32, -1.0, 0.0],
+            };
+            Box::pin(async move { Ok(vector) })
+        })
     }
 
     fn dim3_config() -> DreamingConfig {
@@ -903,7 +1008,7 @@ mod tests {
         // `dream_if_idle` would skip. Passing a larger idle must still run,
         // proving the daemon's lock-free ActivityClock is the source of truth.
         let service = DreamingService::new(gate_cfg(3600, 0));
-        service.record_activity().await;
+        service.record_activity();
 
         let called = AtomicBool::new(false);
         let ran = service
@@ -986,6 +1091,119 @@ mod tests {
             .await
             .expect("dream must succeed");
         assert_eq!(via_default.total_memories, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_activity_clock_opens_and_shuts_the_gate_from_the_host_side() {
+        // The unification invariant: a host that stamps its OWN clock must move
+        // this service's idle gate, without ever calling `record_activity`.
+        let clock = Arc::new(ActivityClock::new());
+        // Threshold 0 ⇒ any idle duration counts as idle, so the gate is open…
+        let open = DreamingService::new(gate_cfg(0, 0))
+            .with_activity_clock(Arc::clone(&clock))
+            .with_embed_fn(test_embed_fn());
+        assert!(
+            open.idle_duration() < Duration::from_secs(1),
+            "a freshly stamped shared clock reads as recently active"
+        );
+
+        // …and a service with a high threshold sharing the same clock is shut,
+        // because the host's stamp is what it reads.
+        let shut = DreamingService::new(gate_cfg(3600, 0)).with_activity_clock(Arc::clone(&clock));
+        clock.record();
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let skipped = shut
+            .dream_if_idle(|_p| {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(String::new()) }
+            })
+            .await
+            .expect("gate must not error");
+        assert!(
+            skipped.is_none(),
+            "the host's stamp must hold the gate shut without record_activity()"
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The handle round-trips, so a host can adopt the service's clock too.
+        assert!(Arc::ptr_eq(&shut.activity_clock(), &clock));
+    }
+
+    #[tokio::test]
+    async fn gated_cycle_reports_the_trigger_that_fired() {
+        // Memory pressure must be distinguishable from an idle lull in the
+        // outcome, so a caller can log *why* a cycle ran.
+        let shared =
+            Arc::new(MemoryService::new(dim3_config().memory).with_embed_fn(distinct_embed_fn()));
+        for i in 0..3 {
+            shared
+                .remember(&format!("fact {i}"), HashMap::new())
+                .await
+                .expect("remember must succeed");
+        }
+        // Never idle (1h threshold), but pressure at 1 memory ⇒ MemoryPressure.
+        let cfg = DreamingConfig {
+            memory: dim3_config().memory,
+            idle_threshold_secs: 3600,
+            memory_pressure_count: 1,
+            // Below the consolidation floor, so the cycle short-circuits before
+            // ever needing an LLM — we are asserting the trigger, not the merge.
+            min_memories_for_consolidation: 1_000,
+            ..DreamingConfig::default()
+        };
+        let service = DreamingService::with_shared_memory(cfg, shared);
+        service.record_activity();
+
+        let outcome = service
+            .dream_if_idle(|_p| async { Ok(String::new()) })
+            .await
+            .expect("cycle must not error")
+            .expect("memory pressure must force a run despite recent activity");
+        assert_eq!(outcome.trigger, DreamTrigger::MemoryPressure);
+        assert_eq!(outcome.stats.total_memories, 3);
+    }
+
+    #[tokio::test]
+    async fn per_run_consolidation_config_overrides_the_construction_time_one() {
+        // The service is built with a permissive budget but the call supplies a
+        // restrictive one; the call site must win, since only it knows the
+        // summarizer model's real context window.
+        let permissive = ConsolidationConfig {
+            min_remaining_memories: 0,
+            ..ConsolidationConfig::default()
+        };
+        let restrictive = ConsolidationConfig {
+            // A floor above the store size leaves zero removal budget, so the
+            // cycle provably cannot merge anything.
+            min_remaining_memories: usize::MAX,
+            ..ConsolidationConfig::default()
+        };
+        let cfg = DreamingConfig {
+            memory: dim3_config().memory,
+            consolidation: permissive,
+            min_memories_for_consolidation: 1,
+            idle_threshold_secs: 0,
+            ..DreamingConfig::default()
+        };
+        let shared =
+            Arc::new(MemoryService::new(dim3_config().memory).with_embed_fn(distinct_embed_fn()));
+        for i in 0..4 {
+            shared
+                .remember(&format!("same-ish fact {i}"), HashMap::new())
+                .await
+                .expect("remember must succeed");
+        }
+        let service = DreamingService::with_shared_memory(cfg, Arc::clone(&shared));
+
+        let stats = service
+            .dream_with(&restrictive, |_p| async { Ok("merged".to_string()) })
+            .await
+            .expect("cycle must not error");
+        assert_eq!(
+            stats.consolidation.memories_merged, 0,
+            "the per-run floor must gate the merge, not the construction-time config"
+        );
+        assert_eq!(shared.count().await, 4, "no memory may be removed");
     }
 
     #[tokio::test]

@@ -729,6 +729,7 @@ fn scheduled_consolidation_config(
     .with_summarizer_context_window(summarizer_context_window_tokens)
 }
 
+
 /// The main daemon server
 pub struct DaemonServer {
     config: DaemonConfig,
@@ -962,26 +963,30 @@ impl DaemonServer {
         // request, read by the scheduled dream cycle to gate on idleness. Made
         // here so it is in scope for both the scheduler executor (below) and the
         // control plane (built later); cloning the Arc shares the same clock.
-        let activity_clock = Arc::new(crate::activity::ActivityClock::new());
+        let activity_clock = Arc::new(nanna_memory::ActivityClock::new());
 
-        // The single dreaming orchestrator (P13 "unify the two stacks"). Both
-        // consolidation paths — the scheduled cycle below and the IPC
-        // `MemoryAction::Consolidate` on the control plane — run through this
-        // one service over the daemon's *live* memory store, so a dream cycle
-        // also applies tallied feedback and flushes the pending FSRS
-        // testing-effect queue that `MemoryService::recall` fills. Calling
-        // `MemoryService::consolidate` directly (the old shape) skipped both.
-        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.as_ref().map(|mem| {
+        // The single dreaming orchestrator (P13 unification). Built once here and
+        // shared by BOTH consolidation paths — the scheduled cycle below and the
+        // IPC `MemoryAction::Consolidate` handler — so they run the same
+        // multi-phase body over the same live store and accumulate pending
+        // feedback in one place. It reads the very `activity_clock` the control
+        // plane stamps, so its idle gate cannot drift from the daemon's own
+        // notion of "in use".
+        let dreaming: Option<Arc<nanna_memory::DreamingService>> = memory.as_ref().map(|memory| {
             let dreaming_config = nanna_memory::DreamingConfig {
                 idle_threshold_secs: self.config.dream_idle_threshold_secs,
                 memory_pressure_count: self.config.dream_memory_pressure_count,
                 ..nanna_memory::DreamingConfig::default()
             };
-            Arc::new(nanna_memory::DreamingService::with_shared_memory(
-                dreaming_config,
-                mem.clone(),
-            ))
+            Arc::new(
+                nanna_memory::DreamingService::with_shared_memory(
+                    dreaming_config,
+                    Arc::clone(memory),
+                )
+                .with_activity_clock(Arc::clone(&activity_clock)),
+            )
         });
+
         // Dreaming must observe the very store the agent writes to, never a
         // private copy — that identity is the whole point of the shared seam.
         debug_assert_eq!(
@@ -1334,11 +1339,12 @@ impl DaemonServer {
 
         // Share the activity clock so chat requests stamp the same clock the
         // scheduled dream cycle reads for its idle gate.
-        control.set_activity_clock(activity_clock.clone());
-        // Same Arc the scheduled cycle holds: manual and automatic dreaming
-        // share one orchestrator, one feedback tally, one live store.
+        control.set_activity_clock(Arc::clone(&activity_clock));
+
+        // Share the ONE dreaming orchestrator, so an IPC-triggered consolidation
+        // runs the same multi-phase cycle the scheduler does (P13 unification).
         if let Some(ref dreaming) = dreaming {
-            control.set_dreaming(dreaming.clone());
+            control.set_dreaming(Arc::clone(dreaming));
         }
 
         let control = Arc::new(control);
@@ -1353,9 +1359,21 @@ impl DaemonServer {
 
         // Spawn IPC server
         let ipc_server = self.ipc.clone();
+        let ipc_shutdown = self.shutdown_tx.clone();
         let ipc_handle = tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
-                error!("IPC server error: {}", e);
+                // An IPC-less daemon is unreachable (no control plane) but
+                // would keep running heartbeats and burning the LLM budget —
+                // observed live when a second instance lost the port race.
+                // Take the daemon down instead of zombie-ing.
+                error!(
+                    "IPC server error: {} — shutting down (a daemon without IPC is unreachable)",
+                    e
+                );
+                if ipc_shutdown.send(()).is_err() {
+                    // No shutdown listener yet — exit hard rather than linger.
+                    std::process::exit(1);
+                }
             }
         });
 
@@ -2337,20 +2355,10 @@ impl DaemonServer {
 ///   denylist still applies) rather than silently muting every tool.
 /// - `disabled` is the denylist and always wins (fail closed on conflict).
 fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPolicy {
-    // A real allowlist is a non-empty `enabled` list without the `"*"` wildcard.
-    // Matched by `if let` so there is no `unwrap` on this path.
-    let real_allowlist = enabled.filter(|e| !e.is_empty() && !e.iter().any(|n| n == "*"));
-
-    let base = match real_allowlist {
-        Some(names) => ToolPolicy::allow_only(names.iter().cloned()),
-        None => ToolPolicy::allow_all(),
-    };
-
-    if disabled.is_empty() {
-        base
-    } else {
-        base.with_denied(disabled.iter().cloned())
-    }
+    // Thin wrapper over the shared interpretation in `nanna-tools`, so the
+    // daemon and `nanna mcp serve` cannot drift on what `[tools] enabled` /
+    // `disabled` mean. The daemon's tests below pin the behaviour from this side.
+    ToolPolicy::from_config_lists(enabled, disabled)
 }
 
 /// Embedding configuration for the daemon
@@ -2939,6 +2947,44 @@ mod tests {
             large.max_cluster_content_bytes,
             nanna_memory::cluster_content_bytes_for_context(200_000)
         );
+    }
+
+    /// The P13 unification invariant: the orchestrator the daemon builds reads
+    /// the **same** clock the control plane stamps, so a chat request moves the
+    /// dream gate without any second bookkeeping call.
+    #[tokio::test]
+    async fn dreaming_service_gates_on_the_control_plane_clock() {
+        let clock = Arc::new(nanna_memory::ActivityClock::new());
+        let memory = Arc::new(nanna_memory::MemoryService::new(
+            nanna_memory::MemoryServiceConfig::default(),
+        ));
+        // A 1-hour idle threshold: the gate is shut for as long as the clock
+        // says the system was recently used.
+        let dreaming = nanna_memory::DreamingService::with_shared_memory(
+            nanna_memory::DreamingConfig {
+                idle_threshold_secs: 3_600,
+                memory_pressure_count: 0,
+                ..nanna_memory::DreamingConfig::default()
+            },
+            memory,
+        )
+        .with_activity_clock(Arc::clone(&clock));
+
+        // Stamping the clock the way the control plane does on a chat request
+        // must be visible to the service…
+        clock.record();
+        assert!(
+            dreaming.idle_duration() < std::time::Duration::from_secs(1),
+            "the control plane's stamp must reset the service's idle timer"
+        );
+        // …and hold the gate shut.
+        let ran = dreaming
+            .dream_if_idle(|_p| async { Ok(String::new()) })
+            .await
+            .expect("gate must not error");
+        assert!(ran.is_none(), "an actively-used daemon must not dream");
+        // Both sides genuinely hold one clock, not two equal ones.
+        assert!(Arc::ptr_eq(&dreaming.activity_clock(), &clock));
     }
 
     #[test]
