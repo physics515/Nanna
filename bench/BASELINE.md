@@ -19,14 +19,43 @@ offline, fixed-seed — these are exact, reproducible values, not timing samples
 
 | Metric | Baseline | Source | Notes |
 | --- | --- | --- | --- |
-| Consolidation compression ratio | **0.90** | `retention::tests::dreaming_shrinks_store_while_holding_recall` | 60 → 6 memories, 6 same-topic clusters of 10 each |
+| Consolidation compression ratio | **0.90** | `retention::tests::dreaming_shrinks_store_while_holding_recall` | 60 → 6 memories |
 | Recall retention across a dream cycle | **1.000** (recall@3 1.0 → 1.0) | same test | same-topic merges keep every topic reachable at its centroid |
+| **Summarizer calls per cycle** (this corpus) | **0** (was 6) | same test | *(2026-07-23)* dream phase (b) folds the 54 removable memories deterministically — `memories_deduped: 54`, `clusters_formed: 0` |
 | w20 aged-recall (FSRS-6 `0.0658`) | **6/6 topics** | `retention::tests::w20_experiment_aged_recall` | 800-day-aged corpus, FSRS-gated recall |
 | w20 aged-recall (FSRS-5 `0.5`, the old default) | **0/6 topics** | same test | evidence the shipped constant was wrong; default flipped 2026-07-17 |
 
 Budget: consolidation must not regress **recall retention below 1.0** on this fixed corpus,
 and must hold **compression ≥ 0.90**. The w20 rows are a correctness fixture (they assert the
 FSRS-6 exponent strictly out-recalls the old FSRS-5 one on aged memories), not a tunable budget.
+
+### Summarization drift (content fidelity, not recall)
+
+Instrument: `nanna-memory::retention::clause_survives` + the two `drift` fixtures. Measures
+whether a **rare, safety-critical clause** survives a dream cycle — deliberately *not* a recall
+metric, because the two come apart exactly here: the topic stays perfectly recallable while the
+one clause that made it actionable is gone. That gap is what makes drift easy to ship blind.
+
+| Metric | Baseline | Source | Notes |
+| --- | --- | --- | --- |
+| Rare clause survives a **summarized** cluster | **NO** (lost in 1 cycle) | `retention::tests::summarized_memories_lose_a_rare_critical_clause_in_one_cycle` | the known exposure, reproduced against our own pipeline |
+| Rare clause survives a **deduplicated** band | **YES** (verbatim) | `retention::tests::deduplicated_memories_keep_their_rare_critical_clause` | dream phase (b) folds without paraphrasing; store still compresses |
+
+Budget: the **dedup arm must never regress to NO** — that is a correctness fixture, and it is the
+concrete payoff of folding restatements deterministically. The summarized arm is a **baseline to
+beat, not a budget to hold**: it currently asserts the clause *is* lost, so when a drift mitigation
+lands (generation ceiling, or verbatim-pinning user-STATED memories — both logged in P13) that test
+will fail loudly and should be flipped to assert survival. A failing baseline arm means the system
+got better, and the assertion says so in its message.
+
+*(2026-07-23)* The summarizer-call row is the newest budget and the point of dream phase (b):
+this corpus's within-topic pairs sit in the `IngestAction::Reinforce` band (cosine > 0.92), so
+they are true restatements and are now folded **deterministically, with zero LLM calls**, where
+the cycle previously paid 6 summarizer prompts to paraphrase them. Compression and recall are
+*unchanged* (0.90 / 1.000) — the win is entirely in the token budget, the governing scarce
+resource on the single-GPU local tier. Do not "fix" a future regression here by lowering the
+similarity threshold: the 0.92 line is the project's existing same-fact definition, and folding
+below it would paraphrase-merge genuinely distinct memories.
 
 ---
 

@@ -331,6 +331,11 @@ pub struct ConsolidationResult {
     pub clusters_formed: usize,
     /// Number of memories merged (reduced by)
     pub memories_merged: usize,
+    /// Number of near-duplicate memories folded away **without** an LLM call
+    /// (dream phase (b) — see `MemoryService::fold_near_duplicates`). Counted
+    /// separately from `memories_merged` so the token-free share of a cycle's
+    /// compression is visible rather than hidden inside the summarized total.
+    pub memories_deduped: usize,
     /// Number of memories expanded
     pub memories_expanded: usize,
     /// Errors encountered (non-fatal)
@@ -393,7 +398,7 @@ pub fn composite_cluster_score(
 /// per-workspace memory scoping the `remember`/`recall` tools enforce. Exact
 /// `Option` equality (`None == None`, `Some(a) == Some(a)`) is the safe rule.
 #[must_use]
-fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
+pub(crate) fn same_scope(a: &MemoryEntry, b: &MemoryEntry) -> bool {
     a.workspace_id == b.workspace_id
 }
 

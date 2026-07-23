@@ -8,7 +8,13 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-23 (**nuxt generate manifest-race mitigation** — pin `buildDir`, prerender `/` only, clean-cache script before generate; unused `README_FILE` import scoped to tests. Open agent-tool loop residual: confirm dual client builders gone.) Prior: **P4 UI simplification** — command palette Mod+K, VirtualList, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.
+**Last updated:** 2026-07-23 (**P13 dreaming unification** — both daemon paths now dream through one
+`DreamingService`, which restored the **inert testing effect** and closed an unbounded `pending_updates`
+queue; new **no-LLM dedup phase (b)** folds true restatements in every band incl. `Detailed`
+(summarizer calls 6 → 0 at unchanged 0.90 compression / 1.000 recall); scheduled dreaming gained
+**model failover** + a min-across-fallbacks context budget; **summarization drift instrumented** with
+both arms baselined; `/tool-stats` render crash fixed. Open: a drift mitigation, HNSW clustering,
+`nanna-timeline`.) Prior: **nuxt generate manifest-race mitigation** — pin `buildDir`, prerender `/` only, clean-cache script before generate; unused `README_FILE` import scoped to tests. Prior: **P4 UI simplification** — command palette Mod+K, VirtualList, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -151,10 +157,16 @@ Concretely, today Nanna:
 `SqliteMemoryPersistence` struct name, docs), **not** an engine swap — the SQL dialect, `.db` files,
 and `datetime('now')`/`AUTOINCREMENT`/`json_*` usage are all Turso-supported and load-bearing (P13).
 
-**Not yet verified / closed:** no **native local model runner** yet (P12); **dreaming** exists but is
-a fixed hourly cron over an O(N²) clusterer with no timeline/DSP layer, and the richer feedback-driven
-`DreamingService`/`DreamingRuntime` is dead code (P13); the daemon + embedded-fallback + reconnection
-path has **no end-to-end test**; **MCP server mode** is claimed complete but `nanna-server/src/mcp.rs`
+**Not yet verified / closed:** no **native local model runner** yet (P12); **dreaming** still runs over
+an O(N²) clusterer with no timeline/DSP layer (P13) — though it is now idle-gated rather than a fixed
+hourly cron *(2026-07-19)*, and **`DreamingService` is no longer dead code**: since *2026-07-23* both
+daemon consolidation paths run through it as the single orchestrator, which also restored the
+testing-effect FSRS flush that nothing had been draining, and added a deterministic no-LLM dedup phase.
+(`nanna-core::DreamingRuntime` is likewise live — `nanna-server` drives `DreamingService` through it.)
+The daemon + reconnection path **is** covered end-to-end
+since *2026-07-16* (`nanna-client/tests/e2e_daemon.rs`, 4 hermetic tests through the real IPC — the
+"embedded fallback" half of this line is moot, P16 deleted embedded mode); what remains untested there
+is a real conversation turn, which needs a live LLM. **MCP server mode** is claimed complete but `nanna-server/src/mcp.rs`
 does not exist (unverified — see P3); several daemon control actions return `not_implemented`; and
 there is remaining **security/correctness debt** tracked below. *(Fixed 2026-07: Discord/Slack webhook
 signature verification is now real Ed25519/HMAC, not a placeholder; user-tool + workspace path traversal
@@ -597,6 +609,34 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-22)* Follow-up hotfix after #58: seven page SFCs had composables spliced inside `interface`
       bodies (broke `nuxt generate` / `cargo tauri build`); restored script order + channels `loadError`
       on catch. Residual logged in BUG_BASH: local channels toast ref; legacy clawd/Nanna config-path copy.
+      *(2026-07-23)* **`/tool-stats` was crashing at render — fixed.** `loadError` is referenced five
+      times in the template's `PageState` block and assigned twice in `loadStats()`, but was **never
+      declared**, so the page threw `loadError is not defined` and `ErrorBoundary` swallowed the whole
+      panel ("Something went wrong"). A leftover from the 2026-07-22 script-order hotfix that reached the
+      other pages but not this one. Added `const loadError = ref<string | null>(null)` alongside the
+      other refs, matching `model-stats`/`memory`/`tools`. The `e2e/page-smoke.spec.ts` suite was already
+      catching this — 12/12 green after the fix.
+- [ ] *(2026-07-23)* **`<UiSonnerSonner />` fails to resolve at runtime — toasts may never render.**
+      Every Playwright page load logs `[Vue warn]: Failed to resolve component: UiSonnerSonner` from
+      `app.vue`, on **both** this branch and pristine `origin/master`, so it is pre-existing and not a
+      dep-bump fallout. The component *does* exist (`app/components/ui/sonner/Sonner.vue`) and the
+      auto-import name looks correct for its nested path, so the likely cause is the component failing to
+      load rather than being misnamed — e.g. the `vue-sonner` import throwing. Worth chasing because the
+      failure is silent and the blast radius is real: `useToast` drives success/error feedback for copy,
+      save, delete and clear across the app (P4 "Toasts & destructive confirms"), so if the toaster never
+      mounts, none of that feedback reaches the user. Check whether `useToast` renders through this
+      component or an independent path, then fix or delete it. Cross-check against the deferred
+      `vue-sonner 1 → 2` major.
+- [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
+      pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
+      the current branch it fails 1). Diagnosis from the trace: the step's locator
+      `getByRole('button', {name: /delete|confirm|yes/i})` is **ambiguous** — it matches both the context
+      menu's `Delete` item and the `ConfirmDialog`'s `Confirm` button, so after the menu detaches
+      Playwright re-resolves onto `Confirm` and then spins on
+      `confirm-overlay … intercepts pointer events` until the 60 s timeout. Fix is test-side: scope the
+      confirmation click to the dialog rather than the page, and wait for the overlay's transition to
+      settle. Deliberately **not** patched under time pressure in the run that found it — loosening an
+      assertion to get green is how a real regression gets hidden later.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
@@ -997,6 +1037,22 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
             `BinFileRecorder` records are not forward-compatible). Sources:
             [Burn 0.21.0](https://github.com/tracel-ai/burn/releases/tag/v0.21.0),
             [burn-lm](https://github.com/tracel-ai/burn-lm).
+      - [ ] *(research 2026-07-23)* **Re-confirmed, nothing moved: Qwen3.5-9B is still the 8 GB default, and
+            Burn is still 0.21.** Two checks worth recording because they *prevent* churn rather than cause it.
+            (1) 2026 round-ups still rate **Qwen3.5-9B the best 8 GB function-calling pick "by a significant
+            margin"**, measured at **~55–58 tok/s flat across context sizes up to 16K** and fully GPU-resident
+            at all tested sizes through 32K — so the reference default in the notes above stands, and the
+            text-only-GGUF caveat (2026-07-13) is what keeps it fitting. **LFM2.5-8B-A1B** remains the verified
+            alternative for the 8–12 GB tier. Newer **Qwen 3.6 / Gemma 4** are now named in function-calling
+            guides with better edge-case handling (nested JSON args, missing-parameter errors, and correctly
+            choosing *not* to call a tool), but **no public BFCL-style numbers for 3.6 exist yet** — do not
+            switch the reference default on vibes; wait for a benchmark or run our own. (2) **Burn has still not
+            shipped 0.22** — 0.21.0 remains latest, so every 0.21 note above (no KV-cache API, `burn-lm` still
+            alpha, `attention()`/flash-attention additions, `TensorData::shape` breakage) is current and the
+            Mummu contract needs no revision this run. Sources:
+            [localllm.in 8 GB benchmarks](https://localllm.in/blog/best-local-llms-8gb-vram-2025),
+            [InsiderLLM function-calling guide](https://insiderllm.com/guides/function-calling-local-llms/),
+            [Burn releases](https://github.com/tracel-ai/burn/releases).
       - [ ] *(research 2026-07-06)* Investigate **MoE + expert CPU-offload** (`--cpu-moe`-style) so a larger agentic model (e.g. Qwen 3.6-A3B) fits a 16GB card — relevant to the single-GPU VRAM budgeting item. Also note the model-specific tool-call parser pattern (Qwen ships `qwen3_coder`) for reliable parsing into `ContentBlock::ToolUse`.
 - [ ] **Weight loading** — HF safetensors via `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16); checked load (fail on missing/unused keys). Stream weights from HF to a per-user model cache (resume `.part`, resources-dir first).
 - [ ] **Tokenization + chat format** — HF `tokenizers` crate; ChatML (or the chosen model's) template built explicitly; correct special/EOS tokens.
@@ -1082,6 +1138,12 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       70 nanna-memory + 61 nanna-daemon tests green.
       Still open (their own items): the multi-phase dream **body** (true merge / cluster-by-band / expand /
       DSP timeline), and nothing yet calls `record_feedback`, so the feedback phase is wired but unfed.
+      *(merge note 2026-07-23)* A parallel, independently-built implementation of this item arrived on
+      the nightly branch the same day; the merge kept this landed design and salvaged the parallel
+      run's genuinely-additive pieces: the failover dream summarizer
+      (`crates/nanna-daemon/src/dream_summarizer.rs` — the scheduled cycle now walks the full
+      `summarization_priority` list instead of only its head), the extra `DreamingService` entry
+      points (`dream_if_triggered`, `dream_with_consolidation`), and their tests.
 > **Dreaming model (do not drift from this):** memories **never expire**. A dream cycle = **semantically
 > rank "like" memories → concatenate them → summarize the concatenation into a single memory**
 > (`composite_cluster_score` → `MemoryCluster::concatenated_content()` → `create_consolidated_entry`).
@@ -1164,6 +1226,63 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `update_content_and_embedding` fold related-but-distinct content into the existing memory
       (bounded, superset-dedup) and reinforce FSRS. Next: apply the same merge in the batch
       dreaming/consolidation clusterer (`cluster_memories`), which still creates consolidated copies.*
+      *(2026-07-23)* **Batch half done — dream phase (b) now folds true duplicates with no LLM call.**
+      A dream cycle paid one summarizer prompt for *every* cluster, including clusters that were nothing
+      but restatements of one fact ("user prefers dark mode", stored three times from three sessions).
+      Paraphrasing those through a model is both wasted tokens — the scarcest resource on the single-GPU
+      local tier — and **lossier** than a deterministic fold. New `MemoryService::fold_near_duplicates`
+      runs per band *before* `cluster_memories`, so the summarizer only ever sees genuinely distinct
+      content. Rules, each a guard rather than a heuristic: **scope is absolute** (reuses the clusterer's
+      `same_scope`, so a fold can never leak or re-home across a workspace); **only the
+      `IngestAction::Reinforce` band** (cosine > 0.92 — the project's *existing* same-fact line, reused
+      rather than inventing a threshold); **never lose content** — `merge_memory_content` silently keeps
+      `existing` when the append would breach its byte bound, so folding-then-removing would drop text;
+      a fold is committed only when the merged content demonstrably still contains the incoming content,
+      otherwise both memories go to the clusterer; **strongest survives** (band ranked by FSRS weight
+      descending, so duplicates fold *into* the best-established memory, which inherits `max` importance
+      and the summed access count, mirroring `create_consolidated_entry`); and **update-before-remove**,
+      so a partial failure leaves a transient duplicate the next cycle re-folds, never a hole. Bounded by
+      the cycle's `removal_budget` and the band size; the pairwise scan is the same O(N²) shape the
+      clusterer already has, so no new complexity class. Declines entirely when no embedder is configured
+      (a survivor that cannot be re-embedded would leave content and vector inconsistent). New
+      `ConsolidationResult::memories_deduped` counts it separately from `memories_merged` so the
+      token-free share of a cycle is visible, and it is surfaced on the IPC consolidate response.
+      **Measured on the retention harness (`bench/BASELINE.md` Suite 3): compression 0.90 and recall
+      retention 1.000 are UNCHANGED, while summarizer calls for that corpus went 6 → 0** (54 memories
+      folded deterministically, `clusters_formed: 0`) — a pure token-budget win at identical quality.
+      The harness assertion was corrected from `memories_merged > 0` to `merged + deduped > 0`: it exists
+      to measure compression and recall, not which mechanism achieved them. 8 new tests (folds duplicates
+      without paying the summarizer; budget respected; distinct content left alone; survivor inherits
+      importance + access count; no-op without an embedder; plus 3 pure `find_duplicate_target` tests —
+      Reinforce-band-only, never-cross-workspace, and degenerate embeddings (dimension mismatch / empty)
+      match nothing rather than panicking). nanna-memory 75 tests green, full workspace suite green,
+      clippy 2147 (−6 vs the 2153 origin baseline; zero warnings in the new code), zero new rustfmt
+      violations.
+      *(2026-07-23, same run)* **Extended to the `Detailed` band — dedup now runs in *every* band.** The
+      band loop skipped `Detailed` (FSRS weight 0.8–1.0: the freshest, most important memories) entirely
+      on the grounds that "no compression is needed" there. That reasoning is right for *summarization*
+      — paraphrasing your best-established facts is exactly what you don't want — but wrong for
+      *deduplication*, which is **lossless** by construction here (a fold is committed only when no
+      content is dropped). So exact restatements of your most important facts were accumulating forever,
+      and those memories were the ones with the most to lose. Phase (b) now runs before the `Detailed`
+      check; the band is deduplicated and still never summarized. This also removes the highest-value
+      memories from the drift-exposed path entirely (see the drift fixture below). 1 test asserting the
+      exact contract: Detailed duplicates fold, `clusters_formed == 0`, and the summarizer is invoked
+      **zero** times (counted with an `AtomicUsize`, not inferred). nanna-memory 78 tests green.
+- [ ] *(discovered 2026-07-23)* **STATED vs OBSERVED provenance is not actually recorded — the
+      `fact_type` metadata key is read but never written.** Chasing the drift mitigation "verbatim-pin
+      user-stated memories" turned up that the distinction the reference notes describe under extraction
+      ("importance 1–5, STATED vs OBSERVED") does not exist in the code: `fact_type` appears only in
+      `nanna-daemon/src/control/memory.rs`, twice, both times *reading* it with
+      `.unwrap_or("stated")` for display — so **every memory reports itself as user-stated regardless of
+      origin**, and `ExtractedMemory` (`loop_runner.rs`) carries only `content`/`category`/`tags` with no
+      provenance field at all. Consequences: the GUI's fact-type column is decorative; the survey's
+      "source attribution (user statement > agent inference)" precedence rule has nothing to run on; and
+      the drift mitigation that would pin user-stated memories verbatim is **blocked** until provenance
+      is genuinely captured. Fix = add a provenance field to `ExtractedMemory`, have the extraction
+      prompt classify it, persist it into memory metadata, and only then build the pin on top. Note the
+      safe default when it lands: **absent provenance must NOT be treated as "stated"** (absence of
+      evidence isn't evidence of a user statement) — the current display default has it backwards.
 - [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
       `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
       `importance`/`storage_strength` is NaN.
@@ -1298,7 +1417,111 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             age past a year and hold uniform importance to reach a compressible band; still 60→6, recall 1.0→1.0).
             nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
             `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
-- [ ] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
+- [~] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
+      *(2026-07-23)* **Model-selection + fallback half shipped.** The two dream paths disagreed: the IPC
+      `MemoryAction::Consolidate` already walked the whole `summarization_priority` with failover, while the
+      **scheduled** cycle took only `summarization_priority.first()` and made a **single attempt** — so one
+      unavailable / rate-limited / out-of-credit model killed the entire nightly dream cycle, silently, until
+      someone read the task result. New `nanna-daemon::dream_summarizer` is the one implementation both paths
+      now share: pure `summarization_models(priority, fallback)` (priority wins verbatim; falls back to the
+      agent's main model for the scheduled path and to `llm.model_priority` for IPC — taken as a slice
+      because the two callers legitimately differ; empty only when *both* inputs are empty, which each caller
+      still reports as unconfigured) and `summarize_with_failover(router, models)` which walks the list,
+      treats a per-model failure as the expected operational condition it is (warn + continue) and only errors
+      after exhausting every candidate, naming the last real failure. **Also fixes a latent overflow:** both
+      paths sized the cluster byte budget to the **first** model's `hard_input_limit`, but one prompt is built
+      and then offered to each candidate in turn — so a budget fitted to a big first model would overflow a
+      smaller fallback. `summarizer_context_window_tokens` now takes the **minimum** window across the whole
+      failover list (floored at 8k), which is safe for whichever model actually answers; the only cost is
+      slightly smaller clusters per pass, and no content is lost because an over-budget cluster simply
+      re-clusters on a later seed. Deleted the hand-rolled summarize closures from `server.rs` and
+      `control/memory.rs` (and their now-dead `RequestBuilder` imports). 4 pure unit tests (verbatim priority,
+      both fallback shapes, priority-wins negative space, empty-only-when-nothing-configured); nanna-daemon
+      72 tests green; full workspace suite green; clippy **2146** (−7 vs the 2153 baseline). Verified on a
+      **real daemon boot**: the scheduled dream cycle *executed* through the new path and correctly skipped
+      in 9 ms (a heartbeat run had just stamped the `ActivityClock`, so idle < 300 s) without touching an LLM.
+      **Remaining:** the `SummaryCache` half of this item is **stale — no such type exists anywhere in the
+      repo** (grep-clean); if a cross-restart summary cache is still wanted it needs designing from scratch
+      (key on cluster content hash, persist to Turso), so it is re-logged as its own item below.
+- [ ] **Persistent dream summary cache (was the `SummaryCache` half above).** No `SummaryCache` type exists —
+      the original item referenced something never built. If worth doing: key on a content hash of the
+      cluster's concatenation, store summary + model + timestamp in Turso, and reuse on a later cycle so a
+      re-formed cluster doesn't re-pay the summarizer. Gate on measuring how often clusters actually recur.
+- [ ] *(research 2026-07-23)* **Summarization drift is the named failure mode of exactly what dreaming does —
+      guard it before it costs us a safety-critical memory.** The 2026 agent-memory survey warns that repeated
+      compression cycles make **low-frequency details vanish** — precisely the ones most likely to matter; its
+      worked example is that after ~3 summary passes over a week, a rarely-mentioned instruction like
+      "never call the production database directly" can disappear entirely. Nanna is squarely exposed:
+      `consolidate()` re-summarizes surviving memories cycle after cycle and already tracks how many times via
+      `FsrsState::generation`. Three concrete, in-reach mitigations, cheapest first: (a) **the deterministic
+      dedup pass landed 2026-07-23 already removes the biggest drift source** — true restatements are now folded
+      verbatim instead of paraphrased, so re-summarization no longer touches them at all; (b) **cap
+      re-summarization** — refuse to consolidate a memory past a `generation` ceiling, or require a *higher*
+      similarity to re-merge an already-consolidated entry, so gist-of-a-gist-of-a-gist cannot form; (c) **pin
+      the un-drift-able** — mark high-importance/low-frequency memories (and anything user-STATED rather than
+      agent-OBSERVED) as verbatim, excluded from summarizing clusters. Gate all of it on the retention harness
+      with a **new drift fixture**: seed one rare-but-critical memory among many common ones, run N dream cycles,
+      and assert it is still recallable *and* still contains its key clause — the harness already measures topic
+      recall, so this is an added probe, not new machinery. Sources:
+      [Memory for Autonomous LLM Agents (arXiv:2603.07670)](https://arxiv.org/html/2603.07670v1),
+      [SSGM — governing evolving memory (arXiv:2603.11768)](https://arxiv.org/html/2603.11768v1).
+      *(2026-07-23)* **Instrument built and both arms baselined — the mitigation is now a measured
+      decision, not a guess** (same "measure first, then flip" discipline the `w20` change used).
+      New `retention::clause_survives(service, clause)` asks whether any live memory still contains a
+      clause **verbatim** — deliberately content fidelity, not recall, because the two come apart
+      exactly here: in the failing arm the topic stays perfectly recallable while the clause that made
+      it actionable is gone, which is why drift is easy to ship blind. Two fixtures share one corpus
+      shape (an aged, compressible band of 8 memories where exactly one carries "never call the
+      production database directly") and one summarizer, differing *only* in similarity spread, which
+      selects the consolidation path: **summarized arm → clause LOST in a single cycle** (the exposure,
+      reproduced against our own pipeline; `echo_summarize` models a real summarizer faithfully here —
+      it keeps the dominant theme and drops what appears once, precisely the reported failure), and
+      **deduplicated arm → clause SURVIVES verbatim while the store still compresses** — i.e. dream
+      phase (b), landed this same run, is already a working drift mitigation for true restatements.
+      Both rows committed to `bench/BASELINE.md`; the dedup arm is a correctness fixture that must never
+      regress, while the summarized arm is a **baseline to beat** — it asserts the clause *is* lost, so
+      whichever mitigation lands next (generation ceiling / verbatim-pinning STATED memories) will make
+      that test fail loudly, and its message says to flip it. Remaining: implement (b) or (c) above.
+- [ ] *(research 2026-07-23)* **Dual-buffer / probation consolidation ("hot" buffer before long-term).** The
+      same survey's recommended write path: a new memory lands in a **hot buffer** and is promoted to long-term
+      storage only after a probation period and quality checks — **re-verification, deduplication, importance
+      scoring** — a computational hippocampal→neocortical transfer. Nanna writes straight to the durable store
+      today, so a one-off mis-extraction is permanent until a dream cycle happens to catch it. Our
+      `smart_ingest` already does dedup + importance at write time, so the missing pieces are the **probation
+      window** and the **promotion/eviction decision** (plus what overflow does). Fits the existing FSRS state
+      machine — probation is arguably just a band. Source:
+      [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1).
+- [ ] *(research 2026-07-23)* **Write-path canonicalization + provenance, and precedence rules for conflicts.**
+      Recommended metadata per record: timestamp, **source**, task label, **confidence**; plus canonicalization
+      that normalizes dates/names/quantities before storage so near-duplicates actually compare equal. Conflict
+      resolution then has principled rules instead of a similarity guess: **temporal versioning** (prefer the
+      newest) and **source attribution** (a *user statement* outranks an *agent inference*). Nanna already
+      distinguishes STATED vs OBSERVED in extraction — that is exactly the precedence signal, currently unused
+      at merge time. This would make the dedup fold landed this run smarter (canonicalized text folds more
+      often) and safer (a user-stated fact never gets overwritten by an inferred one). Sources:
+      [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1),
+      [TOKI — bitemporal contradiction resolution (arXiv:2606.06240)](https://arxiv.org/pdf/2606.06240).
+- [ ] *(research 2026-07-23)* **Fused retrieval score beats pure cosine — reported +29.6 on temporal queries,
+      +23.1 on multi-hop.** 2026 systems combine **semantic similarity + BM25 + entity matching** into one fused
+      score rather than ranking on embedding distance alone. Nanna's `recall` is pure in-RAM cosine over Turso
+      BLOBs, so it is weakest exactly where the fused score helps most (time-anchored and multi-hop questions).
+      A lexical (BM25) leg is cheap and fully local — no model, no network — and composes with the planned HNSW
+      candidate stage: retrieve candidates by vector, re-rank by the fused score. Pairs with the
+      `nanna-timeline` work, which is what makes temporal queries answerable at all. Sources:
+      [state of AI agent memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026),
+      [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1).
+- [ ] *(research 2026-07-23)* **Episodic→semantic promotion is still manual almost everywhere — an opening.**
+      The survey's own example is ours: repeated episodic records ("user corrected the date format", on five
+      different days) should graduate into one semantic fact ("user prefers DD/MM/YYYY"), but in current systems
+      this "rarely automatic" step needs explicit prompting. EverMemOS (Jan 2026) is the closest shipped shape —
+      an engram-inspired three-stage lifecycle: episodic trace formation → semantic consolidation into thematic
+      "MemScenes" → reconstructive recollection that composes context on demand. This is the same arc P13
+      already commits to (`nanna-timeline` episodes consolidating *into* `MemEntry` facts), so the useful part
+      is the staging vocabulary and the fact that **frequency-of-recurrence** is the promotion trigger — which
+      our per-memory access counts and the dedup fold count already measure. Also worth reading before the
+      dreaming overhaul: **RecMem**, recurrence-based consolidation aimed specifically at long-running agents.
+      Sources: [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1),
+      [RecMem (arXiv:2605.16045)](https://arxiv.org/pdf/2605.16045).
 - [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
       Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
       (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation
@@ -1847,6 +2070,26 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      expand to `esm/vs/esm/vs/...` and `nuxt build` fails with *"Rollup failed to resolve import
      …editor.worker?worker"*. Fixed by importing through the exports map
      (`monaco-editor/editor/editor.worker?worker`, `monaco-editor/language/<lang>/<lang>.worker?worker`).
+   - *(2026-07-23 sweep, parallel nightly run — merged the same day)* `cargo update` → 8 compatible bumps (`clap`/`clap_derive 4.6.4`, `libc 0.2.189`,
+     `tokio-util 0.7.19`, `syn 3.0.3`, `glob 0.3.4`, `rustls-pki-types 1.15.1`, `foreign-types-macros 0.2.4`).
+     `cargo upgrade --incompatible` → **nothing behind** (71 packages already latest; only the intentional
+     `aegis`/`turso` pins + the boa git rev). Workspace builds green, **~600 tests pass**, clippy clean.
+     Frontend: `nuxt 4.4.8 → 4.5.0`, `postcss 8.5.22`, `happy-dom 20.11.1`, `@tauri-apps/plugin-dialog 2.7.2`,
+     and **`monaco-editor 0.55.1 → 0.56.0`** — the last one is a **real migration**, not a passthrough:
+     0.56 (PR #5155 "exported modules reorganization") added a package `exports` map
+     (`"./*": "./esm/vs/*.js"`), so every pre-existing `monaco-editor/esm/vs/<path>` specifier now resolves
+     to `esm/vs/esm/vs/<path>.js` and `nuxt generate` **fails** ("Rolldown failed to resolve import
+     `monaco-editor/esm/vs/editor/editor.worker?worker`"). Fix: drop the now-implicit `esm/vs/` prefix from
+     all five worker imports in `gui/app/plugins/monaco.client.ts` (`monaco-editor/editor/editor.worker`,
+     `monaco-editor/language/{json,css,html,typescript}/…`). `editor.worker.js` itself did **not** move —
+     only the specifier did. Verified by the five worker chunks still emitting separately
+     (editor 300 kB · json 430 kB · css 1.07 MB · html 740 kB · ts 6.9 MB), `pnpm generate` green, 56 vitest
+     green. **Deferred majors this run** (each needs its own migration): `@tiptap/* 2 → 3.28`, `marked 17 → 18`,
+     `vue-router 4 → 5`, `vue-sonner 1 → 2`, `lucide-vue-next → @lucide/vue` (rename), and newly
+     **`typescript 5.9 → 7.0`** (the Go-port compiler — needs a `vue-tsc` compatible with TS 7 before it can land).
+     **Merge note:** this run's `nuxt 4.4.8 → 4.5.0` bump was reverted to `4.4.8` at merge,
+     pending the unresolved `UiSonnerSonner` component issue logged above; its monaco 0.56
+     migration is the same one described in the previous bullet.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
