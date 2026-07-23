@@ -192,9 +192,46 @@ impl Tool for ScriptedToolWrapper {
             None
         };
 
+        // Ranked tool search for `Nanna.searchTools(query)`, backed by the
+        // same weak registry handle as `Nanna.listTools()`. The closure is
+        // called synchronously from the script engine's blocking thread, so it
+        // runs the async registry read on a throwaway current-thread runtime
+        // (same pattern the bridge fns use). A dead registry — or any internal
+        // failure — yields an empty array so the skill can fall back to its
+        // own matching; it never throws into the script.
+        let tool_search: Option<nanna_scripting::ToolSearchFn> = self.registry.as_ref().map(|weak| {
+            let weak = weak.clone();
+            let f: nanna_scripting::ToolSearchFn = Arc::new(move |query: &str, limit: usize| {
+                let Some(registry) = weak.upgrade() else {
+                    return Value::Array(Vec::new());
+                };
+                let query = query.to_string();
+                let hits = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .map(|rt| rt.block_on(registry.search_tools(&query, limit)))
+                        .unwrap_or_default()
+                })
+                .join()
+                .unwrap_or_default();
+                Value::Array(
+                    hits.into_iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "name": h.name,
+                                "description": h.description,
+                                "score": h.score,
+                            })
+                        })
+                        .collect(),
+                )
+            });
+            f
+        });
+
         let input = Value::Object(params.into_iter().collect());
 
-        let result = self.engine.execute_with_workdir_and_session(&self.tool, input, tool_defs, self.services.clone(), default_workdir, session_id).await.map_err(|e| {
+        let result = self.engine.execute_full(&self.tool, input, tool_defs, self.services.clone(), default_workdir, session_id, tool_search).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Script execution failed: {e}"))
         })?;
 

@@ -20,6 +20,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
+rust-stemmers.workspace = true
 
 nanna-storage = { path = "../nanna-storage" }
 nanna-simd = { path = "../nanna-simd" }

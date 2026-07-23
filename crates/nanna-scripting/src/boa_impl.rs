@@ -228,6 +228,11 @@ fn register_nanna_bridge(context: &mut Context) -> Result<()> {
             0,
         )
         .function(
+            NativeFunction::from_fn_ptr(nanna_search_tools),
+            js_string!("searchTools"),
+            1,
+        )
+        .function(
             NativeFunction::from_fn_ptr(nanna_service),
             js_string!("service"),
             2,
@@ -282,6 +287,39 @@ fn nanna_list_tools(_: &JsValue, _args: &[JsValue], context: &mut Context) -> Js
             boa_engine::JsError::from_opaque(JsValue::from(js_string!(e.to_string().as_str())))
         }),
         None => Ok(JsValue::null()),
+    }
+}
+
+/// `Nanna.searchTools(query[, limit])` — ranked BM25 tool search.
+///
+/// Contract: NEVER throws. A missing bridge, an unattached search function
+/// (older embedding contexts / bare test harnesses), or an unserializable
+/// result all degrade to an empty array so the calling skill can fall back
+/// to its own matching.
+fn nanna_search_tools(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn empty_array(context: &mut Context) -> JsResult<JsValue> {
+        Ok(boa_engine::object::builtins::JsArray::new(context)?.into())
+    }
+
+    let Ok(query) = args.get_or_undefined(0).to_string(context) else {
+        return empty_array(context);
+    };
+    let query = query.to_std_string_escaped();
+
+    let limit = args
+        .get(1)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .and_then(|v| v.to_number(context).ok())
+        .filter(|n| n.is_finite() && *n >= 1.0)
+        .map_or(crate::bridge::DEFAULT_TOOL_SEARCH_LIMIT, |n| n as usize);
+
+    let Some(bridge) = BRIDGE.with(|b| b.borrow().clone()) else {
+        return empty_array(context);
+    };
+
+    match bridge.search_tools(&query, limit) {
+        Some(hits) => json_to_js(&hits, context).or_else(|_| empty_array(context)),
+        None => empty_array(context),
     }
 }
 

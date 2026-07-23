@@ -47,7 +47,7 @@ pub mod python;
 
 pub use engine::{ScriptEngine, EngineKind, ExecutionResult};
 pub use tool::{ScriptedTool, ToolManifest, ToolPermissions, OutputTarget, extract_manifest};
-pub use bridge::{NannaBridge, ServiceFn};
+pub use bridge::{NannaBridge, ServiceFn, ToolSearchFn, DEFAULT_TOOL_SEARCH_LIMIT};
 
 use thiserror::Error;
 
