@@ -18,7 +18,6 @@ use crate::user_tools::UserToolManager;
 use nanna_channels::StatusManager;
 use nanna_config::Config;
 use nanna_core::{Scheduler, Workspace, WorkspaceRegistry};
-use nanna_llm::RequestBuilder;
 use nanna_memory::{ConsolidationConfig, MemoryService};
 use nanna_storage::{Storage, StoredModelStats};
 use nanna_tools::ToolRegistry;

@@ -1189,7 +1189,36 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             age past a year and hold uniform importance to reach a compressible band; still 60→6, recall 1.0→1.0).
             nanna-memory 53 / nanna-agent 61 / nanna-core 23 / nanna-daemon 54 tests green. Remaining: *fit*
             `w0..=w20` from access history instead of any static default (the eventual FSRS-6 trainable goal).
-- [ ] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
+- [~] **Local dreaming** — run `summarize_fn` on the selected sumarization model + fallback from the users settings; persist the `SummaryCache` (currently in-memory, lost on restart).
+      *(2026-07-23)* **Model-selection + fallback half shipped.** The two dream paths disagreed: the IPC
+      `MemoryAction::Consolidate` already walked the whole `summarization_priority` with failover, while the
+      **scheduled** cycle took only `summarization_priority.first()` and made a **single attempt** — so one
+      unavailable / rate-limited / out-of-credit model killed the entire nightly dream cycle, silently, until
+      someone read the task result. New `nanna-daemon::dream_summarizer` is the one implementation both paths
+      now share: pure `summarization_models(priority, fallback)` (priority wins verbatim; falls back to the
+      agent's main model for the scheduled path and to `llm.model_priority` for IPC — taken as a slice
+      because the two callers legitimately differ; empty only when *both* inputs are empty, which each caller
+      still reports as unconfigured) and `summarize_with_failover(router, models)` which walks the list,
+      treats a per-model failure as the expected operational condition it is (warn + continue) and only errors
+      after exhausting every candidate, naming the last real failure. **Also fixes a latent overflow:** both
+      paths sized the cluster byte budget to the **first** model's `hard_input_limit`, but one prompt is built
+      and then offered to each candidate in turn — so a budget fitted to a big first model would overflow a
+      smaller fallback. `summarizer_context_window_tokens` now takes the **minimum** window across the whole
+      failover list (floored at 8k), which is safe for whichever model actually answers; the only cost is
+      slightly smaller clusters per pass, and no content is lost because an over-budget cluster simply
+      re-clusters on a later seed. Deleted the hand-rolled summarize closures from `server.rs` and
+      `control/memory.rs` (and their now-dead `RequestBuilder` imports). 4 pure unit tests (verbatim priority,
+      both fallback shapes, priority-wins negative space, empty-only-when-nothing-configured); nanna-daemon
+      72 tests green; full workspace suite green; clippy **2146** (−7 vs the 2153 baseline). Verified on a
+      **real daemon boot**: the scheduled dream cycle *executed* through the new path and correctly skipped
+      in 9 ms (a heartbeat run had just stamped the `ActivityClock`, so idle < 300 s) without touching an LLM.
+      **Remaining:** the `SummaryCache` half of this item is **stale — no such type exists anywhere in the
+      repo** (grep-clean); if a cross-restart summary cache is still wanted it needs designing from scratch
+      (key on cluster content hash, persist to Turso), so it is re-logged as its own item below.
+- [ ] **Persistent dream summary cache (was the `SummaryCache` half above).** No `SummaryCache` type exists —
+      the original item referenced something never built. If worth doing: key on a content hash of the
+      cluster's concatenation, store summary + model + timestamp in Turso, and reuse on a later cycle so a
+      re-formed cluster doesn't re-pay the summarizer. Gate on measuring how often clusters actually recur.
 - [ ] *(research 2026-07-19)* **"Sleep-time compute" generalizes our idle gate from *consolidate* to *pre-compute*.**
       Now that the daemon actually dreams only during a lull (idle gate wired 2026-07-19), the 2026 literature
       (Letta's sleep-time compute, arXiv:2504.13171; the SCM "sleep-consolidated memory" and 9-stage consolidation

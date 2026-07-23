@@ -187,13 +187,14 @@ impl ControlPlane {
 
                 let router_for_summarize = router.clone();
 
-                // Use the summarization model priority from settings
+                // Summarization models from settings, falling back to the main
+                // model priority. Shared with the scheduled dream cycle so the
+                // two paths cannot drift (see `crate::dream_summarizer`).
                 let cfg = self.config.read().await;
-                let mut summarize_models = cfg.llm.summarization_priority.clone();
-                // Fall back to main model priority if no summarization models configured
-                if summarize_models.is_empty() {
-                    summarize_models = cfg.llm.model_priority.clone();
-                }
+                let summarize_models = crate::dream_summarizer::summarization_models(
+                    &cfg.llm.summarization_priority,
+                    &cfg.llm.model_priority,
+                );
                 let max_compression_ratio = cfg.memory.max_compression_ratio;
                 let min_remaining_memories = cfg.memory.min_remaining_memories;
                 drop(cfg);
@@ -202,38 +203,29 @@ impl ControlPlane {
                     return json!({ "error": "no_models", "message": "No summarization or main models configured." });
                 }
 
-                // Resolve the actual summarizer before deriving consolidation limits.
-                let summarizer_info = router.get_model_info(&summarize_models[0]).await;
+                // Size the budget to the SMALLEST window across the failover
+                // list — one prompt is offered to each candidate in turn, so a
+                // budget fitted to the first would overflow a smaller fallback.
+                let window_tokens = crate::dream_summarizer::summarizer_context_window_tokens(
+                    router,
+                    &summarize_models,
+                )
+                .await;
                 let config = ConsolidationConfig {
                     max_compression_ratio,
                     min_remaining_memories,
                     ..ConsolidationConfig::default()
                 }
-                .with_summarizer_context_window(summarizer_info.hard_input_limit());
+                .with_summarizer_context_window(window_tokens);
 
                 info!("Consolidation summarization priority: {:?}", summarize_models);
 
-                let summarize = move |prompt: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
-                    let router = router_for_summarize.clone();
-                    let models = summarize_models.clone();
-                    Box::pin(async move {
-                        let mut last_err = String::from("No summarization models configured");
-                        for model in &models {
-                            let request = nanna_llm::CompletionRequest::default()
-                                .with_model(model)
-                                .with_message(nanna_llm::Message::user(&prompt));
-                            match router.complete(model, request).await {
-                                Ok(result) => return Ok(result),
-                                Err(e) => {
-                                    tracing::warn!("Summarization model {} failed: {}", model, e);
-                                    last_err = format!("{}: {}", model, e);
-                                }
-                            }
-                        }
-                        Err(format!("All summarization models failed. Last error: {}", last_err))
-                    })
-                };
-                
+                let summarize = crate::dream_summarizer::summarize_with_failover(
+                    router_for_summarize,
+                    summarize_models,
+                );
+
+
                 // Deliberately NOT idle-gated: the user asked for this one
                 // explicitly, so it runs even while the system is busy.
                 match dreaming.dream_with_consolidation(&config, summarize).await {

@@ -21,7 +21,6 @@ use nanna_channels::{
     Sender as ChannelSender, TelegramChannel,
 };
 use nanna_config::credentials::{self, SecureStore};
-use nanna_llm::RequestBuilder;
 use nanna_memory::MemoryService;
 use nanna_scripting::ServiceFn;
 use nanna_tools::{AgentSpawner, ParentChannel, SpawnResult, ToolPolicy, ToolRegistry};
@@ -1061,20 +1060,20 @@ impl DaemonServer {
             // both thresholds), so there is no second copy of the policy here.
             let dream_idle_threshold_secs = self.config.dream_idle_threshold_secs;
             let activity_for_tasks = activity_clock.clone();
-            let summarization_model = self
-                .config
-                .agent
-                .summarization_priority
-                .first()
-                .cloned()
-                .unwrap_or_else(|| self.config.agent.model.clone());
+            // The user's full summarization priority list, not just its head:
+            // the scheduled dream cycle now fails over exactly like the IPC one,
+            // so a single unavailable model no longer kills the nightly cycle.
+            let summarization_models = crate::dream_summarizer::summarization_models(
+                &self.config.agent.summarization_priority,
+                std::slice::from_ref(&self.config.agent.model),
+            );
             let executor: nanna_core::TaskExecutor = Arc::new(move |task| {
                 let agent = agent_for_tasks.clone();
                 let dreaming = dreaming_for_tasks.clone();
                 let router = router_for_tasks.clone();
                 let storage = storage_for_tasks.clone();
                 let activity = activity_for_tasks.clone();
-                let summarization_model = summarization_model.clone();
+                let summarization_models = summarization_models.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
@@ -1090,25 +1089,26 @@ impl DaemonServer {
                                 // agent for that model and rewrites the store, so it
                                 // still only runs during a lull (or under pressure).
                                 let idle = activity.idle();
-                                let summarizer_info =
-                                    router.get_model_info(&summarization_model).await;
+                                // Size the budget to the SMALLEST window across
+                                // the failover list: one prompt is built and
+                                // then offered to each candidate in turn, so a
+                                // budget fitted to the first model would
+                                // overflow a smaller fallback.
+                                let window_tokens =
+                                    crate::dream_summarizer::summarizer_context_window_tokens(
+                                        &router,
+                                        &summarization_models,
+                                    )
+                                    .await;
                                 let consolidation_config = scheduled_consolidation_config(
                                     consolidation_max_ratio,
                                     consolidation_min_remaining,
-                                    summarizer_info.hard_input_limit(),
+                                    window_tokens,
                                 );
-                                let summarize = |prompt: String| {
-                                    let router = router.clone();
-                                    let model = summarization_model.clone();
-                                    async move {
-                                        let request = nanna_llm::CompletionRequest::default()
-                                            .with_message(nanna_llm::Message::user(&prompt));
-                                        router
-                                            .complete(&model, request)
-                                            .await
-                                            .map_err(|e| e.to_string())
-                                    }
-                                };
+                                let summarize = crate::dream_summarizer::summarize_with_failover(
+                                    router.clone(),
+                                    summarization_models.clone(),
+                                );
                                 match dreaming
                                     .dream_if_triggered(idle, &consolidation_config, summarize)
                                     .await
