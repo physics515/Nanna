@@ -151,10 +151,16 @@ Concretely, today Nanna:
 `SqliteMemoryPersistence` struct name, docs), **not** an engine swap — the SQL dialect, `.db` files,
 and `datetime('now')`/`AUTOINCREMENT`/`json_*` usage are all Turso-supported and load-bearing (P13).
 
-**Not yet verified / closed:** no **native local model runner** yet (P12); **dreaming** exists but is
-a fixed hourly cron over an O(N²) clusterer with no timeline/DSP layer, and the richer feedback-driven
-`DreamingService`/`DreamingRuntime` is dead code (P13); the daemon + embedded-fallback + reconnection
-path has **no end-to-end test**; **MCP server mode** is claimed complete but `nanna-server/src/mcp.rs`
+**Not yet verified / closed:** no **native local model runner** yet (P12); **dreaming** still runs over
+an O(N²) clusterer with no timeline/DSP layer (P13) — though it is now idle-gated rather than a fixed
+hourly cron *(2026-07-19)*, and **`DreamingService` is no longer dead code**: since *2026-07-23* both
+daemon consolidation paths run through it as the single orchestrator, which also restored the
+testing-effect FSRS flush that nothing had been draining, and added a deterministic no-LLM dedup phase.
+(`nanna-core::DreamingRuntime` is likewise live — `nanna-server` drives `DreamingService` through it.)
+The daemon + reconnection path **is** covered end-to-end
+since *2026-07-16* (`nanna-client/tests/e2e_daemon.rs`, 4 hermetic tests through the real IPC — the
+"embedded fallback" half of this line is moot, P16 deleted embedded mode); what remains untested there
+is a real conversation turn, which needs a live LLM. **MCP server mode** is claimed complete but `nanna-server/src/mcp.rs`
 does not exist (unverified — see P3); several daemon control actions return `not_implemented`; and
 there is remaining **security/correctness debt** tracked below. *(Fixed 2026-07: Discord/Slack webhook
 signature verification is now real Ed25519/HMAC, not a placeholder; user-tool + workspace path traversal
