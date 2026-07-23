@@ -606,23 +606,76 @@ pub fn mission_claims_complete(text: &str) -> bool {
 /// Render the escalating auto-continuation prod for mission mode. Injected as
 /// a user-role message AND surfaced in the UI as a `mission_control` tool
 /// call — the automation must be visible, never silent.
+///
+/// `recent_tools` is a short digest of the last few tool outcomes — a
+/// disk-state anchor. Observed live: without it, a small model whose context
+/// was compressed mid-mission concluded its own files were corrupt and
+/// restarted from scratch on every prod, looping forever at feature one.
 #[must_use]
-pub fn mission_continue_message(round: usize, stall_rounds: usize) -> String {
+pub fn mission_continue_message(round: usize, stall_rounds: usize, recent_tools: &str) -> String {
+    let anchor = if recent_tools.is_empty() {
+        String::new()
+    } else {
+        format!("\nYour recent tool results (ground truth):\n{recent_tools}\n")
+    };
     if stall_rounds >= 3 {
         format!(
             "[MISSION CONTROL round {round}] You have now stopped {stall_rounds} times without \
              making tool calls. In ONE short line, state which mission items remain. Then \
-             IMMEDIATELY call the next tool — write_file or exec — to advance the first \
-             remaining item. If a needed tool is missing, call discover_tools. Only output \
-             the line `MISSION COMPLETE` if every item is truly verified done."
+             IMMEDIATELY call the next tool to advance the first remaining item. If a needed \
+             tool is missing, call discover_tools.{anchor}\
+             Do NOT rewrite files from scratch — read_file the current file and fix the \
+             smallest failing thing. Only output the line `MISSION COMPLETE` when every item \
+             is truly verified done."
         )
     } else {
         format!(
-            "[MISSION CONTROL round {round}] The mission is not complete — continue with the \
-             next unfinished item NOW using real tool calls. Do not summarize or wait. When \
-             everything is verified done, end with a line containing exactly: MISSION COMPLETE"
+            "[MISSION CONTROL round {round}] The mission is not complete — continue NOW with \
+             real tool calls. Your files on disk are INTACT and are the source of truth: \
+             read_file the current state, fix the smallest failing thing, verify with exec, \
+             then move to the next numbered item. Do NOT start over or rewrite whole files \
+             from scratch.{anchor}\
+             When everything is verified done, end with a line containing exactly: \
+             MISSION COMPLETE"
         )
     }
+}
+
+/// Render the verification prod injected when the model first claims
+/// `MISSION COMPLETE`: chat has no harness acceptance checks, so the loop
+/// demands proof — a claim is only accepted after a round that actually ran
+/// tools (mirrors the harness's refuse-false-success keystone).
+#[must_use]
+pub fn mission_verify_message() -> String {
+    "[MISSION CONTROL verification] You declared MISSION COMPLETE. Prove it with real \
+     commands NOW: exec the full test suite (or every key command) and show the actual \
+     output. If everything truly passes, output the MISSION COMPLETE line again after the \
+     real results. If anything fails, keep working instead."
+        .to_string()
+}
+
+/// Compact digest of the most recent tool outcomes for prod anchoring.
+/// Bounded: at most `MISSION_DIGEST_TOOLS_MAX` entries, error snippets cut
+/// at `MISSION_DIGEST_ERR_CHARS_MAX` chars on a char boundary.
+pub const MISSION_DIGEST_TOOLS_MAX: usize = 5;
+const MISSION_DIGEST_ERR_CHARS_MAX: usize = 100;
+
+#[must_use]
+pub fn mission_tool_digest(records: &[ToolCallRecord]) -> String {
+    let recent: Vec<String> = records
+        .iter()
+        .rev()
+        .take(MISSION_DIGEST_TOOLS_MAX)
+        .map(|r| {
+            if r.success {
+                format!("- {} ok", r.name)
+            } else {
+                let snippet: String = r.output.chars().take(MISSION_DIGEST_ERR_CHARS_MAX).collect();
+                format!("- {} FAILED: {}", r.name, snippet.replace('\n', " "))
+            }
+        })
+        .collect();
+    recent.join("\n")
 }
 
 /// Escalating firmness of a wrap-up nudge. The nudge only *steers* a long-running
@@ -1671,17 +1724,26 @@ impl Agent {
                     continue;
                 }
 
-                // Mission mode: the model stopped calling tools without
-                // declaring the completion contract. Auto-continue it —
-                // visibly (each prod surfaces through the tool callbacks as a
-                // `mission_control` chip in the UI) — until it completes or
-                // stalls for MISSION_STALL_ROUNDS_MAX tool-free rounds.
+                // Mission mode: the model stopped calling tools. Two cases,
+                // both auto-continued visibly (mission_control chips):
+                // an unverified MISSION COMPLETE claim gets a verification
+                // prod (a claim only stands after a round that ran tools);
+                // anything else gets a state-anchored continuation prod.
+                let mission_claim = options.mission_mode
+                    && mission_claims_complete(&state.final_text);
+                let claim_unverified = mission_claim
+                    && (state.mission_complete_claims == 0
+                        || !state.mission_verified_since_claim);
                 if options.mission_mode
-                    && !mission_claims_complete(&state.final_text)
+                    && (claim_unverified || !mission_claim)
                     && state.mission_stall_rounds < MISSION_STALL_ROUNDS_MAX
                 {
                     state.mission_rounds += 1;
                     state.mission_stall_rounds += 1;
+                    if mission_claim {
+                        state.mission_complete_claims += 1;
+                        state.mission_verified_since_claim = false;
+                    }
                     // Detectors re-arm each round: a narration relapse three
                     // hours in must be caught like the first one.
                     state.narration_nudged = false;
@@ -1692,10 +1754,15 @@ impl Agent {
                     // on its own progress instead of restarting.
                     self.store_assistant_response(&result.content_blocks).await;
 
-                    let prod = mission_continue_message(
-                        state.mission_rounds,
-                        state.mission_stall_rounds,
-                    );
+                    let prod = if claim_unverified {
+                        mission_verify_message()
+                    } else {
+                        mission_continue_message(
+                            state.mission_rounds,
+                            state.mission_stall_rounds,
+                            &mission_tool_digest(&state.tool_records),
+                        )
+                    };
                     // The automation must be visible to the user: render the
                     // prod exactly like a tool call.
                     let call_id = format!("mission-continue-{}", state.mission_rounds);
@@ -1706,7 +1773,11 @@ impl Agent {
                             &serde_json::json!({
                                 "round": state.mission_rounds,
                                 "stall_rounds": state.mission_stall_rounds,
-                                "reason": "model stopped without MISSION COMPLETE",
+                                "reason": if claim_unverified {
+                                    "MISSION COMPLETE claimed without verification"
+                                } else {
+                                    "model stopped without MISSION COMPLETE"
+                                },
                             }),
                             None,
                         );
@@ -1762,8 +1833,10 @@ impl Agent {
                 let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
                 state.finalize_reasoning_block(first_tool);
                 // Real tool activity resets the mission stall counter — the
-                // bound is on grinding, never on productive work.
+                // bound is on grinding, never on productive work. It also
+                // marks a pending completion claim as verified-in-progress.
                 state.mission_stall_rounds = 0;
+                state.mission_verified_since_claim = true;
             }
 
             // Execute tools and continue loop
@@ -3716,6 +3789,12 @@ struct RunState {
     /// Mission mode: consecutive continuation rounds with zero tool calls.
     /// Reset by any tool execution; ends the run at MISSION_STALL_ROUNDS_MAX.
     mission_stall_rounds: usize,
+    /// Mission mode: MISSION COMPLETE claims made so far. The first claim
+    /// triggers a verification prod; only a re-claim after a round that ran
+    /// tools is accepted (chat's substitute for harness acceptance checks).
+    mission_complete_claims: usize,
+    /// Mission mode: whether any tool ran since the last completion claim.
+    mission_verified_since_claim: bool,
 }
 
 impl RunState {
@@ -3743,6 +3822,8 @@ impl RunState {
             wrapup_nudge_count: 0,
             mission_rounds: 0,
             mission_stall_rounds: 0,
+            mission_complete_claims: 0,
+            mission_verified_since_claim: false,
         }
     }
 
@@ -3857,14 +3938,43 @@ mod tests {
 
     #[test]
     fn mission_prods_escalate_and_number_rounds() {
-        let early = mission_continue_message(1, 1);
-        let late = mission_continue_message(7, 3);
+        let early = mission_continue_message(1, 1, "");
+        let late = mission_continue_message(7, 3, "- exec FAILED: SyntaxError");
         assert!(early.contains("round 1"));
         assert!(early.contains("MISSION COMPLETE"));
+        // The anti-restart directive is the round-3 lesson: prods without it
+        // sent the model back to feature one every time.
+        assert!(early.contains("from scratch"));
         assert!(late.contains("round 7"));
-        // The escalated prod demands a remaining-items statement.
+        // The escalated prod demands a remaining-items statement and carries
+        // the ground-truth tool digest.
         assert!(late.contains("remain"));
+        assert!(late.contains("SyntaxError"));
         assert_ne!(early, late);
+    }
+
+    #[test]
+    fn mission_tool_digest_is_bounded_and_carries_errors() {
+        let mut records = Vec::new();
+        for i in 0..10 {
+            records.push(ToolCallRecord {
+                id: format!("t{i}"),
+                name: "exec".to_string(),
+                input: serde_json::json!({}),
+                output: if i == 9 {
+                    format!("SyntaxError line {i}\nmore detail {}", "x".repeat(300))
+                } else {
+                    "ok".to_string()
+                },
+                success: i != 9,
+                duration_ms: 1,
+            });
+        }
+        let digest = mission_tool_digest(&records);
+        assert_eq!(digest.lines().count(), MISSION_DIGEST_TOOLS_MAX);
+        assert!(digest.contains("FAILED: SyntaxError line 9"));
+        // Error snippets are bounded and newline-flattened.
+        assert!(digest.lines().all(|l| l.len() < 160));
     }
 
     #[test]
