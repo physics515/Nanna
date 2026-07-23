@@ -42,8 +42,13 @@ Nanna is not a chatbot. It's a *presence*.
 - **Cognitive memory + dreaming (the moat).** FSRS-6 spaced-repetition memory with semantic recall
   (recall reinforces via the testing effect), **dreaming** (LLM consolidation that clusters and
   summarizes memories by cognitive weight), duplicate detection, and importance scoring — persisted to
-  **Turso**. The dreaming system is being made the centerpiece: idle-gated multi-phase cycles + a
-  DSP-backed event timeline where time-series compression *is* the act of forgetting (ROADMAP P13).
+  **Turso**. Dreaming folds true restatements **deterministically, with no LLM call** before anything
+  reaches the summarizer, so repeated facts collapse without spending tokens and without being
+  paraphrased ([measured](bench/BASELINE.md#suite-3--dreaming--compression-information-retention):
+  identical 0.90 compression and 1.000 recall retention at **0** summarizer calls on the reference
+  corpus, down from 6). The dreaming system is being made the centerpiece: idle-gated multi-phase
+  cycles + a DSP-backed event timeline where time-series compression *is* the act of forgetting
+  (ROADMAP P13).
 - **LLM routing — local-first, cloud-optional.** Today: Anthropic, OpenAI, OpenRouter, and Ollama with
   complexity-based routing and native prompt caching (50–80% input-token savings). Next: a **native
   local runner on Burn** (`nanna-infer`) that executes a small open model on one GPU as the default,
