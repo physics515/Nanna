@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-23 (**P4 UI simplification** — command palette Mod+K, VirtualList for memory/logs/tools, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.) Prior notes condensed below.
+**Last updated:** 2026-07-23 (**nuxt generate manifest-race mitigation** — pin `buildDir`, prerender `/` only, clean-cache script before generate; unused `README_FILE` import scoped to tests. Open agent-tool loop residual: confirm dual client builders gone.) Prior: **P4 UI simplification** — command palette Mod+K, VirtualList, primary vs admin nav, settings Advanced + SettingsSection, compressed onboarding, copy/tone + component inventory. Open: formal 1280×720/1440×900 clipped-CTA pass, deeper tool-card compaction.
 embedded mode deleted, `AppState`/`backend.rs` collapsed, `log_buffer` relocated to `nanna-core`, GUI `nanna-*`
 deps pruned to config/core/tools; completed phases P3/P4/P10 condensed; **P17 re-scoped to workspace-context
 standardization**; prior: GUI testing + UI/UX quality track; P11 tool-manager consistency closed)
@@ -461,6 +461,14 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
+      *(2026-07-23)* **`nuxt generate` manifest race mitigated** — dual Vite client passes were racing
+      `node_modules/.cache/nuxt/.nuxt/dist/client/manifest.json` (ENOENT mid-generate while nitro still
+      prerendered and Tauri packaging kept going). Pin `buildDir: '.nuxt'`, prerender `/` only
+      (`crawlLinks: false`), wipe `.nuxt` + cache before every `pnpm generate`
+      (`gui/scripts/clean-nuxt-cache.mjs`). Also drop unused `README_FILE` import in
+      `nanna-workspace::manager` (test-only). Residual: confirm dual "Building client..." lines never
+      return after a cold wipe; Monaco ~4 MB chunk + `@tauri-apps/api/window` dual-import style logged
+      in `gui/docs/BUG_BASH_GUI_UX.md`.
 
 ##### UI simplification (default calm, power remains)
 - [x] **IA audit** — diagram primary tasks (chat, configure model, inspect run, manage memory/tools/channels)

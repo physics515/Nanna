@@ -2,7 +2,7 @@
 
 use crate::{
     discover_workspace, find_workspace_root, WorkspaceError, WorkspaceFiles, WorkspaceMarker,
-    AGENTS_FILE, README_FILE, WORKSPACE_MARKER_DIR,
+    AGENTS_FILE, WORKSPACE_MARKER_DIR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -274,6 +274,7 @@ impl Default for WorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::README_FILE;
     use std::fs::write;
     use tempfile::tempdir;
 
