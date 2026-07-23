@@ -5346,6 +5346,7 @@ dependencies = [
  "nanna-core",
  "nanna-daemon",
  "nanna-llm",
+ "nanna-mcp",
  "nanna-server",
  "nanna-storage",
  "nanna-tools",

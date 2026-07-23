@@ -432,8 +432,20 @@ pub mod tools_bridge {
     use nanna_tools::{ToolCall, ToolRegistry};
     use std::collections::HashMap as StdHashMap;
 
-    /// Register all tools from a ToolRegistry with the MCP server
-    pub async fn _register_tools_from_registry(
+    /// Register all tools from a ToolRegistry with the MCP server.
+    ///
+    /// `registry.definitions()` already has the registry's [`ToolPolicy`]
+    /// applied, so a tool denied by `[tools] disabled` is never advertised to
+    /// the connecting client — and `registry.execute` re-checks the policy after
+    /// alias/fuzzy resolution, so it could not be invoked even if a client
+    /// guessed the name.
+    ///
+    /// [`ToolPolicy`]: nanna_tools::ToolPolicy
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if a tool definition cannot be converted.
+    pub async fn register_tools_from_registry(
         server: &McpServer,
         registry: Arc<ToolRegistry>,
     ) -> Result<usize> {

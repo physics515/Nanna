@@ -343,9 +343,38 @@ health checks). **Shipped**, except:
       *(2026-07-23)* **Located: the server lives at `crates/nanna-mcp/src/server.rs`** (532 lines —
       `McpServer` with tool/resource/prompt registration, `handle_request` covering initialize/tools/
       resources/prompts/ping, stdio transport, and a `ToolRegistry` bridge that exposes every Nanna tool).
-      The doc pointer was simply wrong, not the feature. Remaining to close this item: nothing is *wired
-      up* — no daemon/CLI entry point starts it, so it is reachable only from Rust. Add a `nanna mcp serve`
-      command (or a daemon action) and an end-to-end test against a real client.
+      The doc pointer was simply wrong, not the feature. But nothing *started* it — no daemon or CLI entry
+      point — so it was reachable only from Rust.
+      *(2026-07-23)* **Wired up: `nanna mcp serve` now exposes Nanna's tool surface over stdio JSON-RPC**,
+      the transport every MCP client speaks. It loads the filesystem JS/TS skills (`--tools-dir`, else
+      `[tools] tools_dir` / `NANNA_TOOLS_DIR` / the dev tree), applies the user's `[tools]`
+      enabled/disabled policy, and serves `McpServer::run_stdio`. The registry bridge
+      `_register_tools_from_registry` was dead code behind its underscore; it is now
+      `register_tools_from_registry` and actually called.
+      **stdout is the protocol** — a stdout-writing log layer corrupts the JSON-RPC stream and the client
+      drops the connection, so `main` installs a **stderr** writer for this command (and only this one, so
+      every other command keeps its console behaviour); the startup banner follows the same writer.
+      **Policy is enforced on both sides:** `definitions()` filters denied tools out of the advertised
+      list, and `execute()` re-checks *after* alias/fuzzy resolution — so a disabled tool is neither
+      offered nor invocable by a guessed name. To guarantee the CLI and the daemon read `[tools]`
+      identically, the daemon's private `build_tool_policy` moved into `nanna-tools` as
+      `ToolPolicy::from_config_lists(enabled, disabled)` (a second copy is a security bug waiting to
+      happen); the daemon fn is now a thin wrapper and its tests still pin the behaviour.
+      5 new policy tests (`enabled=["*"]` and empty/absent mean unrestricted; a real allowlist restricts;
+      deny beats allow when a name is on both lists; `disabled` applies under a wildcard).
+      **Verified against the real binary:** piping JSON-RPC into `nanna mcp serve` returned a valid
+      `initialize` result, a `tools/list` advertising all **39** skills (every one carrying an
+      `inputSchema`), and a `tools/call` of `list_dir` that really executed and returned directory
+      contents — with **stdout containing exactly the 2/2 protocol lines and every log on stderr**.
+      Remaining: memory/agent-backed tools (`remember`/`recall`/`reflect`/`task`) need the daemon's script
+      services, which this standalone path does not build — see the new item below.
+- [ ] *(2026-07-23)* **Give `nanna mcp serve` the memory/agent-backed tools.** It loads skills via
+      `ToolRegistry::load_skills` (no services), so the tools that need `build_script_services` —
+      `remember`, `recall`, `reflect`, `task` — load but cannot reach memory or spawn sub-agents. Options:
+      (a) build the script services in the CLI path (needs storage + an embedding provider), or
+      (b) add a daemon IPC action so `mcp serve` proxies to the running daemon and inherits its live
+      store — (b) matches the "channels as control-plane clients" architecture and avoids a second
+      process owning `nanna.db`. Until then, document the standalone surface as filesystem/shell/web only.
 - [ ] Supervisor health check runs a placeholder, not a real agent loop (`supervisor.rs:496`).
 - [~] *(research 2026-07-20)* **Harden the MCP client for the 2026-07-28 spec RC.** Roots/Sampling/Logging
       are deprecated (file scoping moves to tool params / URIs / server config); tools move to full JSON
@@ -1790,6 +1819,9 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      - [ ] Decide the line-ending policy: add a `.gitattributes` (`*.rs text eol=lf`) and land one
            tree-wide `cargo fmt` normalization commit, so future runs can use `fmt`/`fmt --check` normally.
 3. **`nanna-infer` Burn skeleton** (P12) — one binary, dual `wgpu`+`ndarray` backend, runtime GPU probe, load one small model, greedy decode: prove local inference end-to-end on the dev GPU.
+   **Blocked here by design (checked 2026-07-23): `physics515/Mummu` is still an empty repo** — only
+   `.git`/`.claude`, no crates — so there is no runner surface for Nanna to consume. Items 3–5 stay
+   blocked until Mummu exposes one; runner code must NOT be written in this repo.
 4. **Local embeddings in Burn** (P12) — MiniLM-class CPU embedder wired into the memory `embed_fn` → fully-local memory (no API embeddings).
 5. **`Provider::Local` in the router** (P12) — dispatch completion/stream/tool-calls to `nanna-infer` and make local the top-priority (zero-cost) tier; cloud becomes opt-in escalation.
 6. **Unify + upgrade dreaming** (P13) — ~~one `DreamingService` orchestrator~~ **(done 2026-07-23 — the

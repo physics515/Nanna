@@ -2360,20 +2360,10 @@ impl DaemonServer {
 ///   denylist still applies) rather than silently muting every tool.
 /// - `disabled` is the denylist and always wins (fail closed on conflict).
 fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPolicy {
-    // A real allowlist is a non-empty `enabled` list without the `"*"` wildcard.
-    // Matched by `if let` so there is no `unwrap` on this path.
-    let real_allowlist = enabled.filter(|e| !e.is_empty() && !e.iter().any(|n| n == "*"));
-
-    let base = match real_allowlist {
-        Some(names) => ToolPolicy::allow_only(names.iter().cloned()),
-        None => ToolPolicy::allow_all(),
-    };
-
-    if disabled.is_empty() {
-        base
-    } else {
-        base.with_denied(disabled.iter().cloned())
-    }
+    // Thin wrapper over the shared interpretation in `nanna-tools`, so the
+    // daemon and `nanna mcp serve` cannot drift on what `[tools] enabled` /
+    // `disabled` mean. The daemon's tests below pin the behaviour from this side.
+    ToolPolicy::from_config_lists(enabled, disabled)
 }
 
 /// Embedding configuration for the daemon

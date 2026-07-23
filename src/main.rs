@@ -124,6 +124,25 @@ enum Commands {
         #[command(subcommand)]
         action: CredentialsAction,
     },
+
+    /// Model Context Protocol server — expose Nanna's tools to an MCP client
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Serve Nanna's tools over stdio JSON-RPC (for Claude Code, editors, …).
+    ///
+    /// stdout carries the protocol, so all logging goes to stderr.
+    Serve {
+        /// Directory of JS/TS tool skills (default: `[tools] tools_dir`,
+        /// `NANNA_TOOLS_DIR`, or the dev tree)
+        #[arg(long)]
+        tools_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,28 +216,50 @@ enum DaemonAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
-    // Initialize logging
-    let log_level = match cli.log_level.to_lowercase().as_str() {
+/// Parse the `--log-level` string into a level, defaulting to INFO for an
+/// unrecognised value rather than failing the whole run over a typo.
+fn parse_log_level(raw: &str) -> Level {
+    match raw.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
         "warn" => Level::WARN,
         "error" => Level::ERROR,
-        _ => Level::INFO, // "info" or unknown defaults to INFO
-    };
+        _ => Level::INFO,
+    }
+}
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(log_level.into())
-                .from_env_lossy(),
-        )
-        .init();
+/// Install the global tracing subscriber.
+///
+/// `logs_to_stderr` exists for `nanna mcp serve`, which speaks JSON-RPC on
+/// stdout: ANY log written there corrupts the stream and the client drops the
+/// connection with a parse error. Every other command keeps writing to stdout,
+/// so this is a per-command decision, not a global one.
+fn init_logging(log_level: Level, logs_to_stderr: bool) {
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(log_level.into())
+        .from_env_lossy();
+    if logs_to_stderr {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(filter)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(filter)
+            .init();
+    }
+}
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    let logs_to_stderr = matches!(cli.command, Some(Commands::Mcp { .. }));
+    init_logging(parse_log_level(&cli.log_level), logs_to_stderr);
+
+    // The banner is a log line, so it follows the same writer — it must never
+    // land on stdout ahead of the first JSON-RPC response.
     info!("🌙 Nanna v{} rising...", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
@@ -268,6 +309,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Daemon { action }) => {
             handle_daemon_command(action, &config).await?;
+            return Ok(());
+        }
+        Some(Commands::Mcp { action }) => {
+            match action {
+                McpAction::Serve { tools_dir } => {
+                    commands::mcp::serve(&config, tools_dir).await?;
+                }
+            }
             return Ok(());
         }
         Some(Commands::Server { host, port }) => {
