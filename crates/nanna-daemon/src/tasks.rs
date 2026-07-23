@@ -1050,6 +1050,42 @@ const OLLAMA_RESTART_COOLDOWN_SECS: u64 = 600;
 static LAST_OLLAMA_RESTART_EPOCH_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Normalize a raw `OLLAMA_HOST` value into a CLIENT-usable base URL.
+///
+/// `OLLAMA_HOST` is a SERVER bind address: `0.0.0.0` / `[::]` (all
+/// interfaces) still mean THIS machine, but as connect targets they must
+/// become loopback; a bare `host[:port]` needs the http scheme; a missing
+/// port gets Ollama's default 11434. Observed live: with
+/// `OLLAMA_HOST=0.0.0.0` the runner reset posted to a scheme-less URL
+/// (silently failed) and the server restart refused as "not local" — the
+/// entire healing ladder was neutered by one env var.
+pub(crate) fn normalize_ollama_base(raw: &str) -> String {
+    let with_scheme = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let mapped = with_scheme
+        .replace("0.0.0.0", "127.0.0.1")
+        .replace("[::]", "[::1]");
+    match reqwest::Url::parse(&mapped) {
+        Ok(mut url) => {
+            if url.port().is_none() && url.set_port(Some(11434)).is_err() {
+                return "http://127.0.0.1:11434".to_string();
+            }
+            url.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => "http://127.0.0.1:11434".to_string(),
+    }
+}
+
+/// The client base URL for the local Ollama server (env-driven, normalized).
+pub(crate) fn ollama_local_base() -> String {
+    let raw =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    normalize_ollama_base(&raw)
+}
+
 /// Restart the local Ollama server: kill `ollama.exe` only (the tray
 /// supervisor respawns it) and wait for the API to come back.
 ///
@@ -1059,8 +1095,9 @@ static LAST_OLLAMA_RESTART_EPOCH_SECS: std::sync::atomic::AtomicU64 =
 /// Refuses to act when `OLLAMA_HOST` points at a non-local server, and at
 /// most once per [`OLLAMA_RESTART_COOLDOWN_SECS`] process-wide.
 pub async fn restart_ollama_server() -> bool {
-    let base =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    // Normalization maps bind-all addresses to loopback, so after it a
+    // genuinely remote host is the only thing that won't look local.
+    let base = ollama_local_base();
     let is_local = ["localhost", "127.0.0.1", "[::1]"]
         .iter()
         .any(|h| base.contains(h));
@@ -1137,8 +1174,7 @@ pub(crate) async fn reset_ollama_runner_for(model: &str) {
     if crate::llm_router::ProviderId::from_model(model) != crate::llm_router::ProviderId::Ollama {
         return;
     }
-    let base =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let base = ollama_local_base();
     tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after transient failures");
     let client = reqwest::Client::new();
     let _ = client
@@ -1192,6 +1228,30 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_base_normalization_handles_bind_addresses() {
+        // The live regression: OLLAMA_HOST=0.0.0.0 (a server BIND address)
+        // must normalize to a loopback CLIENT url — it neutered the whole
+        // healing ladder when treated verbatim.
+        assert_eq!(normalize_ollama_base("0.0.0.0"), "http://127.0.0.1:11434");
+        assert_eq!(
+            normalize_ollama_base("0.0.0.0:11434"),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            normalize_ollama_base("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_ollama_base("localhost"),
+            "http://localhost:11434"
+        );
+        // A genuinely remote host stays remote (and stays refusable).
+        let remote = normalize_ollama_base("http://gpubox.lan:11434");
+        assert!(remote.contains("gpubox.lan"));
+        assert!(!remote.contains("127.0.0.1"));
+    }
 
     #[test]
     fn transient_classifier_matches_the_live_failure_strings() {

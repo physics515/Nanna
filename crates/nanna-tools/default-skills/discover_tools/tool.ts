@@ -1,6 +1,6 @@
 export default {
   name: "discover_tools",
-  version: "0.1.0",
+  version: "0.1.1",
   description: "Activate tools for file access, shell commands, web browsing, code analysis, and more. Call with no arguments to see all available tools, or with a query (e.g. 'file', 'exec', 'web', 'code') to filter. Activated tools persist for the rest of this conversation. You MUST call this before using any tool beyond remember/recall/reflect.",
   output: "context",
   parameters: {
@@ -28,17 +28,49 @@ export default {
       }
     }
 
-    // Apply query filter if provided
+    // Apply query filter if provided. The query is TOKENIZED and matched
+    // per word: "file write" must find the file tools exactly like
+    // "write file" does — the old whole-phrase substring match returned
+    // nothing unless the words happened to appear in that order. Tools
+    // matching more query words rank first.
     var matched = discoverable;
     if (query && query.length > 0) {
-      var q = query.toLowerCase();
-      matched = [];
-      for (var i = 0; i < discoverable.length; i++) {
-        var tool = discoverable[i];
-        var nameMatch = tool.name.toLowerCase().indexOf(q) >= 0;
-        var descMatch = tool.description && tool.description.toLowerCase().indexOf(q) >= 0;
-        if (nameMatch || descMatch) {
-          matched.push(tool);
+      var terms = [];
+      var cur = "";
+      var ql = query.toLowerCase();
+      for (var ci = 0; ci < ql.length; ci++) {
+        var ch = ql.charAt(ci);
+        var isWord = (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "_";
+        if (isWord) {
+          cur += ch;
+        } else if (cur.length > 0) {
+          terms.push(cur);
+          cur = "";
+        }
+      }
+      if (cur.length > 0) {
+        terms.push(cur);
+      }
+
+      if (terms.length > 0) {
+        var scored = [];
+        for (var i = 0; i < discoverable.length; i++) {
+          var tool = discoverable[i];
+          var hay = (tool.name + " " + (tool.description || "")).toLowerCase();
+          var hits = 0;
+          for (var t = 0; t < terms.length; t++) {
+            if (hay.indexOf(terms[t]) >= 0) {
+              hits++;
+            }
+          }
+          if (hits > 0) {
+            scored.push({ tool: tool, hits: hits });
+          }
+        }
+        scored.sort(function (a, b) { return b.hits - a.hits; });
+        matched = [];
+        for (var i = 0; i < scored.length; i++) {
+          matched.push(scored[i].tool);
         }
       }
     }
