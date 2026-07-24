@@ -365,7 +365,18 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
 - [ ] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
-- [ ] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
+- [x] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
+      *(2026-07-24)* **Untracked and gitignored.** It was committed in a **public** repo carrying 77 lines
+      of Claude Code permission allowances — including `Bash(curl:*)`, `Bash(taskkill:*)`,
+      `Bash(del /F …)` and several `Get-Process … | Stop-Process -Force` one-liners — plus absolute
+      machine paths still pointing at the repo's **old** name (`D:\Development\clawdbot-rs`). By
+      convention `settings.local.json` *is* the personal override (`settings.json` is the shared one, and
+      this repo has none), so anyone cloning inherited a pre-approved allowlist for network fetches and
+      process kills. Removed from the index with `git rm --cached` — the file stays on disk — and added
+      to `.gitignore`.
+      ⚠️ **Before merging: keep a copy of your local `.claude/settings.local.json`.** Untracking is a
+      deletion as far as git is concerned, so merging this removes the file from any working tree that
+      has it. Restore it afterwards (it is ignored now, so it will stay put from then on).
 - [ ] Add SECURITY.md with vulnerability disclosure process.
 - [ ] Enable GitHub secret scanning and Dependabot.
 - [ ] Claude UI Testing automations

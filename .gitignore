@@ -31,3 +31,7 @@ nul
 
 # Local Playwright run scratch
 playwright-run/
+
+# Claude Code local permission overrides — machine-specific paths + broad agent
+# allowances (curl, taskkill, del /F). Personal, not shareable; see ROADMAP P1.
+.claude/settings.local.json
