@@ -17,6 +17,8 @@ use commands::daemon::handle_daemon_command;
 use commands::serve::{run_daemon, run_server};
 use commands::workspace::handle_workspace_command;
 use nanna_config::Config;
+use nanna_config::bind::LOOPBACK_HOST;
+use nanna_daemon::DEFAULT_IPC_PORT;
 use setup::ensure_api_key;
 use tracing::{info, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -41,11 +43,11 @@ struct Cli {
     daemon_mode: bool,
 
     /// Daemon host
-    #[arg(long, hide = true, default_value = "127.0.0.1")]
+    #[arg(long, hide = true, default_value = LOOPBACK_HOST)]
     host: String,
 
     /// Daemon port
-    #[arg(long, hide = true, default_value = "9999")]
+    #[arg(long, hide = true, default_value_t = DEFAULT_IPC_PORT)]
     port: u16,
 }
 
@@ -191,11 +193,11 @@ enum DaemonAction {
     /// Start the daemon in the background
     Start {
         /// Host to bind to
-        #[arg(short = 'H', long, default_value = "127.0.0.1")]
+        #[arg(short = 'H', long, default_value = LOOPBACK_HOST)]
         host: String,
 
         /// Port to listen on
-        #[arg(short, long, default_value = "9999")]
+        #[arg(short, long, default_value_t = DEFAULT_IPC_PORT)]
         port: u16,
     },
 
@@ -208,11 +210,11 @@ enum DaemonAction {
     /// Restart the daemon
     Restart {
         /// Host to bind to
-        #[arg(short = 'H', long, default_value = "127.0.0.1")]
+        #[arg(short = 'H', long, default_value = LOOPBACK_HOST)]
         host: String,
 
         /// Port to listen on
-        #[arg(short, long, default_value = "9999")]
+        #[arg(short, long, default_value_t = DEFAULT_IPC_PORT)]
         port: u16,
     },
 }

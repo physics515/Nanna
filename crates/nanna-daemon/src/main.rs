@@ -37,15 +37,15 @@ struct Cli {
     command: Commands,
     
     /// WebSocket port to listen on
-    #[arg(short, long, default_value = "5149")]
+    #[arg(short, long, default_value_t = nanna_daemon::DEFAULT_IPC_PORT)]
     port: u16,
     
     /// Host to bind to
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = nanna_config::bind::LOOPBACK_HOST)]
     host: String,
     
     /// HTTP health port (default: 5148)
-    #[arg(long, default_value = "5148")]
+    #[arg(long, default_value_t = nanna_daemon::DEFAULT_HEALTH_PORT)]
     health_port: u16,
     
     /// Disable HTTP health server

@@ -2,6 +2,8 @@
 
 use crate::DaemonAction;
 use nanna_config::Config;
+use nanna_config::bind::LOOPBACK_HOST;
+use nanna_daemon::DEFAULT_IPC_PORT;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -168,13 +170,16 @@ async fn print_daemon_status(pid_file: &std::path::Path) -> anyhow::Result<()> {
         println!("   Status: ✅ Running");
         println!("   PID: {pid}");
 
-        let client_config = ClientConfig::new("ws://127.0.0.1:5149");
+        // Same constant `daemon start` binds, so status can never probe a different port
+        // than the one the daemon was launched on — which is exactly what used to happen.
+        let address = format!("ws://{LOOPBACK_HOST}:{DEFAULT_IPC_PORT}");
+        let client_config = ClientConfig::new(&address);
         if let Ok(Ok(_)) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             Client::connect(client_config)
         ).await {
             println!("   Connection: ✅ Healthy");
-            println!("   Address: ws://127.0.0.1:5149");
+            println!("   Address: {address}");
         } else {
             println!("   Connection: ⚠️  Not responding");
             println!("   (Daemon may be starting up or misconfigured)");

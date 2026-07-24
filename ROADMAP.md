@@ -347,7 +347,22 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [x] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
       *(2026-07-23)* Fixed together with the webhook receiver — see the "Bind local services to localhost
       by default" item below.
-- [ ] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
+- [x] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
+      *(2026-07-24)* **Unified on 5149 behind one exported constant.** This was not cosmetic: `nanna
+      daemon start` bound **9999** while `nanna daemon status` / `stop` connected to a hardcoded
+      `ws://127.0.0.1:5149` and the GUI sidecar used 5149 too — so a CLI-started daemon **reported
+      itself as not running**, and the GUI could not see it either. New
+      `nanna_daemon::DEFAULT_IPC_PORT` (5149) is the single definition, exported from the crate and
+      used by `IpcServerConfig::default()`, all three root-CLI `--port` defaults (`--port` global,
+      `daemon start`, `daemon restart`), the `nanna-daemon` binary's own `--port`, and the address
+      `daemon status` probes — which is now *built* from the constant instead of being a literal, so
+      status can never probe a port different from the one start binds. The matching `--host` defaults
+      switched from literal `"127.0.0.1"` to the existing `nanna_config::bind::LOOPBACK_HOST`, and
+      `--health-port` to the already-exported `DEFAULT_HEALTH_PORT`.
+      **Verified against the real binaries, not just the source:** `nanna daemon start --help` now
+      prints `--port <PORT> ... [default: 5149]` (was 9999) and `nanna-daemon --help` agrees. README's
+      documented `5148`/`5149` was already correct and needed no change. 75 daemon tests + 8 bin tests
+      green, clippy clean.
 - [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
 - [ ] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
 - [ ] No SECURITY.md or vulnerability disclosure process.

@@ -42,7 +42,7 @@ pub mod webhook;
 #[cfg(windows)]
 pub mod windows_service;
 
-pub use ipc::{IpcServer, IpcServerConfig, ConnectionId};
+pub use ipc::{IpcServer, IpcServerConfig, ConnectionId, DEFAULT_IPC_PORT};
 pub use protocol::{Request, Response, Event, Action, SessionAction, MemoryAction, ConfigAction};
 pub use server::{DaemonServer, DaemonConfig};
 pub use session::{Session, SessionManager, SessionId};
