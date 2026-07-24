@@ -616,7 +616,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       other pages but not this one. Added `const loadError = ref<string | null>(null)` alongside the
       other refs, matching `model-stats`/`memory`/`tools`. The `e2e/page-smoke.spec.ts` suite was already
       catching this — 12/12 green after the fix.
-- [ ] *(2026-07-23)* **`<UiSonnerSonner />` fails to resolve at runtime — toasts may never render.**
+- [x] *(2026-07-23)* **`<UiSonnerSonner />` fails to resolve at runtime — toasts may never render.**
       Every Playwright page load logs `[Vue warn]: Failed to resolve component: UiSonnerSonner` from
       `app.vue`, on **both** this branch and pristine `origin/master`, so it is pre-existing and not a
       dep-bump fallout. The component *does* exist (`app/components/ui/sonner/Sonner.vue`) and the
@@ -624,9 +624,47 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       load rather than being misnamed — e.g. the `vue-sonner` import throwing. Worth chasing because the
       failure is silent and the blast radius is real: `useToast` drives success/error feedback for copy,
       save, delete and clear across the app (P4 "Toasts & destructive confirms"), so if the toaster never
-      mounts, none of that feedback reaches the user. Check whether `useToast` renders through this
-      component or an independent path, then fix or delete it. Cross-check against the deferred
-      `vue-sonner 1 → 2` major.
+      mounts, none of that feedback reaches the user.
+      *(2026-07-24)* **Fixed — and it was the name after all.** The 2026-07-23 read ("the auto-import name
+      looks correct… likely the import throwing") was wrong. Nuxt **collapses a filename that repeats its
+      parent directory**, so `app/components/ui/sonner/Sonner.vue` registers as **`UiSonner`**, not
+      `UiSonnerSonner`. Settled from the generated registry rather than by inspection —
+      `.nuxt/components.d.ts` contains exactly `export const UiSonner`. The tag therefore resolved to
+      nothing, the `<Toaster>` never mounted, and every `useToast()` call was dropped: `toast.*` pushed
+      into vue-sonner's store with no renderer subscribed. One-word fix in `app.vue`. **Unrelated to the
+      deferred `vue-sonner 1 → 2` major** — that cross-check is closed.
+      **A second, identical bug fell out of the same audit:** `ui/glass-input/GlassInput.vue` wrapped its
+      field in `<GroundGlass>`, which registers as **`UiGroundGlass`** (same directory-repeat rule). It
+      rendered as an inert unknown element, so the glass slab — borders, mesh gradient, noise overlay —
+      never drew, and `glassRef.value?.onEnter()` silently no-opped because the template ref pointed at a
+      DOM node instead of the component (the `?.` swallowed it). Used by `pages/workspaces.vue`.
+      **Guarded two ways, each proven to fail without the fix:**
+      **(1)** `tests/unit/componentResolution.spec.ts` — walks all **91** `.vue` files under `app/` and
+      checks every PascalCase template tag against the **203** names in `.nuxt/components.d.ts`, allowing
+      Vue built-ins and names the file imports or declares itself. Zero false positives across the tree;
+      reverting either fix reproduces exactly the two failures. It asserts the registry is non-empty and
+      contains a known component first, so a registry that silently read as empty cannot make it pass
+      vacuously. (`nuxt prepare` runs from `postinstall`, so CI has the registry after `pnpm install`.)
+      **(2)** `e2e/toaster.spec.ts` — clicks Copy all on `/logs` and asserts a `[data-sonner-toast]`
+      actually renders. **Note for anyone tempted to assert on the Vue warning instead: you can't.**
+      A first attempt did, and it **passed with the bug still present** — the warning is emitted by the
+      dev server's render pass, never into the browser console, so a Playwright console listener never
+      sees it. That test was deleted rather than kept as false assurance. Also recorded: the glass buttons
+      animate their mesh forever, so Playwright's stability check never settles — assert
+      visible+enabled, then `click({ force: true })`.
+      Verified: 60/60 vitest, 26/26 Playwright (the 27th is the pre-existing flaky session test below).
+- [ ] *(2026-07-24)* **`<UiInput size="sm">` forwards `size` onto the native `<input>` and the DOM rejects
+      it.** Found while verifying the component-resolution fix above; **pre-existing** — reproduced with
+      that fix stashed, so it is not fallout. `app/components/ui/input.vue` declares no `size` prop, so
+      `size` falls through as an attribute to the `<input>` element, where the HTML `size` attribute must
+      be a positive integer. Chromium therefore logs
+      `[Vue warn]: Failed setting prop "size" on <input>: value sm is invalid. IndexSizeError` on every
+      page that renders one (`/tools`, `/tasks`, and others). Harmless to layout — the Tailwind classes do
+      the sizing — but it is log noise that trains everyone to ignore Vue warnings, which is precisely how
+      the toaster bug survived for months. Decide the contract rather than patching the symptom: either
+      give `UiInput` a real `size?: 'sm' | 'md' | 'lg'` prop that maps to classes (matching `UiButton`,
+      which already has one), or drop `size="sm"` from the call sites. Same class of "template hands a
+      component something it never declared, Vue warns, nobody reads it".
 - [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
       pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
       the current branch it fails 1). Diagnosis from the trace: the step's locator
@@ -1010,6 +1048,18 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
       - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-12)* **Qwen3.5 GGUF ships universal chat-template fixes for tool-calling** (apply to *any* Qwen3.5 GGUF), and the Qwen3-Coder tool-call parser is now fixed across llama.cpp/Ollama/LMStudio/Jan — de-risks the "reliable tool-call parsing into `ContentBlock::ToolUse`" item for the local tier. When Mummu ports a Qwen3.5-class model, lift its chat template + tool-call grammar verbatim rather than hand-rolling. 8GB tier still wants Q4_K_S/Q4_0 (drop to Q3_K_M on OOM); Qwen3-Coder-Next's ~46GB Q4 footprint keeps it a 16GB+/CPU-offload target, not an 8GB one. Sources: [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5), [Qwen3.6 VRAM table](https://knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/).
+      - [ ] *(research 2026-07-24)* **Qwen3.5's *Small* series gives the sub-8 GB tiers a real ladder, not just
+            a quantization knob.** The family now spans **0.8B / 2B / 4B / 9B** alongside the big MoEs, all
+            with **256K context** and tool-calling, so the CPU-only and low-VRAM guardrail tiers can drop to a
+            *smaller model at a better quantization* instead of crushing the 9B to Q3_K_M (which is where
+            tool-call validity starts failing). Concretely: keep **9B** as the 8 GB default, and add **4B** as
+            the CPU-only/offline fallback and **2B** as the floor for the low-VRAM guardrail run. Do not treat
+            the sizes as interchangeable on quality — the agent-eval suite's **tool-call validity rate** is the
+            metric that decides the ladder, and per the routine's own governing metric a faster model that
+            fails more tasks is not an improvement. This is a Mummu-side port ordering input, and the tier
+            list the P14 "8 GB tier" eval item should enumerate. Sources:
+            [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5),
+            [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B).
       - [ ] *(research 2026-07-13)* **VRAM footnote for the 8GB default:** the stock Ollama pull of Qwen3.5-9B
             **bundles a vision encoder that inflates VRAM** — for Nanna's pure-text local tier, pull the
             **text-only GGUF (Unsloth)**; at **Q4_K_M ≈ 6 GB** it stays entirely on-GPU across all context sizes
@@ -1291,6 +1341,44 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      - [ ] *(research 2026-07-24 — **corrects a load-bearing "fact"; read before picking an HNSW crate**)*
+            **The `turso` crate we already pin ships native vector SQL functions.** Both this roadmap and the
+            `daily-dev` Appendix C assert "Turso stores embeddings as f32 BLOBs and does **NO** vector search —
+            cosine is entirely in RAM after `bulk_load`". That is **false for `turso 0.6.1`**, the exact pinned
+            version. Verified by grepping the vendored crate source
+            (`~/.cargo/registry/src/*/turso_core-0.6.1`), not from a blog: it registers
+            `vector()`, `vector32`/`vector64`/`vector8`/`vector1bit`, `vector32_sparse`, `vector_extract`,
+            `vector_concat`, `vector_slice`, and **four distance functions** —
+            `vector_distance_cos` / `_dot` / `_l2` / `_jaccard`. So an **exact** k-NN can be pushed into SQL
+            (`ORDER BY vector_distance_cos(embedding, ?) LIMIT k`) instead of `bulk_load`-ing every embedding
+            into RAM — which is the actual cost driver behind the "~50k in-RAM ceiling", and it stays
+            Turso-only + pure-Rust with **zero new dependencies**.
+            **What is *not* there — do not overclaim:** there is **no dense ANN index**. `index_method/`
+            contains only `backing_btree.rs`, `fts.rs`, and `toy_vector_sparse_ivf.rs` (the name is the
+            crate's own), and there is **no `vector_top_k` and no DiskANN** — those belong to the older
+            **libSQL** fork (`libsql_vector_idx`), a different engine, so the widely-cited "Turso brings
+            native vector search" post does **not** describe this crate. Net: SQL-side exact distance is
+            available now; approximate indexing still needs an external crate (the shortlist below stands).
+            Sequence it that way — measure SQL-side exact k-NN against the current in-RAM SIMD scan on the
+            `nanna-memory::retention` harness *first*, since it is exact (no recall trade to prove) and
+            drops the RAM ceiling; only then decide whether ANN is still needed.
+      - [ ] *(research 2026-07-24)* **Deleting a memory must actually destroy its embedding — "Ghost Vectors"
+            (arXiv [2606.18497](https://arxiv.org/abs/2606.18497)).** Embeddings soft-deleted/tombstoned in an
+            HNSW store stay **physically present in the raw index files** and are invertible back to their
+            source text with a Vec2Text-class model: the authors report **25.5%** exact recovery of person
+            names and **100%** recovery of sensitive structured fields. The attack needs storage-layer access
+            (the file on disk), **not** API access — which is precisely the threat model of a local-first
+            product whose whole database sits in the user's filesystem and gets backed up. Two consequences
+            for us: **(a)** it is a hard constraint on the HNSW adoption above — `hnswlib-rs`'s `delete(key)`
+            *tombstones* (keeps the key mapping), so "delete this memory" through an ANN index would be a
+            privacy lie unless deletion also rewrites the index; **(b)** it applies to what ships **today**,
+            before any HNSW: Turso/SQLite frees a deleted row's pages to the free-list without zeroing them,
+            so a deleted memory's f32 BLOB survives on disk until overwritten. Verify what `delete_memory`
+            actually leaves behind, then close it — cheapest honest fix is `VACUUM` (or `secure_delete`) on
+            the delete path; the paper's own mitigation is **epoch key rotation** (encrypt vectors, discard
+            the key on delete — 0% recovery, ~2.5 ms per 500 records, plus a signed proof-of-deletion). Pairs
+            with the P0.2 `PRIVACY.md` "how to delete your data" claim, which must not promise more than the
+            storage layer delivers.
       - [ ] *(research 2026-07-23)* **Three pure-Rust HNSW crates to choose between** (all no-C, matching the
             dependency doctrine): **`hnswlib-rs`** decouples the graph from vector storage (`Hnsw<K, M>` owns the
             graph + an external-key→`NodeId` map, you supply a `VectorStore`) and supports **concurrent search
@@ -1510,6 +1598,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `nanna-timeline` work, which is what makes temporal queries answerable at all. Sources:
       [state of AI agent memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026),
       [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1).
+      - [ ] *(research 2026-07-24)* **The BM25 leg may need no new dependency either — `turso 0.6.1` ships an
+            FTS index method.** Same source-level check as the vector-function finding above:
+            `turso_core-0.6.1/index_method/fts.rs` (133 KB) implements `CREATE INDEX ... USING fts (...)`
+            with a Tantivy-derived tokenizer for both query and text. Caveat, checked rather than assumed:
+            **no BM25 scoring in it** (zero `bm25` references), so it gives the *lexical matching* half, not
+            the ranking function — BM25 term weights would still be ours to compute over the FTS candidate
+            set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
+            This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
+            (tool descriptions currently need literal keywords because there is no lexical search at all).
 - [ ] *(research 2026-07-23)* **Episodic→semantic promotion is still manual almost everywhere — an opening.**
       The survey's own example is ours: repeated episodic records ("user corrected the date format", on five
       different days) should graduate into one semantic fact ("user prefers DD/MM/YYYY"), but in current systems

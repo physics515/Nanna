@@ -5,7 +5,7 @@
     </NuxtLayout>
   </ErrorBoundary>
   <ConfirmDialog />
-  <UiSonnerSonner />
+  <UiSonner />
 </template>
 
 <style>
