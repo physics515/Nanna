@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.8",
+  version: "0.1.9",
   output: "context",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
@@ -99,27 +99,11 @@ export default {
     }
 
     if (!input.force) {
-      // HARD RAIL (round-10 lesson): while a parked draft exists, further
-      // whole-file writes to that path are BLOCKED. Advice alone did not
-      // stop the regeneration reflex (10+ parks, zero repairs); with the
-      // rail, repairing the draft — or explicitly clearing it — is the
-      // only way forward, so convergence is structural.
-      var railBufPath = filePath + ".__buffer__";
-      var railParked = null;
-      try {
-        railParked = Nanna.readFile(railBufPath);
-      } catch (eRail) {
-        // No parked draft.
-      }
-      if (railParked !== null && railParked !== undefined && railParked !== "") {
-        return fail("WRITE BLOCKED — a parked draft for " + filePath + " already exists at " + railBufPath + " (" + railParked.length + " chars). Do NOT regenerate. Repair THAT draft: edit_file(file_path=\"" + railBufPath + "\", old_string=<the broken line>, new_string=<the fix>), then file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). To abandon the draft first: file_buffer(action=\"clear\", file_path=\"" + filePath + "\").");
-      }
-
       // Versioned-copy REFUSAL (observed live: models fork foo.py.new2,
       // new_foo.py, foo_fixed_v1.txt instead of fixing the real file, then
       // lose track of which copy is real — an advisory did not stop it).
       var baseName = filePath.split("\\").join("/").split("/").pop().toLowerCase();
-      var copyMarkers = [".new", "_v1", "_v2", "_v3", "_v4", "_v5", "_fixed", "_backup", "_temp", "_copy", "_part", "_old", "_final", "_clean", "_scrubbed"];
+      var copyMarkers = [".new", "_v1", "_v2", "_v3", "_v4", "_v5", "_fixed", "_backup", "_temp", "_copy", "_part", "_old", "_final", "_clean", "_scrubbed", "scratch"];
       var copyPrefixes = ["new_", "copy_", "old_", "temp_", "backup_"];
       var copyHit = null;
       for (var m = 0; m < copyMarkers.length; m++) {
@@ -134,13 +118,43 @@ export default {
         return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite is always accepted).");
       }
 
+      // VALID CONTENT ALWAYS WINS (round-13 lesson): the earlier rail
+      // blocked whole-file writes whenever a parked draft existed — even
+      // when the new content was perfectly valid, bouncing the model's one
+      // reliable move (fresh generation) and wedging it between an empty
+      // real file and a draft it would not repair. Order is now: check
+      // validity FIRST; a parsing .py write is accepted outright and any
+      // stale draft/markers are swept; only INVALID content meets the
+      // park/rail machinery.
+      var syntaxDetail = pythonSyntaxRefusal(filePath, fileContent);
+      if (syntaxDetail === null) {
+        var sweepBufPath = filePath + ".__buffer__";
+        try {
+          Nanna.exec("rm -f '" + sweepBufPath + "' '" + filePath + ".__cleared__' '" + sweepBufPath + ".__cleared__'", null, 15);
+        } catch (eSweep) {
+          // Stale draft leftovers are harmless.
+        }
+      } else {
+        // Existing parked draft + ANOTHER invalid regeneration: keep the
+        // parked draft authoritative and steer to the repair loop.
+        var railBufPath = filePath + ".__buffer__";
+        var railParked = null;
+        try {
+          railParked = Nanna.readFile(railBufPath);
+        } catch (eRail) {
+          // No parked draft.
+        }
+        if (railParked !== null && railParked !== undefined && railParked !== "") {
+          return fail("WRITE BLOCKED — this content has a SYNTAX ERROR (" + syntaxDetail + ") and a parked draft for " + filePath + " already exists at " + railBufPath + " (" + railParked.length + " chars). Repair THAT draft: edit_file(file_path=\"" + railBufPath + "\", old_string=<the broken line>, new_string=<the fix>), then file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). A fully VALID rewrite of " + filePath + " would also be accepted.");
+        }
+      }
+
       // Draft PARKING (round-8 lesson): refusing a broken whole-file write
       // outright sends the model into a regeneration lottery — each retry
       // regenerates everything and rolls new errors (observed live: 21
       // refusals, every one a different line). Instead the rejected draft
       // is SAVED to the buffer beside the target, where the model repairs
       // the one named error with a small edit_file delta and commits.
-      var syntaxDetail = pythonSyntaxRefusal(filePath, fileContent);
       if (syntaxDetail) {
         var parkPath = filePath + ".__buffer__";
         var parked = false;
