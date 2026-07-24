@@ -157,7 +157,8 @@ async function confirmClearMemories() {
   if (!confirmed) return
 
   try {
-    await invoke('clear_all_memories')
+    // No scope = every scope, which is what "Delete All Memories" promises.
+    await invoke('clear_memories')
     showToast('All memories cleared', 'success')
     await loadMemoryStats()
   } catch (e: any) {

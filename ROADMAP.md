@@ -677,6 +677,33 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             `BUG_BASH_GUI_UX.md`. **Confirm in the real Tauri shell before calling it a product bug** — if
             it reproduces there, Mod+K has never worked for users and the palette is unreachable by its
             advertised shortcut.
+      *(2026-07-24)* **Third instance of the family, and the worst one: Settings → Data's "Delete All
+      Memories" invoked a Tauri command that has never existed.** `SettingsDataTab.vue` called
+      `invoke('clear_all_memories')`; there is **no `#[tauri::command]` of that name anywhere**. The
+      call rejects at runtime with "Command not found", the site catches it into a toast — and until the
+      toaster fix above, that toast never rendered. So the user confirmed a destructive dialog and
+      **nothing happened, silently**, with no memories deleted and no error shown. The real command is
+      `clear_memories` (no scope = every scope, which is what the button promises); `memory.rs`'s own
+      doc comment asserted `clear_all_memories` "was never called, so the button was dead" — that note
+      was itself wrong, Settings → Data was still calling it, and it is corrected in place.
+      Also removed: two `invoke('update_setting', …)` **fallbacks** in `SettingsMemoryTab.vue` for a
+      command that likewise does not exist. They were worse than dead — wrapped around
+      `set_max_compression_ratio` / `set_min_remaining_memories`, they swallowed the *real* failure and
+      replaced it with "Command update_setting not found", so a genuine error reached the user as
+      nonsense. The primaries exist and are registered; the fallbacks are gone.
+      **Guarded by `tests/unit/invokeCommands.spec.ts`**, which checks every `invoke('name')` across the
+      frontend against the `tauri::generate_handler![…]` list — the right authority, since a
+      `#[tauri::command]` that is *defined but not registered* is equally unreachable. Bracket-matched
+      parse (the list spans hundreds of lines and contains comments), depth/count-bounded file walk, and
+      the same non-empty-registry assertion so it cannot pass vacuously. Reverting the fixes reproduces
+      exactly the three failures. Full sweep result: **132 distinct `invoke()` names, 172 registered
+      commands, and after this fix zero unregistered calls.**
+      - [ ] **42 registered commands are never invoked from the frontend** — dead or daemon-only IPC
+            surface (`apply_memory_updates`, `save_memories`, `spawn_sub_session`, `send_to_sub_session`,
+            `kill_sub_session`, `list_sub_sessions`, `get_workspace_context`, `create_skill`/
+            `update_skill`/`delete_skill`/`list_skills`, `test_all_channels`, `clear_rate_limit`, …).
+            Each is either a feature with no UI or a leftover; triage into "wire up" vs "delete" rather
+            than leaving an unaudited command surface exposed to the webview.
       **Negative result worth not re-deriving:** the same audit was extended to the sibling failure mode
       — a `@handler` bound to an event the child never emits, which also fails silently — by checking
       every PascalCase component tag's listeners against the callee's `defineEmits` (allowing native

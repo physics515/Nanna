@@ -436,8 +436,10 @@ pub async fn update_memory(
 /// Clear memories in a scope. "global" clears global-only; a workspace id
 /// clears ONLY that workspace's entries (never the globals its tab also
 /// displays — destructive ops stay conservative); no scope clears all.
-/// (This is the command the memory page actually invokes — the old
-/// `clear_all_memories` name was never called, so the button was dead.)
+/// (This is the command the memory page invokes. The old `clear_all_memories`
+/// name never existed as a command — and the note here claiming nothing called
+/// it was wrong: Settings → Data still invoked it until 2026-07-24, so its
+/// "Delete All Memories" button was dead. Both call sites now use this one.)
 #[tauri::command]
 pub async fn clear_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
