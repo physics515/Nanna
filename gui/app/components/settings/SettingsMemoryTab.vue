@@ -140,12 +140,7 @@ async function setDreamingEnabled(enabled: boolean) {
 
 async function setMaxCompressionRatio(value: number) {
   try {
-    // Prefer dedicated command; fall back to generic setting write.
-    try {
-      await invoke('set_max_compression_ratio', { ratio: value })
-    } catch {
-      await invoke('update_setting', { key: 'max_compression_ratio', value: String(value) })
-    }
+    await invoke('set_max_compression_ratio', { ratio: value })
     if (settings.value) settings.value.max_compression_ratio = value
   } catch (e: any) {
     showToast(`Could not update compression: ${e.message || e}`, 'error')
@@ -154,11 +149,7 @@ async function setMaxCompressionRatio(value: number) {
 
 async function setMinRemainingMemories(value: number) {
   try {
-    try {
-      await invoke('set_min_remaining_memories', { count: value })
-    } catch {
-      await invoke('update_setting', { key: 'min_remaining_memories', value: String(value) })
-    }
+    await invoke('set_min_remaining_memories', { count: value })
     if (settings.value) settings.value.min_remaining_memories = value
   } catch (e: any) {
     showToast(`Could not update memory floor: ${e.message || e}`, 'error')

@@ -24,7 +24,8 @@ Rolling list of open polish. Promote closed items into ROADMAP dated `[x]` lines
 
 ## Open
 - Formal **1280×720 / 1440×900** clipped-CTA visual pass (manual; VirtualList helps long lists but does not replace the viewport audit)
-- Command **palette polish**: fuzzy ranking, recent-commands, tool invoke shortcuts
+- Command **palette polish**: ~~fuzzy ranking~~ *(done 2026-07-24 — `subsequenceScore`)*, recent-commands, tool invoke shortcuts
+- **Command palette does not open from Mod+K in the Playwright dev shell** — needs confirming in the real Tauri shell before it counts as a product bug. On `/logs`, neither `page.keyboard.press('Control+k' | 'Meta+k' | 'ControlOrMeta+k')` nor a synthetic `window.dispatchEvent(new KeyboardEvent('keydown', {key:'k', ctrlKey:true}))` produces a `.cmdk-root`, with no console error and `document.activeElement === BODY`. Reading the code, it should work: `useShortcuts().bind` is called at `default.vue` setup (top level, no preceding top-level `await`), `registerShortcut` calls `ensureListen()` immediately, `matches()` accepts `mod` for either Ctrl or Meta, the binding sets `allowInInput: true`, and `useCommandPalette` is a module-level singleton the layout binds via `:open`. So either registration is not happening in this environment or the toggle is not reaching the render — worth an instrumented run rather than another guess.
 - Channel wizard bulk/multi-step validation still uneven vs single-field ApiKeyInput
 - Windows `node_modules` / vitest file-lock flakiness under concurrent test runs
 - **Onboarding**: health step uses `get_backend_status` only — does not yet validate a model is pulled (Ollama) or a cloud key works end-to-end (P0.1 remainder)
@@ -36,7 +37,7 @@ Rolling list of open polish. Promote closed items into ROADMAP dated `[x]` lines
 - **[mitigated] Nuxt generate ENOENT on `dist/client/manifest.json`** — dual client Vite passes + artifacts under `node_modules/.cache/nuxt/.nuxt` raced mid-generate (`ELIFECYCLE` exit 1 while nitro kept prerendering). Mitigations: pin `buildDir: '.nuxt'`, drop crawlLinks prerender to `/` only, and wipe `.nuxt` + `node_modules/.cache/nuxt` before every `pnpm generate` (`scripts/clean-nuxt-cache.mjs`). *Still watch for dual "Building client..." lines after a cold wipe — if they reappear the root is Nuxt 4 running two vite client envs concurrently.*
 - **Clippy noise:** unused `README_FILE` import in `nanna-workspace::manager` (production import) — scoped to `#[cfg(test)]`.
 - **Monaco chunk size** — `DIJMKxcW.js` ~4 MB minified; deferred under GUI backlog (lazy-load Monaco).
-- **Dynamic+static import of `@tauri-apps/api/window`** — TitleBar/default.vue dynamic import unused because `useCloseHandler` already static-imports it. Collapse to one style.
+- **[fixed 2026-07-24] Dynamic+static import of `@tauri-apps/api/window`** — TitleBar/default.vue dynamic import unused because `useCloseHandler` already static-imports it. Collapsed to static in both (`ssr: false`, so there was never an SSR reason for the dynamic form). Also renamed `const window = getCurrentWindow()` in `default.vue`'s mount hook to `appWindow` — it shadowed the global `window`.
 
 ## Regressions to watch
 - Do not splice script/composables mid-`interface` in SFCs (broke `nuxt generate` post-#58)

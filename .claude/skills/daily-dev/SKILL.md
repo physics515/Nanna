@@ -237,7 +237,18 @@ retrievability × importance is the consolidation signal and the natural DSP kee
 **Dreaming today:** `MemoryService::consolidate()` runs on a fixed hourly cron over an O(N²) greedy
 clusterer; the richer feedback-driven `DreamingService`/`nanna-core::DreamingRuntime` is dead code
 (P13 unifies them). `IngestAction::Update` falls back to create (no true merge yet). Turso stores
-embeddings as f32 BLOBs and does NO vector search — cosine is entirely in RAM after `bulk_load`.
+embeddings as f32 BLOBs and Nanna's cosine is entirely in RAM after `bulk_load`.
+**Corrected 2026-07-24 — the old "Turso does NO vector search" line was wrong.** The pinned
+`turso 0.6.1` *does* ship vector SQL: `vector32/64/8/1bit`, `vector32_sparse`, `vector_extract`,
+`vector_concat`, `vector_slice`, and `vector_distance_cos/_dot/_l2/_jaccard`. Proven end to end,
+not just read from source — `crates/nanna-storage/tests/vector_functions.rs` asserts cosine
+identity/orthogonal/opposite/scale-invariance, correct `ORDER BY` k-NN ranking, and vector
+round-trip through the real dependency. So *Nanna* does no SQL-side vector search; *Turso* can.
+What 0.6.1 has **no** dense ANN index (`index_method/` = btree + FTS + a self-described "toy"
+sparse IVF), and **no `vector_top_k`/DiskANN** — those belong to the older **libSQL** fork
+(`libsql_vector_idx`), a different engine, so the much-cited "Turso brings native vector search"
+post does not describe this crate. Net: exact SQL-side k-NN is available with zero new deps;
+approximate indexing still needs an external crate.
 
 **DSP integration (P13):** lift the **pure** functions `database::compression::algorithm::simplify_with_aggressiveness`
 + `simplify_by_slope_change` + `splimes::auto_interpolate` (extrema-preserving, lossy-analytical) as the

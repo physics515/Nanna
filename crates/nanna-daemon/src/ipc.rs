@@ -40,11 +40,19 @@ pub struct IpcServerConfig {
     pub max_connections: usize,
 }
 
+/// The WebSocket IPC port every client is expected to reach the daemon on.
+///
+/// One definition on purpose: this used to be a literal repeated across the daemon, the CLI and
+/// the docs, and the copies drifted — `nanna daemon start` defaulted to `9999` while
+/// `nanna daemon status`, the GUI sidecar and the README all used `5149`, so a CLI-started daemon
+/// reported itself as not running.
+pub const DEFAULT_IPC_PORT: u16 = 5149;
+
 impl Default for IpcServerConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),
-            port: 5149,
+            host: nanna_config::bind::LOOPBACK_HOST.to_string(),
+            port: DEFAULT_IPC_PORT,
             max_connections: 100,
         }
     }

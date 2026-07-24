@@ -22,7 +22,7 @@ function onFocusOut() {
 </script>
 
 <template>
-  <GroundGlass
+  <UiGroundGlass
     ref="glassRef"
     class="glass-input"
     :class="{ 'glass-input--disabled': disabled }"
@@ -37,7 +37,7 @@ function onFocusOut() {
       :placeholder="placeholder"
       :disabled="disabled"
     >
-  </GroundGlass>
+  </UiGroundGlass>
 </template>
 
 <style scoped>

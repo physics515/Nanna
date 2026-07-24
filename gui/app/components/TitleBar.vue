@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, inject, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Bell } from 'lucide-vue-next'
 import { useGroundGlass } from '~/composables/useGroundGlass'
 
@@ -126,7 +127,6 @@ function manageWorkspaces() {
 }
 
 onMounted(async () => {
-  const { getCurrentWindow } = await import('@tauri-apps/api/window')
   appWindow = getCurrentWindow()
   maximized.value = await appWindow.isMaximized()
   document.addEventListener('click', closeDropdown)

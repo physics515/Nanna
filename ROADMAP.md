@@ -8,7 +8,19 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-23 (**P13 dreaming unification** — both daemon paths now dream through one
+**Last updated:** 2026-07-24 (**silent-failure sweep + two P1 correctness fixes**. Three bugs of one
+family, each of which failed without ever telling anyone: `<UiSonnerSonner/>` never resolved so the
+toaster never mounted and **every toast in the app was dropped**; `<GroundGlass>` likewise, so glass
+inputs lost their slab; and Settings → Data's **"Delete All Memories" invoked a Tauri command that has
+never existed** — confirm the dialog, nothing happens. All three now have static guards (component
+names vs the Nuxt registry, `invoke()` names vs `generate_handler!`, `UiInput`'s `size` prop) plus an
+e2e that a toast really renders. Verified in the **real Tauri shell over WebDriver**. Also: onboarding
+checked only `ANTHROPIC_API_KEY` — an **Ollama-only install was nagged for a cloud key**; the daemon IPC
+port disagreed with itself (**start bound 9999, status probed 5149**); devtools shipped in release
+builds; `.claude/settings.local.json` was tracked in a public repo. **Toolchain pinned** —
+nightly 2026-07-23 ICEs on release codegen of `tokio`. **Turso 0.6.1 does have SQL vector distance**,
+proven by test — a long-standing roadmap "fact" was wrong.)
+Prior: 2026-07-23 (**P13 dreaming unification** — both daemon paths now dream through one
 `DreamingService`, which restored the **inert testing effect** and closed an unbounded `pending_updates`
 queue; new **no-LLM dedup phase (b)** folds true restatements in every band incl. `Detailed`
 (summarizer calls 6 → 0 at unchanged 0.90 compression / 1.000 recall); scheduled dreaming gained
@@ -277,7 +289,13 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 #### P0.3 - Code Quality & CI
 - [ ] Add GitHub Actions workflow: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, cargo test --workspace --all-features, cargo test --no-run smoke check.
 - [ ]  Add cargo audit and cargo deny to CI.
-- [ ]  Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
+- [~]  Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
+       *(2026-07-24)* **`vue-tsc` is now an enforced gate, not advisory.** It ran with
+       `continue-on-error: true` since the workflow landed, which makes a typecheck step decorative — it
+       reports and nobody is blocked. Measured before flipping it: `pnpm exec vue-tsc --noEmit` exits **0
+       with 0 errors** across the whole frontend, so there is no pre-existing debt to grandfather and any
+       future error is a genuine regression. `continue-on-error` removed. Still open on this item:
+       `pnpm audit` and a Tauri build smoke test in CI.
 - [ ]  Add Tauri packaging CI producing signed artifacts per OS.
 - [ ]  Add end-to-end daemon test: start → connect → conversation → persistence → fallback → reconnect.
 - [ ]  Add gitleaks/trufflehog secret-scan step to CI.
@@ -307,15 +325,56 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Onboarding writes API keys to plaintext config.toml (src/onboarding.rs), even though a SecureStore using OS keyring exists. The OS keychain should be the default path; TOML config should store only non-secret settings.
 - [ ] SecureStore file fallback is plaintext JSON (mode 0600), not encrypted — the module comment misleadingly says "encrypted file storage." Fix the comment or implement real AES-GCM encryption with an OS-protected key.
 - [ ] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
-- [ ] Onboarding has_api_key only checks config.llm.api_key or ANTHROPIC_API_KEY, ignoring OpenAI/OpenRouter keys. quick_setup specifically asks for an Anthropic key despite multi-provider support — broken first-run for non-Anthropic users.
+- [x] Onboarding has_api_key only checks config.llm.api_key or ANTHROPIC_API_KEY, ignoring OpenAI/OpenRouter keys. quick_setup specifically asks for an Anthropic key despite multi-provider support — broken first-run for non-Anthropic users.
+      *(2026-07-24)* **Fixed — it now checks the variable for the *selected* provider.** The old check
+      was `api_key.is_some() || env::var("ANTHROPIC_API_KEY").is_ok()`, so an OpenAI or OpenRouter user
+      with their key exported was told it was **missing** and re-prompted by `ensure_api_key` on *every*
+      launch, while `nanna status` reported "API Key: missing". **Worse for the North Star: `ollama`
+      is a real `llm.provider` value, and a fully-local install was nagged for a credential Ollama has
+      no concept of** — the intended default experience blocked on a cloud key.
+      New `provider_api_key_env(provider)` returns `None` for `ollama` (no key needed → configured) and
+      the right variable for `openai` / `openrouter` / `anthropic`; an **unrecognised** provider still
+      falls back to `ANTHROPIC_API_KEY`, so an unknown setup is never silently declared configured.
+      The same helper now feeds `configure_llm`'s prompt — it had a **duplicate** copy of that mapping,
+      which is how a prompt could name a different variable than the check consulted. `quick_setup` no
+      longer hardcodes "Enter your Anthropic API key" / "Set ANTHROPIC_API_KEY"; both name the
+      configured provider and its variable. Blank is not a credential: an exported-but-empty
+      `OPENAI_API_KEY` (or a whitespace `api_key`) reads as unconfigured rather than as a valid key.
+      The decision logic is a **pure** `has_api_key_with(provider, configured_key, read_env)` taking an
+      environment reader, so its 8 tests never mutate process-global env (unsound under a parallel test
+      runner): per-provider variable mapping, ollama-needs-none, unknown→anthropic, the selected
+      provider's variable satisfying the check, **another** provider's variable *not* satisfying it,
+      explicit key beating the environment, blank/whitespace rejection, and missing→unconfigured.
+      8/8 green, clippy clean (0 warnings on the touched file).
 - [ ] Tauri CSP is set to null in gui/src-tauri/tauri.conf.json — not acceptable for a desktop app rendering model output and markdown.
-- [ ] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
+- [x] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
+      *(2026-07-24)* **Removed from `default`.** `default = ["custom-protocol", "devtools"]` meant every
+      release build shipped the webview inspector on an app that renders model output and untrusted
+      markdown. Nothing in `src-tauri/src` references devtools — it was purely the feature flag — and
+      Tauri turns devtools on automatically under `debug_assertions`, so **`tauri dev` is unaffected**;
+      the feature is kept for a deliberate `--features devtools` release build. Verified by a real
+      release rebuild of `nanna-gui` (exit 0, 6m32s).
 - [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
 - [~] ROADMAP explicitly lists open items: ~~disabled tools still execute~~ **(done 2026-07-20 — `ToolPolicy` gate, P6)**, ~~deleted tools remain callable until restart~~ **(done 2026-07-17 — `unregister` wiring)**, ~~delete_skill needs hardening against remove_dir_all/symlink races~~ **(done — symlink + canonical-escape guards in `commands/tools.rs`)**, stronger sandboxing needed *(open — OS-level sandbox under the policy layer; see research note below)*.
 - [x] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
       *(2026-07-23)* Fixed together with the webhook receiver — see the "Bind local services to localhost
       by default" item below.
-- [ ] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
+- [x] Port inconsistencies: README says daemon IPC is 5149, but src/main.rs daemon start defaults to 9999, and daemon status checks 5149. Must be unified and documented.
+      *(2026-07-24)* **Unified on 5149 behind one exported constant.** This was not cosmetic: `nanna
+      daemon start` bound **9999** while `nanna daemon status` / `stop` connected to a hardcoded
+      `ws://127.0.0.1:5149` and the GUI sidecar used 5149 too — so a CLI-started daemon **reported
+      itself as not running**, and the GUI could not see it either. New
+      `nanna_daemon::DEFAULT_IPC_PORT` (5149) is the single definition, exported from the crate and
+      used by `IpcServerConfig::default()`, all three root-CLI `--port` defaults (`--port` global,
+      `daemon start`, `daemon restart`), the `nanna-daemon` binary's own `--port`, and the address
+      `daemon status` probes — which is now *built* from the constant instead of being a literal, so
+      status can never probe a port different from the one start binds. The matching `--host` defaults
+      switched from literal `"127.0.0.1"` to the existing `nanna_config::bind::LOOPBACK_HOST`, and
+      `--health-port` to the already-exported `DEFAULT_HEALTH_PORT`.
+      **Verified against the real binaries, not just the source:** `nanna daemon start --help` now
+      prints `--port <PORT> ... [default: 5149]` (was 9999) and `nanna-daemon --help` agrees. README's
+      documented `5148`/`5149` was already correct and needed no change. 75 daemon tests + 8 bin tests
+      green, clippy clean.
 - [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
 - [ ] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
 - [ ] No SECURITY.md or vulnerability disclosure process.
@@ -359,7 +418,18 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
 - [ ] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
-- [ ] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
+- [x] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
+      *(2026-07-24)* **Untracked and gitignored.** It was committed in a **public** repo carrying 77 lines
+      of Claude Code permission allowances — including `Bash(curl:*)`, `Bash(taskkill:*)`,
+      `Bash(del /F …)` and several `Get-Process … | Stop-Process -Force` one-liners — plus absolute
+      machine paths still pointing at the repo's **old** name (`D:\Development\clawdbot-rs`). By
+      convention `settings.local.json` *is* the personal override (`settings.json` is the shared one, and
+      this repo has none), so anyone cloning inherited a pre-approved allowlist for network fetches and
+      process kills. Removed from the index with `git rm --cached` — the file stays on disk — and added
+      to `.gitignore`.
+      ⚠️ **Before merging: keep a copy of your local `.claude/settings.local.json`.** Untracking is a
+      deletion as far as git is concerned, so merging this removes the file from any working tree that
+      has it. Restore it afterwards (it is ignored now, so it will stay put from then on).
 - [ ] Add SECURITY.md with vulnerability disclosure process.
 - [ ] Enable GitHub secret scanning and Dependabot.
 - [ ] Claude UI Testing automations
@@ -616,7 +686,7 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       other pages but not this one. Added `const loadError = ref<string | null>(null)` alongside the
       other refs, matching `model-stats`/`memory`/`tools`. The `e2e/page-smoke.spec.ts` suite was already
       catching this — 12/12 green after the fix.
-- [ ] *(2026-07-23)* **`<UiSonnerSonner />` fails to resolve at runtime — toasts may never render.**
+- [x] *(2026-07-23)* **`<UiSonnerSonner />` fails to resolve at runtime — toasts may never render.**
       Every Playwright page load logs `[Vue warn]: Failed to resolve component: UiSonnerSonner` from
       `app.vue`, on **both** this branch and pristine `origin/master`, so it is pre-existing and not a
       dep-bump fallout. The component *does* exist (`app/components/ui/sonner/Sonner.vue`) and the
@@ -624,9 +694,127 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       load rather than being misnamed — e.g. the `vue-sonner` import throwing. Worth chasing because the
       failure is silent and the blast radius is real: `useToast` drives success/error feedback for copy,
       save, delete and clear across the app (P4 "Toasts & destructive confirms"), so if the toaster never
-      mounts, none of that feedback reaches the user. Check whether `useToast` renders through this
-      component or an independent path, then fix or delete it. Cross-check against the deferred
-      `vue-sonner 1 → 2` major.
+      mounts, none of that feedback reaches the user.
+      *(2026-07-24)* **Fixed — and it was the name after all.** The 2026-07-23 read ("the auto-import name
+      looks correct… likely the import throwing") was wrong. Nuxt **collapses a filename that repeats its
+      parent directory**, so `app/components/ui/sonner/Sonner.vue` registers as **`UiSonner`**, not
+      `UiSonnerSonner`. Settled from the generated registry rather than by inspection —
+      `.nuxt/components.d.ts` contains exactly `export const UiSonner`. The tag therefore resolved to
+      nothing, the `<Toaster>` never mounted, and every `useToast()` call was dropped: `toast.*` pushed
+      into vue-sonner's store with no renderer subscribed. One-word fix in `app.vue`. **Unrelated to the
+      deferred `vue-sonner 1 → 2` major** — that cross-check is closed.
+      **A second, identical bug fell out of the same audit:** `ui/glass-input/GlassInput.vue` wrapped its
+      field in `<GroundGlass>`, which registers as **`UiGroundGlass`** (same directory-repeat rule). It
+      rendered as an inert unknown element, so the glass slab — borders, mesh gradient, noise overlay —
+      never drew, and `glassRef.value?.onEnter()` silently no-opped because the template ref pointed at a
+      DOM node instead of the component (the `?.` swallowed it). Used by `pages/workspaces.vue`.
+      **Guarded two ways, each proven to fail without the fix:**
+      **(1)** `tests/unit/componentResolution.spec.ts` — walks all **91** `.vue` files under `app/` and
+      checks every PascalCase template tag against the **203** names in `.nuxt/components.d.ts`, allowing
+      Vue built-ins and names the file imports or declares itself. Zero false positives across the tree;
+      reverting either fix reproduces exactly the two failures. It asserts the registry is non-empty and
+      contains a known component first, so a registry that silently read as empty cannot make it pass
+      vacuously. (`nuxt prepare` runs from `postinstall`, so CI has the registry after `pnpm install`.)
+      **(2)** `e2e/toaster.spec.ts` — clicks Copy all on `/logs` and asserts a `[data-sonner-toast]`
+      actually renders. **Note for anyone tempted to assert on the Vue warning instead: you can't.**
+      A first attempt did, and it **passed with the bug still present** — the warning is emitted by the
+      dev server's render pass, never into the browser console, so a Playwright console listener never
+      sees it. That test was deleted rather than kept as false assurance. Also recorded: the glass buttons
+      animate their mesh forever, so Playwright's stability check never settles — assert
+      visible+enabled, then `click({ force: true })`.
+      Verified: 60/60 vitest, 26/26 Playwright (the 27th is the pre-existing flaky session test below).
+      *(2026-07-24)* **Command palette gained a fuzzy tier — `subsequenceScore` in `lib/commandPalette.ts`.**
+      `filterActions` was substring-only, so the way people actually type into a palette (`mstats`,
+      `tglogs`, `nchat`) returned **nothing at all**. It now falls through to a subsequence match over the
+      label and keywords, scored to reward consecutive runs and word-boundary landings, and **capped at 25
+      — strictly below the weakest literal tier (group = 30)** — so fuzzy can only *add* results a literal
+      search missed, never reorder ones it found. Two guards against the noise that makes naive fuzzy
+      palettes feel broken: a query must be ≥2 characters, and must land on at least one word boundary
+      (`oe` is a genuine subsequence of half the list). Raw score is normalised against the best attainable
+      score for the query length so long labels cannot outrank short ones on length alone.
+      Fixed in passing: the tier chain tested `group` **before** `keywords`, so an action whose keyword
+      matched exactly scored 30 instead of 40 — keywords now come first.
+      10 new tests (non-subsequence, single-char, no-boundary rejection; word-initial scoring; consecutive
+      beats scattered; the ≤25 ceiling; the three fuzzy queries above resolving; literal-first ranking;
+      keyword-over-group). All **8 pre-existing tests pass unchanged**, which is the point — ranking
+      behaviour is preserved. 75/75 vitest.
+      - [ ] **Not shipped with it: the planned e2e.** The palette **would not open from Mod+K in the
+            Playwright dev shell** — not via `keyboard.press` (`Control+k` / `Meta+k` / `ControlOrMeta+k`)
+            and not via a synthetic `window` `keydown`, with no console error. The code reads correct
+            (registration at layout setup with no preceding top-level `await`, `mod` matches Ctrl *or*
+            Meta, `allowInInput: true`, module-singleton state bound through `:open`). Rather than ship an
+            e2e that passes for the wrong reason, it was dropped and the observation logged in
+            `BUG_BASH_GUI_UX.md`. **Confirm in the real Tauri shell before calling it a product bug** — if
+            it reproduces there, Mod+K has never worked for users and the palette is unreachable by its
+            advertised shortcut.
+      *(2026-07-24)* **Third instance of the family, and the worst one: Settings → Data's "Delete All
+      Memories" invoked a Tauri command that has never existed.** `SettingsDataTab.vue` called
+      `invoke('clear_all_memories')`; there is **no `#[tauri::command]` of that name anywhere**. The
+      call rejects at runtime with "Command not found", the site catches it into a toast — and until the
+      toaster fix above, that toast never rendered. So the user confirmed a destructive dialog and
+      **nothing happened, silently**, with no memories deleted and no error shown. The real command is
+      `clear_memories` (no scope = every scope, which is what the button promises); `memory.rs`'s own
+      doc comment asserted `clear_all_memories` "was never called, so the button was dead" — that note
+      was itself wrong, Settings → Data was still calling it, and it is corrected in place.
+      Also removed: two `invoke('update_setting', …)` **fallbacks** in `SettingsMemoryTab.vue` for a
+      command that likewise does not exist. They were worse than dead — wrapped around
+      `set_max_compression_ratio` / `set_min_remaining_memories`, they swallowed the *real* failure and
+      replaced it with "Command update_setting not found", so a genuine error reached the user as
+      nonsense. The primaries exist and are registered; the fallbacks are gone.
+      **Guarded by `tests/unit/invokeCommands.spec.ts`**, which checks every `invoke('name')` across the
+      frontend against the `tauri::generate_handler![…]` list — the right authority, since a
+      `#[tauri::command]` that is *defined but not registered* is equally unreachable. Bracket-matched
+      parse (the list spans hundreds of lines and contains comments), depth/count-bounded file walk, and
+      the same non-empty-registry assertion so it cannot pass vacuously. Reverting the fixes reproduces
+      exactly the three failures. Full sweep result: **132 distinct `invoke()` names, 172 registered
+      commands, and after this fix zero unregistered calls.**
+      - [ ] **42 registered commands are never invoked from the frontend** — dead or daemon-only IPC
+            surface (`apply_memory_updates`, `save_memories`, `spawn_sub_session`, `send_to_sub_session`,
+            `kill_sub_session`, `list_sub_sessions`, `get_workspace_context`, `create_skill`/
+            `update_skill`/`delete_skill`/`list_skills`, `test_all_channels`, `clear_rate_limit`, …).
+            Each is either a feature with no UI or a leftover; triage into "wire up" vs "delete" rather
+            than leaving an unaudited command surface exposed to the webview.
+      *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,
+      `nanna-gui.exe` 16 MB, built under the pinned toolchain): `document.title === "Nanna"`, `#__nuxt`
+      attached, `typeof window.__TAURI_INTERNALS__ === "object"` (so this is the real IPC shell, not the
+      browser dev shell), **`[data-sonner-toaster]` count = 1** — the toaster genuinely mounts — and
+      **zero** `<uisonnersonner>` / `<groundglass>` inert elements, i.e. both resolution fixes hold in the
+      packaged app. Screenshot kept with the run.
+      - [ ] **Hazard in the shared WebDriver harness — it kills by process *name*.**
+            `_shared/tauri-webdriver.ps1`'s `Kill-Stale` does `Stop-Process -Name $names`, so `stop` killed
+            the **user's own running `nanna-gui.exe`** (`C:\Program Files\Nanna\`) alongside the
+            WebDriver-launched one. No data loss — the daemon is a separate process name, kept running, and
+            it owns the state — but an unattended run should not close the user's window. The same harness
+            backs the Utter and Laurelane routines, so this affects all of them. Fix: record the launched
+            PID in the session state file and `Stop-Process -Id` that, falling back to name-matching only
+            when the PID is gone.
+      — a `@handler` bound to an event the child never emits, which also fails silently — by checking
+      every PascalCase component tag's listeners against the callee's `defineEmits` (allowing native
+      fallthrough events, `update:*`, and kebab/camel spellings). Across the 91 files and the **25**
+      components that declare an explicit emit contract there are **zero** mismatches. That class is
+      clean; don't spend another run probing it.
+- [x] *(2026-07-24)* **`<UiInput size="sm">` forwards `size` onto the native `<input>` and the DOM rejects
+      it.** Found while verifying the component-resolution fix above; **pre-existing** — reproduced with
+      that fix stashed, so it is not fallout. `app/components/ui/input.vue` declared no `size` prop, so
+      `size` fell through as an attribute to the `<input>` element, where the HTML `size` attribute must
+      be a positive integer. Chromium therefore logged
+      `[Vue warn]: Failed setting prop "size" on <input>: value sm is invalid. IndexSizeError` on every
+      page that rendered one. Harmless to layout — the Tailwind classes did the sizing — but it is log
+      noise that trains everyone to ignore Vue warnings, which is precisely how the toaster bug survived
+      for months.
+      *(2026-07-24)* **Fixed by declaring the contract, not by deleting the call sites.** `UiInput` now
+      has a real `size` prop built with `cva` exactly like `UiButton` — same scale, so the two line up:
+      `default` `h-10 px-4 py-2 text-sm` · `sm` `h-8 px-3 text-xs` · `lg` `h-12 px-6 text-base`. The
+      default reproduces the previous appearance byte-for-byte, so the 5 existing `size="sm"` call sites
+      (`pages/tasks.vue` ×3, `pages/tools.vue` ×2) now get the small control they were always asking for
+      instead of a swallowed DOM error, and nothing else moves. Caller `class` still wins over the variant
+      via `cn`/tailwind-merge.
+      5 tests (`tests/unit/UiInput.spec.ts`): `size` never reaches the DOM element at any variant, each
+      variant maps to a distinct height, the default is `h-10`, a caller `class="h-12"` overrides `sm`,
+      and `update:modelValue` still emits. Reverting the component fails 2 of them
+      (`expected 'sm' to be undefined`). Runtime-confirmed: `/tools`, `/logs`, `/tasks` now load with
+      **zero** Vue warnings — both this one and the resolution one are gone.
+      Verified: 65/65 vitest, 26/27 Playwright (the 27th is the pre-existing flake below).
 - [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
       pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
       the current branch it fails 1). Diagnosis from the trace: the step's locator
@@ -640,6 +828,18 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
+      *(2026-07-24)* **Mixed static/dynamic import of `@tauri-apps/api/window` collapsed to static.**
+      `TitleBar.vue` and `layouts/default.vue` each did `await import('@tauri-apps/api/window')` in their
+      mount hook while `composables/useCloseHandler.ts` **statically** imports the same module — and
+      `default.vue` calls `useCloseHandler()`, so the module was already in the static graph. The dynamic
+      form bought no code-splitting (the bundler warns and inlines it anyway), only an extra `await`
+      before the window handle was available on mount. `ssr: false` in `nuxt.config.ts`, so there was
+      never an SSR reason for it either. Both are now plain static imports.
+      Fixed in passing: `default.vue`'s hook named its handle `const window = getCurrentWindow()`,
+      **shadowing the global `window`** inside an async mount callback — renamed to `appWindow`, matching
+      what `TitleBar.vue` already called it.
+      Verified: `pnpm generate` green with the mixed-import warning gone, 65/65 vitest,
+      26/27 Playwright (the 27th is the pre-existing flake).
       *(2026-07-23)* **`nuxt generate` manifest race mitigated** — dual Vite client passes were racing
       `node_modules/.cache/nuxt/.nuxt/dist/client/manifest.json` (ENOENT mid-generate while nitro still
       prerendered and Tauri packaging kept going). Pin `buildDir: '.nuxt'`, prerender `/` only
@@ -1010,6 +1210,18 @@ Qwen2.5/LFM2/MiniLM, validated on an RTX 4070 Ti SUPER 16GB).
       - [ ] *(research 2026-07-09)* Newer 2026 recommendation for the 8GB tier: **Qwen3-Coder-Next** — an 80B **MoE with only ~3B active params**, so it decodes fast (~40–60 tok/s on a 4090) yet runs Q4 on 8GB+ VRAM, and is now rated best-in-class for *long-horizon tool use + recovery from failed tool calls* (llama.cpp fixed its tool-call parser). Note the MoE/active-param split ties directly to the P12 **`--cpu-moe` expert-offload** and VRAM-budgeting items — the same architecture Nanna's local tier wants. This should become the reference default the Mummu runner targets and the `[infer]` model config points at. Sources: [unsloth Qwen3-Coder-Next](https://unsloth.ai/docs/models/qwen3-coder-next), [running 30B on 8GB VRAM](https://dev.to/upayanghosh/from-oom-to-262k-context-running-qwen3-coder-30b-locally-on-8gb-vram-1ej1).
       - [ ] *(research 2026-07-07)* Per-tier default: **8GB → Qwen 3.5-9B**, **16GB → Qwen 3.6-35B-A3B with `--cpu-moe`** (MoE expert offload — ties to the VRAM-budgeting item), **24GB → Qwen 3.6-27B dense or 35B-A3B**. Local ~7–9B models **lose coherence after 2–3 tool-chain steps** → bias toward short loops + sub-agent decomposition for the local tier (revisit the iteration cap / swarm hand-off for local models). Sources: [sitepoint 2026](https://www.sitepoint.com/best-local-llm-models-2026/), [insiderllm function-calling](https://insiderllm.com/guides/function-calling-local-llms/).
       - [ ] *(research 2026-07-12)* **Qwen3.5 GGUF ships universal chat-template fixes for tool-calling** (apply to *any* Qwen3.5 GGUF), and the Qwen3-Coder tool-call parser is now fixed across llama.cpp/Ollama/LMStudio/Jan — de-risks the "reliable tool-call parsing into `ContentBlock::ToolUse`" item for the local tier. When Mummu ports a Qwen3.5-class model, lift its chat template + tool-call grammar verbatim rather than hand-rolling. 8GB tier still wants Q4_K_S/Q4_0 (drop to Q3_K_M on OOM); Qwen3-Coder-Next's ~46GB Q4 footprint keeps it a 16GB+/CPU-offload target, not an 8GB one. Sources: [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5), [Qwen3.6 VRAM table](https://knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/).
+      - [ ] *(research 2026-07-24)* **Qwen3.5's *Small* series gives the sub-8 GB tiers a real ladder, not just
+            a quantization knob.** The family now spans **0.8B / 2B / 4B / 9B** alongside the big MoEs, all
+            with **256K context** and tool-calling, so the CPU-only and low-VRAM guardrail tiers can drop to a
+            *smaller model at a better quantization* instead of crushing the 9B to Q3_K_M (which is where
+            tool-call validity starts failing). Concretely: keep **9B** as the 8 GB default, and add **4B** as
+            the CPU-only/offline fallback and **2B** as the floor for the low-VRAM guardrail run. Do not treat
+            the sizes as interchangeable on quality — the agent-eval suite's **tool-call validity rate** is the
+            metric that decides the ladder, and per the routine's own governing metric a faster model that
+            fails more tasks is not an improvement. This is a Mummu-side port ordering input, and the tier
+            list the P14 "8 GB tier" eval item should enumerate. Sources:
+            [unsloth Qwen3.5](https://unsloth.ai/docs/models/qwen3.5),
+            [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B).
       - [ ] *(research 2026-07-13)* **VRAM footnote for the 8GB default:** the stock Ollama pull of Qwen3.5-9B
             **bundles a vision encoder that inflates VRAM** — for Nanna's pure-text local tier, pull the
             **text-only GGUF (Unsloth)**; at **Q4_K_M ≈ 6 GB** it stays entirely on-GPU across all context sizes
@@ -1291,6 +1503,56 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       (non-empty cluster in, finite scalars out). 3 unit tests (NaN/inf skipped, max+sum semantics,
       NaN-cluster survives). Removes two prod-path `unwrap`s from the consolidation path.
 - [ ] **Indexed clustering** — replace the O(N²) greedy single-pass `cluster_memories()` with HNSW/IVF candidate neighbors + connected-components/HDBSCAN over `composite_cluster_score`; scales past the ~50k in-RAM ceiling.
+      - [ ] *(research 2026-07-24 — **corrects a load-bearing "fact"; read before picking an HNSW crate**)*
+            **The `turso` crate we already pin ships native vector SQL functions.** Both this roadmap and the
+            `daily-dev` Appendix C assert "Turso stores embeddings as f32 BLOBs and does **NO** vector search —
+            cosine is entirely in RAM after `bulk_load`". That is **false for `turso 0.6.1`**, the exact pinned
+            version. Verified by grepping the vendored crate source
+            (`~/.cargo/registry/src/*/turso_core-0.6.1`), not from a blog: it registers
+            `vector()`, `vector32`/`vector64`/`vector8`/`vector1bit`, `vector32_sparse`, `vector_extract`,
+            `vector_concat`, `vector_slice`, and **four distance functions** —
+            `vector_distance_cos` / `_dot` / `_l2` / `_jaccard`. So an **exact** k-NN can be pushed into SQL
+            (`ORDER BY vector_distance_cos(embedding, ?) LIMIT k`) instead of `bulk_load`-ing every embedding
+            into RAM — which is the actual cost driver behind the "~50k in-RAM ceiling", and it stays
+            Turso-only + pure-Rust with **zero new dependencies**.
+            **What is *not* there — do not overclaim:** there is **no dense ANN index**. `index_method/`
+            contains only `backing_btree.rs`, `fts.rs`, and `toy_vector_sparse_ivf.rs` (the name is the
+            crate's own), and there is **no `vector_top_k` and no DiskANN** — those belong to the older
+            **libSQL** fork (`libsql_vector_idx`), a different engine, so the widely-cited "Turso brings
+            native vector search" post does **not** describe this crate. Net: SQL-side exact distance is
+            available now; approximate indexing still needs an external crate (the shortlist below stands).
+            Sequence it that way — measure SQL-side exact k-NN against the current in-RAM SIMD scan on the
+            `nanna-memory::retention` harness *first*, since it is exact (no recall trade to prove) and
+            drops the RAM ceiling; only then decide whether ANN is still needed.
+            *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
+            A registered SQL function is not a working one, and this decision is too load-bearing to rest
+            on a source grep, so 3 tests now assert it end to end through the pinned dependency:
+            `vector_distance_cos` returns **0** for identical, **1** for orthogonal and **2** for opposed
+            vectors and is **scale-invariant** (`[1,2,3,4]` vs `[10,20,30,40]` → 0, the property that makes
+            cosine the right metric for embeddings); `ORDER BY vector_distance_cos(embedding, ?)` over a
+            real table **ranks correctly** (the far row is the query's opposite, so a constant-returning or
+            rowid-ordered kernel could not fake the result); and a stored vector **round-trips** through
+            `vector_extract` at full dimensionality, which matters because clustering and dedup still need
+            the raw vector back. 3/3 green, clippy clean. The remaining work is the measurement, not the
+            feasibility. The corresponding false claim in the `daily-dev` Appendix C is fixed in the same
+            commit.
+      - [ ] *(research 2026-07-24)* **Deleting a memory must actually destroy its embedding — "Ghost Vectors"
+            (arXiv [2606.18497](https://arxiv.org/abs/2606.18497)).** Embeddings soft-deleted/tombstoned in an
+            HNSW store stay **physically present in the raw index files** and are invertible back to their
+            source text with a Vec2Text-class model: the authors report **25.5%** exact recovery of person
+            names and **100%** recovery of sensitive structured fields. The attack needs storage-layer access
+            (the file on disk), **not** API access — which is precisely the threat model of a local-first
+            product whose whole database sits in the user's filesystem and gets backed up. Two consequences
+            for us: **(a)** it is a hard constraint on the HNSW adoption above — `hnswlib-rs`'s `delete(key)`
+            *tombstones* (keeps the key mapping), so "delete this memory" through an ANN index would be a
+            privacy lie unless deletion also rewrites the index; **(b)** it applies to what ships **today**,
+            before any HNSW: Turso/SQLite frees a deleted row's pages to the free-list without zeroing them,
+            so a deleted memory's f32 BLOB survives on disk until overwritten. Verify what `delete_memory`
+            actually leaves behind, then close it — cheapest honest fix is `VACUUM` (or `secure_delete`) on
+            the delete path; the paper's own mitigation is **epoch key rotation** (encrypt vectors, discard
+            the key on delete — 0% recovery, ~2.5 ms per 500 records, plus a signed proof-of-deletion). Pairs
+            with the P0.2 `PRIVACY.md` "how to delete your data" claim, which must not promise more than the
+            storage layer delivers.
       - [ ] *(research 2026-07-23)* **Three pure-Rust HNSW crates to choose between** (all no-C, matching the
             dependency doctrine): **`hnswlib-rs`** decouples the graph from vector storage (`Hnsw<K, M>` owns the
             graph + an external-key→`NodeId` map, you supply a `VectorStore`) and supports **concurrent search
@@ -1510,6 +1772,15 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       `nanna-timeline` work, which is what makes temporal queries answerable at all. Sources:
       [state of AI agent memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026),
       [arXiv:2603.07670](https://arxiv.org/html/2603.07670v1).
+      - [ ] *(research 2026-07-24)* **The BM25 leg may need no new dependency either — `turso 0.6.1` ships an
+            FTS index method.** Same source-level check as the vector-function finding above:
+            `turso_core-0.6.1/index_method/fts.rs` (133 KB) implements `CREATE INDEX ... USING fts (...)`
+            with a Tantivy-derived tokenizer for both query and text. Caveat, checked rather than assumed:
+            **no BM25 scoring in it** (zero `bm25` references), so it gives the *lexical matching* half, not
+            the ranking function — BM25 term weights would still be ours to compute over the FTS candidate
+            set. Worth measuring before pulling in a search crate, since it keeps the "Turso-only" invariant.
+            This is also the cheapest path for the **tool-description keyword search** noted in P6/P11
+            (tool descriptions currently need literal keywords because there is no lexical search at all).
 - [ ] *(research 2026-07-23)* **Episodic→semantic promotion is still manual almost everywhere — an opening.**
       The survey's own example is ours: repeated episodic records ("user corrected the date format", on five
       different days) should graduate into one semantic fact ("user prefers DD/MM/YYYY"), but in current systems
@@ -2225,6 +2496,49 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      **Merge note:** this run's `nuxt 4.4.8 → 4.5.0` bump was reverted to `4.4.8` at merge,
      pending the unresolved `UiSonnerSonner` component issue logged above; its monaco 0.56
      migration is the same one described in the previous bullet.
+   - *(2026-07-24 sweep)* `cargo update` → 1 compatible bump (the boa git rev tracked `v0.4.4 → v0.4.5`).
+     `cargo upgrade --incompatible` → **two majors, both applied green**: **`base64 0.22 → 0.23`**
+     (`nanna-agent` + `nanna-gui`; the `Engine`-trait call sites in `image_util.rs` and the PKCE OAuth
+     flow compiled unchanged) and **`deno_core 0.408 → 0.409`** (`nanna-scripting`, compiled unchanged).
+     Everything else already sits at its latest req, with only the intentional `turso`/`aegis` pins and
+     the boa git rev held back. **Toolchain tracked too — then reverted; see the ICE item below:**
+     nightly `daf2e5e18 (2026-07-13)` → `89c61a754 (2026-07-23)`; the workspace was rebuilt and
+     re-tested from scratch under it — **719 tests pass, 0 failures**, clippy **0 errors**
+     (2354 pre-existing warnings). That is the **debug** profile only, and release codegen turned out
+     to be broken on it, so the toolchain bump did not survive the run.
+     *Gotcha for future runs:* `cargo-upgrade` rewrites CRLF→LF on any manifest it edits
+     (`crates/nanna-agent/Cargo.toml` came back as a 33-line whole-file diff for a one-line bump) —
+     revert and hand-edit the req instead, or the EOL churn buries the actual change.
+     Also: running `rustup update` **concurrently with a `cargo build`** fails and rolls back on Windows
+     (component files are locked) — sequence them.
+     Frontend: `pnpm outdated` showed **only documented deferred majors** (`@tiptap/* 2 → 3.28`,
+     `marked 17 → 18`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the
+     `lucide-vue-next 1.0.0` tombstone that must never be taken. `pnpm update` re-landed
+     **`nuxt 4.4.8 → 4.5.0`** (Vite 8 / Rolldown) — verified `pnpm generate` green (4 routes prerendered)
+     and 56/56 vitest. This is the bump the previous run reverted at merge pending the
+     `UiSonnerSonner` blocker; **that blocker is fixed in the next commit of this PR** (it was never
+     nuxt's fault — it reproduced on pristine `origin/master`).
+   - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
+     Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
+     release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
+     `not immediate: OperandRef(Uninit @ … UnsafeCell<MaybeUninit<runtime::task::Notified<Arc<multi_thread::handle::Handle>>>>)`
+     (`operand.rs:291:18`). **Debug is unaffected** — the whole workspace builds, 719 tests and clippy
+     pass on that nightly — so this is **release codegen only**, which is why the run's normal
+     fmt/clippy/test/build gate did not catch it. It surfaced when `pnpm build:daemon` failed while
+     preparing the Tauri sidecar. Release is exactly what `cargo tauri build`, `pnpm build:daemon` and
+     every benchmark number depend on, so it cannot ship.
+     Bisected to the toolchain, not our code: the identical `cargo build --package nanna-daemon
+     --release` succeeds under `nightly-2026-07-13` (rustc `77cf889bc`) — **exit 0, 17m34s cold**.
+     Per the routine's own rule ("revert and log any bump that can't be made green"), the bump is
+     reverted — but as **`rust-toolchain.toml`** rather than a `rustup default` on one machine, so the
+     known-good toolchain is reproducible repo state instead of undocumented local state, and CI and
+     the GUI build inherit it. The file carries the full ICE text and its removal condition.
+     - [ ] **Remove the pin** once a newer nightly builds `cargo build --release` green — re-check on
+           every dependency-freshness pass, and report the ICE upstream if it survives.
+     - [ ] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
+           a release-only codegen break, so a toolchain or dependency bump can pass every green check
+           and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
+           least `cargo check --profile release`) to the freshness increment's verification.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at

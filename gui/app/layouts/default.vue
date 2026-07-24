@@ -191,8 +191,9 @@
       @run="onPaletteRun"
     />
 
-    <!-- Global confirmation dialog -->
-    <ConfirmDialog />
+    <!-- Global confirmation dialog lives in app.vue — mounting a second copy
+         here opens two stacked overlays sharing the useConfirm singleton, and
+         the top one swallows clicks aimed at the bottom one (e2e regression). -->
 
     <!-- First-run onboarding (compressed) -->
     <OnboardingWizard
@@ -208,6 +209,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, provide, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, ListChecks, MoreHorizontal } from 'lucide-vue-next'
 import { statusBarLabel } from '~/lib/backendLabels'
 import { useAppUpdater } from '~/composables/useAppUpdater'
@@ -532,9 +534,9 @@ onMounted(async () => {
     if (idx !== -1) sessions.value[idx] = { ...sessions.value[idx], name }
   })
 
-  const { getCurrentWindow } = await import('@tauri-apps/api/window')
-  const window = getCurrentWindow()
-  unlistenCloseRequested = await window.onCloseRequested(async (event) => {
+  // Named `appWindow`, not `window` — shadowing the global inside an async mount hook is a trap.
+  const appWindow = getCurrentWindow()
+  unlistenCloseRequested = await appWindow.onCloseRequested(async (event) => {
     event.preventDefault()
     await handleClose()
   })
