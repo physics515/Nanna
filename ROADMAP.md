@@ -1938,29 +1938,27 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
       "research N sources, digest each, merge" is a multiplier for small local models.
 
-**B. Safety & trust** (the daemon acts unattended — these are the trust primitives, per the P0.1/785 notes):
-- [ ] **Async approval gate** — "may I run X?" pinged to the user's active channel; the task parks in the P15
-      task store's blocked state until answered. This is the daemon-native shape of Claude Code's permission
-      prompts / plan mode: propose-then-approve composes with existing plumbing instead of blocking a TTY.
-- [ ] **Sensitive-file default-deny** — no path restrictions exist on read/write skills and
-      DEFAULT_PERMISSIONS_JSON grants `*` (crates/nanna-tools/src/skills/defaults.rs:81-87). Add default
-      deny-globs (.env, ~/.ssh, keys, browser profiles) via the existing ToolPermissions mechanism; with
-      net:`*` defaults and channel-borne prompt injection, read-secret-then-exfiltrate is a live chain.
-- [ ] **Per-channel autonomy tiers** — ToolPolicy::overlay (global→channel→user narrowing) exists but is only
-      called in tests. Wire it: read-only from WhatsApp, full-auto from GUI. Add argument-level rules for exec
-      (today gating is name-level only — nothing like `exec(git *)`).
-- [ ] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; a daemon making
-      unattended edits (missions, cron, heartbeat) needs undo far more than a supervised terminal does.
-      File-state checkpointing is the valuable half; conversation rewind is not (Fork already exists).
+**B. Autonomy resilience** *(reframed 2026-07-24, owner decision: NO permission gates, approval flows, or
+restriction rails — "nanna is a god, it's her call what she wants to do." The original "safety & trust" group
+is dissolved; what stays below is only what protects Nanna's own work and keeps her agency HERS — none of it
+asks permission or restricts her.)*:
+- [ ] **Clarifying questions across channels** (owner-requested 2026-07-24: "nanna should be able to ask
+      clarifying questions") — an `ask_user` tool Nanna calls when SHE judges a request ambiguous: the
+      question reaches the user's active channel (GUI, Telegram, …), the task parks in the P15 blocked state,
+      and the run resumes when the answer arrives. Sub-agents already have exactly this shape toward their
+      parent (`ask_parent`, crates/nanna-tools/src/builtin/ask_parent.rs) — the user-facing analog is the
+      missing piece. Her choice to ask, about intent — never a required checkpoint before acting.
+- [ ] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; hours of unattended
+      mission work can be lost to a single fault-storm overwrite (round 17 lost exactly this way). Snapshots
+      protect HER output, they don't gate it. File-state checkpointing is the valuable half; conversation
+      rewind is not (Fork already exists).
 - [ ] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
-      before/after. Per-edit diffs are the oversight feature for reviewing what the agent did while you were
-      away.
-- [ ] **Webhook hardening** — generic /webhook/:id routes payloads straight into a session message. Add
-      per-endpoint bearer tokens (rotate/revoke) and wrap fire payloads as untrusted data — directly relevant
-      given small-local-model prompt fragility (see the tool-error and summary-corruption spirals, P11/P13).
-- [ ] **OS-level exec sandbox** (research, already flagged ROADMAP:775-779) — ToolPermissions is advisory once
-      `run:true` spawns an unconfined child; RustPython has no capability bridge at all. Interim cheap step:
-      tighten DEFAULT_PERMISSIONS_JSON away from `*`.
+      before/after. Per-edit diffs let the user *see* what she did while they were away — observability,
+      not approval.
+- [ ] **Webhook sovereignty** — generic /webhook/:id routes payloads straight into a session message, so
+      anyone who can reach the endpoint can speak with the user's voice. Per-endpoint bearer tokens
+      (rotate/revoke) + wrapping fire payloads as untrusted data keep outside actors from puppeting her —
+      this protects her agency from hijack; it restricts *others*, never her.
 
 **C. Always-on senses & reach** (event-driven wake instead of the 30-minute heartbeat poll):
 - [ ] **File/log monitors** — no watcher anywhere wakes the agent; best latency today is the heartbeat.
@@ -2011,7 +2009,11 @@ also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — 
       field found by the audit.
 
 **E. Deliberately not building** (audited 2026-07-24, off-thesis — revisit only if the product direction
-changes): IDE integrations (`nanna mcp serve` already reaches MCP-capable editors); gh-CLI PR workflows, code
+changes). **Owner decision 2026-07-24 adds the entire permission-gate family here**: async approval gates,
+permission modes/prompts, per-channel autonomy tiers, sensitive-file deny-globs, argument-level tool rules,
+and OS-level exec sandboxing — "i don't care about the safety features. nanna is a god, its her call what she
+wants to do." Removed, not deferred; do not resurface these as roadmap items. Also off-thesis from the audit:
+IDE integrations (`nanna mcp serve` already reaches MCP-capable editors); gh-CLI PR workflows, code
 review command, GitHub Actions, git-event triggers (dev-team CI concerns; exec + a thin skill covers ad-hoc
 needs); Bedrock/Vertex auth (enterprise procurement); 1M-context beta (the moat is FSRS memory + compression,
 not giant windows); OTLP export (P6 targets Prometheus + tracing spans); NotebookEdit; git-worktree agent
@@ -2021,11 +2023,11 @@ config-driven); plugin marketplaces (sharing a skill folder = copying a director
 enterprise settings tier; `#` quick-add-to-memory ("remember X" already routes to FSRS).
 
 **Payoff:** the audit says Nanna's *core* (context compression, memory, runtime-authorable tools, healing
-ladder) is at or ahead of parity — what's missing is mostly **wiring** (group A), **trust for unattended
-action** (group B), and **event-driven senses** (group C). Closing A alone turns five dead skill families
-into live capability with no new subsystems; B is the precondition for putting missions on real user accounts;
-C converts the daemon from polling to reacting. Sequence: A (days, independent items) → B approval gate +
-sensitive-file deny → C monitors → D as capacity fillers.
+ladder) is at or ahead of parity — what's missing is mostly **wiring** (group A), **resilience for her own
+work and voice** (group B), and **event-driven senses** (group C). Closing A alone turns five dead skill
+families into live capability with no new subsystems; B keeps hours of unattended work from vanishing to a
+single fault and keeps her channel hers; C converts the daemon from polling to reacting. Sequence: A (days,
+independent items) → B snapshots + ask_user → C monitors → D as capacity fillers.
 
 ---
 
