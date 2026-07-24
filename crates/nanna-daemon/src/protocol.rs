@@ -341,8 +341,12 @@ pub enum MemoryAction {
     },
     /// Delete a memory
     Delete { id: String },
-    /// Clear all memories
-    Clear,
+    /// Clear memories. `scope`: None = all, "global" = global-only,
+    /// anything else = that workspace's entries only.
+    Clear {
+        #[serde(default)]
+        scope: Option<String>,
+    },
     /// Get memory stats
     Stats,
     /// Trigger consolidation

@@ -416,8 +416,8 @@ daemon_proxies! {
     memory_update(id: &str, content: Option<&str>, tags: Option<Vec<String>>);
     /// Delete a memory
     memory_delete(id: &str);
-    /// Clear all memories
-    memory_clear();
+    /// Clear memories ("global", a workspace id, or None = all)
+    memory_clear(scope: Option<&str>);
     /// Get memory stats
     memory_stats();
     /// Trigger memory consolidation

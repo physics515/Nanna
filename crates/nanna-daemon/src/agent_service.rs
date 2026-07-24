@@ -901,6 +901,8 @@ impl AgentService {
                                     .count() > 40;
 
                                 if memory.content.starts_with("Error:")
+                                    || memory.content.contains("HEARTBEAT_OK")
+                                    || memory.content.trim_start().starts_with("[Tool:")
                                     || memory.content.starts_with("Execution failed:")
                                     || memory.content.contains("Error: Execution failed")
                                     || memory.content.contains("Command failed")
