@@ -127,6 +127,7 @@ pub enum DaemonEvent {
     ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value>, #[serde(default)] model: Option<String>, #[serde(default)] tokens: Option<u64>, #[serde(default)] total_tokens: Option<u64> },
     ToolEnd { session_id: String, call_id: String, output: String, success: bool, #[serde(default)] duration_ms: Option<u64>, #[serde(default)] data: Option<serde_json::Value> },
     Error { code: String, message: String, #[serde(default)] session_id: Option<String> },
+    ContextUsage { session_id: String, used: u64, window: u64 },
     Connected { client_id: String },
     Disconnected { client_id: String },
     TaskRunStarted { scope: String, #[serde(default)] scope_id: Option<String>, goal: String },

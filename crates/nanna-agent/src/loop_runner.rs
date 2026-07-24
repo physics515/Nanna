@@ -199,12 +199,15 @@ pub type ToolEndCallback = Box<dyn Fn(&str, &str, &str, bool, u64, Option<&Value
 /// The daemon can persist this to recover if the process crashes mid-run.
 pub type CheckpointCallback = Box<dyn Fn(&[AnthropicMessage], usize) + Send + Sync>;
 
-/// Callback for per-request token usage `(input_tokens, output_tokens)`.
-/// Fired after EVERY LLM request that reports usage — which is what makes
-/// run-level benchmarking honest: `AgentResponse` totals die with a failed
-/// attempt, but a healed long-horizon run spends real tokens in every
-/// attempt. The caller accumulates across attempts.
-pub type UsageCallback = Box<dyn Fn(u32, u32) + Send + Sync>;
+/// Callback for per-request token usage `(input_tokens, output_tokens,
+/// context_window)`. Fired after EVERY LLM request that reports usage —
+/// which is what makes run-level benchmarking honest: `AgentResponse`
+/// totals die with a failed attempt, but a healed long-horizon run spends
+/// real tokens in every attempt. The caller accumulates across attempts.
+/// `input_tokens` is also the provider-reported prompt size of the request
+/// just made, and `context_window` the enforced context bound — together
+/// they are the live "context in use" signal.
+pub type UsageCallback = Box<dyn Fn(u32, u32, u64) + Send + Sync>;
 
 /// Options for running the agent
 #[derive(Default)]
@@ -1625,7 +1628,8 @@ impl Agent {
             state.input_tokens += result.input_tokens;
             state.output_tokens += result.output_tokens;
             if let Some(ref on_usage) = options.on_usage {
-                on_usage(result.input_tokens, result.output_tokens);
+                let window = { self.context.read().await.hard_limit } as u64;
+                on_usage(result.input_tokens, result.output_tokens, window);
             }
 
             // Post-hoc thinking spiral detection (catches sync/non-streaming path

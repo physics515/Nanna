@@ -29,6 +29,19 @@
           {{ currentSession?.name || 'New Chat' }}
         </h2>
         <div class="flex items-center gap-2">
+          <!-- Live context-window usage (updates on every LLM request) -->
+          <span
+            v-if="contextWindow > 0"
+            class="flex items-center gap-1.5 text-xs font-mono rounded-full px-2 py-0.5 bg-nanna-bg-surface border border-white/[0.06]"
+            :class="contextPct >= 90 ? 'text-red-400' : contextPct >= 70 ? 'text-amber-400' : 'text-nanna-text-muted'"
+            :title="`Context window: ${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens in use`"
+          >
+            <span class="ctx-meter" aria-hidden="true">
+              <span class="ctx-meter-fill" :style="{ width: Math.min(100, contextPct) + '%' }"
+                :class="contextPct >= 90 ? 'bg-red-400' : contextPct >= 70 ? 'bg-amber-400' : 'bg-nanna-primary'" />
+            </span>
+            ctx {{ contextPct }}%
+          </span>
           <!-- Active work indicator -->
           <SessionActivityBadge v-if="currentSession" :session-id="currentSession.id" />
           <!-- Daemon-level queue depth (messages from other channels waiting) -->
@@ -372,6 +385,9 @@ interface RunState {
   /** Run-scoped chronological journal — survives the daemon's internal
    *  healing restarts, unlike the per-attempt buffers above. */
   timeline?: TimelineEntry[]
+  /** Live context usage (last prompt tokens / enforced window). */
+  context_used?: number
+  context_window?: number
   started_at: string | null
   message_count: number
   last_message_id?: string | null
@@ -403,6 +419,8 @@ const {
   streamingThinking,
   activeToolCalls,
   liveTimeline,
+  contextUsed,
+  contextWindow,
   messageQueue,
   hasActiveWork,
   hasQueuedMessages,
@@ -416,6 +434,12 @@ const {
   setLiveTimeline,
   clearStreamingState,
 } = useSessionState(sessionId)
+
+// Context-window usage as a whole percentage for the header badge.
+const contextPct = computed(() => {
+  if (!contextWindow.value) return 0
+  return Math.round((contextUsed.value / contextWindow.value) * 100)
+})
 
 // With a live journal, the streaming bubble shows only the trailing OPEN
 // text segment (earlier text renders inline in the timeline). Without one
@@ -457,6 +481,7 @@ let unlistenTool: UnlistenFn | null = null
 let unlistenThinking: UnlistenFn | null = null
 let unlistenModelStatus: UnlistenFn | null = null
 let unlistenDaemonError: UnlistenFn | null = null
+let unlistenContextUsage: UnlistenFn | null = null
 let daemonQueuePollTimer: ReturnType<typeof setInterval> | null = null
 
 // Poll daemon run state while session is active to keep queue depth fresh
@@ -569,6 +594,10 @@ async function loadSession() {
           // run-scoped, so this brings back EVERY tool call and thinking
           // burst of the run, not just the current healing attempt's.
           setLiveTimeline(runState.timeline ?? [])
+
+          // Seed the live context-usage badge from the daemon's snapshot
+          contextUsed.value = runState.context_used ?? 0
+          contextWindow.value = runState.context_window ?? 0
 
           // Replace tool calls with daemon's authoritative list
           activeToolCalls.value = []
@@ -754,6 +783,13 @@ onMounted(async () => {
     }
   })
 
+  // Live context-window usage (one event per LLM request)
+  unlistenContextUsage = await listen<{ session_id: string; used: number; window: number }>('context-usage', (event) => {
+    const sessionState = useSessionState(ref(event.payload.session_id))
+    sessionState.contextUsed.value = event.payload.used
+    sessionState.contextWindow.value = event.payload.window
+  })
+
   // Listen for thinking/reasoning chunks
   unlistenThinking = await listen<{ session_id: string; delta: string }>('thinking-chunk', (event) => {
     const eventSessionId = event.payload.session_id
@@ -829,6 +865,7 @@ onUnmounted(() => {
   if (unlistenThinking) unlistenThinking()
   if (unlistenModelStatus) unlistenModelStatus()
   if (unlistenDaemonError) unlistenDaemonError()
+  if (unlistenContextUsage) unlistenContextUsage()
   if (daemonQueuePollTimer) {
     clearInterval(daemonQueuePollTimer)
     daemonQueuePollTimer = null
@@ -1067,3 +1104,21 @@ function scrollToBottom(force = false) {
 }
 </script>
 
+
+<style scoped>
+/* Tiny horizontal meter inside the context-usage badge */
+.ctx-meter {
+  display: inline-block;
+  width: 34px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(148, 163, 184, 0.15);
+  overflow: hidden;
+}
+.ctx-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+</style>
