@@ -5552,7 +5552,7 @@ name = "nanna-config"
 version = "0.2.2"
 dependencies = [
  "aes-gcm 0.11.0",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
  "directories",
  "getrandom 0.4.3",
