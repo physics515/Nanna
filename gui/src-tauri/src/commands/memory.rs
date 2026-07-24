@@ -348,16 +348,31 @@ fn memory_item_from_json(m: &serde_json::Value) -> Option<MemoryItem> {
     })
 }
 
-/// List all semantic memories (with optional workspace scope filter).
+/// Resolve the page's tab keyword into what the daemon expects: the daemon
+/// filter takes "global" or an actual workspace ID. The page sends the
+/// literal "workspace" plus the active workspace's id — forwarding the
+/// literal matched a workspace named "workspace" (nothing) and showed the
+/// global set on both tabs (observed live).
+fn resolve_memory_scope(scope: Option<String>, workspace_id: Option<String>) -> Option<String> {
+    match scope.as_deref() {
+        Some("workspace") => workspace_id.or(scope),
+        _ => scope,
+    }
+}
+
+/// List semantic memories. Scope semantics: "global" = global-only;
+/// a workspace id = global + that workspace (what the agent sees there).
 #[tauri::command]
 pub async fn list_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
     scope: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<Vec<MemoryItem>, String> {
+    let effective = resolve_memory_scope(scope, workspace_id);
     let state_guard = state.read().await;
     let result = state_guard
         .backend
-        .memory_list(scope.as_deref())
+        .memory_list(effective.as_deref())
         .await
         .map_err(|e| format!("Failed to list memories: {e}"))?;
 
@@ -418,18 +433,25 @@ pub async fn update_memory(
     Ok(())
 }
 
-/// Clear all memories.
+/// Clear memories in a scope. "global" clears global-only; a workspace id
+/// clears ONLY that workspace's entries (never the globals its tab also
+/// displays — destructive ops stay conservative); no scope clears all.
+/// (This is the command the memory page actually invokes — the old
+/// `clear_all_memories` name was never called, so the button was dead.)
 #[tauri::command]
-pub async fn clear_all_memories(
+pub async fn clear_memories(
     state: State<'_, Arc<RwLock<AppState>>>,
+    scope: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<(), String> {
+    let effective = resolve_memory_scope(scope, workspace_id);
     let state_guard = state.read().await;
     state_guard
         .backend
-        .memory_clear()
+        .memory_clear(effective.as_deref())
         .await
         .map_err(|e| format!("Failed to clear memories: {e}"))?;
-    info!("Cleared all memories (via daemon)");
+    info!("Cleared memories (scope: {:?}, via daemon)", effective);
     Ok(())
 }
 

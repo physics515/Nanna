@@ -141,14 +141,41 @@ impl ControlPlane {
                     Err(e) => json!({ "error": "delete_failed", "message": e.to_string() })
                 }
             }
-            MemoryAction::Clear => {
-                memory.clear().await;
-                // Note: clear() removes all in-memory entries. Individual removes
-                // write-through to Turso, but bulk clear would require a separate
-                // DB call. For now we log a warning.
-                warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
-                info!("Cleared all memories (in-memory only)");
-                json!({ "status": "cleared" })
+            MemoryAction::Clear { scope } => {
+                match scope.as_deref() {
+                    None => {
+                        memory.clear().await;
+                        // Note: clear() removes all in-memory entries. Individual removes
+                        // write-through to Turso, but bulk clear would require a separate
+                        // DB call. For now we log a warning.
+                        warn!("Memory cleared in-memory. Turso entries are NOT cleared — restart will reload them.");
+                        info!("Cleared all memories (in-memory only)");
+                        json!({ "status": "cleared", "scope": "all" })
+                    }
+                    Some(s) => {
+                        // Scoped clear removes each matching entry via
+                        // forget(), which write-throughs to Turso — durable,
+                        // unlike the legacy all-clear above. "global" clears
+                        // only unscoped entries; a workspace id clears ONLY
+                        // that workspace's entries (never the globals its
+                        // tab also displays — destructive ops stay narrow).
+                        let target_global = s == "global";
+                        let entries = memory.list_all().await;
+                        let mut removed = 0usize;
+                        for m in entries {
+                            let matches = if target_global {
+                                m.workspace_id.is_none()
+                            } else {
+                                m.workspace_id.as_deref() == Some(s)
+                            };
+                            if matches && memory.forget(&m.id).await.is_ok() {
+                                removed += 1;
+                            }
+                        }
+                        info!("Cleared {} memories in scope {}", removed, s);
+                        json!({ "status": "cleared", "scope": s, "removed": removed })
+                    }
+                }
             }
             MemoryAction::Stats => {
                 let stats = memory.stats().await;

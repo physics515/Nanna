@@ -246,7 +246,7 @@ pub fn run() {
             commands::memory::get_memory,
             commands::memory::delete_memory,
             commands::memory::update_memory,
-            commands::memory::clear_all_memories,
+            commands::memory::clear_memories,
             // Channel status
             commands::channels::get_channel_status,
             commands::channels::get_enhanced_channel_status,

@@ -951,11 +951,12 @@ impl DaemonClient {
         })).await
     }
 
-    /// Clear all memories
-    pub async fn memory_clear(&self) -> Result<Value, String> {
+    /// Clear memories ("global", a workspace id, or None = all)
+    pub async fn memory_clear(&self, scope: Option<&str>) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "memory",
-            "action": "clear"
+            "action": "clear",
+            "scope": scope
         })).await
     }
 
