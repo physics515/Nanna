@@ -19,7 +19,7 @@ uuid.workspace = true
 chrono.workspace = true
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-base64 = "0.22"
+base64 = "0.23"
 regex = "1"
 nanna-storage = { path = "../nanna-storage" }
 

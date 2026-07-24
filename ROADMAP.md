@@ -2090,6 +2090,26 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      **Merge note:** this run's `nuxt 4.4.8 → 4.5.0` bump was reverted to `4.4.8` at merge,
      pending the unresolved `UiSonnerSonner` component issue logged above; its monaco 0.56
      migration is the same one described in the previous bullet.
+   - *(2026-07-24 sweep)* `cargo update` → 1 compatible bump (the boa git rev tracked `v0.4.4 → v0.4.5`).
+     `cargo upgrade --incompatible` → **two majors, both applied green**: **`base64 0.22 → 0.23`**
+     (`nanna-agent` + `nanna-gui`; the `Engine`-trait call sites in `image_util.rs` and the PKCE OAuth
+     flow compiled unchanged) and **`deno_core 0.408 → 0.409`** (`nanna-scripting`, compiled unchanged).
+     Everything else already sits at its latest req, with only the intentional `turso`/`aegis` pins and
+     the boa git rev held back. **Toolchain tracked too:** nightly `daf2e5e18 (2026-07-13)` →
+     `89c61a754 (2026-07-23)`; the workspace was rebuilt and re-tested from scratch under it —
+     **719 tests pass, 0 failures**, clippy **0 errors** (2354 pre-existing warnings).
+     *Gotcha for future runs:* `cargo-upgrade` rewrites CRLF→LF on any manifest it edits
+     (`crates/nanna-agent/Cargo.toml` came back as a 33-line whole-file diff for a one-line bump) —
+     revert and hand-edit the req instead, or the EOL churn buries the actual change.
+     Also: running `rustup update` **concurrently with a `cargo build`** fails and rolls back on Windows
+     (component files are locked) — sequence them.
+     Frontend: `pnpm outdated` showed **only documented deferred majors** (`@tiptap/* 2 → 3.28`,
+     `marked 17 → 18`, `vue-router 4 → 5`, `vue-sonner 1 → 2`, `typescript 5.9 → 7.0`) plus the
+     `lucide-vue-next 1.0.0` tombstone that must never be taken. `pnpm update` re-landed
+     **`nuxt 4.4.8 → 4.5.0`** (Vite 8 / Rolldown) — verified `pnpm generate` green (4 routes prerendered)
+     and 56/56 vitest. This is the bump the previous run reverted at merge pending the
+     `UiSonnerSonner` blocker; **that blocker is fixed in the next commit of this PR** (it was never
+     nuxt's fault — it reproduced on pristine `origin/master`).
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at
