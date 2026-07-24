@@ -704,7 +704,20 @@ bugs and improvements here; do not bury them only in the backlog bullet.
             `update_skill`/`delete_skill`/`list_skills`, `test_all_channels`, `clear_rate_limit`, …).
             Each is either a feature with no UI or a leftover; triage into "wire up" vs "delete" rather
             than leaving an unaudited command surface exposed to the webview.
-      **Negative result worth not re-deriving:** the same audit was extended to the sibling failure mode
+      *(2026-07-24)* **Verified in the real Tauri shell over WebDriver** (`cargo tauri build` release,
+      `nanna-gui.exe` 16 MB, built under the pinned toolchain): `document.title === "Nanna"`, `#__nuxt`
+      attached, `typeof window.__TAURI_INTERNALS__ === "object"` (so this is the real IPC shell, not the
+      browser dev shell), **`[data-sonner-toaster]` count = 1** — the toaster genuinely mounts — and
+      **zero** `<uisonnersonner>` / `<groundglass>` inert elements, i.e. both resolution fixes hold in the
+      packaged app. Screenshot kept with the run.
+      - [ ] **Hazard in the shared WebDriver harness — it kills by process *name*.**
+            `_shared/tauri-webdriver.ps1`'s `Kill-Stale` does `Stop-Process -Name $names`, so `stop` killed
+            the **user's own running `nanna-gui.exe`** (`C:\Program Files\Nanna\`) alongside the
+            WebDriver-launched one. No data loss — the daemon is a separate process name, kept running, and
+            it owns the state — but an unattended run should not close the user's window. The same harness
+            backs the Utter and Laurelane routines, so this affects all of them. Fix: record the launched
+            PID in the session state file and `Stop-Process -Id` that, falling back to name-matching only
+            when the PID is gone.
       — a `@handler` bound to an event the child never emits, which also fails silently — by checking
       every PascalCase component tag's listeners against the callee's `defineEmits` (allowing native
       fallthrough events, `update:*`, and kebab/camel spellings). Across the 91 files and the **25**
