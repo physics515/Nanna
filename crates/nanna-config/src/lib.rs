@@ -6,6 +6,34 @@
 pub mod credentials;
 pub mod bind;
 
+/// Canonical application identity for [`directories::ProjectDirs`].
+///
+/// Every Nanna surface (config, credentials, daemon data, model cache, GUI skills)
+/// MUST use these three components so a single uninstall removes the whole tree and
+/// so secrets never end up orphaned under a different vendor slug.
+pub const APP_QUALIFIER: &str = "com";
+pub const APP_ORGANIZATION: &str = "nanna";
+pub const APP_NAME: &str = "nanna";
+
+/// Build the canonical [`ProjectDirs`] for Nanna.
+///
+/// # Errors
+///
+/// Returns `None` only when the host has no home directory.
+#[must_use]
+pub fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
+}
+
+/// Legacy pre-unification identity (`bot/clawd/Nanna`). Kept solely so the first
+/// boot after upgrade can migrate existing config and credential files into the
+/// canonical tree instead of stranding a user's data under the old vendor slug.
+#[must_use]
+pub fn legacy_clawd_project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("bot", "clawd", "Nanna")
+}
+
+
 pub use bind::{LOOPBACK_HOST, is_loopback_host};
 pub use credentials::{
     ClaudeCredentialManager, CredentialError, CredentialSource, LoadedCredential, OAuthCredential,
@@ -13,7 +41,8 @@ pub use credentials::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::info;
 
@@ -338,6 +367,14 @@ pub struct MemoryConfig {
     /// dream cycle is allowed to run. Dreaming competes with the live agent for
     /// the summarizer model and rewrites the store mid-conversation, so it waits
     /// for a genuine lull. Default: 300 (5 min).
+    /// When true, every user/assistant turn (≥3 words) is written into long-term
+    /// memory automatically. **Default false** — memory accumulation is opt-in so
+    /// a first-run install does not silently hoover conversation content. The
+    /// agent can still `remember` deliberately via the tool, and extraction of
+    /// explicit memories during a run is controlled separately.
+    #[serde(default)]
+    pub auto_remember_messages: bool,
+
     #[serde(default = "default_dream_idle_threshold_secs")]
     pub dream_idle_threshold_secs: u64,
 
@@ -391,6 +428,7 @@ impl Default for MemoryConfig {
             ],
             max_compression_ratio: default_max_compression_ratio(),
             min_remaining_memories: default_min_remaining_memories(),
+            auto_remember_messages: false,
             dream_idle_threshold_secs: default_dream_idle_threshold_secs(),
             dream_memory_pressure_count: default_dream_memory_pressure_count(),
             ocr_model_priority: vec![],
@@ -410,7 +448,9 @@ impl Config {
         if path.exists() {
             Self::load_from(&path)
         } else {
-            Ok(Self::default())
+            let mut cfg = Self::default();
+            cfg.load_secrets_from_store();
+            Ok(cfg)
         }
     }
 
@@ -422,8 +462,9 @@ impl Config {
     /// Returns `ConfigError::Parse` if the TOML is invalid.
     pub fn load_from(path: &PathBuf) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)?;
         info!("Loaded config from {path:?}");
+        config.load_secrets_from_store();
         Ok(config)
     }
 
@@ -443,14 +484,96 @@ impl Config {
     ///
     /// Returns `ConfigError::Io` if the directory cannot be created or the file cannot be written.
     /// Returns `ConfigError::Parse` if the config cannot be serialized.
-    pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        info!("Saved config to {path:?}");
+        // Never write secrets into config.toml. The secure store is the only
+        // durable home for API keys; the in-memory Config may still hold them
+        // for the running process (loaded from keyring/env at boot).
+        let mut disk = self.clone();
+        disk.strip_secrets_for_disk();
+        let contents = toml::to_string_pretty(&disk)?;
+        fs::write(path, contents)?;
         Ok(())
+    }
+
+    /// Blank every secret field so a serialized config never contains
+    /// credentials. Called by [`Self::save_to`].
+    pub fn strip_secrets_for_disk(&mut self) {
+        self.llm.api_key = None;
+        self.llm.openai_api_key = None;
+        self.llm.openrouter_api_key = None;
+        self.llm.github_token = None;
+        self.llm.anthropic_oauth_token = None;
+        self.llm.ollama_api_key = None;
+        self.tools.brave_api_key = None;
+    }
+
+    /// Persist any secret fields currently held in-memory into the OS keyring
+    /// (or encrypted file fallback), then blank them on this Config. Call after
+    /// onboarding / GUI key entry so `save()` never writes secrets to disk.
+    pub fn migrate_secrets_to_keyring(&mut self) -> Result<(), crate::credentials::CredentialError> {
+        use crate::credentials::{keys, SecureStore};
+        let store = SecureStore::new();
+        let put = |key: &str, val: &mut Option<String>| -> Result<(), crate::credentials::CredentialError> {
+            if let Some(v) = val.take() {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    store.set(key, trimmed)?;
+                }
+            }
+            Ok(())
+        };
+        put(keys::ANTHROPIC_API_KEY, &mut self.llm.api_key)?;
+        put(keys::OPENAI_API_KEY, &mut self.llm.openai_api_key)?;
+        put(keys::OPENROUTER_API_KEY, &mut self.llm.openrouter_api_key)?;
+        put(keys::GITHUB_TOKEN, &mut self.llm.github_token)?;
+        put(keys::BRAVE_API_KEY, &mut self.tools.brave_api_key)?;
+        // OAuth token + ollama key share the store under theirs-named keys too.
+        if let Some(v) = self.llm.anthropic_oauth_token.take() {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                store.set("anthropic_oauth_token", trimmed)?;
+            }
+        }
+        if let Some(v) = self.llm.ollama_api_key.take() {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                store.set("ollama_api_key", trimmed)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hydrate secret fields from SecureStore + environment if they are unset.
+    /// Safe to call repeatedly; never overwrites a value already present.
+    pub fn load_secrets_from_store(&mut self) {
+        use crate::credentials::{keys, SecureStore};
+        let store = SecureStore::new();
+        let fill = |slot: &mut Option<String>, key: &str, env: &str| {
+            if slot.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+                return;
+            }
+            if let Ok(v) = std::env::var(env) {
+                if !v.trim().is_empty() {
+                    *slot = Some(v);
+                    return;
+                }
+            }
+            if let Ok(v) = store.get(key) {
+                if !v.trim().is_empty() {
+                    *slot = Some(v);
+                }
+            }
+        };
+        fill(&mut self.llm.api_key, keys::ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY");
+        fill(&mut self.llm.openai_api_key, keys::OPENAI_API_KEY, "OPENAI_API_KEY");
+        fill(&mut self.llm.openrouter_api_key, keys::OPENROUTER_API_KEY, "OPENROUTER_API_KEY");
+        fill(&mut self.llm.github_token, keys::GITHUB_TOKEN, "GITHUB_TOKEN");
+        fill(&mut self.tools.brave_api_key, keys::BRAVE_API_KEY, "BRAVE_API_KEY");
+        fill(&mut self.llm.ollama_api_key, "ollama_api_key", "OLLAMA_API_KEY");
+        fill(&mut self.llm.anthropic_oauth_token, "anthropic_oauth_token", "ANTHROPIC_OAUTH_TOKEN");
     }
 
     /// Get default config path.
@@ -459,8 +582,8 @@ impl Config {
     ///
     /// Returns `ConfigError::NoDirFound` if the system config directory cannot be determined.
     pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-        let dirs =
-            ProjectDirs::from("bot", "clawd", "Nanna").ok_or(ConfigError::NoDirFound)?;
+        Self::migrate_legacy_config_if_needed();
+        let dirs = project_dirs().ok_or(ConfigError::NoDirFound)?;
         Ok(dirs.config_dir().join("config.toml"))
     }
 
@@ -470,9 +593,54 @@ impl Config {
     ///
     /// Returns `ConfigError::NoDirFound` if the system data directory cannot be determined.
     pub fn default_data_dir() -> Result<PathBuf, ConfigError> {
-        let dirs =
-            ProjectDirs::from("bot", "clawd", "Nanna").ok_or(ConfigError::NoDirFound)?;
+        Self::migrate_legacy_config_if_needed();
+        let dirs = project_dirs().ok_or(ConfigError::NoDirFound)?;
         Ok(dirs.data_dir().to_path_buf())
+    }
+
+    /// Copy config.toml from the legacy `bot/clawd/Nanna` tree into the
+    /// canonical `com/nanna/nanna` tree when the latter does not yet exist.
+    /// Best-effort and silent on failure — a failed migrate leaves the user on
+    /// defaults rather than refusing to start.
+    fn migrate_legacy_config_if_needed() {
+        let Some(new_dirs) = project_dirs() else { return };
+        let new_cfg = new_dirs.config_dir().join("config.toml");
+        if new_cfg.exists() {
+            return;
+        }
+        let Some(old_dirs) = legacy_clawd_project_dirs() else { return };
+        let old_cfg = old_dirs.config_dir().join("config.toml");
+        if !old_cfg.exists() {
+            return;
+        }
+        if let Some(parent) = new_cfg.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::copy(&old_cfg, &new_cfg) {
+            Ok(_) => tracing::info!(
+                from = %old_cfg.display(),
+                to = %new_cfg.display(),
+                "Migrated config.toml from legacy clawd path to com.nanna.nanna"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Failed to migrate legacy config.toml; continuing with defaults"
+            ),
+        }
+        // Best-effort: also migrate the data dir contents the first time.
+        let old_data = old_dirs.data_dir();
+        let new_data = new_dirs.data_dir();
+        if old_data.exists() && !new_data.exists() {
+            if let Err(e) = copy_dir_recursive(old_data, new_data) {
+                tracing::warn!(error = %e, "Failed to migrate legacy data dir");
+            } else {
+                tracing::info!(
+                    from = %old_data.display(),
+                    to = %new_data.display(),
+                    "Migrated data directory from legacy clawd path"
+                );
+            }
+        }
     }
 
     /// Override config with environment variables
@@ -524,4 +692,81 @@ impl Config {
 pub fn generate_default_config() -> String {
     let config = Config::default();
     toml::to_string_pretty(&config).unwrap_or_default()
+}
+
+/// Recursively copy a directory tree. Used only for the one-shot legacy-path migrate.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if ty.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_to_strips_secrets_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.llm.api_key = Some("sk-secret-anthropic".into());
+        cfg.llm.openai_api_key = Some("sk-secret-openai".into());
+        cfg.llm.openrouter_api_key = Some("sk-secret-or".into());
+        cfg.llm.github_token = Some("ghp_secret".into());
+        cfg.llm.ollama_api_key = Some("ollama-secret".into());
+        cfg.llm.anthropic_oauth_token = Some("oauth-secret".into());
+        cfg.tools.brave_api_key = Some("brave-secret".into());
+        cfg.save_to(&path).unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        for needle in [
+            "sk-secret-anthropic",
+            "sk-secret-openai",
+            "sk-secret-or",
+            "ghp_secret",
+            "ollama-secret",
+            "oauth-secret",
+            "brave-secret",
+        ] {
+            assert!(
+                !on_disk.contains(needle),
+                "secret {needle:?} leaked into config.toml: {on_disk}"
+            );
+        }
+        // In-memory config is untouched so the running process still has the keys.
+        assert_eq!(cfg.llm.api_key.as_deref(), Some("sk-secret-anthropic"));
+    }
+
+    #[test]
+    fn auto_remember_messages_defaults_off() {
+        assert!(!MemoryConfig::default().auto_remember_messages);
+        // serde default for missing field is also false
+        let parsed: MemoryConfig = toml::from_str("").unwrap();
+        assert!(!parsed.auto_remember_messages);
+    }
+
+    #[test]
+    fn project_dirs_uses_canonical_identity() {
+        let dirs = project_dirs().expect("home dir");
+        let cfg = dirs.config_dir().to_string_lossy().to_lowercase();
+        // Windows: .../nanna/nanna ; Unix: .../nanna
+        assert!(
+            cfg.contains("nanna"),
+            "config dir should contain nanna, got {cfg}"
+        );
+        assert!(
+            !cfg.contains("clawd"),
+            "canonical path must not use legacy clawd slug: {cfg}"
+        );
+    }
 }

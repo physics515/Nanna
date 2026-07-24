@@ -41,7 +41,7 @@ impl PidFile {
     
     /// Get the default PID file path
     pub fn default_path() -> PathBuf {
-        directories::ProjectDirs::from("com", "nanna", "nanna-daemon")
+        nanna_config::project_dirs()
             .map(|d| d.runtime_dir()
                 .map(|r| r.to_path_buf())
                 .unwrap_or_else(|| d.data_dir().to_path_buf()))

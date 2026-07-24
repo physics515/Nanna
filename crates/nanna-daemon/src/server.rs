@@ -678,7 +678,7 @@ impl Default for LlmConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        let data_dir = directories::ProjectDirs::from("com", "nanna", "nanna-daemon")
+        let data_dir = nanna_config::project_dirs()
             .map(|d| d.data_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("./data"));
 

@@ -1,8 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for Nanna",
-  "windows": ["main"],
+  "description": "Default capability for Nanna \u2014 least-privilege shell surface for the daemon sidecar only.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:event:default",
@@ -19,10 +21,6 @@
     "core:window:allow-is-maximized",
     "core:window:allow-start-resize-dragging",
     "shell:allow-open",
-    "shell:allow-spawn",
-    "shell:allow-kill",
-    "updater:default",
-    "process:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [
@@ -33,6 +31,27 @@
         }
       ]
     },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "nanna-daemon",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-kill",
+      "allow": [
+        {
+          "name": "nanna-daemon",
+          "sidecar": true
+        }
+      ]
+    },
+    "updater:default",
+    "process:default",
     "notification:default",
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",

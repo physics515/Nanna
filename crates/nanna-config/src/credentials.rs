@@ -1,19 +1,26 @@
-//! Credential management with cross-platform secure storage
+//! Secure credential storage.
 //!
-//! Supports storing credentials in:
-//! - OS Keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service)
-//! - Fallback to encrypted file storage
-//! - Claude CLI credential file (~/.claude/.credentials.json) for OAuth
+//! Primary backend: the OS keyring (Windows Credential Manager, macOS Keychain,
+//! Linux Secret Service) via the `keyring` crate.
 //!
-//! The keyring is used for storing Nanna's own API keys and secrets,
-//! while Claude CLI credentials are read-only (for OAuth token sharing).
+//! Fallback backend: an **AES-256-GCM encrypted** file under the canonical
+//! application data directory (`com.nanna.nanna`). The envelope key is kept in
+//! the OS keyring when available; otherwise a per-machine `0600` key file sits
+//! next to the encrypted envelope. Secrets never touch disk as plaintext JSON.
+//!
+//! Also reads Claude Code CLI OAuth tokens from `~/.claude/.credentials.json`
+//! (that file is owned by Claude Code, not us).
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 /// Service name for keyring storage
 const KEYRING_SERVICE: &str = "nanna";
@@ -49,6 +56,9 @@ pub enum CredentialError {
     NoHomeDir,
     #[error("Keyring error: {0}")]
     Keyring(String),
+    /// AES-GCM envelope encrypt/decrypt failure.
+    #[error("Credential crypto error: {0}")]
+    Crypto(String),
 }
 
 impl From<keyring::Error> for CredentialError {
@@ -64,7 +74,7 @@ impl From<keyring::Error> for CredentialError {
 // Secure Keyring Storage
 // =============================================================================
 
-/// Cross-platform credential store using the OS keyring, with a file fallback.
+/// Cross-platform credential store using the OS keyring, with an AES-GCM encrypted file fallback.
 #[derive(Debug, Clone, Default)]
 pub struct SecureStore {
     /// Fallback to file storage if keyring unavailable
@@ -103,7 +113,7 @@ impl SecureStore {
     /// Create a file-only store rooted at `dir` (bypasses the OS keyring).
     ///
     /// Deterministic and self-contained: every `set`/`get`/`delete` reads and
-    /// writes `dir/credentials.json` only. Used for headless deployments and for
+    /// writes `dir/credentials.enc` only (AES-GCM). Used for headless deployments and for
     /// tests, so credential round-trips never depend on an interactive keyring.
     #[must_use]
     pub const fn file_only_at(dir: PathBuf) -> Self {
@@ -234,9 +244,21 @@ impl SecureStore {
     
     fn credentials_file_path(&self) -> Result<PathBuf, CredentialError> {
         if let Some(dir) = &self.file_dir {
+            return Ok(dir.join("credentials.enc"));
+        }
+        // Canonical identity shared with config/data (com.nanna.nanna).
+        let data_dir = crate::project_dirs()
+            .ok_or(CredentialError::NoHomeDir)?
+            .data_dir()
+            .to_path_buf();
+        Ok(data_dir.join("credentials.enc"))
+    }
+
+    fn legacy_plaintext_path(&self) -> Result<PathBuf, CredentialError> {
+        if let Some(dir) = &self.file_dir {
             return Ok(dir.join("credentials.json"));
         }
-        let data_dir = directories::ProjectDirs::from("com", "nanna", "nanna")
+        let data_dir = crate::project_dirs()
             .ok_or(CredentialError::NoHomeDir)?
             .data_dir()
             .to_path_buf();
@@ -244,13 +266,13 @@ impl SecureStore {
     }
 
     fn load_file_credentials(&self) -> Result<HashMap<String, String>, CredentialError> {
+        self.migrate_plaintext_file_if_needed()?;
         let path = self.credentials_file_path()?;
         if !path.exists() {
             return Ok(HashMap::new());
         }
-        let content = std::fs::read_to_string(&path)?;
-        let creds: HashMap<String, String> = serde_json::from_str(&content)?;
-        Ok(creds)
+        let bytes = std::fs::read(&path)?;
+        decrypt_credentials(&bytes, &self.file_encryption_key()?)
     }
 
     fn save_file_credentials(&self, creds: &HashMap<String, String>) -> Result<(), CredentialError> {
@@ -258,10 +280,15 @@ impl SecureStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(creds)?;
-        std::fs::write(&path, content)?;
-        
-        // Set restrictive permissions on Unix
+        let bytes = encrypt_credentials(creds, &self.file_encryption_key()?)?;
+        let tmp = path.with_extension("enc.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -269,8 +296,81 @@ impl SecureStore {
             perms.set_mode(0o600);
             std::fs::set_permissions(&path, perms)?;
         }
-        
+        if let Ok(legacy) = self.legacy_plaintext_path() {
+            let _ = std::fs::remove_file(legacy);
+        }
         Ok(())
+    }
+
+    /// One-shot: encrypt a leftover plaintext `credentials.json` and delete it.
+    fn migrate_plaintext_file_if_needed(&self) -> Result<(), CredentialError> {
+        let legacy = self.legacy_plaintext_path()?;
+        let modern = self.credentials_file_path()?;
+        if !legacy.exists() || modern.exists() {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(&legacy)?;
+        let creds: HashMap<String, String> = serde_json::from_str(&content)?;
+        self.save_file_credentials(&creds)?;
+        info!("Migrated plaintext credentials.json to AES-GCM credentials.enc");
+        Ok(())
+    }
+
+    /// Resolve the 32-byte AES-256 key.
+    /// Prefer OS keyring (`nanna/file-encryption-key`); else a 0600 key file.
+    fn file_encryption_key(&self) -> Result<[u8; 32], CredentialError> {
+        // In file-only mode (tests/headless) never touch the OS keyring: the whole
+        // point is determinism. Always use the colocated key file.
+        if !self.file_only {
+            if let Ok(entry) = Entry::new(KEYRING_SERVICE, "file-encryption-key") {
+                match entry.get_password() {
+                    Ok(b64) => {
+                        if let Ok(bytes) = base64_decode(&b64) {
+                            if bytes.len() == 32 {
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&bytes);
+                                return Ok(key);
+                            }
+                        }
+                    }
+                    Err(keyring::Error::NoEntry) => {
+                        let key = random_key();
+                        if entry.set_password(&base64_encode(&key)).is_ok() {
+                            return Ok(key);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        let key_path = self
+            .credentials_file_path()?
+            .with_file_name("credentials.key");
+        if key_path.exists() {
+            let bytes = std::fs::read(&key_path)?;
+            if bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                return Ok(key);
+            }
+        }
+        let key = random_key();
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        {
+            let mut f = std::fs::File::create(&key_path)?;
+            f.write_all(&key)?;
+            f.sync_all()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&key_path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&key_path, perms)?;
+        }
+        Ok(key)
     }
     
     fn get_from_file(&self, key: &str) -> Result<String, CredentialError> {
@@ -724,6 +824,88 @@ impl ClaudeCredentialManager {
     }
 }
 
+
+// =============================================================================
+// AES-256-GCM helpers
+// =============================================================================
+
+/// Envelope: magic (8) || nonce (12) || ciphertext+tag.
+const ENC_MAGIC: &[u8; 8] = b"NANNAENC";
+const NONCE_LEN: usize = 12;
+
+fn random_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    if getrandom::getrandom(&mut key).is_err() {
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = ((tick >> ((i % 16) * 4)) as u8)
+                .wrapping_mul(31)
+                .wrapping_add(i as u8);
+        }
+    }
+    key
+}
+
+fn random_nonce() -> [u8; NONCE_LEN] {
+    let mut n = [0u8; NONCE_LEN];
+    let _ = getrandom::getrandom(&mut n);
+    n
+}
+
+fn encrypt_credentials(
+    creds: &HashMap<String, String>,
+    key: &[u8; 32],
+) -> Result<Vec<u8>, CredentialError> {
+    let plaintext = serde_json::to_vec(creds)?;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| CredentialError::Crypto(e.to_string()))?;
+    let nonce_bytes = random_nonce();
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_ref())
+        .map_err(|e| CredentialError::Crypto(e.to_string()))?;
+    let mut out = Vec::with_capacity(8 + NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(ENC_MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_credentials(
+    bytes: &[u8],
+    key: &[u8; 32],
+) -> Result<HashMap<String, String>, CredentialError> {
+    if bytes.len() < 8 + NONCE_LEN + 16 {
+        return Err(CredentialError::Crypto("envelope too short".into()));
+    }
+    if &bytes[..8] != ENC_MAGIC {
+        return Err(CredentialError::Crypto("bad envelope magic".into()));
+    }
+    let nonce = Nonce::from_slice(&bytes[8..8 + NONCE_LEN]);
+    let ciphertext = &bytes[8 + NONCE_LEN..];
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| CredentialError::Crypto(e.to_string()))?;
+    let mut plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        CredentialError::Crypto("decryption failed (wrong key or corrupt file)".into())
+    })?;
+    let creds: HashMap<String, String> = serde_json::from_slice(&plaintext)?;
+    plaintext.zeroize();
+    Ok(creds)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +982,21 @@ mod tests {
         store.set(key, value).unwrap();
         assert_eq!(store.get(key).unwrap(), value);
 
+        // Envelope exists and does NOT contain the secret in plaintext.
+        let enc_path = temp_dir.path().join("credentials.enc");
+        assert!(enc_path.exists(), "encrypted credentials file should exist");
+        let raw = std::fs::read(&enc_path).unwrap();
+        assert!(raw.starts_with(b"NANNAENC"), "envelope magic missing");
+        let as_text = String::from_utf8_lossy(&raw);
+        assert!(
+            !as_text.contains(value),
+            "secret leaked into the on-disk envelope in plaintext"
+        );
+        assert!(
+            !temp_dir.path().join("credentials.json").exists(),
+            "legacy plaintext file must not be written"
+        );
+
         // Overwrite updates the stored value.
         store.set(key, "updated_value").unwrap();
         assert_eq!(store.get(key).unwrap(), "updated_value");
@@ -808,6 +1005,24 @@ mod tests {
         store.delete(key).unwrap();
         assert!(matches!(store.get(key), Err(CredentialError::NotFound)));
         assert!(matches!(store.delete(key), Err(CredentialError::NotFound)));
+    }
+
+    #[test]
+    fn test_migrates_legacy_plaintext_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let legacy = temp_dir.path().join("credentials.json");
+        std::fs::write(&legacy, r#"{"legacy_key":"legacy_secret"}"#).unwrap();
+        let store = SecureStore::file_only_at(temp_dir.path().to_path_buf());
+        assert_eq!(store.get("legacy_key").unwrap(), "legacy_secret");
+        assert!(
+            !legacy.exists(),
+            "legacy plaintext should be removed after migrate"
+        );
+        assert!(temp_dir.path().join("credentials.enc").exists());
+        // And the envelope must not contain the secret in plaintext.
+        let raw = std::fs::read(temp_dir.path().join("credentials.enc")).unwrap();
+        assert!(raw.starts_with(b"NANNAENC"));
+        assert!(!String::from_utf8_lossy(&raw).contains("legacy_secret"));
     }
 
     #[test]
