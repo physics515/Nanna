@@ -53,16 +53,22 @@ export default {
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
       return k;
     }
-    // Transient park buffers and the ratchet's own state file must never be
-    // judged by (or recorded in) cross-call history: buffers are rewritten
-    // wholesale every park cycle, and a guard on the state file would block
-    // its own repair once it grows past the floor gate.
-    function hiwaterExempt(key) {
+    // Transient park buffers must never be judged by (or recorded in)
+    // cross-call history — they are rewritten wholesale every park cycle —
+    // and the ratchet's own state file guards itself specially (below).
+    function hiwaterIsBuffer(key) {
       var buf = ".__buffer__";
-      if (key.length >= buf.length && key.lastIndexOf(buf) === key.length - buf.length) return true;
-      var st = "write_hiwater.json";
-      if (key.length >= st.length && key.lastIndexOf(st) === key.length - st.length) return true;
-      return false;
+      return key.length >= buf.length && key.lastIndexOf(buf) === key.length - buf.length;
+    }
+    // Exact path only (root or any /.nanna/ dir), so a real work file with a
+    // similar name keeps full ratchet protection.
+    function hiwaterIsState(key) {
+      if (key === ".nanna/write_hiwater.json") return true;
+      var tail = "/.nanna/write_hiwater.json";
+      return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
+    }
+    function hiwaterExempt(key) {
+      return hiwaterIsBuffer(key) || hiwaterIsState(key);
     }
     function hiwaterLoad() {
       try {
@@ -140,7 +146,14 @@ export default {
 
     // Accept multiple parameter name variants from different models
     var filePath = input.file_path || input.filePath || input.path || input.file || input.filename;
-    var fileContent = input.content || input.text || input.data || input.new_content || input.file_content;
+    // Undefined-chain, NOT || — an explicit content:"" is a legitimate
+    // empty-file write (e.g. a package __init__.py) and must not be
+    // misreported as "missing content" (verify-round finding).
+    var fileContent = input.content;
+    if (fileContent === undefined || fileContent === null) fileContent = input.text;
+    if (fileContent === undefined || fileContent === null) fileContent = input.data;
+    if (fileContent === undefined || fileContent === null) fileContent = input.new_content;
+    if (fileContent === undefined || fileContent === null) fileContent = input.file_content;
     if (!filePath && (fileContent === undefined || fileContent === null)) {
       return fail("write_file failed: you must pass BOTH file_path AND content. Call it again like: write_file(file_path=\"D:/path/to/file.py\", content=\"<the complete file text>\")");
     }
@@ -152,6 +165,13 @@ export default {
     }
     if (typeof filePath !== "string") filePath = String(filePath);
     if (typeof fileContent !== "string") fileContent = String(fileContent);
+
+    // Writing the ratchet's own bookkeeping is always confusion — and wiping
+    // it would silently disarm the erosion guard. Calm, self-describing
+    // refusal so the model moves on instead of "repairing" internals.
+    if (!input.force && hiwaterIsState(hiwaterKey(filePath))) {
+      return fail("write_file skipped: " + filePath + " is write_file's internal bookkeeping. It maintains itself, is healthy, and never needs manual repair. Your own files are unaffected. Continue with your actual task.");
+    }
 
     var bytes = fileContent.length;
 
@@ -181,8 +201,11 @@ export default {
         // probably THERE but unreadable: fail open on the guard, but flag it
         // so the ratchet state is left untouched (verify finding: a transient
         // lock must not reset the mark to the new small size).
+        // Parenthesized form ONLY: the bridge embeds io::Error display as
+        // "...(os error N)", and a bare "os error 3" substring also matches
+        // "(os error 32)" — the sharing-violation case this flag exists for.
         var readErr = String(e);
-        if (readErr.indexOf("os error 2") === -1 && readErr.indexOf("os error 3") === -1) {
+        if (readErr.indexOf("(os error 2)") === -1 && readErr.indexOf("(os error 3)") === -1) {
           existsUnknown = true;
         }
       }
@@ -200,7 +223,7 @@ export default {
         }
       }
 
-      if (hwBase > 500 && bytes < existingSize && bytes < hwBase * 0.3) {
+      if (!hiwaterExempt(hwKeyGuard) && hwBase > 500 && bytes < existingSize && bytes < hwBase * 0.3) {
         var sizeStory = "currently holds " + existingSize + " bytes";
         if (hwBase > existingSize) {
           sizeStory = "holds " + existingSize + " bytes now and has held " + hwBase + " bytes before";

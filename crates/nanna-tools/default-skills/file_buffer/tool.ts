@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.3",
+  version: "0.1.4",
   output: "context",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit.",
   parameters: {
@@ -17,6 +17,76 @@ export default {
     // model under five stacked "Execution failed:" prefixes.
     function fail(message) {
       return { content: message, success: false };
+    }
+
+    // Anti-erosion ratchet state, shared with write_file v0.1.11 (full
+    // design comment lives there). Commit is a TRUSTED in-band mutator: its
+    // shrink guard judges against the file's high-water mark while history
+    // is live (disk still equals the last in-band write), and a successful
+    // commit records {hi, last} so write_file's guard stays armed instead of
+    // treating the change as out-of-band. Without this, the park->repair->
+    // commit cycle was the open erosion route during .py fault storms
+    // (verify-round blocker). All state I/O is best-effort and fails OPEN.
+    var HIWATER_STATE = ".nanna/write_hiwater.json";
+    var HIWATER_MAX_ENTRIES = 200;
+    function hiwaterKey(path) {
+      var k = path.split("\\").join("/").toLowerCase();
+      while (k.indexOf("./") === 0) k = k.substring(2);
+      while (k.indexOf("//") !== -1) k = k.split("//").join("/");
+      return k;
+    }
+    function hiwaterIsBuffer(key) {
+      var buf = ".__buffer__";
+      return key.length >= buf.length && key.lastIndexOf(buf) === key.length - buf.length;
+    }
+    function hiwaterIsState(key) {
+      if (key === ".nanna/write_hiwater.json") return true;
+      var tail = "/.nanna/write_hiwater.json";
+      return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
+    }
+    function hiwaterLoad() {
+      try {
+        var raw = Nanna.readFile(HIWATER_STATE);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+        }
+      } catch (e) {
+        // Missing or corrupt state: start fresh.
+      }
+      return {};
+    }
+    function hiwaterSave(map) {
+      try {
+        var keys = Object.keys(map);
+        if (keys.length > HIWATER_MAX_ENTRIES) {
+          keys.sort(function(a, b) {
+            return ((map[a] && map[a].at) || 0) - ((map[b] && map[b].at) || 0);
+          });
+          var evict = keys.length - HIWATER_MAX_ENTRIES;
+          for (var i = 0; i < evict; i++) delete map[keys[i]];
+        }
+        Nanna.writeFile(HIWATER_STATE, JSON.stringify(map));
+      } catch (e) {
+        // State persistence is best-effort.
+      }
+    }
+    function hiwaterRecord(path, newSize, prevSize) {
+      try {
+        var key = hiwaterKey(path);
+        if (hiwaterIsBuffer(key) || hiwaterIsState(key)) return;
+        var map = hiwaterLoad();
+        var entry = map[key];
+        var hi = newSize > prevSize ? newSize : prevSize;
+        if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi &&
+            typeof entry.last === "number" && entry.last === prevSize) {
+          hi = entry.hi;
+        }
+        map[key] = { hi: hi, last: newSize, at: Date.now() };
+        hiwaterSave(map);
+      } catch (e) {
+        // Best-effort.
+      }
     }
 
     // Python syntax gate — same contract as write_file/edit_file v0.1.4:
@@ -148,8 +218,11 @@ export default {
           }
           return fail("COMMIT REFUSED — the buffered content for " + filePath + " is not valid Python (" + syntaxDetail + "). The real file is UNCHANGED and the buffer is KEPT." + lineQuote + " Your NEXT call must be edit_file(file_path=\"" + bufPath + "\", old_string=<the broken line>, new_string=<the fixed line>), then commit again. Do NOT regenerate the file.");
         }
-        // Shrink guard, same 30% rule as write_file: a much-smaller commit
-        // over an existing file usually means the buffer is incomplete.
+        // Shrink guard, same rule as write_file v0.1.11: judged against the
+        // file's HIGH-WATER mark while history is live, so park->repair->
+        // commit cycles cannot erode a file any further than a direct
+        // rewrite could. A commit that does not shrink the current file is
+        // never refused.
         var existingLen = 0;
         try {
           var existing = Nanna.readFile(filePath);
@@ -157,8 +230,16 @@ export default {
         } catch (eR) {
           // New file.
         }
-        if (existingLen > 500 && buffered.length < existingLen * 0.3) {
-          return fail("COMMIT REFUSED — the buffer holds only " + buffered.length + " chars but " + filePath + " currently holds " + existingLen + ". The file is UNCHANGED and the buffer is KEPT — it looks incomplete. Keep appending the rest of the file, then commit again.");
+        var hwBase = existingLen;
+        var hwEntry = hiwaterLoad()[hiwaterKey(filePath)];
+        if (hwEntry && typeof hwEntry.hi === "number" && isFinite(hwEntry.hi) && hwEntry.hi > hwBase &&
+            typeof hwEntry.last === "number" && hwEntry.last === existingLen) {
+          hwBase = hwEntry.hi;
+        }
+        if (hwBase > 500 && buffered.length < existingLen && buffered.length < hwBase * 0.3) {
+          var sizeStory = "currently holds " + existingLen;
+          if (hwBase > existingLen) sizeStory = "holds " + existingLen + " now and has held " + hwBase + " before";
+          return fail("COMMIT REFUSED — the buffer holds only " + buffered.length + " chars but " + filePath + " " + sizeStory + ". The file is UNCHANGED and the buffer is KEPT — it looks incomplete. Keep appending the rest of the file, then commit again.");
         }
       }
       try {
@@ -173,6 +254,11 @@ export default {
       } catch (eRm) {
         try { Nanna.writeFile(bufPath, ""); } catch (eZ) { /* leftovers are harmless */ }
       }
+      // In-band ratchet sync. On a force commit existingLen was never read
+      // (var hoists to undefined): prevSize -1 makes the liveness check fail
+      // and re-arms from the committed size — exactly force's reset
+      // semantics in write_file.
+      hiwaterRecord(filePath, buffered.length, existingLen === undefined ? -1 : existingLen);
       return {
         content: "Committed " + buffered.length + " chars (" + lineCount(buffered) + " lines) to " + filePath + ". Buffer cleared. Verify the file now with exec, then continue.",
         success: true
