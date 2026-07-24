@@ -394,14 +394,21 @@ pub async fn set_provider_api_key(
         _ => return Err(format!("Unknown provider: {}", provider)),
     }
 
-    // Persist to config file so keys survive restarts
+    // Durable storage is the OS keyring; config.toml never receives secrets.
+    // (claude-proxy is a URL, not a secret — strip_secrets leaves it alone.)
+    if provider != "claude-proxy" {
+        if let Err(e) = state_guard.config.migrate_secrets_to_keyring() {
+            error!("Failed to store API key in keyring: {e}");
+            return Err(format!("failed to store API key securely: {e}"));
+        }
+    }
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
-        // Non-fatal - key is set for this session
+        // Non-fatal - key is hydrated in-process for this session
     }
     let _ = state_guard.backend.config_reload().await;
 
-    info!("API key set for provider: {}", provider);
+    info!("API key set for provider: {} (secure store)", provider);
     Ok(())
 }
 
@@ -788,9 +795,14 @@ pub async fn set_ollama_api_key(
 ) -> Result<String, String> {
     let mut state_guard = state.write().await;
     state_guard.config.llm.ollama_api_key = if key.is_empty() { None } else { Some(key.clone()) };
+    if let Err(e) = state_guard.config.migrate_secrets_to_keyring() {
+        let err_msg = format!("Failed to store Ollama API key securely: {e}");
+        error!("{err_msg}");
+        return Err(err_msg);
+    }
     match state_guard.config.save() {
         Ok(()) => {
-            info!("Ollama API key saved");
+            info!("Ollama API key saved to OS keychain");
         }
         Err(e) => {
             let err_msg = format!("Failed to save config: {}", e);

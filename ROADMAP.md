@@ -8,7 +8,7 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-24 (**silent-failure sweep + two P1 correctness fixes**. Three bugs of one
+**Last updated:** 2026-07-24 (**P1 security hardening.** Secrets leave `config.toml`: onboarding + GUI key setters route every API key through the OS keyring (`Config::migrate_secrets_to_keyring`) and `Config::save_to` strips secret fields before writing TOML. `SecureStore` file fallback is real AES-256-GCM (`credentials.enc`, key in keyring) with automatic migration from legacy plaintext JSON. ProjectDirs identity unified on `com/nanna/nanna` with one-shot clawd→nanna directory migration. Tauri CSP is no longer `null` (restrictive default-src self + local daemon connect). Shell capabilities scoped to the `nanna-daemon` sidecar only. Auto-remembering conversations is **opt-in** (`[memory] auto_remember_messages`, default false) and gated in the chat control plane. Shipped `SECURITY.md` (disclosure process) + `PRIVACY.md` (data flows / opt-out / deletion) + `.github/dependabot.yml` for cargo and npm. Remaining P1: non-local control-plane auth, webhook replay/coverage audit, gitleaks/trufflehog history scan, GitHub secret-scanning toggle, per-tool GUI audit log, OS-level tool sandbox.)
 family, each of which failed without ever telling anyone: `<UiSonnerSonner/>` never resolved so the
 toaster never mounted and **every toast in the app was dropped**; `<GroundGlass>` likewise, so glass
 inputs lost their slab; and Settings → Data's **"Delete All Memories" invoked a Tauri command that has
@@ -252,7 +252,9 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
 - [ ] Move architecture/performance content to the bottom of the readme
 - [ ] Add truthful capability matrix: Desktop GUI / CLI chat / Fully local inference / Ollama backend / Cloud providers / Channels — each with Status and Requires columns.
-- [ ] Add PRIVACY.md documenting: what's stored locally, what's sent to LLM providers, OpenAI embeddings, Brave Search, channels, websites; how to disable cloud calls; how to delete/export data.
+- [x] Add PRIVACY.md documenting: what's stored locally, what's sent to LLM providers, OpenAI embeddings, Brave Search, channels, websites; how to disable cloud calls; how to delete/export data.
+      *(2026-07-24)* **`PRIVACY.md` shipped** at repo root (local storage, outbound sinks, opt-out,
+      deletion). Cross-linked from the P1 privacy item.
 - [ ] Add screenshots of: chat, settings, memory browser, channel setup, daemon/tray state, model/backend selection.
 - [ ] Add troubleshooting guide: API key invalid, Ollama not running, daemon not responding, port already in use, macOS app blocked, Windows Defender warning, Linux WebKitGTK missing, GPU not detected.
 - [ ] Add per-OS installation docs.
@@ -320,9 +322,27 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 SIMD vector ops (AVX/AVX2), GPU compute (wgpu), Turso persistence (embedded, SQLite-compatible),
 vector store + conversation memory, LLM clients (Anthropic/OpenAI/OpenRouter/Ollama) with streaming +
 tool calling, agent loop with context management, scheduler (heartbeats, cron).
-- [ ] Onboarding writes API keys to plaintext config.toml (src/onboarding.rs), even though a SecureStore using OS keyring exists. The OS keychain should be the default path; TOML config should store only non-secret settings.
-- [ ] SecureStore file fallback is plaintext JSON (mode 0600), not encrypted — the module comment misleadingly says "encrypted file storage." Fix the comment or implement real AES-GCM encryption with an OS-protected key.
-- [ ] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
+- [x] Onboarding writes API keys to plaintext config.toml (src/onboarding.rs), even though a SecureStore using OS keyring exists. The OS keychain should be the default path; TOML config should store only non-secret settings.
+      *(2026-07-24)* **Done.** `src/onboarding.rs` routes every key through `persist_config` →
+      `Config::migrate_secrets_to_keyring()` → OS keyring, then `Config::save()` which
+      `strip_secrets_for_disk()` blanks every secret field before writing `config.toml`. A failed
+      keyring write no longer falls back to TOML — it errors and leaves the on-disk file clean.
+      GUI setters (`set_api_key` / `set_provider_api_key` / `set_ollama_api_key`) do the same.
+      Regression: `save_to_strips_secrets_from_disk` asserts no secret ever lands in the TOML.
+- [x] SecureStore file fallback is plaintext JSON (mode 0600), not encrypted — the module comment misleadingly says "encrypted file storage." Fix the comment or implement real AES-GCM encryption with an OS-protected key.
+      *(2026-07-24)* **Real AES-256-GCM.** `SecureStore` writes `credentials.enc` (MAGIC
+      `NANNAENC` + version + 12-byte nonce + ciphertext). The 32-byte key lives in the OS keyring
+      under `nanna/file-store-key`, so the bulk payload is GCM and the key is OS-protected. Legacy
+      plaintext `credentials.json` is migrated on first unlock (read → write enc → delete).
+      Tests: round-trip, migrate-from-legacy, isolated-dir.
+- [x] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
+      *(2026-07-24)* **Unified on `com` / `nanna` / `nanna`.** New `nanna_config::{APP_QUALIFIER,
+      APP_ORGANIZATION, APP_NAME, project_dirs, legacy_clawd_project_dirs}` is the single identity.
+      `Config::default_config_path` / `default_data_dir` and `SecureStore::project_dirs` all go through
+      it. On first boot after upgrade, `Config::migrate_legacy_clawd_dirs` copies the old
+      `bot/clawd/Nanna` config+data tree into the canonical location (non-destructive; legacy left in
+      place). Daemon health/server data dir and GUI skills path updated. `nanna-llm` cache path uses
+      the same triple.
 - [x] Onboarding has_api_key only checks config.llm.api_key or ANTHROPIC_API_KEY, ignoring OpenAI/OpenRouter keys. quick_setup specifically asks for an Anthropic key despite multi-provider support — broken first-run for non-Anthropic users.
       *(2026-07-24)* **Fixed — it now checks the variable for the *selected* provider.** The old check
       was `api_key.is_some() || env::var("ANTHROPIC_API_KEY").is_ok()`, so an OpenAI or OpenRouter user
@@ -344,7 +364,11 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       provider's variable satisfying the check, **another** provider's variable *not* satisfying it,
       explicit key beating the environment, blank/whitespace rejection, and missing→unconfigured.
       8/8 green, clippy clean (0 warnings on the touched file).
-- [ ] Tauri CSP is set to null in gui/src-tauri/tauri.conf.json — not acceptable for a desktop app rendering model output and markdown.
+- [x] Tauri CSP is set to null in gui/src-tauri/tauri.conf.json — not acceptable for a desktop app rendering model output and markdown.
+      *(2026-07-24)* **Restrictive CSP set.** `gui/src-tauri/tauri.conf.json` `app.security.csp` is
+      no longer `null`. Default-src `'self'`; connect-src allows the local daemon (loopback http/ws)
+      plus https for cloud providers & channel webhooks; img/media allow `data:`/`blob:`; object-src
+      and frame-src are `'none'`. Model output and markdown can no longer pull arbitrary script.
 - [x] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
       *(2026-07-24)* **Removed from `default`.** `default = ["custom-protocol", "devtools"]` meant every
       release build shipped the webview inspector on an app that renders model output and untrusted
@@ -352,7 +376,11 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       Tauri turns devtools on automatically under `debug_assertions`, so **`tauri dev` is unaffected**;
       the feature is kept for a deliberate `--features devtools` release build. Verified by a real
       release rebuild of `nanna-gui` (exit 0, 6m32s).
-- [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
+- [x] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
+      *(2026-07-24)* **Least-privilege shell surface.** `gui/src-tauri/capabilities/default.json`
+      scopes `shell:allow-execute` / `allow-spawn` / `allow-kill` to the `nanna-daemon` sidecar only
+      (`sidecar: true`). Broad unrestricted shell spawn is gone; `shell:allow-open` remains for
+      opening user-facing URLs/files.
 - [~] ROADMAP explicitly lists open items: ~~disabled tools still execute~~ **(done 2026-07-20 — `ToolPolicy` gate, P6)**, ~~deleted tools remain callable until restart~~ **(done 2026-07-17 — `unregister` wiring)**, ~~delete_skill needs hardening against remove_dir_all/symlink races~~ **(done — symlink + canonical-escape guards in `commands/tools.rs`)**, stronger sandboxing needed *(open — OS-level sandbox under the policy layer; see research note below)*.
 - [x] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.
       *(2026-07-23)* Fixed together with the webhook receiver — see the "Bind local services to localhost
@@ -373,26 +401,55 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       prints `--port <PORT> ... [default: 5149]` (was 9999) and `nanna-daemon --help` agrees. README's
       documented `5148`/`5149` was already correct and needed no change. 75 daemon tests + 8 bin tests
       green, clippy clean.
-- [ ] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
-- [ ] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
-- [ ] No SECURITY.md or vulnerability disclosure process.
-- [ ] No Dependabot / cargo-audit / npm audit automation.
+- [x] Current usage can transmit user data to: cloud LLM providers, OpenAI embeddings (if OPENAI_API_KEY set), Brave Search, channel platforms (Telegram/Discord/Slack/Signal/WhatsApp), and websites fetched by tools/browser. A PRIVACY.md documenting data flows, opt-out options, and data deletion procedures is mandatory.
+      *(2026-07-24)* **`PRIVACY.md` shipped** at the repo root. Documents local storage (config,
+      keyring/AES-GCM credentials, Turso sessions/memory/tasks, logs), every outbound sink (cloud
+      LLM providers, OpenAI embeddings, Brave Search, five channels, browser/web-fetch tools), how
+      to run fully offline, how to pause/delete memory, and how to wipe data on uninstall.
+- [x] Auto-remembering user messages and assistant replies into long-term memory should be opt-in with clear onboarding language and a pause/delete memory UI.
+      *(2026-07-24)* **Opt-in, default off.** New `[memory] auto_remember_messages` (bool, default
+      `false` — including when the key is absent from an old config). The chat control plane
+      (`nanna-daemon/src/control/chat.rs`) gates both the user-turn and assistant-turn remember
+      paths on it. Pause = flip the toggle; delete = existing Settings → Data "Delete All Memories".
+      Clear onboarding/privacy language lives in `PRIVACY.md`.
+- [x] No SECURITY.md or vulnerability disclosure process.
+      *(2026-07-24)* **`SECURITY.md` shipped** — supported versions, private disclosure via
+      security@nanna.bot / GitHub private advisory, response targets, and scope.
+- [~] No Dependabot / cargo-audit / npm audit automation.
+      *(2026-07-24)* **Dependabot on.** `.github/dependabot.yml` covers cargo (workspace root,
+      weekly, holds the intentional `turso`/`aegis` pins) and npm (`/gui`, weekly, ignores the
+      documented deferred majors: tiptap/vue-router/vue-sonner/marked/typescript). cargo-audit /
+      npm-audit CI steps remain open under P0.3.
 - [ ] No GitHub secret scanning enabled.
-- [ ] Store all secrets in OS keychain by default; remove secret fields from config.toml.
-- [ ] Encrypt the SecureStore file fallback with AES-GCM (OS-protected key) or remove fallback; correct the misleading "encrypted" comment.
-      - [ ] *(research 2026-07-09)* `keyring 4` (now on the workspace) split into a `keyring-core` layer
+      *(2026-07-24)* Dependabot shipped (see above). Secret scanning itself is still a repo-admin
+      toggle on GitHub and is not something a PR can flip — left open.
+- [x] Store all secrets in OS keychain by default; remove secret fields from config.toml.
+      *(2026-07-24)* **Done** as part of the onboarding/GUI keyring work above. `Config::save_to`
+      always strips `llm.{api_key,openai_api_key,openrouter_api_key,github_token,ollama_api_key,
+      anthropic_oauth_token}` and `tools.brave_api_key` before serializing. `load`/`load_from`
+      re-hydrate from the keyring (env still wins as an override for CI/headless). Secret fields
+      remain on the in-memory struct for routing, but they are never the on-disk source of truth.
+- [x] Encrypt the SecureStore file fallback with AES-GCM (OS-protected key) or remove fallback; correct the misleading "encrypted" comment.
+      *(2026-07-24)* **AES-GCM file fallback shipped** — see the SecureStore item above. The
+      keyring-4 `CredentialStore` pluggable-register research note is still the cleaner long-term
+      seam (implement `CredentialStore` + `keyring::set_default_store` instead of the ad-hoc
+      fallback); tracked as a follow-up under P1, not blocking.
+      - [ ] *(research 2026-07-09)* `keyring 4` split into a `keyring-core` layer
             exposing a pluggable `CredentialStore`/`CredentialBuilder` trait registrable via
-            `keyring::set_default_store(..)`. That's the clean seam for this item: implement an
-            encrypted-file `CredentialStore` (AES-GCM) and register it as the default when no OS keyring is
-            present, instead of the ad-hoc plaintext-JSON fallback in `credentials.rs`. Source: [keyring-core docs](https://docs.rs/keyring-core).
-- [ ] Set a restrictive Tauri CSP (not null).
+            `keyring::set_default_store(..)`. Clean seam for replacing the ad-hoc file fallback
+            with a registered encrypted-file store when no OS keyring is present.
+            Source: [keyring-core docs](https://docs.rs/keyring-core).
+- [x] Set a restrictive Tauri CSP (not null).
+      *(2026-07-24)* Done — see the CSP item above.
 - [ ] Disable devtools in production default features in gui/src-tauri/Cargo.toml.
 - [ ] Per-tool toggles visible in GUI; audit log for every tool call.
 - [x] Fix tool lifecycle bugs: disabled tools must not execute; deleted tools must not remain callable until restart (ROADMAP P6/P11).
       *(2026-07-20)* Disabled-tools-execute closed by the `ToolPolicy` gate above (`[tools] disabled` now
       denies at `execute()`, post-resolution). Deleted-tools-callable was closed 2026-07-17 via
       `ToolRegistry::unregister` wiring (see the P11 tool-manager-consistency note).
-- [ ] Harden delete_skill against remove_dir_all/symlink races.
+- [x] Harden delete_skill against remove_dir_all/symlink races.
+      *(2026-07-14 / confirmed 2026-07-24)* Done — symlink + canonical-escape guards in
+      `commands/tools.rs` before `remove_dir_all`.
 - [x] Bind local services (health/webhook) to localhost by default; require explicit opt-in for public exposure.
       *(2026-07-23)* **Done.** Audit found three surfaces defaulting to `0.0.0.0` — the webhook receiver
       (`WebhookConfig::default`), the legacy HTTP server (`ServerConfig::default`), and the `nanna server
@@ -414,7 +471,8 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
-- [ ] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
+- [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
+      *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
 - [x] Remove or gitignore .claude/settings.local.json (committed with machine paths and broad agent permissions).
       *(2026-07-24)* **Untracked and gitignored.** It was committed in a **public** repo carrying 77 lines
@@ -428,8 +486,12 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       ⚠️ **Before merging: keep a copy of your local `.claude/settings.local.json`.** Untracking is a
       deletion as far as git is concerned, so merging this removes the file from any working tree that
       has it. Restore it afterwards (it is ignored now, so it will stay put from then on).
-- [ ] Add SECURITY.md with vulnerability disclosure process.
-- [ ] Enable GitHub secret scanning and Dependabot.
+- [x] Add SECURITY.md with vulnerability disclosure process.
+      *(2026-07-24)* Done — `SECURITY.md` at repo root.
+- [~] Enable GitHub secret scanning and Dependabot.
+      *(2026-07-24)* **Dependabot half done** (`.github/dependabot.yml`). Secret scanning is a
+      GitHub repository setting (Settings → Code security) and must be flipped by a repo admin —
+      left open until confirmed on `physics515/Nanna`.
 - [ ] Claude UI Testing automations
 - [ ] Implement Mummu model runner to replace the built in
 

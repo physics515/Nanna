@@ -65,12 +65,45 @@ fn has_api_key_with(
 /// their key exported was told it was missing and re-prompted on every launch, and an Ollama user
 /// was asked for a key that provider has no concept of.
 pub fn has_api_key(config: &Config) -> bool {
+    // Prefer an already-hydrated in-memory key or the process environment;
+    // fall back to the OS keyring / encrypted store so a key saved at
+    // onboarding (and never written to config.toml) still counts.
     has_api_key_with(
         &config.llm.provider,
         config.llm.api_key.as_deref(),
-        |variable| std::env::var(variable).ok(),
+        |variable| {
+            if let Ok(v) = std::env::var(variable) {
+                if !v.trim().is_empty() {
+                    return Some(v);
+                }
+            }
+            // Map the env-var name to the SecureStore key.
+            let store_key = match variable {
+                "ANTHROPIC_API_KEY" => nanna_config::credentials::keys::ANTHROPIC_API_KEY,
+                "OPENAI_API_KEY" => nanna_config::credentials::keys::OPENAI_API_KEY,
+                "OPENROUTER_API_KEY" => nanna_config::credentials::keys::OPENROUTER_API_KEY,
+                "GITHUB_TOKEN" => nanna_config::credentials::keys::GITHUB_TOKEN,
+                other => other,
+            };
+            nanna_config::credentials::SecureStore::new()
+                .get(store_key)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        },
     )
 }
+
+/// Persist config: secrets → keyring, non-secrets → config.toml.
+fn persist_config(config: &mut Config) -> anyhow::Result<()> {
+    if let Err(e) = config.migrate_secrets_to_keyring() {
+        // Don't write secrets to disk as a consolation prize.
+        config.strip_secrets_for_disk();
+        return Err(anyhow::anyhow!("failed to store secrets securely: {e}"));
+    }
+    config.save()?;
+    Ok(())
+}
+
 
 /// Configure LLM settings (provider, API key, model).
 fn configure_llm(config: &mut Config, theme: &ColorfulTheme) -> anyhow::Result<()> {
@@ -278,7 +311,7 @@ pub fn run_onboarding() -> anyhow::Result<Config> {
 
     // Save config
     println!("\n{CHECK}{}", style("Saving configuration...").bold());
-    config.save()?;
+    persist_config(&mut config)?;
 
     let config_path = Config::default_config_path()?;
     println!(
@@ -324,9 +357,9 @@ pub fn quick_setup(config: &mut Config) -> anyhow::Result<()> {
     }
 
     config.llm.api_key = Some(api_key);
-    config.save()?;
+    persist_config(config)?;
 
-    println!("{CHECK}API key saved.");
+    println!("{CHECK}API key saved to the OS keychain.");
     Ok(())
 }
 

@@ -292,7 +292,7 @@ impl ModelInfoCache {
 
     /// Create cache in the default location (user's cache directory)
     pub fn default_location() -> Option<Self> {
-        directories::ProjectDirs::from("bot", "clawd", "Nanna")
+        directories::ProjectDirs::from("com", "nanna", "nanna")
             .map(|dirs| Self::new(dirs.cache_dir().join("model_info")))
     }
 

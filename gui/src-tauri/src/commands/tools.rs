@@ -225,7 +225,7 @@ pub(crate) async fn get_skills_path(state: &AppState) -> std::path::PathBuf {
             return ws.path.join("skills");
         }
     }
-    directories::ProjectDirs::from("com", "clawd", "Nanna")
+    nanna_config::project_dirs()
         .map(|p| p.data_dir().join("skills"))
         .unwrap_or_else(|| std::path::PathBuf::from("skills"))
 }

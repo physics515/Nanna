@@ -21,12 +21,16 @@ impl ControlPlane {
                     }),
                 };
 
-                // Auto-remember user message as semantic memory
-                if let Some(ref memory) = self.memory {
-                    if content.split_whitespace().count() >= 3 {
-                        let meta = std::collections::HashMap::new();
-                        if let Err(e) = memory.remember_with_importance(&content, meta, 1.0).await {
-                            debug!("Failed to auto-remember user message: {}", e);
+                // Auto-remember user message only when the user has opted in
+                // (`[memory] auto_remember_messages = true`). Default is off so a
+                // first-run install does not silently store conversation content.
+                if self.config.read().await.memory.auto_remember_messages {
+                    if let Some(ref memory) = self.memory {
+                        if content.split_whitespace().count() >= 3 {
+                            let meta = std::collections::HashMap::new();
+                            if let Err(e) = memory.remember_with_importance(&content, meta, 1.0).await {
+                                debug!("Failed to auto-remember user message: {}", e);
+                            }
                         }
                     }
                 }
@@ -238,12 +242,14 @@ impl ControlPlane {
                             }
                         }
 
-                        // Auto-remember assistant response as semantic memory
-                        if let Some(ref memory) = self.memory {
-                            if result.content.split_whitespace().count() >= 3 {
-                                let meta = std::collections::HashMap::new();
-                                if let Err(e) = memory.remember_with_importance(&result.content, meta, 1.0).await {
-                                    debug!("Failed to auto-remember assistant response: {}", e);
+                        // Opt-in only — see auto_remember_messages above.
+                        if self.config.read().await.memory.auto_remember_messages {
+                            if let Some(ref memory) = self.memory {
+                                if result.content.split_whitespace().count() >= 3 {
+                                    let meta = std::collections::HashMap::new();
+                                    if let Err(e) = memory.remember_with_importance(&result.content, meta, 1.0).await {
+                                        debug!("Failed to auto-remember assistant response: {}", e);
+                                    }
                                 }
                             }
                         }

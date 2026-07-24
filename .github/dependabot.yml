@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # Rust workspace
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "rust"]
+    ignore:
+      # Pre-1.0 pins we deliberately hold (see ROADMAP dep notes).
+      - dependency-name: turso
+      - dependency-name: aegis
+
+  # GUI / Tauri frontend
+  - package-ecosystem: npm
+    directory: "/gui"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "javascript"]
+    # Major bumps of these need a real migration — do not auto-PR them.
+    ignore:
+      - dependency-name: "@tiptap/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: vue-router
+        update-types: ["version-update:semver-major"]
+      - dependency-name: vue-sonner
+        update-types: ["version-update:semver-major"]
+      - dependency-name: marked
+        update-types: ["version-update:semver-major"]
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      - dependency-name: lucide-vue-next
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "ci"]
