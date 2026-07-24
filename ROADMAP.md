@@ -277,7 +277,13 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 #### P0.3 - Code Quality & CI
 - [ ] Add GitHub Actions workflow: cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings, cargo test --workspace --all-features, cargo test --no-run smoke check.
 - [ ]  Add cargo audit and cargo deny to CI.
-- [ ]  Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
+- [~]  Add frontend CI: pnpm install --frozen-lockfile, pnpm exec vue-tsc, pnpm audit, Tauri build smoke test.
+       *(2026-07-24)* **`vue-tsc` is now an enforced gate, not advisory.** It ran with
+       `continue-on-error: true` since the workflow landed, which makes a typecheck step decorative — it
+       reports and nobody is blocked. Measured before flipping it: `pnpm exec vue-tsc --noEmit` exits **0
+       with 0 errors** across the whole frontend, so there is no pre-existing debt to grandfather and any
+       future error is a genuine regression. `continue-on-error` removed. Still open on this item:
+       `pnpm audit` and a Tauri build smoke test in CI.
 - [ ]  Add Tauri packaging CI producing signed artifacts per OS.
 - [ ]  Add end-to-end daemon test: start → connect → conversation → persistence → fallback → reconnect.
 - [ ]  Add gitleaks/trufflehog secret-scan step to CI.

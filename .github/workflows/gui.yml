@@ -38,8 +38,9 @@ jobs:
           cache-dependency-path: gui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
+      # Enforced as of 2026-07-24: the tree typechecks with 0 errors, so a new one is a
+      # regression, not pre-existing debt. Revert to continue-on-error only with a reason.
       - run: pnpm exec vue-tsc --noEmit
-        continue-on-error: true
 
   e2e-web:
     name: Playwright web/dev shell
