@@ -1896,6 +1896,139 @@ lands so the workspace code is edited once, not in two copies.
 
 ---
 
+### P18 — Claude Code parity: close the gaps that fit a personal daemon 🌱 (new — 2026-07-24, audit-driven)
+
+**Provenance:** 2026-07-24 multi-agent audit of Nanna against Claude Code's shipped feature set (9 parallel
+auditors, 76 features checked against this repo with file-level evidence; 58 gaps found). Lens applied
+throughout: Nanna is a **local-first, always-on personal daemon**, not a terminal dev tool — parity for its own
+sake is explicitly NOT the goal. Every gap below was rated for value *to this product*; the off-thesis remainder
+is recorded in group E ("deliberately not building") so it doesn't get re-litigated at the next audit.
+
+**Recurring finding — stranded code.** The single biggest pattern: finished implementations that were never
+registered in `build_script_services()` (crates/nanna-daemon/src/server.rs). The Whisper client, PDF reader,
+browser-automation crate, scheduler skills, and swarm coordinator all exist in-tree and all fail at runtime as
+"service not available". Where that's the case the item says **wire** — it's service glue, not new code. (This
+also means P2's "PDF + audio shipped" claims are wrong in daemon mode today — they error when called.)
+
+**A. Wire what's already built** (service registration + config, not new subsystems):
+- [ ] **`schedule.*` services** — remind / list_reminders / cancel_reminder skills call
+      `Nanna.service("schedule.add"/…)` which is never registered; `TaskType::Delayed` exists
+      (crates/nanna-core/src/scheduler.rs) and nothing polls `get_due`. "Check back in 20 minutes"
+      self-scheduling is the difference between an agent and a chatbot; ROADMAP:1721 already says
+      "wire, don't duplicate". Add absolute-timestamp one-shots (fire once, auto-disable) while in there.
+- [ ] **`browser.*` services** — nanna-browser (chromiumoxide + playwright, full navigate/click/type/extract
+      API) plus four browser_* skills exist; nanna-daemon builds nanna-tools *without* the `browser` feature
+      and registers nothing. Enable the flag, register the services. The P8 "browser relay Chrome extension"
+      (drive the user's real logged-in browser) remains the valuable second half.
+- [ ] **`audio.transcribe`** — Whisper client written (crates/nanna-tools/src/builtin/audio.rs); channel
+      listeners already extract voice-note file ids, but the daemon drops non-text messages
+      (crates/nanna-daemon/src/channels.rs:231). Register the service, download channel media, transcribe
+      before the ignore-non-text branch. Voice note from your phone → answer is hallmark personal-daemon UX.
+- [ ] **`pdf.read`** — complete ReadPdfTool (text + OCR fallback, tested) registered nowhere; read_pdf skill
+      errors at runtime. Pure registration fix.
+- [ ] **`screenshot.capture`** — skill exists, service missing, Rust tool is a stub. Wire screen *reading*
+      (screenshot + existing vision skills) first; defer input synthesis (see E — high-risk for an unattended
+      local model, largely redundant with exec + browser).
+- [ ] **MCP client startup** — nanna-mcp is hardened (schema guard, quarantine, SSE) but `McpIntegration` is
+      constructed nowhere and nanna-config has no `[mcp]` section. Add config + daemon boot registration +
+      bearer/OAuth headers on HttpTransport (currently none) + Streamable HTTP (pinned to 2024-11-05 legacy
+      SSE). Unlocks the whole connector ecosystem (calendar, email, home automation) — highest-leverage
+      integration path for a personal daemon.
+- [ ] **Fan-out pipelines** — spawn_swarm + TaskDecomposer (crates/nanna-agent/src/multi.rs) are real but
+      never constructed outside the crate. Wire the coordinator or expose a pipeline skill; deterministic
+      "research N sources, digest each, merge" is a multiplier for small local models.
+
+**B. Safety & trust** (the daemon acts unattended — these are the trust primitives, per the P0.1/785 notes):
+- [ ] **Async approval gate** — "may I run X?" pinged to the user's active channel; the task parks in the P15
+      task store's blocked state until answered. This is the daemon-native shape of Claude Code's permission
+      prompts / plan mode: propose-then-approve composes with existing plumbing instead of blocking a TTY.
+- [ ] **Sensitive-file default-deny** — no path restrictions exist on read/write skills and
+      DEFAULT_PERMISSIONS_JSON grants `*` (crates/nanna-tools/src/skills/defaults.rs:81-87). Add default
+      deny-globs (.env, ~/.ssh, keys, browser profiles) via the existing ToolPermissions mechanism; with
+      net:`*` defaults and channel-borne prompt injection, read-secret-then-exfiltrate is a live chain.
+- [ ] **Per-channel autonomy tiers** — ToolPolicy::overlay (global→channel→user narrowing) exists but is only
+      called in tests. Wire it: read-only from WhatsApp, full-auto from GUI. Add argument-level rules for exec
+      (today gating is name-level only — nothing like `exec(git *)`).
+- [ ] **Pre-edit snapshots + rollback** — write_file/edit_file mutate with no backup; a daemon making
+      unattended edits (missions, cron, heartbeat) needs undo far more than a supervised terminal does.
+      File-state checkpointing is the valuable half; conversation rewind is not (Fork already exists).
+- [ ] **Diff presentation** — edit_file returns "replaced N occurrence(s)"; the GUI timeline shows no
+      before/after. Per-edit diffs are the oversight feature for reviewing what the agent did while you were
+      away.
+- [ ] **Webhook hardening** — generic /webhook/:id routes payloads straight into a session message. Add
+      per-endpoint bearer tokens (rotate/revoke) and wrap fire payloads as untrusted data — directly relevant
+      given small-local-model prompt fragility (see the tool-error and summary-corruption spirals, P11/P13).
+- [ ] **OS-level exec sandbox** (research, already flagged ROADMAP:775-779) — ToolPermissions is advisory once
+      `run:true` spawns an unconfined child; RustPython has no capability bridge at all. Interim cheap step:
+      tighten DEFAULT_PERMISSIONS_JSON away from `*`.
+
+**C. Always-on senses & reach** (event-driven wake instead of the 30-minute heartbeat poll):
+- [ ] **File/log monitors** — no watcher anywhere wakes the agent; best latency today is the heartbeat.
+      Watcher → agent-prompt (reusing scheduler/executor plumbing): a download landing, a build log erroring,
+      a folder changing are the daemon's native senses.
+- [ ] **Detached sub-agents with channel notifications** — the chat task tool blocks the parent turn, and
+      scheduled-task channel routing is a warn-"not implemented" (server.rs:1242). "Do X" from Telegram then
+      walk away requires fire-and-forget spawn + completion that reaches the channel, not just GUI clients.
+- [ ] **Phone steering of missions** — channels ship chat, but there's no approve/inspect-run-state from
+      Telegram/Signal. Pairs with the B approval gate; the local-first answer to Claude Code's cloud sessions
+      ("reach your home daemon from anywhere" — cloud VMs themselves are anti-thesis).
+- [ ] **Doctor probes** — health checks report availability, not root cause. Add config validation, provider
+      connectivity / API-key probes, Ollama reachability, tools-dir checks with fix suggestions. Our own
+      history (loopback stream faults misread as provider 502s → restart spirals) is exactly the failure class
+      a self-diagnosing always-on daemon must catch.
+
+**D. Agent quality-of-life** (cheap, high-leverage; several pairs share infrastructure — build together):
+- [ ] **Instruction skills + slash macros** — tools are executable-only; there's no packaged *procedure* the
+      user can teach ("how I do my invoicing") nor a user-invocable command form (`/morning`,
+      `/summarize-inbox` with $ARGUMENTS from any channel). One storage/discovery mechanism serves both;
+      injected procedures are exactly what small local models need for repeatable workflows.
+- [ ] **Real ripgrep + glob tools** — code_search/search_file are Boa line-scanners (1MB cap, 50-match cap, no
+      gitignore). Bundle/shell to rg + add a find-files-by-glob tool; fast precise search keeps small models
+      on task in long-horizon runs.
+- [ ] **Git context injection** — inject `git status --short --branch` + recent commits at run start when the
+      workspace is a repo (P17 injects only README/AGENTS/CONTRIBUTING/ROADMAP). Prevents destructive edits
+      and redundant discovery calls.
+- [ ] **@-file mentions + drag-drop injection** — chat attachments are image-only. Deterministic client-side
+      file injection beats a read_file roundtrip the model may fumble; pairs with the P4 drag-drop item.
+- [ ] **"think hard" phrases** — map natural-language budget phrases onto the existing ThinkingMode ladder;
+      chat-first users on Telegram can't flip config flags mid-message.
+- [ ] **Per-session model override** — "use the big model for this conversation"; SpawnSubSession already
+      carries `model: Option<String>`, the Chat message doesn't.
+- [ ] **Typed sub-agents with tool scoping** — the chat task tool spawns with all_tools_active:true and no
+      restriction surface, while the P14 harness already does per-step tool_scope. Port scoped spawn to chat
+      (a research sub-agent that cannot exec is a safety win, and small models degrade past ~10 tools).
+- [ ] **Cross-cutting tool-call hooks** — a scripted interceptor point in ToolRegistry::execute (audit-log
+      every call, guard-check before any exec). Per-tool logic is already user-editable in each skill; this
+      covers the cross-tool niche only.
+- [ ] **1h prompt-cache TTL** — CacheControl has no ttl field; the pricing side already landed (P5
+      `with_hour_cache_write`). One field + a config flag keeps the big prefix warm across heartbeat/cron
+      gaps on the cloud escape hatch.
+- [ ] **Cost rollups + spend cap** — per-session/day/month aggregation and GUI surfacing of the existing
+      cost_report (P6:715 is [~]); an always-on daemon that spends autonomously needs time-bucketed spend
+      visibility more than a per-terminal-session number.
+- [ ] **Conversation/memory export** (MD/JSON) — three unchecked roadmap items (P4:691, P0:264, PRIVACY:245);
+      part of the local-first data-ownership promise. Also: wire or delete the dead `personality_mode` config
+      field found by the audit.
+
+**E. Deliberately not building** (audited 2026-07-24, off-thesis — revisit only if the product direction
+changes): IDE integrations (`nanna mcp serve` already reaches MCP-capable editors); gh-CLI PR workflows, code
+review command, GitHub Actions, git-event triggers (dev-team CI concerns; exec + a thin skill covers ad-hoc
+needs); Bedrock/Vertex auth (enterprise procurement); 1M-context beta (the moat is FSRS memory + compression,
+not giant windows); OTLP export (P6 targets Prometheus + tracing spans); NotebookEdit; git-worktree agent
+isolation (per-scope runs are serialized); statusline scripting + output styles (one persona, already
+config-driven); plugin marketplaces (sharing a skill folder = copying a directory); fast-mode serving tier
+(local routing covers latency); manual /compact (the automatic side is already ahead of Claude Code's);
+enterprise settings tier; `#` quick-add-to-memory ("remember X" already routes to FSRS).
+
+**Payoff:** the audit says Nanna's *core* (context compression, memory, runtime-authorable tools, healing
+ladder) is at or ahead of parity — what's missing is mostly **wiring** (group A), **trust for unattended
+action** (group B), and **event-driven senses** (group C). Closing A alone turns five dead skill families
+into live capability with no new subsystems; B is the precondition for putting missions on real user accounts;
+C converts the daemon from polling to reacting. Sequence: A (days, independent items) → B approval gate +
+sensitive-file deny → C monitors → D as capacity fillers.
+
+---
+
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
 
 These are aspirational per-subsystem enhancements distilled from the old planning docs. Grouped to
