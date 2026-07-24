@@ -1576,6 +1576,11 @@ impl LlmClient {
         let mut options = serde_json::Map::new();
         if let Some(temp) = request.temperature {
             options.insert("temperature".to_string(), serde_json::json!(temp));
+        } else {
+            // No caller override: Modelfile defaults for thinking models run
+            // temp 1.0, which is hot for precise code emission. 0.6 is
+            // Qwen's own non-thinking recommendation.
+            options.insert("temperature".to_string(), serde_json::json!(0.6));
         }
         // Bound generation to the request's token budget. num_predict=-1
         // (unlimited) let a degraded runner emit degenerate tokens without
@@ -1590,6 +1595,12 @@ impl LlmClient {
         // one-liner slop (observed live, round-5 drive). 1.0 keeps a mild
         // guard; the loop's repetition/spiral detectors cover the rest.
         options.insert("presence_penalty".to_string(), serde_json::json!(1.0));
+        // repeat_penalty 1.1 (the Ollama default) punishes exactly the tokens
+        // Python repeats by design — newlines and indentation runs — and the
+        // model visibly compensates by cramming statements onto one line
+        // (observed live across rounds even at presence 1.0). Code presets
+        // use 1.0: no repetition penalty at all.
+        options.insert("repeat_penalty".to_string(), serde_json::json!(1.0));
         if !options.is_empty() {
             body["options"] = serde_json::Value::Object(options);
         }
@@ -3129,6 +3140,11 @@ impl LlmClient {
             let mut options = serde_json::Map::new();
             if let Some(temp) = request.temperature {
                 options.insert("temperature".to_string(), serde_json::json!(temp));
+            } else {
+                // See the non-streaming site: Modelfile thinking defaults run
+                // hot (1.0); 0.6 is Qwen's non-thinking recommendation and
+                // measurably reduces one-line code cramming.
+                options.insert("temperature".to_string(), serde_json::json!(0.6));
             }
             // Bound generation to the request's token budget. num_predict=-1
             // (unlimited) let a degraded runner emit degenerate tokens without
@@ -3143,6 +3159,12 @@ impl LlmClient {
             // keeps a mild guard; the loop's repetition/spiral detectors
             // cover the rest.
             options.insert("presence_penalty".to_string(), serde_json::json!(1.0));
+        // repeat_penalty 1.1 (the Ollama default) punishes exactly the tokens
+        // Python repeats by design — newlines and indentation runs — and the
+        // model visibly compensates by cramming statements onto one line
+        // (observed live across rounds even at presence 1.0). Code presets
+        // use 1.0: no repetition penalty at all.
+        options.insert("repeat_penalty".to_string(), serde_json::json!(1.0));
             if !options.is_empty() {
                 body["options"] = serde_json::Value::Object(options);
             }
