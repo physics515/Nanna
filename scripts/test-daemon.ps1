@@ -15,7 +15,7 @@ function Write-Info { Write-Host "→ $args" -ForegroundColor Cyan }
 function Write-Step { Write-Host "`n[$($script:step++)] $args" -ForegroundColor Yellow }
 $script:step = 1
 
-$ProjectDir = "D:\Development\clawdbot-rs"
+$ProjectDir = Split-Path -Parent $PSScriptRoot
 $DaemonBin = "$ProjectDir\target\debug\nanna-daemon.exe"
 $HealthUrl = "http://127.0.0.1:5148"
 $WsUrl = "ws://127.0.0.1:5149"

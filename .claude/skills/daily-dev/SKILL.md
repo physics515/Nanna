@@ -83,9 +83,9 @@ cargo build                     # release if perf-relevant
 - **GUI / runtime verification — drive the real app over WebDriver (grant-free, PRIMARY).** For any
   increment touching the Tauri UI, a Tauri `invoke` command, a Pinia store, or persistence: **`cargo
   tauri build`** (from `gui/`), then drive the *built* app with the shared harness
-  `C:\Users\physi\.claude\scheduled-tasks\_shared\tauri-webdriver.ps1` (same one Utter/Laurelane use):
+  `%USERPROFILE%\.claude\scheduled-tasks\_shared\tauri-webdriver.ps1`:
   `ensure` → `start -App '<exe>'` → `exec -Script '<js>'` / `shot -Out '<scratch>\x.png'` → **always
-  `stop`**. Point `-App` at the fresh `D:\Development\Cargo Target\release\nanna-gui.exe` (or the
+  `stop`**. Point `-App` at the fresh `<cargo target dir>\release\nanna-gui.exe` (or the
   installed `%LOCALAPPDATA%\Nanna\Nanna.exe`) — **NOT `pnpm dev`** (a browser shell where `invoke()`
   fails). Call backend commands directly from JS via `return window.__TAURI_INTERNALS__.invoke('<cmd>',
   {..})` to prove the live path, assert DOM/store state, and screenshot as evidence. This needs **no

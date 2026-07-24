@@ -1,0 +1,11 @@
+{
+  "version": "0.2.1",
+  "notes": "Public Beta 2 — signed auto-updates, anti-erosion file guards, chronological run journal",
+  "pub_date": "2026-07-24T18:28:54.370Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXZ1K2hvYzN3UGtOL1lRZVprV216VVFpRUJhZFhaSjJSdkV1SFlCdVNUM1FJSGJmWlJlaEsvMmJiWi9UZURHKzAvWml1TkJYS3lmK0lrcWxRV00rNFFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0OTE3MzIzCWZpbGU6TmFubmFfMC4yLjFfeDY0LXNldHVwLmV4ZQpHcXNLNG5SWDg4eFRyOXNjVHlNS21RVktaRk9OTmNiMHNVQlJFVmlLajVIeVA5L25ldCt6NzhFM3p2RE9BWDRiQm1PYmx2TlhEQmlyMWc5S21qSVFEZz09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.2.1-beta.2/Nanna_0.2.1_x64-setup.exe"
+    }
+  }
+}
