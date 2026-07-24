@@ -121,7 +121,7 @@ async fn versioned_copy_names_are_refused() {
 }
 
 #[tokio::test]
-async fn parked_draft_blocks_further_whole_file_writes() {
+async fn valid_rewrite_over_a_parked_draft_is_accepted() {
     if skill_missing() {
         return;
     }
@@ -129,17 +129,22 @@ async fn parked_draft_blocks_further_whole_file_writes() {
     let target = dir.path().join("a.py").to_string_lossy().into_owned();
     std::fs::write(dir.path().join("a.py.__buffer__"), "draft = (").unwrap();
 
-    // Round-10 lesson: with a parked draft present, regeneration is not an
-    // option — the rail forces the repair (or explicit clear) path.
-    let err = run_fail(
+    // Round-13 lesson: the old rail bounced even VALID regenerations while
+    // a draft was parked — throwing away the model's one reliable move.
+    // Valid content always wins now. (In this harness the syntax checker
+    // fails open, which lands on the same accept path.)
+    let result = run_write(
         json!({ "file_path": target, "content": "print('regenerated')\n" }),
         dir.path(),
     )
-    .await;
-    assert!(err.contains("WRITE BLOCKED"), "got: {err}");
-    assert!(err.contains("edit_file"), "got: {err}");
-    assert!(err.contains("clear"), "got: {err}");
-    assert!(!dir.path().join("a.py").exists(), "target must stay unwritten");
+    .await
+    .expect("valid rewrite must be accepted");
+    let content = result["content"].as_str().expect("content");
+    assert!(content.contains("Wrote"), "got: {content}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.py")).unwrap(),
+        "print('regenerated')\n"
+    );
 }
 
 #[tokio::test]
