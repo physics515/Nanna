@@ -787,6 +787,14 @@ pub enum Event {
     StatusChange {
         status: String,
     },
+    /// Live context-window usage for a session's active run. Emitted after
+    /// every LLM request: `used` = provider-reported prompt tokens of that
+    /// request, `window` = the enforced context bound.
+    ContextUsage {
+        session_id: String,
+        used: u64,
+        window: u64,
+    },
     Error {
         code: String,
         message: String,

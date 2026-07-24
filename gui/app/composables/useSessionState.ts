@@ -67,6 +67,9 @@ interface SessionState {
   messageQueue: QueuedMessage[]
   lastError: string | null
   daemonQueueCount: number
+  /** Live context usage: last request's prompt tokens / enforced window. */
+  contextUsed: number
+  contextWindow: number
 }
 
 // Global state store - persists across component lifecycle
@@ -85,6 +88,8 @@ function getSessionState(sessionId: string): SessionState {
       messageQueue: [],
       lastError: null,
       daemonQueueCount: 0,
+      contextUsed: 0,
+      contextWindow: 0,
     })
   }
   return sessionStates.get(sessionId)!
@@ -136,6 +141,20 @@ export function useSessionState(sessionId: Ref<string | null>) {
     get: () => state.value?.liveTimeline ?? [],
     set: (val: TimelineEntry[]) => {
       if (state.value) state.value.liveTimeline = val
+    }
+  })
+
+  const contextUsed = computed({
+    get: () => state.value?.contextUsed ?? 0,
+    set: (val: number) => {
+      if (state.value) state.value.contextUsed = val
+    }
+  })
+
+  const contextWindow = computed({
+    get: () => state.value?.contextWindow ?? 0,
+    set: (val: number) => {
+      if (state.value) state.value.contextWindow = val
     }
   })
 
@@ -347,6 +366,8 @@ export function useSessionState(sessionId: Ref<string | null>) {
     messageQueue,
     lastError,
     daemonQueueCount,
+    contextUsed,
+    contextWindow,
 
     // Computed
     hasActiveWork,

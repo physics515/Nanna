@@ -139,6 +139,10 @@ struct ActiveChat {
     /// benchmarking a model on a task.
     run_input_tokens: Arc<std::sync::atomic::AtomicU64>,
     run_output_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Live context usage: prompt tokens of the most recent request and the
+    /// enforced context window (for the chat header's realtime indicator).
+    context_used: Arc<std::sync::atomic::AtomicU64>,
+    context_window: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Journal outputs are capped at this many bytes. Derivation: tool results
@@ -289,6 +293,10 @@ pub struct RunStateSnapshot {
     /// visible before the run completes.
     pub run_input_tokens: u64,
     pub run_output_tokens: u64,
+    /// Live context usage: last request's prompt tokens vs the enforced
+    /// context window (0 = not yet known this run).
+    pub context_used: u64,
+    pub context_window: u64,
     pub started_at: Option<String>,
     /// Total completed messages in session (for sync verification)
     pub message_count: usize,
@@ -572,6 +580,9 @@ impl AgentService {
         // Spend of the most recent LLM request — the "cost of the action"
         // stamped onto tool calls that request issues.
         let last_request_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Live context usage (last prompt size vs enforced window).
+        let context_used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let context_window_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let run_started = std::time::Instant::now();
         let cancellation_flag = Arc::new(AtomicBool::new(false));
 
@@ -590,6 +601,8 @@ impl AgentService {
                 timeline: timeline.clone(),
                 run_input_tokens: run_input_tokens.clone(),
                 run_output_tokens: run_output_tokens.clone(),
+                context_used: context_used.clone(),
+                context_window: context_window_tokens.clone(),
             });
         }
 
@@ -951,13 +964,26 @@ impl AgentService {
                     // Run-scoped totals: every LLM request's usage counts,
                     // including requests inside attempts that later fault —
                     // that spend is real and belongs in the benchmark.
+                    // Also the realtime context-usage signal: each request's
+                    // prompt size vs the enforced window, pushed to clients.
                     let usage_in = run_input_tokens.clone();
                     let usage_out = run_output_tokens.clone();
                     let usage_last = last_request_tokens.clone();
-                    Some(Box::new(move |input: u32, output: u32| {
+                    let ctx_used = context_used.clone();
+                    let ctx_window = context_window_tokens.clone();
+                    let event_tx_usage = self.event_tx.clone();
+                    let session_id_usage = session_id.to_string();
+                    Some(Box::new(move |input: u32, output: u32, window: u64| {
                         usage_in.fetch_add(u64::from(input), Ordering::Relaxed);
                         usage_out.fetch_add(u64::from(output), Ordering::Relaxed);
                         usage_last.store(u64::from(input) + u64::from(output), Ordering::Relaxed);
+                        ctx_used.store(u64::from(input), Ordering::Relaxed);
+                        ctx_window.store(window, Ordering::Relaxed);
+                        let _ = event_tx_usage.send(Event::ContextUsage {
+                            session_id: session_id_usage.clone(),
+                            used: u64::from(input),
+                            window,
+                        });
                     }))
                 },
                 on_checkpoint: {
@@ -1538,6 +1564,8 @@ impl AgentService {
                 timeline: if include_timeline { timeline_lock(&chat.timeline).clone() } else { vec![] },
                 run_input_tokens: chat.run_input_tokens.load(Ordering::Relaxed),
                 run_output_tokens: chat.run_output_tokens.load(Ordering::Relaxed),
+                context_used: chat.context_used.load(Ordering::Relaxed),
+                context_window: chat.context_window.load(Ordering::Relaxed),
                 started_at: Some(chat.started_at.to_rfc3339()),
                 message_count,
                 last_message_id,
@@ -1552,6 +1580,8 @@ impl AgentService {
                 timeline: vec![],
                 run_input_tokens: 0,
                 run_output_tokens: 0,
+                context_used: 0,
+                context_window: 0,
                 started_at: None,
                 message_count,
                 last_message_id,

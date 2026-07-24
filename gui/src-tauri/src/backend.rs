@@ -285,6 +285,13 @@ impl Backend {
                             "session_id": session_id,
                         }));
                     }
+                    DaemonEvent::ContextUsage { session_id, used, window } => {
+                        let _ = app.emit("context-usage", serde_json::json!({
+                            "session_id": session_id,
+                            "used": used,
+                            "window": window,
+                        }));
+                    }
                     DaemonEvent::TaskRunStarted { scope, scope_id, goal } => {
                         let _ = app.emit("task-event", serde_json::json!({
                             "kind": "run_started",
