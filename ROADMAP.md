@@ -653,18 +653,28 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       animate their mesh forever, so Playwright's stability check never settles — assert
       visible+enabled, then `click({ force: true })`.
       Verified: 60/60 vitest, 26/26 Playwright (the 27th is the pre-existing flaky session test below).
-- [ ] *(2026-07-24)* **`<UiInput size="sm">` forwards `size` onto the native `<input>` and the DOM rejects
+- [x] *(2026-07-24)* **`<UiInput size="sm">` forwards `size` onto the native `<input>` and the DOM rejects
       it.** Found while verifying the component-resolution fix above; **pre-existing** — reproduced with
-      that fix stashed, so it is not fallout. `app/components/ui/input.vue` declares no `size` prop, so
-      `size` falls through as an attribute to the `<input>` element, where the HTML `size` attribute must
-      be a positive integer. Chromium therefore logs
+      that fix stashed, so it is not fallout. `app/components/ui/input.vue` declared no `size` prop, so
+      `size` fell through as an attribute to the `<input>` element, where the HTML `size` attribute must
+      be a positive integer. Chromium therefore logged
       `[Vue warn]: Failed setting prop "size" on <input>: value sm is invalid. IndexSizeError` on every
-      page that renders one (`/tools`, `/tasks`, and others). Harmless to layout — the Tailwind classes do
-      the sizing — but it is log noise that trains everyone to ignore Vue warnings, which is precisely how
-      the toaster bug survived for months. Decide the contract rather than patching the symptom: either
-      give `UiInput` a real `size?: 'sm' | 'md' | 'lg'` prop that maps to classes (matching `UiButton`,
-      which already has one), or drop `size="sm"` from the call sites. Same class of "template hands a
-      component something it never declared, Vue warns, nobody reads it".
+      page that rendered one. Harmless to layout — the Tailwind classes did the sizing — but it is log
+      noise that trains everyone to ignore Vue warnings, which is precisely how the toaster bug survived
+      for months.
+      *(2026-07-24)* **Fixed by declaring the contract, not by deleting the call sites.** `UiInput` now
+      has a real `size` prop built with `cva` exactly like `UiButton` — same scale, so the two line up:
+      `default` `h-10 px-4 py-2 text-sm` · `sm` `h-8 px-3 text-xs` · `lg` `h-12 px-6 text-base`. The
+      default reproduces the previous appearance byte-for-byte, so the 5 existing `size="sm"` call sites
+      (`pages/tasks.vue` ×3, `pages/tools.vue` ×2) now get the small control they were always asking for
+      instead of a swallowed DOM error, and nothing else moves. Caller `class` still wins over the variant
+      via `cn`/tailwind-merge.
+      5 tests (`tests/unit/UiInput.spec.ts`): `size` never reaches the DOM element at any variant, each
+      variant maps to a distinct height, the default is `h-10`, a caller `class="h-12"` overrides `sm`,
+      and `update:modelValue` still emits. Reverting the component fails 2 of them
+      (`expected 'sm' to be undefined`). Runtime-confirmed: `/tools`, `/logs`, `/tasks` now load with
+      **zero** Vue warnings — both this one and the resolution one are gone.
+      Verified: 65/65 vitest, 26/27 Playwright (the 27th is the pre-existing flake below).
 - [ ] *(2026-07-23)* **`critical-path.spec.ts` "session create / rename / delete / switch" is flaky —
       pre-existing, confirmed against pristine `origin/master`** (where that file fails **3** tests; on
       the current branch it fails 1). Diagnosis from the trace: the step's locator
