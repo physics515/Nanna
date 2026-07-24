@@ -17,7 +17,7 @@ reqwest.workspace = true
 keyring = { version = "4", features = ["apple-native-keyring-store"] }
 
 # AES-256-GCM encryption for the file-fallback credential store
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 getrandom = "0.2"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
