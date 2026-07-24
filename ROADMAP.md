@@ -885,7 +885,7 @@ scaffolding, shared OS keyring, daemon-side workspaces/config/scheduler/tool-aut
 - [ ] **Browser relay Chrome extension** (Low/High) — MV3 extension ↔ daemon relay (proposed port 5150),
       feed the LLM the accessibility tree (not raw DOM); tools `browser_relay_{snapshot,action,screenshot}`.
 - [ ] **Paired devices / nodes** — defer to P9 (Tor P2P) rather than a standalone mDNS/WebSocket scheme.
-- [ ] Gateway control: `/restart` + `/status` as channel commands, full backup/restore archive, self-update via GitHub releases.
+- [ ] Gateway control: `/restart` + `/status` as channel commands, full backup/restore archive, ~~self-update via GitHub releases~~ **(GUI half landed 2026-07-24, v0.2.1: tauri-plugin-updater with signed NSIS artifacts, endpoint = raw master `.updater/latest.json` since `releases/latest` skips pre-releases; status-bar "Update to vX" chip — user-initiated apply so a running mission is never yanked. Remaining: headless-daemon self-update.)**
 
 ### P9 — Multi-Device Swarm (Tor P2P) 🌱 (not started)
 Personal device mesh over Tor hidden services — zero-config, encrypted, no port forwarding. Every
