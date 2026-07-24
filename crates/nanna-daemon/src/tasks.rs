@@ -1164,6 +1164,34 @@ pub(crate) fn ollama_restart_allowed() -> bool {
     std::env::var("NANNA_OLLAMA_RESTART_ON_DEGRADED").as_deref() != Ok("0")
 }
 
+/// Poll the local Ollama server until it answers `/api/version`, up to
+/// `max_secs`. The chat healer uses this to WAIT OUT a server-down window
+/// (our own runner-surgery restart, or any external restart) instead of
+/// burning retry budget: attempts against a down server complete zero tool
+/// calls, so the progress-based replenishment can never refill the budget,
+/// and the 2/5/10s backoffs burn out inside a ~20-60s restart — observed
+/// live killing a 4h55m mission two minutes after the surgery that cured
+/// its fault storm.
+pub(crate) async fn wait_for_ollama_ready(max_secs: u64) -> bool {
+    let base = ollama_local_base();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+    loop {
+        let up = reqwest::Client::new()
+            .get(format!("{base}/api/version"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if up {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
 /// Unload an Ollama-served model (`keep_alive: 0`) to clear runner state —
 /// the observed degraded mode restores a stale KV context checkpoint that
 /// sends every generation straight to a stop token, and only a fresh runner
