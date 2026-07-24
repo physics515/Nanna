@@ -223,15 +223,13 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 ## Phases
 
 ### P0 - Public Preview Release
-- [ ] Decide: ship as Developer Preview 0.1.0 (compile-from-source, power users only) OR commit to non-technical public beta (requires Phase 1 completion).
-- [ ] If Developer Preview: rewrite README top section to explicitly state "experimental alpha, requires Rust + Node, requires cloud API key or Ollama, native local inference not yet included, not recommended for sensitive data."
 - [ ] Create RELEASE_NOTES.md or MILESTONE that freezes scope.
 - [ ] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases.
 - [ ] Publish signed Windows .msi/.exe installer with bundled daemon sidecar.
 - [ ] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon).
 - [ ] Publish Linux AppImage and/or .deb/.rpm.
 - [ ] App launches without terminal; daemon starts automatically.
-- [ ] Add Start Menu / tray / launch-at-login support.
+- [x] Add Start Menu / tray / launch-at-login support.
 - [ ] WebView2 handling on Windows.
 - [ ] Document uninstall process.
 - [ ] Add "check for updates" or auto-update mechanism
