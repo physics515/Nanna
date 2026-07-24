@@ -688,6 +688,18 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       *(2026-07-23)* Simplification pass closed most open carry-overs (palette, virtualization, IA nav,
       Advanced settings). Remaining bash items: channel-wizard bulk validation, formal viewport pass,
       channels toast ref, legacy clawd config-path copy.
+      *(2026-07-24)* **Mixed static/dynamic import of `@tauri-apps/api/window` collapsed to static.**
+      `TitleBar.vue` and `layouts/default.vue` each did `await import('@tauri-apps/api/window')` in their
+      mount hook while `composables/useCloseHandler.ts` **statically** imports the same module — and
+      `default.vue` calls `useCloseHandler()`, so the module was already in the static graph. The dynamic
+      form bought no code-splitting (the bundler warns and inlines it anyway), only an extra `await`
+      before the window handle was available on mount. `ssr: false` in `nuxt.config.ts`, so there was
+      never an SSR reason for it either. Both are now plain static imports.
+      Fixed in passing: `default.vue`'s hook named its handle `const window = getCurrentWindow()`,
+      **shadowing the global `window`** inside an async mount callback — renamed to `appWindow`, matching
+      what `TitleBar.vue` already called it.
+      Verified: `pnpm generate` green with the mixed-import warning gone, 65/65 vitest,
+      26/27 Playwright (the 27th is the pre-existing flake).
       *(2026-07-23)* **`nuxt generate` manifest race mitigated** — dual Vite client passes were racing
       `node_modules/.cache/nuxt/.nuxt/dist/client/manifest.json` (ENOENT mid-generate while nitro still
       prerendered and Tauri packaging kept going). Pin `buildDir: '.nuxt'`, prerender `/` only
