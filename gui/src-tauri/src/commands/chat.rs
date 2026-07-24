@@ -74,5 +74,7 @@ pub async fn send_message(
         timestamp: chrono::Utc::now().to_rfc3339(),
         tool_calls,
         reasoning: result.get("reasoning").and_then(|v| v.as_str()).map(str::to_string),
+        timeline: result.get("timeline").filter(|t| t.is_array()).cloned(),
+        usage: result.get("run_usage").filter(|u| u.is_object()).cloned(),
     })
 }

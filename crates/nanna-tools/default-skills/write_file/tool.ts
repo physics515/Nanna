@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.9",
+  version: "0.1.10",
   output: "context",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
@@ -90,9 +90,11 @@ export default {
             "You tried to write only " + bytes + " bytes over " + filePath +
             " which currently holds " + existingSize + " bytes (" +
             Math.round(bytes / existingSize * 100) + "% of it). That usually means " +
-            "you sent a fragment instead of the whole file. To proceed: " +
-            "(1) read_file " + filePath + ", (2) merge your change into the FULL text, " +
-            "(3) call write_file again with the complete content.",
+            "you sent a fragment instead of the whole file. For a small change, use " +
+            "edit_file instead: edit_file(file_path=\"" + filePath + "\", old_string=<the exact current text>, " +
+            "new_string=<your replacement>) — it changes just that snippet and leaves the rest untouched. " +
+            "Only if you truly mean to replace the WHOLE file: (1) read_file " + filePath + ", " +
+            "(2) merge your change into the FULL text, (3) call write_file again with the complete content.",
           success: false
         };
       }

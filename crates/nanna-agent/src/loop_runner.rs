@@ -199,6 +199,13 @@ pub type ToolEndCallback = Box<dyn Fn(&str, &str, &str, bool, u64, Option<&Value
 /// The daemon can persist this to recover if the process crashes mid-run.
 pub type CheckpointCallback = Box<dyn Fn(&[AnthropicMessage], usize) + Send + Sync>;
 
+/// Callback for per-request token usage `(input_tokens, output_tokens)`.
+/// Fired after EVERY LLM request that reports usage — which is what makes
+/// run-level benchmarking honest: `AgentResponse` totals die with a failed
+/// attempt, but a healed long-horizon run spends real tokens in every
+/// attempt. The caller accumulates across attempts.
+pub type UsageCallback = Box<dyn Fn(u32, u32) + Send + Sync>;
+
 /// Options for running the agent
 #[derive(Default)]
 pub struct RunOptions {
@@ -235,6 +242,9 @@ pub struct RunOptions {
     /// Checkpoint callback: fired after each iteration with current conversation state.
     /// Enables crash recovery by persisting intermediate state.
     pub on_checkpoint: Option<CheckpointCallback>,
+    /// Per-request usage callback — see [`UsageCallback`]. Lets the caller
+    /// keep run-scoped token totals that survive attempt restarts.
+    pub on_usage: Option<UsageCallback>,
     /// If true, this is a sub-agent run. Nudge thresholds are lowered
     /// (start at 20 instead of 50) since sub-agents should be focused tasks.
     pub is_sub_agent: bool,
@@ -1614,6 +1624,9 @@ impl Agent {
 
             state.input_tokens += result.input_tokens;
             state.output_tokens += result.output_tokens;
+            if let Some(ref on_usage) = options.on_usage {
+                on_usage(result.input_tokens, result.output_tokens);
+            }
 
             // Post-hoc thinking spiral detection (catches sync/non-streaming path
             // where we can't abort mid-stream)

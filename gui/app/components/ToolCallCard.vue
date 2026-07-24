@@ -14,6 +14,8 @@
       <span v-if="modelBadge" class="tool-model-badge">{{ modelBadge }}</span>
       <span class="tool-spacer" />
       <span v-if="status === 'started'" class="tool-running-dot" />
+      <span v-if="dayStamp" class="tool-timestamp" :title="preciseTime">{{ dayStamp }}</span>
+      <span v-if="tokenStamp" class="tool-tokens" title="tokens on this action / run total">{{ tokenStamp }}</span>
       <span v-if="toolCall.duration_ms" class="tool-duration">{{ formatDuration(toolCall.duration_ms) }}</span>
       <span :class="['tool-status', `tool-status--${status}`]">
         {{ status === 'started' ? '⟳' : status === 'completed' ? '✓' : '✗' }}
@@ -65,6 +67,12 @@ interface ToolCallInfo {
 const props = defineProps<{
   toolCall: ToolCallInfo
   status: 'started' | 'completed' | 'error'
+  /** ISO timestamp of when the call started; shown next to the duration. */
+  timestamp?: string
+  /** Tokens spent by the LLM request that issued this call. */
+  tokens?: number
+  /** Run-total tokens spent when this call was issued. */
+  totalTokens?: number
 }>()
 
 const expanded = ref(false)
@@ -152,6 +160,30 @@ function formatDuration(ms: number): string {
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
   return `${(ms / 60000).toFixed(1)}m`
 }
+
+// Wall-clock stamp shown next to the duration ("Thursday, July 23 2026");
+// the precise time lives in the hover title.
+const dayStamp = computed(() => {
+  if (!props.timestamp) return ''
+  const d = new Date(props.timestamp)
+  if (isNaN(d.getTime())) return ''
+  const weekday = d.toLocaleDateString('en-US', { weekday: 'long' })
+  const month = d.toLocaleDateString('en-US', { month: 'long' })
+  return `${weekday}, ${month} ${d.getDate()} ${d.getFullYear()}`
+})
+
+const preciseTime = computed(() => {
+  if (!props.timestamp) return ''
+  const d = new Date(props.timestamp)
+  if (isNaN(d.getTime())) return ''
+  return d.toLocaleString()
+})
+
+// "342/48213 tok" — the action's spend over the run's running total.
+const tokenStamp = computed(() => {
+  if (props.tokens == null || props.totalTokens == null) return ''
+  return `${props.tokens}/${props.totalTokens} tok`
+})
 
 function formatJson(obj: any): string {
   try { return JSON.stringify(obj, null, 2) } catch { return String(obj) }
@@ -244,6 +276,22 @@ function truncateOutput(output: string): string {
   font-size: 10px;
   color: rgba(148, 163, 184, 0.5);
   flex-shrink: 0;
+}
+
+.tool-timestamp {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.4);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.tool-tokens {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: rgba(139, 92, 246, 0.55);
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .tool-status {
