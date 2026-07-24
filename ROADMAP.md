@@ -2226,9 +2226,11 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      (`nanna-agent` + `nanna-gui`; the `Engine`-trait call sites in `image_util.rs` and the PKCE OAuth
      flow compiled unchanged) and **`deno_core 0.408 → 0.409`** (`nanna-scripting`, compiled unchanged).
      Everything else already sits at its latest req, with only the intentional `turso`/`aegis` pins and
-     the boa git rev held back. **Toolchain tracked too:** nightly `daf2e5e18 (2026-07-13)` →
-     `89c61a754 (2026-07-23)`; the workspace was rebuilt and re-tested from scratch under it —
-     **719 tests pass, 0 failures**, clippy **0 errors** (2354 pre-existing warnings).
+     the boa git rev held back. **Toolchain tracked too — then reverted; see the ICE item below:**
+     nightly `daf2e5e18 (2026-07-13)` → `89c61a754 (2026-07-23)`; the workspace was rebuilt and
+     re-tested from scratch under it — **719 tests pass, 0 failures**, clippy **0 errors**
+     (2354 pre-existing warnings). That is the **debug** profile only, and release codegen turned out
+     to be broken on it, so the toolchain bump did not survive the run.
      *Gotcha for future runs:* `cargo-upgrade` rewrites CRLF→LF on any manifest it edits
      (`crates/nanna-agent/Cargo.toml` came back as a 33-line whole-file diff for a one-line bump) —
      revert and hand-edit the req instead, or the EOL churn buries the actual change.
@@ -2241,6 +2243,27 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      and 56/56 vitest. This is the bump the previous run reverted at merge pending the
      `UiSonnerSonner` blocker; **that blocker is fixed in the next commit of this PR** (it was never
      nuxt's fault — it reproduced on pristine `origin/master`).
+   - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
+     Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
+     release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
+     `not immediate: OperandRef(Uninit @ … UnsafeCell<MaybeUninit<runtime::task::Notified<Arc<multi_thread::handle::Handle>>>>)`
+     (`operand.rs:291:18`). **Debug is unaffected** — the whole workspace builds, 719 tests and clippy
+     pass on that nightly — so this is **release codegen only**, which is why the run's normal
+     fmt/clippy/test/build gate did not catch it. It surfaced when `pnpm build:daemon` failed while
+     preparing the Tauri sidecar. Release is exactly what `cargo tauri build`, `pnpm build:daemon` and
+     every benchmark number depend on, so it cannot ship.
+     Bisected to the toolchain, not our code: the identical `cargo build --package nanna-daemon
+     --release` succeeds under `nightly-2026-07-13` (rustc `77cf889bc`) — **exit 0, 17m34s cold**.
+     Per the routine's own rule ("revert and log any bump that can't be made green"), the bump is
+     reverted — but as **`rust-toolchain.toml`** rather than a `rustup default` on one machine, so the
+     known-good toolchain is reproducible repo state instead of undocumented local state, and CI and
+     the GUI build inherit it. The file carries the full ICE text and its removal condition.
+     - [ ] **Remove the pin** once a newer nightly builds `cargo build --release` green — re-check on
+           every dependency-freshness pass, and report the ICE upstream if it survives.
+     - [ ] **The verify gate has a hole worth closing:** `cargo build` (debug) + `cargo test` cannot see
+           a release-only codegen break, so a toolchain or dependency bump can pass every green check
+           and still leave the shippable artifact unbuildable. Add a `cargo build --release` (or at
+           least `cargo check --profile release`) to the freshness increment's verification.
    - **Build-env note (not a code bug):** `cargo build -p nanna-gui` needs two artifacts the repo does
      not commit — the Tauri **sidecar** `gui/src-tauri/binaries/nanna-daemon-<triple>.exe`
      (build via `pnpm build:daemon`, per that dir's `.gitkeep`) and the built frontend at

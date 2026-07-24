@@ -1,0 +1,20 @@
+# Pinned to the last nightly that compiles this workspace in the *release* profile.
+#
+# Why: nightly 2026-07-23 (89c61a754) ICEs in rustc_codegen_ssa while compiling `tokio` under our
+# release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):
+#
+#   error: internal compiler error: compiler/rustc_codegen_ssa/src/mir/operand.rs:291:18:
+#   not immediate: OperandRef(Uninit @ ...
+#   UnsafeCell<MaybeUninit<runtime::task::Notified<Arc<multi_thread::handle::Handle>>>>)
+#
+# Debug builds are unaffected — the whole workspace builds, tests (719) and clippy pass on that
+# nightly — so the breakage is release codegen only. That is exactly what `cargo tauri build`,
+# `pnpm build:daemon` and every benchmark number need, so the toolchain cannot ship as-is.
+# This channel (which resolves to rustc 77cf889bc) builds the same release profile clean —
+# verified by a full cold `cargo build --package nanna-daemon --release`, exit 0 in 17m34s.
+#
+# Remove this file (and go back to tracking latest nightly) once a newer nightly builds
+# `cargo build --release` green. Re-check on each dependency-freshness pass.
+[toolchain]
+channel = "nightly-2026-07-13"
+components = ["rustfmt", "clippy"]
