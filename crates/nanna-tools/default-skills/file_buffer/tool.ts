@@ -230,13 +230,15 @@ export default {
         } catch (eR) {
           // New file.
         }
+        var hwKeyC = hiwaterKey(filePath);
         var hwBase = existingLen;
-        var hwEntry = hiwaterLoad()[hiwaterKey(filePath)];
+        var hwEntry = hiwaterLoad()[hwKeyC];
         if (hwEntry && typeof hwEntry.hi === "number" && isFinite(hwEntry.hi) && hwEntry.hi > hwBase &&
             typeof hwEntry.last === "number" && hwEntry.last === existingLen) {
           hwBase = hwEntry.hi;
         }
-        if (hwBase > 500 && buffered.length < existingLen && buffered.length < hwBase * 0.3) {
+        if (!hiwaterIsBuffer(hwKeyC) && !hiwaterIsState(hwKeyC) &&
+            hwBase > 500 && buffered.length < existingLen && buffered.length < hwBase * 0.3) {
           var sizeStory = "currently holds " + existingLen;
           if (hwBase > existingLen) sizeStory = "holds " + existingLen + " now and has held " + hwBase + " before";
           return fail("COMMIT REFUSED — the buffer holds only " + buffered.length + " chars but " + filePath + " " + sizeStory + ". The file is UNCHANGED and the buffer is KEPT — it looks incomplete. Keep appending the rest of the file, then commit again.");
@@ -282,6 +284,11 @@ export default {
       // file is free; the second requires force, and the refusal steers
       // back to the one-line repair.
       var clearMarker = filePath + ".__cleared__";
+      // Nothing pending: succeed as a no-op instead of steering the model
+      // at a draft that does not exist (ship-gate finding).
+      if (buffered === null || buffered === "") {
+        return { content: "Buffer for " + filePath + " is already empty — nothing to discard. Continue.", success: true };
+      }
       if (input.force !== true) {
         var clearedBefore = null;
         try {
