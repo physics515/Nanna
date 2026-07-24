@@ -25,6 +25,14 @@ const CHAT_TRANSIENT_RETRIES_MAX: usize = 3;
 /// Escalating backoff before same-model retries `1..=CHAT_TRANSIENT_RETRIES_MAX`.
 const CHAT_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 
+/// Bounded waits for a DOWN local Ollama server before falling back to
+/// normal retry accounting. Derivation: a runner-surgery restart is back in
+/// under 60s (tasks.rs polls 20×3s), so one 120s wait covers a restart with
+/// 2× margin; three waits = six minutes of continuous downtime = genuinely
+/// dead, stop stalling the run.
+const CHAT_SERVER_DOWN_WAITS_MAX: usize = 3;
+const CHAT_SERVER_DOWN_WAIT_SECS: u64 = 120;
+
 /// A chat message opens mission mode when its first word is MISSION
 /// (case-insensitive; optional trailing colon). An explicit prefix — never a
 /// heuristic — so ordinary chats can never accidentally run long-horizon.
@@ -656,6 +664,11 @@ impl AgentService {
         // doing real work between faults.
         let mut model_index = 0usize;
         let mut same_model_retries = 0usize;
+        // Bounded server-down waits (see the connection-refused branch in
+        // the error handler). Derivation: one runner restart is back in
+        // <60s; three 120s readiness waits = six minutes of continuous
+        // downtime = the server is genuinely dead, stop stalling the run.
+        let mut server_down_waits = 0usize;
 
         while model_index < models_to_try.len() {
             let model = &models_to_try[model_index];
@@ -1183,6 +1196,33 @@ impl AgentService {
                         at: chrono::Utc::now().to_rfc3339(),
                     });
 
+                    // A DOWN local server (connection refused — e.g. our own
+                    // runner-surgery restart window, observed live killing a
+                    // 4h55m mission two minutes after the surgery cured its
+                    // fault storm) is a WAIT condition, not a fault to
+                    // retry-count: attempts against a down server complete
+                    // zero tool calls, so progress-based replenishment can
+                    // never refill the budget, and the 2/5/10s backoffs burn
+                    // out inside a ~20-60s restart. Wait for readiness
+                    // (bounded) and resume the same model with the budget
+                    // untouched; if the server never comes back, fall
+                    // through to normal retry accounting and exhaust.
+                    if provider == crate::llm_router::ProviderId::Ollama
+                        && Self::is_server_down_error(&error_str)
+                        && server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
+                        && !cancellation_flag.load(Ordering::Relaxed)
+                    {
+                        server_down_waits += 1;
+                        warn!(
+                            "Ollama unreachable (server down or restarting) — waiting for readiness instead of spending retry budget (wait {server_down_waits}/{CHAT_SERVER_DOWN_WAITS_MAX})"
+                        );
+                        if crate::tasks::wait_for_ollama_ready(CHAT_SERVER_DOWN_WAIT_SECS).await {
+                            info!("Ollama is reachable again — resuming the run");
+                            continue;
+                        }
+                        warn!("Ollama still unreachable after {CHAT_SERVER_DOWN_WAIT_SECS}s — falling back to normal retry accounting");
+                    }
+
                     // Transient provider fault (timeout / 5xx / dropped
                     // stream / aborted generation)? Retry the SAME model with
                     // escalating backoff before falling down the priority
@@ -1369,6 +1409,20 @@ impl AgentService {
             message: error_msg,
             partial_result,
         })
+    }
+
+    /// Connection-class failure against the local server: the server is DOWN
+    /// (or restarting), as opposed to a mid-stream fault from a live server.
+    /// Over-matching is safe — the caller's readiness wait returns instantly
+    /// when the server is actually up, and the wait count is bounded.
+    fn is_server_down_error(error: &str) -> bool {
+        let lower = error.to_lowercase();
+        lower.contains("connection refused")
+            || lower.contains("actively refused")
+            || lower.contains("no connection could be made")
+            || lower.contains("tcp connect error")
+            || lower.contains("connection reset")
+            || lower.contains("error sending request")
     }
 
     /// Check if an error indicates the context length was exceeded (400-class, not retryable

@@ -142,7 +142,15 @@
       <!-- ═══ Bottom Status Bar (full width except activity bar) ═══ -->
       <div class="status-bar">
         <div class="status-left">
-          <span class="status-version">v0.1.0</span>
+          <span class="status-version">{{ appVersion ? 'v' + appVersion : '' }}</span>
+          <button
+            :class="['status-update', updateVersion ? 'status-update-available' : '']"
+            :disabled="updating || checking"
+            :title="updateTooltip"
+            @click="applyUpdate"
+          >
+            {{ updateButtonLabel }}
+          </button>
           <span
             v-if="backendStatus"
             :class="['status-badge', backendLabel.online ? 'status-badge-accent' : '']"
@@ -203,6 +211,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Plus, Brain, Radio, Settings, ChevronDown, FolderKanban, Bot, Wrench, Clock, FileText, BarChart3, Activity, ListChecks, MoreHorizontal } from 'lucide-vue-next'
 import { statusBarLabel } from '~/lib/backendLabels'
+import { useAppUpdater } from '~/composables/useAppUpdater'
 import type { PaletteAction } from '~/lib/commandPalette'
 import { NAV_ACTIONS, QUICK_ACTIONS } from '~/lib/commandPalette'
 
@@ -262,6 +271,20 @@ interface AppConfig {
 }
 
 const route = useRoute()
+
+const { currentVersion: appVersion, updateVersion, checking, updating, updateError, applyUpdate } = useAppUpdater()
+
+const updateButtonLabel = computed(() => {
+  if (updating.value) return 'Updating…'
+  if (checking.value) return 'Checking…'
+  if (updateVersion.value) return '⭮ Update to v' + updateVersion.value
+  return 'Update'
+})
+const updateTooltip = computed(() => {
+  if (updateError.value) return 'Update failed: ' + updateError.value + ' — click to retry'
+  if (updateVersion.value) return 'Download v' + updateVersion.value + ' and restart Nanna'
+  return 'Check for updates'
+})
 
 const sessions = ref<SessionInfo[]>([])
 const currentSessionId = ref<string | null>(null)
@@ -870,6 +893,32 @@ async function hideToTray() {
 }
 .status-version {
   color: #64748b;
+}
+.status-update {
+  padding: 1px 8px;
+  border-radius: 3px;
+  font-size: 10px;
+  border: 1px solid rgba(51, 65, 85, 0.6);
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+}
+.status-update:hover:not(:disabled) {
+  border-color: rgba(100, 116, 139, 0.8);
+  color: #94a3b8;
+}
+.status-update-available {
+  border-color: rgba(34, 211, 238, 0.4);
+  background: rgba(34, 211, 238, 0.15);
+  color: #22d3ee;
+}
+.status-update-available:hover:not(:disabled) {
+  background: rgba(34, 211, 238, 0.3);
+  color: #22d3ee;
+}
+.status-update:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 .status-badge {
   padding: 1px 6px;

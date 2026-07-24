@@ -32,6 +32,10 @@ nul
 # Local Playwright run scratch
 playwright-run/
 
-# Claude Code local permission overrides — machine-specific paths + broad agent
-# allowances (curl, taskkill, del /F). Personal, not shareable; see ROADMAP P1.
+# Local Claude Code state + secrets that must never be committed
 .claude/settings.local.json
+gui/src-tauri/memory/
+*.key
+*.pem
+.env
+.env.*

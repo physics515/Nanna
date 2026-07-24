@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.5",
+  version: "0.1.6",
   output: "context",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -21,6 +21,71 @@ export default {
     // and spiral on. A structured failure surfaces as clean corrective text.
     function fail(message) {
       return { content: message, success: false };
+    }
+
+    // Anti-erosion ratchet state, shared with write_file v0.1.11 / file_buffer
+    // v0.1.4 (the design comment lives in write_file). All state I/O is
+    // best-effort and fails OPEN — it can never block an edit.
+    var HIWATER_STATE = ".nanna/write_hiwater.json";
+    var HIWATER_MAX_ENTRIES = 200;
+    function hiwaterKey(path) {
+      var k = path.split("\\").join("/").toLowerCase();
+      while (k.indexOf("./") === 0) k = k.substring(2);
+      while (k.indexOf("//") !== -1) k = k.split("//").join("/");
+      return k;
+    }
+    function hiwaterIsBuffer(key) {
+      var buf = ".__buffer__";
+      return key.length >= buf.length && key.lastIndexOf(buf) === key.length - buf.length;
+    }
+    function hiwaterIsState(key) {
+      if (key === ".nanna/write_hiwater.json") return true;
+      var tail = "/.nanna/write_hiwater.json";
+      return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
+    }
+    function hiwaterLoad() {
+      try {
+        var raw = Nanna.readFile(HIWATER_STATE);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+        }
+      } catch (e) {
+        // Missing or corrupt state: start fresh.
+      }
+      return {};
+    }
+    function hiwaterSave(map) {
+      try {
+        var keys = Object.keys(map);
+        if (keys.length > HIWATER_MAX_ENTRIES) {
+          keys.sort(function(a, b) {
+            return ((map[a] && map[a].at) || 0) - ((map[b] && map[b].at) || 0);
+          });
+          var evict = keys.length - HIWATER_MAX_ENTRIES;
+          for (var i = 0; i < evict; i++) delete map[keys[i]];
+        }
+        Nanna.writeFile(HIWATER_STATE, JSON.stringify(map));
+      } catch (e) {
+        // State persistence is best-effort.
+      }
+    }
+    function hiwaterRecord(path, newSize, prevSize) {
+      try {
+        var key = hiwaterKey(path);
+        if (hiwaterIsBuffer(key) || hiwaterIsState(key)) return;
+        var map = hiwaterLoad();
+        var entry = map[key];
+        var hi = newSize > prevSize ? newSize : prevSize;
+        if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi &&
+            typeof entry.last === "number" && entry.last === prevSize) {
+          hi = entry.hi;
+        }
+        map[key] = { hi: hi, last: newSize, at: Date.now() };
+        hiwaterSave(map);
+      } catch (e) {
+        // Best-effort.
+      }
     }
 
     // Collapse whitespace runs in one line: leading/trailing dropped,
@@ -315,6 +380,16 @@ export default {
       if (writeErr.length > 120) writeErr = writeErr.substring(0, 120) + "...";
       return fail("edit_file failed writing " + filePath + " (" + writeErr + "). Retry the same edit_file call; if it fails again, read the file to verify its current state before editing.");
     }
+
+    // Anti-erosion ratchet sync, shared with write_file v0.1.11 (full design
+    // comment there). edit_file is a TRUSTED in-band mutator: recording
+    // {hi, last} after each successful edit keeps write_file's high-water
+    // guard armed across surgical edits — otherwise every edit looks
+    // out-of-band and hands the next rewrite a fresh current-size floor (the
+    // 2-call nibble+rewrite erosion loop from the verify round). Best-effort,
+    // fails open; deliberately NO shrink refusal here (deletion is this
+    // tool's job — the guard's own refusals steer deletions to edit_file).
+    hiwaterRecord(filePath, updated.length, content.length);
 
     return { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters.", success: true };
   }
