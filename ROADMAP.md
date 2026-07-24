@@ -313,9 +313,35 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
 - [ ] Onboarding writes API keys to plaintext config.toml (src/onboarding.rs), even though a SecureStore using OS keyring exists. The OS keychain should be the default path; TOML config should store only non-secret settings.
 - [ ] SecureStore file fallback is plaintext JSON (mode 0600), not encrypted — the module comment misleadingly says "encrypted file storage." Fix the comment or implement real AES-GCM encryption with an OS-protected key.
 - [ ] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
-- [ ] Onboarding has_api_key only checks config.llm.api_key or ANTHROPIC_API_KEY, ignoring OpenAI/OpenRouter keys. quick_setup specifically asks for an Anthropic key despite multi-provider support — broken first-run for non-Anthropic users.
+- [x] Onboarding has_api_key only checks config.llm.api_key or ANTHROPIC_API_KEY, ignoring OpenAI/OpenRouter keys. quick_setup specifically asks for an Anthropic key despite multi-provider support — broken first-run for non-Anthropic users.
+      *(2026-07-24)* **Fixed — it now checks the variable for the *selected* provider.** The old check
+      was `api_key.is_some() || env::var("ANTHROPIC_API_KEY").is_ok()`, so an OpenAI or OpenRouter user
+      with their key exported was told it was **missing** and re-prompted by `ensure_api_key` on *every*
+      launch, while `nanna status` reported "API Key: missing". **Worse for the North Star: `ollama`
+      is a real `llm.provider` value, and a fully-local install was nagged for a credential Ollama has
+      no concept of** — the intended default experience blocked on a cloud key.
+      New `provider_api_key_env(provider)` returns `None` for `ollama` (no key needed → configured) and
+      the right variable for `openai` / `openrouter` / `anthropic`; an **unrecognised** provider still
+      falls back to `ANTHROPIC_API_KEY`, so an unknown setup is never silently declared configured.
+      The same helper now feeds `configure_llm`'s prompt — it had a **duplicate** copy of that mapping,
+      which is how a prompt could name a different variable than the check consulted. `quick_setup` no
+      longer hardcodes "Enter your Anthropic API key" / "Set ANTHROPIC_API_KEY"; both name the
+      configured provider and its variable. Blank is not a credential: an exported-but-empty
+      `OPENAI_API_KEY` (or a whitespace `api_key`) reads as unconfigured rather than as a valid key.
+      The decision logic is a **pure** `has_api_key_with(provider, configured_key, read_env)` taking an
+      environment reader, so its 8 tests never mutate process-global env (unsound under a parallel test
+      runner): per-provider variable mapping, ollama-needs-none, unknown→anthropic, the selected
+      provider's variable satisfying the check, **another** provider's variable *not* satisfying it,
+      explicit key beating the environment, blank/whitespace rejection, and missing→unconfigured.
+      8/8 green, clippy clean (0 warnings on the touched file).
 - [ ] Tauri CSP is set to null in gui/src-tauri/tauri.conf.json — not acceptable for a desktop app rendering model output and markdown.
-- [ ] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
+- [x] Tauri Devtools enabled by default in production features (gui/src-tauri/Cargo.toml) — should be removed from default features.
+      *(2026-07-24)* **Removed from `default`.** `default = ["custom-protocol", "devtools"]` meant every
+      release build shipped the webview inspector on an app that renders model output and untrusted
+      markdown. Nothing in `src-tauri/src` references devtools — it was purely the feature flag — and
+      Tauri turns devtools on automatically under `debug_assertions`, so **`tauri dev` is unaffected**;
+      the feature is kept for a deliberate `--features devtools` release build. Verified by a real
+      release rebuild of `nanna-gui` (exit 0, 6m32s).
 - [ ] Tauri shell permissions (allow-open/spawn/kill/execute) for the daemon sidecar need least-privilege review.
 - [~] ROADMAP explicitly lists open items: ~~disabled tools still execute~~ **(done 2026-07-20 — `ToolPolicy` gate, P6)**, ~~deleted tools remain callable until restart~~ **(done 2026-07-17 — `unregister` wiring)**, ~~delete_skill needs hardening against remove_dir_all/symlink races~~ **(done — symlink + canonical-escape guards in `commands/tools.rs`)**, stronger sandboxing needed *(open — OS-level sandbox under the policy layer; see research note below)*.
 - [x] HTTP server defaults to 0.0.0.0:3000 (src/main.rs) — potential footgun if exposed without auth.

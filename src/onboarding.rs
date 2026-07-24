@@ -1,7 +1,7 @@
 //! Onboarding and setup wizard for Nanna.
 
-use console::{style, Emoji};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use console::{Emoji, style};
+use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use nanna_config::{Config, DiscordConfig, SlackConfig, TelegramConfig};
 use std::path::PathBuf;
 
@@ -23,13 +23,53 @@ const BANNER: &str = r"
 
 /// Check if this is a first run (no config exists).
 pub fn is_first_run() -> bool {
-    Config::default_config_path()
-        .map_or(true, |p| !p.exists())
+    Config::default_config_path().map_or(true, |p| !p.exists())
 }
 
-/// Check if API key is configured.
+/// Environment variable that holds the API key for `provider`.
+///
+/// `None` means the provider needs no key at all. A local Ollama server is the case that matters:
+/// a fully-local install is the intended default experience, so it must never be nagged for a
+/// credential it does not use. An unrecognised provider falls back to Anthropic, preserving the
+/// historical behaviour rather than silently declaring an unknown setup "configured".
+fn provider_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "ollama" => None,
+        "openai" => Some("OPENAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        _ => Some("ANTHROPIC_API_KEY"),
+    }
+}
+
+/// Whether a credential is present, given the configured key and a way to read the environment.
+///
+/// Pure so it can be tested without mutating process-global environment variables, which is
+/// unsound under a parallel test runner. A value that is present but blank does not count — an
+/// exported-but-empty `OPENAI_API_KEY` is a misconfiguration, not a credential.
+fn has_api_key_with(
+    provider: &str,
+    configured_key: Option<&str>,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> bool {
+    if configured_key.is_some_and(|key| !key.trim().is_empty()) {
+        return true;
+    }
+    // No variable means the provider needs no key, which counts as configured.
+    provider_api_key_env(provider)
+        .is_none_or(|variable| read_env(variable).is_some_and(|value| !value.trim().is_empty()))
+}
+
+/// Check if an API key is configured for the *selected* provider.
+///
+/// Previously this only ever looked at `ANTHROPIC_API_KEY`, so an `OpenAI` or `OpenRouter` user with
+/// their key exported was told it was missing and re-prompted on every launch, and an Ollama user
+/// was asked for a key that provider has no concept of.
 pub fn has_api_key(config: &Config) -> bool {
-    config.llm.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
+    has_api_key_with(
+        &config.llm.provider,
+        config.llm.api_key.as_deref(),
+        |variable| std::env::var(variable).ok(),
+    )
 }
 
 /// Configure LLM settings (provider, API key, model).
@@ -53,11 +93,9 @@ fn configure_llm(config: &mut Config, theme: &ColorfulTheme) -> anyhow::Result<(
     // API Key
     println!("\n{KEY}{}", style("API Key").bold());
 
-    let env_var = match config.llm.provider.as_str() {
-        "openai" => "OPENAI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        _ => "ANTHROPIC_API_KEY",
-    };
+    // Same mapping `has_api_key` checks against — one definition, so the prompt can never name a
+    // different variable than the one that actually satisfies the check.
+    let env_var = provider_api_key_env(&config.llm.provider).unwrap_or("ANTHROPIC_API_KEY");
 
     let api_key_hint = format!(
         "Enter your {} API key (or set {} env var)",
@@ -272,12 +310,17 @@ pub fn quick_setup(config: &mut Config) -> anyhow::Result<()> {
 
     let theme = ColorfulTheme::default();
 
+    // Ask for the key the *configured* provider actually uses. Hardcoding Anthropic here asked
+    // OpenAI/OpenRouter users for a credential that would never be read back.
+    let provider = config.llm.provider.clone();
+    let env_var = provider_api_key_env(&provider).unwrap_or("ANTHROPIC_API_KEY");
+
     let api_key: String = Password::with_theme(&theme)
-        .with_prompt("Enter your Anthropic API key")
+        .with_prompt(format!("Enter your {provider} API key"))
         .interact()?;
 
-    if api_key.is_empty() {
-        anyhow::bail!("API key is required. Set ANTHROPIC_API_KEY or run 'nanna init'");
+    if api_key.trim().is_empty() {
+        anyhow::bail!("API key is required. Set {env_var} or run 'nanna init'");
     }
 
     config.llm.api_key = Some(api_key);
@@ -362,4 +405,100 @@ pub fn show_status(config: &Config) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_api_key_with, provider_api_key_env};
+    use std::collections::HashMap;
+
+    /// Build an environment reader over a fixed map — never touches the real process env, which
+    /// is global state and unsound to mutate under a parallel test runner.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        move |variable: &str| map.get(variable).cloned()
+    }
+
+    #[test]
+    fn each_cloud_provider_maps_to_its_own_variable() {
+        assert_eq!(provider_api_key_env("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(provider_api_key_env("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(
+            provider_api_key_env("openrouter"),
+            Some("OPENROUTER_API_KEY")
+        );
+    }
+
+    #[test]
+    fn ollama_needs_no_key() {
+        assert_eq!(provider_api_key_env("ollama"), None);
+        // The local-first default must never be blocked on a credential it does not use.
+        assert!(has_api_key_with("ollama", None, env_of(&[])));
+    }
+
+    #[test]
+    fn an_unknown_provider_falls_back_to_anthropic() {
+        assert_eq!(
+            provider_api_key_env("something-else"),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert!(!has_api_key_with("something-else", None, env_of(&[])));
+    }
+
+    #[test]
+    fn the_selected_providers_variable_satisfies_the_check() {
+        // The bug: only ANTHROPIC_API_KEY was ever consulted, so these read as "missing".
+        assert!(has_api_key_with(
+            "openai",
+            None,
+            env_of(&[("OPENAI_API_KEY", "sk-x")])
+        ));
+        assert!(has_api_key_with(
+            "openrouter",
+            None,
+            env_of(&[("OPENROUTER_API_KEY", "or-x")])
+        ));
+    }
+
+    #[test]
+    fn another_providers_variable_does_not_satisfy_the_check() {
+        // Having an Anthropic key does not let an OpenAI-configured install run.
+        assert!(!has_api_key_with(
+            "openai",
+            None,
+            env_of(&[("ANTHROPIC_API_KEY", "sk-ant")])
+        ));
+    }
+
+    #[test]
+    fn an_explicitly_configured_key_wins_over_the_environment() {
+        assert!(has_api_key_with(
+            "openai",
+            Some("sk-configured"),
+            env_of(&[])
+        ));
+    }
+
+    #[test]
+    fn blank_values_are_not_credentials() {
+        assert!(!has_api_key_with("openai", Some("   "), env_of(&[])));
+        assert!(!has_api_key_with(
+            "openai",
+            None,
+            env_of(&[("OPENAI_API_KEY", "")])
+        ));
+        assert!(!has_api_key_with(
+            "openai",
+            None,
+            env_of(&[("OPENAI_API_KEY", "  ")])
+        ));
+    }
+
+    #[test]
+    fn a_missing_variable_reads_as_unconfigured() {
+        assert!(!has_api_key_with("anthropic", None, env_of(&[])));
+    }
 }
