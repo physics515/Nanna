@@ -63,8 +63,12 @@ nanna-config = { path = "../../crates/nanna-config" }
 nanna-tools = { path = "../../crates/nanna-tools", features = ["scripting"] }
 
 [features]
-default = ["custom-protocol", "devtools"]
+default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# NOT in `default`: this feature opens the webview inspector in *release* builds, on an app that
+# renders model output and untrusted markdown. Tauri enables devtools automatically under
+# `debug_assertions`, so `tauri dev` is unaffected — build with `--features devtools` to get the
+# inspector in a release build deliberately.
 devtools = ["tauri/devtools"]
 
 [dev-dependencies]
