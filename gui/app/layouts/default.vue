@@ -191,8 +191,9 @@
       @run="onPaletteRun"
     />
 
-    <!-- Global confirmation dialog -->
-    <ConfirmDialog />
+    <!-- Global confirmation dialog lives in app.vue — mounting a second copy
+         here opens two stacked overlays sharing the useConfirm singleton, and
+         the top one swallows clicks aimed at the bottom one (e2e regression). -->
 
     <!-- First-run onboarding (compressed) -->
     <OnboardingWizard
