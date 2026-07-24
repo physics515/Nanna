@@ -8,7 +8,19 @@
 > clean checklist. Shipped capability is *described* in [`README.md`](README.md); here it is only
 > tracked. Edit surgically; never rewrite wholesale.
 
-**Last updated:** 2026-07-23 (**P13 dreaming unification** — both daemon paths now dream through one
+**Last updated:** 2026-07-24 (**silent-failure sweep + two P1 correctness fixes**. Three bugs of one
+family, each of which failed without ever telling anyone: `<UiSonnerSonner/>` never resolved so the
+toaster never mounted and **every toast in the app was dropped**; `<GroundGlass>` likewise, so glass
+inputs lost their slab; and Settings → Data's **"Delete All Memories" invoked a Tauri command that has
+never existed** — confirm the dialog, nothing happens. All three now have static guards (component
+names vs the Nuxt registry, `invoke()` names vs `generate_handler!`, `UiInput`'s `size` prop) plus an
+e2e that a toast really renders. Verified in the **real Tauri shell over WebDriver**. Also: onboarding
+checked only `ANTHROPIC_API_KEY` — an **Ollama-only install was nagged for a cloud key**; the daemon IPC
+port disagreed with itself (**start bound 9999, status probed 5149**); devtools shipped in release
+builds; `.claude/settings.local.json` was tracked in a public repo. **Toolchain pinned** —
+nightly 2026-07-23 ICEs on release codegen of `tokio`. **Turso 0.6.1 does have SQL vector distance**,
+proven by test — a long-standing roadmap "fact" was wrong.)
+Prior: 2026-07-23 (**P13 dreaming unification** — both daemon paths now dream through one
 `DreamingService`, which restored the **inert testing effect** and closed an unbounded `pending_updates`
 queue; new **no-LLM dedup phase (b)** folds true restatements in every band incl. `Detailed`
 (summarizer calls 6 → 0 at unchanged 0.90 compression / 1.000 recall); scheduled dreaming gained
