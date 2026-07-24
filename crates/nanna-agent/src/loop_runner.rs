@@ -612,11 +612,18 @@ pub const MISSION_MODE_CONTRACT: &str = "\n\n[MISSION MODE] This conversation is
 
 /// Line-anchored mission completion check (mirrors the harness's
 /// `step_claims_completion` contract): `MISSION COMPLETE` must stand on its
-/// own line, so prose *about* the marker doesn't end the run.
+/// own line, so prose *about* the marker doesn't end the run. Trailing
+/// sentence punctuation is tolerated ("MISSION COMPLETE." is a claim);
+/// leading words are not ("All tests pass. MISSION COMPLETE" run-on prose
+/// stays rejected — observed live producing an unbreakable prod loop).
 #[must_use]
 pub fn mission_claims_complete(text: &str) -> bool {
-    text.lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("MISSION COMPLETE"))
+    text.lines().any(|line| {
+        line.trim()
+            .trim_end_matches(['.', '!'])
+            .trim_end()
+            .eq_ignore_ascii_case("MISSION COMPLETE")
+    })
 }
 
 /// Render the escalating auto-continuation prod for mission mode. Injected as
@@ -684,6 +691,52 @@ pub fn mission_verify_message() -> String {
      output. If everything truly passes, output the MISSION COMPLETE line again after the \
      real results. If anything fails, keep working instead."
         .to_string()
+}
+
+/// Continuation prods with an identical tool digest this many times in a
+/// row escalate to the convergence prod. Derivation: observed live (round
+/// 15) the degenerate cycle was unmistakable by its third identical round —
+/// same single test command, same passing output, same run-on completion
+/// prose — while two identical rounds still occur in honest work (rerunning
+/// a suite after reading a file).
+pub const MISSION_REPEAT_ROUNDS_ESCALATE: usize = 3;
+
+/// Identical-digest rounds at which the run ends. Derivation: the
+/// convergence prod fires at 3 and again every round after; by 8 the model
+/// has ignored FIVE explicit loop-break instructions — the same
+/// grinding-not-working evidence standard as [`MISSION_STALL_ROUNDS_MAX`],
+/// with margin for one slow re-verification pass. A bound on grinding,
+/// never on productive work: any round whose tool activity differs resets
+/// the counter.
+pub const MISSION_REPEAT_ROUNDS_MAX: usize = 8;
+
+/// Render the loop-breaking prod for a detected convergence failure: the
+/// model repeats one action with identical results every round (typically
+/// rerunning a passing test and re-claiming victory in prose that never
+/// matches the completion contract). Observed live in round 15: ten
+/// identical rounds in one minute — "All 12 tests pass. MISSION COMPLETE"
+/// embedded mid-sentence, so the line-anchored contract never fired, and
+/// the standard prod sent it straight back to the same test run. This prod
+/// names the repetition, forbids repeating it, and TEACHES the exact
+/// completion format the contract accepts.
+#[must_use]
+pub fn mission_convergence_message(round: usize, repeats: usize, digest: &str) -> String {
+    let anchor = if digest.is_empty() {
+        String::new()
+    } else {
+        format!("\nThe action you keep repeating:\n{digest}\n")
+    };
+    format!(
+        "[MISSION CONTROL round {round} — LOOP DETECTED] You have repeated the same action \
+         {repeats} rounds in a row with IDENTICAL results. Its result will not change; do \
+         NOT run it again.{anchor}\
+         Instead, go through the mission's numbered acceptance items one by one against \
+         your CURRENT files. In ONE short line name the FIRST item that is not truly done, \
+         then immediately do that item with a tool call (for a test suite: one test per \
+         feature — a suite that prints a single PASS line does not cover 12 features). \
+         If and ONLY if every item is verified done, finish by outputting this marker on \
+         its own line with NOTHING else on that line:\nMISSION COMPLETE"
+    )
 }
 
 /// Compact digest of the most recent tool outcomes for prod anchoring.
@@ -1815,7 +1868,32 @@ impl Agent {
                 let claim_unverified = mission_claim
                     && (state.mission_complete_claims == 0
                         || !state.mission_verified_since_claim);
+                // Convergence-loop fingerprint: a continuation round whose
+                // tool digest is byte-identical to the previous round's did
+                // no new work, whatever its tool count. Track BEFORE the
+                // stall gate so the repeat bound can end the run.
+                if options.mission_mode && (claim_unverified || !mission_claim) {
+                    let digest_now = mission_tool_digest(&state.tool_records);
+                    if !digest_now.is_empty() && digest_now == state.mission_last_digest {
+                        state.mission_repeat_rounds += 1;
+                    } else {
+                        state.mission_repeat_rounds = 0;
+                        state.mission_last_digest = digest_now;
+                    }
+                }
                 if options.mission_mode
+                    && (claim_unverified || !mission_claim)
+                    && state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_MAX
+                {
+                    warn!(
+                        rounds = state.mission_rounds,
+                        repeats = state.mission_repeat_rounds,
+                        "🧭 Mission mode: {} identical rounds despite loop-break prods — ending run",
+                        state.mission_repeat_rounds
+                    );
+                    // Fall through to the normal exit below: the run ends
+                    // with done semantics and the partial work persists.
+                } else if options.mission_mode
                     && (claim_unverified || !mission_claim)
                     && state.mission_stall_rounds < MISSION_STALL_ROUNDS_MAX
                 {
@@ -1837,6 +1915,15 @@ impl Agent {
 
                     let prod = if claim_unverified {
                         mission_verify_message()
+                    } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
+                        // Identical rounds: the standard prod would send the
+                        // model straight back into the same action — break
+                        // the loop by naming it and teaching the contract.
+                        mission_convergence_message(
+                            state.mission_rounds,
+                            state.mission_repeat_rounds,
+                            &state.mission_last_digest,
+                        )
                     } else {
                         // Live disk anchor: the registry's session-aware
                         // workdir is where the model is actually working
@@ -1862,8 +1949,11 @@ impl Agent {
                             &serde_json::json!({
                                 "round": state.mission_rounds,
                                 "stall_rounds": state.mission_stall_rounds,
+                                "repeat_rounds": state.mission_repeat_rounds,
                                 "reason": if claim_unverified {
                                     "MISSION COMPLETE claimed without verification"
+                                } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
+                                    "convergence loop detected — identical rounds"
                                 } else {
                                     "model stopped without MISSION COMPLETE"
                                 },
@@ -3894,6 +3984,16 @@ struct RunState {
     mission_complete_claims: usize,
     /// Mission mode: whether any tool ran since the last completion claim.
     mission_verified_since_claim: bool,
+    /// Mission mode: digest of the tool activity at the last continuation
+    /// prod — the convergence-loop fingerprint (see `mission_repeat_rounds`).
+    mission_last_digest: String,
+    /// Mission mode: consecutive continuation prods fired with an IDENTICAL
+    /// tool digest. The stall counter above only bounds tool-FREE grinding;
+    /// observed live (round 15): a model can loop forever at one tool call
+    /// per round — rerunning the same passing test and re-claiming victory
+    /// in prose that never matches the completion contract — and the stall
+    /// counter resets every round. This counter bounds THAT loop.
+    mission_repeat_rounds: usize,
 }
 
 impl RunState {
@@ -3923,6 +4023,8 @@ impl RunState {
             mission_stall_rounds: 0,
             mission_complete_claims: 0,
             mission_verified_since_claim: false,
+            mission_last_digest: String::new(),
+            mission_repeat_rounds: 0,
         }
     }
 
@@ -4038,6 +4140,38 @@ mod tests {
         ));
         assert!(!mission_claims_complete("The mission is complete-ish"));
         assert!(!mission_claims_complete(""));
+    }
+
+    #[test]
+    fn mission_claims_tolerate_trailing_punctuation_but_not_runon_prose() {
+        // Trailing sentence punctuation is an accepted claim…
+        assert!(mission_claims_complete("MISSION COMPLETE."));
+        assert!(mission_claims_complete("all done\nMISSION COMPLETE!"));
+        // …but the round-15 run-on prose is not: the marker embedded
+        // mid-sentence never ends the run.
+        assert!(!mission_claims_complete(
+            "All 12 tests pass. MISSION COMPLETE All 10 tests pass."
+        ));
+        assert!(!mission_claims_complete("end with MISSION COMPLETE when done"));
+    }
+
+    #[test]
+    fn mission_convergence_prod_names_the_loop_and_teaches_the_marker() {
+        let prod = mission_convergence_message(12, 4, "- exec ok: PASS: add");
+        assert!(prod.contains("LOOP DETECTED"));
+        assert!(prod.contains("round 12"));
+        assert!(prod.contains("4 rounds"));
+        // Carries the repeated action as evidence…
+        assert!(prod.contains("PASS: add"));
+        // …forbids repeating it…
+        assert!(prod.contains("do \nNOT run it again") || prod.contains("NOT run it again"));
+        // …and teaches the exact accepted format: marker alone on a line.
+        assert!(prod.contains("NOTHING else on that line"));
+        assert!(prod.ends_with("MISSION COMPLETE"));
+        // Digest section omitted when empty, still well-formed.
+        let bare = mission_convergence_message(3, 3, "");
+        assert!(!bare.contains("keep repeating:\n\n"));
+        assert!(bare.contains("LOOP DETECTED"));
     }
 
     #[test]
