@@ -1384,6 +1384,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             Sequence it that way — measure SQL-side exact k-NN against the current in-RAM SIMD scan on the
             `nanna-memory::retention` harness *first*, since it is exact (no recall trade to prove) and
             drops the RAM ceiling; only then decide whether ANN is still needed.
+            *(2026-07-24)* **Proven, not just read — `crates/nanna-storage/tests/vector_functions.rs`.**
+            A registered SQL function is not a working one, and this decision is too load-bearing to rest
+            on a source grep, so 3 tests now assert it end to end through the pinned dependency:
+            `vector_distance_cos` returns **0** for identical, **1** for orthogonal and **2** for opposed
+            vectors and is **scale-invariant** (`[1,2,3,4]` vs `[10,20,30,40]` → 0, the property that makes
+            cosine the right metric for embeddings); `ORDER BY vector_distance_cos(embedding, ?)` over a
+            real table **ranks correctly** (the far row is the query's opposite, so a constant-returning or
+            rowid-ordered kernel could not fake the result); and a stored vector **round-trips** through
+            `vector_extract` at full dimensionality, which matters because clustering and dedup still need
+            the raw vector back. 3/3 green, clippy clean. The remaining work is the measurement, not the
+            feasibility. The corresponding false claim in the `daily-dev` Appendix C is fixed in the same
+            commit.
       - [ ] *(research 2026-07-24)* **Deleting a memory must actually destroy its embedding — "Ghost Vectors"
             (arXiv [2606.18497](https://arxiv.org/abs/2606.18497)).** Embeddings soft-deleted/tombstoned in an
             HNSW store stay **physically present in the raw index files** and are invertible back to their
