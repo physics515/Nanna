@@ -1,8 +1,8 @@
 export default {
   name: "write_file",
-  version: "0.1.10",
+  version: "0.1.11",
   output: "context",
-  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the existing file size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
+  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the largest size the file has held (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
     type: "object",
     properties: {
@@ -17,6 +17,87 @@ export default {
     // models read as corruption and spiral on.
     function fail(message) {
       return { content: message, success: false };
+    }
+
+    // Anti-erosion ratchet (round-17 lesson): the 30% shrink floor used to be
+    // relative to the CURRENT size, so repeated 60-80% rewrites during fault
+    // storms compounded (0.7^n) and slowly hollowed files out without ever
+    // tripping the guard. The floor is now 30% of the LARGEST size the file
+    // has held, tracked per workspace in .nanna/write_hiwater.json (.nanna/
+    // is the non-markdown local-state dir — never beside user files, so no
+    // sidecar clutter). Each entry stores {hi, last, at}: `hi` is the
+    // high-water mark, `last` is the size write_file ITSELF last left on
+    // disk. The history is only trusted while write_file is the sole
+    // mutator: if the disk size no longer equals `last`, another actor
+    // (edit_file, file_buffer, exec, the user) changed the file
+    // deliberately, and the guard RE-BASES to disk truth instead of judging
+    // against a size that no longer exists — a stale mark must never refuse
+    // a write that the disk state itself would allow (verify-round blocker:
+    // grow-writes after an out-of-band shrink looped forever). Every state
+    // operation fails OPEN: a missing or corrupt state file degrades to the
+    // old current-size behavior, never blocks a write.
+    var HIWATER_STATE = ".nanna/write_hiwater.json";
+    // Bound: the state file must stay trivially small over an unbounded
+    // daemon lifetime; missions touch tens of files, so 200 entries with
+    // least-recently-updated eviction loses nothing real.
+    var HIWATER_MAX_ENTRIES = 200;
+    function hiwaterKey(path) {
+      // Slash/case normalization plus "./" stripping only. Deliberately NO
+      // workspace-root resolution (that lives on the Rust side): an aliased
+      // spelling of the same file gets an independent entry whose `last`
+      // never matches disk, so it re-bases to current-size behavior — it
+      // costs a little ratchet strength, never a false refusal. Lowercase is
+      // correct here because this daemon targets Windows paths.
+      var k = path.split("\\").join("/").toLowerCase();
+      while (k.indexOf("./") === 0) k = k.substring(2);
+      while (k.indexOf("//") !== -1) k = k.split("//").join("/");
+      return k;
+    }
+    // Transient park buffers and the ratchet's own state file must never be
+    // judged by (or recorded in) cross-call history: buffers are rewritten
+    // wholesale every park cycle, and a guard on the state file would block
+    // its own repair once it grows past the floor gate.
+    function hiwaterExempt(key) {
+      var buf = ".__buffer__";
+      if (key.length >= buf.length && key.lastIndexOf(buf) === key.length - buf.length) return true;
+      var st = "write_hiwater.json";
+      if (key.length >= st.length && key.lastIndexOf(st) === key.length - st.length) return true;
+      return false;
+    }
+    function hiwaterLoad() {
+      try {
+        var raw = Nanna.readFile(HIWATER_STATE);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+        }
+      } catch (e) {
+        // Missing or corrupt state: start fresh.
+      }
+      return {};
+    }
+    function hiwaterHi(entry) {
+      if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > 0) return entry.hi;
+      return 0;
+    }
+    function hiwaterLast(entry) {
+      if (entry && typeof entry.last === "number" && isFinite(entry.last) && entry.last >= 0) return entry.last;
+      return -1;
+    }
+    function hiwaterSave(map) {
+      try {
+        var keys = Object.keys(map);
+        if (keys.length > HIWATER_MAX_ENTRIES) {
+          keys.sort(function(a, b) {
+            return ((map[a] && map[a].at) || 0) - ((map[b] && map[b].at) || 0);
+          });
+          var evict = keys.length - HIWATER_MAX_ENTRIES;
+          for (var i = 0; i < evict; i++) delete map[keys[i]];
+        }
+        Nanna.writeFile(HIWATER_STATE, JSON.stringify(map));
+      } catch (e) {
+        // State persistence is best-effort.
+      }
     }
 
     // Refuse ANY .py content that does not parse — new file or overwrite.
@@ -69,30 +150,70 @@ export default {
     if (fileContent === undefined || fileContent === null) {
       return fail("write_file failed: missing content. Nothing was written. Call write_file again with file_path=\"" + filePath + "\" AND content set to the COMPLETE file text.");
     }
+    if (typeof filePath !== "string") filePath = String(filePath);
+    if (typeof fileContent !== "string") fileContent = String(fileContent);
 
     var bytes = fileContent.length;
 
     // Safety check BEFORE writing: block if new content is drastically smaller
-    // than existing file. This prevents the model from accidentally overwriting
-    // a large file with truncated/compressed content when it lost context.
+    // than the file has ever been WHILE write_file was its only mutator. This
+    // prevents the model from overwriting a large file with truncated content
+    // when it lost context, AND (via the high-water base) from eroding it
+    // across many individually-"acceptable" shrinks. Three invariants from
+    // the adversarial verify round: a write that does not shrink the CURRENT
+    // disk file can never erode it, so it is never refused; a file that was
+    // changed out-of-band since our last write re-bases to disk truth; a file
+    // that no longer exists has nothing left to protect — creation is always
+    // allowed and re-arms the ratchet from the new size.
+    var existingSize = 0;
+    var fileExists = false;
+    var existsUnknown = false;
     if (!input.force) {
-      var existingSize = 0;
       try {
         var existing = Nanna.readFile(filePath);
-        if (existing) existingSize = existing.length;
+        if (existing !== undefined && existing !== null) {
+          fileExists = true;
+          existingSize = existing.length;
+        }
       } catch (e) {
-        // File doesn't exist yet, no check needed
+        // "os error 2"/"os error 3" = the file genuinely doesn't exist. Any
+        // OTHER read failure (sharing violation, non-UTF-8) means the file is
+        // probably THERE but unreadable: fail open on the guard, but flag it
+        // so the ratchet state is left untouched (verify finding: a transient
+        // lock must not reset the mark to the new small size).
+        var readErr = String(e);
+        if (readErr.indexOf("os error 2") === -1 && readErr.indexOf("os error 3") === -1) {
+          existsUnknown = true;
+        }
       }
 
-      if (existingSize > 500 && bytes < existingSize * 0.3) {
+      var hwKeyGuard = hiwaterKey(filePath);
+      var hwBase = existingSize;
+      if (fileExists && !hiwaterExempt(hwKeyGuard)) {
+        var hwEntry = hiwaterLoad()[hwKeyGuard];
+        var hwHi = hiwaterHi(hwEntry);
+        // History is live only if the disk still holds exactly what OUR last
+        // write left there; otherwise another tool/user re-shaped the file
+        // deliberately and the stale mark must not judge this write.
+        if (hwHi > hwBase && hiwaterLast(hwEntry) === existingSize) {
+          hwBase = hwHi;
+        }
+      }
+
+      if (hwBase > 500 && bytes < existingSize && bytes < hwBase * 0.3) {
+        var sizeStory = "currently holds " + existingSize + " bytes";
+        if (hwBase > existingSize) {
+          sizeStory = "holds " + existingSize + " bytes now and has held " + hwBase + " bytes before";
+        }
         return {
           content: "WRITE REFUSED — the file was NOT modified and is fully intact. " +
             "You tried to write only " + bytes + " bytes over " + filePath +
-            " which currently holds " + existingSize + " bytes (" +
-            Math.round(bytes / existingSize * 100) + "% of it). That usually means " +
+            " which " + sizeStory + " (" +
+            Math.round(bytes / hwBase * 100) + "% of that). That usually means " +
             "you sent a fragment instead of the whole file. For a small change, use " +
             "edit_file instead: edit_file(file_path=\"" + filePath + "\", old_string=<the exact current text>, " +
             "new_string=<your replacement>) — it changes just that snippet and leaves the rest untouched. " +
+            "To remove a section, edit_file with new_string=\"\". " +
             "Only if you truly mean to replace the WHOLE file: (1) read_file " + filePath + ", " +
             "(2) merge your change into the FULL text, (3) call write_file again with the complete content.",
           success: false
@@ -198,6 +319,35 @@ export default {
       var writeErr = String(e2);
       if (writeErr.length > 120) writeErr = writeErr.substring(0, 120) + "...";
       return fail("write_file failed writing " + filePath + " (" + writeErr + "). Retry the same call; if it fails again, read_file to verify the file state.");
+    }
+
+    // Ratchet update AFTER a successful write. In-band writes only ever
+    // raise the high-water mark (so fluctuating rewrites stay pinned to the
+    // peak — a grow-write must NOT re-base, or shrink/grow alternation
+    // launders the ratchet). Force and creation-over-missing RESET it: both
+    // are deliberate re-shapes with nothing stale worth protecting. A write
+    // over a file that changed out-of-band re-bases to disk truth. And when
+    // the pre-write read failed for unknown reasons, the state is left
+    // completely alone — the next successful write re-bases naturally via
+    // the last-mismatch path.
+    if (!existsUnknown) {
+      try {
+        var hwMap = hiwaterLoad();
+        var hwKey = hiwaterKey(filePath);
+        if (!hiwaterExempt(hwKey)) {
+          var hwPrevEntry = hwMap[hwKey];
+          var hwNext = bytes > existingSize ? bytes : existingSize;
+          if (!input.force && fileExists && hiwaterLast(hwPrevEntry) === existingSize) {
+            var hwPrevHi = hiwaterHi(hwPrevEntry);
+            if (hwPrevHi > hwNext) hwNext = hwPrevHi;
+          }
+          if (input.force || !fileExists) hwNext = bytes;
+          hwMap[hwKey] = { hi: hwNext, last: bytes, at: Date.now() };
+          hiwaterSave(hwMap);
+        }
+      } catch (eHw) {
+        // Best-effort; the user's write already succeeded.
+      }
     }
 
     // Deliberately NO echo of the written content: echoing the whole file
