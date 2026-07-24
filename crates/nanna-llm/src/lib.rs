@@ -3337,6 +3337,23 @@ impl LlmClient {
                             // next_block_index not needed after this
                         }
 
+                        // Emit usage. Ollama reports BOTH sides only in the
+                        // final done message: prompt_eval_count (input) and
+                        // eval_count (output). The prompt side rides a late
+                        // MessageStart — the stream consumer records it by
+                        // assignment wherever it appears, and Ollama streams
+                        // never emit an earlier one. Omitting it zeroed
+                        // every per-request input count downstream (run
+                        // benchmarks and the context-usage indicator).
+                        if let Some(prompt_eval) = obj["prompt_eval_count"].as_u64() {
+                            yield Ok(StreamEvent::MessageStart {
+                                id: String::new(),
+                                model: obj["model"].as_str().unwrap_or("").to_string(),
+                                input_tokens: prompt_eval as u32,
+                                cache_read_tokens: 0,
+                                cache_creation_tokens: 0,
+                            });
+                        }
                         // Emit output token count
                         if let Some(eval_count) = obj["eval_count"].as_u64() {
                             yield Ok(StreamEvent::MessageDelta {
