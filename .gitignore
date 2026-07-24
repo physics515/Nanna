@@ -31,3 +31,11 @@ nul
 
 # Local Playwright run scratch
 playwright-run/
+
+# Local Claude Code state + secrets that must never be committed
+.claude/settings.local.json
+gui/src-tauri/memory/
+*.key
+*.pem
+.env
+.env.*
