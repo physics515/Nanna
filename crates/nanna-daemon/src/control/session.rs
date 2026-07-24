@@ -67,10 +67,14 @@ impl ControlPlane {
             }
             SessionAction::History { id, limit, before: _ } => {
                 if let Some(session) = self.sessions.get(&id).await {
-                    // Get last N messages (reversed to get newest first), then reverse back to chronological
+                    // No limit = the WHOLE session. A long-horizon run's chat
+                    // page must be able to reload every message after
+                    // navigation — a silent default cap made remounts drop
+                    // history (observed live: a 4-hour mission showing only
+                    // its final slice).
                     let mut messages: Vec<_> = session.messages.iter()
                         .rev()
-                        .take(limit.unwrap_or(50))
+                        .take(limit.unwrap_or(usize::MAX))
                         .cloned()
                         .collect();
                     messages.reverse(); // Back to chronological order (oldest first)
@@ -88,9 +92,9 @@ impl ControlPlane {
                     json!({ "error": "not_found", "message": format!("Session {} not found", id) })
                 }
             }
-            SessionAction::GetRunState { id } => {
+            SessionAction::GetRunState { id, light } => {
                 if let Some(ref agent) = self.agent {
-                    let state = agent.get_run_state(&id, &self.sessions).await;
+                    let state = agent.get_run_state(&id, &self.sessions, !light).await;
                     serde_json::to_value(state).unwrap_or(json!({ "is_running": false }))
                 } else {
                     json!({ "is_running": false })

@@ -902,7 +902,12 @@ impl DaemonServer {
             match storage.list_checkpoints().await {
                 Ok(checkpoint_ids) => {
                     for session_id in checkpoint_ids {
-                        // Load checkpoint data from DB and parse it
+                        // Load checkpoint data from DB and parse it. The
+                        // checkpoint is deleted only after a SUCCESSFUL
+                        // recovery (or when it holds nothing recoverable) —
+                        // deleting before/regardless of the parse made any
+                        // recovery failure a permanent data loss.
+                        let mut recovered = false;
                         if let Ok(Some(data)) = storage.load_checkpoint(&session_id).await {
                             if let Some(partial) = agent.recover_checkpoint_from_data(&data) {
                                 let reasoning = partial.reasoning.clone();
@@ -913,17 +918,30 @@ impl DaemonServer {
                                         &partial.content,
                                         partial.tool_calls,
                                         reasoning,
+                                        partial.timeline,
+                                        partial.usage,
                                     )
                                     .await;
                                 info!("Recovered crashed run for session {}", session_id);
+                                recovered = true;
+                            } else if serde_json::from_str::<serde_json::Value>(&data).is_ok() {
+                                // Parsed fine but held nothing recoverable —
+                                // an empty checkpoint is safe to clean up.
+                                recovered = true;
+                            } else {
+                                warn!(
+                                    "Checkpoint for session {} did not parse — keeping it for manual inspection",
+                                    session_id
+                                );
                             }
                         }
-                        // Clean up the checkpoint
-                        if let Err(e) = storage.delete_checkpoint(&session_id).await {
-                            warn!(
-                                "Failed to delete checkpoint for session {}: {}",
-                                session_id, e
-                            );
+                        if recovered {
+                            if let Err(e) = storage.delete_checkpoint(&session_id).await {
+                                warn!(
+                                    "Failed to delete checkpoint for session {}: {}",
+                                    session_id, e
+                                );
+                            }
                         }
                     }
                 }
@@ -952,6 +970,8 @@ impl DaemonServer {
                                             &partial.content,
                                             partial.tool_calls,
                                             reasoning,
+                                            partial.timeline,
+                                            partial.usage,
                                         )
                                         .await;
                                     info!(

@@ -174,14 +174,34 @@ impl ControlPlane {
                     .collect();
                 match agent.chat_in_workspace(&session_id, &content, Some(system_prompt), &prior_messages, effective_ws_id.clone(), image_attachments).await {
                     Ok(result) => {
-                        // Add assistant response to session with tool calls and reasoning
+                        // Add assistant response to session with tool calls,
+                        // reasoning, and the run's chronological timeline.
+                        // When the timeline is present it already carries
+                        // every tool outcome — persisting outputs AGAIN in
+                        // the flat records would double the metadata row for
+                        // no reader (the UI renders the timeline; stats are
+                        // recorded from the in-memory copy below).
                         let reasoning = result.reasoning.clone();
+                        let persisted_tool_calls = if result.timeline.is_empty() {
+                            result.tool_calls.clone()
+                        } else {
+                            result.tool_calls.iter().map(|tc| crate::session::ToolCallRecord {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                input: serde_json::Value::Null,
+                                output: None,
+                                success: tc.success,
+                                duration_ms: tc.duration_ms,
+                            }).collect()
+                        };
                         self.sessions.add_full_message(
                             &session_id,
                             MessageRole::Assistant,
                             &result.content,
-                            result.tool_calls.clone(),
+                            persisted_tool_calls,
                             reasoning,
+                            result.timeline.clone(),
+                            result.usage.clone(),
                         ).await;
 
                         // Record tool stats for each tool call
@@ -234,10 +254,13 @@ impl ControlPlane {
                             "content": result.content,
                             "tool_calls": result.tool_calls,
                             "reasoning": result.reasoning,
+                            "timeline": result.timeline,
                             "usage": {
                                 "input_tokens": result.input_tokens,
                                 "output_tokens": result.output_tokens
-                            }
+                            },
+                            // Run-scoped benchmark totals (across healing attempts)
+                            "run_usage": result.usage,
                         })
                     }
                     Err(e) => {
@@ -249,12 +272,26 @@ impl ControlPlane {
                                 partial.content.len()
                             );
                             let reasoning = partial.reasoning.clone();
+                            let persisted_tool_calls = if partial.timeline.is_empty() {
+                                partial.tool_calls.clone()
+                            } else {
+                                partial.tool_calls.iter().map(|tc| crate::session::ToolCallRecord {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    input: serde_json::Value::Null,
+                                    output: None,
+                                    success: tc.success,
+                                    duration_ms: tc.duration_ms,
+                                }).collect()
+                            };
                             self.sessions.add_full_message(
                                 &session_id,
                                 MessageRole::Assistant,
                                 &partial.content,
-                                partial.tool_calls.clone(),
+                                persisted_tool_calls,
                                 reasoning,
+                                partial.timeline.clone(),
+                                partial.usage.clone(),
                             ).await;
 
                             json!({

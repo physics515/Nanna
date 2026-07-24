@@ -253,8 +253,15 @@ pub enum SessionAction {
     Switch { id: String },
     /// Fork a session (create copy)
     Fork { id: String, name: Option<String> },
-    /// Get current execution state (in-flight streaming text, active tools)
-    GetRunState { id: String },
+    /// Get current execution state (in-flight streaming text, active tools).
+    /// `light: true` omits the run journal (timeline) — for cheap periodic
+    /// polls that only need counters; a full snapshot of a multi-hour run
+    /// clones and ships megabytes.
+    GetRunState {
+        id: String,
+        #[serde(default)]
+        light: bool,
+    },
     /// Set/change the workspace for a session (None = make global)
     SetWorkspace {
         id: String,
@@ -665,6 +672,12 @@ pub enum Event {
         input: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Tokens spent by the LLM request that issued this call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<u64>,
+        /// Run-total tokens spent when this call was issued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_tokens: Option<u64>,
     },
     ToolEnd {
         session_id: String,
@@ -773,6 +786,10 @@ pub enum Event {
     Error {
         code: String,
         message: String,
+        /// The session the error belongs to, when known. Clients must not
+        /// attribute session-less errors to whatever session is open.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
 
     // Client connection events

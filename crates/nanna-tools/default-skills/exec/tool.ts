@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.2",
+  version: "0.1.3",
   output: "context",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -94,7 +94,27 @@ export default {
       };
     }
 
-    var result = Nanna.exec(input.command, input.workdir, input.timeout);
+    // Bridge failures (spawn errors, bad workdir, missing files) must be
+    // RETURNED, not thrown — a thrown error reaches the model under five
+    // stacked "Execution failed:" prefixes (observed live: os error 267 in
+    // a retry loop). Name the likely cause so the retry is a correction.
+    var result;
+    try {
+      result = Nanna.exec(input.command, input.workdir, input.timeout);
+    } catch (e) {
+      var bridgeErr = String(e && e.message ? e.message : e);
+      if (bridgeErr.length > 200) bridgeErr = bridgeErr.substring(0, 200);
+      var hint = "";
+      if (bridgeErr.indexOf("directory name is invalid") !== -1 || bridgeErr.indexOf("os error 267") !== -1) {
+        hint = " The workdir you passed ('" + (input.workdir || "") + "') is not a valid directory — pass an existing DIRECTORY (not a file path), or omit workdir to use the workspace default.";
+      } else if (bridgeErr.indexOf("cannot find the file") !== -1 || bridgeErr.indexOf("os error 2") !== -1) {
+        hint = " A path in the command or workdir does not exist — check it with ls, then retry.";
+      }
+      return {
+        content: "exec could not start the command (" + bridgeErr + ")." + hint + " Nothing ran; retry with the correction.",
+        success: false
+      };
+    }
 
     var output = result.stdout;
     if (result.stderr) {

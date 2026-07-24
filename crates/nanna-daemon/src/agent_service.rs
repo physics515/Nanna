@@ -4,7 +4,7 @@
 
 use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
-use crate::session::{MessageRole, SessionId, SessionMessage, ToolCallRecord};
+use crate::session::{MessageRole, RunUsage, SessionId, SessionMessage, TimelineItem, ToolCallRecord};
 use nanna_agent::{Agent, AgentConfig, ModelTier, RunOptions, ThinkingMode};
 use nanna_llm::{AnthropicMessage, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
@@ -121,6 +121,140 @@ struct ActiveChat {
     active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
     /// Tool calls completed during this run (before final message)
     completed_tool_calls: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+    /// RUN-scoped chronological journal (thinking / text / tool / fault
+    /// items, in order). Unlike the buffers above — which are cleared at
+    /// every healing-attempt start — this survives attempt restarts, so a
+    /// client that remounts mid-run (or reads the persisted message later)
+    /// sees the WHOLE run, not just the slice since the last 502.
+    ///
+    /// A std::sync::Mutex, deliberately: the journal is the primary render
+    /// source, so appends must be INFALLIBLE. An earlier try_write design
+    /// silently dropped items whenever a snapshot clone held the lock —
+    /// which fused text across healed attempts (the Fault seam vanished)
+    /// and lost stream deltas. Every critical section here is a short
+    /// push/merge or a clone; none awaits while holding the lock.
+    timeline: Arc<std::sync::Mutex<Vec<TimelineItem>>>,
+    /// RUN-scoped token totals (input, output), accumulated per LLM request
+    /// across every healing attempt — the honest denominator for
+    /// benchmarking a model on a task.
+    run_input_tokens: Arc<std::sync::atomic::AtomicU64>,
+    run_output_tokens: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Journal outputs are capped at this many bytes. Derivation: tool results
+/// over `context_result_threshold` (2000) are already stubbed/truncated for
+/// the MODEL; the journal keeps 2× that so a chip can show meaningfully
+/// more than the model's stub, while a thousand-call mission's journal
+/// (persisted per message, shipped on remount) stays bounded.
+const TIMELINE_OUTPUT_CAP: usize = 4000;
+
+/// Lock the journal, surviving a poisoned mutex (a panicking thread must
+/// not erase the run's record — the data inside is still valid).
+fn timeline_lock(
+    timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
+) -> std::sync::MutexGuard<'_, Vec<TimelineItem>> {
+    timeline.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Append a delta to the open trailing segment of `kind`, or start a new
+/// segment. Segments close implicitly: any other item appended after them
+/// makes them no longer the tail. Infallible — see the field doc for why
+/// this must never silently drop.
+fn timeline_append_segment(
+    timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
+    chunk: &str,
+    thinking: bool,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    let mut items = timeline_lock(timeline);
+    match items.last_mut() {
+        Some(TimelineItem::Thinking { content, .. }) if thinking => content.push_str(chunk),
+        Some(TimelineItem::Text { content, .. }) if !thinking => content.push_str(chunk),
+        _ => {
+            let at = chrono::Utc::now().to_rfc3339();
+            items.push(if thinking {
+                TimelineItem::Thinking { content: chunk.to_string(), at }
+            } else {
+                TimelineItem::Text { content: chunk.to_string(), at }
+            });
+        }
+    }
+}
+
+/// Record a tool call starting (input captured; outcome back-filled on end).
+/// `tokens` = spend of the LLM request that issued the call; `total_tokens`
+/// = run total at that moment (0 means "unknown" and is stored as None).
+fn timeline_tool_start(
+    timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
+    call_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    tokens: u64,
+    total_tokens: u64,
+) {
+    timeline_lock(timeline).push(TimelineItem::Tool {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        input: Some(input.clone()),
+        output: None,
+        success: None,
+        duration_ms: None,
+        tokens: (tokens > 0).then_some(tokens),
+        total_tokens: (total_tokens > 0).then_some(total_tokens),
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+/// Cap a journal output with a self-describing marker (never a silent cut).
+fn timeline_cap_output(output: &str) -> String {
+    if output.len() <= TIMELINE_OUTPUT_CAP {
+        return output.to_string();
+    }
+    let total = output.len();
+    format!(
+        "{} …[journal shows the first {TIMELINE_OUTPUT_CAP} of {total} bytes ONLY to keep the run record bounded — the tool call itself ran to completion and the full result was delivered where it belongs]",
+        truncate(output, TIMELINE_OUTPUT_CAP)
+    )
+}
+
+/// Back-fill a tool call's outcome. Only OPEN items (no output yet) match:
+/// Ollama synthesizes call ids per response (`toolu_00000000`, …), so the
+/// same id recurs across iterations — matching a completed record would
+/// overwrite an EARLIER call's outcome with this one's. If no open match
+/// exists (start was never journaled), a fresh item records the outcome so
+/// the call can never vanish from the run record.
+fn timeline_tool_end(
+    timeline: &Arc<std::sync::Mutex<Vec<TimelineItem>>>,
+    call_id: &str,
+    name: &str,
+    output: &str,
+    ok: bool,
+    duration: u64,
+) {
+    let mut items = timeline_lock(timeline);
+    for item in items.iter_mut().rev() {
+        if let TimelineItem::Tool { call_id: id, output: out, success, duration_ms, .. } = item {
+            if id == call_id && out.is_none() {
+                *out = Some(timeline_cap_output(output));
+                *success = Some(ok);
+                *duration_ms = Some(duration);
+                return;
+            }
+        }
+    }
+    items.push(TimelineItem::Tool {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        input: None,
+        output: Some(timeline_cap_output(output)),
+        success: Some(ok),
+        duration_ms: Some(duration),
+        tokens: None,
+        total_tokens: None,
+        at: chrono::Utc::now().to_rfc3339(),
+    });
 }
 
 /// Info about a tool call currently executing
@@ -149,6 +283,12 @@ pub struct RunStateSnapshot {
     pub accumulated_thinking: String,
     pub active_tool_calls: Vec<ActiveToolCallInfo>,
     pub completed_tool_calls: Vec<CompletedToolCallInfo>,
+    /// The run's chronological journal — see [`ActiveChat::timeline`].
+    pub timeline: Vec<TimelineItem>,
+    /// Live token totals so far this run (input, output) — benchmark data
+    /// visible before the run completes.
+    pub run_input_tokens: u64,
+    pub run_output_tokens: u64,
     pub started_at: Option<String>,
     /// Total completed messages in session (for sync verification)
     pub message_count: usize,
@@ -426,6 +566,13 @@ impl AgentService {
         let accumulated_thinking = Arc::new(tokio::sync::RwLock::new(String::new()));
         let active_tools = Arc::new(tokio::sync::RwLock::new(Vec::<ActiveToolCallInfo>::new()));
         let completed_tools = Arc::new(tokio::sync::RwLock::new(Vec::<CompletedToolCallInfo>::new()));
+        let timeline = Arc::new(std::sync::Mutex::new(Vec::<TimelineItem>::new()));
+        let run_input_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let run_output_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Spend of the most recent LLM request — the "cost of the action"
+        // stamped onto tool calls that request issues.
+        let last_request_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let run_started = std::time::Instant::now();
         let cancellation_flag = Arc::new(AtomicBool::new(false));
 
         // Register this chat as active (for streaming state tracking)
@@ -440,6 +587,9 @@ impl AgentService {
                 accumulated_thinking: accumulated_thinking.clone(),
                 active_tool_calls: active_tools.clone(),
                 completed_tool_calls: completed_tools.clone(),
+                timeline: timeline.clone(),
+                run_input_tokens: run_input_tokens.clone(),
+                run_output_tokens: run_output_tokens.clone(),
             });
         }
 
@@ -629,11 +779,16 @@ impl AgentService {
             let has_memory = memory_for_extraction.is_some();
 
             let accumulated_for_cb = accumulated.clone();
+            let timeline_for_text = timeline.clone();
             let event_tx_thinking = self.event_tx.clone();
             let session_id_thinking = session_id.to_string();
             let event_tx_tool_start = self.event_tx.clone();
             let session_id_tool_start = session_id.to_string();
             let active_tools_for_cb = active_tools.clone();
+            let timeline_for_tool_start = timeline.clone();
+            let tokens_last_for_tool_start = last_request_tokens.clone();
+            let tokens_in_for_tool_start = run_input_tokens.clone();
+            let tokens_out_for_tool_start = run_output_tokens.clone();
             let options = RunOptions {
                 cancellation_flag: Some(cancellation_flag.clone()),
                 on_text: Some(Box::new(move |chunk: &str| {
@@ -641,6 +796,7 @@ impl AgentService {
                     if let Ok(mut buf) = accumulated_for_cb.try_write() {
                         buf.push_str(chunk);
                     }
+                    timeline_append_segment(&timeline_for_text, chunk, false);
                     let _ = event_tx.send(Event::MessageDelta {
                         session_id: session_id_for_stream.clone(),
                         message_id: String::new(),
@@ -649,11 +805,13 @@ impl AgentService {
                 })),
                 on_thinking: Some(Box::new({
                     let accumulated_thinking = accumulated_thinking.clone();
+                    let timeline_for_thinking = timeline.clone();
                     move |chunk: &str| {
                         // Accumulate thinking for run state recovery
                         if let Ok(mut buf) = accumulated_thinking.try_write() {
                             buf.push_str(chunk);
                         }
+                        timeline_append_segment(&timeline_for_thinking, chunk, true);
                         let _ = event_tx_thinking.send(Event::ThinkingDelta {
                             session_id: session_id_thinking.clone(),
                             delta: chunk.to_string(),
@@ -669,12 +827,20 @@ impl AgentService {
                             started_at: chrono::Utc::now(),
                         });
                     }
+                    // Cost of the action: the issuing request's spend, plus
+                    // the run total at this moment (benchmark breadcrumbs).
+                    let action_tokens = tokens_last_for_tool_start.load(Ordering::Relaxed);
+                    let total_tokens = tokens_in_for_tool_start.load(Ordering::Relaxed)
+                        + tokens_out_for_tool_start.load(Ordering::Relaxed);
+                    timeline_tool_start(&timeline_for_tool_start, call_id, name, input, action_tokens, total_tokens);
                     let _ = event_tx_tool_start.send(Event::ToolStart {
                         session_id: session_id_tool_start.clone(),
                         call_id: call_id.to_string(),
                         name: name.to_string(),
                         input: input.clone(),
                         model: model.map(|m| m.to_string()),
+                        tokens: (action_tokens > 0).then_some(action_tokens),
+                        total_tokens: (total_tokens > 0).then_some(total_tokens),
                     });
                 })),
                 on_tool_end: {
@@ -682,6 +848,7 @@ impl AgentService {
                     let session_id_tool_end = session_id.to_string();
                     let active_tools_for_end = active_tools.clone();
                     let completed_tools_for_end = completed_tools.clone();
+                    let timeline_for_tool_end = timeline.clone();
                     Some(Box::new(move |call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64, data: Option<&serde_json::Value>| {
                         // Move from active to completed
                         if let Ok(mut active) = active_tools_for_end.try_write() {
@@ -696,6 +863,7 @@ impl AgentService {
                                 duration_ms,
                             });
                         }
+                        timeline_tool_end(&timeline_for_tool_end, call_id, name, output, success, duration_ms);
                         let _ = event_tx_tool_end.send(Event::ToolEnd {
                             session_id: session_id_tool_end.clone(),
                             call_id: call_id.to_string(),
@@ -777,10 +945,24 @@ impl AgentService {
                 // as mission_control tool chips) until it declares MISSION
                 // COMPLETE or stalls. One user prompt, continuous work.
                 mission_mode: !is_sub_agent && message_is_mission(message),
+                on_usage: {
+                    // Run-scoped totals: every LLM request's usage counts,
+                    // including requests inside attempts that later fault —
+                    // that spend is real and belongs in the benchmark.
+                    let usage_in = run_input_tokens.clone();
+                    let usage_out = run_output_tokens.clone();
+                    let usage_last = last_request_tokens.clone();
+                    Some(Box::new(move |input: u32, output: u32| {
+                        usage_in.fetch_add(u64::from(input), Ordering::Relaxed);
+                        usage_out.fetch_add(u64::from(output), Ordering::Relaxed);
+                        usage_last.store(u64::from(input) + u64::from(output), Ordering::Relaxed);
+                    }))
+                },
                 on_checkpoint: {
                     let checkpoint_session_id = session_id.to_string();
                     let checkpoint_accumulated = accumulated.clone();
                     let checkpoint_completed = completed_tools.clone();
+                    let checkpoint_timeline = timeline.clone();
                     let checkpoint_storage = self.storage.clone();
                     Some(Box::new(move |messages: &[nanna_llm::AnthropicMessage], iteration: usize| {
                         // Snapshot accumulated text + tool calls to a checkpoint.
@@ -792,11 +974,73 @@ impl AgentService {
                             .map(|t| t.clone())
                             .unwrap_or_default();
 
+                        // Timeline snapshot with EVERYTHING bulky bounded:
+                        // the checkpoint is rewritten every iteration, so
+                        // carrying full outputs, inputs (write_file bodies!),
+                        // or thinking/text segments would make cumulative
+                        // writes grow quadratically over a long mission. The
+                        // full record is persisted with the message when the
+                        // run ends; this bound only trims what a CRASH
+                        // recovery can redisplay, and every trim says so.
+                        let journal: Vec<TimelineItem> = timeline_lock(&checkpoint_timeline)
+                            .clone()
+                            .into_iter()
+                            .map(|item| match item {
+                                TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at } => {
+                                    let output = output.map(|o| {
+                                        if o.len() > 200 {
+                                            let outcome = if success == Some(false) { "failed" } else { "completed" };
+                                            format!(
+                                                "{} …[trimmed in this crash-recovery checkpoint ONLY because full outputs would bloat per-iteration writes; the call {outcome} exactly as recorded]",
+                                                truncate(&o, 200)
+                                            )
+                                        } else {
+                                            o
+                                        }
+                                    });
+                                    let input = input.map(|i| {
+                                        let s = i.to_string();
+                                        if s.len() > 200 {
+                                            serde_json::Value::String(format!(
+                                                "[input ({} bytes) omitted from this crash-recovery checkpoint only; the call received it in full]",
+                                                s.len()
+                                            ))
+                                        } else {
+                                            i
+                                        }
+                                    });
+                                    TimelineItem::Tool { call_id, name, input, output, success, duration_ms, tokens, total_tokens, at }
+                                }
+                                TimelineItem::Thinking { content, at } if content.len() > 500 => {
+                                    let total = content.len();
+                                    TimelineItem::Thinking {
+                                        content: format!(
+                                            "{} …[thinking trimmed to 500 of {total} bytes in this crash-recovery checkpoint only]",
+                                            truncate(&content, 500)
+                                        ),
+                                        at,
+                                    }
+                                }
+                                TimelineItem::Text { content, at } if content.len() > 500 => {
+                                    let total = content.len();
+                                    TimelineItem::Text {
+                                        content: format!(
+                                            "{} …[text trimmed to 500 of {total} bytes in this crash-recovery checkpoint only]",
+                                            truncate(&content, 500)
+                                        ),
+                                        at,
+                                    }
+                                }
+                                other => other,
+                            })
+                            .collect();
+
                         let checkpoint = serde_json::json!({
                             "session_id": checkpoint_session_id,
                             "iteration": iteration,
                             "accumulated_text": text,
                             "tool_calls": tools,
+                            "timeline": journal,
                             "message_count": messages.len(),
                             "timestamp": chrono::Utc::now().to_rfc3339(),
                         });
@@ -851,6 +1095,31 @@ impl AgentService {
                         });
                     }
 
+                    let final_timeline = timeline_lock(&timeline).clone();
+                    let usage = RunUsage {
+                        input_tokens: run_input_tokens.load(Ordering::Relaxed),
+                        output_tokens: run_output_tokens.load(Ordering::Relaxed),
+                        duration_ms: run_started.elapsed().as_millis() as u64,
+                        model: model.clone(),
+                    };
+                    // One benchmark line per run: identical tasks across
+                    // models are compared on tokens spent and time taken.
+                    let (tl_tools, tl_faults) = final_timeline.iter().fold((0usize, 0usize), |(t, f), item| match item {
+                        TimelineItem::Tool { .. } => (t + 1, f),
+                        TimelineItem::Fault { .. } => (t, f + 1),
+                        _ => (t, f),
+                    });
+                    info!(
+                        session_id = %session_id,
+                        model = %usage.model,
+                        duration_s = usage.duration_ms / 1000,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        tool_calls = tl_tools,
+                        faults_healed = tl_faults,
+                        "📊 RUN SUMMARY"
+                    );
+
                     return Ok(ChatResult {
                         message_id,
                         content: response.text,
@@ -865,6 +1134,8 @@ impl AgentService {
                         input_tokens: response.input_tokens,
                         output_tokens: response.output_tokens,
                         reasoning: response.reasoning.map(|r| r.content),
+                        timeline: final_timeline,
+                        usage: Some(usage),
                         partial: false,
                     });
                 }
@@ -872,6 +1143,17 @@ impl AgentService {
                     let error_str = e.to_string();
                     warn!("Model {} failed: {}", model, error_str);
                     last_error = error_str.clone();
+
+                    // Journal the fault so the timeline explains the seam:
+                    // thinking/text after this point is a fresh attempt
+                    // regenerating, not the same stream resuming. This push
+                    // is infallible on purpose — if the seam is ever lost,
+                    // the tail-merge rule fuses the dead attempt's partial
+                    // text with the retry's regeneration into one segment.
+                    timeline_lock(&timeline).push(TimelineItem::Fault {
+                        message: truncate(&error_str, 200),
+                        at: chrono::Utc::now().to_rfc3339(),
+                    });
 
                     // Transient provider fault (timeout / 5xx / dropped
                     // stream / aborted generation)? Retry the SAME model with
@@ -922,6 +1204,7 @@ impl AgentService {
                             message: format!(
                                 "Transient failure on {model}. Retrying ({same_model_retries}/{CHAT_TRANSIENT_RETRIES_MAX})..."
                             ),
+                            session_id: Some(session_id.to_string()),
                         });
                         tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                         // Re-check cancellation after the sleep: a cancel
@@ -959,6 +1242,7 @@ impl AgentService {
                         let _ = self.event_tx.send(Event::Error {
                             code: "rate_limit".to_string(),
                             message: format!("Rate limited on {}. Waiting {}s...", model, wait_secs),
+                            session_id: Some(session_id.to_string()),
                         });
                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                     }
@@ -978,6 +1262,7 @@ impl AgentService {
                     let _ = self.event_tx.send(Event::Error {
                         code: "model_error".to_string(),
                         message: format!("Model {} failed: {}. Trying next model...", model, last_error),
+                        session_id: Some(session_id.to_string()),
                     });
 
                     info!("Model {} failed, trying next model in priority list", model);
@@ -998,6 +1283,7 @@ impl AgentService {
         let partial_text = accumulated.read().await.clone();
         let partial_thinking = accumulated_thinking.read().await.clone();
         let completed = completed_tools.read().await.clone();
+        let full_timeline = timeline_lock(&timeline).clone();
 
         let error_msg = format!("All models exhausted. Tried: {:?}. Last error: {}", tried_models, last_error);
 
@@ -1005,11 +1291,14 @@ impl AgentService {
         let _ = self.event_tx.send(Event::Error {
             code: "all_models_exhausted".to_string(),
             message: error_msg.clone(),
+            session_id: Some(session_id.to_string()),
         });
 
         // If there was accumulated work, return it as a partial result so the caller
         // can persist it. This prevents losing hours of streamed agent work.
-        let partial_result = if !partial_text.is_empty() || !completed.is_empty() {
+        // The timeline is run-scoped, so it preserves work from EVERY healed
+        // attempt — not just the final one whose buffers survived.
+        let partial_result = if !partial_text.is_empty() || !completed.is_empty() || !full_timeline.is_empty() {
             let tool_records: Vec<ToolCallRecord> = completed.into_iter().map(|tc| ToolCallRecord {
                 id: tc.call_id,
                 name: tc.name,
@@ -1035,6 +1324,13 @@ impl AgentService {
                 input_tokens: 0,
                 output_tokens: 0,
                 reasoning: if partial_thinking.is_empty() { None } else { Some(partial_thinking) },
+                timeline: full_timeline,
+                usage: Some(RunUsage {
+                    input_tokens: run_input_tokens.load(Ordering::Relaxed),
+                    output_tokens: run_output_tokens.load(Ordering::Relaxed),
+                    duration_ms: run_started.elapsed().as_millis() as u64,
+                    model: tried_models.last().cloned().unwrap_or_default(),
+                }),
                 partial: true,
             })
         } else {
@@ -1133,10 +1429,6 @@ impl AgentService {
         let iteration = checkpoint.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
         let timestamp = checkpoint.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-        if text.is_empty() {
-            return None;
-        }
-
         let tool_calls: Vec<ToolCallRecord> = checkpoint.get("tool_calls")
             .and_then(|v| serde_json::from_value::<Vec<CompletedToolCallInfo>>(v.clone()).ok())
             .unwrap_or_default()
@@ -1150,6 +1442,19 @@ impl AgentService {
                 duration_ms: Some(tc.duration_ms),
             })
             .collect();
+
+        let recovered_timeline: Vec<TimelineItem> = checkpoint.get("timeline")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // Only bail when there is truly nothing to recover. `accumulated_text`
+        // is a PER-ATTEMPT buffer (cleared at every healing-attempt start),
+        // while the timeline is run-scoped — a checkpoint written during a
+        // fresh attempt's tool-only stretch has empty text but can carry
+        // hours of journal. Gating on text alone silently discarded it.
+        if text.is_empty() && tool_calls.is_empty() && recovered_timeline.is_empty() {
+            return None;
+        }
 
         info!(
             iteration = iteration,
@@ -1169,6 +1474,8 @@ impl AgentService {
             input_tokens: 0,
             output_tokens: 0,
             reasoning: None,
+            timeline: recovered_timeline,
+            usage: None,
             partial: true,
         })
     }
@@ -1176,15 +1483,17 @@ impl AgentService {
     /// Recover a crashed run from its checkpoint (legacy file-based only).
     /// DB-based checkpoints are recovered at startup via async code in server.rs.
     /// Returns the partial content and tool calls, or None if no checkpoint exists.
-    /// The checkpoint file is consumed (deleted) after recovery.
+    /// The checkpoint file is consumed (deleted) only AFTER a successful
+    /// parse — deleting before parsing made any recovery failure permanent.
     pub fn recover_checkpoint(&self, session_id: &str) -> Option<ChatResult> {
         // Legacy file-based checkpoint
         let path = self.checkpoint_dir.join(format!("checkpoint-{}.json", session_id));
-        let data = std::fs::read_to_string(&path).ok();
-        if data.is_some() {
+        let data = std::fs::read_to_string(&path).ok()?;
+        let recovered = self.recover_checkpoint_from_data(&data);
+        if recovered.is_some() {
             let _ = std::fs::remove_file(&path);
         }
-        self.recover_checkpoint_from_data(&data?)
+        recovered
     }
 
     /// Check if a chat is active
@@ -1195,10 +1504,14 @@ impl AgentService {
 
     /// Get a snapshot of the current run state for a session.
     /// Includes sync metadata (message_count, last_message_id) from SessionManager.
+    /// `include_timeline: false` skips cloning the run journal — periodic
+    /// polls that only need counters must not pay for (or contend on) a
+    /// multi-hour run's full record.
     pub async fn get_run_state(
         &self,
         session_id: &str,
         sessions: &crate::session::SessionManager,
+        include_timeline: bool,
     ) -> RunStateSnapshot {
         // Get message count + last ID from session for sync verification
         let (message_count, last_message_id) = if let Some(session) = sessions.get(session_id).await {
@@ -1220,6 +1533,9 @@ impl AgentService {
                 accumulated_thinking: chat.accumulated_thinking.read().await.clone(),
                 active_tool_calls: chat.active_tool_calls.read().await.clone(),
                 completed_tool_calls: chat.completed_tool_calls.read().await.clone(),
+                timeline: if include_timeline { timeline_lock(&chat.timeline).clone() } else { vec![] },
+                run_input_tokens: chat.run_input_tokens.load(Ordering::Relaxed),
+                run_output_tokens: chat.run_output_tokens.load(Ordering::Relaxed),
                 started_at: Some(chat.started_at.to_rfc3339()),
                 message_count,
                 last_message_id,
@@ -1231,6 +1547,9 @@ impl AgentService {
                 accumulated_thinking: String::new(),
                 active_tool_calls: vec![],
                 completed_tool_calls: vec![],
+                timeline: vec![],
+                run_input_tokens: 0,
+                run_output_tokens: 0,
                 started_at: None,
                 message_count,
                 last_message_id,
@@ -1309,6 +1628,13 @@ pub struct ChatResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub reasoning: Option<String>,
+    /// Chronological journal of the whole run (thinking / text / tool /
+    /// fault items across every healed attempt). Persisted with the message
+    /// so the UI can replay the run's true order later.
+    pub timeline: Vec<TimelineItem>,
+    /// Run totals for benchmarking: tokens spent (across ALL healing
+    /// attempts) and wall-clock duration.
+    pub usage: Option<RunUsage>,
     /// If true, this result is partial (the run failed but work was done).
     /// The caller should still persist the content to avoid losing streamed work.
     pub partial: bool,

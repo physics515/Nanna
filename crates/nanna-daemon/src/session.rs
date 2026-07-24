@@ -32,6 +32,16 @@ pub struct SessionMessage {
     pub attachments: Vec<AttachmentRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Chronological journal of the run that produced this message (thinking
+    /// segments, tool calls, text segments, healed faults — in order). The
+    /// flat `tool_calls`/`reasoning` fields above are kept for older
+    /// messages and for model-context reconstruction; when `timeline` is
+    /// non-empty the UI renders it instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline: Vec<TimelineItem>,
+    /// Token + wall-clock totals for the run (model benchmarking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +84,63 @@ pub struct ToolCallRecord {
     pub output: Option<String>,
     pub success: Option<bool>,
     pub duration_ms: Option<u64>,
+}
+
+/// One entry in a run's chronological journal. A long-horizon run is not
+/// "one thinking blob + one flat tool list + one text blob" — it is an
+/// interleaved sequence (think → call tools → think → speak → …), and for
+/// runs that heal through provider faults it can span many attempts. The
+/// timeline records events in the order they happened so the UI can replay
+/// the run faithfully, including after navigation away and back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimelineItem {
+    /// A contiguous burst of thinking/reasoning (closed by the next tool
+    /// call or text output).
+    Thinking { content: String, at: String },
+    /// A contiguous burst of visible assistant text.
+    Text { content: String, at: String },
+    /// One tool call. `output`/`success`/`duration_ms` are back-filled when
+    /// the call completes; a run that dies mid-call leaves them None.
+    Tool {
+        call_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        success: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// Tokens spent on the action: input+output of the LLM request that
+        /// issued this tool call (parallel calls from one request share it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<u64>,
+        /// Run-total tokens spent at the moment this call was issued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_tokens: Option<u64>,
+        at: String,
+    },
+    /// A provider fault the run healed through (stream drop, timeout, …).
+    /// Recorded so the journal explains why thinking/text may restart:
+    /// the attempt after a fault regenerates rather than resumes.
+    Fault { message: String, at: String },
+}
+
+/// Resource totals for one run, for benchmarking models against each other
+/// on identical tasks: total tokens spent and wall-clock time taken.
+/// Token totals accumulate across EVERY healing attempt via the per-request
+/// usage callback — not just the attempt that finally succeeded. (Streams
+/// that die before the provider reports usage still under-count slightly;
+/// that loss is inherent to the protocol.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub duration_ms: u64,
+    /// The model that finished the run (last model used).
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,18 +222,23 @@ impl Session {
             tool_calls: Vec::new(),
             attachments: Vec::new(),
             reasoning: None,
+            timeline: Vec::new(),
+            usage: None,
         });
         self.updated_at = Utc::now();
         id
     }
 
-    /// Add a message with tool calls and reasoning to the session (in-memory only)
+    /// Add a message with tool calls, reasoning, run timeline, and usage
+    /// totals to the session (in-memory only)
     pub fn add_full_message(
         &mut self,
         role: MessageRole,
         content: impl Into<String>,
         tool_calls: Vec<ToolCallRecord>,
         reasoning: Option<String>,
+        timeline: Vec<TimelineItem>,
+        usage: Option<RunUsage>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         self.messages.push(SessionMessage {
@@ -177,6 +249,8 @@ impl Session {
             tool_calls,
             attachments: Vec::new(),
             reasoning,
+            timeline,
+            usage,
         });
         self.updated_at = Utc::now();
         id
@@ -319,13 +393,15 @@ pub struct MailboxMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Serialize a SessionMessage's extra fields (tool_calls, attachments, reasoning) to JSON metadata.
+/// Serialize a SessionMessage's extra fields (tool_calls, attachments, reasoning, timeline, usage) to JSON metadata.
 fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
     let has_tool_calls = !msg.tool_calls.is_empty();
     let has_attachments = !msg.attachments.is_empty();
     let has_reasoning = msg.reasoning.is_some();
+    let has_timeline = !msg.timeline.is_empty();
+    let has_usage = msg.usage.is_some();
 
-    if !has_tool_calls && !has_attachments && !has_reasoning {
+    if !has_tool_calls && !has_attachments && !has_reasoning && !has_timeline && !has_usage {
         return None;
     }
 
@@ -338,6 +414,12 @@ fn message_to_metadata(msg: &SessionMessage) -> Option<String> {
     }
     if let Some(ref reasoning) = msg.reasoning {
         meta.insert("reasoning".to_string(), serde_json::Value::String(reasoning.clone()));
+    }
+    if has_timeline {
+        meta.insert("timeline".to_string(), serde_json::to_value(&msg.timeline).unwrap_or_default());
+    }
+    if let Some(ref usage) = msg.usage {
+        meta.insert("usage".to_string(), serde_json::to_value(usage).unwrap_or_default());
     }
     Some(serde_json::Value::Object(meta).to_string())
 }
@@ -362,6 +444,13 @@ fn db_message_to_session_message(
         .and_then(|m| m.get("reasoning"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let timeline = metadata
+        .and_then(|m| m.get("timeline"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let usage = metadata
+        .and_then(|m| m.get("usage"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     // Parse timestamp, fall back to now
     let timestamp = chrono::DateTime::parse_from_rfc3339(created_at)
@@ -381,6 +470,8 @@ fn db_message_to_session_message(
         tool_calls,
         attachments,
         reasoning,
+        timeline,
+        usage,
     }
 }
 
@@ -735,7 +826,7 @@ impl SessionManager {
         }
     }
 
-    /// Add a message with tool calls and reasoning to a session (with write-through to DB)
+    /// Add a message with tool calls, reasoning, run timeline, and usage totals to a session (with write-through to DB)
     pub async fn add_full_message(
         &self,
         session_id: &str,
@@ -743,11 +834,13 @@ impl SessionManager {
         content: impl Into<String>,
         tool_calls: Vec<ToolCallRecord>,
         reasoning: Option<String>,
+        timeline: Vec<TimelineItem>,
+        usage: Option<RunUsage>,
     ) -> Option<String> {
         let content = content.into();
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            let msg_id = session.add_full_message(role, content, tool_calls, reasoning);
+            let msg_id = session.add_full_message(role, content, tool_calls, reasoning, timeline, usage);
             // Persist the new message synchronously
             if let Some(msg) = session.messages.last() {
                 self.persist_message(session_id, msg).await;

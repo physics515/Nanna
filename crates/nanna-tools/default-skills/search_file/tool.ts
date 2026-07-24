@@ -1,6 +1,6 @@
 export default {
   name: "search_file",
-  version: "0.1.0",
+  version: "0.1.1",
   output: "context",
   description: "Search within a single file for a pattern and return matching lines with surrounding context. Useful for finding specific functions, variables, or text in large files without reading the entire file. Returns line numbers so you can follow up with read_file for a broader view.",
   parameters: {
@@ -33,9 +33,18 @@ export default {
       return "Error: Invalid regex pattern: " + e.message;
     }
 
-    // Check file size
+    // Check file size. A missing file is a structured answer, not a throw
+    // (thrown errors reach the model under "Execution failed:" prefixes).
     var MAX_SIZE = 10 * 1024 * 1024;
-    var stat = Nanna.stat(filePath);
+    var stat;
+    try {
+      stat = Nanna.stat(filePath);
+    } catch (e) {
+      return {
+        content: "search_file: '" + filePath + "' does not exist (or is unreadable). Nothing was searched. Check the path with exec `ls` first.",
+        success: false
+      };
+    }
     if (stat.size > MAX_SIZE) {
       return "Error: File is too large (" + (stat.size / 1024 / 1024).toFixed(1) + "MB). Maximum is 10MB.";
     }

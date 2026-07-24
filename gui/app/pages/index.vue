@@ -81,83 +81,139 @@
 
       <!-- Messages -->
       <template v-for="(msg, idx) in messages" :key="msg.id || idx">
-        <!-- Thinking block rendered as its own card (before tools and response) -->
-        <div v-if="msg.role === 'assistant' && msg.reasoning" class="max-w-[1800px] mx-auto">
+        <!-- Chronological run timeline: thinking bursts, tool calls, text,
+             and healed faults rendered inline, in the order they happened. -->
+        <template v-if="msg.role === 'assistant' && msg.timeline?.length">
+          <div class="max-w-[1800px] mx-auto">
+            <div class="mx-4 sm:mx-12 my-2">
+              <RunTimeline :items="msg.timeline" />
+            </div>
+          </div>
+          <!-- Content bubble only when the timeline carries no text of its
+               own (older runs journaled before text capture existed). -->
+          <div v-if="!timelineHasText(msg.timeline)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+            <MessageBubble variant="assistant">
+              <div class="flex items-start gap-2 sm:gap-3">
+                <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
+                <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
+                <div class="flex-1 min-w-0">
+                  <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
+                  <MarkdownContent :content="msg.content" />
+                </div>
+              </div>
+            </MessageBubble>
+          </div>
+          <!-- Run benchmark: tokens + time for this run -->
+          <div v-if="msg.usage" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+            <div class="mx-4 sm:mx-12 mt-1 text-[10px] font-mono text-nanna-text-dim opacity-70">
+              {{ formatRunUsage(msg.usage) }}
+            </div>
+          </div>
+        </template>
+
+        <!-- Legacy layout for messages without a journal -->
+        <template v-else>
+          <!-- Thinking block rendered as its own card (before tools and response) -->
+          <div v-if="msg.role === 'assistant' && msg.reasoning" class="max-w-[1800px] mx-auto">
+            <div class="mx-4 sm:mx-12 my-2">
+              <ThinkingCard :content="msg.reasoning" />
+            </div>
+          </div>
+
+          <!-- Tool calls rendered BEFORE the assistant response (between user msg and response) -->
+          <div v-if="msg.role === 'assistant' && msg.tool_calls?.length" class="max-w-[1800px] mx-auto">
+            <div class="space-y-1 mx-4 sm:mx-12 my-2">
+              <ToolCallCard
+                v-for="tool in msg.tool_calls"
+                :key="tool.id"
+                :tool-call="tool"
+                :status="tool.success ? 'completed' : 'error'"
+              />
+            </div>
+          </div>
+
+          <!-- Message bubble -->
+          <div class="max-w-[1800px] mx-auto" :class="msg.role === 'user' ? 'ml-4 sm:ml-12' : 'mr-4 sm:mr-12'">
+            <MessageBubble :variant="msg.role">
+              <div class="flex items-start gap-2 sm:gap-3">
+                <UiAvatar
+                  :variant="msg.role === 'user' ? 'primary' : 'accent'"
+                  :fallback="msg.role === 'user' ? 'U' : '☽'"
+                  size="sm"
+                  class="flex-shrink-0 sm:hidden"
+                />
+                <UiAvatar
+                  :variant="msg.role === 'user' ? 'primary' : 'accent'"
+                  :fallback="msg.role === 'user' ? 'U' : '☽'"
+                  class="flex-shrink-0 hidden sm:flex"
+                />
+                <div class="flex-1 min-w-0">
+                  <div class="text-xs text-nanna-text-dim mb-1">
+                    {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
+                  </div>
+                  <MarkdownContent :content="msg.content" />
+                </div>
+              </div>
+            </MessageBubble>
+          </div>
+          <!-- Run benchmark: tokens + time for this run -->
+          <div v-if="msg.role === 'assistant' && msg.usage" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+            <div class="mx-4 sm:mx-12 mt-1 text-[10px] font-mono text-nanna-text-dim opacity-70">
+              {{ formatRunUsage(msg.usage) }}
+            </div>
+          </div>
+        </template>
+      </template>
+
+      <!-- Live chronological journal: thinking and tool calls interleaved as
+           they happen. The current thinking burst is the last block — always
+           just above the streaming response. -->
+      <div v-if="liveTimeline.length > 0" class="max-w-[1800px] mx-auto">
+        <div class="mx-4 sm:mx-12 my-2">
+          <RunTimeline :items="liveTimeline" :is-live="true" />
+        </div>
+      </div>
+
+      <!-- Legacy live blocks (only when no journal exists — e.g. daemon
+           predating the timeline) -->
+      <template v-else>
+        <!-- Live thinking card during streaming -->
+        <div v-if="streamingThinking" class="max-w-[1800px] mx-auto">
           <div class="mx-4 sm:mx-12 my-2">
-            <ThinkingCard :content="msg.reasoning" />
+            <ThinkingCard :content="streamingThinking" :is-active="isStreaming" />
           </div>
         </div>
 
-        <!-- Tool calls rendered BEFORE the assistant response (between user msg and response) -->
-        <div v-if="msg.role === 'assistant' && msg.tool_calls?.length" class="max-w-[1800px] mx-auto">
-          <div class="space-y-1 mx-4 sm:mx-12 my-2">
+        <!-- Active tool calls during streaming -->
+        <div v-if="activeToolCalls.length > 0" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+          <div class="space-y-2">
             <ToolCallCard
-              v-for="tool in msg.tool_calls"
+              v-for="tool in activeToolCalls"
               :key="tool.id"
               :tool-call="tool"
-              :status="tool.success ? 'completed' : 'error'"
+              :status="tool.status"
             />
           </div>
         </div>
-
-        <!-- Message bubble -->
-        <div class="max-w-[1800px] mx-auto" :class="msg.role === 'user' ? 'ml-4 sm:ml-12' : 'mr-4 sm:mr-12'">
-          <MessageBubble :variant="msg.role">
-            <div class="flex items-start gap-2 sm:gap-3">
-              <UiAvatar
-                :variant="msg.role === 'user' ? 'primary' : 'accent'"
-                :fallback="msg.role === 'user' ? 'U' : '☽'"
-                size="sm"
-                class="flex-shrink-0 sm:hidden"
-              />
-              <UiAvatar
-                :variant="msg.role === 'user' ? 'primary' : 'accent'"
-                :fallback="msg.role === 'user' ? 'U' : '☽'"
-                class="flex-shrink-0 hidden sm:flex"
-              />
-              <div class="flex-1 min-w-0">
-                <div class="text-xs text-nanna-text-dim mb-1">
-                  {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
-                </div>
-                <MarkdownContent :content="msg.content" />
-              </div>
-            </div>
-          </MessageBubble>
-        </div>
       </template>
 
-      <!-- Live thinking card during streaming -->
-      <div v-if="streamingThinking" class="max-w-[1800px] mx-auto">
-        <div class="mx-4 sm:mx-12 my-2">
-          <ThinkingCard :content="streamingThinking" :is-active="isStreaming" />
-        </div>
-      </div>
-
-      <!-- Active tool calls during streaming -->
-      <div v-if="activeToolCalls.length > 0" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
-        <div class="space-y-2">
-          <ToolCallCard
-            v-for="tool in activeToolCalls"
-            :key="tool.id"
-            :tool-call="tool"
-            :status="tool.status"
-          />
-        </div>
-      </div>
-
-      <!-- Streaming indicator -->
-      <div v-if="isStreaming" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+      <!-- Streaming indicator. With a live journal, this bubble shows ONLY
+           the trailing open text segment — earlier text lives in the
+           timeline where it happened, so nothing renders twice. When the
+           journal's tail is a tool/thinking item there is no open text, so
+           the bubble hides entirely rather than sit hollow. -->
+      <div v-if="isStreaming && (liveBubbleContent || !liveTimeline.length)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
         <MessageBubble variant="assistant">
           <div class="flex items-start gap-2 sm:gap-3">
             <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
             <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-              <div v-if="streamingContent" class="prose prose-invert prose-sm max-w-none">
-                <MarkdownContent :content="streamingContent" />
+              <div v-if="liveBubbleContent" class="prose prose-invert prose-sm max-w-none">
+                <MarkdownContent :content="liveBubbleContent" />
                 <span class="cursor-blink inline-block ml-0.5">▋</span>
               </div>
-              <div v-else-if="!streamingThinking" class="text-nanna-text-muted flex items-center gap-2">
+              <div v-else-if="!streamingThinking && !liveTimeline.length" class="text-nanna-text-muted flex items-center gap-2">
                 <span class="animate-pulse">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
@@ -224,7 +280,7 @@
 import { ref, inject, watch, nextTick, onMounted, onUnmounted, computed, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit as tauriEmit, type UnlistenFn } from '@tauri-apps/api/event'
-import { useSessionState } from '~/composables/useSessionState'
+import { useSessionState, type TimelineEntry } from '~/composables/useSessionState'
 import { useBackend } from '~/composables/useBackend'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
@@ -265,6 +321,16 @@ interface Message {
   timestamp: string
   tool_calls?: ToolCallInfo[]
   reasoning?: string
+  /** Chronological run journal — when present, rendered instead of the
+   *  flat reasoning/tool_calls blocks. */
+  timeline?: TimelineEntry[]
+  /** Run benchmark totals: tokens spent + wall-clock time for this run. */
+  usage?: {
+    input_tokens: number
+    output_tokens: number
+    duration_ms: number
+    model: string
+  }
 }
 
 interface SessionInfo {
@@ -303,6 +369,9 @@ interface RunState {
   accumulated_thinking: string
   active_tool_calls: { call_id: string, name: string, started_at: string }[]
   completed_tool_calls: { call_id: string, name: string, output: string, success: boolean, duration_ms: number }[]
+  /** Run-scoped chronological journal — survives the daemon's internal
+   *  healing restarts, unlike the per-attempt buffers above. */
+  timeline?: TimelineEntry[]
   started_at: string | null
   message_count: number
   last_message_id?: string | null
@@ -333,6 +402,7 @@ const {
   streamingContent,
   streamingThinking,
   activeToolCalls,
+  liveTimeline,
   messageQueue,
   hasActiveWork,
   hasQueuedMessages,
@@ -343,8 +413,39 @@ const {
   removeFromQueue,
   addToolCall,
   updateToolCall,
+  setLiveTimeline,
   clearStreamingState,
 } = useSessionState(sessionId)
+
+// With a live journal, the streaming bubble shows only the trailing OPEN
+// text segment (earlier text renders inline in the timeline). Without one
+// (daemon predating the journal), fall back to the accumulated blob.
+const liveBubbleContent = computed(() => {
+  const items = liveTimeline.value
+  if (items.length > 0) {
+    const last = items[items.length - 1]
+    return last && last.kind === 'text' ? (last.content ?? '') : ''
+  }
+  return streamingContent.value
+})
+
+function timelineHasText(items: TimelineEntry[] | undefined): boolean {
+  return !!items?.some(item => item.kind === 'text' && (item.content ?? '').trim().length > 0)
+}
+
+// Benchmark line under a completed run: tokens spent + time taken, so
+// identical missions can be compared across models.
+function formatRunUsage(usage: NonNullable<Message['usage']>): string {
+  const total = usage.input_tokens + usage.output_tokens
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+  const ms = usage.duration_ms
+  const time = ms >= 3_600_000
+    ? `${Math.floor(ms / 3_600_000)}h ${Math.floor((ms % 3_600_000) / 60_000)}m`
+    : ms >= 60_000
+      ? `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`
+      : `${(ms / 1000).toFixed(1)}s`
+  return `⏱ ${time} · ${fmt(total)} tokens (${fmt(usage.input_tokens)} in / ${fmt(usage.output_tokens)} out) · ${usage.model}`
+}
 
 function truncateText(text: string, maxLen: number): string {
   if (!text || text.length <= maxLen) return text || ''
@@ -364,8 +465,11 @@ watch(hasActiveWork, (active) => {
     daemonQueuePollTimer = setInterval(async () => {
       if (!currentSession.value) return
       try {
+        // light: skip the run journal — this poll only reads queued_count,
+        // and a multi-hour run's journal is megabytes per snapshot.
         const runState = await invoke<RunState>('get_session_run_state', {
           sessionId: currentSession.value.id,
+          light: true,
         })
         daemonQueueCount.value = runState.queued_count ?? 0
       } catch {
@@ -435,7 +539,7 @@ async function loadSession() {
         // We'll set authoritative state from the daemon AFTER the fetch.
         const [historyResult, runState] = await Promise.all([
           invoke<Message[]>('get_session_history', { sessionId: sid }),
-          invoke<RunState>('get_session_run_state', { sessionId: sid })
+          invoke<RunState>('get_session_run_state', { sessionId: sid, light: false })
             .catch(() => ({ is_running: false, accumulated_text: '', accumulated_thinking: '', active_tool_calls: [], completed_tool_calls: [], started_at: null, message_count: 0 } as RunState))
         ])
 
@@ -460,6 +564,11 @@ async function loadSession() {
           isStreaming.value = runState.accumulated_text.length > 0 || runState.accumulated_thinking.length > 0
           streamingContent.value = runState.accumulated_text
           streamingThinking.value = runState.accumulated_thinking
+
+          // Restore the chronological journal — the daemon's copy is
+          // run-scoped, so this brings back EVERY tool call and thinking
+          // burst of the run, not just the current healing attempt's.
+          setLiveTimeline(runState.timeline ?? [])
 
           // Replace tool calls with daemon's authoritative list
           activeToolCalls.value = []
@@ -541,13 +650,15 @@ onMounted(async () => {
       const finalContent = sessionState.streamingContent.value
       const finalToolCalls = [...sessionState.activeToolCalls.value]
       const finalThinking = sessionState.streamingThinking.value || undefined
+      // Snapshot the chronological journal BEFORE clearing streaming state
+      const finalTimeline = [...sessionState.liveTimeline.value]
 
       // Clear streaming state
       sessionState.clearStreamingState()
 
       // If this is the current session, add to messages
       if (eventSessionId === currentSession.value?.id) {
-        if (finalContent || finalToolCalls.length > 0 || finalThinking) {
+        if (finalContent || finalToolCalls.length > 0 || finalThinking || finalTimeline.length > 0) {
           messages.value.push({
             id: Date.now().toString(),
             role: 'assistant',
@@ -562,6 +673,7 @@ onMounted(async () => {
               duration_ms: t.duration_ms,
             })),
             reasoning: finalThinking,
+            timeline: finalTimeline.length > 0 ? finalTimeline : undefined,
           })
 
           // Notify if window is not focused
@@ -580,6 +692,8 @@ onMounted(async () => {
       // Append chunk
       sessionState.isStreaming.value = true
       sessionState.streamingContent.value += event.payload.chunk
+      // Mirror into the chronological journal (opens/extends a text segment)
+      sessionState.timelineAppendSegment('text', event.payload.chunk)
 
       if (eventSessionId === currentSession.value?.id) {
         scrollToBottom()
@@ -596,6 +710,7 @@ onMounted(async () => {
     if (status === 'started') {
       // Add new tool call
       sessionState.addToolCall({ ...tool_call, status: 'started' })
+      sessionState.timelineToolStart(tool_call)
     } else {
       // Resolve tool name: prefer event payload, fall back to existing state
       // (ToolEnd events from daemon don't include name)
@@ -604,6 +719,13 @@ onMounted(async () => {
 
       // Update existing tool call
       sessionState.updateToolCall(tool_call.id, { ...tool_call, status })
+      sessionState.timelineToolEnd(
+        tool_call.id,
+        toolName,
+        tool_call.output || '',
+        tool_call.success ?? false,
+        tool_call.duration_ms || 0,
+      )
 
       // Push tool errors to notification center
       if (status === 'error' || tool_call.success === false) {
@@ -637,6 +759,8 @@ onMounted(async () => {
     const eventSessionId = event.payload.session_id
     const sessionState = useSessionState(ref(eventSessionId))
     sessionState.streamingThinking.value += event.payload.delta
+    // Mirror into the chronological journal (opens/extends a thinking segment)
+    sessionState.timelineAppendSegment('thinking', event.payload.delta)
   })
 
   // Listen for model status changes (fallbacks)
@@ -655,7 +779,19 @@ onMounted(async () => {
   })
 
   // Listen for daemon-level errors
-  unlistenDaemonError = await listen<{ code?: string; message: string }>('error', (event) => {
+  unlistenDaemonError = await listen<{ code?: string; message: string; session_id?: string | null }>('error', (event) => {
+    // Journal healed faults inline so the live timeline explains restarts.
+    // (The daemon records these authoritatively in its own run journal; this
+    // mirrors them into the live view without waiting for a remount.)
+    // Only when the event names its session — attributing a session-less
+    // error to whichever chat is open journals phantom faults.
+    if (
+      (event.payload.code === 'model_retry' || event.payload.code === 'model_error' || event.payload.code === 'rate_limit') &&
+      event.payload.session_id
+    ) {
+      const sessionState = useSessionState(ref(event.payload.session_id))
+      sessionState.timelineFault(event.payload.message)
+    }
     addNotification({
       type: 'error',
       title: event.payload.code ? `Error: ${event.payload.code}` : 'Daemon Error',
@@ -741,6 +877,12 @@ async function stopSession() {
         streamingContent.value = '[Stopped by user]'
         isStreaming.value = true
       }
+      // The journal is the primary render source when present — the stop
+      // marker must land there too, or the finalized timeline never shows it.
+      if (liveTimeline.value.length > 0 && sessionId.value) {
+        const state = useSessionState(sessionId)
+        state.timelineAppendSegment('text', '\n\n[Stopped by user]')
+      }
       // Do NOT call clearStreamingState here — that was wiping unfinished work.
     }
   } catch (e) {
@@ -802,11 +944,13 @@ async function sendMessageToBackend(message: string, attachments: Array<{filenam
   if (sendInFlight.value) return
   sendInFlight.value = true
 
-  // Start loading
+  // Start loading — a stale journal from a previous run must not prefix
+  // the new run's timeline.
   isLoading.value = true
   isStreaming.value = false
   streamingContent.value = ''
   activeToolCalls.value = []
+  setLiveTimeline([])
 
   try {
     // Send message and wait for response (streaming happens via events)
@@ -820,6 +964,7 @@ async function sendMessageToBackend(message: string, attachments: Array<{filenam
     isLoading.value = false
     isStreaming.value = false
     activeToolCalls.value = []
+    setLiveTimeline([])
 
     // Extract meaningful error message
     const errorMsg = error.message || String(error)

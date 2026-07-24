@@ -124,9 +124,9 @@ pub enum DaemonEvent {
     MessageEnd { session_id: String, message_id: String, content: String },
     ThinkingDelta { session_id: String, delta: String },
     ModelSwitch { model: String, reason: Option<String> },
-    ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value>, #[serde(default)] model: Option<String> },
+    ToolStart { session_id: String, call_id: String, name: String, #[serde(default)] input: Option<serde_json::Value>, #[serde(default)] model: Option<String>, #[serde(default)] tokens: Option<u64>, #[serde(default)] total_tokens: Option<u64> },
     ToolEnd { session_id: String, call_id: String, output: String, success: bool, #[serde(default)] duration_ms: Option<u64>, #[serde(default)] data: Option<serde_json::Value> },
-    Error { code: String, message: String },
+    Error { code: String, message: String, #[serde(default)] session_id: Option<String> },
     Connected { client_id: String },
     Disconnected { client_id: String },
     TaskRunStarted { scope: String, #[serde(default)] scope_id: Option<String>, goal: String },
@@ -828,12 +828,15 @@ impl DaemonClient {
         })).await
     }
     
-    /// Get session run state (in-flight streaming text, active tools)
-    pub async fn session_get_run_state(&self, session_id: &str) -> Result<Value, String> {
+    /// Get session run state (in-flight streaming text, active tools).
+    /// `light: true` omits the run journal — use it for periodic polls that
+    /// only need counters, not the full multi-hour record.
+    pub async fn session_get_run_state(&self, session_id: &str, light: bool) -> Result<Value, String> {
         self.request(serde_json::json!({
             "type": "session",
             "action": "get_run_state",
-            "id": session_id
+            "id": session_id,
+            "light": light
         })).await
     }
 

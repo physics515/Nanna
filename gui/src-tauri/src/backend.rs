@@ -225,7 +225,7 @@ impl Backend {
                             "delta": delta,
                         }));
                     }
-                    DaemonEvent::ToolStart { session_id, call_id, name, input, model } => {
+                    DaemonEvent::ToolStart { session_id, call_id, name, input, model, tokens, total_tokens } => {
                         let mut tool_call = serde_json::json!({
                             "id": call_id,
                             "name": name,
@@ -236,6 +236,12 @@ impl Backend {
                         });
                         if let Some(m) = &model {
                             tool_call["model"] = serde_json::json!(m);
+                        }
+                        if let Some(t) = tokens {
+                            tool_call["tokens"] = serde_json::json!(t);
+                        }
+                        if let Some(t) = total_tokens {
+                            tool_call["total_tokens"] = serde_json::json!(t);
                         }
                         let _ = app.emit("tool-call", serde_json::json!({
                             "session_id": session_id,
@@ -272,10 +278,11 @@ impl Backend {
                             "rate_limited_models": [],
                         }));
                     }
-                    DaemonEvent::Error { code, message, .. } => {
+                    DaemonEvent::Error { code, message, session_id } => {
                         let _ = app.emit("error", serde_json::json!({
                             "code": code,
                             "message": message,
+                            "session_id": session_id,
                         }));
                     }
                     DaemonEvent::TaskRunStarted { scope, scope_id, goal } => {
@@ -390,8 +397,9 @@ daemon_proxies! {
     sessions_delete_all();
     /// Rename a session
     session_rename(session_id: &str, name: &str);
-    /// Get session run state (in-flight streaming text, active tools)
-    session_get_run_state(session_id: &str);
+    /// Get session run state (in-flight streaming text, active tools).
+    /// `light` skips the run journal — for periodic counter polls.
+    session_get_run_state(session_id: &str, light: bool);
     /// Clear session history
     session_clear(session_id: &str);
 

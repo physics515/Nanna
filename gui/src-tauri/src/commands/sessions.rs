@@ -91,9 +91,13 @@ pub async fn get_session_history(
     session_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
     let state_guard = state.read().await;
+    // Effectively no limit: the chat page must reload the WHOLE session on
+    // remount — a cap here silently dropped history for long-horizon runs.
+    // An explicit huge bound (rather than None) keeps one guarantee under
+    // version skew: an older daemon defaulted None to 50.
     let result = state_guard
         .backend
-        .session_history(&session_id, Some(500))
+        .session_history(&session_id, Some(1_000_000))
         .await?;
 
     Ok(result
@@ -107,6 +111,8 @@ pub async fn get_session_history(
                         .and_then(|tc| serde_json::from_value::<Vec<ToolCallInfo>>(tc.clone()).ok())
                         .unwrap_or_default();
                     let reasoning = m.get("reasoning").and_then(|r| r.as_str()).map(str::to_string);
+                    let timeline = m.get("timeline").filter(|t| t.is_array()).cloned();
+                    let usage = m.get("usage").filter(|u| u.is_object()).cloned();
                     Some(ChatMessage {
                         id: m.get("id")?.as_str()?.to_string(),
                         role: m.get("role")?.as_str()?.to_string(),
@@ -114,6 +120,8 @@ pub async fn get_session_history(
                         timestamp: m.get("timestamp")?.as_str()?.to_string(),
                         tool_calls,
                         reasoning,
+                        timeline,
+                        usage,
                     })
                 })
                 .collect()
@@ -292,13 +300,15 @@ pub async fn send_to_sub_session(
 }
 
 /// Get session run state (in-flight streaming text, active tools).
+/// `light: true` skips the run journal — for periodic counter polls.
 #[tauri::command]
 pub async fn get_session_run_state(
     state: State<'_, Arc<RwLock<AppState>>>,
     session_id: String,
+    light: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let state = state.read().await;
-    state.backend.session_get_run_state(&session_id).await
+    state.backend.session_get_run_state(&session_id, light.unwrap_or(false)).await
 }
 
 // =============================================================================
