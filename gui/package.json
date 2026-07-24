@@ -40,7 +40,7 @@
     "@tiptap/extension-typography": "2.11.5",
     "@tiptap/pm": "^2.27.2",
     "@tiptap/starter-kit": "^2.27.2",
-    "@tiptap/suggestion": "2.11.5",
+    "@tiptap/suggestion": "2.27.2",
     "@tiptap/vue-3": "^2.27.2",
     "@vueuse/core": "^14.3.0",
     "class-variance-authority": "^0.7.1",
