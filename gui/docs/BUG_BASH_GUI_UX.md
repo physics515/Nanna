@@ -24,7 +24,8 @@ Rolling list of open polish. Promote closed items into ROADMAP dated `[x]` lines
 
 ## Open
 - Formal **1280×720 / 1440×900** clipped-CTA visual pass (manual; VirtualList helps long lists but does not replace the viewport audit)
-- Command **palette polish**: fuzzy ranking, recent-commands, tool invoke shortcuts
+- Command **palette polish**: ~~fuzzy ranking~~ *(done 2026-07-24 — `subsequenceScore`)*, recent-commands, tool invoke shortcuts
+- **Command palette does not open from Mod+K in the Playwright dev shell** — needs confirming in the real Tauri shell before it counts as a product bug. On `/logs`, neither `page.keyboard.press('Control+k' | 'Meta+k' | 'ControlOrMeta+k')` nor a synthetic `window.dispatchEvent(new KeyboardEvent('keydown', {key:'k', ctrlKey:true}))` produces a `.cmdk-root`, with no console error and `document.activeElement === BODY`. Reading the code, it should work: `useShortcuts().bind` is called at `default.vue` setup (top level, no preceding top-level `await`), `registerShortcut` calls `ensureListen()` immediately, `matches()` accepts `mod` for either Ctrl or Meta, the binding sets `allowInInput: true`, and `useCommandPalette` is a module-level singleton the layout binds via `:open`. So either registration is not happening in this environment or the toggle is not reaching the render — worth an instrumented run rather than another guess.
 - Channel wizard bulk/multi-step validation still uneven vs single-field ApiKeyInput
 - Windows `node_modules` / vitest file-lock flakiness under concurrent test runs
 - **Onboarding**: health step uses `get_backend_status` only — does not yet validate a model is pulled (Ollama) or a cloud key works end-to-end (P0.1 remainder)

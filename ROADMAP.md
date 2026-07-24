@@ -653,6 +653,36 @@ bugs and improvements here; do not bury them only in the backlog bullet.
       animate their mesh forever, so Playwright's stability check never settles — assert
       visible+enabled, then `click({ force: true })`.
       Verified: 60/60 vitest, 26/26 Playwright (the 27th is the pre-existing flaky session test below).
+      *(2026-07-24)* **Command palette gained a fuzzy tier — `subsequenceScore` in `lib/commandPalette.ts`.**
+      `filterActions` was substring-only, so the way people actually type into a palette (`mstats`,
+      `tglogs`, `nchat`) returned **nothing at all**. It now falls through to a subsequence match over the
+      label and keywords, scored to reward consecutive runs and word-boundary landings, and **capped at 25
+      — strictly below the weakest literal tier (group = 30)** — so fuzzy can only *add* results a literal
+      search missed, never reorder ones it found. Two guards against the noise that makes naive fuzzy
+      palettes feel broken: a query must be ≥2 characters, and must land on at least one word boundary
+      (`oe` is a genuine subsequence of half the list). Raw score is normalised against the best attainable
+      score for the query length so long labels cannot outrank short ones on length alone.
+      Fixed in passing: the tier chain tested `group` **before** `keywords`, so an action whose keyword
+      matched exactly scored 30 instead of 40 — keywords now come first.
+      10 new tests (non-subsequence, single-char, no-boundary rejection; word-initial scoring; consecutive
+      beats scattered; the ≤25 ceiling; the three fuzzy queries above resolving; literal-first ranking;
+      keyword-over-group). All **8 pre-existing tests pass unchanged**, which is the point — ranking
+      behaviour is preserved. 75/75 vitest.
+      - [ ] **Not shipped with it: the planned e2e.** The palette **would not open from Mod+K in the
+            Playwright dev shell** — not via `keyboard.press` (`Control+k` / `Meta+k` / `ControlOrMeta+k`)
+            and not via a synthetic `window` `keydown`, with no console error. The code reads correct
+            (registration at layout setup with no preceding top-level `await`, `mod` matches Ctrl *or*
+            Meta, `allowInInput: true`, module-singleton state bound through `:open`). Rather than ship an
+            e2e that passes for the wrong reason, it was dropped and the observation logged in
+            `BUG_BASH_GUI_UX.md`. **Confirm in the real Tauri shell before calling it a product bug** — if
+            it reproduces there, Mod+K has never worked for users and the palette is unreachable by its
+            advertised shortcut.
+      **Negative result worth not re-deriving:** the same audit was extended to the sibling failure mode
+      — a `@handler` bound to an event the child never emits, which also fails silently — by checking
+      every PascalCase component tag's listeners against the callee's `defineEmits` (allowing native
+      fallthrough events, `update:*`, and kebab/camel spellings). Across the 91 files and the **25**
+      components that declare an explicit emit contract there are **zero** mismatches. That class is
+      clean; don't spend another run probing it.
 - [x] *(2026-07-24)* **`<UiInput size="sm">` forwards `size` onto the native `<input>` and the DOM rejects
       it.** Found while verifying the component-resolution fix above; **pre-existing** — reproduced with
       that fix stashed, so it is not fallout. `app/components/ui/input.vue` declared no `size` prop, so

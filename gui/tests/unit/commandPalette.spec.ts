@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { filterActions, NAV_ACTIONS, QUICK_ACTIONS, type PaletteAction } from '../../app/lib/commandPalette'
+import {
+  filterActions,
+  subsequenceScore,
+  NAV_ACTIONS,
+  QUICK_ACTIONS,
+  type PaletteAction,
+} from '../../app/lib/commandPalette'
 
 const ALL: PaletteAction[] = [...NAV_ACTIONS, ...QUICK_ACTIONS]
 
@@ -57,5 +63,63 @@ describe('filterActions', () => {
     ]
     const result = filterActions(actions, 'settings')
     expect(result[0]?.id).toBe('b')
+  })
+})
+
+describe('subsequenceScore', () => {
+  it('rejects a query that is not a subsequence', () => {
+    expect(subsequenceScore('model stats', 'zzz')).toBe(-1)
+  })
+
+  it('rejects a single-character query as too weak to be meaningful', () => {
+    expect(subsequenceScore('model stats', 'm')).toBe(-1)
+  })
+
+  it('rejects a subsequence that never lands on a word boundary', () => {
+    // 'oe' really is a subsequence of "model stats", and that kind of accidental hit is
+    // exactly the noise that makes naive fuzzy palettes feel broken.
+    expect(subsequenceScore('model stats', 'oe')).toBe(-1)
+  })
+
+  it('scores initials of each word highly', () => {
+    expect(subsequenceScore('model stats', 'ms')).toBeGreaterThan(0)
+  })
+
+  it('rewards consecutive runs over scattered matches', () => {
+    const consecutive = subsequenceScore('toggle live logs', 'togg')
+    const scattered = subsequenceScore('toggle live logs', 'tlls')
+    expect(consecutive).toBeGreaterThan(scattered)
+  })
+
+  it('never exceeds the fuzzy ceiling, so a fuzzy hit cannot outrank a literal one', () => {
+    // 25 is FUZZY_SCORE_MAX; the weakest literal tier (group) is 30.
+    expect(subsequenceScore('model stats', 'model stats')).toBeLessThanOrEqual(25)
+  })
+})
+
+describe('filterActions — fuzzy tier', () => {
+  it('finds actions that a substring search misses entirely', () => {
+    // None of these appear as a contiguous substring of any label or keyword.
+    expect(filterActions(ALL, 'mstats').some((a) => a.id === 'nav-model-stats')).toBe(true)
+    expect(filterActions(ALL, 'tglogs').some((a) => a.id === 'toggle-live-logs')).toBe(true)
+    expect(filterActions(ALL, 'nchat').some((a) => a.id === 'new-chat')).toBe(true)
+  })
+
+  it('ranks every literal match above every fuzzy one', () => {
+    const results = filterActions(ALL, 'logs')
+    // 'Logs' is an exact label match; anything reached only by subsequence must come after it.
+    expect(results[0]?.id).toBe('nav-logs')
+  })
+
+  it('still returns nothing for a query that matches no action at all', () => {
+    expect(filterActions(ALL, 'zzzz-no-such-command-qqq')).toEqual([])
+  })
+
+  it('keeps a keyword hit ahead of a group-name hit', () => {
+    const actions: PaletteAction[] = [
+      { id: 'by-group', label: 'Unrelated', group: 'Diagnostics' },
+      { id: 'by-keyword', label: 'Unrelated too', group: 'Other', keywords: ['diagnostics'] },
+    ]
+    expect(filterActions(actions, 'diagnostics')[0]?.id).toBe('by-keyword')
   })
 })
