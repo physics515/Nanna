@@ -2526,6 +2526,28 @@ model masks. Measured on the 5-task smoke suite, same model, same seed tasks:
 **Principle earned:** *a guard the model cannot satisfy is a wedge.* Refuse only when the model can
 act on the refusal; otherwise repair and say so.
 
+**REGRESSION — self-verification kills the harness (2026-07-25, blocks the eval).** The self-check
+instruction above works: models now genuinely run their own acceptance command
+(`DEBUG Executing tool: exec … {"command":"sh tests/test_05.sh"}`). But running it **through the
+`exec` tool kills the test process** — exit `0xffffffff`, no panic, no watchdog involvement.
+Reproduced across two different models, each dying seconds after its first self-check:
+
+| model | ran | last action |
+|---|---|---|
+| lfm2.5 | 2m34s | `exec sh tests/test_05.sh` |
+| gemma4:12b | 1m40s | `exec sh tests/test_01.sh` |
+
+The same command is safe through the acceptance runner, which spawns via
+`tokio::process::Command` with `current_dir` + `kill_on_drop` (hundreds of `FAIL(test_NN)` results,
+zero crashes). The difference is isolation: `builtin/exec.rs:112` does a bare `Command::new(shell)`
+with no process-group separation, so a child that terminates its group takes the harness with it.
+
+**Fix before re-running the eval** — isolate the exec child (`CREATE_NEW_PROCESS_GROUP` on Windows /
+`setsid` on unix), so model-generated code can never kill the harness driving it. This is a real
+robustness hole independent of the eval: any agent that writes and runs a script can currently take
+down its own daemon. Until then the self-check instruction is effectively a footgun, and every
+endurance rung dies in ~2 minutes.
+
 **Open:** `live_endurance` leaves a **zombie process** — observed alive ~1.5 h after printing its final
 summary, holding `live_long_horizon-*.exe` and failing every later build with `LNK1104`. The test
 function completes but the runtime never exits (suspect a lingering spawned task / connection pool).
