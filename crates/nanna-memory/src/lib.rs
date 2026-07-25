@@ -108,6 +108,19 @@ pub trait MemoryPersistence: Send + Sync {
     async fn save_entry(&self, entry: &MemoryEntry) -> Result<(), MemoryError>;
     /// Remove an entry by its ID.
     async fn remove_entry(&self, id: &str) -> Result<(), MemoryError>;
+    /// Remove multiple entries by ID in one batch.
+    ///
+    /// The default loops [`remove_entry`](Self::remove_entry); a backing store
+    /// that can amortize per-delete cost across the batch (e.g. a single WAL
+    /// checkpoint for the whole set, rather than one per row) overrides this. The
+    /// dream cycle removes a cluster's superseded sources through this path, so a
+    /// per-row checkpoint there would fsync once per consolidated memory.
+    async fn remove_entries(&self, ids: &[&str]) -> Result<(), MemoryError> {
+        for id in ids {
+            self.remove_entry(id).await?;
+        }
+        Ok(())
+    }
     /// Update only the FSRS cognitive state for an existing entry.
     async fn update_entry_fsrs(&self, id: &str, fsrs: &FsrsState) -> Result<(), MemoryError>;
     /// Update only the text content for an existing entry.
@@ -522,6 +535,49 @@ impl VectorStore {
         }
 
         Ok(())
+    }
+
+    /// Remove many entries by ID in one batch.
+    ///
+    /// Best-effort like [`remove`](Self::remove): an id absent from the in-RAM
+    /// cache is skipped rather than erroring, and a persistence failure is logged
+    /// but non-fatal (the dream cycle that drives this must not abort a whole
+    /// consolidation because one source removal failed). The batch takes the
+    /// entries write-lock **once** and issues **one** persistence
+    /// [`remove_entries`](MemoryPersistence::remove_entries) call, so a backing
+    /// store that batches (Turso) checkpoints once for the set instead of per row.
+    ///
+    /// Returns the number of entries actually removed from the in-RAM cache.
+    pub async fn remove_many(&self, ids: &[&str]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let requested = ids.len();
+        let id_set: std::collections::HashSet<&str> = ids.iter().copied().collect();
+
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|e| !id_set.contains(e.id.as_str()));
+        let removed = before - entries.len();
+        drop(entries);
+
+        debug_assert!(
+            removed <= requested,
+            "removed more entries than ids requested"
+        );
+
+        // Write-through: one batched persistence call for the whole set.
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.remove_entries(ids).await {
+                warn!(
+                    "Failed to batch-remove {} memory entries from persistence: {}",
+                    requested, e
+                );
+                // Non-fatal
+            }
+        }
+
+        removed
     }
 
     /// Update FSRS state for an entry.
@@ -1036,6 +1092,96 @@ mod tests {
         let h = store.store_health().await;
         assert!(h.degraded, "a whole-store load failure must mark degraded");
         assert_eq!(h.loaded, 0);
+    }
+
+    // Counts single vs batched removals to prove `remove_many` routes through the
+    // batched persistence path (one call) instead of N single `remove_entry`s.
+    #[derive(Default)]
+    struct CountingRemovalDb {
+        single_calls: std::sync::atomic::AtomicUsize,
+        batch_calls: std::sync::atomic::AtomicUsize,
+        batch_ids_total: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl MemoryPersistence for CountingRemovalDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> {
+            self.single_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn remove_entries(&self, ids: &[&str]) -> Result<(), MemoryError> {
+            self.batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.batch_ids_total
+                .fetch_add(ids.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(vec![]) }
+    }
+
+    fn entry_dim8(id: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: format!("content {id}"),
+            embedding: vec![0.0; 8],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_many_uses_one_batched_persistence_call() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let db = Arc::new(CountingRemovalDb::default());
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        })
+        .with_persistence(db.clone());
+        for i in 0..3 {
+            store.add(entry_dim8(&format!("m{i}"))).await.unwrap();
+        }
+
+        let removed = store.remove_many(&["m0", "m1", "m2"]).await;
+
+        assert_eq!(removed, 3, "all three present entries removed from cache");
+        assert_eq!(
+            db.batch_calls.load(SeqCst),
+            1,
+            "exactly one batched persistence call"
+        );
+        assert_eq!(
+            db.batch_ids_total.load(SeqCst),
+            3,
+            "the batch carried all three ids"
+        );
+        assert_eq!(
+            db.single_calls.load(SeqCst),
+            0,
+            "no per-row remove_entry calls"
+        );
+        assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_many_empty_is_a_noop() {
+        let db = Arc::new(CountingRemovalDb::default());
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        })
+        .with_persistence(db.clone());
+        let removed = store.remove_many(&[]).await;
+        assert_eq!(removed, 0);
+        assert_eq!(
+            db.batch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty batch makes no persistence call"
+        );
     }
 
     #[tokio::test]

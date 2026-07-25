@@ -1134,6 +1134,8 @@ impl MemoryService {
 
         let mut survivors: Vec<MemoryEntry> = Vec::with_capacity(ranked.len());
         let mut folded_count = 0_usize;
+        // Source ids of successful folds, removed in one batch after the pass.
+        let mut folded_source_ids: Vec<String> = Vec::new();
 
         for candidate in ranked {
             let target = if folded_count < removal_budget_count {
@@ -1176,6 +1178,7 @@ impl MemoryService {
                         .importance
                         .max(candidate.fsrs.importance);
                     survivors[target_index].fsrs.access_count += candidate.fsrs.access_count;
+                    folded_source_ids.push(candidate.id.clone());
                     folded_count += 1;
                     result.memories_deduped += 1;
                 }
@@ -1197,16 +1200,31 @@ impl MemoryService {
             memories_count_before,
             "every memory must either survive or be folded — none may vanish"
         );
+        debug_assert_eq!(
+            folded_source_ids.len(),
+            folded_count,
+            "one source id recorded per fold"
+        );
 
-        if folded_count > 0 {
+        // Drop every folded source in a single batch — one WAL checkpoint for the
+        // whole dedup pass instead of one per fold. Deferred to here (not inside
+        // `commit_duplicate_fold`) precisely so it can be batched; the sources are
+        // already absent from `survivors`, so this is pure write-through cleanup.
+        if !folded_source_ids.is_empty() {
+            let id_refs: Vec<&str> = folded_source_ids.iter().map(String::as_str).collect();
+            self.store.remove_many(&id_refs).await;
             info!("Dream dedup: folded {folded_count} near-duplicate memories (no LLM call)");
         }
         survivors
     }
 
     /// Persist one duplicate fold: rewrite the survivor (merged content, fresh
-    /// embedding, inherited FSRS), then drop the source. Update-before-remove,
-    /// so a partial failure can only leave a duplicate, never lose content.
+    /// embedding, inherited FSRS). The source row is **not** dropped here — the
+    /// caller batches all folded sources into a single `remove_many` at the end
+    /// of the pass (one WAL checkpoint for the whole batch, not one per fold).
+    /// Update-before-remove still holds at the pass level: every survivor rewrite
+    /// commits before any source is removed, so a partial failure can only leave a
+    /// transient duplicate (re-folded next cycle), never lose content.
     ///
     /// Returns the survivor's **new embedding** when the content changed (so the
     /// caller's in-memory copy can be kept in step with the store — a stale
@@ -1246,7 +1264,7 @@ impl MemoryService {
             })
             .await?;
 
-        self.store.remove(&source.id).await?;
+        // NB: the source is removed by the caller in one batch, not here.
         Ok(new_embedding)
     }
 
@@ -1285,12 +1303,15 @@ impl MemoryService {
         // delete every source and then lose them all on a failed add.
         self.store.add(consolidated).await?;
 
-        // Remove the now-superseded source memories (best-effort).
-        for memory in &cluster.memories {
-            if let Err(e) = self.store.remove(&memory.id).await {
-                warn!("Failed to remove old memory {}: {}", memory.id, e);
-            }
-        }
+        // Remove the now-superseded source memories in ONE batch (best-effort):
+        // a single persistence call / WAL checkpoint for the whole cluster rather
+        // than one fsync per source.
+        let source_ids: Vec<&str> = cluster.memories.iter().map(|m| m.id.as_str()).collect();
+        let removed = self.store.remove_many(&source_ids).await;
+        debug_assert!(
+            removed <= source_ids.len(),
+            "removed more sources than the cluster held"
+        );
 
         debug!(
             "Consolidated {} memories into 1 ({:?})",

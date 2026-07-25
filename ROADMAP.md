@@ -1638,6 +1638,18 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             (latest zeroed page wins) **and truncates the WAL to 0**, discarding the stale pre-overwrite frame
             (empirically: `FULL`/`RESTART`/passive do **not** truncate; `TRUNCATE` took the WAL 2.6 MB → 0).
             `bulk_delete` checkpoints **once** for the whole batch (the dream-cycle fold path), not per row.
+            *(2026-07-25, follow-on)* **The dream cycle now actually takes that batch path — the per-delete
+            checkpoint regression is closed.** The secure-delete checkpoint made each single `delete` fsync, but
+            consolidation removed cluster members and folded duplicates **one at a time**
+            (`consolidate_cluster`'s loop and `commit_duplicate_fold`), so a dream cycle would have fsynced once
+            per removed memory. Added `MemoryPersistence::remove_entries` (default loops `remove_entry`; the
+            Turso impl overrides to `bulk_delete` → one checkpoint) and `VectorStore::remove_many` (one
+            entries-write-lock + one persistence call). `consolidate_cluster` removes the whole cluster in one
+            `remove_many`; `fold_near_duplicates` defers every folded source to a single end-of-pass
+            `remove_many` (`commit_duplicate_fold` no longer removes — update-before-remove still holds at the
+            pass level, since folded sources are already absent from the in-pass `survivors` list). 2 new tests
+            (one batched persistence call for N ids, not N single calls; empty batch is a no-op); the 8 existing
+            fold/consolidation invariant tests stay green (88 nanna-memory + 99 nanna-daemon).
             Best-effort by contract: a `busy` checkpoint (concurrent reader) leaves the stale frame for a later
             one; the row is already deleted + overwritten. 4 tests in `crates/nanna-storage/tests/secure_delete.rs`
             (single-delete embedding absent-after / present-before; bulk 3-embedding; in-memory graceful; raw
