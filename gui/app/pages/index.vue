@@ -66,6 +66,10 @@
       </p>
     </header>
 
+    <!-- Body: messages + input column, with the run's task checklist beside
+         it (the chat's live window into the task store — P19). -->
+    <div class="flex flex-1 min-h-0">
+    <div class="flex flex-col flex-1 min-w-0">
     <!-- Messages area -->
     <div ref="messagesContainer" @scroll="handleScroll" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
       <ConnectionStatus
@@ -284,6 +288,15 @@
           @stop="stopSession"
         />
       </div>
+    </div>
+    </div>
+
+    <!-- Task checklist sidebar (renders only when the session has tasks) -->
+    <TaskChecklist
+      v-if="currentSession"
+      :session-id="currentSession.id"
+      class="hidden lg:flex"
+    />
     </div>
     </template>
   </div>

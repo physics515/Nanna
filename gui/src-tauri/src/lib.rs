@@ -375,6 +375,8 @@ pub fn run() {
             commands::scheduler::run_cron_job_now,
             commands::scheduler::get_cron_job_history,
             commands::scheduler::validate_cron_expression,
+            // Task store (read-only view for the chat's checklist)
+            commands::tasks::list_tasks,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
