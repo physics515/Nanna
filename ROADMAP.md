@@ -2735,6 +2735,23 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      and 56/56 vitest. This is the bump the previous run reverted at merge pending the
      `UiSonnerSonner` blocker; **that blocker is fixed in the next commit of this PR** (it was never
      nuxt's fault — it reproduced on pristine `origin/master`).
+   - *(2026-07-25 sweep)* `cargo update` → 4 compatible bumps (`cc 1.3→1.4`, `either 1.16→1.17`,
+     `simd_cesu8 1.1→1.2`, `webpki-root-certs 1.0.8→1.0.9`). `cargo upgrade --incompatible` → **two
+     majors applied green**: **`base64 0.22 → 0.23` in `nanna-config`** — the previous run bumped it in
+     `nanna-agent`+`nanna-gui` but left `nanna-config` (credentials.rs) on 0.22, so a stray 0.22 node
+     lingered; the `general_purpose::STANDARD.{encode,decode}` call sites compiled unchanged. `base64
+     0.22.1` still resolves for `tiktoken-rs 0.12` (its `^0.22.1` req), so the two coexist by design.
+     And **`playwright-rs 0.14 → 0.15` in `nanna-browser`** — 0.15 made `Page::locator()` **synchronous**
+     (returns `Locator` directly, no longer a future), so the 8 `self.page.locator(..).await` sites in
+     `playwright.rs` dropped their `.await`; compiled clean under the `playwright` feature. Everything
+     else already at latest req (only the intentional `turso`/`aegis` pins + boa git rev held back).
+     Workspace (excl. `nanna-gui`) builds green; nanna-config 1 + nanna-browser 17 + dep_guard 1 tests
+     pass; no banned deps entered the tree. Frontend `pnpm outdated`: **only the documented deferred
+     majors** (`@tiptap/* 2→3`, `marked 17→18`, `vue-router 4→5`, `vue-sonner 1→2`, `typescript 5.9→7.0`)
+     plus the two traps (`lucide-vue-next 1.0.0` tombstone, `vuedraggable` `latest`=Vue-2) — `package.json`
+     is already at latest-safe, no GUI changes this run. *Reconfirmed the fmt gotcha: `cargo fmt -p <crate>`
+     reformats the whole crate, not the touched file — `origin/master` isn't fmt-clean, so it churned 4
+     unrelated files; reverted, kept only the surgical `.await` diff.*
    - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
      Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
      release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):

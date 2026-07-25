@@ -22,7 +22,7 @@ futures = "0.3"
 chromiumoxide = { version = "0.9", optional = true }
 
 # Playwright for multi-browser support (Firefox, WebKit, Chromium)
-playwright-rs = { version = "0.14", optional = true }
+playwright-rs = { version = "0.15", optional = true }
 
 # Image processing
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
