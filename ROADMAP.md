@@ -513,6 +513,14 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             matching the daemon. Added the first tests for this function (6): valid accepts, tampered body
             rejects, stale timestamp rejects, wrong secret rejects, **non-UTF-8 body verifies correctly**
             (the regression guard), and missing-`v0=`/empty-input rejects. nanna-server green.
+      - [x] *(2026-07-25)* **Telegram webhook secret now compared constant-time (daemon).** The daemon
+            checked the `X-Telegram-Bot-Api-Secret-Token` with a plain `!=`, which short-circuits on the
+            first wrong byte and leaks match progress through response timing — inconsistent with the
+            HMAC/Ed25519 verifiers next to it. Extracted a testable `webhook_secret_matches(expected,
+            provided)` using `subtle::ConstantTimeEq` (subtle was already in the tree transitively; now a
+            direct dep). 1 test (exact match accepts; wrong-byte / prefix / superstring / missing / empty
+            reject). Low practical risk on a static high-entropy secret, but it keeps the whole webhook
+            surface constant-time.
       - [x] *(2026-07-25)* **`nanna-server` Discord Ed25519 verify aligned to the daemon's `verify_strict`.**
             The server copy used `verifying_key.verify(..)`; the daemon uses `verify_strict`, which rejects
             **malleable / non-canonical signatures and small-order keys**. Switched to `verify_strict` (and

@@ -20,9 +20,24 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
+
+/// Constant-time comparison of a configured webhook secret against the value a
+/// request presented (absent → `""`).
+///
+/// A plain `==`/`!=` on the secret would compare byte-by-byte and short-circuit
+/// on the first mismatch, leaking — through response timing — how much of a
+/// guess is correct. It is a static shared secret rather than a per-request MAC,
+/// so the practical risk is small, but the daemon's HMAC/Ed25519 verifiers are
+/// all constant-time and this keeps the whole surface consistent. Length is not
+/// secret, so an early length check is fine.
+fn webhook_secret_matches(expected: &str, provided: Option<&str>) -> bool {
+    let provided = provided.unwrap_or("");
+    expected.as_bytes().ct_eq(provided.as_bytes()).into()
+}
 
 // =============================================================================
 // Webhook Event Types
@@ -190,13 +205,13 @@ async fn telegram_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Verify secret token if configured
+    // Verify secret token if configured (constant-time — see webhook_secret_matches).
     if let Some(ref secret) = state.config.telegram_secret {
         let header_secret = headers
             .get("X-Telegram-Bot-Api-Secret-Token")
             .and_then(|v| v.to_str().ok());
-        
-        if header_secret != Some(secret.as_str()) {
+
+        if !webhook_secret_matches(secret, header_secret) {
             warn!("Telegram webhook: invalid secret token");
             return StatusCode::UNAUTHORIZED;
         }
@@ -930,7 +945,23 @@ pub const DEFAULT_WEBHOOK_PORT: u16 = 3000;
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    #[test]
+    fn webhook_secret_matches_only_on_exact_equality() {
+        assert!(webhook_secret_matches("s3cr3t", Some("s3cr3t")));
+        // Each rejection binds the result so the line stays readable.
+        let wrong_byte = webhook_secret_matches("s3cr3t", Some("s3cr3T"));
+        assert!(!wrong_byte, "one wrong byte");
+        let prefix = webhook_secret_matches("s3cr3t", Some("s3cr3"));
+        assert!(!prefix, "a prefix must not match");
+        let superstring = webhook_secret_matches("s3cr3t", Some("s3cr3t2"));
+        assert!(!superstring, "a superstring must not match");
+        let missing = webhook_secret_matches("s3cr3t", None);
+        assert!(!missing, "a missing token never matches");
+        let empty = webhook_secret_matches("s3cr3t", Some(""));
+        assert!(!empty, "an empty token never matches");
+    }
+
     #[test]
     fn test_extract_generic_message_pattern1() {
         let payload = json!({
