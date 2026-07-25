@@ -114,6 +114,25 @@ impl AcceptanceCheck {
         }
     }
 
+    /// The shell command the model can run itself to see the same verdict the
+    /// harness will apply, or `None` when the check is pure inspection with
+    /// no command to run (a bare file/regex test the model can just look at).
+    ///
+    /// Deliberately NOT synthesized for `FileExists`/path-`Regex`: inventing
+    /// a `test -f`/`grep` line would put words in the check's mouth, and the
+    /// description already states the condition plainly.
+    #[must_use]
+    pub fn self_check_command(&self) -> Option<&str> {
+        match self {
+            Self::Command { command, .. } => Some(command),
+            Self::Regex {
+                command: Some(command),
+                ..
+            } => Some(command),
+            Self::FileExists { .. } | Self::Regex { .. } => None,
+        }
+    }
+
     fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
         let secs = timeout_secs
             .unwrap_or(ACCEPTANCE_TIMEOUT_SECS_DEFAULT)
@@ -596,6 +615,20 @@ pub fn build_step_prompt(
                 "Done when (checked by the harness, not by you): {}\n",
                 check.describe()
             ));
+            // Close the feedback loop INSIDE the step. Measured live
+            // (gemma4:12b, 42-feature ladder): across two hours the model
+            // never once ran its own acceptance command, even though the
+            // line above names it — so it edited blind, learned the verdict
+            // only at the step boundary, and re-submitted the same broken
+            // implementation repeatedly. Checking costs one `exec`; not
+            // checking costs a whole step.
+            if let Some(command) = check.self_check_command() {
+                prompt.push_str(&format!(
+                    "Before you finish this step, RUN THAT CHECK YOURSELF: exec `{command}`. \
+                     Read its output, fix what it reports, and run it again until it passes. \
+                     Do not end the step on an unverified guess.\n"
+                ));
+            }
         }
         None => {
             prompt.push_str(
@@ -1413,6 +1446,34 @@ mod tests {
         let last_pos = prompt.find("last output").unwrap();
         let budget_pos = prompt.find("== BUDGET ==").unwrap();
         assert!(goal_pos < task_pos && task_pos < last_pos && last_pos < budget_pos);
+    }
+
+    /// gemma4:12b ran its acceptance command ZERO times across two hours of
+    /// the 42-feature ladder, so it edited blind and re-submitted the same
+    /// broken implementation. The prompt now hands it the command.
+    #[test]
+    fn step_prompt_tells_the_model_to_run_the_check_itself() {
+        let check = AcceptanceCheck::from_json(&serde_json::json!({
+            "kind": "command", "command": "sh tests/test_05.sh"
+        }))
+        .unwrap();
+        let prompt = build_step_prompt("g", &step(1, "t", Some(check)), None, "b");
+        assert!(prompt.contains("RUN THAT CHECK YOURSELF"));
+        assert!(prompt.contains("exec `sh tests/test_05.sh`"));
+    }
+
+    /// A pure file/regex check has no command to run — inventing one would
+    /// put words in the check's mouth, so the instruction is omitted.
+    #[test]
+    fn a_file_check_gets_no_self_check_instruction() {
+        let check = AcceptanceCheck::from_json(&serde_json::json!({
+            "kind": "file_exists", "path": "greeting.txt"
+        }))
+        .unwrap();
+        assert!(check.self_check_command().is_none());
+        let prompt = build_step_prompt("g", &step(1, "t", Some(check)), None, "b");
+        assert!(!prompt.contains("RUN THAT CHECK YOURSELF"));
+        assert!(prompt.contains("must exist"), "the condition is still stated");
     }
 
     #[test]
