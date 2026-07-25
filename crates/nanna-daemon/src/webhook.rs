@@ -39,6 +39,32 @@ fn webhook_secret_matches(expected: &str, provided: Option<&str>) -> bool {
     expected.as_bytes().ct_eq(provided.as_bytes()).into()
 }
 
+/// Verify a Meta/WhatsApp `X-Hub-Signature-256` header against the raw body.
+///
+/// Meta signs each webhook POST with `sha256=<hex>` where the digest is
+/// HMAC-SHA256(app_secret, raw_body). Without this check the `/webhook/whatsapp`
+/// POST endpoint accepts **any** payload from anyone who learns the URL. The body
+/// is HMAC'd as raw bytes; comparison is constant-time via `Mac::verify_slice`.
+fn verify_meta_signature(app_secret: &str, signature_header: Option<&str>, body: &[u8]) -> bool {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    if app_secret.is_empty() {
+        return false;
+    }
+    let Some(hex_digest) = signature_header.and_then(|s| s.strip_prefix("sha256=")) else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_digest) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
 // =============================================================================
 // Webhook Event Types
 // =============================================================================
@@ -94,8 +120,12 @@ pub struct WebhookConfig {
     pub discord_public_key: Option<String>,
     /// Slack signing secret
     pub slack_signing_secret: Option<String>,
-    /// WhatsApp verify token
+    /// WhatsApp verify token (GET subscription handshake)
     pub whatsapp_verify_token: Option<String>,
+    /// WhatsApp/Meta app secret — HMAC-SHA256 key for the `X-Hub-Signature-256`
+    /// on inbound POST payloads. `None` skips verification (matches the other
+    /// providers when unconfigured).
+    pub whatsapp_app_secret: Option<String>,
     /// Generic webhook secrets (webhook_id -> secret)
     pub generic_secrets: HashMap<String, String>,
 }
@@ -114,6 +144,7 @@ impl Default for WebhookConfig {
             discord_public_key: None,
             slack_signing_secret: None,
             whatsapp_verify_token: None,
+            whatsapp_app_secret: None,
             generic_secrets: HashMap::new(),
         }
     }
@@ -613,7 +644,7 @@ async fn whatsapp_verify(
     
     if mode == Some("subscribe") {
         if let Some(ref verify_token) = state.config.whatsapp_verify_token {
-            if token == Some(verify_token.as_str()) {
+            if webhook_secret_matches(verify_token, token) {
                 info!("WhatsApp webhook: verification successful");
                 return (StatusCode::OK, challenge.cloned().unwrap_or_default()).into_response();
             }
@@ -684,8 +715,24 @@ struct WhatsAppText {
 /// Handle WhatsApp webhook
 async fn whatsapp_webhook(
     State(state): State<Arc<WebhookState>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Verify the Meta X-Hub-Signature-256 when an app secret is configured. Skips
+    // (with a warning) when unset — same posture as the other providers — but an
+    // unset secret means the POST endpoint is unauthenticated, so configure one.
+    if let Some(ref app_secret) = state.config.whatsapp_app_secret {
+        let sig = headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok());
+        if !verify_meta_signature(app_secret, sig, &body) {
+            warn!("WhatsApp webhook: invalid X-Hub-Signature-256");
+            return StatusCode::UNAUTHORIZED;
+        }
+    } else {
+        warn!("WhatsApp app secret not configured - skipping POST signature verification");
+    }
+
     // Parse webhook
     let webhook: WhatsAppWebhook = match serde_json::from_slice(&body) {
         Ok(w) => w,
@@ -960,6 +1007,49 @@ mod tests {
         assert!(!missing, "a missing token never matches");
         let empty = webhook_secret_matches("s3cr3t", Some(""));
         assert!(!empty, "an empty token never matches");
+    }
+
+    fn meta_signature(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("key");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn verify_meta_signature_accepts_a_valid_signature() {
+        let secret = "app-secret";
+        let body = br#"{"object":"whatsapp_business_account"}"#;
+        let sig = meta_signature(secret, body);
+        assert!(verify_meta_signature(secret, Some(&sig), body));
+    }
+
+    #[test]
+    fn verify_meta_signature_rejects_tampering_and_bad_inputs() {
+        let secret = "app-secret";
+        let body = b"original";
+        let sig = meta_signature(secret, body);
+        let tampered = verify_meta_signature(secret, Some(&sig), b"tampered");
+        assert!(!tampered, "a changed body must not verify");
+        let wrong_secret = verify_meta_signature("other", Some(&sig), body);
+        assert!(!wrong_secret, "a wrong secret must not verify");
+        let no_prefix = verify_meta_signature(secret, Some("deadbeef"), body);
+        assert!(!no_prefix, "signature without the sha256= prefix must fail");
+        let missing = verify_meta_signature(secret, None, body);
+        assert!(!missing, "a missing header must not verify");
+        let empty_secret = verify_meta_signature("", Some(&sig), body);
+        assert!(!empty_secret, "an empty app secret must not verify");
+    }
+
+    #[test]
+    fn verify_meta_signature_handles_non_utf8_body() {
+        // WhatsApp media notifications aren't guaranteed UTF-8; the body is HMAC'd
+        // as raw bytes, so a binary payload must verify correctly.
+        let secret = "app-secret";
+        let body: &[u8] = &[0x00, 0xff, 0x10, 0x80, 0x7f];
+        let sig = meta_signature(secret, body);
+        assert!(verify_meta_signature(secret, Some(&sig), body));
     }
 
     #[test]

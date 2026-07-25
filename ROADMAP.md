@@ -513,6 +513,20 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             matching the daemon. Added the first tests for this function (6): valid accepts, tampered body
             rejects, stale timestamp rejects, wrong secret rejects, **non-UTF-8 body verifies correctly**
             (the regression guard), and missing-`v0=`/empty-input rejects. nanna-server green.
+      - [x] *(2026-07-25)* **WhatsApp POST webhook was UNAUTHENTICATED — now verifies the Meta
+            `X-Hub-Signature-256` (daemon).** `whatsapp_webhook` parsed and acted on any POST body with **no
+            signature check at all**, so anyone who learned the `/webhook/whatsapp` URL could inject fake
+            WhatsApp events. Added a tested pure `verify_meta_signature(app_secret, header, body)`
+            (HMAC-SHA256 over the **raw** body, `sha256=<hex>` prefix, constant-time `verify_slice`) and a
+            `whatsapp_app_secret: Option<String>` field on `WebhookConfig`; the handler now rejects a bad
+            signature with 401 when the secret is configured (skips with a warning when unset — same posture
+            as the other providers, and `None` by default so existing behaviour is unchanged). Also switched
+            the GET subscription handshake's verify-token check from `==` to the constant-time
+            `webhook_secret_matches`. 4 tests (valid accepts; tamper/wrong-secret/no-prefix/missing/empty
+            reject; **non-UTF-8 body verifies** — WhatsApp media notifications aren't guaranteed UTF-8).
+            *(Config plumbing note: `whatsapp_app_secret` is populated at the same maturity as the existing
+            `whatsapp_verify_token` — neither is yet mapped from the user `Config` into `WebhookConfig`; that
+            end-to-end wiring is the remaining piece for all webhook secrets.)*
       - [x] *(2026-07-25)* **Telegram webhook secret now compared constant-time (daemon).** The daemon
             checked the `X-Telegram-Bot-Api-Secret-Token` with a plain `!=`, which short-circuits on the
             first wrong byte and leaks match progress through response timing — inconsistent with the
