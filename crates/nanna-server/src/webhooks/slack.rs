@@ -29,23 +29,35 @@ fn verify_slack_signature(
     timestamp: &str,
     body: &[u8],
 ) -> bool {
-    // Check timestamp freshness to prevent replay attacks
-    if let Ok(ts) = timestamp.parse::<i64>() {
-        let now = chrono::Utc::now().timestamp();
-        if (now - ts).abs() > MAX_TIMESTAMP_AGE_SECS {
-            warn!("Slack request timestamp too old: {}s", (now - ts).abs());
-            return false;
-        }
-    } else {
-        warn!("Invalid Slack timestamp: {}", timestamp);
+    // Required inputs must be present (an empty field can never verify).
+    if signing_secret.is_empty() || signature.is_empty() {
         return false;
     }
 
-    // Build the base string: v0:{timestamp}:{body}
-    let body_str = std::str::from_utf8(body).unwrap_or("");
-    let base_string = format!("v0:{timestamp}:{body_str}");
+    // Replay guard: the timestamp must parse and be within MAX_TIMESTAMP_AGE_SECS.
+    let Ok(ts) = timestamp.parse::<i64>() else {
+        warn!("Invalid Slack timestamp: {}", timestamp);
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    if (now - ts).abs() > MAX_TIMESTAMP_AGE_SECS {
+        warn!("Slack request timestamp too old: {}s", (now - ts).abs());
+        return false;
+    }
 
-    // Compute HMAC-SHA256
+    // Slack signatures are `v0=<hex>`; strip the version prefix and hex-decode to
+    // the raw digest so it can be compared as bytes.
+    let Some(hex_digest) = signature.strip_prefix("v0=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_digest) else {
+        return false;
+    };
+
+    // HMAC-SHA256 over `v0:{timestamp}:{body}`. The body is hashed as **raw
+    // bytes**, not a UTF-8-lossy string: the old `from_utf8(body).unwrap_or("")`
+    // silently hashed an *empty* body for any non-UTF-8 payload, so a mangled
+    // request could sail past with a signature computed over nothing.
     let mut mac = match HmacSha256::new_from_slice(signing_secret.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -53,20 +65,14 @@ fn verify_slack_signature(
             return false;
         }
     };
-    mac.update(base_string.as_bytes());
-    let result = mac.finalize();
-    let computed = format!("v0={}", hex::encode(result.into_bytes()));
+    mac.update(b"v0:");
+    mac.update(timestamp.as_bytes());
+    mac.update(b":");
+    mac.update(body);
 
-    // Constant-time comparison
-    if computed.len() != signature.len() {
-        return false;
-    }
-    computed
-        .as_bytes()
-        .iter()
-        .zip(signature.as_bytes())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+    // Constant-time verification via the MAC primitive (replaces the hand-rolled
+    // hex-string compare).
+    mac.verify_slice(&expected).is_ok()
 }
 
 /// Slack event wrapper
@@ -359,4 +365,88 @@ fn is_positive_reaction(reaction: &str) -> bool {
     }
     
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a valid Slack `v0=` signature for the given secret/timestamp/body.
+    fn sign(secret: &str, timestamp: &str, body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("key");
+        mac.update(b"v0:");
+        mac.update(timestamp.as_bytes());
+        mac.update(b":");
+        mac.update(body);
+        format!("v0={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn now_ts() -> String {
+        chrono::Utc::now().timestamp().to_string()
+    }
+
+    #[test]
+    fn accepts_a_valid_signature() {
+        let secret = "topsecret";
+        let ts = now_ts();
+        let body = br#"{"type":"event_callback"}"#;
+        let sig = sign(secret, &ts, body);
+        assert!(verify_slack_signature(secret, &sig, &ts, body));
+    }
+
+    #[test]
+    fn rejects_a_tampered_body() {
+        let secret = "topsecret";
+        let ts = now_ts();
+        let sig = sign(secret, &ts, b"original body");
+        assert!(!verify_slack_signature(secret, &sig, &ts, b"tampered body"));
+    }
+
+    #[test]
+    fn rejects_a_stale_timestamp() {
+        let secret = "topsecret";
+        let stale = (chrono::Utc::now().timestamp() - MAX_TIMESTAMP_AGE_SECS - 60).to_string();
+        let body = b"hello";
+        let sig = sign(secret, &stale, body);
+        assert!(
+            !verify_slack_signature(secret, &sig, &stale, body),
+            "a signature older than the replay window must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_secret() {
+        let ts = now_ts();
+        let body = b"hello";
+        let sig = sign("the-real-secret", &ts, body);
+        let ok = verify_slack_signature("a-different-secret", &sig, &ts, body);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn rejects_a_body_that_is_not_valid_utf8() {
+        // The whole point of hashing raw bytes: a non-UTF-8 body must still be
+        // verified correctly rather than silently hashed as empty.
+        let secret = "topsecret";
+        let ts = now_ts();
+        let body: &[u8] = &[0xff, 0xfe, 0x00, 0x01, 0x80];
+        let sig = sign(secret, &ts, body);
+        assert!(verify_slack_signature(secret, &sig, &ts, body));
+        // And a different non-UTF-8 body must not match that signature.
+        let other: &[u8] = &[0xff, 0xfe, 0x00, 0x02, 0x80];
+        assert!(!verify_slack_signature(secret, &sig, &ts, other));
+    }
+
+    #[test]
+    fn rejects_missing_version_prefix_and_empty_inputs() {
+        let ts = now_ts();
+        let no_prefix = verify_slack_signature("s", "deadbeef", &ts, b"x");
+        assert!(!no_prefix, "no v0= prefix");
+        let empty_secret = verify_slack_signature("", "v0=deadbeef", &ts, b"x");
+        assert!(!empty_secret, "empty secret");
+        let empty_sig = verify_slack_signature("s", "", &ts, b"x");
+        assert!(!empty_sig, "empty signature");
+        let bad_ts = verify_slack_signature("s", "v0=deadbeef", "notanumber", b"x");
+        assert!(!bad_ts, "bad timestamp");
+    }
 }

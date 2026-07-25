@@ -240,7 +240,19 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Plain-language intro screen explaining what Nanna is.
 - [ ] Data storage location selection.
 - [ ] Backend chooser: Anthropic / OpenAI / OpenRouter / Ollama — with clear "native local model coming soon" if not implemented.
-- [ ] API key entry with validation; fix has_api_key to check all provider keys, not only Anthropic.
+- [ ] API key entry with validation; ~~fix has_api_key to check all provider keys, not only Anthropic~~
+      **(the provider check is fixed, 2026-07-25)**: the GUI `get_config` command's `api_key_set` looked
+      only at `config.llm.api_key` (the Anthropic slot) + the `ANTHROPIC_API_KEY` env var, so a user with
+      only an OpenAI/OpenRouter/GitHub-Models key, or Anthropic OAuth, was wrongly told they had no key and
+      re-nagged in onboarding. Added a pure, unit-tested `LlmConfig::has_configured_api_key()` in
+      `nanna-config` (checks `api_key` / `anthropic_oauth_token` / `openai_api_key` / `openrouter_api_key`
+      / `github_token`, treating blank/whitespace as unset; Ollama excluded on purpose — it is keyless and
+      handled by the onboarding's separate `needsKey`), and the command now ORs it with the env vars for all
+      four providers. 3 config tests (none→false, each provider alone→true, blank/empty→false); 20
+      nanna-config tests green. *Remaining on this line: the "entry with validation" (live key check) part,
+      and the nanna-gui compile of the 4-line command wiring was not run this pass (a fresh worktree needs
+      the sidecar + built frontend before `nanna-gui` compiles — the fixed logic itself is in the
+      unit-tested `nanna-config` helper).*
 - [ ] Ollama detection (is server running? is a model pulled?).
 - [ ] Memory/privacy explanation with opt-in toggle for auto-remembering.
 - [ ] Tool permission setup: ask before enabling shell/browser/file-write.
@@ -267,7 +279,12 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [x] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
       *(2026-07-23)* Fixed in both the root package and `[workspace.package]`.
 - [ ] Add GitHub repo description and topics.
-- [ ] Unify port documentation (README says 5149; CLI defaults to 9999) — pick one, update both code and docs.
+- [x] ~~Unify port documentation (README says 5149; CLI defaults to 9999)~~ **(already resolved; verified
+      2026-07-25)**: there is now a single source of truth — `nanna_daemon::DEFAULT_IPC_PORT = 5149`
+      (`crates/nanna-daemon/src/ipc.rs`), and every CLI entry point (`src/main.rs` start/status/stop,
+      `src/commands/daemon.rs`, `nanna-daemon/src/main.rs`) takes it via `default_value_t`, matching the
+      README (`5149` IPC / `5148` health). The remaining `9999` occurrences in the tree are unrelated (an
+      acceptance-check timeout in `harness.rs`, test-fixture row ids) — not a port default anywhere.
 
 #### P0.3 - Stronger Public Release (can follow 0.1)
 - [ ] Local Ollama setup assistant in GUI.
@@ -335,6 +352,21 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       under `nanna/file-store-key`, so the bulk payload is GCM and the key is OS-protected. Legacy
       plaintext `credentials.json` is migrated on first unlock (read → write enc → delete).
       Tests: round-trip, migrate-from-legacy, isolated-dir.
+      *(2026-07-25, hardening)* **Closed a silent nonce-reuse hole + removed the deprecated nonce API.**
+      `random_nonce` ignored `getrandom`'s error (`let _ = getrandom::fill(..)`), so an OS-RNG failure
+      left the nonce **all-zeros** — and since every `encrypt_credentials` call reuses the file key, a
+      zero nonce means *guaranteed* AES-GCM nonce reuse (catastrophic: breaks confidentiality and lets an
+      attacker forge authentication). It now **fails closed** — returns `CredentialError::Crypto` on RNG
+      failure (a nonce, unlike the key, has no safe weak fallback; uniqueness is its whole contract).
+      Also migrated both `Nonce::from_slice` sites (deprecated in the current `aes-gcm`, and panicking on a
+      wrong length) to fallible `Nonce::try_from`. 2 new tests (nonce is non-zero + unique across calls;
+      encrypting the same plaintext+key twice yields **different** envelopes yet both decrypt back — an
+      observable proof the nonce is fresh each call), 22 nanna-config tests green, no deprecation warnings.
+      *(same day)* **`random_key` given the same fail-closed treatment.** Its RNG-failure fallback derived
+      the 32-byte file key from `SystemTime` nanos — ~30 bits of guessable entropy, brute-forceable by an
+      attacker who has `credentials.enc` and a rough creation time. There is no safe weak fallback for a
+      long-lived key, so it now returns `Result` and propagates the getrandom error (both call sites in
+      `file_encryption_key` already return `Result`).
 - [x] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
       *(2026-07-24)* **Unified on `com` / `nanna` / `nanna`.** New `nanna_config::{APP_QUALIFIER,
       APP_ORGANIZATION, APP_NAME, project_dirs, legacy_clawd_project_dirs}` is the single identity.
@@ -471,6 +503,60 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+      - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
+            match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
+            (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had
+            **drifted** in two ways: it hashed `std::str::from_utf8(body).unwrap_or("")` — so a **non-UTF-8
+            body was silently HMAC'd as empty**, letting a mangled payload verify against a signature
+            computed over nothing — and it used a **hand-rolled hex-string** comparison instead of the MAC
+            primitive. Rewrote it to `mac.update(body)` (raw bytes) + `mac.verify_slice(&hex::decode(v0…))`,
+            matching the daemon. Added the first tests for this function (6): valid accepts, tampered body
+            rejects, stale timestamp rejects, wrong secret rejects, **non-UTF-8 body verifies correctly**
+            (the regression guard), and missing-`v0=`/empty-input rejects. nanna-server green.
+      - [x] *(2026-07-25)* **WhatsApp POST webhook was UNAUTHENTICATED — now verifies the Meta
+            `X-Hub-Signature-256` (daemon).** `whatsapp_webhook` parsed and acted on any POST body with **no
+            signature check at all**, so anyone who learned the `/webhook/whatsapp` URL could inject fake
+            WhatsApp events. Added a tested pure `verify_meta_signature(app_secret, header, body)`
+            (HMAC-SHA256 over the **raw** body, `sha256=<hex>` prefix, constant-time `verify_slice`) and a
+            `whatsapp_app_secret: Option<String>` field on `WebhookConfig`; the handler now rejects a bad
+            signature with 401 when the secret is configured (skips with a warning when unset — same posture
+            as the other providers, and `None` by default so existing behaviour is unchanged). Also switched
+            the GET subscription handshake's verify-token check from `==` to the constant-time
+            `webhook_secret_matches`. 4 tests (valid accepts; tamper/wrong-secret/no-prefix/missing/empty
+            reject; **non-UTF-8 body verifies** — WhatsApp media notifications aren't guaranteed UTF-8).
+            *(Config plumbing — closed the same day, see below.)*
+      - [x] *(2026-07-25)* **Webhook signature verification was entirely DORMANT — the daemon never received
+            the secrets. Now wired.** `DaemonBuilder::with_webhook_config` was never called and
+            `DaemonConfig.webhook` was only ever `WebhookConfig::default()` (all-None), so **every** provider's
+            verification silently no-op'd (the handlers logged "not configured - skipping") no matter what the
+            user set — the whole webhook-auth surface (mine + the pre-existing Discord/Slack verifiers) was
+            unreachable. `from_nanna_config` now calls a pure, tested `apply_channel_webhook_secrets(webhook,
+            channels)` that copies `channels.discord.public_key` → `discord_public_key`,
+            `channels.slack.signing_secret` → `slack_signing_secret`, and `channels.whatsapp.{verify_token,
+            app_secret}` → the WhatsApp fields. Added `app_secret` to `WhatsAppConfig` (serde-default, so old
+            configs deserialize). Telegram is intentionally excluded — its `TelegramConfig` has no webhook
+            secret (bot-token-in-URL auth), only the bot token (wired for outbound). 2 tests (all configured
+            providers flow through; absent channels leave secrets unset). This is what makes Discord/Slack/
+            WhatsApp webhook verification actually *enforce* for a configured user. *(Still open: the GUI/
+            embedded and legacy `serve.rs` paths build `WebhookConfig::default()` directly and don't call the
+            mapper; and Telegram/generic secrets still have no config home.)*
+      - [x] *(2026-07-25)* **Telegram webhook secret now compared constant-time (daemon).** The daemon
+            checked the `X-Telegram-Bot-Api-Secret-Token` with a plain `!=`, which short-circuits on the
+            first wrong byte and leaks match progress through response timing — inconsistent with the
+            HMAC/Ed25519 verifiers next to it. Extracted a testable `webhook_secret_matches(expected,
+            provided)` using `subtle::ConstantTimeEq` (subtle was already in the tree transitively; now a
+            direct dep). 1 test (exact match accepts; wrong-byte / prefix / superstring / missing / empty
+            reject). Low practical risk on a static high-entropy secret, but it keeps the whole webhook
+            surface constant-time.
+      - [x] *(2026-07-25)* **`nanna-server` Discord Ed25519 verify aligned to the daemon's `verify_strict`.**
+            The server copy used `verifying_key.verify(..)`; the daemon uses `verify_strict`, which rejects
+            **malleable / non-canonical signatures and small-order keys**. Switched to `verify_strict` (and
+            dropped the now-unused `Verifier` trait import) so the two verifiers can't drift on strictness,
+            and added the first tests for it (4): valid accepts, tampered body rejects, wrong public key
+            rejects, malformed-hex + all-zero-signature reject. *(Still open on this line: the Telegram
+            secret / WhatsApp / Signal paths, and **folding the duplicated Slack/Discord verifiers** into one
+            shared implementation so daemon and server can't drift again — this run fixed the drift twice,
+            which is the argument for de-duplicating.)*
 - [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
       *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
@@ -1541,20 +1627,29 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       memories from the drift-exposed path entirely (see the drift fixture below). 1 test asserting the
       exact contract: Detailed duplicates fold, `clusters_formed == 0`, and the summarizer is invoked
       **zero** times (counted with an `AtomicUsize`, not inferred). nanna-memory 78 tests green.
-- [ ] *(discovered 2026-07-23)* **STATED vs OBSERVED provenance is not actually recorded — the
-      `fact_type` metadata key is read but never written.** Chasing the drift mitigation "verbatim-pin
-      user-stated memories" turned up that the distinction the reference notes describe under extraction
-      ("importance 1–5, STATED vs OBSERVED") does not exist in the code: `fact_type` appears only in
-      `nanna-daemon/src/control/memory.rs`, twice, both times *reading* it with
-      `.unwrap_or("stated")` for display — so **every memory reports itself as user-stated regardless of
-      origin**, and `ExtractedMemory` (`loop_runner.rs`) carries only `content`/`category`/`tags` with no
-      provenance field at all. Consequences: the GUI's fact-type column is decorative; the survey's
-      "source attribution (user statement > agent inference)" precedence rule has nothing to run on; and
-      the drift mitigation that would pin user-stated memories verbatim is **blocked** until provenance
-      is genuinely captured. Fix = add a provenance field to `ExtractedMemory`, have the extraction
-      prompt classify it, persist it into memory metadata, and only then build the pin on top. Note the
-      safe default when it lands: **absent provenance must NOT be treated as "stated"** (absence of
-      evidence isn't evidence of a user statement) — the current display default has it backwards.
+- [x] *(discovered 2026-07-23; captured 2026-07-25)* **STATED vs OBSERVED provenance is now genuinely
+      recorded — `fact_type` is written, not just read, and the dangerous default is fixed.** Before this,
+      `fact_type` appeared only in `control/memory.rs`, twice, both *reading* it with `.unwrap_or("stated")`
+      — so every memory reported as user-stated regardless of origin, and `ExtractedMemory` had no
+      provenance field at all. Now: a `MemoryProvenance { Stated, Observed }` enum
+      (`nanna-agent::loop_runner`, re-exported) whose `Default` is **`Observed`, never `Stated`** and whose
+      `from_label` only promotes an explicit case-insensitive "stated" (every other/absent/garbled label →
+      `Observed`, so an unlabeled memory can never impersonate a user assertion). The extraction prompt now
+      asks the model to classify each fact's provenance ("stated" = the user plainly said it; "observed" =
+      inferred/derived; when unsure → observed) with a worked two-item example; `ExtractedMemoryRaw` parses
+      the optional label and `filter_extracted_memories` maps it through `from_label`. Tool-result memories
+      are hard-coded `Observed` (agent output is never a user statement). Both auto-store callbacks
+      (`nanna-daemon/agent_service.rs` and `nanna-server/state.rs`) persist it into memory metadata under the
+      `fact_type` key. The two display reads default absent provenance to **"unknown"** now — not "stated"
+      — so legacy pre-provenance memories are shown as unknown, not falsely user-stated. 7 new unit tests
+      (`from_label` only-"stated"-is-stated incl. "statedly"→observed; default is observed; `as_str`;
+      `filter` carries + defaults provenance for stated/observed/garbage/missing; prompt asks for
+      provenance). 150 nanna-agent + 99 nanna-daemon tests green; nanna-agent/daemon/server build clean, new
+      code clippy- and fmt-clean. **Note (LLM-gated):** the *classification quality* rides on the extraction
+      model and can't be asserted unattended — the plumbing + conservative defaults are what's proven here.
+      This unblocks the drift mitigation: the verbatim-pin of user-stated memories can now be built on real
+      provenance (its own item), and the survey's "user statement > agent inference" precedence finally has
+      a real signal to run on.
 - [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
       `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
       `importance`/`storage_strength` is NaN.
@@ -1596,6 +1691,73 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the raw vector back. 3/3 green, clippy clean. The remaining work is the measurement, not the
             feasibility. The corresponding false claim in the `daily-dev` Appendix C is fixed in the same
             commit.
+            *(2026-07-25)* **The k-NN primitive now exists on the real column — `MemoryRepository::search_by_embedding_sql`
+            + `crates/nanna-storage/tests/vector_knn.rs`.** The load-bearing question a source-read left open was
+            the **on-disk format**: memories store embeddings as *raw little-endian f32 bytes*
+            (`f.to_le_bytes()`), while turso's `vector_extract` reads a **trailing type byte**
+            (`blob[len-1]`). It turned out `vector_distance_cos`'s parse path (`Vector::from_slice`) does
+            **not** use that type byte — it treats a bare BLOB as `Float32Dense` — so cosine works over the
+            stored column **directly, with no `vector32()` wrapper, no type byte, and no migration** (proven:
+            identical→0, orthogonal→1, opposite→2, correct `ORDER BY` rank; the query vector binds the same
+            way as a raw blob). The new method runs `ORDER BY vector_distance_cos(embedding, ?) LIMIT ?`
+            inside Turso (O(N) computes, **O(1) RAM** — streams rows instead of `bulk_load`-ing every vector),
+            mirrors `recall_scoped` scope (`Some`→workspace+global, `None`→all), and — since
+            `vector_distance_cos` **errors** on a dimension mismatch (would abort the whole scan on one
+            stray-dim vector) — guards with `octet_length(embedding) = dims*4` so mixed-dimension stores skip
+            rather than fail. 4 tests: **ranking parity with an independent in-RAM cosine scan**, LIMIT +
+            NULL-skip, the dimension guard, and workspace scope. 82 nanna-storage tests green, new code
+            clippy/fmt-clean.
+            *(2026-07-25, ranking parity extended to realistic data)* `crates/nanna-daemon/tests/sql_knn_retention.rs`
+            takes the memory crate's `RetentionCorpus` (8 topic centroids × 12 jittered members, 64-dim —
+            the same generator the recall harness uses), persists it to Turso, and asserts for every centroid
+            probe that SQL k-NN's nearest neighbour is the **same memory** an independent in-RAM cosine scan
+            picks **and** is in the probe's own topic cluster. So exact SQL k-NN is a faithful drop-in for the
+            in-RAM scan on realistic embeddings, not just a hand-built spread. **Still the remaining work:** the
+            *latency/RAM comparison* (wall-clock trade; needs the not-yet-built `nanna-bench` harness, release
+            profile), and the **decision to wire it into the live recall path** vs the current `bulk_load`+SIMD
+            scan — only after that measurement does the ANN-crate question reopen.
+      - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
+            "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
+            control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
+            f32 BLOB recoverable — and the diagnosis went deeper than the SQLite folklore: **turso 0.6.1 has no
+            `secure_delete` pragma and no `VACUUM` (its `auto_vacuum` is a documented no-op), and it keeps
+            *all* committed data in the `-wal` file (main `.db` stayed at one 4096-byte header page after an
+            insert+close; it does not checkpoint on close).** So the embedding lived verbatim in the WAL, and a
+            plain overwrite alone failed — the zeroed frame merely sits *behind* the original in the same
+            growing WAL. Two steps close it: (1) overwrite `embedding`/`content`/`metadata` with **same-length
+            `zeroblob`s** (`octet_length` → identical record size → the newest page frame carries zeros);
+            (2) `PRAGMA wal_checkpoint(TRUNCATE)` — the one mode that both collapses the WAL into the main file
+            (latest zeroed page wins) **and truncates the WAL to 0**, discarding the stale pre-overwrite frame
+            (empirically: `FULL`/`RESTART`/passive do **not** truncate; `TRUNCATE` took the WAL 2.6 MB → 0).
+            `bulk_delete` checkpoints **once** for the whole batch (the dream-cycle fold path), not per row.
+            *(2026-07-25, follow-on)* **The dream cycle now actually takes that batch path — the per-delete
+            checkpoint regression is closed.** The secure-delete checkpoint made each single `delete` fsync, but
+            consolidation removed cluster members and folded duplicates **one at a time**
+            (`consolidate_cluster`'s loop and `commit_duplicate_fold`), so a dream cycle would have fsynced once
+            per removed memory. Added `MemoryPersistence::remove_entries` (default loops `remove_entry`; the
+            Turso impl overrides to `bulk_delete` → one checkpoint) and `VectorStore::remove_many` (one
+            entries-write-lock + one persistence call). `consolidate_cluster` removes the whole cluster in one
+            `remove_many`; `fold_near_duplicates` defers every folded source to a single end-of-pass
+            `remove_many` (`commit_duplicate_fold` no longer removes — update-before-remove still holds at the
+            pass level, since folded sources are already absent from the in-pass `survivors` list). 2 new tests
+            (one batched persistence call for N ids, not N single calls; empty batch is a no-op); the 8 existing
+            fold/consolidation invariant tests stay green (88 nanna-memory + 99 nanna-daemon).
+            Best-effort by contract: a `busy` checkpoint (concurrent reader) leaves the stale frame for a later
+            one; the row is already deleted + overwritten. 4 tests in `crates/nanna-storage/tests/secure_delete.rs`
+            (single-delete embedding absent-after / present-before; bulk 3-embedding; in-memory graceful; raw
+            control present-after). 72 nanna-storage + 86 nanna-memory + nanna-daemon tests green; new code
+            clippy-clean. Still open: **(i)** ~~unbounded WAL~~ **(corrected 2026-07-25 — the WAL is bounded)**:
+            a follow-up probe (12k inserts) showed turso **does** auto-checkpoint at the standard ~4 MB /
+            1000-page threshold and truncates the `-wal` file back down (4.1 MB → 41 KB), so there is no
+            growth bug — the "no checkpoint on close" observation only meant a *single* sub-threshold insert
+            stays in the WAL until the threshold or an explicit checkpoint. Note the auto-checkpoint is
+            **passive**: it copies the embedding page into the main file *unzeroed* before resetting the WAL,
+            which is exactly why the overwrite + explicit `TRUNCATE` above is still required (a plain delete
+            that races an auto-checkpoint leaves the ghost in the main `.db`, not just the WAL);
+            **(ii)** the stronger backup/epoch threat (a `-wal` copied *before* the truncate, or the `busy`
+            path) still wants the paper's **epoch key rotation** (encrypt vectors, discard key on delete);
+            **(iii)** the HNSW-tombstone constraint below still stands for when an ANN index lands; **(iv)** wire
+            this into the P0.2 `PRIVACY.md` "how to delete your data" claim.
       - [ ] *(research 2026-07-24)* **Deleting a memory must actually destroy its embedding — "Ghost Vectors"
             (arXiv [2606.18497](https://arxiv.org/abs/2606.18497)).** Embeddings soft-deleted/tombstoned in an
             HNSW store stay **physically present in the raw index files** and are invertible back to their
@@ -1613,6 +1775,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the key on delete — 0% recovery, ~2.5 ms per 500 records, plus a signed proof-of-deletion). Pairs
             with the P0.2 `PRIVACY.md` "how to delete your data" claim, which must not promise more than the
             storage layer delivers.
+            - [ ] *(research 2026-07-25 — raises the stakes on the epoch-key follow-up above)* **Embedding
+                  inversion got cheaper and no longer needs the encoder.** Beyond Vec2Text (per-encoder,
+                  query-access), 2025–26 work makes recovery practical from *just the stored vectors*: **ALGEN**
+                  learns a linear map between embedding spaces from ~10³ leaked pairs and hits Vec2Text-level
+                  recovery **without query access**; **ZSINVERT** is zero-shot (no encoder-specific training);
+                  **Zero2Text** does online token-by-token regression. For our threat model (a `.db`/backup on
+                  the user's disk) this means a leaked embedding BLOB is invertible by an attacker who never
+                  touched our model — so the today-fix (secure-delete overwrite, done 2026-07-25) closes the
+                  *deletion* leak but a *live* embedding at rest is still recoverable. The durable answer is
+                  **encrypt embeddings at rest** (the epoch-key-rotation mitigation), NOT retrieval-time
+                  perturbation (Laplace/Purkayastha/Bound-Aware Perturbation harm recall and don't help a
+                  storage-access adversary). Sources:
+                  [ALGEN/ZSINVERT survey](https://arxiv.org/pdf/2504.00147),
+                  [Concept-Aware defenses](https://arxiv.org/html/2602.07090v1).
       - [ ] *(research 2026-07-23)* **Three pure-Rust HNSW crates to choose between** (all no-C, matching the
             dependency doctrine): **`hnswlib-rs`** decouples the graph from vector storage (`Hnsw<K, M>` owns the
             graph + an external-key→`NodeId` map, you supply a `VectorStore`) and supports **concurrent search
@@ -1669,6 +1845,17 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             map drops in without duplicating vectors. Decision stands: `hnsw_rs::insert_parallel` for a
             rebuild-per-dream clusterer (simpler), `hnswlib-rs` only when we move to a long-lived insert-while-serve
             index. Source: [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+      - [ ] *(research 2026-07-25 — settles "wait for turso native ANN vs adopt a crate")* **Native ANN in the
+            `turso` crate is NOT coming soon — the external HNSW plan stands.** The often-cited "Turso brings
+            native vector search / DiskANN" posts describe the **libSQL** engine (a different codebase); in the
+            pure-Rust rewrite we actually pin, DiskANN is [issue #832](https://github.com/tursodatabase/turso/issues/832)
+            — **Backlog milestone, no assignee, no branch, no PR** as of this check (the proposal is literally
+            "port the libSQL DiskANN C code to Rust"). A parallel discussion
+            ([#3778](https://github.com/tursodatabase/turso/issues/3778)) argues turso should ship
+            **SIMD brute-force first**, before any ANN index. Net for us: the exact SQL k-NN primitive landed
+            2026-07-25 (`search_by_embedding_sql`) is the near-term path for the RAM-ceiling win, and an
+            **external pure-Rust HNSW crate** (`hnsw_rs`/`hnswlib-rs` above) remains the only route to
+            *approximate* indexing — do not block on a turso release for it.
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
       `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
@@ -2749,6 +2936,23 @@ Reordered around the local-first pivot (P12/P13 lead), with the highest-value sa
      and 56/56 vitest. This is the bump the previous run reverted at merge pending the
      `UiSonnerSonner` blocker; **that blocker is fixed in the next commit of this PR** (it was never
      nuxt's fault — it reproduced on pristine `origin/master`).
+   - *(2026-07-25 sweep)* `cargo update` → 4 compatible bumps (`cc 1.3→1.4`, `either 1.16→1.17`,
+     `simd_cesu8 1.1→1.2`, `webpki-root-certs 1.0.8→1.0.9`). `cargo upgrade --incompatible` → **two
+     majors applied green**: **`base64 0.22 → 0.23` in `nanna-config`** — the previous run bumped it in
+     `nanna-agent`+`nanna-gui` but left `nanna-config` (credentials.rs) on 0.22, so a stray 0.22 node
+     lingered; the `general_purpose::STANDARD.{encode,decode}` call sites compiled unchanged. `base64
+     0.22.1` still resolves for `tiktoken-rs 0.12` (its `^0.22.1` req), so the two coexist by design.
+     And **`playwright-rs 0.14 → 0.15` in `nanna-browser`** — 0.15 made `Page::locator()` **synchronous**
+     (returns `Locator` directly, no longer a future), so the 8 `self.page.locator(..).await` sites in
+     `playwright.rs` dropped their `.await`; compiled clean under the `playwright` feature. Everything
+     else already at latest req (only the intentional `turso`/`aegis` pins + boa git rev held back).
+     Workspace (excl. `nanna-gui`) builds green; nanna-config 1 + nanna-browser 17 + dep_guard 1 tests
+     pass; no banned deps entered the tree. Frontend `pnpm outdated`: **only the documented deferred
+     majors** (`@tiptap/* 2→3`, `marked 17→18`, `vue-router 4→5`, `vue-sonner 1→2`, `typescript 5.9→7.0`)
+     plus the two traps (`lucide-vue-next 1.0.0` tombstone, `vuedraggable` `latest`=Vue-2) — `package.json`
+     is already at latest-safe, no GUI changes this run. *Reconfirmed the fmt gotcha: `cargo fmt -p <crate>`
+     reformats the whole crate, not the touched file — `origin/master` isn't fmt-clean, so it churned 4
+     unrelated files; reverted, kept only the surgical `.await` diff.*
    - [x] *(2026-07-24)* **Toolchain pinned in-repo: `rust-toolchain.toml` → `nightly-2026-07-13`.**
      Nightly **`89c61a754` (2026-07-23)** ICEs in `rustc_codegen_ssa` compiling **`tokio`** under our
      release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`):

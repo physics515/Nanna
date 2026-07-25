@@ -148,6 +148,18 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
+    /// Batch removal via `MemoryRepository::bulk_delete`, which overwrites every
+    /// row's sensitive columns and then checkpoint-truncates the WAL **once** for
+    /// the whole set — one fsync per dream cycle's cluster instead of one per
+    /// consolidated source memory.
+    async fn remove_entries(&self, ids: &[&str]) -> Result<(), MemoryError> {
+        self.repo
+            .bulk_delete(ids)
+            .await
+            .map(|_| ())
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
     async fn update_entry_fsrs(&self, id: &str, fsrs: &FsrsState) -> Result<(), MemoryError> {
         self.repo
             .update_fsrs(

@@ -25,9 +25,12 @@ impl ControlPlane {
                         }
                     })
                     .map(|m| {
+                        // Absent provenance is "unknown" — NOT "stated". A legacy
+                        // memory stored before provenance was captured must not be
+                        // able to impersonate a user assertion.
                         let fact_type = m.metadata.get("fact_type")
                             .cloned()
-                            .unwrap_or_else(|| "stated".to_string());
+                            .unwrap_or_else(|| "unknown".to_string());
                         let created_at = chrono::DateTime::from_timestamp(m.timestamp, 0)
                             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                             .unwrap_or_else(|| m.timestamp.to_string());
@@ -75,9 +78,10 @@ impl ControlPlane {
             MemoryAction::Get { id } => {
                 // Get memory by ID
                 if let Some(entry) = memory.get(&id).await {
+                    // Absent provenance is "unknown", never "stated" (see above).
                     let fact_type = entry.metadata.get("fact_type")
                         .cloned()
-                        .unwrap_or_else(|| "stated".to_string());
+                        .unwrap_or_else(|| "unknown".to_string());
                     let created_at = chrono::DateTime::from_timestamp(entry.timestamp, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| entry.timestamp.to_string());

@@ -2464,6 +2464,32 @@ pub struct DaemonBuilder {
     log_buffer: Option<crate::log_buffer::LogBuffer>,
 }
 
+/// Copy the signature-verification secrets from the user's channel config into a
+/// [`WebhookConfig`]. Only providers the user configured are set; each verifier
+/// skips when its secret is `None`, so unset providers keep the previous value.
+///
+/// Telegram is intentionally absent: its `TelegramConfig` carries no webhook
+/// secret (Telegram authenticates via the bot token in the URL), only the bot
+/// token (registered for outbound sends).
+fn apply_channel_webhook_secrets(
+    webhook: &mut WebhookConfig,
+    channels: &nanna_config::ChannelsConfig,
+) {
+    if let Some(ref discord) = channels.discord {
+        webhook.discord_public_key = Some(discord.public_key.clone());
+    }
+    if let Some(ref slack) = channels.slack {
+        webhook.slack_signing_secret = Some(slack.signing_secret.clone());
+    }
+    if let Some(ref whatsapp) = channels.whatsapp {
+        webhook.whatsapp_verify_token = whatsapp.verify_token.clone();
+        webhook.whatsapp_app_secret = whatsapp.app_secret.clone();
+    }
+    if let Some(ref telegram) = channels.telegram {
+        webhook.telegram_token = Some(telegram.bot_token.clone());
+    }
+}
+
 impl DaemonBuilder {
     pub fn new() -> Self {
         Self {
@@ -2518,6 +2544,12 @@ impl DaemonBuilder {
         // Idle gate for the scheduled dream cycle (defers dreaming to a lull).
         builder.config.dream_idle_threshold_secs = config.memory.dream_idle_threshold_secs;
         builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
+
+        // Wire webhook signature-verification secrets from the user's channel
+        // config. Without this the inbound webhook server always ran with the
+        // all-None default, so every provider's verification silently no-op'd —
+        // the daemon never received the secrets it checks against.
+        apply_channel_webhook_secrets(&mut builder.config.webhook, &config.channels);
 
         // Set data directory from Nanna config (same location as GUI)
         match nanna_config::Config::default_data_dir() {
@@ -2851,6 +2883,59 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_webhook_secrets_flow_into_webhook_config() {
+        use nanna_config::{ChannelsConfig, DiscordConfig, SlackConfig, WhatsAppConfig};
+
+        let channels = ChannelsConfig {
+            discord: Some(DiscordConfig {
+                bot_token: "bot".into(),
+                application_id: "app".into(),
+                public_key: "pubkey-hex".into(),
+            }),
+            slack: Some(SlackConfig {
+                bot_token: "bot".into(),
+                app_token: None,
+                signing_secret: "slack-signing".into(),
+            }),
+            whatsapp: Some(WhatsAppConfig {
+                connection_method: "cloud-api".into(),
+                phone_number_id: None,
+                access_token: None,
+                verify_token: Some("wa-verify".into()),
+                app_secret: Some("wa-app-secret".into()),
+                session_name: None,
+                allowed_contacts: None,
+            }),
+            telegram: None,
+            signal: None,
+        };
+
+        let mut webhook = WebhookConfig::default();
+        apply_channel_webhook_secrets(&mut webhook, &channels);
+
+        assert_eq!(webhook.discord_public_key.as_deref(), Some("pubkey-hex"));
+        assert_eq!(
+            webhook.slack_signing_secret.as_deref(),
+            Some("slack-signing")
+        );
+        assert_eq!(webhook.whatsapp_verify_token.as_deref(), Some("wa-verify"));
+        assert_eq!(
+            webhook.whatsapp_app_secret.as_deref(),
+            Some("wa-app-secret")
+        );
+    }
+
+    #[test]
+    fn absent_channels_leave_webhook_secrets_unset() {
+        let channels = nanna_config::ChannelsConfig::default();
+        let mut webhook = WebhookConfig::default();
+        apply_channel_webhook_secrets(&mut webhook, &channels);
+        assert!(webhook.discord_public_key.is_none());
+        assert!(webhook.slack_signing_secret.is_none());
+        assert!(webhook.whatsapp_app_secret.is_none());
+    }
 
     #[test]
     fn tool_policy_wildcard_enabled_is_unrestricted() {

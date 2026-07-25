@@ -37,8 +37,8 @@ pub use registry::{
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
-    ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions, StepKind,
-    StreamCallback, TaskComplexity, ThinkingCallback, ThinkingMode, ToolCallRecord,
+    MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions,
+    StepKind, StreamCallback, TaskComplexity, ThinkingCallback, ThinkingMode, ToolCallRecord,
     wrapup_nudge_due, wrapup_nudge_message,
 };
 pub use multi::{

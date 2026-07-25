@@ -47,8 +47,16 @@ pub async fn get_config(state: State<'_, Arc<RwLock<AppState>>>) -> Result<AppCo
     Ok(AppConfig {
         theme: "dark".to_string(),
         model: state_guard.config.llm.model.clone(),
-        api_key_set: state_guard.config.llm.api_key.is_some()
-            || std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        // Any provider counts, not just Anthropic (config field or its env var).
+        api_key_set: state_guard.config.llm.has_configured_api_key()
+            || [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "GITHUB_TOKEN",
+            ]
+            .iter()
+            .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty())),
         available_models: vec![
             // Anthropic
             "claude-opus-4-20250514".to_string(),

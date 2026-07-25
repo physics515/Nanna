@@ -610,6 +610,102 @@ impl MemoryRepository {
         Ok(result > 0)
     }
 
+    /// Exact k-nearest-neighbour search **in SQL**, returning the `limit` closest
+    /// memories to `query_embedding` by cosine distance, nearest first.
+    ///
+    /// The pinned `turso 0.6.1` computes `vector_distance_cos` over the stored
+    /// **raw little-endian f32 BLOBs directly** — no `vector32()` wrapper and no
+    /// trailing type byte are needed (that byte only matters to `vector_extract`),
+    /// and the query vector is bound the same way. Proven end to end in
+    /// `crates/nanna-storage/tests/vector_knn.rs`: identical → 0, orthogonal → 1,
+    /// opposite → 2, and `ORDER BY` ranks correctly. This is O(N) distance
+    /// computes but **O(1) RAM** — it streams rows instead of `bulk_load`-ing every
+    /// embedding into memory, which is the cost behind the ~50k in-RAM ceiling.
+    ///
+    /// Scope mirrors the in-RAM `recall_scoped`: `Some(id)` → that workspace's +
+    /// global memories; `None` → all memories.
+    ///
+    /// **Dimension guard:** `vector_distance_cos` *errors* on a dimension
+    /// mismatch, so a single differently-sized embedding (e.g. left over from a
+    /// prior embedding model) would abort the whole scan. Rows are therefore
+    /// filtered to `octet_length(embedding) = query_dims * 4` — only same-dimension
+    /// vectors are scored, which is also the only meaningful comparison. NULL
+    /// embeddings are skipped.
+    ///
+    /// Returns `(memory_id, cosine_distance)` pairs, distance in `0.0..=2.0`
+    /// (0 = identical). Cosine *similarity* is `1.0 - distance`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query_embedding` is empty or `limit` is zero (programmer errors).
+    pub async fn search_by_embedding_sql(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<(String, f64)>, StorageError> {
+        assert!(
+            !query_embedding.is_empty(),
+            "query embedding must not be empty"
+        );
+        assert!(limit > 0, "limit must be positive");
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let query_bytes = i64::try_from(query_blob.len()).unwrap_or(i64::MAX);
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock().await;
+        // Push the scope branch up: two fixed statements rather than dynamic SQL.
+        let mut rows = match workspace_id {
+            Some(ws) => {
+                conn.query(
+                    "SELECT memory_id, vector_distance_cos(embedding, ?1) AS dist \
+                     FROM memories \
+                     WHERE embedding IS NOT NULL AND octet_length(embedding) = ?2 \
+                       AND (workspace_id = ?3 OR workspace_id IS NULL) \
+                     ORDER BY dist ASC LIMIT ?4",
+                    turso::params![query_blob, query_bytes, ws, limit_i64],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    "SELECT memory_id, vector_distance_cos(embedding, ?1) AS dist \
+                     FROM memories \
+                     WHERE embedding IS NOT NULL AND octet_length(embedding) = ?2 \
+                     ORDER BY dist ASC LIMIT ?3",
+                    turso::params![query_blob, query_bytes, limit_i64],
+                )
+                .await?
+            }
+        };
+
+        let mut out: Vec<(String, f64)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            let dist: f64 = row.get(1)?;
+            out.push((id, dist));
+        }
+        drop(rows);
+
+        debug_assert!(
+            out.len() <= limit,
+            "returned more neighbours than the limit"
+        );
+        debug_assert!(
+            out.windows(2).all(|w| w[0].1 <= w[1].1),
+            "distances must be non-decreasing (ORDER BY dist ASC)"
+        );
+        Ok(out)
+    }
+
     /// Update content text for a memory entry.
     pub async fn update_content(&self, memory_id: &str, content: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().await;
@@ -622,7 +718,22 @@ impl MemoryRepository {
         Ok(result > 0)
     }
 
-    /// Delete multiple memories by their memory_ids.
+    /// Delete multiple memories by their `memory_id`s, destroying their embeddings
+    /// on disk (see [`Self::delete`] for why a plain `DELETE` leaks them).
+    ///
+    /// Each row is overwritten with `zeroblob`s and deleted, then the WAL is
+    /// checkpoint-truncated **once** for the whole batch — the stale pre-overwrite
+    /// frames of every removed row are discarded together, which is both correct
+    /// (no ghost survives) and far cheaper than one checkpoint per row (the batch
+    /// path a dream cycle takes when it folds duplicates).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if any overwrite or delete statement fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any id in `ids` is empty (a programmer error).
     pub async fn bulk_delete(&self, ids: &[&str]) -> Result<u64, StorageError> {
         if ids.is_empty() {
             return Ok(0);
@@ -630,11 +741,14 @@ impl MemoryRepository {
         let conn = self.conn.lock().await;
         let mut deleted = 0u64;
         for id in ids {
+            assert!(!id.is_empty(), "memory_id must not be empty");
+            Self::overwrite_sensitive_columns(&conn, id).await?;
             // Delete tags first
             conn.execute(
                 "DELETE FROM memory_tags WHERE memory_id = ?1",
                 turso::params![*id],
-            ).await?;
+            )
+            .await?;
             let n = conn
                 .execute(
                     "DELETE FROM memories WHERE memory_id = ?1",
@@ -643,11 +757,78 @@ impl MemoryRepository {
                 .await?;
             deleted += n as u64;
         }
+        // One checkpoint for the whole batch (not per row).
+        Self::checkpoint_truncate(&conn).await;
+        debug_assert!(
+            deleted <= ids.len() as u64,
+            "cannot delete more rows than ids given"
+        );
         Ok(deleted)
     }
 
+    /// Overwrite a memory row's sensitive columns (`embedding`/`content`/`metadata`)
+    /// with **same-length** `zeroblob`s so the record byte-size is unchanged and the
+    /// newest WAL frame for its page carries zeros rather than the plaintext/vector.
+    /// The caller is responsible for the subsequent `DELETE` and a WAL checkpoint.
+    async fn overwrite_sensitive_columns(
+        conn: &Connection,
+        memory_id: &str,
+    ) -> Result<(), StorageError> {
+        // `octet_length` gives the exact stored byte count; nullable columns
+        // COALESCE to 0 (a NULL column has no ghost to clear).
+        conn.execute(
+            "UPDATE memories SET \
+                 embedding = zeroblob(COALESCE(octet_length(embedding), 0)), \
+                 content = zeroblob(octet_length(content)), \
+                 metadata = zeroblob(COALESCE(octet_length(metadata), 0)) \
+             WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a memory, destroying its embedding on disk rather than leaking it.
+    ///
+    /// A plain `DELETE` only unlinks the row — Turso (like SQLite) does **not**
+    /// zero freed pages, has no `secure_delete` pragma and no `VACUUM`, and in
+    /// 0.6.1 keeps *all* committed data in the WAL (it does not checkpoint on
+    /// close). So the deleted memory's embedding `f32` BLOB survives verbatim in
+    /// the `-wal` file, and an embedding is invertible back to its source text by
+    /// a Vec2Text-class model ("Ghost Vectors", arXiv 2606.18497) — a real
+    /// exposure for a local-first product whose whole database sits in the user's
+    /// filesystem and gets backed up.
+    ///
+    /// Two steps close it, both verified end to end in
+    /// `crates/nanna-storage/tests/secure_delete.rs`:
+    /// 1. Overwrite `embedding`/`content`/`metadata` with **same-length**
+    ///    `zeroblob`s (keeps the record byte-size identical), so the newest WAL
+    ///    frame for the row's page carries zeros, not the plaintext/vector.
+    /// 2. `PRAGMA wal_checkpoint(TRUNCATE)` — collapse the WAL into the main file
+    ///    (the latest, zeroed page image wins) **and truncate it to zero**,
+    ///    discarding the stale pre-overwrite frame that still held the original
+    ///    embedding. Without the truncate, the zeroed frame merely sits *behind*
+    ///    the original in the same growing WAL and both remain on disk.
+    ///
+    /// The checkpoint is best-effort: a concurrent reader can make it report
+    /// `busy`, in which case the stale frame lingers until a later checkpoint
+    /// succeeds — the row is already deleted and overwritten regardless.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the overwrite or delete statements fail. A
+    /// failed WAL checkpoint is logged, not returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `memory_id` is empty (a programmer error — every stored memory
+    /// has a non-empty id).
     pub async fn delete(&self, memory_id: &str) -> Result<bool, StorageError> {
+        assert!(!memory_id.is_empty(), "memory_id must not be empty");
         let conn = self.conn.lock().await;
+
+        // Step 1: overwrite the sensitive columns so the newest page frame is zeros.
+        Self::overwrite_sensitive_columns(&conn, memory_id).await?;
 
         // Delete tags first
         conn.execute(
@@ -664,7 +845,42 @@ impl MemoryRepository {
             )
             .await?;
 
+        debug_assert!(result <= 1, "memory_id is unique, at most one row deleted");
+
+        // Step 2: collapse + truncate the WAL so the pre-overwrite frame is gone.
+        Self::checkpoint_truncate(&conn).await;
+
         Ok(result > 0)
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on `conn`, draining its status row.
+    ///
+    /// Best-effort by contract: logs and returns on any error or a `busy` result
+    /// rather than propagating — the caller's row mutation has already committed,
+    /// and a failed checkpoint only delays reclaiming the stale WAL frame.
+    async fn checkpoint_truncate(conn: &Connection) {
+        // A pragma that returns rows must go through `query`, not `execute`
+        // (`execute` errors with "unexpected row during execution"). Leaving the
+        // `Rows` cursor open on the shared connection would silently swallow the
+        // next write, so it is drained and dropped before returning.
+        match conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
+            Ok(mut rows) => {
+                let busy = match rows.next().await {
+                    Ok(Some(row)) => row.get_value(0).ok().and_then(|v| match v {
+                        turso::Value::Integer(i) => Some(i),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                drop(rows);
+                if busy == Some(1) {
+                    tracing::warn!(
+                        "secure delete: WAL checkpoint reported busy; stale frame will clear on a later checkpoint"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("secure delete: WAL checkpoint failed: {e}"),
+        }
     }
 }
 

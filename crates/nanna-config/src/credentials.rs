@@ -334,7 +334,7 @@ impl SecureStore {
                         }
                     }
                     Err(keyring::Error::NoEntry) => {
-                        let key = random_key();
+                        let key = random_key()?;
                         if entry.set_password(&base64_encode(&key)).is_ok() {
                             return Ok(key);
                         }
@@ -354,7 +354,7 @@ impl SecureStore {
                 return Ok(key);
             }
         }
-        let key = random_key();
+        let key = random_key()?;
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -833,26 +833,36 @@ impl ClaudeCredentialManager {
 const ENC_MAGIC: &[u8; 8] = b"NANNAENC";
 const NONCE_LEN: usize = 12;
 
-fn random_key() -> [u8; 32] {
+/// Generate a fresh 32-byte AES-256 file-encryption key, **failing closed** if the
+/// OS RNG does.
+///
+/// The old body fell back to a `SystemTime`-nanos-derived key on `getrandom`
+/// failure — only ~30 bits of guessable entropy, so an attacker who obtained
+/// `credentials.enc` and knew roughly when the key was created could brute-force
+/// it. A getrandom failure is essentially never seen on a real system, and there
+/// is no safe weak fallback for a long-lived encryption key, so we refuse to mint
+/// one rather than mint a guessable one (matches [`random_nonce`]).
+fn random_key() -> Result<[u8; 32], CredentialError> {
     let mut key = [0u8; 32];
-    if getrandom::fill(&mut key).is_err() {
-        let tick = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        for (i, b) in key.iter_mut().enumerate() {
-            *b = ((tick >> ((i % 16) * 4)) as u8)
-                .wrapping_mul(31)
-                .wrapping_add(i as u8);
-        }
-    }
-    key
+    getrandom::fill(&mut key)
+        .map_err(|e| CredentialError::Crypto(format!("RNG failure generating file key: {e}")))?;
+    Ok(key)
 }
 
-fn random_nonce() -> [u8; NONCE_LEN] {
+/// Generate a fresh random AES-GCM nonce, **failing closed** if the OS RNG does.
+///
+/// The old body ignored `getrandom`'s error (`let _ = …`), so an RNG failure left
+/// the nonce all-zeros. Under AES-GCM a repeated nonce with the same key is
+/// catastrophic — it breaks confidentiality and forges authentication — and every
+/// `encrypt_credentials` call reuses the file key, so a zero nonce means guaranteed
+/// reuse. A getrandom failure is essentially never seen on a real system, so
+/// refusing to encrypt is the correct, conservative response (unlike a key, a nonce
+/// has no safe weak fallback: uniqueness is the whole contract).
+fn random_nonce() -> Result<[u8; NONCE_LEN], CredentialError> {
     let mut n = [0u8; NONCE_LEN];
-    let _ = getrandom::fill(&mut n);
-    n
+    getrandom::fill(&mut n)
+        .map_err(|e| CredentialError::Crypto(format!("RNG failure generating nonce: {e}")))?;
+    Ok(n)
 }
 
 fn encrypt_credentials(
@@ -862,10 +872,11 @@ fn encrypt_credentials(
     let plaintext = serde_json::to_vec(creds)?;
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CredentialError::Crypto(e.to_string()))?;
-    let nonce_bytes = random_nonce();
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce_bytes = random_nonce()?;
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|_| CredentialError::Crypto("nonce length mismatch".into()))?;
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
+        .encrypt(&nonce, plaintext.as_ref())
         .map_err(|e| CredentialError::Crypto(e.to_string()))?;
     let mut out = Vec::with_capacity(8 + NONCE_LEN + ciphertext.len());
     out.extend_from_slice(ENC_MAGIC);
@@ -884,11 +895,12 @@ fn decrypt_credentials(
     if &bytes[..8] != ENC_MAGIC {
         return Err(CredentialError::Crypto("bad envelope magic".into()));
     }
-    let nonce = Nonce::from_slice(&bytes[8..8 + NONCE_LEN]);
+    let nonce = Nonce::try_from(&bytes[8..8 + NONCE_LEN])
+        .map_err(|_| CredentialError::Crypto("nonce length mismatch".into()))?;
     let ciphertext = &bytes[8 + NONCE_LEN..];
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CredentialError::Crypto(e.to_string()))?;
-    let mut plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+    let mut plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
         CredentialError::Crypto("decryption failed (wrong key or corrupt file)".into())
     })?;
     let creds: HashMap<String, String> = serde_json::from_slice(&plaintext)?;
@@ -924,6 +936,35 @@ mod tests {
 
         assert!(!cred.is_expired());
         assert!(cred.can_refresh());
+    }
+
+    #[test]
+    fn random_nonce_is_nonzero_and_unique() {
+        // The old body swallowed getrandom errors and could yield an all-zeros
+        // nonce; AES-GCM nonce reuse is catastrophic. Prove the happy path gives a
+        // fresh, non-zero nonce each call.
+        let a = random_nonce().expect("RNG available in tests");
+        let b = random_nonce().expect("RNG available in tests");
+        assert_ne!(a, [0u8; NONCE_LEN], "a real nonce is never all zeros");
+        assert_ne!(
+            a, b,
+            "two nonces must differ — uniqueness is the GCM contract"
+        );
+    }
+
+    #[test]
+    fn encrypt_uses_a_fresh_nonce_each_call() {
+        // Same plaintext + key must produce different envelopes, because the
+        // random nonce is prepended — the observable proof a fixed nonce is not
+        // being reused — yet both still decrypt back to the original.
+        let key = [7u8; 32];
+        let mut creds = HashMap::new();
+        creds.insert("k".to_string(), "v".to_string());
+        let a = encrypt_credentials(&creds, &key).expect("encrypt a");
+        let b = encrypt_credentials(&creds, &key).expect("encrypt b");
+        assert_ne!(a, b, "distinct nonces must yield distinct envelopes");
+        assert_eq!(decrypt_credentials(&a, &key).expect("decrypt a"), creds);
+        assert_eq!(decrypt_credentials(&b, &key).expect("decrypt b"), creds);
     }
 
     #[test]

@@ -185,7 +185,7 @@ impl BrowserPage for PlaywrightPage {
 
     async fn text_content(&self) -> Result<String, BrowserError> {
         // Get body text content via locator
-        let locator = self.page.locator("body").await;
+        let locator = self.page.locator("body");
         locator
             .text_content()
             .await
@@ -201,7 +201,7 @@ impl BrowserPage for PlaywrightPage {
     }
 
     async fn click(&self, selector: &str) -> Result<(), BrowserError> {
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         locator
             .click(None)
             .await
@@ -210,7 +210,7 @@ impl BrowserPage for PlaywrightPage {
 
     async fn type_text(&self, selector: &str, text: &str) -> Result<(), BrowserError> {
         // Use fill for typing (more reliable in Playwright)
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         locator
             .fill(text, None)
             .await
@@ -218,7 +218,7 @@ impl BrowserPage for PlaywrightPage {
     }
 
     async fn fill(&self, selector: &str, text: &str) -> Result<(), BrowserError> {
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         locator
             .fill(text, None)
             .await
@@ -226,7 +226,7 @@ impl BrowserPage for PlaywrightPage {
     }
 
     async fn press(&self, selector: &str, key: &str) -> Result<(), BrowserError> {
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         locator
             .press(key, None)
             .await
@@ -235,7 +235,7 @@ impl BrowserPage for PlaywrightPage {
 
     async fn wait_for_selector(&self, selector: &str) -> Result<(), BrowserError> {
         // Use locator's visibility check as wait mechanism
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         // Wait for it to be visible
         let _visible = locator
             .is_visible()
@@ -256,7 +256,7 @@ impl BrowserPage for PlaywrightPage {
     }
 
     async fn get_attribute(&self, selector: &str, attribute: &str) -> Result<Option<String>, BrowserError> {
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         locator
             .get_attribute(attribute)
             .await
@@ -264,7 +264,7 @@ impl BrowserPage for PlaywrightPage {
     }
 
     async fn exists(&self, selector: &str) -> Result<bool, BrowserError> {
-        let locator = self.page.locator(selector).await;
+        let locator = self.page.locator(selector);
         let count = locator
             .count()
             .await
