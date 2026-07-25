@@ -2463,6 +2463,55 @@ drops them — needs plumbing into `StepRunner`).
 
 ---
 
+### P20 — Make the harness carry a weak model 🌱 (2026-07-25, owner: "get the harness to a place where it can run lfm")
+
+Driving `lfm2.5:latest` (5.2 GB) against the eval exposed four harness/tooling defects that a capable
+model masks. Measured on the 5-task smoke suite, same model, same seed tasks:
+
+| | before | after |
+|---|---|---|
+| smoke score | 3/5 | **5/5** |
+| tasks in scope (5 seeded) | 55 | **5** |
+| tokens per completed item | 69,846 | **25,296** |
+| wall clock | ~15 min | **53 s** |
+
+- [x] **Explicit tool scopes are honoured exactly** (`RunOptions::restrict_to_active_tools`) —
+      `CORE_TOOL_NAMES` (`remember`/`recall`/`reflect`/`discover_tools`) was unioned into EVERY request,
+      so a step scoped to three tools actually saw ~8. The first tool-loop nudge of the endurance run
+      was `last_tool="discover_tools"`: the model burned steps rediscovering tools it already held and
+      called `write_file` **once in 487 steps**. An item that names its tools has had its discovery
+      done for it. Unscoped steps keep the core set — they have no other way to reach a tool.
+- [x] **Idempotent `todo` add** — re-adding a title that is still OPEN in the same scope returns the
+      existing item instead of a duplicate. lfm2.5 re-planned the same work every step, turning 5
+      seeded tasks into ~50 ("Write data file with header and 3 rows" created ten times), so the plan
+      grew faster than it was worked. Only OPEN items dedupe (a recurring chore is addable once the
+      previous one closes) and only within the same parent (the same subtask title under two parents
+      is different work). 3 tests.
+- [x] **Acceptance contracts are not deletable** (`tasks.remove`) — blocked on a refusing `write_file`
+      and holding only `write_file` + `todo`, the model **deleted a seeded plan item**, and the run
+      then panicked on a task the harness still expected to verify. A task with a machine-checkable
+      check defines what "done" means; the honest outcomes are complete or cancel, both of which keep
+      the record. Scratch items (no acceptance) stay freely removable. 2 tests.
+- [x] **Double-escaped writes are REPAIRED, not refused** (`write_file` 0.1.13) — the model emitted
+      `#!/bin/sh\ncase $1 in` with the backslash-n as two literal characters, so its "script" landed as
+      one physical line that could never execute and every downstream acceptance check failed on
+      *behaviour*, hiding the cause. **Refusing was tried first and was worse:** the model cannot see
+      its own escaping (the defect is in serialization, not intent), so it resent byte-identical
+      content three times and then began SHRINKING the file to appease the guard, heading for the
+      truncation ratchet. The write now converts the sequences to real newlines and announces what
+      changed + that it SUCCEEDED. JSON-family files exempt (`\n` in a string is the spec encoding);
+      `force=true` passes bytes through.
+
+**Principle earned:** *a guard the model cannot satisfy is a wedge.* Refuse only when the model can
+act on the refusal; otherwise repair and say so.
+
+**Open:** `live_endurance` leaves a **zombie process** — observed alive ~1.5 h after printing its final
+summary, holding `live_long_horizon-*.exe` and failing every later build with `LNK1104`. The test
+function completes but the runtime never exits (suspect a lingering spawned task / connection pool).
+Until fixed, kill stale `live_long_horizon*` processes before rebuilding.
+
+---
+
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
 
 These are aspirational per-subsystem enhancements distilled from the old planning docs. Grouped to
