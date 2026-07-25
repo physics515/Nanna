@@ -2362,6 +2362,52 @@ independent items) → B snapshots + ask_user → C monitors → D as capacity f
 
 ---
 
+### P19 — Long-horizon IS the chat interface ✅ (landed 2026-07-24, owner directive)
+
+**Directive (owner, 2026-07-24):** *"every chat should be treated as a long horizon task. long horizon
+should be the default behaviour of the chat interface."*
+
+Before this, chat and the harness were two execution paths that could not meet. Chat ran
+`AgentService::chat_with_options` — one growing context, no continuation machinery (measured autonomy
+ceiling ~75s), and a follow-up message serialized behind a `tokio::Mutex` until the turn finished. The
+harness (P14) had the continuation machinery but **nothing to execute**: `LongHorizonRunner::run` reads
+`TaskSource::next` and breaks on `AllTasksDone` the moment the store is empty, and nothing turned a
+request into a plan — tasks were authored by hand on the Tasks page or by the agent calling the `task`
+skill.
+
+- [x] **Planner** (`nanna-agent/src/planner.rs`) — plan-from-goal, the missing seam. Tolerant parsing
+      (bare array, fenced block, `{tasks|plan|steps}` wrapper, bare task object, bare strings; brace- and
+      escape-aware JSON extraction). Malformed acceptance checks are **dropped, not passed through** — an
+      unparseable check fails every verdict and grinds an item to abandonment. Every failure path degrades
+      to the single-task plan, so a planner hiccup costs a turn nothing. 24 unit tests.
+- [x] **Interjection seam** (`harness::Interjector` + `run_with_interjector`) — the harness owns *when*
+      new input may enter (a step boundary, before `next()`); the implementation owns *what* entering
+      means. Mid-step is deliberately not an opportunity: a step owns a fresh context and an item, and
+      interrupting it strands work the acceptance check would then refute. `run()` delegates with `None`,
+      so every existing call site is untouched. 5 tests incl. reviving a plan that had already drained.
+- [x] **Queue-jumping semantics** (`SessionInterjector`) — `TaskRepository::next` sorts `in_progress`
+      ahead of priority ("resume what you started"), which would starve an interjection behind a long
+      multi-step item. The interjector therefore *yields* the in-flight item back to `pending` before
+      seeding, and seeds at priority 1 with a `sort_order` strictly below the scope minimum. The yielded
+      item resumes exactly where it stood — notes intact, harness progress counters keyed by id. 7 tests.
+- [x] **Show the work as it goes** (`ChatSink`) — harness steps stream into the session transcript
+      through the **existing** `MessageDelta` / `ToolStart` / `ToolEnd` events, which the GUI already
+      bridges to `stream-chunk`. No protocol or GUI change was needed. Each item is announced with a
+      `**[working]** <title>` header so a multi-step run reads as labelled pieces of work.
+- [x] **Chat cutover** (`control/chat_harness.rs`) — every turn: plan → seed → run → stream. A message
+      arriving mid-run is admitted to that run instead of starting a second one. Config
+      `[agent] long_horizon_chat` defaults **true**; false restores the single-shot path as a rollback for
+      a bad provider day, not as a second supported mode.
+
+**Open:** planner quality on the reference 9B tier is unmeasured (does it over-decompose small talk?);
+the interjection path has no live end-to-end test (unit-tested at the store and harness layers only);
+`PENDING_MESSAGES_MAX` overflow drops the oldest silently — it should announce itself per the
+summaries-must-announce-themselves rule; the chat turn awaits the whole run, so a genuinely long plan
+holds the IPC request open (the GUI renders live via events, but the request/response contract wants
+revisiting for multi-hour runs).
+
+---
+
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
 
 These are aspirational per-subsystem enhancements distilled from the old planning docs. Grouped to

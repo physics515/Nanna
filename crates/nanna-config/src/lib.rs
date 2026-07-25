@@ -203,6 +203,19 @@ pub struct AgentConfig {
     /// iterations. Default: 100.
     #[serde(default = "default_nudge_interval")]
     pub nudge_interval_iterations: usize,
+    /// Drive every chat turn through the long-horizon harness (P19): the
+    /// message is planned, the plan runs as re-anchored steps that stream
+    /// into the transcript, and a message sent mid-run joins it at the next
+    /// step boundary. Default: true — long-horizon IS the chat behaviour.
+    ///
+    /// Setting this false restores the single-shot agent path. It exists as a
+    /// rollback for a bad provider day, not as a second supported mode.
+    #[serde(default = "default_long_horizon_chat")]
+    pub long_horizon_chat: bool,
+}
+
+fn default_long_horizon_chat() -> bool {
+    true
 }
 
 fn default_nudge_after() -> usize {
@@ -226,6 +239,7 @@ impl Default for AgentConfig {
             max_iterations: None,
             nudge_after_iterations: default_nudge_after(),
             nudge_interval_iterations: default_nudge_interval(),
+            long_horizon_chat: default_long_horizon_chat(),
         }
     }
 }

@@ -170,6 +170,60 @@ impl ControlPlane {
                 // Set session ID so tools can scope per-session state
                 agent.tools().set_session_id(Some(session_id.clone())).await;
 
+                // ── Long-horizon by default (P18) ──
+                // Every turn is a harness run: the message is planned, the
+                // plan is driven with re-anchored steps, and the work streams
+                // into this transcript as it happens. A message sent while a
+                // run is live joins that run at the next step boundary.
+                if self.config.read().await.agent.long_horizon_chat {
+                    let workspace_root = if let Some(ref ws_id) = effective_ws_id {
+                        let registry = self.workspaces.read().await;
+                        registry.get(ws_id).map(|ws| ws.path.clone())
+                    } else {
+                        None
+                    };
+                    match self
+                        .run_chat_turn(&session_id, &content, system_prompt.clone(), workspace_root)
+                        .await
+                    {
+                        Ok(Some(outcome)) => {
+                            self.sessions
+                                .add_message(&session_id, MessageRole::Assistant, &outcome.content)
+                                .await;
+                            return json!({
+                                "status": "success",
+                                "message_id": outcome.message_id,
+                                "content": outcome.content,
+                                "usage": {
+                                    "input_tokens": outcome.input_tokens,
+                                    "output_tokens": outcome.output_tokens,
+                                },
+                                "run": {
+                                    "steps_taken": outcome.steps_taken,
+                                    "items_completed": outcome.items_completed,
+                                    "interjected_items": outcome.interjected_items,
+                                    "stop": outcome.stop,
+                                },
+                            });
+                        }
+                        // The message joined the run already in flight.
+                        Ok(None) => {
+                            let depth = self
+                                .chat_runs
+                                .pending_for(&session_id)
+                                .await
+                                .len()
+                                .await;
+                            return super::chat_harness::interjected_response(&session_id, depth);
+                        }
+                        // Never strand a turn: fall through to the direct
+                        // agent path if the harness could not be started.
+                        Err(message) => {
+                            warn!(%message, "long-horizon chat unavailable — using the direct path");
+                        }
+                    }
+                }
+
                 // Run the agent with conversation history (workspace-scoped for memory extraction)
                 // Convert protocol attachments to (base64_data, media_type) tuples
                 let image_attachments: Vec<(String, String)> = attachments.into_iter()

@@ -14,6 +14,7 @@ pub mod image_util;
 mod loop_runner;
 pub mod model_stats;
 mod multi;
+pub mod planner;
 pub mod prompts;
 pub mod tool_stats;
 mod registry;
@@ -54,6 +55,7 @@ pub use summarizer::{
     Summarizer,
     SummarizerConfig,
 };
+pub use planner::{Plan, PlanOrigin, PlannedTask, build_plan_prompt, parse_plan, plan_or_fallback};
 pub use cost::{ModelPricing, default_pricing, estimate_cost_usd};
 pub use model_stats::{
     ModelCost, ModelStatsTracker, ModelStats, ModelStatsSummary, RequestModelStats,

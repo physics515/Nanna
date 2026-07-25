@@ -440,6 +440,29 @@ pub trait StepRunner: Send + Sync {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String>;
 }
 
+/// Folds newly-arrived user input into the running plan.
+///
+/// A long-horizon run can last hours, so a user message that arrives mid-run
+/// must not wait for the run to end — it is admitted at the **first available
+/// opportunity**, which is a step boundary. Mid-step is not an opportunity:
+/// a step owns a fresh context and an item, and interrupting it would strand
+/// half-finished work the acceptance check would then refute.
+///
+/// The split of duties is deliberate: the harness owns *when* input may
+/// enter (here, and only here); the implementation owns *what* entering
+/// means — in the daemon it plans the message and inserts the tasks at top
+/// priority, so the very next `next()` surfaces them ahead of existing work.
+#[async_trait::async_trait]
+pub trait Interjector: Send + Sync {
+    /// Admit any pending input into the plan. Returns the number of items
+    /// admitted (0 when nothing was waiting — the overwhelmingly common
+    /// case, so implementations must make that path cheap).
+    ///
+    /// Errors are logged and the run continues: failing to admit a message
+    /// must never kill work already in flight.
+    async fn interject(&self) -> Result<usize, String>;
+}
+
 // ---------------------------------------------------------------------------
 // Config / report
 // ---------------------------------------------------------------------------
@@ -532,6 +555,10 @@ pub struct LongHorizonReport {
     pub wall_clock_secs: u64,
     /// total tokens / items completed. None when nothing completed.
     pub tokens_per_completed_item: Option<u64>,
+    /// Items admitted mid-run by an [`Interjector`] — user messages that
+    /// joined the plan at a step boundary instead of waiting for the run.
+    #[serde(default)]
+    pub interjected_items: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +748,25 @@ impl LongHorizonRunner {
         workdir: &Path,
         cancel: Option<Arc<AtomicBool>>,
     ) -> LongHorizonReport {
+        self.run_with_interjector(goal, source, runner, workdir, cancel, None)
+            .await
+    }
+
+    /// [`Self::run`], plus a hook that admits new user input at each step
+    /// boundary. This is the shape chat uses: a run is live for as long as
+    /// the plan takes, and messages sent meanwhile join it rather than
+    /// queueing behind it.
+    pub async fn run_with_interjector(
+        &self,
+        goal: &str,
+        source: &dyn TaskSource,
+        runner: &dyn StepRunner,
+        workdir: &Path,
+        cancel: Option<Arc<AtomicBool>>,
+        interjector: Option<&dyn Interjector>,
+    ) -> LongHorizonReport {
         let cfg = &self.config;
+        let mut interjected_items = 0usize;
         let started = Instant::now();
         let mut steps_taken = 0usize;
         let mut items_completed = 0usize;
@@ -747,6 +792,24 @@ impl LongHorizonRunner {
             let tokens_used = input_tokens + output_tokens;
             if cfg.max_total_tokens.is_some_and(|max| tokens_used >= max) {
                 break StopReason::TokenBudgetExhausted;
+            }
+
+            // The first available opportunity: admit anything the user sent
+            // while the previous step ran, BEFORE choosing the next item, so
+            // a fresh request is picked up by this very iteration rather
+            // than after the rest of the plan drains.
+            if let Some(interjector) = interjector {
+                match interjector.interject().await {
+                    Ok(0) => {}
+                    Ok(admitted) => {
+                        interjected_items += admitted;
+                    }
+                    // A failed admission must not kill work in flight; the
+                    // message stays pending and is retried next boundary.
+                    Err(message) => {
+                        tracing::warn!(%message, "interjection failed — retrying next step");
+                    }
+                }
             }
 
             // Re-anchor: the store, not the transcript, is the state.
@@ -1007,6 +1070,7 @@ impl LongHorizonRunner {
             } else {
                 None
             },
+            interjected_items,
         }
     }
 }
@@ -1800,5 +1864,186 @@ mod tests {
             report.input_tokens + report.output_tokens <= 6000,
             "drift cost must be bounded: {report:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Interjection — user input joining a run at a step boundary
+    // -----------------------------------------------------------------
+
+    /// Admits a scripted batch of items the first time it is polled, by
+    /// pushing them into the shared source (as the daemon impl does).
+    struct ScriptedInterjector {
+        source: Arc<MemorySource>,
+        /// Batches to admit, one per poll; empty batches mean "nothing waiting".
+        batches: Mutex<VecDeque<Vec<TaskStep>>>,
+        polls: Mutex<usize>,
+        fail_first: Mutex<bool>,
+    }
+
+    impl ScriptedInterjector {
+        fn new(source: Arc<MemorySource>, batches: Vec<Vec<TaskStep>>) -> Self {
+            Self {
+                source,
+                batches: Mutex::new(batches.into()),
+                polls: Mutex::new(0),
+                fail_first: Mutex::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Interjector for ScriptedInterjector {
+        async fn interject(&self) -> Result<usize, String> {
+            *self.polls.lock().await += 1;
+            {
+                let mut fail = self.fail_first.lock().await;
+                if *fail {
+                    *fail = false;
+                    return Err("store unavailable".to_string());
+                }
+            }
+            let batch = self.batches.lock().await.pop_front().unwrap_or_default();
+            let admitted = batch.len();
+            for step in batch {
+                self.source.push(step).await;
+            }
+            Ok(admitted)
+        }
+    }
+
+    #[tokio::test]
+    async fn interjected_task_is_executed_in_the_same_run() {
+        let source = Arc::new(MemorySource::default());
+        source.push(step(1, "original work", None)).await;
+        // Nothing waiting on the first boundary; a message lands on the second.
+        let interjector = ScriptedInterjector::new(
+            source.clone(),
+            vec![vec![], vec![step(2, "the interjected ask", None)]],
+        );
+        let runner = ScriptedRunner::new(vec![Ok(outcome("did 1
+TASK COMPLETE")), Ok(outcome("did 2
+TASK COMPLETE"))]);
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run_with_interjector(
+                "goal",
+                source.as_ref(),
+                &runner,
+                Path::new("."),
+                None,
+                Some(&interjector),
+            )
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.interjected_items, 1);
+        assert_eq!(report.items_completed, 2, "both items ran: {report:?}");
+        let titles: Vec<String> = runner
+            .requests
+            .lock()
+            .await
+            .iter()
+            .map(|r| r.prompt.clone())
+            .collect();
+        assert!(
+            titles.iter().any(|p| p.contains("the interjected ask")),
+            "the mid-run message must reach a step prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn interjection_is_polled_before_every_step_selection() {
+        let source = Arc::new(MemorySource::default());
+        source.push(step(1, "a", None)).await;
+        source.push(step(2, "b", None)).await;
+        let interjector = ScriptedInterjector::new(source.clone(), vec![]);
+        let runner = ScriptedRunner::new(vec![Ok(outcome("x
+TASK COMPLETE")), Ok(outcome("y
+TASK COMPLETE"))]);
+
+        LongHorizonRunner::new(fast_config())
+            .run_with_interjector(
+                "goal",
+                source.as_ref(),
+                &runner,
+                Path::new("."),
+                None,
+                Some(&interjector),
+            )
+            .await;
+
+        // Two steps plus the final poll that discovers the empty plan.
+        assert_eq!(*interjector.polls.lock().await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_failing_interjection_does_not_kill_work_in_flight() {
+        let source = Arc::new(MemorySource::default());
+        source.push(step(1, "keep going", None)).await;
+        let interjector = ScriptedInterjector::new(source.clone(), vec![]);
+        *interjector.fail_first.lock().await = true;
+        let runner = ScriptedRunner::new(vec![Ok(outcome("done
+TASK COMPLETE"))]);
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run_with_interjector(
+                "goal",
+                source.as_ref(),
+                &runner,
+                Path::new("."),
+                None,
+                Some(&interjector),
+            )
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(report.interjected_items, 0);
+    }
+
+    #[tokio::test]
+    async fn interjection_revives_a_plan_that_had_drained() {
+        // The message lands exactly as the plan empties — the boundary poll
+        // happens BEFORE next(), so the run continues instead of reporting
+        // AllTasksDone and making the user start over.
+        let source = Arc::new(MemorySource::default());
+        source.push(step(1, "only item", None)).await;
+        let interjector = ScriptedInterjector::new(
+            source.clone(),
+            vec![vec![], vec![step(2, "arrived at the buzzer", None)]],
+        );
+        let runner = ScriptedRunner::new(vec![Ok(outcome("first
+TASK COMPLETE")), Ok(outcome("second
+TASK COMPLETE"))]);
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run_with_interjector(
+                "goal",
+                source.as_ref(),
+                &runner,
+                Path::new("."),
+                None,
+                Some(&interjector),
+            )
+            .await;
+
+        assert_eq!(report.items_completed, 2);
+        assert_eq!(report.interjected_items, 1);
+    }
+
+    #[tokio::test]
+    async fn run_without_an_interjector_behaves_exactly_as_before() {
+        let source = Arc::new(MemorySource::default());
+        source.push(step(1, "a", None)).await;
+        let runner = ScriptedRunner::new(vec![Ok(outcome("x
+TASK COMPLETE"))]);
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", source.as_ref(), &runner, Path::new("."), None)
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(report.interjected_items, 0);
     }
 }
