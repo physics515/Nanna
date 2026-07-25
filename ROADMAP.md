@@ -1671,6 +1671,20 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the key on delete — 0% recovery, ~2.5 ms per 500 records, plus a signed proof-of-deletion). Pairs
             with the P0.2 `PRIVACY.md` "how to delete your data" claim, which must not promise more than the
             storage layer delivers.
+            - [ ] *(research 2026-07-25 — raises the stakes on the epoch-key follow-up above)* **Embedding
+                  inversion got cheaper and no longer needs the encoder.** Beyond Vec2Text (per-encoder,
+                  query-access), 2025–26 work makes recovery practical from *just the stored vectors*: **ALGEN**
+                  learns a linear map between embedding spaces from ~10³ leaked pairs and hits Vec2Text-level
+                  recovery **without query access**; **ZSINVERT** is zero-shot (no encoder-specific training);
+                  **Zero2Text** does online token-by-token regression. For our threat model (a `.db`/backup on
+                  the user's disk) this means a leaked embedding BLOB is invertible by an attacker who never
+                  touched our model — so the today-fix (secure-delete overwrite, done 2026-07-25) closes the
+                  *deletion* leak but a *live* embedding at rest is still recoverable. The durable answer is
+                  **encrypt embeddings at rest** (the epoch-key-rotation mitigation), NOT retrieval-time
+                  perturbation (Laplace/Purkayastha/Bound-Aware Perturbation harm recall and don't help a
+                  storage-access adversary). Sources:
+                  [ALGEN/ZSINVERT survey](https://arxiv.org/pdf/2504.00147),
+                  [Concept-Aware defenses](https://arxiv.org/html/2602.07090v1).
       - [ ] *(research 2026-07-23)* **Three pure-Rust HNSW crates to choose between** (all no-C, matching the
             dependency doctrine): **`hnswlib-rs`** decouples the graph from vector storage (`Hnsw<K, M>` owns the
             graph + an external-key→`NodeId` map, you supply a `VectorStore`) and supports **concurrent search
@@ -1727,6 +1741,17 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             map drops in without duplicating vectors. Decision stands: `hnsw_rs::insert_parallel` for a
             rebuild-per-dream clusterer (simpler), `hnswlib-rs` only when we move to a long-lived insert-while-serve
             index. Source: [hnswlib-rs](https://crates.io/crates/hnswlib-rs).
+      - [ ] *(research 2026-07-25 — settles "wait for turso native ANN vs adopt a crate")* **Native ANN in the
+            `turso` crate is NOT coming soon — the external HNSW plan stands.** The often-cited "Turso brings
+            native vector search / DiskANN" posts describe the **libSQL** engine (a different codebase); in the
+            pure-Rust rewrite we actually pin, DiskANN is [issue #832](https://github.com/tursodatabase/turso/issues/832)
+            — **Backlog milestone, no assignee, no branch, no PR** as of this check (the proposal is literally
+            "port the libSQL DiskANN C code to Rust"). A parallel discussion
+            ([#3778](https://github.com/tursodatabase/turso/issues/3778)) argues turso should ship
+            **SIMD brute-force first**, before any ANN index. Net for us: the exact SQL k-NN primitive landed
+            2026-07-25 (`search_by_embedding_sql`) is the near-term path for the RAM-ceiling win, and an
+            **external pure-Rust HNSW crate** (`hnsw_rs`/`hnswlib-rs` above) remains the only route to
+            *approximate* indexing — do not block on a turso release for it.
 - [ ] **Feedback-driven FSRS** — wire real signals (thumbs, corrections, tool-success/failure) into `DreamingService::record_feedback` so importance is learned, not static.
       *(2026-07-13)* **Feedback accumulator hardened + boost table de-duplicated.** `record_feedback`'s
       `pending_feedback` (`memory_id → Vec<MemoryFeedback>`) was an **unbounded** per-memory accumulator on the
