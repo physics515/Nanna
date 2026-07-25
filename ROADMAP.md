@@ -1605,6 +1605,25 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the raw vector back. 3/3 green, clippy clean. The remaining work is the measurement, not the
             feasibility. The corresponding false claim in the `daily-dev` Appendix C is fixed in the same
             commit.
+            *(2026-07-25)* **The k-NN primitive now exists on the real column — `MemoryRepository::search_by_embedding_sql`
+            + `crates/nanna-storage/tests/vector_knn.rs`.** The load-bearing question a source-read left open was
+            the **on-disk format**: memories store embeddings as *raw little-endian f32 bytes*
+            (`f.to_le_bytes()`), while turso's `vector_extract` reads a **trailing type byte**
+            (`blob[len-1]`). It turned out `vector_distance_cos`'s parse path (`Vector::from_slice`) does
+            **not** use that type byte — it treats a bare BLOB as `Float32Dense` — so cosine works over the
+            stored column **directly, with no `vector32()` wrapper, no type byte, and no migration** (proven:
+            identical→0, orthogonal→1, opposite→2, correct `ORDER BY` rank; the query vector binds the same
+            way as a raw blob). The new method runs `ORDER BY vector_distance_cos(embedding, ?) LIMIT ?`
+            inside Turso (O(N) computes, **O(1) RAM** — streams rows instead of `bulk_load`-ing every vector),
+            mirrors `recall_scoped` scope (`Some`→workspace+global, `None`→all), and — since
+            `vector_distance_cos` **errors** on a dimension mismatch (would abort the whole scan on one
+            stray-dim vector) — guards with `octet_length(embedding) = dims*4` so mixed-dimension stores skip
+            rather than fail. 4 tests: **ranking parity with an independent in-RAM cosine scan**, LIMIT +
+            NULL-skip, the dimension guard, and workspace scope. 82 nanna-storage tests green, new code
+            clippy/fmt-clean. **Still the remaining work:** the *latency/RAM comparison* on the
+            `nanna-memory::retention` harness (this proves ranking parity + the RAM-ceiling escape, not the
+            wall-clock trade), and the **decision to wire it into the live recall path** vs the current
+            `bulk_load`+SIMD scan — only after that measurement does the ANN-crate question reopen.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
