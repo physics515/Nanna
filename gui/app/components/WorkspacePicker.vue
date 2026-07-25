@@ -8,7 +8,7 @@
           v-model="searchQuery"
           type="text"
           placeholder="Search workspaces..."
-          class="w-full pl-10 pr-4 py-2 rounded-lg bg-nanna-bg-elevated/30 border border-white/[0.06] text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
+          class="w-full pl-10 pr-4 py-2 rounded-lg glass-well text-nanna-text text-sm focus:outline-none focus:border-nanna-accent"
         />
       </div>
 
@@ -44,7 +44,7 @@
         >
           <div :class="[
             'w-10 h-10 rounded-lg flex items-center justify-center shrink-0',
-            isAlreadyOpen(ws.id) ? 'bg-nanna-accent/20' : 'bg-nanna-bg-elevated'
+            isAlreadyOpen(ws.id) ? 'bg-nanna-accent/20' : 'glass-panel'
           ]">
             <Folder :class="[
               'w-5 h-5',

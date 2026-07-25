@@ -61,15 +61,21 @@ const props = withDefaults(defineProps<Props>(), {
   position: relative;
   isolation: isolate;
   overflow: hidden;
-  background: rgba(139, 92, 246, 0.5);
-  border: 1px solid rgba(139, 92, 246, 0.3);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  background: rgba(139, 92, 246, 0.32);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  border: 1px solid rgba(167, 139, 250, 0.32);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
+    0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
 .glass-btn:hover {
-  background: rgba(139, 92, 246, 0.65);
-  border-color: rgba(139, 92, 246, 0.5);
-  box-shadow: 0 2px 8px rgba(139, 92, 246, 0.25);
+  background: rgba(139, 92, 246, 0.48);
+  border-color: rgba(167, 139, 250, 0.5);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.1),
+    0 2px 8px rgba(139, 92, 246, 0.25);
 }
 
 /* Ground glass noise overlay */

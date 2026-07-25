@@ -140,7 +140,7 @@ const typeBorder: Record<NotificationType, string> = {
         :class="[
           'rounded-lg border p-2.5 cursor-pointer transition-colors',
           typeBorder[n.type],
-          expandedId === n.id ? typeBg[n.type] : 'bg-slate-800/50 hover:bg-slate-800/80',
+          expandedId === n.id ? typeBg[n.type] : 'hover:bg-white/[0.03]',
           !n.read ? 'ring-1 ring-violet-500/30' : ''
         ]"
         @click="toggleExpand(n)"
@@ -158,7 +158,7 @@ const typeBorder: Record<NotificationType, string> = {
             </div>
             <p class="text-[11px] text-slate-400 mt-0.5 line-clamp-2">{{ n.summary }}</p>
             <!-- Source badge -->
-            <span class="inline-block mt-1 px-1.5 py-0.5 text-[9px] rounded bg-slate-700/50 text-slate-500">
+            <span class="inline-block mt-1 px-1.5 py-0.5 text-[9px] rounded glass-tag text-slate-400">
               {{ n.source }}
             </span>
           </div>
@@ -175,7 +175,7 @@ const typeBorder: Record<NotificationType, string> = {
             <!-- Detail text -->
             <div v-if="n.detail && n.detail !== n.summary" class="mb-2">
               <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-wider">Detail</div>
-              <pre class="text-[11px] text-slate-300 bg-slate-900/60 rounded p-2 overflow-x-auto whitespace-pre-wrap font-mono max-h-[200px] overflow-y-auto">{{ n.detail }}</pre>
+              <pre class="text-[11px] text-slate-300 glass-well rounded p-2 overflow-x-auto whitespace-pre-wrap font-mono max-h-[200px] overflow-y-auto">{{ n.detail }}</pre>
             </div>
 
             <!-- Metadata -->
@@ -197,14 +197,14 @@ const typeBorder: Record<NotificationType, string> = {
             <div class="flex items-center gap-2 mt-2" @click.stop>
               <button
                 @click="copyNotification(n.id)"
-                class="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-slate-700/50 text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors"
+                class="flex items-center gap-1 px-2 py-1 text-[10px] rounded glass-chip text-slate-400 hover:text-slate-200"
               >
                 <component :is="copiedId === n.id ? Check : Copy" class="w-3 h-3" />
                 {{ copiedId === n.id ? 'Copied!' : 'Copy as Markdown' }}
               </button>
               <button
                 @click="removeNotification(n.id)"
-                class="flex items-center gap-1 px-2 py-1 text-[10px] rounded bg-slate-700/50 text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 transition-colors"
+                class="flex items-center gap-1 px-2 py-1 text-[10px] rounded glass-chip text-slate-400 hover:text-rose-300"
               >
                 <X class="w-3 h-3" />
                 Dismiss

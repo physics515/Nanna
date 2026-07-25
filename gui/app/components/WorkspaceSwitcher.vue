@@ -179,7 +179,9 @@ const isGlobal = computed(() => currentValue.value === 'global')
   max-width: 260px;
   border-radius: 0.75rem;
   padding: 6px;
-  background: rgba(15, 23, 42, 0.92);
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.06);

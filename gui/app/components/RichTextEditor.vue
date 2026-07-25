@@ -412,7 +412,7 @@ function nodeContentToText(node: any): string {
 
 /* ═══ Inline code ═══ */
 .rich-text-editor__content code {
-  @apply px-1.5 py-0.5 rounded bg-nanna-bg-elevated text-nanna-accent font-mono text-xs;
+  @apply px-1.5 py-0.5 rounded glass-tag text-nanna-accent font-mono text-xs;
 }
 
 /* ═══ Bold / Italic / Strike ═══ */

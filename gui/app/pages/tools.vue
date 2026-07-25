@@ -1,7 +1,7 @@
 <template>
   <div class="flex h-full">
     <!-- Sidebar: Tools List -->
-    <aside class="w-64 border-r border-white/[0.04] bg-nanna-bg-surface/80 flex flex-col">
+    <aside class="w-64 border-r border-white/[0.04] flex flex-col">
       <header class="px-3 py-3 border-b border-white/[0.04]">
         <div class="flex items-center justify-between mb-2">
           <h2 class="font-semibold text-nanna-text text-sm">Tools</h2>
@@ -102,7 +102,7 @@
       <!-- Tool Details / Editor -->
       <div v-else class="flex-1 flex flex-col min-h-0">
         <!-- Header -->
-        <header class="px-4 py-2 border-b border-white/[0.04] bg-nanna-bg-surface/80">
+        <header class="px-4 py-2 border-b border-white/[0.04]">
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-3">
               <div class="flex items-center gap-2">
@@ -129,18 +129,8 @@
         </header>
 
         <!-- Tabs -->
-        <div class="flex border-b border-white/[0.04] bg-nanna-bg-surface/30">
-          <button
-            v-for="tab in editorTabs"
-            :key="tab.id"
-            @click="activeTab = tab.id"
-            class="px-4 py-2 text-sm font-medium transition-colors border-b-2"
-            :class="activeTab === tab.id
-              ? 'text-nanna-accent border-nanna-accent'
-              : 'text-nanna-text-muted hover:text-nanna-text border-transparent'"
-          >
-            {{ tab.label }}
-          </button>
+        <div class="flex px-3 py-1.5 border-b border-white/[0.04]">
+          <UiGlassTabs v-model="activeTab" :tabs="editorTabs" size="sm" />
         </div>
 
         <!-- Content -->
@@ -159,9 +149,9 @@
               <!-- Parameters -->
               <div v-if="toolDetails?.parameters">
                 <h3 class="text-sm font-semibold text-nanna-text mb-2">Parameters</h3>
-                <div class="bg-nanna-bg-elevated rounded-lg p-3 space-y-2">
+                <div class="glass-well rounded-lg p-3 space-y-2">
                   <div v-for="(param, key) in toolDetails.parameters.properties || {}" :key="key" class="flex items-start gap-2 text-sm">
-                    <code class="px-1.5 py-0.5 bg-nanna-bg-surface rounded text-nanna-accent text-xs">{{ key }}</code>
+                    <code class="px-1.5 py-0.5 glass-tag rounded text-nanna-accent text-xs">{{ key }}</code>
                     <span class="text-nanna-text-dim">{{ param.type }}</span>
                     <span v-if="toolDetails.parameters.required?.includes(key)" class="text-red-400 text-xs">required</span>
                     <span v-if="param.description" class="text-nanna-text-muted text-xs flex-1">— {{ param.description }}</span>
@@ -184,7 +174,7 @@
                 </div>
                 <div>
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Output Routing</label>
-                  <select v-model="editingTool.outputTarget" class="w-full px-3 py-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded-lg text-sm text-nanna-text">
+                  <select v-model="editingTool.outputTarget" class="w-full px-3 py-2 glass-well rounded-lg text-sm text-nanna-text">
                     <option value="memory">Memory (default) — large results stored in memory, stubbed in context</option>
                     <option value="context">Context — results always inline, summarized if large</option>
                   </select>
@@ -199,7 +189,7 @@
           <!-- Code Tab -->
           <div v-show="activeTab === 'code'" class="flex-1 flex flex-col min-w-0">
             <!-- Creating: Name input -->
-            <div v-if="creating" class="px-4 py-3 border-b border-white/[0.04] bg-nanna-bg-surface/30">
+            <div v-if="creating" class="px-4 py-3 border-b border-white/[0.04]">
               <div class="flex gap-4">
                 <div class="flex-1">
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Tool Name</label>
@@ -207,7 +197,7 @@
                 </div>
                 <div class="w-32">
                   <label class="block text-xs font-medium text-nanna-text-muted mb-1">Type</label>
-                  <select v-model="editingTool.toolType" class="w-full px-3 py-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded-lg text-sm text-nanna-text">
+                  <select v-model="editingTool.toolType" class="w-full px-3 py-2 glass-well rounded-lg text-sm text-nanna-text">
                     <option value="script">Script (JS/TS)</option>
                     <option value="manifest">Manifest (YAML)</option>
                   </select>
@@ -245,7 +235,7 @@
           </div>
 
           <!-- Test Panel (slide out) -->
-          <aside v-if="showTestPanel" class="w-80 border-l border-white/[0.04] bg-nanna-bg-surface/80 flex flex-col">
+          <aside v-if="showTestPanel" class="w-80 border-l border-white/[0.04] flex flex-col">
             <header class="px-3 py-2 border-b border-white/[0.04] flex items-center justify-between">
               <span class="text-sm font-semibold text-nanna-text">Test Tool</span>
               <button @click="showTestPanel = false" class="p-1 rounded hover:bg-nanna-primary/20">
@@ -278,7 +268,7 @@
                 <label class="block text-xs font-medium text-nanna-text-muted mb-1">Input (JSON)</label>
                 <textarea
                   v-model="testInputJson"
-                  class="w-full h-24 p-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded text-xs font-mono text-nanna-text resize-none"
+                  class="w-full h-24 p-2 glass-well rounded text-xs font-mono text-nanna-text resize-none"
                   placeholder='{ "param": "value" }'
                 ></textarea>
               </div>
@@ -291,7 +281,7 @@
               <!-- Test Result -->
               <div v-if="testResult !== null" class="space-y-2">
                 <div class="text-xs font-medium text-nanna-text-muted">Result</div>
-                <div class="p-3 bg-nanna-bg-elevated rounded text-xs font-mono whitespace-pre-wrap" :class="testError ? 'text-red-400' : 'text-green-400'">
+                <div class="p-3 glass-well rounded text-xs font-mono whitespace-pre-wrap" :class="testError ? 'text-red-400' : 'text-green-400'">
                   {{ testResult }}
                 </div>
                 <div v-if="testDuration" class="text-[10px] text-nanna-text-dim">
@@ -316,7 +306,7 @@
             v-for="template in templates"
             :key="template.id"
             @click="createFromTemplate(template)"
-            class="p-4 text-left bg-nanna-bg-elevated hover:bg-nanna-primary/10 border border-white/[0.06] hover:border-nanna-accent/50 rounded-lg transition-colors"
+            class="p-4 text-left glass-panel hover:bg-nanna-primary/10 hover:border-nanna-accent/50 rounded-lg transition-colors"
           >
             <div class="text-lg mb-1">{{ template.icon }}</div>
             <div class="font-medium text-nanna-text text-sm">{{ template.name }}</div>

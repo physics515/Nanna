@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04]">
       <div class="flex items-center justify-between gap-3">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text flex items-center gap-2">
@@ -15,7 +15,7 @@
         <div class="flex items-center gap-3">
           <!-- Stats badges -->
           <div class="hidden sm:flex items-center gap-2 text-sm">
-            <span class="px-2 py-1 rounded-lg bg-nanna-bg-elevated text-nanna-text-muted">
+            <span class="px-2 py-1 rounded-lg glass-tag text-nanna-text-muted">
               {{ stats?.total_agents || 0 }} agents
             </span>
             <span v-if="stats?.active_agents" class="px-2 py-1 rounded-lg bg-nanna-success/20 text-nanna-success">
@@ -49,7 +49,7 @@
 
         <!-- Global stats bar -->
         <div v-if="stats && stats.total_agents > 0" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div class="p-3 rounded-xl bg-nanna-bg-elevated/30 border border-white/[0.04]">
+          <div class="p-3 rounded-xl glass-panel">
             <div class="text-2xl font-bold text-nanna-text">{{ stats.total_agents }}</div>
             <div class="text-xs text-nanna-text-muted">Total Agents</div>
           </div>
@@ -57,11 +57,11 @@
             <div class="text-2xl font-bold text-nanna-success">{{ stats.active_agents }}</div>
             <div class="text-xs text-nanna-text-muted">Active</div>
           </div>
-          <div class="p-3 rounded-xl bg-nanna-bg-elevated/30 border border-white/[0.04]">
+          <div class="p-3 rounded-xl glass-panel">
             <div class="text-2xl font-bold text-nanna-text">{{ stats.workspaces }}</div>
             <div class="text-xs text-nanna-text-muted">Workspaces</div>
           </div>
-          <div class="p-3 rounded-xl bg-nanna-bg-elevated/30 border border-white/[0.04]">
+          <div class="p-3 rounded-xl glass-panel">
             <div class="text-lg font-mono text-nanna-text">
               {{ formatTokens(stats.total_tokens_in) }} / {{ formatTokens(stats.total_tokens_out) }}
             </div>
@@ -117,7 +117,7 @@
         </div>
 
         <!-- State legend -->
-        <div v-if="stats && stats.total_agents > 0" class="mt-8 p-4 rounded-xl bg-nanna-bg-elevated/40 border border-white/[0.04]">
+        <div v-if="stats && stats.total_agents > 0" class="mt-8 p-4 rounded-xl glass-panel">
           <h4 class="text-xs font-semibold text-nanna-text-muted uppercase mb-3">State Legend</h4>
           <div class="flex flex-wrap gap-3">
             <div v-for="(color, state) in stateColors" :key="state" class="flex items-center gap-2">
@@ -137,7 +137,7 @@
         class="fixed inset-0 bg-black/60 flex justify-end z-50"
         @click.self="selectedAgent = null"
       >
-        <div class="w-full max-w-md bg-nanna-bg-surface h-full overflow-y-auto border-l border-white/[0.06] shadow-2xl">
+        <div class="w-full max-w-md glass-strong h-full overflow-y-auto border-l border-white/[0.06]">
           <!-- Sidebar header -->
           <div class="sticky top-0 glass border-b border-white/[0.04] p-4 flex items-center justify-between">
             <div class="flex items-center gap-3">
@@ -157,7 +157,7 @@
           <!-- Sidebar content -->
           <div class="p-4 space-y-4">
             <!-- Status -->
-            <div class="p-3 rounded-lg bg-nanna-bg-elevated">
+            <div class="p-3 rounded-lg glass-well">
               <div class="flex items-center justify-between mb-2">
                 <span class="text-sm text-nanna-text-muted">Status</span>
                 <span :class="['px-2 py-0.5 rounded text-xs font-medium', getStateBadge(selectedAgent.state)]">
@@ -171,41 +171,41 @@
 
             <!-- Info grid -->
             <div class="grid grid-cols-2 gap-3">
-              <div class="p-3 rounded-lg bg-nanna-bg-elevated">
+              <div class="p-3 rounded-lg glass-well">
                 <div class="text-xs text-nanna-text-muted">Role</div>
                 <div class="text-sm text-nanna-text capitalize">{{ selectedAgent.role }}</div>
               </div>
-              <div class="p-3 rounded-lg bg-nanna-bg-elevated">
+              <div class="p-3 rounded-lg glass-well">
                 <div class="text-xs text-nanna-text-muted">Model</div>
                 <div class="text-sm text-nanna-text truncate" :title="selectedAgent.model">
                   {{ formatModel(selectedAgent.model) }}
                 </div>
               </div>
-              <div class="p-3 rounded-lg bg-nanna-bg-elevated">
+              <div class="p-3 rounded-lg glass-well">
                 <div class="text-xs text-nanna-text-muted">Tokens In</div>
                 <div class="text-sm text-nanna-text font-mono">{{ selectedAgent.tokens_in.toLocaleString() }}</div>
               </div>
-              <div class="p-3 rounded-lg bg-nanna-bg-elevated">
+              <div class="p-3 rounded-lg glass-well">
                 <div class="text-xs text-nanna-text-muted">Tokens Out</div>
                 <div class="text-sm text-nanna-text font-mono">{{ selectedAgent.tokens_out.toLocaleString() }}</div>
               </div>
             </div>
 
             <!-- Workspace -->
-            <div v-if="selectedAgent.workspace_path" class="p-3 rounded-lg bg-nanna-bg-elevated">
+            <div v-if="selectedAgent.workspace_path" class="p-3 rounded-lg glass-well">
               <div class="text-xs text-nanna-text-muted mb-1">Workspace</div>
               <div class="text-sm text-nanna-text font-medium">{{ selectedAgent.workspace_name }}</div>
               <div class="text-xs text-nanna-text-dim truncate">{{ selectedAgent.workspace_path }}</div>
             </div>
 
             <!-- Parent -->
-            <div v-if="selectedAgent.parent_id" class="p-3 rounded-lg bg-nanna-bg-elevated">
+            <div v-if="selectedAgent.parent_id" class="p-3 rounded-lg glass-well">
               <div class="text-xs text-nanna-text-muted mb-1">Parent Agent</div>
               <code class="text-xs text-nanna-accent">{{ selectedAgent.parent_id }}</code>
             </div>
 
             <!-- Children -->
-            <div v-if="selectedAgent.children.length > 0" class="p-3 rounded-lg bg-nanna-bg-elevated">
+            <div v-if="selectedAgent.children.length > 0" class="p-3 rounded-lg glass-well">
               <div class="text-xs text-nanna-text-muted mb-2">
                 Sub-agents ({{ selectedAgent.children.length }})
               </div>
@@ -221,7 +221,7 @@
             </div>
 
             <!-- Timestamps -->
-            <div class="p-3 rounded-lg bg-nanna-bg-elevated">
+            <div class="p-3 rounded-lg glass-well">
               <div class="text-xs text-nanna-text-muted mb-2">Timeline</div>
               <div class="space-y-1 text-xs">
                 <div class="flex justify-between">
@@ -424,7 +424,7 @@ function getAgentDepth(agent: AgentInfo, allAgents: AgentInfo[]): number {
 
 function getStateBackground(state: string): string {
   const map: Record<string, string> = {
-    spawned: 'bg-nanna-bg-elevated',
+    spawned: 'glass-tag',
     idle: 'bg-nanna-primary/20',
     thinking: 'bg-nanna-warning/20',
     tool_use: 'bg-nanna-accent/20',
@@ -433,7 +433,7 @@ function getStateBackground(state: string): string {
     error: 'bg-nanna-error/20',
     cancelled: 'bg-nanna-text-dim/20',
   }
-  return map[state] || 'bg-nanna-bg-elevated'
+  return map[state] || 'glass-tag'
 }
 
 function getStateTextColor(state: string): string {
@@ -452,7 +452,7 @@ function getStateTextColor(state: string): string {
 
 function getStateBadge(state: string): string {
   const map: Record<string, string> = {
-    spawned: 'bg-nanna-bg-elevated text-nanna-text-muted',
+    spawned: 'glass-tag text-nanna-text-muted',
     idle: 'bg-nanna-primary/20 text-nanna-primary',
     thinking: 'bg-nanna-warning/20 text-nanna-warning',
     tool_use: 'bg-nanna-accent/20 text-nanna-accent',
@@ -461,7 +461,7 @@ function getStateBadge(state: string): string {
     error: 'bg-nanna-error/20 text-nanna-error',
     cancelled: 'bg-nanna-text-dim/20 text-nanna-text-dim',
   }
-  return map[state] || 'bg-nanna-bg-elevated text-nanna-text'
+  return map[state] || 'glass-tag text-nanna-text'
 }
 
 function isTerminalState(state: string): boolean {

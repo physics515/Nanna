@@ -29,7 +29,7 @@
         <div
           v-for="tool in settings?.tools || []"
           :key="tool.name"
-          class="flex items-center justify-between gap-2 p-3 rounded-lg bg-nanna-bg-elevated/40"
+          class="flex items-center justify-between gap-2 p-3 rounded-lg glass-panel"
         >
           <div class="flex items-center gap-2 min-w-0">
             <span class="text-lg">{{ getToolIcon(tool.name) }}</span>

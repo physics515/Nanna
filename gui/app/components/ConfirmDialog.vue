@@ -90,8 +90,12 @@ onUnmounted(() => {
   width: min(420px, 100%);
   border-radius: 0.75rem;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(22, 28, 42, 0.96);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+    0 18px 50px rgba(0, 0, 0, 0.45);
   padding: 1.25rem 1.35rem;
 }
 .confirm-title {

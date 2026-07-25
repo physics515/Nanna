@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04]">
       <div class="flex items-center justify-between">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Scheduler</h2>
@@ -41,7 +41,7 @@
         <UiCard
           v-for="job in jobs"
           :key="job.id"
-          class="p-4 hover:bg-nanna-bg-surface transition-colors"
+          class="p-4 hover:bg-white/[0.03] transition-colors"
           :class="{ 'opacity-50': !job.enabled }"
         >
           <div class="flex items-start justify-between gap-4">
@@ -219,7 +219,7 @@
         <div 
           v-for="run in history" 
           :key="run.id"
-          class="p-3 bg-nanna-bg-surface rounded-md"
+          class="p-3 glass-well rounded-md"
         >
           <div class="flex items-center justify-between mb-1">
             <span :class="run.success ? 'text-nanna-success' : 'text-nanna-error'">

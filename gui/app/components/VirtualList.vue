@@ -23,7 +23,7 @@
           v-for="(item, i) in visibleItems"
           :key="keyOf(item, start + i)"
           class="virtual-list__row"
-          :style="{ height: `${itemHeight}px`, boxSizing: 'border-box' }"
+          :style="{ height: `${itemHeight}px`, boxSizing: 'border-box', overflow: 'hidden' }"
         >
           <slot :item="item" :index="start + i" />
         </div>

@@ -12,7 +12,7 @@ const avatarVariants = cva(
         lg: 'h-12 w-12 text-base',
       },
       variant: {
-        default: 'bg-nanna-bg-elevated/50 text-nanna-text',
+        default: 'glass-well text-nanna-text',
         primary: 'bg-nanna-primary/20 text-nanna-primary',
         accent: 'bg-nanna-primary/15 text-nanna-primary-hover',
         secondary: 'bg-nanna-secondary/20 text-nanna-secondary',

@@ -8,7 +8,7 @@
         <Database class="w-4 h-4 text-nanna-primary" />
       </template>
 
-      <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
+      <div class="flex items-center justify-between p-3 rounded-lg glass-panel">
         <div>
           <div class="text-sm font-medium text-nanna-text">Chat Sessions</div>
           <div class="text-xs text-nanna-text-dim">{{ sessionCount }} sessions stored</div>
@@ -19,7 +19,7 @@
         </UiButton>
       </div>
 
-      <div class="flex items-center justify-between p-3 rounded-lg bg-nanna-bg-elevated/40">
+      <div class="flex items-center justify-between p-3 rounded-lg glass-panel">
         <div>
           <div class="text-sm font-medium text-nanna-text">Memories</div>
           <div class="text-xs text-nanna-text-dim">{{ memoryStats?.total_memories || 0 }} memories stored</div>
@@ -40,7 +40,7 @@
       </template>
 
       <p class="text-sm text-nanna-text-muted">Config file location:</p>
-      <code class="block text-xs bg-nanna-bg-deep text-nanna-accent p-2 rounded font-mono break-all">
+      <code class="block text-xs glass-well text-nanna-accent p-2 rounded font-mono break-all">
         {{ configPath }}
       </code>
       <div class="flex gap-2">

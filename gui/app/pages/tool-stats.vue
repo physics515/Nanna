@@ -1,7 +1,7 @@
 <template>
-  <div class="h-full flex flex-col bg-nanna-bg-deep">
+  <div class="h-full flex flex-col">
     <!-- Header -->
-    <div class="px-6 py-4 border-b border-white/[0.04] bg-nanna-bg-surface">
+    <div class="px-6 py-4 border-b border-white/[0.04]">
       <div class="flex items-center justify-between">
         <div>
           <h1 class="text-2xl font-bold text-nanna-text">Tool Stats</h1>
@@ -10,7 +10,7 @@
         <div class="flex items-center gap-2">
           <button
             @click="fetchAll"
-            class="px-3 py-2 rounded-lg text-sm font-medium bg-nanna-bg-elevated text-nanna-text-muted hover:text-nanna-text transition-colors"
+            class="px-3 py-2 rounded-lg text-sm font-medium glass-chip text-nanna-text-muted hover:text-nanna-text"
           >
             <RefreshCw class="w-4 h-4 inline mr-1" :class="isLoading ? 'animate-spin' : ''" />
             Refresh
@@ -38,19 +38,19 @@
 
       <!-- Global Dashboard Cards -->
       <div v-if="tools.length > 0" class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-4">
+        <div class="glass-panel rounded-xl p-4">
           <div class="text-xs text-nanna-text-muted mb-1">Total Calls</div>
           <div class="text-2xl font-bold font-mono text-nanna-text">
             {{ global.total_calls?.toLocaleString() ?? 0 }}
           </div>
         </div>
-        <div class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-4">
+        <div class="glass-panel rounded-xl p-4">
           <div class="text-xs text-nanna-text-muted mb-1">Avg Latency</div>
           <div class="text-2xl font-bold font-mono text-nanna-text">
             {{ formatLatency(global.avg_latency_ms ?? 0) }}
           </div>
         </div>
-        <div class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-4">
+        <div class="glass-panel rounded-xl p-4">
           <div class="text-xs text-nanna-text-muted mb-1">Success Rate</div>
           <div :class="[
             'text-2xl font-bold font-mono',
@@ -61,7 +61,7 @@
             {{ ((global.success_rate ?? 1) * 100).toFixed(1) }}%
           </div>
         </div>
-        <div class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-4">
+        <div class="glass-panel rounded-xl p-4">
           <div class="text-xs text-nanna-text-muted mb-1">Unique Tools</div>
           <div class="text-2xl font-bold font-mono text-nanna-accent">
             {{ tools.length }}
@@ -90,7 +90,7 @@
 
       <!-- Tool vs LLM Time Breakdown -->
       <div v-if="sessionTotals.total_tool_time_ms > 0 || sessionTotals.total_llm_time_ms > 0"
-           class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-5">
+           class="glass-panel rounded-xl p-5">
         <h3 class="text-sm font-semibold text-nanna-text mb-3">Time Breakdown: Tool vs LLM</h3>
         <div class="flex items-center gap-4">
           <div class="flex-1">
@@ -98,7 +98,7 @@
               <span>Tool Time</span>
               <span>{{ formatDuration(sessionTotals.total_tool_time_ms) }}</span>
             </div>
-            <div class="h-4 bg-nanna-bg-elevated rounded-full overflow-hidden flex">
+            <div class="h-4 glass-well rounded-full overflow-hidden flex">
               <div
                 class="bg-nanna-accent h-full transition-all duration-500"
                 :style="{ width: toolTimePct + '%' }"
@@ -129,7 +129,7 @@
       </div>
 
       <!-- Hourly Activity Graph -->
-      <div v-if="hourlyBuckets.length > 0" class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-5">
+      <div v-if="hourlyBuckets.length > 0" class="glass-panel rounded-xl p-5">
         <div class="flex items-center justify-between mb-4">
           <h3 class="text-sm font-semibold text-nanna-text">Tool Calls — Last 24 Hours</h3>
           <div class="flex gap-2 text-[10px] text-nanna-text-dim">
@@ -144,7 +144,7 @@
           >
             <!-- Tooltip -->
             <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10">
-              <div class="bg-nanna-bg-elevated border border-white/[0.1] rounded-lg px-2 py-1 text-[10px] text-nanna-text whitespace-nowrap shadow-lg">
+              <div class="glass-strong rounded-lg px-2 py-1 text-[10px] text-nanna-text whitespace-nowrap">
                 <div class="font-mono">{{ b.period?.slice(11, 16) || '?' }}</div>
                 <div>{{ b.call_count }} calls · {{ formatLatency(b.avg_duration_ms) }} avg</div>
               </div>
@@ -171,7 +171,7 @@
       </div>
 
       <!-- Daily Trend Graph -->
-      <div v-if="dailyBuckets.length > 0" class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-5">
+      <div v-if="dailyBuckets.length > 0" class="glass-panel rounded-xl p-5">
         <div class="flex items-center justify-between mb-4">
           <h3 class="text-sm font-semibold text-nanna-text">Daily Trend — Last 30 Days</h3>
           <div class="flex gap-2 text-[10px] text-nanna-text-dim">
@@ -187,7 +187,7 @@
           >
             <!-- Tooltip -->
             <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10">
-              <div class="bg-nanna-bg-elevated border border-white/[0.1] rounded-lg px-2 py-1 text-[10px] text-nanna-text whitespace-nowrap shadow-lg">
+              <div class="glass-strong rounded-lg px-2 py-1 text-[10px] text-nanna-text whitespace-nowrap">
                 <div class="font-mono">{{ b.period }}</div>
                 <div>{{ b.call_count }} calls · {{ formatLatency(b.avg_duration_ms) }} avg</div>
                 <div>P95: {{ formatLatency(b.p95_duration_ms) }}</div>
@@ -214,14 +214,14 @@
       </div>
 
       <!-- Sortable Tool Performance Table -->
-      <div v-if="tools.length > 0" class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] overflow-hidden">
+      <div v-if="tools.length > 0" class="glass-panel rounded-xl overflow-hidden">
         <div class="px-5 py-3 border-b border-white/[0.04] flex items-center justify-between">
           <h3 class="text-sm font-semibold text-nanna-text">Tool Performance</h3>
           <input
             v-model="searchQuery"
             type="text"
             placeholder="Filter tools..."
-            class="px-3 py-1.5 rounded-lg text-sm bg-nanna-bg-elevated border border-white/[0.06] text-nanna-text placeholder-nanna-text-dim focus:outline-none focus:border-nanna-accent/40 w-48"
+            class="px-3 py-1.5 rounded-lg text-sm glass-well text-nanna-text placeholder-nanna-text-dim focus:outline-none focus:border-nanna-accent/40 w-48"
           />
         </div>
         <div class="overflow-x-auto">
@@ -308,7 +308,7 @@
                   </td>
                 </tr>
                 <!-- Expanded error detail row -->
-                <tr v-if="expandedTool === tool.name" class="bg-nanna-bg-elevated/30">
+                <tr v-if="expandedTool === tool.name" class="glass-well">
                   <td colspan="7" class="px-5 py-4">
                     <div class="space-y-4">
                       <!-- Error Summary -->
@@ -340,7 +340,7 @@
                           <div
                             v-for="([errorMsg, count], idx) in tool.top_errors"
                             :key="idx"
-                            class="flex items-start gap-3 text-xs bg-nanna-bg-deep/50 rounded-lg px-3 py-2"
+                            class="flex items-start gap-3 text-xs glass-well rounded-lg px-3 py-2"
                           >
                             <span class="text-nanna-error font-mono font-bold shrink-0">×{{ count }}</span>
                             <div class="flex-1 min-w-0">
@@ -348,7 +348,7 @@
                             </div>
                             <!-- Error percentage bar -->
                             <div class="shrink-0 w-16 flex items-center gap-1">
-                              <div class="flex-1 h-1.5 bg-nanna-bg-surface rounded-full overflow-hidden">
+                              <div class="flex-1 h-1.5 glass-well rounded-full overflow-hidden">
                                 <div
                                   class="h-full bg-nanna-error/60 rounded-full"
                                   :style="{ width: `${(count / tool.failure_count * 100).toFixed(0)}%` }"
@@ -372,7 +372,7 @@
                           <div
                             v-for="(entry, idx) in toolCallLog.filter(e => !e.success).slice(0, 10)"
                             :key="idx"
-                            class="flex items-start gap-3 text-[11px] bg-nanna-bg-deep/30 rounded px-3 py-1.5"
+                            class="flex items-start gap-3 text-[11px] glass-well rounded px-3 py-1.5"
                           >
                             <span class="text-nanna-text-dim font-mono shrink-0">{{ entry.created_at?.slice(5, 16) || '—' }}</span>
                             <span class="text-nanna-text-dim font-mono shrink-0">{{ formatLatency(entry.duration_ms) }}</span>
@@ -406,30 +406,30 @@
       </div>
 
       <!-- Session Totals -->
-      <div v-if="sessionTotals.total_iterations > 0" class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-5">
+      <div v-if="sessionTotals.total_iterations > 0" class="glass-panel rounded-xl p-5">
         <h3 class="text-sm font-semibold text-nanna-text mb-3">Session Aggregates</h3>
         <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Total Iterations</div>
             <div class="text-lg font-bold font-mono text-nanna-text">{{ sessionTotals.total_iterations.toLocaleString() }}</div>
           </div>
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Total Tool Calls</div>
             <div class="text-lg font-bold font-mono text-nanna-text">{{ sessionTotals.total_tool_calls.toLocaleString() }}</div>
           </div>
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Input Tokens</div>
             <div class="text-lg font-bold font-mono text-nanna-accent">{{ formatTokens(sessionTotals.total_input_tokens) }}</div>
           </div>
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Output Tokens</div>
             <div class="text-lg font-bold font-mono text-nanna-primary">{{ formatTokens(sessionTotals.total_output_tokens) }}</div>
           </div>
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Tool Time</div>
             <div class="text-lg font-bold font-mono text-nanna-text">{{ formatDuration(sessionTotals.total_tool_time_ms) }}</div>
           </div>
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">LLM Time</div>
             <div class="text-lg font-bold font-mono text-nanna-text">{{ formatDuration(sessionTotals.total_llm_time_ms) }}</div>
           </div>

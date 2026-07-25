@@ -834,7 +834,10 @@ async function hideToTray() {
   transform: translateY(-50%);
   margin-left: 8px;
   padding: 4px 10px;
-  background: #1a1a2e;
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
   color: #e2e8f0;
   font-size: 12px;
   white-space: nowrap;
@@ -955,9 +958,13 @@ async function hideToTray() {
   min-width: 168px;
   padding: 6px;
   border-radius: 10px;
-  background: rgba(15, 23, 42, 0.96);
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+    0 18px 48px -12px rgba(0, 0, 0, 0.55);
   z-index: 120;
   display: flex;
   flex-direction: column;

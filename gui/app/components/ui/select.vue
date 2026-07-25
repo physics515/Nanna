@@ -46,7 +46,7 @@ const emit = defineEmits<{
         :key="option.value"
         :value="option.value"
         :disabled="option.disabled"
-        class="bg-nanna-bg-surface text-nanna-text"
+        class="text-nanna-text"
       >
         {{ option.label }}
       </option>

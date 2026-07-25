@@ -94,7 +94,9 @@ function setLink() {
 
 .floating-toolbar {
   @apply flex items-center gap-0.5 p-1 rounded-lg;
-  background: rgba(15, 23, 42, 0.95);
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
   border: 1px solid rgba(71, 85, 105, 0.3);
   backdrop-filter: blur(12px);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);

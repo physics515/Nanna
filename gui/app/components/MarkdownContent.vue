@@ -105,7 +105,7 @@ function renderMarkdown(text: string): string {
 
 /* Ensure inline code still looks good */
 .markdown-content :deep(code) {
-  @apply px-1.5 py-0.5 rounded bg-nanna-bg-elevated text-nanna-secondary font-mono text-xs;
+  @apply px-1.5 py-0.5 rounded glass-tag text-nanna-secondary font-mono text-xs;
 }
 
 /* Don't apply inline styles to Monaco code */

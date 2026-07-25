@@ -97,9 +97,13 @@ const sizeClass = computed(() => ({
   padding: 1.5rem;
   transform: translate(-50%, -50%);
   border-radius: 0.75rem;
-  background: #1e293b;
-  border: 1px solid rgba(71, 85, 105, 0.3);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+    0 18px 48px -12px rgba(0, 0, 0, 0.55);
 }
 .modal-content[data-state="open"] {
   animation: modal-in 200ms ease-out forwards;

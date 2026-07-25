@@ -9,7 +9,7 @@
           'w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-colors',
           step >= s 
             ? 'bg-nanna-primary text-white' 
-            : 'bg-nanna-bg-elevated text-nanna-text-dim'
+            : 'glass-tag text-nanna-text-dim'
         ]"
       >
         {{ s }}
@@ -22,12 +22,12 @@
     <div v-if="step === 1" class="space-y-4">
       <h4 class="font-medium text-nanna-text">1. Create a Telegram Bot</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           Open Telegram and search for <strong class="text-nanna-accent">@BotFather</strong>
         </p>
         <ol class="text-sm text-nanna-text-muted space-y-2 list-decimal list-inside">
-          <li>Send <code class="bg-nanna-bg-deep px-1 rounded">/newbot</code> to BotFather</li>
+          <li>Send <code class="glass-tag px-1 rounded">/newbot</code> to BotFather</li>
           <li>Choose a name for your bot (e.g., "My Nanna")</li>
           <li>Choose a username ending in "bot" (e.g., "my_nanna_bot")</li>
           <li>BotFather will give you an API token</li>

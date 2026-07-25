@@ -21,7 +21,7 @@
           <UiSwitch :model-value="settings?.heartbeat_enabled" label="Heartbeat enabled" @update:model-value="setHeartbeatEnabled" />
         </div>
 
-        <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+        <div class="p-3 rounded-lg glass-panel">
           <div class="flex items-center justify-between mb-2">
             <span class="text-sm font-medium text-nanna-text">Heartbeat Interval</span>
             <span class="text-sm text-nanna-accent font-mono">{{ formatInterval(settings?.heartbeat_interval_seconds || 300) }}</span>
@@ -30,7 +30,7 @@
             type="range" min="60" max="1800" step="60"
             :value="settings?.heartbeat_interval_seconds || 300"
             @change="setHeartbeatInterval(Number(($event.target as HTMLInputElement).value))"
-            class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+            class="w-full h-2 glass-well rounded-lg appearance-none cursor-pointer accent-nanna-primary"
           >
           <div class="flex justify-between text-xs text-nanna-text-dim mt-1">
             <span>1 min</span>

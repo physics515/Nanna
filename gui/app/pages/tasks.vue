@@ -3,7 +3,7 @@
     <!-- Main: Task tree -->
     <main class="flex-1 flex flex-col min-w-0">
       <!-- Header -->
-      <header class="px-4 py-2 border-b border-white/[0.04] bg-nanna-bg-surface/80">
+      <header class="px-4 py-2 border-b border-white/[0.04]">
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-3">
             <div class="flex items-center gap-2">
@@ -41,7 +41,7 @@
       </header>
 
       <!-- Filter -->
-      <div class="px-4 py-2 border-b border-white/[0.04] bg-nanna-bg-surface/30 flex items-center gap-2">
+      <div class="px-4 py-2 border-b border-white/[0.04] flex items-center gap-2">
         <UiInput
           v-model="filterText"
           placeholder="Filter query (e.g. p1 & !done, @bug, overdue, search: parser)"
@@ -128,7 +128,7 @@
     </main>
 
     <!-- Right panel: details + run -->
-    <aside class="w-96 border-l border-white/[0.04] bg-nanna-bg-surface/80 flex flex-col min-h-0">
+    <aside class="w-96 border-l border-white/[0.04] flex flex-col min-h-0">
       <!-- Task details -->
       <section class="flex-1 overflow-y-auto border-b border-white/[0.04] min-h-0">
         <div v-if="!selectedTask" class="p-4 py-10 text-center text-sm text-nanna-text-muted">
@@ -184,7 +184,7 @@
             <!-- Acceptance criteria -->
             <div v-if="detailTask?.acceptance">
               <h4 class="text-xs font-semibold text-nanna-text mb-1">Acceptance</h4>
-              <pre class="p-2 bg-nanna-bg-elevated/50 rounded text-[11px] font-mono text-nanna-text-muted overflow-x-auto">{{ JSON.stringify(detailTask.acceptance, null, 2) }}</pre>
+              <pre class="p-2 glass-well rounded text-[11px] font-mono text-nanna-text-muted overflow-x-auto">{{ JSON.stringify(detailTask.acceptance, null, 2) }}</pre>
             </div>
 
             <!-- Notes -->
@@ -192,7 +192,7 @@
               <h4 class="text-xs font-semibold text-nanna-text mb-1">Notes</h4>
               <div v-if="taskNotes.length === 0" class="text-xs text-nanna-text-dim">No notes yet</div>
               <div v-else class="space-y-1.5">
-                <div v-for="(note, i) in taskNotes" :key="i" class="p-2 bg-nanna-bg-elevated/50 rounded text-xs text-nanna-text-muted">
+                <div v-for="(note, i) in taskNotes" :key="i" class="p-2 glass-well rounded text-xs text-nanna-text-muted">
                   <div class="whitespace-pre-wrap break-words">{{ entryText(note) }}</div>
                   <div v-if="entryTime(note)" class="text-[10px] text-nanna-text-dim mt-0.5">{{ entryTime(note) }}</div>
                 </div>
@@ -252,7 +252,7 @@
         </div>
 
         <!-- Final report -->
-        <div v-if="finalReport" class="p-3 rounded-lg bg-nanna-bg-elevated space-y-2">
+        <div v-if="finalReport" class="p-3 rounded-lg glass-well space-y-2">
           <div class="text-xs font-medium text-nanna-text-muted">Last Report</div>
           <div class="grid grid-cols-3 gap-2 text-center">
             <div>
@@ -281,7 +281,7 @@
         <!-- Live event feed -->
         <div>
           <div class="text-xs font-medium text-nanna-text-muted mb-1">Events</div>
-          <div ref="feedEl" class="h-40 overflow-y-auto p-2 bg-nanna-bg-elevated/50 rounded text-[11px] font-mono space-y-0.5">
+          <div ref="feedEl" class="h-40 overflow-y-auto p-2 glass-well rounded text-[11px] font-mono space-y-0.5">
             <div v-if="runFeed.length === 0" class="text-nanna-text-dim">No run events yet</div>
             <div v-for="(line, i) in runFeed" :key="i" class="text-nanna-text-muted break-words">
               <span class="text-nanna-text-dim">{{ line.ts }}</span> {{ line.text }}
@@ -305,7 +305,7 @@
         <div class="flex gap-3">
           <div class="flex-1">
             <label class="block text-xs font-medium text-nanna-text-muted mb-1">Priority</label>
-            <select v-model="newTask.priority" class="w-full px-3 py-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded-lg text-sm text-nanna-text">
+            <select v-model="newTask.priority" class="w-full px-3 py-2 glass-well rounded-lg text-sm text-nanna-text">
               <option value="1">p1 — urgent</option>
               <option value="2">p2 — high</option>
               <option value="3">p3 — normal</option>
@@ -314,7 +314,7 @@
           </div>
           <div class="flex-1 min-w-0">
             <label class="block text-xs font-medium text-nanna-text-muted mb-1">Parent (optional)</label>
-            <select v-model="newTask.parentId" class="w-full px-3 py-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded-lg text-sm text-nanna-text">
+            <select v-model="newTask.parentId" class="w-full px-3 py-2 glass-well rounded-lg text-sm text-nanna-text">
               <option value="">None (top-level)</option>
               <option v-for="t in openTasks" :key="t.id" :value="String(t.id)">#{{ t.id }} {{ t.title }}</option>
             </select>
@@ -324,7 +324,7 @@
           <label class="block text-xs font-medium text-nanna-text-muted mb-1">Acceptance criteria JSON (optional)</label>
           <textarea
             v-model="newTask.acceptance"
-            class="w-full h-20 p-2 bg-nanna-bg-elevated/30 border border-white/[0.06] rounded text-xs font-mono text-nanna-text resize-none"
+            class="w-full h-20 p-2 glass-well rounded text-xs font-mono text-nanna-text resize-none"
             placeholder='{ "kind": "command", "command": "cargo test" }  |  { "kind": "file_exists", "path": "out.txt" }'
           ></textarea>
         </div>

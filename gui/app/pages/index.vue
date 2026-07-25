@@ -32,7 +32,7 @@
           <!-- Live context-window usage (updates on every LLM request) -->
           <span
             v-if="contextWindow > 0"
-            class="flex items-center gap-1.5 text-xs font-mono rounded-full px-2 py-0.5 bg-nanna-bg-surface border border-white/[0.06]"
+            class="flex items-center gap-1.5 text-xs font-mono rounded-full px-2 py-0.5 glass-tag"
             :class="contextPct >= 90 ? 'text-red-400' : contextPct >= 70 ? 'text-amber-400' : 'text-nanna-text-muted'"
             :title="`Context window: ${contextUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens in use`"
           >
@@ -47,7 +47,7 @@
           <!-- Daemon-level queue depth (messages from other channels waiting) -->
           <span
             v-if="daemonQueueCount > 0"
-            class="flex items-center gap-1 text-xs text-nanna-text-muted bg-nanna-bg-surface border border-white/[0.06] rounded-full px-2 py-0.5"
+            class="flex items-center gap-1 text-xs text-nanna-text-muted glass-tag rounded-full px-2 py-0.5"
             :title="`${daemonQueueCount} message${daemonQueueCount > 1 ? 's' : ''} queued at daemon`"
           >
             <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1112,7 +1112,10 @@ function scrollToBottom(force = false) {
   width: 34px;
   height: 4px;
   border-radius: 2px;
-  background: rgba(148, 163, 184, 0.15);
+  /* Recessed glass track — matches the glass-well tier at meter scale. */
+  background: rgba(2, 6, 23, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.25);
   overflow: hidden;
 }
 .ctx-meter-fill {
