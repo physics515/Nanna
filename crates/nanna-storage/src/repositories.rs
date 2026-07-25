@@ -622,7 +622,22 @@ impl MemoryRepository {
         Ok(result > 0)
     }
 
-    /// Delete multiple memories by their memory_ids.
+    /// Delete multiple memories by their `memory_id`s, destroying their embeddings
+    /// on disk (see [`Self::delete`] for why a plain `DELETE` leaks them).
+    ///
+    /// Each row is overwritten with `zeroblob`s and deleted, then the WAL is
+    /// checkpoint-truncated **once** for the whole batch — the stale pre-overwrite
+    /// frames of every removed row are discarded together, which is both correct
+    /// (no ghost survives) and far cheaper than one checkpoint per row (the batch
+    /// path a dream cycle takes when it folds duplicates).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if any overwrite or delete statement fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any id in `ids` is empty (a programmer error).
     pub async fn bulk_delete(&self, ids: &[&str]) -> Result<u64, StorageError> {
         if ids.is_empty() {
             return Ok(0);
@@ -630,11 +645,14 @@ impl MemoryRepository {
         let conn = self.conn.lock().await;
         let mut deleted = 0u64;
         for id in ids {
+            assert!(!id.is_empty(), "memory_id must not be empty");
+            Self::overwrite_sensitive_columns(&conn, id).await?;
             // Delete tags first
             conn.execute(
                 "DELETE FROM memory_tags WHERE memory_id = ?1",
                 turso::params![*id],
-            ).await?;
+            )
+            .await?;
             let n = conn
                 .execute(
                     "DELETE FROM memories WHERE memory_id = ?1",
@@ -643,11 +661,78 @@ impl MemoryRepository {
                 .await?;
             deleted += n as u64;
         }
+        // One checkpoint for the whole batch (not per row).
+        Self::checkpoint_truncate(&conn).await;
+        debug_assert!(
+            deleted <= ids.len() as u64,
+            "cannot delete more rows than ids given"
+        );
         Ok(deleted)
     }
 
+    /// Overwrite a memory row's sensitive columns (`embedding`/`content`/`metadata`)
+    /// with **same-length** `zeroblob`s so the record byte-size is unchanged and the
+    /// newest WAL frame for its page carries zeros rather than the plaintext/vector.
+    /// The caller is responsible for the subsequent `DELETE` and a WAL checkpoint.
+    async fn overwrite_sensitive_columns(
+        conn: &Connection,
+        memory_id: &str,
+    ) -> Result<(), StorageError> {
+        // `octet_length` gives the exact stored byte count; nullable columns
+        // COALESCE to 0 (a NULL column has no ghost to clear).
+        conn.execute(
+            "UPDATE memories SET \
+                 embedding = zeroblob(COALESCE(octet_length(embedding), 0)), \
+                 content = zeroblob(octet_length(content)), \
+                 metadata = zeroblob(COALESCE(octet_length(metadata), 0)) \
+             WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a memory, destroying its embedding on disk rather than leaking it.
+    ///
+    /// A plain `DELETE` only unlinks the row — Turso (like SQLite) does **not**
+    /// zero freed pages, has no `secure_delete` pragma and no `VACUUM`, and in
+    /// 0.6.1 keeps *all* committed data in the WAL (it does not checkpoint on
+    /// close). So the deleted memory's embedding `f32` BLOB survives verbatim in
+    /// the `-wal` file, and an embedding is invertible back to its source text by
+    /// a Vec2Text-class model ("Ghost Vectors", arXiv 2606.18497) — a real
+    /// exposure for a local-first product whose whole database sits in the user's
+    /// filesystem and gets backed up.
+    ///
+    /// Two steps close it, both verified end to end in
+    /// `crates/nanna-storage/tests/secure_delete.rs`:
+    /// 1. Overwrite `embedding`/`content`/`metadata` with **same-length**
+    ///    `zeroblob`s (keeps the record byte-size identical), so the newest WAL
+    ///    frame for the row's page carries zeros, not the plaintext/vector.
+    /// 2. `PRAGMA wal_checkpoint(TRUNCATE)` — collapse the WAL into the main file
+    ///    (the latest, zeroed page image wins) **and truncate it to zero**,
+    ///    discarding the stale pre-overwrite frame that still held the original
+    ///    embedding. Without the truncate, the zeroed frame merely sits *behind*
+    ///    the original in the same growing WAL and both remain on disk.
+    ///
+    /// The checkpoint is best-effort: a concurrent reader can make it report
+    /// `busy`, in which case the stale frame lingers until a later checkpoint
+    /// succeeds — the row is already deleted and overwritten regardless.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the overwrite or delete statements fail. A
+    /// failed WAL checkpoint is logged, not returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `memory_id` is empty (a programmer error — every stored memory
+    /// has a non-empty id).
     pub async fn delete(&self, memory_id: &str) -> Result<bool, StorageError> {
+        assert!(!memory_id.is_empty(), "memory_id must not be empty");
         let conn = self.conn.lock().await;
+
+        // Step 1: overwrite the sensitive columns so the newest page frame is zeros.
+        Self::overwrite_sensitive_columns(&conn, memory_id).await?;
 
         // Delete tags first
         conn.execute(
@@ -664,7 +749,42 @@ impl MemoryRepository {
             )
             .await?;
 
+        debug_assert!(result <= 1, "memory_id is unique, at most one row deleted");
+
+        // Step 2: collapse + truncate the WAL so the pre-overwrite frame is gone.
+        Self::checkpoint_truncate(&conn).await;
+
         Ok(result > 0)
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on `conn`, draining its status row.
+    ///
+    /// Best-effort by contract: logs and returns on any error or a `busy` result
+    /// rather than propagating — the caller's row mutation has already committed,
+    /// and a failed checkpoint only delays reclaiming the stale WAL frame.
+    async fn checkpoint_truncate(conn: &Connection) {
+        // A pragma that returns rows must go through `query`, not `execute`
+        // (`execute` errors with "unexpected row during execution"). Leaving the
+        // `Rows` cursor open on the shared connection would silently swallow the
+        // next write, so it is drained and dropped before returning.
+        match conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
+            Ok(mut rows) => {
+                let busy = match rows.next().await {
+                    Ok(Some(row)) => row.get_value(0).ok().and_then(|v| match v {
+                        turso::Value::Integer(i) => Some(i),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                drop(rows);
+                if busy == Some(1) {
+                    tracing::warn!(
+                        "secure delete: WAL checkpoint reported busy; stale frame will clear on a later checkpoint"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("secure delete: WAL checkpoint failed: {e}"),
+        }
     }
 }
 

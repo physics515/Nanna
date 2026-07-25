@@ -1596,6 +1596,30 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             the raw vector back. 3/3 green, clippy clean. The remaining work is the measurement, not the
             feasibility. The corresponding false claim in the `daily-dev` Appendix C is fixed in the same
             commit.
+      - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
+            "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
+            control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
+            f32 BLOB recoverable — and the diagnosis went deeper than the SQLite folklore: **turso 0.6.1 has no
+            `secure_delete` pragma and no `VACUUM` (its `auto_vacuum` is a documented no-op), and it keeps
+            *all* committed data in the `-wal` file (main `.db` stayed at one 4096-byte header page after an
+            insert+close; it does not checkpoint on close).** So the embedding lived verbatim in the WAL, and a
+            plain overwrite alone failed — the zeroed frame merely sits *behind* the original in the same
+            growing WAL. Two steps close it: (1) overwrite `embedding`/`content`/`metadata` with **same-length
+            `zeroblob`s** (`octet_length` → identical record size → the newest page frame carries zeros);
+            (2) `PRAGMA wal_checkpoint(TRUNCATE)` — the one mode that both collapses the WAL into the main file
+            (latest zeroed page wins) **and truncates the WAL to 0**, discarding the stale pre-overwrite frame
+            (empirically: `FULL`/`RESTART`/passive do **not** truncate; `TRUNCATE` took the WAL 2.6 MB → 0).
+            `bulk_delete` checkpoints **once** for the whole batch (the dream-cycle fold path), not per row.
+            Best-effort by contract: a `busy` checkpoint (concurrent reader) leaves the stale frame for a later
+            one; the row is already deleted + overwritten. 4 tests in `crates/nanna-storage/tests/secure_delete.rs`
+            (single-delete embedding absent-after / present-before; bulk 3-embedding; in-memory graceful; raw
+            control present-after). 72 nanna-storage + 86 nanna-memory + nanna-daemon tests green; new code
+            clippy-clean. Still open: **(i)** the WAL never auto-checkpointing means it grows unbounded until an
+            explicit checkpoint — a separate durability/footprint concern worth a periodic-checkpoint task;
+            **(ii)** the stronger backup/epoch threat (a `-wal` copied *before* the truncate, or the `busy`
+            path) still wants the paper's **epoch key rotation** (encrypt vectors, discard key on delete);
+            **(iii)** the HNSW-tombstone constraint below still stands for when an ANN index lands; **(iv)** wire
+            this into the P0.2 `PRIVACY.md` "how to delete your data" claim.
       - [ ] *(research 2026-07-24)* **Deleting a memory must actually destroy its embedding — "Ghost Vectors"
             (arXiv [2606.18497](https://arxiv.org/abs/2606.18497)).** Embeddings soft-deleted/tombstoned in an
             HNSW store stay **physically present in the raw index files** and are invertible back to their
