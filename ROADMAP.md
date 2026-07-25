@@ -240,7 +240,19 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [ ] Plain-language intro screen explaining what Nanna is.
 - [ ] Data storage location selection.
 - [ ] Backend chooser: Anthropic / OpenAI / OpenRouter / Ollama — with clear "native local model coming soon" if not implemented.
-- [ ] API key entry with validation; fix has_api_key to check all provider keys, not only Anthropic.
+- [ ] API key entry with validation; ~~fix has_api_key to check all provider keys, not only Anthropic~~
+      **(the provider check is fixed, 2026-07-25)**: the GUI `get_config` command's `api_key_set` looked
+      only at `config.llm.api_key` (the Anthropic slot) + the `ANTHROPIC_API_KEY` env var, so a user with
+      only an OpenAI/OpenRouter/GitHub-Models key, or Anthropic OAuth, was wrongly told they had no key and
+      re-nagged in onboarding. Added a pure, unit-tested `LlmConfig::has_configured_api_key()` in
+      `nanna-config` (checks `api_key` / `anthropic_oauth_token` / `openai_api_key` / `openrouter_api_key`
+      / `github_token`, treating blank/whitespace as unset; Ollama excluded on purpose — it is keyless and
+      handled by the onboarding's separate `needsKey`), and the command now ORs it with the env vars for all
+      four providers. 3 config tests (none→false, each provider alone→true, blank/empty→false); 20
+      nanna-config tests green. *Remaining on this line: the "entry with validation" (live key check) part,
+      and the nanna-gui compile of the 4-line command wiring was not run this pass (a fresh worktree needs
+      the sidecar + built frontend before `nanna-gui` compiles — the fixed logic itself is in the
+      unit-tested `nanna-config` helper).*
 - [ ] Ollama detection (is server running? is a model pulled?).
 - [ ] Memory/privacy explanation with opt-in toggle for auto-remembering.
 - [ ] Tool permission setup: ask before enabling shell/browser/file-write.

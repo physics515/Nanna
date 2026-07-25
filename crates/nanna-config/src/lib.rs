@@ -170,6 +170,27 @@ impl LlmConfig {
     }
 }
 
+impl LlmConfig {
+    /// Whether **any** LLM API credential is configured, across every provider —
+    /// not just Anthropic.
+    ///
+    /// Onboarding uses this to decide whether to prompt for a key. The old check
+    /// looked only at `api_key` (the Anthropic slot), so a user who had entered an
+    /// OpenAI / OpenRouter / GitHub-Models key, or was using Anthropic OAuth, was
+    /// wrongly told they had no key. Ollama is intentionally excluded here: it is a
+    /// keyless local backend, so "needs a key at all" is a separate question the
+    /// onboarding tracks with `needsKey`.
+    #[must_use]
+    pub fn has_configured_api_key(&self) -> bool {
+        let has = |k: &Option<String>| k.as_deref().is_some_and(|s| !s.trim().is_empty());
+        has(&self.api_key)
+            || has(&self.anthropic_oauth_token)
+            || has(&self.openai_api_key)
+            || has(&self.openrouter_api_key)
+            || has(&self.github_token)
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -744,6 +765,48 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Any-provider API key detection (onboarding gate)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn no_credentials_means_no_api_key() {
+        assert!(!LlmConfig::default().has_configured_api_key());
+    }
+
+    #[test]
+    fn each_provider_key_counts_on_its_own() {
+        for set in [
+            |c: &mut LlmConfig| c.api_key = Some("k".into()),
+            |c: &mut LlmConfig| c.anthropic_oauth_token = Some("k".into()),
+            |c: &mut LlmConfig| c.openai_api_key = Some("k".into()),
+            |c: &mut LlmConfig| c.openrouter_api_key = Some("k".into()),
+            |c: &mut LlmConfig| c.github_token = Some("k".into()),
+        ] {
+            let mut llm = LlmConfig::default();
+            set(&mut llm);
+            assert!(
+                llm.has_configured_api_key(),
+                "a single provider credential must satisfy the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_or_whitespace_key_does_not_count() {
+        let mut llm = LlmConfig::default();
+        llm.openai_api_key = Some("   ".into());
+        assert!(
+            !llm.has_configured_api_key(),
+            "a whitespace-only key is not a real credential"
+        );
+        llm.openai_api_key = Some(String::new());
+        assert!(
+            !llm.has_configured_api_key(),
+            "an empty key is not a credential"
+        );
+    }
 
     // -----------------------------------------------------------------
     // Sub-agent model fallback chain
