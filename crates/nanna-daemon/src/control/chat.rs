@@ -186,24 +186,15 @@ impl ControlPlane {
                         .run_chat_turn(&session_id, &content, system_prompt.clone(), workspace_root)
                         .await
                     {
-                        Ok(Some(outcome)) => {
-                            self.sessions
-                                .add_message(&session_id, MessageRole::Assistant, &outcome.content)
-                                .await;
+                        // The run proceeds in a spawned task; ACK immediately
+                        // so the IPC request never outlives the client's
+                        // patience — a run can last hours, and the transcript
+                        // is driven by events, not by this response.
+                        Ok(Some(message_id)) => {
                             return json!({
-                                "status": "success",
-                                "message_id": outcome.message_id,
-                                "content": outcome.content,
-                                "usage": {
-                                    "input_tokens": outcome.input_tokens,
-                                    "output_tokens": outcome.output_tokens,
-                                },
-                                "run": {
-                                    "steps_taken": outcome.steps_taken,
-                                    "items_completed": outcome.items_completed,
-                                    "interjected_items": outcome.interjected_items,
-                                    "stop": outcome.stop,
-                                },
+                                "status": "started",
+                                "message_id": message_id,
+                                "content": "",
                             });
                         }
                         // The message joined the run already in flight.

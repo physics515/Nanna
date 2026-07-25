@@ -2399,12 +2399,30 @@ skill.
       `[agent] long_horizon_chat` defaults **true**; false restores the single-shot path as a rollback for
       a bad provider day, not as a second supported mode.
 
-**Open:** planner quality on the reference 9B tier is unmeasured (does it over-decompose small talk?);
-the interjection path has no live end-to-end test (unit-tested at the store and harness layers only);
-`PENDING_MESSAGES_MAX` overflow drops the oldest silently — it should announce itself per the
-summaries-must-announce-themselves rule; the chat turn awaits the whole run, so a genuinely long plan
-holds the IPC request open (the GUI renders live via events, but the request/response contract wants
-revisiting for multi-hour runs).
+**Live GUI drive (2026-07-24, gemma4:12b):** planner does NOT over-decompose — "what is 2+2?" planned
+as 1 task (origin=Model); an 817-char project brief hit the 30s planner timeout while the model was
+busy and the fallback single-task plan carried the turn exactly as designed. The run healed a CUDA
+crash and six Ollama stream drops via the retry ladder and built real files. The drive exposed four
+gaps, all fixed same-day:
+- [x] **Fire-and-forget send** — awaiting the whole run outlived the GUI IPC client's grace period
+      ("Received response for unknown request"). `run_chat_turn` now ACKs `status:started` immediately
+      and drives the run in a spawned task; events carry everything.
+- [x] **Run registration** (`AgentService::register_external_run`) — the harness path bypassed
+      `active_chats`, so navigating away and back lost all streamed tool calls (`get_run_state` found
+      nothing) and Stop could not cancel (`cancel: None`). The run now registers shared buffers, the
+      `ChatSink` fills them (text, thinking, tool start/end, run-scoped timeline journal), and the
+      cancellation flag feeds `run_with_interjector` — Stop lands at the next step boundary.
+- [x] **Durable history** — the persisted assistant message was only the summary line; the full
+      timeline journal is now persisted via `add_full_message`, so a run's work survives restart.
+- [x] **GUI send-through** — the client-side message queue held mid-run messages until the run ended,
+      making interjection unreachable from the UI; mid-run sends now go straight to the daemon (with
+      the old local queue as transport-error fallback). `ThinkingDelta` is also wired for harness steps.
+
+**Open:** interjection still has no live end-to-end pass (the machinery is now reachable; needs a
+mid-run send observed landing at a boundary); `PENDING_MESSAGES_MAX` overflow drops the oldest
+silently — it should announce itself per the summaries-must-announce-themselves rule; internal markers
+(`TASK COMPLETE`, thinking-spiral nudges) leak into the visible transcript and should be filtered at
+the sink; Stop is boundary-granular — an in-flight step runs to completion before the run stops.
 
 ---
 

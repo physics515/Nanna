@@ -106,7 +106,26 @@ impl DaemonManager {
                 format!("Failed to create sidecar command: {}", e)
             })?;
         
-        let args = ["--port", &self.config.port.to_string(), "--host", &self.config.host, "run"];
+        // A dev build must never share the installed app's store: the daemon
+        // takes an exclusive lock on nanna.db and runs migrations at startup,
+        // so two builds pointed at one file is unsupported and unsafe.
+        // NANNA_DEV_DATA_DIR isolates a dev run; unset in production, where
+        // the daemon resolves its own default data dir as before.
+        let port = self.config.port.to_string();
+        let mut args: Vec<String> = vec![
+            "--port".into(),
+            port,
+            "--host".into(),
+            self.config.host.clone(),
+        ];
+        if let Ok(dev_data_dir) = std::env::var("NANNA_DEV_DATA_DIR") {
+            if !dev_data_dir.trim().is_empty() {
+                info!("NANNA_DEV_DATA_DIR set — isolating daemon store at {dev_data_dir}");
+                args.push("--data-dir".into());
+                args.push(dev_data_dir);
+            }
+        }
+        args.push("run".into());
         info!("Spawning daemon with args: {:?}", args);
         let (mut rx, child) = sidecar
             .args(args)

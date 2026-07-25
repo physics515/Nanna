@@ -798,11 +798,18 @@ pub struct AgentStepRunner {
 /// Streams a harness step into a chat session using the *existing* chat event
 /// contract (`MessageDelta` / `ToolStart` / `ToolEnd`), so a long-horizon run
 /// renders in the transcript with no protocol change on the GUI side.
+///
+/// When `run` is set (chat-backed runs), every callback ALSO fills the
+/// registered [`crate::agent_service::ExternalRunHandle`] buffers, which is
+/// what makes navigation recovery (`get_run_state`), Stop, and end-of-run
+/// timeline persistence work — events alone vanish the moment the page
+/// unmounts.
 #[derive(Clone)]
 pub struct ChatSink {
     pub session_id: String,
     pub message_id: String,
     pub event_tx: tokio::sync::broadcast::Sender<Event>,
+    pub run: Option<crate::agent_service::ExternalRunHandle>,
 }
 
 impl ChatSink {
@@ -815,6 +822,125 @@ impl ChatSink {
             message_id: self.message_id.clone(),
             delta: text.to_string(),
         });
+        if let Some(run) = &self.run {
+            // try_write mirrors the in-service path: a snapshot clone briefly
+            // holding the lock must not block the stream thread.
+            if let Ok(mut acc) = run.accumulated_text.try_write() {
+                acc.push_str(text);
+            }
+            // The journal lock is std::sync and infallible by design (see
+            // ActiveChat::timeline) — merge into the trailing Text item so a
+            // token stream stays one item, not thousands.
+            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            if let Some(crate::session::TimelineItem::Text { content, .. }) = journal.last_mut() {
+                content.push_str(text);
+            } else {
+                journal.push(crate::session::TimelineItem::Text {
+                    content: text.to_string(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    fn thinking(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let _ = self.event_tx.send(Event::ThinkingDelta {
+            session_id: self.session_id.clone(),
+            delta: text.to_string(),
+        });
+        if let Some(run) = &self.run {
+            if let Ok(mut acc) = run.accumulated_thinking.try_write() {
+                acc.push_str(text);
+            }
+            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            if let Some(crate::session::TimelineItem::Thinking { content, .. }) = journal.last_mut()
+            {
+                content.push_str(text);
+            } else {
+                journal.push(crate::session::TimelineItem::Thinking {
+                    content: text.to_string(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    fn tool_start(&self, call_id: &str, name: &str, input: &Value, model: Option<&str>) {
+        let _ = self.event_tx.send(Event::ToolStart {
+            session_id: self.session_id.clone(),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
+            model: model.map(String::from),
+            tokens: None,
+            total_tokens: None,
+        });
+        if let Some(run) = &self.run {
+            if let Ok(mut active) = run.active_tool_calls.try_write() {
+                active.push(crate::agent_service::ActiveToolCallInfo {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    started_at: chrono::Utc::now(),
+                });
+            }
+            run.timeline
+                .lock()
+                .expect("timeline lock poisoned")
+                .push(crate::session::TimelineItem::Tool {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    input: Some(input.clone()),
+                    output: None,
+                    success: None,
+                    duration_ms: None,
+                    tokens: None,
+                    total_tokens: None,
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+        }
+    }
+
+    fn tool_end(&self, call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64) {
+        let _ = self.event_tx.send(Event::ToolEnd {
+            session_id: self.session_id.clone(),
+            call_id: call_id.to_string(),
+            output: output.to_string(),
+            success,
+            duration_ms,
+            data: None,
+        });
+        if let Some(run) = &self.run {
+            if let Ok(mut active) = run.active_tool_calls.try_write() {
+                active.retain(|t| t.call_id != call_id);
+            }
+            if let Ok(mut done) = run.completed_tool_calls.try_write() {
+                done.push(crate::agent_service::CompletedToolCallInfo {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    output: output.to_string(),
+                    success,
+                    duration_ms,
+                });
+            }
+            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            if let Some(crate::session::TimelineItem::Tool {
+                output: slot_output,
+                success: slot_success,
+                duration_ms: slot_duration,
+                ..
+            }) = journal
+                .iter_mut()
+                .rev()
+                .find(|item| matches!(item, crate::session::TimelineItem::Tool { call_id: id, .. } if id == call_id))
+            {
+                *slot_output = Some(output.to_string());
+                *slot_success = Some(success);
+                *slot_duration = Some(duration_ms);
+            }
+        }
     }
 
     /// Announce which item the run is starting, so the transcript reads as
@@ -992,50 +1118,35 @@ impl AgentStepRunner {
             active.push("todo".to_string());
         }
 
-        // Show the work as it happens: the step's text streams straight into
-        // the session transcript through the same events a plain chat turn
-        // uses. Tool activity rides the same contract.
-        // Show the work as it happens: the step's text streams straight into
-        // the session transcript through the same events a plain chat turn
-        // uses. Tool activity rides the same contract.
-        let (on_text, on_tool_start, on_tool_end) = match &self.chat_sink {
-            None => (None, None, None),
+        // Show the work as it happens: the step's text, thinking, and tool
+        // activity stream through the same events a plain chat turn uses,
+        // and fill the registered run buffers for recovery/persistence.
+        let (on_text, on_thinking, on_tool_start, on_tool_end) = match &self.chat_sink {
+            None => (None, None, None, None),
             Some(sink) => {
                 let text_sink = sink.clone();
+                let think_sink = sink.clone();
                 let start_sink = sink.clone();
                 let end_sink = sink.clone();
                 (
                     Some(Box::new(move |chunk: &str| text_sink.delta(chunk))
                         as Box<dyn Fn(&str) + Send + Sync>),
+                    Some(Box::new(move |chunk: &str| think_sink.thinking(chunk))
+                        as Box<dyn Fn(&str) + Send + Sync>),
                     Some(Box::new(
                         move |call_id: &str, name: &str, input: &Value, model: Option<&str>| {
-                            let _ = start_sink.event_tx.send(Event::ToolStart {
-                                session_id: start_sink.session_id.clone(),
-                                call_id: call_id.to_string(),
-                                name: name.to_string(),
-                                input: input.clone(),
-                                model: model.map(String::from),
-                                tokens: None,
-                                total_tokens: None,
-                            });
+                            start_sink.tool_start(call_id, name, input, model);
                         },
                     )
                         as Box<dyn Fn(&str, &str, &Value, Option<&str>) + Send + Sync>),
                     Some(Box::new(
                         move |call_id: &str,
-                              _name: &str,
+                              name: &str,
                               output: &str,
                               success: bool,
                               duration_ms: u64,
-                              data: Option<&Value>| {
-                            let _ = end_sink.event_tx.send(Event::ToolEnd {
-                                session_id: end_sink.session_id.clone(),
-                                call_id: call_id.to_string(),
-                                output: output.to_string(),
-                                success,
-                                duration_ms,
-                                data: data.cloned(),
-                            });
+                              _data: Option<&Value>| {
+                            end_sink.tool_end(call_id, name, output, success, duration_ms);
                         },
                     )
                         as Box<
@@ -1053,6 +1164,7 @@ impl AgentStepRunner {
             initial_active_tools: active,
             is_sub_agent: true,
             on_text,
+            on_thinking,
             on_tool_start,
             on_tool_end,
             ..Default::default()

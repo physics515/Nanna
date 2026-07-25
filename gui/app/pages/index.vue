@@ -952,9 +952,31 @@ async function sendMessage() {
   lastUserMessage.value = userMessage
   connectionError.value = null
 
-  // If already working, queue the message
+  // Mid-run message: send it THROUGH (P19 interjection). The daemon admits
+  // it into the live run at the next step boundary — holding it client-side
+  // would make the user wait out a possibly hours-long run instead.
   if (hasActiveWork.value) {
-    queueMessage(userMessage)
+    messages.value.push({
+      id: Date.now().toString(),
+      role: 'user',
+      content: userMessage,
+      timestamp: new Date().toISOString(),
+    })
+    userScrolledUp.value = false
+    await nextTick()
+    scrollToBottom(true)
+    try {
+      await invoke('send_message', {
+        sessionId: currentSession.value!.id,
+        message: userMessage,
+        attachments: imageAttachments,
+      })
+    } catch (error) {
+      // The daemon queues it in PendingMessages either way; a transport
+      // error here falls back to the old client-side queue so nothing is lost.
+      console.error('Interjection send failed, falling back to local queue:', error)
+      queueMessage(userMessage)
+    }
     return
   }
 
