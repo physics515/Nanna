@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -169,8 +169,10 @@ fn verify_discord_signature(
     let mut message = timestamp.as_bytes().to_vec();
     message.extend_from_slice(body);
 
-    // Verify
-    verifying_key.verify(&message, &signature).is_ok()
+    // `verify_strict` (not `verify`) rejects malleable / non-canonical signatures
+    // and small-order public keys — matches the daemon's verifier so the two
+    // copies can't drift on strictness.
+    verifying_key.verify_strict(&message, &signature).is_ok()
 }
 
 /// Handle Discord interaction webhook
@@ -283,4 +285,59 @@ pub async fn handle(
             flags: Some(64), // Ephemeral
         }),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Sign `timestamp || body` with `key`, returning (pubkey_hex, signature_hex).
+    fn sign(key: &SigningKey, timestamp: &str, body: &[u8]) -> (String, String) {
+        let mut message = timestamp.as_bytes().to_vec();
+        message.extend_from_slice(body);
+        let sig = key.sign(&message);
+        (
+            hex::encode(key.verifying_key().to_bytes()),
+            hex::encode(sig.to_bytes()),
+        )
+    }
+
+    #[test]
+    fn accepts_a_valid_signature() {
+        let key = signing_key(42);
+        let (pubkey, sig) = sign(&key, "1700000000", b"{\"type\":1}");
+        assert!(verify_discord_signature(&pubkey, &sig, "1700000000", b"{\"type\":1}"));
+    }
+
+    #[test]
+    fn rejects_a_tampered_body() {
+        let key = signing_key(42);
+        let (pubkey, sig) = sign(&key, "1700000000", b"original");
+        assert!(!verify_discord_signature(&pubkey, &sig, "1700000000", b"tampered"));
+    }
+
+    #[test]
+    fn rejects_a_wrong_public_key() {
+        let key = signing_key(42);
+        let (_pubkey, sig) = sign(&key, "1700000000", b"{}");
+        let wrong_pub = hex::encode(signing_key(7).verifying_key().to_bytes());
+        assert!(!verify_discord_signature(&wrong_pub, &sig, "1700000000", b"{}"));
+    }
+
+    #[test]
+    fn rejects_malformed_hex_inputs() {
+        let malformed = verify_discord_signature("nothex", "nothex", "1700000000", b"{}");
+        assert!(!malformed);
+        // A valid-length-but-wrong signature over the right key must also fail.
+        let key = signing_key(42);
+        let (pubkey, _sig) = sign(&key, "1700000000", b"{}");
+        let bad_sig = hex::encode([0u8; 64]);
+        let wrong = verify_discord_signature(&pubkey, &bad_sig, "1700000000", b"{}");
+        assert!(!wrong);
+    }
 }

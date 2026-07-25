@@ -512,9 +512,16 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             primitive. Rewrote it to `mac.update(body)` (raw bytes) + `mac.verify_slice(&hex::decode(v0…))`,
             matching the daemon. Added the first tests for this function (6): valid accepts, tampered body
             rejects, stale timestamp rejects, wrong secret rejects, **non-UTF-8 body verifies correctly**
-            (the regression guard), and missing-`v0=`/empty-input rejects. nanna-server green. *(Still open
-            on this line: the Telegram secret / WhatsApp / Signal paths, and folding the duplicated Slack/
-            Discord verifiers so daemon and server can't drift again.)*
+            (the regression guard), and missing-`v0=`/empty-input rejects. nanna-server green.
+      - [x] *(2026-07-25)* **`nanna-server` Discord Ed25519 verify aligned to the daemon's `verify_strict`.**
+            The server copy used `verifying_key.verify(..)`; the daemon uses `verify_strict`, which rejects
+            **malleable / non-canonical signatures and small-order keys**. Switched to `verify_strict` (and
+            dropped the now-unused `Verifier` trait import) so the two verifiers can't drift on strictness,
+            and added the first tests for it (4): valid accepts, tampered body rejects, wrong public key
+            rejects, malformed-hex + all-zero-signature reject. *(Still open on this line: the Telegram
+            secret / WhatsApp / Signal paths, and **folding the duplicated Slack/Discord verifiers** into one
+            shared implementation so daemon and server can't drift again — this run fixed the drift twice,
+            which is the argument for de-duplicating.)*
 - [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
       *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
