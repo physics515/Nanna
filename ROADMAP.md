@@ -352,6 +352,16 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       under `nanna/file-store-key`, so the bulk payload is GCM and the key is OS-protected. Legacy
       plaintext `credentials.json` is migrated on first unlock (read → write enc → delete).
       Tests: round-trip, migrate-from-legacy, isolated-dir.
+      *(2026-07-25, hardening)* **Closed a silent nonce-reuse hole + removed the deprecated nonce API.**
+      `random_nonce` ignored `getrandom`'s error (`let _ = getrandom::fill(..)`), so an OS-RNG failure
+      left the nonce **all-zeros** — and since every `encrypt_credentials` call reuses the file key, a
+      zero nonce means *guaranteed* AES-GCM nonce reuse (catastrophic: breaks confidentiality and lets an
+      attacker forge authentication). It now **fails closed** — returns `CredentialError::Crypto` on RNG
+      failure (a nonce, unlike the key, has no safe weak fallback; uniqueness is its whole contract).
+      Also migrated both `Nonce::from_slice` sites (deprecated in the current `aes-gcm`, and panicking on a
+      wrong length) to fallible `Nonce::try_from`. 2 new tests (nonce is non-zero + unique across calls;
+      encrypting the same plaintext+key twice yields **different** envelopes yet both decrypt back — an
+      observable proof the nonce is fresh each call), 22 nanna-config tests green, no deprecation warnings.
 - [x] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
       *(2026-07-24)* **Unified on `com` / `nanna` / `nanna`.** New `nanna_config::{APP_QUALIFIER,
       APP_ORGANIZATION, APP_NAME, project_dirs, legacy_clawd_project_dirs}` is the single identity.
