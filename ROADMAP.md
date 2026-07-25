@@ -279,7 +279,12 @@ benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out
 - [x] Fix Cargo.toml repository URL from clawdbot/nanna to physics515/Nanna.
       *(2026-07-23)* Fixed in both the root package and `[workspace.package]`.
 - [ ] Add GitHub repo description and topics.
-- [ ] Unify port documentation (README says 5149; CLI defaults to 9999) — pick one, update both code and docs.
+- [x] ~~Unify port documentation (README says 5149; CLI defaults to 9999)~~ **(already resolved; verified
+      2026-07-25)**: there is now a single source of truth — `nanna_daemon::DEFAULT_IPC_PORT = 5149`
+      (`crates/nanna-daemon/src/ipc.rs`), and every CLI entry point (`src/main.rs` start/status/stop,
+      `src/commands/daemon.rs`, `nanna-daemon/src/main.rs`) takes it via `default_value_t`, matching the
+      README (`5149` IPC / `5148` health). The remaining `9999` occurrences in the tree are unrelated (an
+      acceptance-check timeout in `harness.rs`, test-fixture row ids) — not a port default anywhere.
 
 #### P0.3 - Stronger Public Release (can follow 0.1)
 - [ ] Local Ollama setup assistant in GUI.
