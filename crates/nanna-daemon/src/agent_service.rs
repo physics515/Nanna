@@ -287,6 +287,20 @@ pub struct CompletedToolCallInfo {
     pub duration_ms: u64,
 }
 
+/// Shared buffers for a run registered via
+/// [`AgentService::register_external_run`] — the P19 harness chat path fills
+/// these as it streams, so navigation recovery, Stop, and timeline
+/// persistence work identically to the in-service chat path.
+#[derive(Clone)]
+pub struct ExternalRunHandle {
+    pub cancellation_flag: Arc<AtomicBool>,
+    pub accumulated_text: Arc<tokio::sync::RwLock<String>>,
+    pub accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
+    pub active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
+    pub completed_tool_calls: Arc<tokio::sync::RwLock<Vec<CompletedToolCallInfo>>>,
+    pub timeline: Arc<std::sync::Mutex<Vec<crate::session::TimelineItem>>>,
+}
+
 /// Snapshot of the current run state for a session
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunStateSnapshot {
@@ -517,6 +531,51 @@ impl AgentService {
                 })
             })
             .clone()
+    }
+
+    /// Register a run that executes OUTSIDE `chat_with_options` (the P19
+    /// harness chat path) so the whole live-run surface keeps working for it:
+    /// `get_run_state` recovery when the user navigates away and back,
+    /// `cancel` for the Stop button, and the run-scoped timeline journal
+    /// that is persisted with the final message.
+    ///
+    /// Returns the shared buffers the external driver fills as it streams.
+    /// The caller MUST call [`Self::unregister_external_run`] on every exit
+    /// path — a leaked entry would make the session look busy forever.
+    pub async fn register_external_run(&self, session_id: &str) -> ExternalRunHandle {
+        let handle = ExternalRunHandle {
+            cancellation_flag: Arc::new(AtomicBool::new(false)),
+            accumulated_text: Arc::new(tokio::sync::RwLock::new(String::new())),
+            accumulated_thinking: Arc::new(tokio::sync::RwLock::new(String::new())),
+            active_tool_calls: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            completed_tool_calls: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            timeline: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mut active = self.active_chats.write().await;
+        active.insert(
+            session_id.to_string(),
+            ActiveChat {
+                _session_id: session_id.to_string(),
+                cancelled: false,
+                cancellation_flag: handle.cancellation_flag.clone(),
+                started_at: chrono::Utc::now(),
+                accumulated_text: handle.accumulated_text.clone(),
+                accumulated_thinking: handle.accumulated_thinking.clone(),
+                active_tool_calls: handle.active_tool_calls.clone(),
+                completed_tool_calls: handle.completed_tool_calls.clone(),
+                timeline: handle.timeline.clone(),
+                run_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                run_output_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                context_used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+        handle
+    }
+
+    /// Remove an external run registered via [`Self::register_external_run`].
+    pub async fn unregister_external_run(&self, session_id: &str) {
+        self.active_chats.write().await.remove(session_id);
     }
 
     /// Get the current queue depth for a session (messages waiting + processing)

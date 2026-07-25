@@ -2,7 +2,7 @@
   <section
     v-if="shouldShow"
     :class="[
-      'rounded-xl border bg-nanna-bg-surface/60 p-4 sm:p-5 space-y-3',
+      'rounded-xl border glass-panel p-4 sm:p-5 space-y-3',
       danger
         ? 'border-nanna-error/25'
         : 'border-white/[0.06]',

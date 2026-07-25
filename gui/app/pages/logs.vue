@@ -47,11 +47,11 @@
     </div>
 
     <div class="relative z-10 px-4 sm:px-6 py-2 border-b border-white/[0.04] flex flex-wrap gap-2">
-      <input v-model="searchQuery" aria-label="Search logs" placeholder="Search logs" class="bg-white/[0.04] border border-white/[0.08] rounded px-2 py-1 text-xs" />
-      <select v-model="levelFilter" aria-label="Filter by level" class="bg-[#292d3e] border border-white/[0.08] rounded px-2 py-1 text-xs">
+      <input v-model="searchQuery" aria-label="Search logs" placeholder="Search logs" class="glass-well rounded px-2 py-1 text-xs" />
+      <select v-model="levelFilter" aria-label="Filter by level" class="glass-well rounded px-2 py-1 text-xs">
         <option value="all">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option>
       </select>
-      <select v-model="sourceFilter" aria-label="Filter by source" class="bg-[#292d3e] border border-white/[0.08] rounded px-2 py-1 text-xs">
+      <select v-model="sourceFilter" aria-label="Filter by source" class="glass-well rounded px-2 py-1 text-xs">
         <option value="all">All sources</option><option value="daemon">Daemon</option><option value="embedded">GUI</option>
       </select>
     </div>
@@ -105,8 +105,12 @@
         class="flex-1 font-mono text-sm p-4 min-h-0"
       >
         <template #default="{ item: log }">
+          <!-- Virtualized rows are a fixed 32px, so the line must stay on one
+               line: wrapping here paints over the neighbouring row. Full text
+               is on the title attribute. -->
           <div
-            class="py-1 px-2 rounded transition-colors group cursor-default h-full"
+            class="py-1 px-2 rounded transition-colors group cursor-default h-full flex items-center whitespace-nowrap overflow-hidden"
+            :title="log.message"
             :class="[
             'hover:bg-white/[0.03]',
             log.level === 'error' ? 'text-red-400/80' :
@@ -115,9 +119,9 @@
             'text-white/40'
           ]"
           >
-          <span class="text-white/20 text-xs select-none">{{ log.timestamp }}</span>
+          <span class="text-white/20 text-xs select-none shrink-0">{{ log.timestamp }}</span>
           <span :class="[
-            'inline-block w-[4.5rem] text-center text-[10px] font-bold uppercase tracking-wide',
+            'inline-block w-[4.5rem] shrink-0 text-center text-[10px] font-bold uppercase tracking-wide',
             'ml-2 px-1 py-px rounded border select-none',
             sourceOf(log) === 'daemon'
               ? 'text-violet-300/70 border-violet-400/20 bg-violet-400/[0.06]'
@@ -126,7 +130,7 @@
             {{ sourceLabel(log) }}
           </span>
           <span :class="[
-            'inline-block w-8 text-xs font-bold ml-2 select-none',
+            'inline-block w-8 shrink-0 text-xs font-bold ml-2 select-none',
             log.level === 'error' ? 'text-red-400/80' :
             log.level === 'warn' ? 'text-amber-400/80' :
             log.level === 'info' ? 'text-emerald-400/60' :
@@ -134,8 +138,8 @@
           ]">
             {{ log.level.toUpperCase().padEnd(5) }}
           </span>
-          <span class="text-white/20 text-xs select-none">[{{ log.target }}]</span>
-          <span class="ml-2 break-words">{{ log.message }}</span>
+          <span class="text-white/20 text-xs select-none shrink-0">[{{ log.target }}]</span>
+          <span class="ml-2 truncate">{{ log.message }}</span>
           </div>
         </template>
       </VirtualList>

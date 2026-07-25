@@ -147,7 +147,7 @@ async function runHealthCheck() {
     >
       <div class="absolute inset-0 bg-black/55 backdrop-blur-sm" @click="skip" />
       <div
-        class="relative w-full max-w-md rounded-2xl border border-white/[0.08] bg-nanna-bg-elevated shadow-2xl shadow-black/40 overflow-hidden"
+        class="relative w-full max-w-md rounded-2xl glass-strong overflow-hidden"
       >
         <!-- Progress -->
         <div class="flex items-center gap-1.5 px-6 pt-5">

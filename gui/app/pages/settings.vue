@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04]">
       <div class="flex items-center gap-3 sm:gap-4">
         <NuxtLink
           to="/"

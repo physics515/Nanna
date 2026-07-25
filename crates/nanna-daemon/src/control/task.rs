@@ -391,6 +391,8 @@ impl ControlPlane {
                     system_prompt: self.system_prompt.read().await.clone(),
                     workspace_root,
                     stats: Some(self.model_stats.clone()),
+                    // Background run: no transcript to stream into.
+                    chat_sink: None,
                 };
                 let mut config = LongHorizonConfig::default();
                 if let Some(secs) = max_wall_clock_secs {

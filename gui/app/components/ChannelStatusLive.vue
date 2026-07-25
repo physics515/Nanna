@@ -248,7 +248,7 @@ function getStateClasses(state: string): string {
     case 'auth_failed':
       return 'bg-nanna-error/5 border-nanna-error/30'
     default:
-      return 'bg-nanna-bg-elevated/40 border-white/[0.04]'
+      return 'glass-panel'
   }
 }
 

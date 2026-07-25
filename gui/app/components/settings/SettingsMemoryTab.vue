@@ -14,26 +14,26 @@
 
       <!-- Stats Grid -->
       <div class="grid grid-cols-4 gap-2">
-        <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
+        <div class="p-2 rounded-lg glass-panel text-center">
           <div class="text-lg font-bold text-nanna-success">{{ memoryStats?.active || 0 }}</div>
           <div class="text-xs text-nanna-text-dim">Active</div>
         </div>
-        <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
+        <div class="p-2 rounded-lg glass-panel text-center">
           <div class="text-lg font-bold text-nanna-warning">{{ memoryStats?.dormant || 0 }}</div>
           <div class="text-xs text-nanna-text-dim">Dormant</div>
         </div>
-        <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
+        <div class="p-2 rounded-lg glass-panel text-center">
           <div class="text-lg font-bold text-nanna-text-muted">{{ memoryStats?.silent || 0 }}</div>
           <div class="text-xs text-nanna-text-dim">Silent</div>
         </div>
-        <div class="p-2 rounded-lg bg-nanna-bg-elevated/40 text-center">
+        <div class="p-2 rounded-lg glass-panel text-center">
           <div class="text-lg font-bold text-nanna-error">{{ memoryStats?.unavailable || 0 }}</div>
           <div class="text-xs text-nanna-text-dim">Faded</div>
         </div>
       </div>
 
       <!-- Similarity Threshold -->
-      <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+      <div class="p-3 rounded-lg glass-panel">
         <div class="flex items-center justify-between mb-2">
           <span class="text-sm font-medium text-nanna-text">Recall Threshold</span>
           <span class="text-sm text-nanna-accent font-mono">{{ (similarityThreshold * 100).toFixed(0) }}%</span>
@@ -42,7 +42,7 @@
           type="range" min="0" max="100" step="5"
           :value="similarityThreshold * 100"
           @change="setSimilarityThreshold(Number(($event.target as HTMLInputElement).value) / 100)"
-          class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+          class="w-full h-2 glass-well rounded-lg appearance-none cursor-pointer accent-nanna-primary"
         >
         <p class="text-xs text-nanna-text-dim mt-1">Lower = more results, higher = more precise</p>
       </div>
@@ -58,7 +58,7 @@
 
       <!-- Advanced consolidation knobs -->
       <div v-if="showAdvanced" class="space-y-3">
-        <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+        <div class="p-3 rounded-lg glass-panel">
           <div class="flex items-center justify-between mb-2">
             <span class="text-sm font-medium text-nanna-text">Max Compression</span>
             <span class="text-sm text-nanna-accent font-mono">{{ ((settings?.max_compression_ratio ?? 0.5) * 100).toFixed(0) }}%</span>
@@ -67,11 +67,11 @@
             type="range" min="10" max="90" step="5"
             :value="(settings?.max_compression_ratio ?? 0.5) * 100"
             @change="setMaxCompressionRatio(Number(($event.target as HTMLInputElement).value) / 100)"
-            class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+            class="w-full h-2 glass-well rounded-lg appearance-none cursor-pointer accent-nanna-primary"
           >
           <p class="text-xs text-nanna-text-dim mt-1">Max fraction of memories that can be merged per consolidation run</p>
         </div>
-        <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+        <div class="p-3 rounded-lg glass-panel">
           <div class="flex items-center justify-between mb-2">
             <span class="text-sm font-medium text-nanna-text">Min Memories Floor</span>
             <span class="text-sm text-nanna-accent font-mono">{{ settings?.min_remaining_memories ?? 20 }}</span>
@@ -80,7 +80,7 @@
             type="range" min="5" max="200" step="5"
             :value="settings?.min_remaining_memories ?? 20"
             @change="setMinRemainingMemories(Number(($event.target as HTMLInputElement).value))"
-            class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+            class="w-full h-2 glass-well rounded-lg appearance-none cursor-pointer accent-nanna-primary"
           >
           <p class="text-xs text-nanna-text-dim mt-1">Never consolidate below this many memories</p>
         </div>

@@ -9,7 +9,7 @@
           'w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-colors',
           step >= s 
             ? 'bg-nanna-primary text-white' 
-            : 'bg-nanna-bg-elevated text-nanna-text-dim'
+            : 'glass-tag text-nanna-text-dim'
         ]"
       >
         {{ s }}
@@ -76,11 +76,11 @@
     <div v-if="step === 2 && connectionMethod === 'signal-cli'" class="space-y-4">
       <h4 class="font-medium text-nanna-text">2. Configure signal-cli</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           First, install signal-cli:
         </p>
-        <div class="bg-nanna-bg-deep p-2 rounded font-mono text-xs text-nanna-accent overflow-x-auto">
+        <div class="glass-well p-2 rounded font-mono text-xs text-nanna-accent overflow-x-auto">
           # macOS<br>
           brew install signal-cli<br><br>
           # Linux (download from GitHub)<br>
@@ -136,11 +136,11 @@
     <div v-if="step === 2 && connectionMethod === 'api'" class="space-y-4">
       <h4 class="font-medium text-nanna-text">2. Configure Signal REST API</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           Run the signal-cli-rest-api Docker container:
         </p>
-        <div class="bg-nanna-bg-deep p-2 rounded font-mono text-xs text-nanna-accent overflow-x-auto whitespace-pre">
+        <div class="glass-well p-2 rounded font-mono text-xs text-nanna-accent overflow-x-auto whitespace-pre">
 docker run -d --name signal-api \
   -p 8080:8080 \
   -v signal-cli-config:/home/.local/share/signal-cli \
@@ -192,12 +192,12 @@ docker run -d --name signal-api \
     <div v-if="step === 3" class="space-y-4">
       <h4 class="font-medium text-nanna-text">3. Link Account & Test</h4>
       
-      <div v-if="!isLinked" class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div v-if="!isLinked" class="glass-panel rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           If this is a new setup, you need to link your Signal account:
         </p>
         
-        <div v-if="connectionMethod === 'signal-cli'" class="bg-nanna-bg-deep p-2 rounded font-mono text-xs text-nanna-accent">
+        <div v-if="connectionMethod === 'signal-cli'" class="glass-well p-2 rounded font-mono text-xs text-nanna-accent">
           signal-cli link -n "Nanna"
         </div>
         <div v-else class="text-sm text-nanna-text-dim">

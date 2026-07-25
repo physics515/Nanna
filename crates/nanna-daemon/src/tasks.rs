@@ -17,9 +17,10 @@
 use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
 use nanna_agent::harness::{
-    AcceptanceCheck, LongHorizonConfig, LongHorizonReport, LongHorizonRunner, StepOutcome,
-    StepRequest, StepRunner, StepToolCall, StopReason, TaskSource, TaskStep,
+    AcceptanceCheck, Interjector, LongHorizonConfig, LongHorizonReport, LongHorizonRunner,
+    StepOutcome, StepRequest, StepRunner, StepToolCall, StopReason, TaskSource, TaskStep,
 };
+use nanna_agent::planner::{Plan, build_plan_prompt, plan_or_fallback};
 use nanna_scripting::ServiceFn;
 use nanna_storage::{NewTask, Storage, StorageError, Task, TaskPatch};
 use serde_json::{Value, json};
@@ -788,6 +789,182 @@ pub struct AgentStepRunner {
     pub system_prompt: String,
     pub workspace_root: Option<PathBuf>,
     pub stats: Option<nanna_agent::ModelStatsTracker>,
+    /// When set, every step streams its text and tool activity into the
+    /// session's chat transcript ("show your work as you go"). None for
+    /// background runs that have no transcript to show.
+    pub chat_sink: Option<ChatSink>,
+}
+
+/// Streams a harness step into a chat session using the *existing* chat event
+/// contract (`MessageDelta` / `ToolStart` / `ToolEnd`), so a long-horizon run
+/// renders in the transcript with no protocol change on the GUI side.
+///
+/// When `run` is set (chat-backed runs), every callback ALSO fills the
+/// registered [`crate::agent_service::ExternalRunHandle`] buffers, which is
+/// what makes navigation recovery (`get_run_state`), Stop, and end-of-run
+/// timeline persistence work — events alone vanish the moment the page
+/// unmounts.
+#[derive(Clone)]
+pub struct ChatSink {
+    pub session_id: String,
+    pub message_id: String,
+    pub event_tx: tokio::sync::broadcast::Sender<Event>,
+    pub run: Option<crate::agent_service::ExternalRunHandle>,
+}
+
+impl ChatSink {
+    fn delta(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let _ = self.event_tx.send(Event::MessageDelta {
+            session_id: self.session_id.clone(),
+            message_id: self.message_id.clone(),
+            delta: text.to_string(),
+        });
+        if let Some(run) = &self.run {
+            // try_write mirrors the in-service path: a snapshot clone briefly
+            // holding the lock must not block the stream thread.
+            if let Ok(mut acc) = run.accumulated_text.try_write() {
+                acc.push_str(text);
+            }
+            // The journal lock is std::sync and infallible by design (see
+            // ActiveChat::timeline) — merge into the trailing Text item so a
+            // token stream stays one item, not thousands.
+            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            if let Some(crate::session::TimelineItem::Text { content, .. }) = journal.last_mut() {
+                content.push_str(text);
+            } else {
+                journal.push(crate::session::TimelineItem::Text {
+                    content: text.to_string(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    fn thinking(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let _ = self.event_tx.send(Event::ThinkingDelta {
+            session_id: self.session_id.clone(),
+            delta: text.to_string(),
+        });
+        if let Some(run) = &self.run {
+            if let Ok(mut acc) = run.accumulated_thinking.try_write() {
+                acc.push_str(text);
+            }
+            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            if let Some(crate::session::TimelineItem::Thinking { content, .. }) = journal.last_mut()
+            {
+                content.push_str(text);
+            } else {
+                journal.push(crate::session::TimelineItem::Thinking {
+                    content: text.to_string(),
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    fn tool_start(&self, call_id: &str, name: &str, input: &Value, model: Option<&str>) {
+        let _ = self.event_tx.send(Event::ToolStart {
+            session_id: self.session_id.clone(),
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
+            model: model.map(String::from),
+            tokens: None,
+            total_tokens: None,
+        });
+        if let Some(run) = &self.run {
+            if let Ok(mut active) = run.active_tool_calls.try_write() {
+                active.push(crate::agent_service::ActiveToolCallInfo {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    started_at: chrono::Utc::now(),
+                });
+            }
+            run.timeline
+                .lock()
+                .expect("timeline lock poisoned")
+                .push(crate::session::TimelineItem::Tool {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    input: Some(input.clone()),
+                    output: None,
+                    success: None,
+                    duration_ms: None,
+                    tokens: None,
+                    total_tokens: None,
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+        }
+    }
+
+    fn tool_end(&self, call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64) {
+        let _ = self.event_tx.send(Event::ToolEnd {
+            session_id: self.session_id.clone(),
+            call_id: call_id.to_string(),
+            output: output.to_string(),
+            success,
+            duration_ms,
+            data: None,
+        });
+        if let Some(run) = &self.run {
+            if let Ok(mut active) = run.active_tool_calls.try_write() {
+                active.retain(|t| t.call_id != call_id);
+            }
+            if let Ok(mut done) = run.completed_tool_calls.try_write() {
+                done.push(crate::agent_service::CompletedToolCallInfo {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    output: output.to_string(),
+                    success,
+                    duration_ms,
+                });
+            }
+            let mut journal = run.timeline.lock().expect("timeline lock poisoned");
+            if let Some(crate::session::TimelineItem::Tool {
+                output: slot_output,
+                success: slot_success,
+                duration_ms: slot_duration,
+                ..
+            }) = journal
+                .iter_mut()
+                .rev()
+                .find(|item| matches!(item, crate::session::TimelineItem::Tool { call_id: id, .. } if id == call_id))
+            {
+                *slot_output = Some(output.to_string());
+                *slot_success = Some(success);
+                *slot_duration = Some(duration_ms);
+            }
+        }
+    }
+
+    /// Announce which item the run is starting, so the transcript reads as
+    /// work-in-progress rather than a wall of unattributed text.
+    /// The label is read back out of the step prompt (`build_step_prompt`
+    /// writes `Task #id: title`); if that line is ever absent the header
+    /// degrades to the bare item id rather than failing.
+    fn step_header(&self, request: &StepRequest) {
+        let kind = match request.step_kind {
+            nanna_agent::harness::StepKind::Plan => "planning",
+            nanna_agent::harness::StepKind::Verify => "verifying",
+            nanna_agent::harness::StepKind::Execute => "working",
+        };
+        let marker = format!("Task #{}: ", request.item_id);
+        let label = request
+            .prompt
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&marker))
+            .map_or_else(
+                || format!("Task #{}", request.item_id),
+                std::string::ToString::to_string,
+            );
+        self.delta(&format!("\n\n**[{kind}]** {label}\n\n"));
+    }
 }
 
 /// In-step retries for transient provider errors.
@@ -900,6 +1077,13 @@ impl AgentStepRunner {
     async fn try_run_step(&self, request: &StepRequest) -> Result<StepOutcome, String> {
         use nanna_agent::{Agent, AgentContext, RunOptions};
 
+        // Name the item before its output starts arriving, so a multi-step
+        // run reads as a sequence of labelled pieces of work rather than one
+        // undifferentiated stream.
+        if let Some(sink) = &self.chat_sink {
+            sink.step_header(request);
+        }
+
         let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
             .with_system_prompt(&self.system_prompt);
         if let Some(ws_root) = &self.workspace_root {
@@ -934,6 +1118,44 @@ impl AgentStepRunner {
             active.push("todo".to_string());
         }
 
+        // Show the work as it happens: the step's text, thinking, and tool
+        // activity stream through the same events a plain chat turn uses,
+        // and fill the registered run buffers for recovery/persistence.
+        let (on_text, on_thinking, on_tool_start, on_tool_end) = match &self.chat_sink {
+            None => (None, None, None, None),
+            Some(sink) => {
+                let text_sink = sink.clone();
+                let think_sink = sink.clone();
+                let start_sink = sink.clone();
+                let end_sink = sink.clone();
+                (
+                    Some(Box::new(move |chunk: &str| text_sink.delta(chunk))
+                        as Box<dyn Fn(&str) + Send + Sync>),
+                    Some(Box::new(move |chunk: &str| think_sink.thinking(chunk))
+                        as Box<dyn Fn(&str) + Send + Sync>),
+                    Some(Box::new(
+                        move |call_id: &str, name: &str, input: &Value, model: Option<&str>| {
+                            start_sink.tool_start(call_id, name, input, model);
+                        },
+                    )
+                        as Box<dyn Fn(&str, &str, &Value, Option<&str>) + Send + Sync>),
+                    Some(Box::new(
+                        move |call_id: &str,
+                              name: &str,
+                              output: &str,
+                              success: bool,
+                              duration_ms: u64,
+                              _data: Option<&Value>| {
+                            end_sink.tool_end(call_id, name, output, success, duration_ms);
+                        },
+                    )
+                        as Box<
+                            dyn Fn(&str, &str, &str, bool, u64, Option<&Value>) + Send + Sync,
+                        >),
+                )
+            }
+        };
+
         let options = RunOptions {
             max_iterations: request.max_iterations,
             token_budget: request.token_budget,
@@ -941,6 +1163,10 @@ impl AgentStepRunner {
             step_kind: Some(request.step_kind),
             initial_active_tools: active,
             is_sub_agent: true,
+            on_text,
+            on_thinking,
+            on_tool_start,
+            on_tool_end,
             ..Default::default()
         };
 
@@ -965,6 +1191,292 @@ impl AgentStepRunner {
             output_tokens: u64::from(result.output_tokens),
             tool_calls,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Planning (P19): every chat turn becomes a plan the harness can execute
+// ---------------------------------------------------------------------------
+
+/// Wall-clock ceiling for one planning call.
+///
+/// Bound justification: planning sits in front of *every* chat turn, so it is
+/// on the latency path of "hi". The reference local tier answers a short
+/// structured prompt in single-digit seconds; 30s covers a cold model load
+/// without letting a wedged provider hold a turn hostage — on timeout the
+/// caller falls back to the single-task plan and the turn proceeds.
+const PLAN_TIMEOUT_SECS: u64 = 30;
+
+/// Iterations allowed inside a planning step.
+///
+/// Bound justification: planning emits one JSON array and calls no tools.
+/// More than one iteration means the model is looping, not planning.
+const PLAN_ITERATIONS: usize = 1;
+
+/// Turns a request into a plan using the configured model.
+///
+/// Wraps [`AgentStepRunner`] rather than duplicating its provider handling:
+/// planning is just a step whose prompt asks for JSON and whose tool scope is
+/// empty.
+pub struct AgentPlanner {
+    pub runner: Arc<AgentStepRunner>,
+}
+
+impl AgentPlanner {
+    #[must_use]
+    pub const fn new(runner: Arc<AgentStepRunner>) -> Self {
+        Self { runner }
+    }
+
+    /// Plan `goal`, degrading to the single-task plan on any failure.
+    ///
+    /// Never returns an error: a planner problem must not cost the user a
+    /// turn. The returned `Plan::origin` records which path was taken.
+    pub async fn plan(&self, goal: &str, context: Option<&str>) -> Plan {
+        let request = StepRequest {
+            // Planning is not attached to an item yet; the store assigns ids
+            // when the plan is seeded.
+            item_id: 0,
+            step_index: 0,
+            step_kind: nanna_agent::harness::StepKind::Plan,
+            prompt: build_plan_prompt(goal, context),
+            tool_scope: Vec::new(),
+            token_budget: None,
+            max_iterations: Some(PLAN_ITERATIONS),
+            max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(PLAN_TIMEOUT_SECS),
+            self.runner.run_step(request),
+        )
+        .await;
+
+        match outcome {
+            Ok(Ok(step)) => plan_or_fallback(goal, &step.text),
+            Ok(Err(message)) => {
+                tracing::warn!(%message, "planner failed - falling back to a single-task plan");
+                Plan::single(goal)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = PLAN_TIMEOUT_SECS,
+                    "planner timed out - falling back to a single-task plan"
+                );
+                Plan::single(goal)
+            }
+        }
+    }
+}
+
+/// Seed a plan into the store, returning the created task ids in plan order.
+///
+/// `jump_queue` is how an interjected message reaches the front: the store
+/// orders `next()` by `in_progress` first, then priority, then `sort_order`.
+/// A task inserted mid-run therefore has to (a) sort ahead on `sort_order`
+/// and (b) not be outranked by an item the harness already marked
+/// `in_progress` - see `SessionInterjector::yield_current_item`.
+pub async fn seed_plan(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+    plan: &Plan,
+    jump_queue: bool,
+) -> Result<Vec<i64>, String> {
+    let repo = storage.tasks();
+    let base_sort = if jump_queue {
+        // Strictly below every existing item in the scope so the new work is
+        // selected next. Explicitly computed rather than hardcoded to 0 -
+        // 0 collides with the default and merely ties.
+        let existing = repo
+            .list(scope, scope_id, false)
+            .await
+            .map_err(|e| e.to_string())?;
+        existing.iter().map(|t| t.sort_order).min().unwrap_or(0) - plan.tasks.len() as i64 - 1
+    } else {
+        0
+    };
+
+    let mut ids = Vec::with_capacity(plan.tasks.len());
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let new = NewTask {
+            parent_id: None,
+            scope: scope.to_string(),
+            scope_id: scope_id.map(String::from),
+            project: None,
+            title: task.title.clone(),
+            description: task.description.clone(),
+            // 1 is the highest the store accepts; an interjection is the
+            // user speaking, which outranks anything already planned.
+            priority: if jump_queue { 1 } else { 2 },
+            labels: vec!["chat".to_string()],
+            tool_scope: task.tool_scope.clone(),
+            due_at: None,
+            recurrence: None,
+            depends_on: Vec::new(),
+            acceptance: task.acceptance.clone(),
+            assignee: None,
+            sort_order: base_sort + index as i64,
+        };
+        match repo.create(new).await {
+            Ok(created) => ids.push(created.id),
+            // One rejected task must not sink the plan - the rest still runs.
+            Err(e) => {
+                tracing::warn!(title = %task.title, error = %e, "failed to seed planned task");
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Err("no planned task could be created".to_string());
+    }
+    Ok(ids)
+}
+
+// ---------------------------------------------------------------------------
+// Interjection: mid-run messages join the plan at the next step boundary
+// ---------------------------------------------------------------------------
+
+/// Messages held for one session before admission.
+///
+/// Bound justification: these are messages a human typed while watching a run
+/// - an unbounded queue here is a memory leak fed by a stuck run. 64 is far
+/// past any realistic burst of human typing between two step boundaries, and
+/// overflow drops the OLDEST so the most recent intent always survives.
+pub const PENDING_MESSAGES_MAX: usize = 64;
+
+/// Pending user messages for one session, drained by `SessionInterjector`.
+///
+/// This replaces "queue behind the mutex until the run ends" for the chat
+/// path. A run can be hours long; blocking a follow-up message for that long
+/// is the behaviour this exists to remove.
+#[derive(Debug, Default)]
+pub struct PendingMessages {
+    inner: RwLock<Vec<String>>,
+}
+
+impl PendingMessages {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a message for admission at the next step boundary.
+    /// Returns the queue depth after the push.
+    pub async fn push(&self, message: String) -> usize {
+        let mut queue = self.inner.write().await;
+        if queue.len() >= PENDING_MESSAGES_MAX {
+            queue.remove(0);
+        }
+        queue.push(message);
+        queue.len()
+    }
+
+    /// Take everything waiting.
+    pub async fn drain(&self) -> Vec<String> {
+        let mut queue = self.inner.write().await;
+        std::mem::take(&mut *queue)
+    }
+
+    /// Cheap check used on the hot path - the overwhelmingly common answer
+    /// is "nothing waiting", and that must not cost a write lock.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
+
+    /// Current depth.
+    pub async fn len(&self) -> usize {
+        self.inner.read().await.len()
+    }
+}
+
+/// Admits pending chat messages into a live run at step boundaries.
+pub struct SessionInterjector {
+    pub storage: Arc<Storage>,
+    pub scope: String,
+    pub scope_id: Option<String>,
+    pub pending: Arc<PendingMessages>,
+    pub planner: Arc<AgentPlanner>,
+    pub actor: String,
+    pub event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+}
+
+impl SessionInterjector {
+    /// Put the in-flight item back to `pending` so the interjected task wins
+    /// the next selection.
+    ///
+    /// `TaskRepository::next` sorts `in_progress` ahead of everything else
+    /// ("resume what you started"), which would otherwise starve an
+    /// interjection behind a long multi-step item. Yielding is safe: the
+    /// harness re-marks an item `in_progress` via `start()` whenever it
+    /// selects it, notes are untouched, and the harness's in-memory progress
+    /// counters are keyed by item id, so the original resumes exactly where
+    /// it stood once the user's request is done.
+    async fn yield_current_item(&self) -> Result<(), String> {
+        let repo = self.storage.tasks();
+        let tasks = repo
+            .list(&self.scope, self.scope_id.as_deref(), false)
+            .await
+            .map_err(|e| e.to_string())?;
+        for task in tasks.iter().filter(|t| t.status == "in_progress") {
+            repo.update(
+                task.id,
+                TaskPatch {
+                    status: Some("pending".to_string()),
+                    ..TaskPatch::default()
+                },
+                Some(&self.actor),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Interjector for SessionInterjector {
+    async fn interject(&self) -> Result<usize, String> {
+        // Hot path: a read lock and an is_empty, nothing more.
+        if self.pending.is_empty().await {
+            return Ok(0);
+        }
+        let messages = self.pending.drain().await;
+        if messages.is_empty() {
+            return Ok(0);
+        }
+
+        let mut admitted = 0usize;
+        for message in messages {
+            let plan = self.planner.plan(&message, None).await;
+            // Yield before seeding so the new tasks are the only candidates
+            // not outranked by an in-progress item.
+            if let Err(e) = self.yield_current_item().await {
+                tracing::warn!(error = %e, "could not yield the in-flight item for an interjection");
+            }
+            let ids = seed_plan(
+                &self.storage,
+                &self.scope,
+                self.scope_id.as_deref(),
+                &plan,
+                true,
+            )
+            .await?;
+            admitted += ids.len();
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(Event::TaskRunProgress {
+                    scope: self.scope.clone(),
+                    scope_id: self.scope_id.clone(),
+                    task_id: ids.first().copied(),
+                    kind: "interjected".to_string(),
+                    detail: json!({
+                        "message": message,
+                        "tasks": ids,
+                        "plan_origin": plan.origin,
+                    }),
+                });
+            }
+        }
+        Ok(admitted)
     }
 }
 
@@ -1234,6 +1746,7 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         output_tokens: 0,
         wall_clock_secs: 0,
         tokens_per_completed_item: None,
+        interjected_items: 0,
     });
     folded.steps_taken = segments.iter().map(|r| r.steps_taken).sum();
     folded.items_completed = segments.iter().map(|r| r.items_completed).sum();
@@ -1245,6 +1758,7 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.input_tokens = segments.iter().map(|r| r.input_tokens).sum();
     folded.output_tokens = segments.iter().map(|r| r.output_tokens).sum();
     folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
+    folded.interjected_items = segments.iter().map(|r| r.interjected_items).sum();
     folded.tokens_per_completed_item = if folded.items_completed > 0 {
         Some((folded.input_tokens + folded.output_tokens) / folded.items_completed as u64)
     } else {
@@ -1256,6 +1770,179 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Pending messages (interjection intake)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pending_messages_drain_in_arrival_order_and_empty_the_queue() {
+        let pending = PendingMessages::new();
+        assert!(pending.is_empty().await);
+        pending.push("first".to_string()).await;
+        pending.push("second".to_string()).await;
+        assert_eq!(pending.len().await, 2);
+        assert!(!pending.is_empty().await);
+
+        assert_eq!(pending.drain().await, vec!["first", "second"]);
+        assert!(pending.is_empty().await, "drain must empty the queue");
+        assert!(pending.drain().await.is_empty(), "second drain is a no-op");
+    }
+
+    #[tokio::test]
+    async fn pending_messages_overflow_drops_the_oldest_not_the_newest() {
+        // The bound exists so a stuck run cannot leak memory; when it bites,
+        // the user's most recent intent is what must survive.
+        let pending = PendingMessages::new();
+        for i in 0..(PENDING_MESSAGES_MAX + 5) {
+            pending.push(format!("m{i}")).await;
+        }
+        assert_eq!(pending.len().await, PENDING_MESSAGES_MAX);
+        let drained = pending.drain().await;
+        assert_eq!(drained.last().unwrap(), &format!("m{}", PENDING_MESSAGES_MAX + 4));
+        assert_eq!(drained.first().unwrap(), "m5");
+    }
+
+    // -----------------------------------------------------------------
+    // Plan seeding + queue jumping
+    // -----------------------------------------------------------------
+
+    fn plan_of(titles: &[&str]) -> Plan {
+        Plan {
+            tasks: titles
+                .iter()
+                .map(|t| nanna_agent::planner::PlannedTask {
+                    title: (*t).to_string(),
+                    description: None,
+                    acceptance: None,
+                    tool_scope: Vec::new(),
+                })
+                .collect(),
+            origin: nanna_agent::planner::PlanOrigin::Model,
+        }
+    }
+
+    #[tokio::test]
+    async fn seeded_plan_is_executed_in_plan_order() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let ids = seed_plan(&storage, "session", Some("s1"), &plan_of(&["a", "b", "c"]), false)
+            .await
+            .expect("seeded");
+        assert_eq!(ids.len(), 3);
+
+        let repo = storage.tasks();
+        let next = repo.next("session", Some("s1")).await.unwrap().unwrap();
+        assert_eq!(next.title, "a", "plan order decides what runs first");
+    }
+
+    #[tokio::test]
+    async fn an_interjected_plan_preempts_pending_work() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["original"]), false)
+            .await
+            .expect("seeded");
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["urgent"]), true)
+            .await
+            .expect("interjected");
+
+        let next = storage
+            .tasks()
+            .next("session", Some("s1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.title, "urgent", "the user's new message goes first");
+    }
+
+    #[tokio::test]
+    async fn an_in_progress_item_outranks_an_interjection_until_it_yields() {
+        // This is the reason SessionInterjector::yield_current_item exists:
+        // TaskRepository::next sorts in_progress ahead of priority, so a
+        // mid-run interjection would otherwise starve behind a long item.
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let original = seed_plan(&storage, "session", Some("s1"), &plan_of(&["original"]), false)
+            .await
+            .expect("seeded")[0];
+        let repo = storage.tasks();
+        repo.update(
+            original,
+            TaskPatch {
+                status: Some("in_progress".to_string()),
+                ..TaskPatch::default()
+            },
+            Some("harness"),
+        )
+        .await
+        .expect("marked in progress");
+
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["urgent"]), true)
+            .await
+            .expect("interjected");
+
+        // Without yielding, the in-flight item still wins.
+        let blocked = repo.next("session", Some("s1")).await.unwrap().unwrap();
+        assert_eq!(blocked.title, "original");
+
+        // Yielding it back to pending is what lets the interjection through.
+        repo.update(
+            original,
+            TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            },
+            Some("harness"),
+        )
+        .await
+        .expect("yielded");
+        let freed = repo.next("session", Some("s1")).await.unwrap().unwrap();
+        assert_eq!(freed.title, "urgent");
+    }
+
+    #[tokio::test]
+    async fn the_yielded_item_resumes_once_the_interjection_completes() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["original"]), false)
+            .await
+            .expect("seeded");
+        let urgent = seed_plan(&storage, "session", Some("s1"), &plan_of(&["urgent"]), true)
+            .await
+            .expect("interjected")[0];
+
+        let repo = storage.tasks();
+        repo.complete(urgent, Some("harness"), Some(json!({"verified": false})))
+            .await
+            .expect("completed");
+
+        let resumed = repo.next("session", Some("s1")).await.unwrap().unwrap();
+        assert_eq!(
+            resumed.title, "original",
+            "the interrupted plan continues where it stood"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_interjections_stay_in_arrival_order() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["original"]), false)
+            .await
+            .expect("seeded");
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["first ask"]), true)
+            .await
+            .expect("first");
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["second ask"]), true)
+            .await
+            .expect("second");
+
+        // The later interjection sorts ahead — a user who speaks twice means
+        // the most recent thing most.
+        let next = storage
+            .tasks()
+            .next("session", Some("s1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.title, "second ask");
+    }
 
     #[test]
     fn ollama_base_normalization_handles_bind_addresses() {
@@ -1322,6 +2009,7 @@ mod tests {
             output_tokens: tokens_out,
             wall_clock_secs: 60,
             tokens_per_completed_item: None,
+            interjected_items: 0,
         }
     }
 
@@ -1413,6 +2101,24 @@ impl TaskRunManager {
         workdir: PathBuf,
         event_tx: tokio::sync::broadcast::Sender<Event>,
     ) -> Result<(), String> {
+        self.start_with_interjector(goal, source, runner, config, workdir, event_tx, None)
+            .await
+    }
+
+    /// [`Self::start`], plus the hook that lets user messages join this run
+    /// at a step boundary instead of queueing behind it. Chat-backed runs
+    /// always pass one; background runs do not.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_interjector(
+        self: &Arc<Self>,
+        goal: String,
+        source: TursoTaskSource,
+        runner: AgentStepRunner,
+        config: LongHorizonConfig,
+        workdir: PathBuf,
+        event_tx: tokio::sync::broadcast::Sender<Event>,
+        interjector: Option<Arc<SessionInterjector>>,
+    ) -> Result<(), String> {
         let key = Self::scope_key(&source.scope, source.scope_id.as_deref());
         {
             let mut runs = self.runs.write().await;
@@ -1461,7 +2167,14 @@ impl TaskRunManager {
                     ..config.clone()
                 };
                 let report = LongHorizonRunner::new(segment_config)
-                    .run(&goal, &source, &runner, &workdir, Some(cancel.clone()))
+                    .run_with_interjector(
+                        &goal,
+                        &source,
+                        &runner,
+                        &workdir,
+                        Some(cancel.clone()),
+                        interjector.as_deref().map(|i| i as &dyn Interjector),
+                    )
                     .await;
                 let provider_died = matches!(report.stop, StopReason::RunnerErrors { .. });
                 segments.push(report);

@@ -10,7 +10,7 @@
 
     <!-- Active Models (Drag & Drop) -->
     <div
-      class="min-h-[60px] p-2 rounded-lg bg-nanna-bg-elevated/30 border border-dashed border-white/[0.06]"
+      class="min-h-[60px] p-2 rounded-lg glass-well border-dashed"
     >
       <div v-if="localModels.length === 0" class="text-center py-4 text-sm text-nanna-text-dim">
         No models selected. Click "Add" to enable models.
@@ -35,7 +35,7 @@
             <GripVertical class="drag-handle w-4 h-4 text-nanna-text-dim shrink-0 cursor-grab active:cursor-grabbing" />
 
             <!-- Priority Badge -->
-            <span class="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold shrink-0 bg-nanna-bg-elevated text-nanna-text-muted">
+            <span class="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold shrink-0 glass-tag text-nanna-text-muted">
               {{ index + 1 }}
             </span>
 
@@ -78,11 +78,11 @@
       <summary class="cursor-pointer text-nanna-text-muted hover:text-nanna-text">
         {{ excludedModels.length }} excluded model{{ excludedModels.length > 1 ? 's' : '' }}
       </summary>
-      <div class="mt-2 space-y-1 p-2 rounded-lg bg-nanna-bg-deep/50">
+      <div class="mt-2 space-y-1 p-2 rounded-lg glass-well">
         <div
           v-for="model in excludedModels"
           :key="model.id"
-          class="flex items-center gap-2 p-2 rounded bg-nanna-bg-elevated/40 opacity-60"
+          class="flex items-center gap-2 p-2 rounded glass-panel opacity-60"
         >
           <span class="text-sm">{{ getProviderIcon(model.provider) }}</span>
           <span class="text-sm text-nanna-text-muted flex-1 truncate">{{ model.name }}</span>
@@ -103,7 +103,7 @@
         class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
         @click.self="closeAddDialog"
       >
-        <div class="bg-nanna-bg-surface rounded-xl p-4 w-full max-w-sm border border-white/[0.06] shadow-xl">
+        <div class="glass-strong rounded-xl p-4 w-full max-w-sm">
           <h3 class="font-semibold text-nanna-text mb-3">Add Model</h3>
 
           <!-- Search Input -->
@@ -114,7 +114,7 @@
               v-model="searchQuery"
               type="text"
               placeholder="Search models..."
-              class="w-full pl-8 pr-3 py-2 text-sm bg-nanna-bg-elevated rounded-lg border border-nanna-border/30 text-nanna-text placeholder:text-nanna-text-dim/50 focus:outline-none focus:border-nanna-primary"
+              class="w-full pl-8 pr-3 py-2 text-sm glass-well rounded-lg text-nanna-text placeholder:text-nanna-text-dim/50 focus:outline-none focus:border-nanna-primary"
               @keydown.escape="closeAddDialog"
             />
           </div>
@@ -264,7 +264,9 @@ function addModel(model: ModelOption) {
 <style scoped>
 .dragging {
   opacity: 0.8;
-  background: var(--nanna-bg-surface);
+  background: rgba(30, 41, 59, 0.45);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 </style>

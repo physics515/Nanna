@@ -44,7 +44,10 @@ const lineWidths = computed(() => {
 .message-skeleton {
   padding: 1rem;
   border-radius: 0.5rem;
-  background: var(--color-nanna-bg-surface);
+  background: rgba(30, 41, 59, 0.38);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .skeleton-pulse {

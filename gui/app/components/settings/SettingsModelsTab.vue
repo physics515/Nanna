@@ -27,7 +27,7 @@
           <!-- Not logged in state -->
           <div v-else class="space-y-3">
             <p class="text-xs text-nanna-text-muted">
-              Run <code class="bg-nanna-bg-elevated px-1 rounded">claude setup-token</code> and paste the token below.
+              Run <code class="glass-tag px-1 rounded">claude setup-token</code> and paste the token below.
             </p>
 
             <!-- Token input box -->
@@ -86,7 +86,7 @@
         />
 
         <!-- Claude Proxy (claude-max-api-proxy) -->
-        <div class="space-y-2 p-3 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30">
+        <div class="space-y-2 p-3 rounded-lg glass-panel">
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2">
               <span class="text-sm font-medium text-nanna-text">Claude Proxy</span>
@@ -107,7 +107,7 @@
                 class="sr-only peer"
                 aria-label="Claude OAuth proxy"
               >
-              <div class="w-9 h-5 bg-nanna-bg-elevated peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-nanna-text-muted after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-nanna-primary peer-checked:after:bg-white"></div>
+              <div class="w-9 h-5 glass-well peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-nanna-text-muted after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-nanna-primary peer-checked:after:bg-white"></div>
             </label>
           </div>
           <p class="text-xs text-nanna-text-muted">
@@ -118,14 +118,14 @@
               v-model="claudeProxyUrl"
               type="text"
               placeholder="http://localhost:3456"
-              class="flex-1 px-2 py-1.5 text-sm bg-nanna-bg rounded border border-nanna-border/50 text-nanna-text placeholder:text-nanna-text-muted/50 focus:outline-none focus:border-nanna-primary"
+              class="flex-1 px-2 py-1.5 text-sm glass-well rounded text-nanna-text placeholder:text-nanna-text-muted/50 focus:outline-none focus:border-nanna-primary"
             >
             <UiButton @click="saveClaudeProxyUrl" size="sm" variant="ghost">Save</UiButton>
           </div>
         </div>
 
         <!-- Ollama -->
-        <div class="space-y-3 p-3 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30">
+        <div class="space-y-3 p-3 rounded-lg glass-panel">
           <div class="flex items-center justify-between">
             <span class="text-sm font-medium text-nanna-text">Ollama</span>
             <div class="flex items-center gap-2">

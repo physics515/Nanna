@@ -29,6 +29,7 @@ use tracing::{debug, error, info, warn};
 
 mod channel;
 mod chat;
+pub mod chat_harness;
 mod config;
 mod memory;
 mod scheduler;
@@ -93,6 +94,10 @@ pub struct ControlPlane {
     /// page-level corruption at startup, so `SystemAction::Status` keeps
     /// reporting the rebuild to clients that connected after the boot event.
     memory_recovery: Option<Arc<nanna_storage::RecoveryReport>>,
+    /// Live long-horizon chat runs and their interjection intake (P18).
+    /// Every chat turn is a harness run; a message that arrives while one is
+    /// live joins it at the next step boundary instead of queueing behind it.
+    chat_runs: Arc<chat_harness::ChatRunRegistry>,
 }
 
 impl ControlPlane {
@@ -124,6 +129,7 @@ impl ControlPlane {
             activity: None,
             dreaming: None,
             memory_recovery: None,
+            chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
         }
     }
 
@@ -179,6 +185,7 @@ impl ControlPlane {
             activity: None,
             dreaming: None,
             memory_recovery: None,
+            chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
         }
     }
 
@@ -233,6 +240,7 @@ impl ControlPlane {
             activity: None,
             dreaming: None,
             memory_recovery: None,
+            chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
         }
     }
 

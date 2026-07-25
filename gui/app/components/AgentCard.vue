@@ -65,7 +65,7 @@
         </div>
 
         <!-- Model -->
-        <div class="hidden md:block px-2 py-1 rounded bg-nanna-bg-elevated text-xs text-nanna-text-muted">
+        <div class="hidden md:block px-2 py-1 rounded glass-tag text-xs text-nanna-text-muted">
           {{ formatModel(agent.model) }}
         </div>
 
@@ -146,7 +146,7 @@ function getCardClasses(): string {
 
 function getStateBackground(): string {
   const map: Record<string, string> = {
-    spawned: 'bg-nanna-bg-elevated',
+    spawned: 'glass-tag',
     idle: 'bg-nanna-primary/20',
     thinking: 'bg-nanna-warning/20',
     tool_use: 'bg-nanna-accent/20',
@@ -155,7 +155,7 @@ function getStateBackground(): string {
     error: 'bg-nanna-error/20',
     cancelled: 'bg-nanna-text-dim/20',
   }
-  return map[props.agent.state] || 'bg-nanna-bg-elevated'
+  return map[props.agent.state] || 'glass-tag'
 }
 
 function getStateTextColor(): string {
@@ -174,7 +174,7 @@ function getStateTextColor(): string {
 
 function getStateBadge(): string {
   const map: Record<string, string> = {
-    spawned: 'bg-nanna-bg-elevated text-nanna-text-muted',
+    spawned: 'glass-tag text-nanna-text-muted',
     idle: 'bg-nanna-primary/10 text-nanna-primary',
     thinking: 'bg-nanna-warning/10 text-nanna-warning',
     tool_use: 'bg-nanna-accent/10 text-nanna-accent',
@@ -183,7 +183,7 @@ function getStateBadge(): string {
     error: 'bg-nanna-error/10 text-nanna-error',
     cancelled: 'bg-nanna-text-dim/10 text-nanna-text-dim',
   }
-  return map[props.agent.state] || 'bg-nanna-bg-elevated text-nanna-text'
+  return map[props.agent.state] || 'glass-tag text-nanna-text'
 }
 
 function getRoleBadge(): string {
@@ -193,7 +193,7 @@ function getRoleBadge(): string {
     background: 'bg-nanna-text-dim/20 text-nanna-text-muted',
     system: 'bg-nanna-warning/20 text-nanna-warning',
   }
-  return map[props.agent.role] || 'bg-nanna-bg-elevated text-nanna-text-muted'
+  return map[props.agent.role] || 'glass-tag text-nanna-text-muted'
 }
 
 function getStateIcon() {

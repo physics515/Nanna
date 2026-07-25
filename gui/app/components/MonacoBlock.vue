@@ -254,7 +254,7 @@ async function copyCode() {
 @reference "../assets/css/main.css";
 
 .code-block-container {
-  @apply relative rounded-lg overflow-hidden border border-white/[0.08] bg-nanna-bg-surface;
+  @apply relative rounded-lg overflow-hidden glass-well;
 }
 
 .code-block-editable {
@@ -310,7 +310,7 @@ async function copyCode() {
 /* Override Monaco's default background */
 .monaco-wrapper :deep(.monaco-editor),
 .monaco-wrapper :deep(.monaco-editor-background) {
-  background-color: #1e293b !important;
+  background-color: rgba(2, 6, 23, 0.35) !important;
 }
 
 .monaco-wrapper :deep(.monaco-editor .margin) {

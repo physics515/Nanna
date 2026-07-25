@@ -1,7 +1,7 @@
 <template>
-  <div class="h-full flex flex-col bg-nanna-bg-deep">
+  <div class="h-full flex flex-col">
     <!-- Header -->
-    <div class="px-6 py-4 border-b border-white/[0.04] bg-nanna-bg-surface">
+    <div class="px-6 py-4 border-b border-white/[0.04]">
       <div class="flex items-center justify-between">
         <div>
           <h1 class="text-2xl font-bold text-nanna-text">Model Stats</h1>
@@ -10,7 +10,7 @@
         <div class="flex items-center gap-2">
           <button
             @click="fetchStats"
-            class="px-3 py-2 rounded-lg text-sm font-medium bg-nanna-bg-elevated text-nanna-text-muted hover:text-nanna-text transition-colors"
+            class="px-3 py-2 rounded-lg text-sm font-medium glass-chip text-nanna-text-muted hover:text-nanna-text"
           >
             <RefreshCw class="w-4 h-4 inline mr-1" :class="isLoading ? 'animate-spin' : ''" />
             Refresh
@@ -36,7 +36,7 @@
       />
 
       <!-- Model cards -->
-      <div v-for="model in sortedModels" :key="model.model" class="bg-nanna-bg-surface rounded-xl border border-white/[0.04] p-5">
+      <div v-for="model in sortedModels" :key="model.model" class="glass-panel rounded-xl p-5">
         <!-- Model header -->
         <div class="flex items-center justify-between mb-4">
           <div class="flex items-center gap-3">
@@ -70,7 +70,7 @@
         <!-- Stats grid -->
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
           <!-- Success Rate -->
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Success Rate</div>
             <div :class="[
               'text-xl font-bold font-mono',
@@ -83,7 +83,7 @@
           </div>
 
           <!-- Avg Latency -->
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Avg Latency</div>
             <div class="text-xl font-bold font-mono text-nanna-text">
               {{ formatLatency(model.avg_latency_ms) }}
@@ -91,7 +91,7 @@
           </div>
 
           <!-- Throughput -->
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Throughput</div>
             <div class="text-xl font-bold font-mono text-nanna-accent">
               {{ model.avg_throughput_tps.toFixed(1) }} <span class="text-sm text-nanna-text-muted">tok/s</span>
@@ -99,7 +99,7 @@
           </div>
 
           <!-- Cache Hit Rate -->
-          <div class="bg-nanna-bg-elevated rounded-lg p-3">
+          <div class="glass-well rounded-lg p-3">
             <div class="text-xs text-nanna-text-muted mb-1">Cache Hit Rate</div>
             <div class="text-xl font-bold font-mono text-nanna-primary">
               {{ (model.cache_hit_rate * 100).toFixed(1) }}%
@@ -113,7 +113,7 @@
             <span>Token Usage</span>
             <span>{{ formatTokens(model.total_input_tokens + model.total_output_tokens) }} total</span>
           </div>
-          <div class="h-2 bg-nanna-bg-elevated rounded-full overflow-hidden flex">
+          <div class="h-2 glass-well rounded-full overflow-hidden flex">
             <div
               class="bg-nanna-primary h-full"
               :style="{ width: tokenBarWidth(model, 'input') + '%' }"

@@ -9,7 +9,7 @@
           'w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-colors',
           step >= s 
             ? 'bg-nanna-primary text-white' 
-            : 'bg-nanna-bg-elevated text-nanna-text-dim'
+            : 'glass-tag text-nanna-text-dim'
         ]"
       >
         {{ s }}
@@ -22,7 +22,7 @@
     <div v-if="step === 1" class="space-y-4">
       <h4 class="font-medium text-nanna-text">1. Create a Slack App</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <ol class="text-sm text-nanna-text-muted space-y-2 list-decimal list-inside">
           <li>Go to the Slack API portal</li>
           <li>Click <strong>"Create New App"</strong> → <strong>"From scratch"</strong></li>
@@ -50,7 +50,7 @@
     <div v-if="step === 2" class="space-y-4">
       <h4 class="font-medium text-nanna-text">2. Configure OAuth Scopes</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           In your Slack app settings, go to <strong>OAuth & Permissions</strong>:
         </p>
@@ -59,7 +59,7 @@
           <li>Add these scopes:</li>
         </ol>
         <div class="flex flex-wrap gap-1 mt-2">
-          <span v-for="scope in requiredScopes" :key="scope" class="text-xs bg-nanna-bg-deep px-2 py-1 rounded font-mono">
+          <span v-for="scope in requiredScopes" :key="scope" class="text-xs glass-tag px-2 py-1 rounded font-mono">
             {{ scope }}
           </span>
         </div>
@@ -81,7 +81,7 @@
     <div v-if="step === 3" class="space-y-4">
       <h4 class="font-medium text-nanna-text">3. Install & Get Bot Token</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <ol class="text-sm text-nanna-text-muted space-y-2 list-decimal list-inside">
           <li>Go back to <strong>OAuth & Permissions</strong></li>
           <li>Click <strong>"Install to Workspace"</strong></li>
@@ -136,7 +136,7 @@
     <div v-if="step === 4" class="space-y-4">
       <h4 class="font-medium text-nanna-text">4. Enable Events & Test</h4>
       
-      <div class="bg-nanna-bg-elevated/40 rounded-lg p-4 space-y-3">
+      <div class="glass-panel rounded-lg p-4 space-y-3">
         <p class="text-sm text-nanna-text-muted">
           Enable Socket Mode for real-time events:
         </p>

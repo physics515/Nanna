@@ -1,7 +1,7 @@
 <template>
   <div class="flex flex-col h-full">
     <!-- Header -->
-    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04] bg-nanna-bg-surface/80">
+    <header class="px-4 sm:px-6 py-3 sm:py-4 border-b border-white/[0.04]">
       <div class="flex items-center justify-between gap-3">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-nanna-text">Channels</h2>
@@ -130,7 +130,7 @@
         </UiCard>
         
         <!-- Config File Info -->
-        <UiCard class="bg-nanna-bg-elevated/30">
+        <UiCard class="glass-well">
           <div class="flex items-start gap-3">
             <FileCode class="w-5 h-5 text-nanna-accent shrink-0 mt-0.5" />
             <div>
@@ -138,7 +138,7 @@
               <p class="text-xs text-nanna-text-dim mb-2">
                 Channel credentials are saved to your config file:
               </p>
-              <code class="block bg-nanna-bg-deep text-nanna-accent text-xs p-2 rounded font-mono break-all">
+              <code class="block glass-well text-nanna-accent text-xs p-2 rounded font-mono break-all">
                 {{ configPath }}
               </code>
             </div>

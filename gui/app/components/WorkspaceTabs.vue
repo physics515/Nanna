@@ -1,5 +1,5 @@
 <template>
-  <div class="flex items-center gap-1 px-2 py-1.5 bg-nanna-bg-deep/50 border-b border-white/[0.04] overflow-x-auto scrollbar-thin">
+  <div class="flex items-center gap-1 px-2 py-1.5 border-b border-white/[0.04] overflow-x-auto scrollbar-thin">
     <!-- Global Tab -->
     <button
       :class="[

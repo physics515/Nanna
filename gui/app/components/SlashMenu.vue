@@ -61,7 +61,9 @@ defineExpose({ onKeyDown })
 
 .slash-menu {
   @apply flex flex-col gap-0.5 p-1.5 rounded-lg min-w-[220px] max-h-[300px] overflow-y-auto;
-  background: rgba(15, 23, 42, 0.95);
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
   border: 1px solid rgba(71, 85, 105, 0.3);
   backdrop-filter: blur(12px);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);

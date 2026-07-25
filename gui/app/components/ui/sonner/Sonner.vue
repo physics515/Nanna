@@ -33,7 +33,9 @@ const toasterProps = computed(() => {
 }
 
 .nanna-sonner [data-sonner-toast] {
-  background: rgba(15, 23, 42, 0.95) !important;
+  background: rgba(15, 23, 42, 0.72) !important;
+  backdrop-filter: blur(28px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(150%) !important;
   border: 1px solid rgba(255, 255, 255, 0.06) !important;
   color: #e2e8f0 !important;
   backdrop-filter: blur(12px);
@@ -72,7 +74,9 @@ const toasterProps = computed(() => {
 /* Error variant */
 .nanna-sonner [data-sonner-toast][data-type="error"] {
   border-color: rgba(251, 113, 133, 0.2) !important;
-  background: rgba(15, 23, 42, 0.95) !important;
+  background: rgba(15, 23, 42, 0.72) !important;
+  backdrop-filter: blur(28px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(150%) !important;
 }
 .nanna-sonner [data-sonner-toast][data-type="error"] [data-title] {
   color: #fb7185 !important;
@@ -81,7 +85,9 @@ const toasterProps = computed(() => {
 /* Warning variant */
 .nanna-sonner [data-sonner-toast][data-type="warning"] {
   border-color: rgba(251, 191, 36, 0.2) !important;
-  background: rgba(15, 23, 42, 0.95) !important;
+  background: rgba(15, 23, 42, 0.72) !important;
+  backdrop-filter: blur(28px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(150%) !important;
 }
 .nanna-sonner [data-sonner-toast][data-type="warning"] [data-title] {
   color: #fbbf24 !important;
@@ -90,7 +96,9 @@ const toasterProps = computed(() => {
 /* Success variant */
 .nanna-sonner [data-sonner-toast][data-type="success"] {
   border-color: rgba(52, 211, 153, 0.2) !important;
-  background: rgba(15, 23, 42, 0.95) !important;
+  background: rgba(15, 23, 42, 0.72) !important;
+  backdrop-filter: blur(28px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(150%) !important;
 }
 .nanna-sonner [data-sonner-toast][data-type="success"] [data-title] {
   color: #34d399 !important;
@@ -99,7 +107,9 @@ const toasterProps = computed(() => {
 /* Info variant */
 .nanna-sonner [data-sonner-toast][data-type="info"] {
   border-color: rgba(34, 211, 238, 0.2) !important;
-  background: rgba(15, 23, 42, 0.95) !important;
+  background: rgba(15, 23, 42, 0.72) !important;
+  backdrop-filter: blur(28px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(150%) !important;
 }
 .nanna-sonner [data-sonner-toast][data-type="info"] [data-title] {
   color: #22d3ee !important;

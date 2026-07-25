@@ -82,11 +82,11 @@
               <span class="text-xs text-nanna-text-dim">Cheapest first — drag to reorder</span>
             </div>
 
-            <div v-if="modelRoutes.length === 0" class="p-4 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30 text-center">
+            <div v-if="modelRoutes.length === 0" class="p-4 rounded-lg glass-panel text-center">
               <p class="text-xs text-nanna-text-dim">No routes configured. Add a route to start saving on API costs.</p>
             </div>
 
-            <div v-for="(route, index) in modelRoutes" :key="index" class="flex items-center gap-2 p-2 rounded-lg bg-nanna-bg-elevated/40 border border-nanna-border/30">
+            <div v-for="(route, index) in modelRoutes" :key="index" class="flex items-center gap-2 p-2 rounded-lg glass-panel">
               <!-- Model select -->
               <UiSelect
                 :model-value="route.model"
@@ -119,7 +119,7 @@
           </div>
 
           <!-- Complexity guide -->
-          <div class="p-3 rounded-lg bg-nanna-bg-elevated/20 border border-nanna-border/20">
+          <div class="p-3 rounded-lg glass-panel">
             <div class="text-xs font-medium text-nanna-text-muted mb-2">Complexity Tiers</div>
             <div class="space-y-1 text-xs text-nanna-text-dim">
               <div><span class="text-nanna-text">⚡ Simple</span> — tool result processing, acknowledgments, straightforward tool calls</div>
@@ -151,7 +151,7 @@
         </div>
 
         <!-- Max Tokens -->
-        <div class="p-3 rounded-lg bg-nanna-bg-elevated/40">
+        <div class="p-3 rounded-lg glass-panel">
           <div class="flex items-center justify-between mb-2">
             <span class="text-sm font-medium text-nanna-text">Max Response Length</span>
             <span class="text-sm text-nanna-accent font-mono">{{ maxTokens.toLocaleString() }}</span>
@@ -160,7 +160,7 @@
             type="range" min="256" max="8192" step="256"
             :value="maxTokens"
             @change="setMaxTokens(Number(($event.target as HTMLInputElement).value))"
-            class="w-full h-2 bg-nanna-bg-deep rounded-lg appearance-none cursor-pointer accent-nanna-primary"
+            class="w-full h-2 glass-well rounded-lg appearance-none cursor-pointer accent-nanna-primary"
           />
           <div class="flex justify-between text-xs text-nanna-text-dim mt-1">
             <span>256</span>
@@ -169,7 +169,7 @@
         </div>
 
         <!-- Agent Loop (long-horizon) -->
-        <div class="p-3 rounded-lg bg-nanna-bg-elevated/40 space-y-3">
+        <div class="p-3 rounded-lg glass-panel space-y-3">
           <div class="flex items-center justify-between">
             <div>
               <span class="text-sm font-medium text-nanna-text">Agent Loop</span>
@@ -196,7 +196,7 @@
                 type="number" min="1" step="100"
                 v-model.number="maxIterations"
                 @change="saveIterationPolicy"
-                class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+                class="w-28 px-2 py-1 text-sm text-right rounded glass-well text-nanna-text font-mono"
               />
             </div>
             <div class="flex items-center justify-between gap-3">
@@ -205,7 +205,7 @@
                 type="number" min="1" step="50"
                 v-model.number="nudgeAfterIterations"
                 @change="saveIterationPolicy"
-                class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+                class="w-28 px-2 py-1 text-sm text-right rounded glass-well text-nanna-text font-mono"
               />
             </div>
             <div class="flex items-center justify-between gap-3">
@@ -214,7 +214,7 @@
                 type="number" min="1" step="25"
                 v-model.number="nudgeIntervalIterations"
                 @change="saveIterationPolicy"
-                class="w-28 px-2 py-1 text-sm text-right rounded bg-nanna-bg-deep text-nanna-text border border-nanna-border font-mono"
+                class="w-28 px-2 py-1 text-sm text-right rounded glass-well text-nanna-text font-mono"
               />
             </div>
           </div>
