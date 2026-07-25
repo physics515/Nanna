@@ -2413,6 +2413,20 @@ skill.
       is the **full streamed prose** (not a summary stub) so history, exports and follow-up context
       read like chat; the `TASK COMPLETE` claim marker is stripped at persistence (content + timeline)
       and at GUI render (`stripHarnessMarkers`) so it never reaches the user even mid-stream.
+- [x] **Tool calls are first-class chat citizens (2026-07-25, owner)** — pinned at both layers:
+      `tool_calls_survive_navigation_via_run_buffers` (sink → run buffers that `get_run_state` serves)
+      and `a_runs_tool_calls_survive_daemon_restart` (timeline journal round-trips through Turso via a
+      fresh `SessionManager::load_from_db`, tool input/output/verdict intact).
+- [x] **Task checklist in the chat (2026-07-25, owner)** — `TaskChecklist.vue`, a collapsible sidebar
+      on the chat page showing the session's live task store (planner-seeded items, the agent's `todo`
+      checklists, interjections flagged `!`), refreshed by the existing `task-event` stream. Read-only
+      by design: the store is the chat engine; mutations happen through chat. The only IPC restored
+      for it is `list_tasks` — the Tasks *page* stays deleted.
+- [x] **Thinking on by default (2026-07-25, owner)** — `[agent] thinking_enabled` defaults **true**.
+      Safe across providers: only Anthropic-native requests carry the thinking budget; Ollama enables
+      `think` by model detection; the OpenAI-compat conversion drops it. NOTE: a config file that
+      explicitly saved `thinking_enabled = false` (any install that touched Settings before this)
+      keeps false — flip it in Settings → Agent.
 
 **Live GUI drive (2026-07-24, gemma4:12b):** planner does NOT over-decompose — "what is 2+2?" planned
 as 1 task (origin=Model); an 817-char project brief hit the 30s planner timeout while the model was

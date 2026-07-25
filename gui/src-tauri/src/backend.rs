@@ -503,6 +503,10 @@ daemon_proxies! {
     channel_list();
     /// Get channel status
     channel_status(id: Option<&str>);
+
+    // --- Task store (read-only view for the chat's checklist) ---
+    /// List tasks in a scope
+    task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>);
 }
 
 impl Default for Backend {

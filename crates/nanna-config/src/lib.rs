@@ -221,7 +221,10 @@ impl Default for AgentConfig {
             personality_mode: "balanced".to_string(),
             persona: None,
             user_profile: None,
-            thinking_enabled: false,
+            // On by default: models that support thinking should show it
+            // (the request layer only sends thinking where the provider
+            // supports it — Ollama detects by model, OpenAI-compat drops it).
+            thinking_enabled: true,
             streaming_enabled: true,
             max_iterations: None,
             nudge_after_iterations: default_nudge_after(),

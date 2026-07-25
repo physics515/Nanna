@@ -1293,6 +1293,19 @@ impl DaemonClient {
             "id": id
         })).await
     }
+
+    /// List tasks in a scope. The chat's task checklist reads the store this
+    /// way — the store is the chat engine (P19), so the checklist is a view
+    /// of the live run, not a separate task UI.
+    pub async fn task_list(&self, scope: &str, session_id: Option<&str>, include_closed: Option<bool>) -> Result<Value, String> {
+        self.request(serde_json::json!({
+            "type": "task",
+            "action": "list",
+            "scope": scope,
+            "session_id": session_id,
+            "include_closed": include_closed
+        })).await
+    }
 }
 
 /// Connection status for frontend

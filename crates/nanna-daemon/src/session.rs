@@ -1151,6 +1151,78 @@ mod tests {
         assert_eq!(s.messages.len(), before, "session left unchanged");
     }
 
+    /// REGRESSION (P19): a run's tool calls are first-class citizens of the
+    /// chat — they must survive not just navigation (see
+    /// `tasks::tests::tool_calls_survive_navigation_via_run_buffers`) but a
+    /// full daemon restart. The timeline journal persisted with the message
+    /// must round-trip through Turso intact: a fresh SessionManager over the
+    /// same database restores the message with its tool call, input, output
+    /// and verdict in place.
+    #[tokio::test]
+    async fn a_runs_tool_calls_survive_daemon_restart() {
+        let storage = Arc::new(nanna_storage::Storage::in_memory().await.expect("storage"));
+        let manager = SessionManager::with_storage(storage.clone());
+        let session = manager.create(Some("restart-proof".to_string())).await;
+
+        let at = Utc::now().to_rfc3339();
+        let timeline = vec![
+            TimelineItem::Thinking {
+                content: "which files exist?".to_string(),
+                at: at.clone(),
+            },
+            TimelineItem::Tool {
+                call_id: "c1".to_string(),
+                name: "exec".to_string(),
+                input: Some(serde_json::json!({"cmd": "ls"})),
+                output: Some("file.txt".to_string()),
+                success: Some(true),
+                duration_ms: Some(12),
+                tokens: None,
+                total_tokens: None,
+                at: at.clone(),
+            },
+            TimelineItem::Text {
+                content: "there is one file: file.txt".to_string(),
+                at,
+            },
+        ];
+        manager
+            .add_full_message(
+                &session.id,
+                MessageRole::Assistant,
+                "there is one file: file.txt",
+                Vec::new(),
+                None,
+                timeline,
+                None,
+            )
+            .await;
+
+        // "Restart": a brand-new manager over the same database, exactly what
+        // daemon startup does via load_from_db.
+        let reborn = SessionManager::with_storage(storage);
+        assert!(reborn.load_from_db().await >= 1, "session loads from Turso");
+
+        let restored = reborn.get(&session.id).await.expect("session survives restart");
+        let msg = restored
+            .messages
+            .last()
+            .expect("assistant message survives restart");
+        assert_eq!(msg.content, "there is one file: file.txt");
+        assert_eq!(msg.timeline.len(), 3, "the full journal round-trips");
+        assert!(matches!(
+            &msg.timeline[1],
+            TimelineItem::Tool {
+                call_id,
+                input: Some(input),
+                output: Some(output),
+                success: Some(true),
+                duration_ms: Some(12),
+                ..
+            } if call_id == "c1" && input["cmd"] == "ls" && output == "file.txt"
+        ));
+    }
+
     #[tokio::test]
     async fn test_peek_mailbox_is_non_destructive() {
         let manager = SessionManager::new();

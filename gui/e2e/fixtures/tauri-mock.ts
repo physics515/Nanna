@@ -521,6 +521,9 @@ function installInPage(options = {}) {
       case 'validate_cron_expression':
         return { valid: true, next: nowIso() };
 
+      case 'list_tasks':
+        return { tasks: [] };
+
       case 'get_model_stats':
         return { ...state.modelStats };
       case 'get_global_stats':
