@@ -1679,10 +1679,16 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             stray-dim vector) — guards with `octet_length(embedding) = dims*4` so mixed-dimension stores skip
             rather than fail. 4 tests: **ranking parity with an independent in-RAM cosine scan**, LIMIT +
             NULL-skip, the dimension guard, and workspace scope. 82 nanna-storage tests green, new code
-            clippy/fmt-clean. **Still the remaining work:** the *latency/RAM comparison* on the
-            `nanna-memory::retention` harness (this proves ranking parity + the RAM-ceiling escape, not the
-            wall-clock trade), and the **decision to wire it into the live recall path** vs the current
-            `bulk_load`+SIMD scan — only after that measurement does the ANN-crate question reopen.
+            clippy/fmt-clean.
+            *(2026-07-25, ranking parity extended to realistic data)* `crates/nanna-daemon/tests/sql_knn_retention.rs`
+            takes the memory crate's `RetentionCorpus` (8 topic centroids × 12 jittered members, 64-dim —
+            the same generator the recall harness uses), persists it to Turso, and asserts for every centroid
+            probe that SQL k-NN's nearest neighbour is the **same memory** an independent in-RAM cosine scan
+            picks **and** is in the probe's own topic cluster. So exact SQL k-NN is a faithful drop-in for the
+            in-RAM scan on realistic embeddings, not just a hand-built spread. **Still the remaining work:** the
+            *latency/RAM comparison* (wall-clock trade; needs the not-yet-built `nanna-bench` harness, release
+            profile), and the **decision to wire it into the live recall path** vs the current `bulk_load`+SIMD
+            scan — only after that measurement does the ANN-crate question reopen.
       - [x] *(2026-07-25)* **`MemoryRepository::delete`/`bulk_delete` now destroy the embedding on disk — the
             "today, before any HNSW" half of Ghost Vectors is closed.** Proven, not assumed: the negative
             control test (`raw_delete_leaves_embedding_on_disk`) confirms a plain `DELETE` **does** leave the
