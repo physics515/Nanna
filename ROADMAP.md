@@ -2526,7 +2526,7 @@ model masks. Measured on the 5-task smoke suite, same model, same seed tasks:
 **Principle earned:** *a guard the model cannot satisfy is a wedge.* Refuse only when the model can
 act on the refusal; otherwise repair and say so.
 
-**REGRESSION — self-verification kills the harness (2026-07-25, blocks the eval).** The self-check
+**FIXED — self-verification killed the harness (2026-07-25).** The self-check
 instruction above works: models now genuinely run their own acceptance command
 (`DEBUG Executing tool: exec … {"command":"sh tests/test_05.sh"}`). But running it **through the
 `exec` tool kills the test process** — exit `0xffffffff`, no panic, no watchdog involvement.
@@ -2542,11 +2542,13 @@ The same command is safe through the acceptance runner, which spawns via
 zero crashes). The difference is isolation: `builtin/exec.rs:112` does a bare `Command::new(shell)`
 with no process-group separation, so a child that terminates its group takes the harness with it.
 
-**Fix before re-running the eval** — isolate the exec child (`CREATE_NEW_PROCESS_GROUP` on Windows /
-`setsid` on unix), so model-generated code can never kill the harness driving it. This is a real
-robustness hole independent of the eval: any agent that writes and runs a script can currently take
-down its own daemon. Until then the self-check instruction is effectively a footgun, and every
-endurance rung dies in ~2 minutes.
+**Fixed** in `nanna-scripting/src/bridge.rs`: the exec child is now spawned isolated
+(`CREATE_NEW_PROCESS_GROUP` on Windows, `process_group(0)` on unix), so model-generated code can
+never kill the agent driving it — and the timeout tree-kill now bounds exactly the subtree we
+created rather than potentially walking up into us. Pinned by
+`a_child_that_kills_its_process_group_cannot_kill_us`, which drives the real exec path with a child
+that terminates its own group; surviving to read the result IS the assertion. This was a real hole
+independent of the eval: any agent that writes and runs a script could take down its own daemon.
 
 **Open:** `live_endurance` leaves a **zombie process** — observed alive ~1.5 h after printing its final
 summary, holding `live_long_horizon-*.exe` and failing every later build with `LNK1104`. The test
