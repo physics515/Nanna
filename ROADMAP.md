@@ -503,6 +503,18 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       `host` explicitly now, which is exactly the opt-in this item asked for.
 - [ ] Add authentication for any non-local control plane.
 - [ ] Verify webhook signature validation across all channels (Telegram secret, WhatsApp verification, Signal bridge trust, replay protection).
+      - [x] *(2026-07-25)* **Slack HMAC verification in `nanna-server` (the `nanna serve` path) hardened to
+            match the daemon's.** The daemon copy (`nanna-daemon/src/webhook.rs`) was already correct
+            (raw-body HMAC + `verify_slice` constant-time + replay guard), but the `nanna-server` copy had
+            **drifted** in two ways: it hashed `std::str::from_utf8(body).unwrap_or("")` — so a **non-UTF-8
+            body was silently HMAC'd as empty**, letting a mangled payload verify against a signature
+            computed over nothing — and it used a **hand-rolled hex-string** comparison instead of the MAC
+            primitive. Rewrote it to `mac.update(body)` (raw bytes) + `mac.verify_slice(&hex::decode(v0…))`,
+            matching the daemon. Added the first tests for this function (6): valid accepts, tampered body
+            rejects, stale timestamp rejects, wrong secret rejects, **non-UTF-8 body verifies correctly**
+            (the regression guard), and missing-`v0=`/empty-input rejects. nanna-server green. *(Still open
+            on this line: the Telegram secret / WhatsApp / Signal paths, and folding the duplicated Slack/
+            Discord verifiers so daemon and server can't drift again.)*
 - [x] Unify ProjectDirs namespaces — config and credentials must use the same ("com", "nanna", "nanna") (or equivalent) namespace.
       *(2026-07-24)* Done — see the namespace-unification item above.
 - [ ] Run gitleaks detect --source . and trufflehog git file://. across full git history.
