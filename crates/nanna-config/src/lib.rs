@@ -351,8 +351,12 @@ pub struct WhatsAppConfig {
     pub phone_number_id: Option<String>,
     /// Access token (for Cloud API)
     pub access_token: Option<String>,
-    /// Webhook verify token (for Cloud API)
+    /// Webhook verify token (for Cloud API — the GET subscription handshake)
     pub verify_token: Option<String>,
+    /// App secret (for Cloud API — HMAC key for the `X-Hub-Signature-256` on
+    /// inbound POST payloads). Without it, POSTs to the webhook are unauthenticated.
+    #[serde(default)]
+    pub app_secret: Option<String>,
     /// Session name (for Web bridge)
     pub session_name: Option<String>,
     /// Allowed phone numbers (None = allow all)

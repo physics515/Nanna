@@ -524,9 +524,22 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
             the GET subscription handshake's verify-token check from `==` to the constant-time
             `webhook_secret_matches`. 4 tests (valid accepts; tamper/wrong-secret/no-prefix/missing/empty
             reject; **non-UTF-8 body verifies** — WhatsApp media notifications aren't guaranteed UTF-8).
-            *(Config plumbing note: `whatsapp_app_secret` is populated at the same maturity as the existing
-            `whatsapp_verify_token` — neither is yet mapped from the user `Config` into `WebhookConfig`; that
-            end-to-end wiring is the remaining piece for all webhook secrets.)*
+            *(Config plumbing — closed the same day, see below.)*
+      - [x] *(2026-07-25)* **Webhook signature verification was entirely DORMANT — the daemon never received
+            the secrets. Now wired.** `DaemonBuilder::with_webhook_config` was never called and
+            `DaemonConfig.webhook` was only ever `WebhookConfig::default()` (all-None), so **every** provider's
+            verification silently no-op'd (the handlers logged "not configured - skipping") no matter what the
+            user set — the whole webhook-auth surface (mine + the pre-existing Discord/Slack verifiers) was
+            unreachable. `from_nanna_config` now calls a pure, tested `apply_channel_webhook_secrets(webhook,
+            channels)` that copies `channels.discord.public_key` → `discord_public_key`,
+            `channels.slack.signing_secret` → `slack_signing_secret`, and `channels.whatsapp.{verify_token,
+            app_secret}` → the WhatsApp fields. Added `app_secret` to `WhatsAppConfig` (serde-default, so old
+            configs deserialize). Telegram is intentionally excluded — its `TelegramConfig` has no webhook
+            secret (bot-token-in-URL auth), only the bot token (wired for outbound). 2 tests (all configured
+            providers flow through; absent channels leave secrets unset). This is what makes Discord/Slack/
+            WhatsApp webhook verification actually *enforce* for a configured user. *(Still open: the GUI/
+            embedded and legacy `serve.rs` paths build `WebhookConfig::default()` directly and don't call the
+            mapper; and Telegram/generic secrets still have no config home.)*
       - [x] *(2026-07-25)* **Telegram webhook secret now compared constant-time (daemon).** The daemon
             checked the `X-Telegram-Bot-Api-Secret-Token` with a plain `!=`, which short-circuits on the
             first wrong byte and leaks match progress through response timing — inconsistent with the
