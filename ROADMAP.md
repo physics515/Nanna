@@ -2475,6 +2475,20 @@ model masks. Measured on the 5-task smoke suite, same model, same seed tasks:
 | tokens per completed item | 69,846 | **25,296** |
 | wall clock | ~15 min | **53 s** |
 
+- [x] **NEVER GATE TOOLS (owner directive, 2026-07-25)** — *"it should be able to get any tool
+      regardless of task. never gate tools."* The scope restriction below originally dropped
+      `discover_tools` too, which is the model's only route to the rest of the registry: that was a
+      cage, not focus. `discover_tools` is now sent on **every request in every mode**
+      (`DISCOVERY_TOOL_NAME`, pinned by 2 tests). A scope trims default *context* — the memory trio
+      `remember`/`recall`/`reflect`, which is noise during execution — and never trims *capability*;
+      everything stays reachable on demand.
+- [x] **The model runs its own acceptance check** (`AcceptanceCheck::self_check_command`) — measured
+      live: gemma4:12b ran its acceptance command **zero times in two hours** on the 42-feature
+      ladder, though the prompt named it. It edited blind, learned the verdict only at the step
+      boundary, and re-submitted the same broken implementation (`FAIL(test_05)` verbatim, repeatedly).
+      Command-backed checks now tell the step to run the check itself and iterate until it passes —
+      turning a minutes-long feedback loop into a seconds-long one. Pure file/regex checks get no
+      synthesized command (inventing one would put words in the check's mouth).
 - [x] **Explicit tool scopes are honoured exactly** (`RunOptions::restrict_to_active_tools`) —
       `CORE_TOOL_NAMES` (`remember`/`recall`/`reflect`/`discover_tools`) was unioned into EVERY request,
       so a step scoped to three tools actually saw ~8. The first tool-loop nudge of the endurance run

@@ -17,6 +17,36 @@ use uuid::Uuid;
 /// Core tools always sent to the LLM. Everything else is discoverable via `discover_tools`.
 const CORE_TOOL_NAMES: &[&str] = &["remember", "recall", "reflect", "discover_tools"];
 
+/// The one tool that is ALWAYS sent, on every request, in every mode.
+///
+/// It is how the model reaches every other tool in the registry, so dropping
+/// it is the one omission that would actually gate capability rather than
+/// merely trim context. Owner directive: never gate tools.
+const DISCOVERY_TOOL_NAME: &str = "discover_tools";
+
+/// Which tool definitions go out with a request.
+///
+/// A scope is a STARTING SET, never a cage: [`DISCOVERY_TOOL_NAME`] is
+/// included unconditionally so the model can pull in anything it turns out to
+/// need — an `edit_file` for a surgical change, a `code_search` to find a call
+/// site. Owner directive (2026-07-25): *"it should be able to get any tool
+/// regardless of task. never gate tools."*
+///
+/// What a pinned scope DOES drop is the always-on memory trio
+/// (`remember`/`recall`/`reflect`), which is noise during an execution step
+/// and measurably costs a small model accuracy. Those stay reachable through
+/// discovery like everything else, so capability is never gated — only the
+/// default context is trimmed.
+fn tool_names_for_request(active_tools: &HashSet<String>, restrict: bool) -> HashSet<String> {
+    let mut names: HashSet<String> = if restrict && !active_tools.is_empty() {
+        std::iter::once(DISCOVERY_TOOL_NAME.to_string()).collect()
+    } else {
+        CORE_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect()
+    };
+    names.extend(active_tools.iter().cloned());
+    names
+}
+
 /// Thinking mode for extended reasoning
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkingMode {
@@ -263,18 +293,18 @@ pub struct RunOptions {
     /// hint, not the whole registry — small models degrade past 5-10
     /// definitions). Ignored when `all_tools_active` is set.
     pub initial_active_tools: Vec<String>,
-    /// Send ONLY `initial_active_tools` — suppress the always-on core set
-    /// (`remember` / `recall` / `reflect` / `discover_tools`).
+    /// Start from `initial_active_tools` instead of the full core set —
+    /// dropping the memory trio (`remember` / `recall` / `reflect`), which is
+    /// noise during an execution step and measurably costs a small model
+    /// accuracy.
     ///
-    /// An explicitly scoped step has already had its discovery done for it by
-    /// whoever wrote the scope, so `discover_tools` is not an escape hatch
-    /// there — it is a fifth option competing with the four tools that
-    /// actually do the work. Observed live (lfm2.5, endurance round 1): the
-    /// model burned steps re-running `discover_tools` for tools it already
-    /// held, tripping the tool-loop detector, and called `write_file` once in
-    /// 487 steps. The bound is not a magic number: it is "honour the caller's
-    /// explicit scope exactly". Ignored when the scope is empty (nothing to
-    /// restrict to) or `all_tools_active` is set.
+    /// **This never gates capability.** `discover_tools` is sent on every
+    /// request regardless of this flag, so the model can always pull in any
+    /// tool in the registry the moment it needs one. A scope is a starting
+    /// set, not a cage — see [`DISCOVERY_TOOL_NAME`].
+    ///
+    /// Ignored when the scope is empty (nothing to start from) or
+    /// `all_tools_active` is set.
     pub restrict_to_active_tools: bool,
     /// Wall-clock budget for this run (P14 bounded blast radius).
     /// Exceeding it ends the run with `truncated = true`.
@@ -3460,17 +3490,7 @@ impl Agent {
     ) -> AnthropicRequest {
         let ctx = self.context.read().await;
 
-        // Build the set of tool names to send: core + any activated via
-        // discover_tools — unless the caller pinned an exact scope, in which
-        // case the core discovery/memory tools are omitted so the model sees
-        // only the tools its item actually needs (see
-        // `RunOptions::restrict_to_active_tools`).
-        let mut names: HashSet<String> = if restrict_to_active && !active_tools.is_empty() {
-            HashSet::new()
-        } else {
-            CORE_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect()
-        };
-        names.extend(active_tools.iter().cloned());
+        let names = tool_names_for_request(active_tools, restrict_to_active);
 
         let tool_defs = self.tools.definitions_for_names(&names).await;
 
@@ -4166,6 +4186,52 @@ mod tests {
         ));
         assert!(!mission_claims_complete("The mission is complete-ish"));
         assert!(!mission_claims_complete(""));
+    }
+
+    // -----------------------------------------------------------------
+    // Tool availability — a scope is a starting set, never a cage
+    // -----------------------------------------------------------------
+
+    fn scope(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Owner directive (2026-07-25): "it should be able to get any tool
+    /// regardless of task. never gate tools." A pinned scope trims the
+    /// default context, but `discover_tools` must survive every mode — it is
+    /// the model's route to every other tool in the registry.
+    #[test]
+    fn discover_tools_is_sent_in_every_mode() {
+        let pinned = tool_names_for_request(&scope(&["write_file", "exec"]), true);
+        assert!(
+            pinned.contains("discover_tools"),
+            "a pinned scope must still be able to reach any other tool"
+        );
+
+        let unpinned = tool_names_for_request(&scope(&["write_file"]), false);
+        assert!(unpinned.contains("discover_tools"));
+
+        // Degenerate case: an empty scope has nothing to start from, so the
+        // full core set applies rather than leaving the model with nothing.
+        let empty = tool_names_for_request(&HashSet::new(), true);
+        assert!(empty.contains("discover_tools"));
+        for core in CORE_TOOL_NAMES {
+            assert!(empty.contains(*core), "empty scope keeps the core set");
+        }
+    }
+
+    #[test]
+    fn a_pinned_scope_keeps_its_own_tools_and_drops_only_the_memory_trio() {
+        let names = tool_names_for_request(&scope(&["write_file", "exec", "todo"]), true);
+        for wanted in ["write_file", "exec", "todo", "discover_tools"] {
+            assert!(names.contains(wanted), "{wanted} must be present");
+        }
+        for trimmed in ["remember", "recall", "reflect"] {
+            assert!(
+                !names.contains(trimmed),
+                "{trimmed} is context noise for an execution step (still reachable via discovery)"
+            );
+        }
     }
 
     #[test]
