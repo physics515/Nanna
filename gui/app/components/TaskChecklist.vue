@@ -47,13 +47,26 @@
             <XCircle v-else-if="task.status === 'cancelled'" class="w-3.5 h-3.5" />
             <Circle v-else class="w-3.5 h-3.5" />
           </span>
-          <span
-            class="task-title"
-            :class="{
-              'line-through text-nanna-text-dim': task.status === 'done' || task.status === 'cancelled',
-              'text-nanna-text': task.status === 'in_progress',
-            }"
-          >{{ task.title }}</span>
+          <span class="flex-1 min-w-0">
+            <span
+              class="task-title"
+              :class="{
+                'line-through text-nanna-text-dim': task.status === 'done' || task.status === 'cancelled',
+                'text-nanna-text': task.status === 'in_progress',
+              }"
+            >{{ task.title }}</span>
+            <!-- Whose responsibility: the store's assignee. Sub-agents own
+                 items they were delegated; unassigned items are Nanna's. -->
+            <span
+              v-if="assigneeLabel(task)"
+              class="owner"
+              :class="isDelegated(task) ? 'owner-agent' : 'owner-self'"
+              :title="`Owner: ${task.assignee}`"
+            >
+              <Bot v-if="isDelegated(task)" class="w-3 h-3" />
+              {{ assigneeLabel(task) }}
+            </span>
+          </span>
           <span v-if="task.priority === 1 && task.status !== 'done'" class="prio" title="Interjected / urgent">!</span>
         </div>
       </div>
@@ -65,7 +78,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { CheckCircle2, ChevronRight, Circle, ListChecks, Loader2, XCircle } from 'lucide-vue-next'
+import { Bot, CheckCircle2, ChevronRight, Circle, ListChecks, Loader2, XCircle } from 'lucide-vue-next'
 
 interface TaskItem {
   id: number
@@ -74,6 +87,8 @@ interface TaskItem {
   description?: string | null
   status: string
   priority: number
+  /// Who owns this item: "chat" (Nanna's own run) or a sub-agent label.
+  assignee?: string | null
   completed_at?: string | null
 }
 
@@ -82,6 +97,18 @@ const props = defineProps<{ sessionId: string }>()
 const tasks = ref<TaskItem[]>([])
 const collapsed = ref(false)
 const doneCount = computed(() => tasks.value.filter(t => t.status === 'done').length)
+
+// The harness runs chat items as actor "chat"; anything else was delegated
+// (a sub-agent, the scheduler, a channel). Only the delegations are worth
+// labelling — tagging every row "chat" would be noise.
+function isDelegated(task: TaskItem): boolean {
+  const owner = task.assignee?.trim()
+  return !!owner && owner !== 'chat'
+}
+
+function assigneeLabel(task: TaskItem): string {
+  return isDelegated(task) ? (task.assignee as string) : ''
+}
 
 function glyphClass(status: string): string {
   switch (status) {
@@ -208,5 +235,24 @@ watch(() => props.sessionId, () => { tasks.value = []; void load() })
   font-weight: 700;
   font-size: 11px;
   color: rgb(251 191 36);
+}
+.owner {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.owner-agent {
+  color: rgb(129 140 248);
+  background: rgba(129, 140, 248, 0.12);
+}
+.owner-self {
+  color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.7));
 }
 </style>

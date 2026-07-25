@@ -295,8 +295,8 @@ pub fn run() {
             commands::settings::set_model_routing,
             commands::settings::get_routing_first_turn_primary,
             commands::settings::set_routing_first_turn_primary,
-            commands::settings::get_sub_agent_model,
-            commands::settings::set_sub_agent_model,
+            commands::settings::get_sub_agent_models,
+            commands::settings::set_sub_agent_models,
             // Model status
             commands::system::get_model_status,
             commands::system::get_model_stats,

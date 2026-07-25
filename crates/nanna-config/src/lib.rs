@@ -137,10 +137,37 @@ pub struct LlmConfig {
     pub model_routing: Vec<String>,
     /// Whether to always use the primary model for the first iteration. Default: true.
     pub routing_first_turn_primary: bool,
-    /// Model to use for sub-agent tasks (optional).
-    /// When set, sub-agents spawned via the `task` tool use this cheaper model
-    /// instead of the primary model. Format: "provider/model" e.g. "ollama/qwen3:4b"
+    /// Legacy single sub-agent model. Superseded by `sub_agent_models`; kept
+    /// so configs saved before the list existed keep working — see
+    /// [`LlmConfig::effective_sub_agent_models`]. The GUI clears it when the
+    /// list is saved.
     pub sub_agent_model: Option<String>,
+    /// Model priority list for sub-agents spawned via the `task` tool: first
+    /// working model wins, failures fall back to the next in the list.
+    /// Empty = sub-agents use the main chat list (`model_priority`).
+    /// Format: ["ollama/qwen3:4b", "claude-haiku-3-5"]
+    pub sub_agent_models: Vec<String>,
+}
+
+impl LlmConfig {
+    /// The model list sub-agents actually run with, in fallback order:
+    /// `sub_agent_models` when set, else the legacy single `sub_agent_model`,
+    /// else the main chat list, else the single primary `model`. Never empty.
+    #[must_use]
+    pub fn effective_sub_agent_models(&self) -> Vec<String> {
+        if !self.sub_agent_models.is_empty() {
+            return self.sub_agent_models.clone();
+        }
+        if let Some(ref legacy) = self.sub_agent_model {
+            if !legacy.is_empty() {
+                return vec![legacy.clone()];
+            }
+        }
+        if !self.model_priority.is_empty() {
+            return self.model_priority.clone();
+        }
+        vec![self.model.clone()]
+    }
 }
 
 impl Default for LlmConfig {
@@ -163,7 +190,8 @@ impl Default for LlmConfig {
             ollama_api_key: None,
             model_routing: vec![], // Empty = disabled (always use primary model)
             routing_first_turn_primary: true,
-            sub_agent_model: None, // None = use primary model for sub-agents
+            sub_agent_model: None, // Legacy — see sub_agent_models
+            sub_agent_models: vec![], // Empty = fall back to model_priority
         }
     }
 }
@@ -716,6 +744,65 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Sub-agent model fallback chain
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sub_agent_models_win_when_set() {
+        let mut llm = LlmConfig::default();
+        llm.model_priority = vec!["chat-a".into(), "chat-b".into()];
+        llm.sub_agent_models = vec!["sub-a".into(), "sub-b".into()];
+        assert_eq!(
+            llm.effective_sub_agent_models(),
+            vec!["sub-a".to_string(), "sub-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_sub_agent_list_falls_back_to_the_chat_list() {
+        let mut llm = LlmConfig::default();
+        llm.model_priority = vec!["chat-a".into(), "chat-b".into()];
+        assert_eq!(
+            llm.effective_sub_agent_models(),
+            vec!["chat-a".to_string(), "chat-b".to_string()],
+            "no dedicated sub-agent models = follow the main chat chain"
+        );
+    }
+
+    #[test]
+    fn the_legacy_single_model_still_works_and_is_outranked_by_the_list() {
+        let mut llm = LlmConfig::default();
+        llm.model_priority = vec!["chat-a".into()];
+        llm.sub_agent_model = Some("legacy-sub".into());
+        assert_eq!(
+            llm.effective_sub_agent_models(),
+            vec!["legacy-sub".to_string()],
+            "a config saved before the list existed keeps its behaviour"
+        );
+
+        llm.sub_agent_models = vec!["new-sub".into()];
+        assert_eq!(
+            llm.effective_sub_agent_models(),
+            vec!["new-sub".to_string()],
+            "the list supersedes the legacy field"
+        );
+    }
+
+    #[test]
+    fn the_chain_is_never_empty() {
+        let llm = LlmConfig::default();
+        assert_eq!(
+            llm.effective_sub_agent_models(),
+            vec![llm.model.clone()],
+            "with nothing configured, sub-agents still get the primary model"
+        );
+        // An empty-string legacy value must not become a bogus candidate.
+        let mut blank = LlmConfig::default();
+        blank.sub_agent_model = Some(String::new());
+        assert_eq!(blank.effective_sub_agent_models(), vec![blank.model.clone()]);
+    }
 
     #[test]
     fn save_to_strips_secrets_from_disk() {

@@ -561,7 +561,7 @@ function installInPage(options = {}) {
       case 'set_summarization_model_priority':
       case 'set_ocr_model_priority':
       case 'set_embedding_config':
-      case 'set_sub_agent_model':
+      case 'set_sub_agent_models':
       case 'set_personality_mode':
       case 'set_agent_iteration_policy':
       case 'set_claude_proxy':
@@ -569,8 +569,8 @@ function installInPage(options = {}) {
       case 'set_ollama_api_key':
       case 'set_use_embedded_ocr':
         return true;
-      case 'get_sub_agent_model':
-        return state.config.model;
+      case 'get_sub_agent_models':
+        return [];
       case 'get_use_embedded_ocr':
         return true;
       case 'get_anthropic_models':

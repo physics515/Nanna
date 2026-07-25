@@ -1747,36 +1747,51 @@ pub async fn set_routing_first_turn_primary(
     Ok(())
 }
 
-/// Get sub-agent model
+/// Get the sub-agent model priority list (raw stored value; the legacy single
+/// `sub_agent_model` is folded in so pre-list configs show what they run).
 #[tauri::command]
-pub async fn get_sub_agent_model(
+pub async fn get_sub_agent_models(
     state: State<'_, Arc<RwLock<AppState>>>,
-) -> Result<Option<String>, String> {
+) -> Result<Vec<String>, String> {
     let state_guard = state.read().await;
-    Ok(state_guard.config.llm.sub_agent_model.clone())
+    let llm = &state_guard.config.llm;
+    if llm.sub_agent_models.is_empty() {
+        if let Some(ref legacy) = llm.sub_agent_model {
+            if !legacy.is_empty() {
+                return Ok(vec![legacy.clone()]);
+            }
+        }
+    }
+    Ok(llm.sub_agent_models.clone())
 }
 
-/// Set sub-agent model (None = use primary model)
+/// Set the sub-agent model priority list. Empty = sub-agents use the main
+/// chat model list. Saving migrates away the legacy single-model field.
 #[tauri::command]
-pub async fn set_sub_agent_model(
+pub async fn set_sub_agent_models(
     state: State<'_, Arc<RwLock<AppState>>>,
-    model: Option<String>,
+    models: Vec<String>,
 ) -> Result<(), String> {
     let mut state_guard = state.write().await;
-    // Treat empty string as None
-    let model = model.filter(|m| !m.is_empty());
-    state_guard.config.llm.sub_agent_model = model.clone();
+    state_guard.config.llm.sub_agent_models = models.clone();
+    // The list is now the source of truth — a lingering single would
+    // resurrect itself whenever the list is cleared.
+    state_guard.config.llm.sub_agent_model = None;
 
     state_guard.config.save()
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
     // Propagate to the daemon
     let _ = state_guard.backend.config_set(
+        "llm.sub_agent_models",
+        serde_json::json!(models),
+    ).await;
+    let _ = state_guard.backend.config_set(
         "llm.sub_agent_model",
-        model.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+        serde_json::Value::Null,
     ).await;
 
-    info!("Sub-agent model set: {:?}", state_guard.config.llm.sub_agent_model);
+    info!("Sub-agent models set: {:?}", state_guard.config.llm.sub_agent_models);
     Ok(())
 }
 

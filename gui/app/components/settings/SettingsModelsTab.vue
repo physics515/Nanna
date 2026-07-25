@@ -192,6 +192,28 @@
         </div>
       </div>
 
+      <!-- Sub-Agent Models -->
+      <div class="mt-6 pt-6 border-t border-white/[0.04]">
+        <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
+          <Bot class="w-4 h-4" />
+          Sub-Agent Models
+        </h3>
+        <p class="text-xs text-nanna-text-dim mb-3">
+          Models for delegated sub-agents (the <code>task</code> tool). First working model wins; failures fall back down the list. Use cheaper/local models here to cut costs on delegated work.
+        </p>
+        <ModelPriorityList
+          label="Sub-Agent Model Priority"
+          hint="Empty = sub-agents use the chat model list above."
+          :all-models="allChatModels"
+          v-model="subAgentModelPriority"
+          @update:model-value="saveSubAgentModelPriority"
+        />
+        <div class="mt-3">
+          <UiBadge v-if="subAgentModelPriority.length > 0" variant="success">✓ {{ subAgentModelPriority.length }} dedicated sub-agent model{{ subAgentModelPriority.length !== 1 ? 's' : '' }}</UiBadge>
+          <UiBadge v-else variant="default">Following the chat model list</UiBadge>
+        </div>
+      </div>
+
       <!-- Summarization Models -->
       <div class="mt-6 pt-6 border-t border-white/[0.04]">
         <h3 class="text-sm font-semibold text-nanna-primary mb-3 flex items-center gap-2">
@@ -292,7 +314,7 @@ import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import {
   Key, CheckCircle, XCircle, LogOut, Terminal, Download, RefreshCw,
-  Brain, AlertTriangle, Layers, Link, ScanText
+  Brain, AlertTriangle, Layers, Link, ScanText, Bot
 } from 'lucide-vue-next'
 import { useSettingsPage } from '~/composables/useSettingsPage'
 
@@ -316,6 +338,7 @@ const ollamaApiKeyInput = ref('')
 const chatModelPriority = ref<string[]>([])
 const embeddingModelPriority = ref<string[]>([])
 const summarizationModelPriority = ref<string[]>([])
+const subAgentModelPriority = ref<string[]>([])
 
 // OCR settings
 const ocrModelPriority = ref<string[]>([])
@@ -374,6 +397,11 @@ store.onSettingsLoaded(async () => {
     ocrModelPriority.value = []
   }
   try {
+    subAgentModelPriority.value = await invoke<string[]>('get_sub_agent_models')
+  } catch {
+    subAgentModelPriority.value = []
+  }
+  try {
     useEmbeddedOcr.value = await invoke<boolean>('get_use_embedded_ocr')
   } catch {
     useEmbeddedOcr.value = true
@@ -406,6 +434,15 @@ async function saveEmbeddingModelPriority(priority: string[]) {
   try {
     await invoke('set_embedding_model_priority', { priority })
     showToast('Embedding model priority saved', 'success')
+  } catch (e: any) {
+    showToast(`Couldn't save: ${e.message || e}`, 'error')
+  }
+}
+
+async function saveSubAgentModelPriority(priority: string[]) {
+  try {
+    await invoke('set_sub_agent_models', { models: priority })
+    showToast(priority.length > 0 ? 'Sub-agent models saved' : 'Sub-agents will use the chat model list', 'success')
   } catch (e: any) {
     showToast(`Couldn't save: ${e.message || e}`, 'error')
   }

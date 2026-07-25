@@ -42,18 +42,14 @@
       advanced
     >
       <div class="space-y-4">
-        <!-- Sub-agent model -->
-        <div class="flex items-center justify-between">
-          <div>
-            <div class="text-sm font-medium text-nanna-text">Sub-Agent Model</div>
-            <div class="text-xs text-nanna-text-dim">Cheaper model for delegated sub-tasks</div>
+        <!-- Sub-agent models live in Settings → Models as a priority list
+             (with fallbacks), alongside the chat/summarization/OCR chains. -->
+        <div>
+          <div class="text-sm font-medium text-nanna-text">Sub-Agent Models</div>
+          <div class="text-xs text-nanna-text-dim">
+            Delegated sub-tasks run their own model fallback chain — set it under
+            <span class="text-nanna-primary">Models → Sub-Agent Models</span>.
           </div>
-          <UiSelect
-            :model-value="subAgentModel || ''"
-            @update:model-value="saveSubAgentModel($event)"
-            :options="[{ value: '', label: 'Same as primary' }, ...routingModelOptions]"
-            class="w-64"
-          />
         </div>
 
         <!-- Enable routing -->
@@ -251,7 +247,6 @@ interface RouteEntry {
 const modelRoutes = ref<RouteEntry[]>([])
 const routingEnabled = ref(false)
 const routingFirstTurnPrimary = ref(true)
-const subAgentModel = ref<string | null>(null)
 
 // Repopulate tab state whenever settings are (re)loaded
 store.onSettingsLoaded(async () => {
@@ -280,11 +275,6 @@ store.onSettingsLoaded(async () => {
     routingFirstTurnPrimary.value = await invoke<boolean>('get_routing_first_turn_primary')
   } catch {
     routingFirstTurnPrimary.value = true
-  }
-  try {
-    subAgentModel.value = await invoke<string | null>('get_sub_agent_model')
-  } catch {
-    subAgentModel.value = null
   }
 })
 
@@ -352,17 +342,6 @@ function updateRouteModel(index: number, model: string) {
 function updateRouteTier(index: number, tier: string) {
   modelRoutes.value[index].tier = tier
   saveRoutes()
-}
-
-async function saveSubAgentModel(model: string) {
-  const value = model || null
-  subAgentModel.value = value
-  try {
-    await invoke('set_sub_agent_model', { model: value })
-    showToast(value ? `Sub-agent model: ${value}` : 'Sub-agents will use primary model', 'success')
-  } catch (e: any) {
-    showToast(`Couldn't save: ${e.message || e}`, 'error')
-  }
 }
 
 async function saveAgentName() {
