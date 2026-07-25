@@ -584,12 +584,65 @@ pub fn build_task_services(
                         .get("closed_only")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    let removed = storage
+
+                    // Same contract rule as tasks.remove, applied in bulk —
+                    // and this is the path that actually bites. Observed live
+                    // (lfm2.5 endurance, 2026-07-25): guarding only the
+                    // per-id remove left `clear` wide open, and one call took
+                    // the scope from 42 tasks to 6 mid-run, destroying 36
+                    // seeded features the harness was still driving.
+                    //
+                    // Ancestors of a contract are protected too: `delete`
+                    // removes whole SUBTREES, so clearing a scratch parent
+                    // would take a contract-bearing child down with it.
+                    let all = storage
                         .tasks()
-                        .clear(&scope, scope_id.as_deref(), closed_only)
+                        .list(&scope, scope_id.as_deref(), true)
                         .await
                         .map_err(err_str)?;
-                    Ok(json!({ "removed": removed }))
+                    let parents: HashMap<i64, Option<i64>> =
+                        all.iter().map(|t| (t.id, t.parent_id)).collect();
+                    let mut protected: std::collections::HashSet<i64> =
+                        std::collections::HashSet::new();
+                    for task in all.iter().filter(|t| t.acceptance.is_some()) {
+                        let mut cursor = Some(task.id);
+                        while let Some(id) = cursor {
+                            if !protected.insert(id) {
+                                break; // this ancestor chain is already marked
+                            }
+                            cursor = parents.get(&id).copied().flatten();
+                        }
+                    }
+
+                    let mut removed = 0u64;
+                    for task in &all {
+                        if protected.contains(&task.id) {
+                            continue;
+                        }
+                        if closed_only && task.status != "done" && task.status != "cancelled" {
+                            continue;
+                        }
+                        // A subtree delete may already have taken this id;
+                        // that is success, not an error.
+                        if let Ok(count) = storage.tasks().delete(task.id, None).await {
+                            removed += count;
+                        }
+                    }
+
+                    let kept = protected.len();
+                    Ok(json!({
+                        "removed": removed,
+                        "protected": kept,
+                        "note": if kept > 0 {
+                            format!(
+                                "Cleared {removed} scratch task(s). {kept} task(s) carrying an \
+                                 acceptance contract were KEPT — they define what \"done\" means \
+                                 and are still intact. Complete or cancel those instead."
+                            )
+                        } else {
+                            format!("Cleared {removed} task(s).")
+                        },
+                    }))
                 })
             }),
         );
@@ -2325,6 +2378,72 @@ mod tests {
         assert!(
             storage.tasks().get(seeded.id).await.is_ok(),
             "the seeded task must still exist"
+        );
+    }
+
+    /// REGRESSION (lfm2.5 endurance, 2026-07-25): guarding only the per-id
+    /// remove left `clear` open, and one call took the scope from 42 tasks to
+    /// 6 mid-run — destroying 36 seeded features the harness was still
+    /// driving. Bulk clear obeys the same contract rule, including for
+    /// ancestors (delete removes whole subtrees).
+    #[tokio::test]
+    async fn clear_keeps_every_task_carrying_a_contract() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        let seeded = |title: &str| NewTask {
+            scope: "session".to_string(),
+            scope_id: Some("s1".to_string()),
+            title: title.to_string(),
+            priority: 3,
+            acceptance: Some(json!({"kind": "regex", "path": "f", "pattern": "x"})),
+            ..NewTask::default()
+        };
+        let a = storage.tasks().create(seeded("feature A")).await.expect("a");
+        let b = storage.tasks().create(seeded("feature B")).await.expect("b");
+
+        // A scratch parent whose CHILD holds a contract: clearing the parent
+        // would take the child with it, so the parent is protected too.
+        let scratch_parent = add_task(
+            &services,
+            json!({"title": "scratch parent", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let parent_id = scratch_parent["task"]["id"].as_i64().expect("id");
+        let mut child = seeded("contract child");
+        child.parent_id = Some(parent_id);
+        let child = storage.tasks().create(child).await.expect("child");
+
+        let free = add_task(
+            &services,
+            json!({"title": "pure scratch", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let free_id = free["task"]["id"].as_i64().expect("id");
+
+        let out = services
+            .get("tasks.clear")
+            .expect("tasks.clear service")(
+            json!({"scope": "session", "session_id": "s1", "closed_only": false}),
+        )
+        .await
+        .expect("clear succeeds");
+
+        assert_eq!(
+            out["protected"],
+            json!(4),
+            "A, B, the contract child, and the scratch parent that would take it down"
+        );
+        for id in [a.id, b.id, child.id, parent_id] {
+            assert!(
+                storage.tasks().get(id).await.is_ok(),
+                "task #{id} must survive a bulk clear"
+            );
+        }
+        assert!(
+            storage.tasks().get(free_id).await.is_err(),
+            "contract-free scratch is still cleared"
         );
     }
 

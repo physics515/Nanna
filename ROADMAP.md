@@ -2487,6 +2487,13 @@ model masks. Measured on the 5-task smoke suite, same model, same seed tasks:
       grew faster than it was worked. Only OPEN items dedupe (a recurring chore is addable once the
       previous one closes) and only within the same parent (the same subtask title under two parents
       is different work). 3 tests.
+- [x] **Acceptance contracts survive BULK clear too** (`tasks.clear`) — guarding only the per-id remove
+      left the bulk path open, and one `clear` call took the endurance scope from **42 tasks to 6**
+      mid-run, destroying 36 seeded features the harness was still driving (the run then panicked on
+      `task: NotFound("Task: #1")`). Clear now skips every contract-bearing task **and its ancestors**
+      — `delete` removes whole subtrees, so clearing a scratch parent would take a contract child down
+      with it — and reports how many it kept. Lesson: guarding the single-item path is not guarding
+      the operation; find every writer.
 - [x] **Acceptance contracts are not deletable** (`tasks.remove`) — blocked on a refusing `write_file`
       and holding only `write_file` + `todo`, the model **deleted a seeded plan item**, and the run
       then panicked on a task the harness still expected to verify. A task with a machine-checkable
