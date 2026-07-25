@@ -94,6 +94,9 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
         workspace_root: Some(workdir.to_path_buf()),
         stats: None,
+        // The eval drives the harness directly, with no chat session to
+        // stream into — step output is judged by acceptance checks, not read.
+        chat_sink: None,
     };
     EvalEnv { storage, runner }
 }
