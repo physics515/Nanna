@@ -48,6 +48,10 @@ struct AgentSpawnerImpl {
     workspace_context: Option<String>,
     /// Shared model stats tracker (sub-agents contribute to the same stats)
     stats: Option<nanna_agent::ModelStatsTracker>,
+    /// Model fallback chain for sub-agents, in priority order — resolved via
+    /// [`nanna_config::LlmConfig::effective_sub_agent_models`], so an empty
+    /// sub-agent list already means "the main chat list". Never empty.
+    sub_agent_models: Vec<String>,
 }
 
 #[async_trait]
@@ -62,84 +66,104 @@ impl AgentSpawner for AgentSpawnerImpl {
 
         info!(description = description, max_iterations = ?max_iterations, "Spawning sub-agent");
 
-        // Create isolated context with system prompt + workspace only
-        let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
-            .with_system_prompt(&self.system_prompt);
-
-        // Inject workspace context if available
-        if let Some(ref ws_root) = self.workspace_root {
-            context.workspace_root = Some(ws_root.clone());
-        }
-        if let Some(ref ws_ctx) = self.workspace_context {
-            context.workspace_context = Some(ws_ctx.clone());
-        }
-
-        // Configure agent — sub-agents are full agents, no artificial iteration cap
-        let mut config = self.agent_config.clone();
-        config.max_iterations = max_iterations;
-
-        // Use sub_agent_model if configured, otherwise fall back to primary model
-        if let Some(ref sub_model) = self.agent_config.sub_agent_model {
-            info!(
-                sub_agent_model = %sub_model,
-                primary_model = %config.model,
-                "Using dedicated sub-agent model instead of primary"
-            );
-            config.model = sub_model.clone();
-        }
-
-        // Select the right LLM client via the router based on the model
-        // The router dispatches to the correct provider (Anthropic, Ollama, OpenAI, etc.)
-        let model = &config.model;
-        let model_display = model.clone(); // Preserve full model name for reporting
-        let llm_client = self.router.client_for_model(model).ok_or_else(|| {
-            format!(
-                "No provider available for model '{}'. Available providers: {:?}",
-                model,
-                self.router.available_providers()
-            )
-        })?;
-
-        // Strip provider prefix from model name for the actual API call
-        config.model = LlmRouter::strip_model_prefix(&config.model);
-
-        let mut agent = Agent::new(config, llm_client, self.tools.clone()).with_context(context);
-
-        // Share model stats tracker with sub-agents
-        if let Some(ref tracker) = self.stats {
-            agent = agent.with_stats(tracker.clone());
-        }
-
-        let options = RunOptions {
-            max_iterations,
-            is_sub_agent: true,
-            all_tools_active: true,
-            ..Default::default()
+        // Fallback chain: first working model wins. A candidate whose
+        // provider is missing is skipped; a candidate whose run fails hands
+        // the prompt to the next (a fresh agent — sub-agent runs are
+        // idempotent by contract, the parent only consumes the final text).
+        let candidates = if self.sub_agent_models.is_empty() {
+            vec![self.agent_config.model.clone()]
+        } else {
+            self.sub_agent_models.clone()
         };
 
-        // Run without timeout — agent stops when done or cancelled
-        let result = agent
-            .run(prompt, options)
-            .await
-            .map_err(|e| format!("Sub-agent error: {e}"))?;
+        let mut last_error = String::new();
+        for (attempt, model_spec) in candidates.iter().enumerate() {
+            let Some(llm_client) = self.router.client_for_model(model_spec) else {
+                last_error = format!(
+                    "No provider available for model '{}'. Available providers: {:?}",
+                    model_spec,
+                    self.router.available_providers()
+                );
+                warn!(model = %model_spec, "Sub-agent model has no provider — trying next");
+                continue;
+            };
 
-        info!(
-            description = description,
-            iterations = result.iterations,
-            tool_calls = result.tool_calls.len(),
-            input_tokens = result.input_tokens,
-            output_tokens = result.output_tokens,
-            "Sub-agent completed"
-        );
+            // Fresh isolated context per attempt: a failed candidate must not
+            // leak partial state into the next one.
+            let mut context = AgentContext::new(uuid::Uuid::new_v4().to_string())
+                .with_system_prompt(&self.system_prompt);
+            if let Some(ref ws_root) = self.workspace_root {
+                context.workspace_root = Some(ws_root.clone());
+            }
+            if let Some(ref ws_ctx) = self.workspace_context {
+                context.workspace_context = Some(ws_ctx.clone());
+            }
 
-        Ok(SpawnResult {
-            text: result.text,
-            iterations: result.iterations,
-            tool_calls: result.tool_calls.len(),
-            input_tokens: result.input_tokens,
-            output_tokens: result.output_tokens,
-            model: model_display,
-        })
+            // Configure agent — sub-agents are full agents, no artificial iteration cap
+            let mut config = self.agent_config.clone();
+            config.max_iterations = max_iterations;
+            let model_display = model_spec.clone(); // Full name (with provider prefix) for reporting
+            // Strip provider prefix from model name for the actual API call
+            config.model = LlmRouter::strip_model_prefix(model_spec);
+
+            if attempt > 0 {
+                info!(model = %model_spec, attempt, "Sub-agent model attempt");
+            }
+
+            let mut agent =
+                Agent::new(config, llm_client, self.tools.clone()).with_context(context);
+
+            // Share model stats tracker with sub-agents
+            if let Some(ref tracker) = self.stats {
+                agent = agent.with_stats(tracker.clone());
+            }
+
+            let options = RunOptions {
+                max_iterations,
+                is_sub_agent: true,
+                all_tools_active: true,
+                ..Default::default()
+            };
+
+            // Run without timeout — agent stops when done or cancelled
+            match agent.run(prompt, options).await {
+                Ok(result) => {
+                    info!(
+                        description = description,
+                        model = %model_display,
+                        iterations = result.iterations,
+                        tool_calls = result.tool_calls.len(),
+                        input_tokens = result.input_tokens,
+                        output_tokens = result.output_tokens,
+                        "Sub-agent completed"
+                    );
+                    return Ok(SpawnResult {
+                        text: result.text,
+                        iterations: result.iterations,
+                        tool_calls: result.tool_calls.len(),
+                        input_tokens: result.input_tokens,
+                        output_tokens: result.output_tokens,
+                        model: model_display,
+                    });
+                }
+                Err(e) => {
+                    last_error = format!("Sub-agent error on '{model_display}': {e}");
+                    warn!(
+                        model = %model_display,
+                        error = %e,
+                        remaining = candidates.len() - attempt - 1,
+                        "Sub-agent model failed — falling back"
+                    );
+                }
+            }
+        }
+
+        Err(format!(
+            "All {} sub-agent model(s) failed ({:?}). Last error: {}",
+            candidates.len(),
+            candidates,
+            last_error
+        ))
     }
 }
 
@@ -2266,7 +2290,6 @@ impl DaemonServer {
                             .agent
                             .summarization_ollama_url
                             .clone(),
-                        sub_agent_model: self.config.agent.sub_agent_model.clone(),
                         model_routing: sub_agent_routing,
                         routing_first_turn_primary: true,
                         openrouter_api_key: self.config.agent.openrouter_api_key.clone(),
@@ -2277,6 +2300,7 @@ impl DaemonServer {
                     workspace_root: None,
                     workspace_context: None,
                     stats: Some(model_stats.clone()),
+                    sub_agent_models: self.config.agent.sub_agent_models.clone(),
                 }))
             } else {
                 None
@@ -2541,11 +2565,17 @@ impl DaemonBuilder {
         builder.config.agent.model_routing = config.llm.model_routing.clone();
         builder.config.agent.routing_first_turn_primary = config.llm.routing_first_turn_primary;
         builder.config.agent.sub_agent_model = config.llm.sub_agent_model.clone();
+        // Resolved here (list > legacy single > main chat list) so every
+        // consumer sees one authoritative, never-empty chain.
+        builder.config.agent.sub_agent_models = config.llm.effective_sub_agent_models();
         if !config.llm.model_routing.is_empty() {
             info!("Model routing enabled: {:?}", config.llm.model_routing);
         }
-        if let Some(ref sub_model) = config.llm.sub_agent_model {
-            info!("Sub-agent model: {}", sub_model);
+        if !config.llm.sub_agent_models.is_empty() || config.llm.sub_agent_model.is_some() {
+            info!(
+                "Sub-agent models: {:?}",
+                builder.config.agent.sub_agent_models
+            );
         }
 
         // Set Brave API key for web search

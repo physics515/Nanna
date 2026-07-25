@@ -2422,6 +2422,13 @@ skill.
       checklists, interjections flagged `!`), refreshed by the existing `task-event` stream. Read-only
       by design: the store is the chat engine; mutations happen through chat. The only IPC restored
       for it is `list_tasks` — the Tasks *page* stays deleted.
+- [x] **Sub-agent model chain (2026-07-25, owner)** — `[llm] sub_agent_models` is a priority list like
+      every other model list (chat / summarization / embedding / OCR), edited with the same
+      `ModelPriorityList` under Settings → Models. `AgentSpawnerImpl::spawn` walks it: a candidate with
+      no provider is skipped, a candidate whose run fails hands the prompt to the next with a **fresh**
+      context. Resolution order (`LlmConfig::effective_sub_agent_models`, never empty): list > legacy
+      single `sub_agent_model` > main chat list > primary model. 4 tests. The task checklist labels
+      delegated items with their `assignee`, so the sidebar shows what a sub-agent owns.
 - [x] **Thinking on by default (2026-07-25, owner)** — `[agent] thinking_enabled` defaults **true**.
       Safe across providers: only Anthropic-native requests carry the thinking budget; Ollama enables
       `think` by model detection; the OpenAI-compat conversion drops it. NOTE: a config file that

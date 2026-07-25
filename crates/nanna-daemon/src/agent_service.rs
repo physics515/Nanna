@@ -84,7 +84,13 @@ pub struct AgentServiceConfig {
     pub routing_first_turn_primary: bool,
     /// Model to use for sub-agent tasks (optional).
     /// When set, sub-agents use this cheaper model instead of the primary.
+    /// Legacy — superseded by `sub_agent_models`; folded into that list at
+    /// config load via `LlmConfig::effective_sub_agent_models`.
     pub sub_agent_model: Option<String>,
+    /// Sub-agent model fallback chain, in priority order (first working model
+    /// wins). Resolved at config load — empty here means the resolver already
+    /// defaulted it to the main chat list, so consumers may use it verbatim.
+    pub sub_agent_models: Vec<String>,
     /// OpenRouter API key (passed to agents for summarization/extraction)
     pub openrouter_api_key: Option<String>,
     /// OpenAI API key (passed to agents for summarization/extraction)
@@ -107,6 +113,7 @@ impl Default for AgentServiceConfig {
             model_routing: vec![],
             routing_first_turn_primary: true,
             sub_agent_model: None,
+            sub_agent_models: vec![],
             openrouter_api_key: None,
             openai_api_key: None,
         }
