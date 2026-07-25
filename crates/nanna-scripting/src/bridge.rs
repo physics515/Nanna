@@ -560,6 +560,34 @@ impl NannaBridge {
         // engine deadline fires) — a backstop for the explicit tree-kill below.
         cmd.kill_on_drop(true);
 
+        // Isolate the child from OUR process group.
+        //
+        // Without this the child shares the parent's console/process group, so a
+        // script that terminates its group takes the agent down with it.
+        // Observed live (2026-07-25): once models were told to run their own
+        // acceptance checks, `exec sh tests/test_NN.sh` killed the harness
+        // outright — exit 0xffffffff, no panic — reproduced across two models,
+        // each dying seconds after its first self-check. The very same command
+        // is safe through the acceptance runner, which spawns detached.
+        //
+        // This is not eval-specific: any agent that writes a script and runs it
+        // can otherwise kill the daemon executing it. Isolation also makes the
+        // timeout path honest — the tree-kill below now bounds exactly the
+        // subtree we created, and can never walk up into us.
+        #[cfg(windows)]
+        {
+            // CREATE_NEW_PROCESS_GROUP: console events (Ctrl+C / Ctrl+Break)
+            // raised by or for the child stop at the child.
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        #[cfg(unix)]
+        {
+            // setsid(): new session + process group, so a child that signals its
+            // group (or dies on a terminal signal) cannot reach us.
+            cmd.process_group(0);
+        }
+
         let child = cmd
             .spawn()
             .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
@@ -1000,6 +1028,43 @@ fn strip_ansi_escapes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION (2026-07-25): once models were told to run their own
+    /// acceptance checks, `exec sh tests/test_NN.sh` killed the HARNESS —
+    /// exit 0xffffffff, no panic — reproduced across two models, each dying
+    /// seconds after its first self-check. The child shared our process
+    /// group, so a script that signalled its group reached us.
+    ///
+    /// This drives the real `exec` path with a child that deliberately
+    /// terminates its own process group. Surviving to read the result IS the
+    /// assertion: without isolation this test process dies with the child.
+    #[tokio::test]
+    async fn a_child_that_kills_its_process_group_cannot_kill_us() {
+        let bridge = NannaBridge::new(ToolPermissions {
+            run: true,
+            ..ToolPermissions::default()
+        });
+
+        // Kill the whole group the child belongs to. Isolated, that group is
+        // the child's own and we are untouched; unisolated, it is ours too.
+        #[cfg(windows)]
+        let suicidal = "taskkill /T /F /PID $$ 2>/dev/null; kill -TERM 0 2>/dev/null; exit 7";
+        #[cfg(unix)]
+        let suicidal = "kill -TERM 0; exit 7";
+
+        let _ = bridge.exec_with_timeout(suicidal, None, Some(20)).await;
+
+        // Reaching here at all means we survived. Prove we are still healthy
+        // by running another command through the same bridge.
+        let after = bridge
+            .exec_with_timeout("echo still_alive", None, Some(20))
+            .await
+            .expect("bridge still usable after a self-killing child");
+        assert!(
+            after.stdout.contains("still_alive"),
+            "parent survived but the bridge is broken: {after:?}"
+        );
+    }
 
     #[cfg(windows)]
     #[test]
