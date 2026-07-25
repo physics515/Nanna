@@ -12,7 +12,6 @@ export type PaletteAction = {
 export const NAV_ACTIONS: PaletteAction[] = [
   // Primary
   { id: 'nav-chat', label: 'Chat', group: 'Primary', keywords: ['home', 'messages', 'conversation'], href: '/', shortcut: '⌘1' },
-  { id: 'nav-tasks', label: 'Tasks', group: 'Primary', keywords: ['todo', 'work'], href: '/tasks' },
   { id: 'nav-memory', label: 'Memory', group: 'Primary', keywords: ['memories', 'knowledge', 'cards'], href: '/memory' },
   { id: 'nav-tools', label: 'Tools', group: 'Primary', keywords: ['mcp', 'functions'], href: '/tools' },
   { id: 'nav-channels', label: 'Channels', group: 'Primary', keywords: ['integrations', 'telegram', 'discord'], href: '/channels' },

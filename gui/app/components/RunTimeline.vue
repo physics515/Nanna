@@ -29,7 +29,7 @@
           <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
           <div class="flex-1 min-w-0">
             <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-            <MarkdownContent :content="item.content ?? ''" />
+            <MarkdownContent :content="stripHarnessMarkers(item.content ?? '')" />
           </div>
         </div>
       </MessageBubble>
@@ -51,6 +51,7 @@
 
 <script setup lang="ts">
 import type { TimelineEntry } from '~/composables/useSessionState'
+import { stripHarnessMarkers } from '~/lib/harnessMarkers'
 
 const props = defineProps<{
   items: TimelineEntry[]

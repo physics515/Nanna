@@ -9,7 +9,7 @@
 //! request into a plan.
 //!
 //! [`nanna_agent::planner`] closes that gap, so this module makes the harness
-//! the chat path:
+//! THE chat path — there is no other:
 //!
 //! 1. **Plan.** The turn's message becomes a plan. Conversation and questions
 //!    yield one task with no acceptance check, which the harness runs as
@@ -30,13 +30,21 @@
 //!    it: it is admitted at the next step boundary and jumps the plan, so the
 //!    user is answered at the first available opportunity rather than in
 //!    however many hours the run takes.
+//!
+//! **It must feel like chat.** The harness is machinery, not UI: a
+//! single-task turn renders as a plain reply — no step banner, no run-stats
+//! line — and the `TASK COMPLETE` claim marker the harness verdicts on is
+//! stripped before anything is persisted. Run mechanics surface only when
+//! there is a genuine multi-item run to attribute work to.
 
 use super::{ControlPlane, Value, json};
+use crate::session::{MessageRole, SessionMessage, TimelineItem};
 use crate::tasks::{
     AgentPlanner, AgentStepRunner, ChatSink, PendingMessages, SessionInterjector, TursoTaskSource,
     seed_plan,
 };
 use nanna_agent::harness::LongHorizonConfig;
+use nanna_agent::planner::{PLAN_DESCRIPTION_MAX_BYTES, PLAN_GOAL_MAX_BYTES};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,6 +104,10 @@ impl ChatRunRegistry {
 impl ControlPlane {
     /// Start one chat turn as a long-horizon harness run.
     ///
+    /// `conversation` is the bounded rendering of the session so far (see
+    /// [`conversation_context`]); it is handed to the planner so a follow-up
+    /// turn ("double it") plans against what was actually said.
+    ///
     /// Returns `Ok(Some(message_id))` when a run was started — the run itself
     /// proceeds in a spawned task and the caller should ACK immediately.
     /// Returns `Ok(None)` when a run is already live for the session: the
@@ -105,6 +117,7 @@ impl ControlPlane {
         session_id: &str,
         content: &str,
         system_prompt: String,
+        conversation: Option<String>,
         workspace_root: Option<PathBuf>,
     ) -> Result<Option<String>, String> {
         let (Some(agent), Some(router), Some(tools), Some(storage), Some(event_tx)) = (
@@ -147,7 +160,15 @@ impl ControlPlane {
             message_id: message_id.clone(),
             event_tx: event_tx.clone(),
             run: Some(run_handle.clone()),
+            // Parity with the retired direct path: chat tool calls feed the
+            // stats tracker and the Turso time-series.
+            tool_stats: Some(self.tool_stats.clone()),
+            storage: Some(storage.clone()),
+            quiet_item: Arc::new(std::sync::Mutex::new(None)),
         };
+        // The finalizer needs the sink after the step runner takes ownership;
+        // ChatSink is a bundle of shared handles, so a clone IS the same sink.
+        let final_sink = sink.clone();
 
         let step_runner = AgentStepRunner {
             router: router.clone(),
@@ -171,6 +192,11 @@ impl ControlPlane {
         };
         let planner = Arc::new(AgentPlanner::new(Arc::new(planner_runner)));
 
+        // Opt-in assistant auto-remember, matching the user-message side of
+        // the Send handler.
+        let auto_remember = self.config.read().await.memory.auto_remember_messages;
+        let memory = self.memory.clone();
+
         let sessions = self.sessions.clone();
         let session_id_owned = session_id.to_string();
         let content_owned = content.to_string();
@@ -180,7 +206,9 @@ impl ControlPlane {
             let scope = "session".to_string();
             let scope_id = Some(session_id_owned.clone());
 
-            let plan = planner.plan(&content_owned, None).await;
+            let plan = planner
+                .plan(&content_owned, conversation.as_deref())
+                .await;
             tracing::info!(
                 session_id = %session_id_owned,
                 tasks = plan.tasks.len(),
@@ -188,13 +216,22 @@ impl ControlPlane {
                 "planned a chat turn"
             );
 
-            let summary = match seed_plan(&storage, &scope, scope_id.as_deref(), &plan, false).await
-            {
+            match seed_plan(&storage, &scope, scope_id.as_deref(), &plan, false).await {
                 Err(message) => {
                     tracing::warn!(%message, "could not seed the chat plan");
-                    format!("_could not start the run: {message}_")
+                    final_sink.delta(&format!("_could not start the run: {message}_"));
                 }
-                Ok(_ids) => {
+                Ok(ids) => {
+                    // A one-task plan is a conversation-shaped turn: mark its
+                    // item quiet so the transcript reads as a plain reply,
+                    // with no step banner. Items added later (interjections,
+                    // replans) get banners — by then there IS a run to show.
+                    if let (1, Some(id)) = (ids.len(), ids.first()) {
+                        if let Ok(mut quiet) = final_sink.quiet_item.lock() {
+                            *quiet = Some(*id);
+                        }
+                    }
+
                     let source = TursoTaskSource::new(
                         storage.clone(),
                         scope.clone(),
@@ -228,34 +265,47 @@ impl ControlPlane {
                         )
                         .await;
 
-                    format!(
-                        "_{} step{} · {} item{} completed{}_",
-                        report.steps_taken,
-                        if report.steps_taken == 1 { "" } else { "s" },
-                        report.items_completed,
-                        if report.items_completed == 1 { "" } else { "s" },
-                        if report.interjected_items > 0 {
-                            format!(" · {} interjected", report.interjected_items)
-                        } else {
-                            String::new()
-                        },
-                    )
+                    // Run mechanics are shown only when there was a real run:
+                    // a single-step reply stays a plain reply.
+                    let multi_step = report.steps_taken > 1
+                        || report.items_completed > 1
+                        || report.interjected_items > 0;
+                    if multi_step {
+                        final_sink.delta(&format!(
+                            "\n\n_{} step{} · {} item{} completed{}_",
+                            report.steps_taken,
+                            if report.steps_taken == 1 { "" } else { "s" },
+                            report.items_completed,
+                            if report.items_completed == 1 { "" } else { "s" },
+                            if report.interjected_items > 0 {
+                                format!(" · {} interjected", report.interjected_items)
+                            } else {
+                                String::new()
+                            },
+                        ));
+                    }
                 }
-            };
+            }
 
-            // Persist the WHOLE run — the timeline journal carries every
-            // streamed step, so history survives navigation and restart
-            // instead of collapsing to the summary line.
-            let timeline = run_handle
-                .timeline
-                .lock()
-                .map(|journal| journal.clone())
-                .unwrap_or_default();
+            // Persist the WHOLE run: the message content is everything that
+            // streamed (so conversation history and exports read like chat),
+            // and the timeline journal carries the interleaved record.
+            // Harness plumbing (the TASK COMPLETE claim marker) is stripped
+            // from both — it is a verdict signal, not conversation.
+            let full_text = run_handle.accumulated_text.read().await.clone();
+            let content = strip_harness_markers(&full_text);
+            let timeline = sanitize_timeline(
+                run_handle
+                    .timeline
+                    .lock()
+                    .map(|journal| journal.clone())
+                    .unwrap_or_default(),
+            );
             sessions
                 .add_full_message(
                     &session_id_owned,
-                    crate::session::MessageRole::Assistant,
-                    &summary,
+                    MessageRole::Assistant,
+                    &content,
                     Vec::new(),
                     None,
                     timeline,
@@ -263,10 +313,23 @@ impl ControlPlane {
                 )
                 .await;
 
+            if auto_remember {
+                if let Some(memory) = memory {
+                    if content.split_whitespace().count() >= 3 {
+                        if let Err(e) = memory
+                            .remember_with_importance(&content, HashMap::new(), 1.0)
+                            .await
+                        {
+                            tracing::debug!("Failed to auto-remember assistant response: {e}");
+                        }
+                    }
+                }
+            }
+
             let _ = event_tx.send(crate::protocol::Event::MessageEnd {
                 session_id: session_id_owned.clone(),
                 message_id: message_id_for_run,
-                content: summary,
+                content,
             });
 
             // Every exit path releases both registrations — a leaked entry
@@ -291,4 +354,221 @@ pub fn interjected_response(session_id: &str, depth: usize) -> Value {
         "content": "",
         "message": "admitted to the run in progress at the next step boundary",
     })
+}
+
+/// Render recent conversation as role-tagged lines for prompt injection.
+///
+/// The harness re-anchors every step from the task store, so unlike the
+/// retired direct path (which passed history as a message array) the
+/// conversation must ride in the system prompt — without it, "double it"
+/// after "what is 2+2?" plans against nothing.
+///
+/// Bounds — both derived from the planner's own limits so every consumer of
+/// this rendering sees the same window:
+/// - total ≤ [`PLAN_GOAL_MAX_BYTES`] (8 KiB): the planner clamps its context
+///   slot to this constant, and anything larger would displace the step's
+///   working context;
+/// - each message ≤ [`PLAN_DESCRIPTION_MAX_BYTES`] (2 KiB): one giant paste
+///   must not occupy the whole window — this guarantees at least the last
+///   four turns always fit.
+///
+/// Newest messages win; a dropped prefix and clamped messages announce
+/// themselves so a partial view is never mistaken for the whole.
+pub(super) fn conversation_context(messages: &[SessionMessage]) -> Option<String> {
+    const OMISSION_NOTE: &str = "[earlier conversation omitted]";
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+
+    for message in messages.iter().rev() {
+        let speaker = match message.role {
+            MessageRole::User => "User",
+            MessageRole::Assistant => "Nanna",
+            // System/tool records are plumbing, not conversation.
+            MessageRole::System | MessageRole::Tool => continue,
+        };
+        let text = message.content.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let clamped = if text.len() > PLAN_DESCRIPTION_MAX_BYTES {
+            let end = text.floor_char_boundary(PLAN_DESCRIPTION_MAX_BYTES);
+            format!("{}… [message truncated]", &text[..end])
+        } else {
+            text.to_string()
+        };
+        let line = format!("{speaker}: {clamped}");
+
+        if used + line.len() + 1 > PLAN_GOAL_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        used += line.len() + 1;
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    if truncated {
+        lines.push(OMISSION_NOTE.to_string());
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
+}
+
+/// Remove harness plumbing from user-visible text: the `TASK COMPLETE`
+/// claim marker the harness verdicts on (a line matching
+/// `nanna_agent::harness::step_claims_completion`'s predicate — trimmed,
+/// case-insensitive, on its own line). Inline mentions are left alone; only
+/// whole marker lines are dropped.
+pub(super) fn strip_harness_markers(text: &str) -> String {
+    let mut out: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().eq_ignore_ascii_case("TASK COMPLETE"))
+        .collect();
+    // Marker lines at the end often leave a dangling blank line behind them.
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// Apply [`strip_harness_markers`] to the journal's text entries, dropping
+/// entries the strip empties out. Tool, thinking and fault entries pass
+/// through untouched — they are records, not prose.
+pub(super) fn sanitize_timeline(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            TimelineItem::Text { content, at } => {
+                let stripped = strip_harness_markers(&content);
+                if stripped.trim().is_empty() {
+                    None
+                } else {
+                    Some(TimelineItem::Text {
+                        content: stripped,
+                        at,
+                    })
+                }
+            }
+            other => Some(other),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn msg(role: MessageRole, content: &str) -> SessionMessage {
+        SessionMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            role,
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            reasoning: None,
+            timeline: Vec::new(),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn conversation_context_renders_roles_in_order() {
+        let history = vec![
+            msg(MessageRole::User, "what is 2+2?"),
+            msg(MessageRole::Assistant, "4"),
+        ];
+        let rendered = conversation_context(&history).expect("non-empty history renders");
+        assert_eq!(rendered, "User: what is 2+2?\nNanna: 4");
+    }
+
+    #[test]
+    fn conversation_context_skips_system_tool_and_empty_messages() {
+        let history = vec![
+            msg(MessageRole::System, "internal prompt"),
+            msg(MessageRole::User, "   "),
+            msg(MessageRole::Tool, "tool record"),
+        ];
+        assert!(conversation_context(&history).is_none());
+        assert!(conversation_context(&[]).is_none());
+    }
+
+    #[test]
+    fn conversation_context_clamps_one_giant_message() {
+        let giant = "x".repeat(PLAN_GOAL_MAX_BYTES * 2);
+        let history = vec![msg(MessageRole::User, &giant), msg(MessageRole::User, "next")];
+        let rendered = conversation_context(&history).expect("renders");
+        // The giant message is clamped to the per-message bound, so BOTH
+        // messages fit — one paste must not occupy the whole window.
+        assert!(rendered.contains("… [message truncated]"));
+        assert!(rendered.ends_with("User: next"));
+        assert!(rendered.len() <= PLAN_GOAL_MAX_BYTES + "[earlier conversation omitted]\n".len());
+    }
+
+    #[test]
+    fn conversation_context_keeps_newest_and_announces_dropped_prefix() {
+        // Enough medium messages to overflow the total budget.
+        let filler = "y".repeat(PLAN_DESCRIPTION_MAX_BYTES / 2);
+        let history: Vec<SessionMessage> = (0..20)
+            .map(|i| msg(MessageRole::User, &format!("m{i} {filler}")))
+            .collect();
+        let rendered = conversation_context(&history).expect("renders");
+        assert!(rendered.starts_with("[earlier conversation omitted]"));
+        // Newest message always survives.
+        assert!(rendered.contains("m19 "));
+        // Oldest was dropped.
+        assert!(!rendered.contains("m0 "));
+    }
+
+    #[test]
+    fn strip_harness_markers_removes_only_whole_marker_lines() {
+        let text = "did the work\ntask complete\nTASK COMPLETE\nalmost TASK COMPLETE inline\n";
+        let stripped = strip_harness_markers(text);
+        assert_eq!(stripped, "did the work\nalmost TASK COMPLETE inline");
+    }
+
+    #[test]
+    fn strip_harness_markers_trims_dangling_trailing_blanks() {
+        assert_eq!(strip_harness_markers("answer: 4\n\nTASK COMPLETE\n"), "answer: 4");
+        assert_eq!(strip_harness_markers("TASK COMPLETE"), "");
+    }
+
+    #[test]
+    fn sanitize_timeline_strips_text_and_drops_emptied_entries() {
+        let at = Utc::now().to_rfc3339();
+        let items = vec![
+            TimelineItem::Text {
+                content: "hello\nTASK COMPLETE".to_string(),
+                at: at.clone(),
+            },
+            TimelineItem::Text {
+                content: "\nTASK COMPLETE\n".to_string(),
+                at: at.clone(),
+            },
+            TimelineItem::Tool {
+                call_id: "c1".to_string(),
+                name: "exec".to_string(),
+                input: None,
+                output: Some("ok".to_string()),
+                success: Some(true),
+                duration_ms: Some(3),
+                tokens: None,
+                total_tokens: None,
+                at: at.clone(),
+            },
+        ];
+        let sanitized = sanitize_timeline(items);
+        assert_eq!(sanitized.len(), 2);
+        assert!(matches!(
+            &sanitized[0],
+            TimelineItem::Text { content, .. } if content == "hello"
+        ));
+        assert!(matches!(&sanitized[1], TimelineItem::Tool { .. }));
+    }
 }

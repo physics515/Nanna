@@ -16,7 +16,6 @@ const PAGES: Array<{ path: string; hit: RegExp }> = [
   { path: '/tools', hit: /Tools|skills|No tools/i },
   { path: '/workspaces', hit: /Workspaces|No workspace|Open Workspace/i },
   { path: '/logs', hit: /Logs|Live|Copy/i },
-  { path: '/tasks', hit: /Tasks|No tasks|goal/i },
 ]
 
 for (const { path, hit } of PAGES) {
