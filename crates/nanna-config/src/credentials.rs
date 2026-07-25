@@ -835,7 +835,7 @@ const NONCE_LEN: usize = 12;
 
 fn random_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    if getrandom::getrandom(&mut key).is_err() {
+    if getrandom::fill(&mut key).is_err() {
         let tick = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -851,7 +851,7 @@ fn random_key() -> [u8; 32] {
 
 fn random_nonce() -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
-    let _ = getrandom::getrandom(&mut n);
+    let _ = getrandom::fill(&mut n);
     n
 }
 

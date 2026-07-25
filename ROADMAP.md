@@ -2395,9 +2395,24 @@ skill.
       bridges to `stream-chunk`. No protocol or GUI change was needed. Each item is announced with a
       `**[working]** <title>` header so a multi-step run reads as labelled pieces of work.
 - [x] **Chat cutover** (`control/chat_harness.rs`) — every turn: plan → seed → run → stream. A message
-      arriving mid-run is admitted to that run instead of starting a second one. Config
-      `[agent] long_horizon_chat` defaults **true**; false restores the single-shot path as a rollback for
-      a bad provider day, not as a second supported mode.
+      arriving mid-run is admitted to that run instead of starting a second one.
+- [x] **One path enforced (2026-07-25, owner: "remove the chat fallback if it's redundant")** — the
+      `[agent] long_horizon_chat` rollback flag and the direct `chat_in_workspace` branch in
+      `control/chat.rs` are **deleted**; a degraded daemon reports `chat_failed` honestly instead of
+      pretending a second chat path exists. Everything the direct path did is now owned by the harness
+      path: conversation history rides in the system prompt AND the planner context
+      (`conversation_context` — bounded by the planner's own limits: 8 KiB total / 2 KiB per message,
+      newest-first, truncation announces itself), tool calls feed `ToolStatsTracker` + the Turso
+      time-series from `ChatSink::tool_end`, and opt-in `auto_remember_messages` covers the assistant
+      reply. The **Tasks page is removed** with its whole GUI surface (page, nav, palette entry, tauri
+      commands, client methods) — the task store is the chat engine now, not a parallel UI; the daemon
+      `task` control API and `todo` skill remain for the agent and scheduler.
+- [x] **It must feel like chat (2026-07-25, owner)** — a one-task (conversation-shaped) plan streams
+      with **no** `**[working]**` banner and **no** run-stats line; mechanics appear only for real
+      multi-item runs (and for items that join by interjection/replan). The persisted message content
+      is the **full streamed prose** (not a summary stub) so history, exports and follow-up context
+      read like chat; the `TASK COMPLETE` claim marker is stripped at persistence (content + timeline)
+      and at GUI render (`stripHarnessMarkers`) so it never reaches the user even mid-stream.
 
 **Live GUI drive (2026-07-24, gemma4:12b):** planner does NOT over-decompose — "what is 2+2?" planned
 as 1 task (origin=Model); an 817-char project brief hit the 30s planner timeout while the model was
@@ -2420,9 +2435,10 @@ gaps, all fixed same-day:
 
 **Open:** interjection still has no live end-to-end pass (the machinery is now reachable; needs a
 mid-run send observed landing at a boundary); `PENDING_MESSAGES_MAX` overflow drops the oldest
-silently — it should announce itself per the summaries-must-announce-themselves rule; internal markers
-(`TASK COMPLETE`, thinking-spiral nudges) leak into the visible transcript and should be filtered at
-the sink; Stop is boundary-granular — an in-flight step runs to completion before the run stops.
+silently — it should announce itself per the summaries-must-announce-themselves rule; Stop is
+boundary-granular — an in-flight step runs to completion before the run stops; **attachments** are not
+carried into harness steps (the retired direct path passed images through; the harness path warns and
+drops them — needs plumbing into `StepRunner`).
 
 ---
 

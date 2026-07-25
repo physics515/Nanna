@@ -111,7 +111,7 @@
                 <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
                 <div class="flex-1 min-w-0">
                   <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-                  <MarkdownContent :content="msg.content" />
+                  <MarkdownContent :content="stripHarnessMarkers(msg.content)" />
                 </div>
               </div>
             </MessageBubble>
@@ -164,7 +164,7 @@
                   <div class="text-xs text-nanna-text-dim mb-1">
                     {{ msg.role === 'user' ? 'You' : '☽ Nanna' }}
                   </div>
-                  <MarkdownContent :content="msg.content" />
+                  <MarkdownContent :content="msg.role === 'assistant' ? stripHarnessMarkers(msg.content) : msg.content" />
                 </div>
               </div>
             </MessageBubble>
@@ -223,7 +223,7 @@
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
               <div v-if="liveBubbleContent" class="prose prose-invert prose-sm max-w-none">
-                <MarkdownContent :content="liveBubbleContent" />
+                <MarkdownContent :content="stripHarnessMarkers(liveBubbleContent)" />
                 <span class="cursor-blink inline-block ml-0.5">▋</span>
               </div>
               <div v-else-if="!streamingThinking && !liveTimeline.length" class="text-nanna-text-muted flex items-center gap-2">
@@ -295,6 +295,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, emit as tauriEmit, type UnlistenFn } from '@tauri-apps/api/event'
 import { useSessionState, type TimelineEntry } from '~/composables/useSessionState'
 import { useBackend } from '~/composables/useBackend'
+import { stripHarnessMarkers } from '~/lib/harnessMarkers'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
 const offlineDetail = computed(() => {

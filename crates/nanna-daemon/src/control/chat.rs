@@ -170,193 +170,78 @@ impl ControlPlane {
                 // Set session ID so tools can scope per-session state
                 agent.tools().set_session_id(Some(session_id.clone())).await;
 
-                // ── Long-horizon by default (P18) ──
+                // ── Long-horizon chat (P19): the only path ──
                 // Every turn is a harness run: the message is planned, the
                 // plan is driven with re-anchored steps, and the work streams
                 // into this transcript as it happens. A message sent while a
                 // run is live joins that run at the next step boundary.
-                if self.config.read().await.agent.long_horizon_chat {
-                    let workspace_root = if let Some(ref ws_id) = effective_ws_id {
-                        let registry = self.workspaces.read().await;
-                        registry.get(ws_id).map(|ws| ws.path.clone())
-                    } else {
-                        None
-                    };
-                    match self
-                        .run_chat_turn(&session_id, &content, system_prompt.clone(), workspace_root)
-                        .await
-                    {
-                        // The run proceeds in a spawned task; ACK immediately
-                        // so the IPC request never outlives the client's
-                        // patience — a run can last hours, and the transcript
-                        // is driven by events, not by this response.
-                        Ok(Some(message_id)) => {
-                            return json!({
-                                "status": "started",
-                                "message_id": message_id,
-                                "content": "",
-                            });
-                        }
-                        // The message joined the run already in flight.
-                        Ok(None) => {
-                            let depth = self
-                                .chat_runs
-                                .pending_for(&session_id)
-                                .await
-                                .len()
-                                .await;
-                            return super::chat_harness::interjected_response(&session_id, depth);
-                        }
-                        // Never strand a turn: fall through to the direct
-                        // agent path if the harness could not be started.
-                        Err(message) => {
-                            warn!(%message, "long-horizon chat unavailable — using the direct path");
-                        }
-                    }
+
+                // Attachments are not carried into harness steps yet (open
+                // P19 item, see ROADMAP) — warn so the gap is visible in the
+                // logs instead of silently dropping user input.
+                if !attachments.is_empty() {
+                    warn!(
+                        count = attachments.len(),
+                        "attachments are not yet supported by long-horizon chat — ignored"
+                    );
                 }
 
-                // Run the agent with conversation history (workspace-scoped for memory extraction)
-                // Convert protocol attachments to (base64_data, media_type) tuples
-                let image_attachments: Vec<(String, String)> = attachments.into_iter()
-                    .filter(|a| a.content_type.starts_with("image/"))
-                    .map(|a| (a.data, a.content_type))
-                    .collect();
-                match agent.chat_in_workspace(&session_id, &content, Some(system_prompt), &prior_messages, effective_ws_id.clone(), image_attachments).await {
-                    Ok(result) => {
-                        // Add assistant response to session with tool calls,
-                        // reasoning, and the run's chronological timeline.
-                        // When the timeline is present it already carries
-                        // every tool outcome — persisting outputs AGAIN in
-                        // the flat records would double the metadata row for
-                        // no reader (the UI renders the timeline; stats are
-                        // recorded from the in-memory copy below).
-                        let reasoning = result.reasoning.clone();
-                        let persisted_tool_calls = if result.timeline.is_empty() {
-                            result.tool_calls.clone()
-                        } else {
-                            result.tool_calls.iter().map(|tc| crate::session::ToolCallRecord {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                input: serde_json::Value::Null,
-                                output: None,
-                                success: tc.success,
-                                duration_ms: tc.duration_ms,
-                            }).collect()
-                        };
-                        self.sessions.add_full_message(
-                            &session_id,
-                            MessageRole::Assistant,
-                            &result.content,
-                            persisted_tool_calls,
-                            reasoning,
-                            result.timeline.clone(),
-                            result.usage.clone(),
-                        ).await;
+                // Each harness step re-anchors from the task store, so the
+                // conversation must ride in the system prompt (the retired
+                // direct path passed it as a message array). The same bounded
+                // rendering is handed to the planner as context.
+                let conversation = super::chat_harness::conversation_context(&prior_messages);
+                if let Some(ref conversation) = conversation {
+                    system_prompt.push_str("\n\n## Conversation so far\n");
+                    system_prompt.push_str(conversation);
+                }
 
-                        // Record tool stats for each tool call
-                        for tc in &result.tool_calls {
-                            if let (Some(success), Some(duration_ms)) = (tc.success, tc.duration_ms) {
-                                let output_size = tc.output.as_ref().map_or(0, |o| o.len());
-                                let error = if !success {
-                                    tc.output.clone()
-                                } else {
-                                    None
-                                };
-                                self.tool_stats.record(nanna_agent::ToolObservation {
-                                    tool_name: tc.name.clone(),
-                                    success,
-                                    duration_ms,
-                                    output_size,
-                                    error: error.clone(),
-                                    session_id: Some(session_id.clone()),
-                                }).await;
-
-                                // Persist to Turso for time-series graphs
-                                if let Some(ref storage) = self.storage {
-                                    if let Err(e) = storage.log_tool_call(
-                                        &tc.name,
-                                        success,
-                                        duration_ms,
-                                        output_size,
-                                        error.as_deref(),
-                                        Some(&session_id),
-                                    ).await {
-                                        tracing::warn!("Failed to log tool call to DB: {}", e);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Opt-in only — see auto_remember_messages above.
-                        if self.config.read().await.memory.auto_remember_messages {
-                            if let Some(ref memory) = self.memory {
-                                if result.content.split_whitespace().count() >= 3 {
-                                    let meta = std::collections::HashMap::new();
-                                    if let Err(e) = memory.remember_with_importance(&result.content, meta, 1.0).await {
-                                        debug!("Failed to auto-remember assistant response: {}", e);
-                                    }
-                                }
-                            }
-                        }
-
+                let workspace_root = if let Some(ref ws_id) = effective_ws_id {
+                    let registry = self.workspaces.read().await;
+                    registry.get(ws_id).map(|ws| ws.path.clone())
+                } else {
+                    None
+                };
+                match self
+                    .run_chat_turn(
+                        &session_id,
+                        &content,
+                        system_prompt,
+                        conversation,
+                        workspace_root,
+                    )
+                    .await
+                {
+                    // The run proceeds in a spawned task; ACK immediately so
+                    // the IPC request never outlives the client's patience —
+                    // a run can last hours, and the transcript is driven by
+                    // events, not by this response.
+                    Ok(Some(message_id)) => {
                         json!({
-                            "status": "success",
-                            "message_id": result.message_id,
-                            "content": result.content,
-                            "tool_calls": result.tool_calls,
-                            "reasoning": result.reasoning,
-                            "timeline": result.timeline,
-                            "usage": {
-                                "input_tokens": result.input_tokens,
-                                "output_tokens": result.output_tokens
-                            },
-                            // Run-scoped benchmark totals (across healing attempts)
-                            "run_usage": result.usage,
+                            "status": "started",
+                            "message_id": message_id,
+                            "content": "",
                         })
                     }
-                    Err(e) => {
-                        // If there's a partial result (agent did work before failing),
-                        // persist it so the user doesn't lose hours of streamed work
-                        if let Some(partial) = e.partial_result {
-                            warn!(
-                                "Chat failed but {} chars of work were done — persisting partial result",
-                                partial.content.len()
-                            );
-                            let reasoning = partial.reasoning.clone();
-                            let persisted_tool_calls = if partial.timeline.is_empty() {
-                                partial.tool_calls.clone()
-                            } else {
-                                partial.tool_calls.iter().map(|tc| crate::session::ToolCallRecord {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    input: serde_json::Value::Null,
-                                    output: None,
-                                    success: tc.success,
-                                    duration_ms: tc.duration_ms,
-                                }).collect()
-                            };
-                            self.sessions.add_full_message(
-                                &session_id,
-                                MessageRole::Assistant,
-                                &partial.content,
-                                persisted_tool_calls,
-                                reasoning,
-                                partial.timeline.clone(),
-                                partial.usage.clone(),
-                            ).await;
-
-                            json!({
-                                "error": "chat_failed",
-                                "message": e.message,
-                                "partial_content": partial.content,
-                                "partial": true
-                            })
-                        } else {
-                            json!({
-                                "error": "chat_failed",
-                                "message": e.message
-                            })
-                        }
+                    // The message joined the run already in flight.
+                    Ok(None) => {
+                        let depth = self
+                            .chat_runs
+                            .pending_for(&session_id)
+                            .await
+                            .len()
+                            .await;
+                        super::chat_harness::interjected_response(&session_id, depth)
+                    }
+                    // Only reachable when the daemon is degraded (agent,
+                    // router, tools or storage missing) — report it honestly
+                    // rather than pretending a second chat path exists.
+                    Err(message) => {
+                        warn!(%message, "long-horizon chat could not start");
+                        json!({
+                            "error": "chat_failed",
+                            "message": message,
+                        })
                     }
                 }
             }

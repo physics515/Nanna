@@ -109,7 +109,6 @@ function installInPage(options = {}) {
       { name: 'discord', configured: false, connected: false, status: 'not_configured' },
     ],
     cronJobs: [],
-    tasks: [],
     modelStats: { models: [], total_requests: 0, total_tokens: 0, total_cost_usd: 0, costs: [] },
     toolStats: { tools: [], total_calls: 0 },
     agentStats: { agents: [], clusters: [] },
@@ -521,21 +520,6 @@ function installInPage(options = {}) {
         return [];
       case 'validate_cron_expression':
         return { valid: true, next: nowIso() };
-
-      case 'list_tasks':
-      case 'query_tasks':
-        return state.tasks.slice();
-      case 'get_task':
-        return state.tasks[0] || null;
-      case 'create_task':
-      case 'complete_task':
-      case 'delete_task':
-      case 'add_task_note':
-      case 'start_task_run':
-      case 'cancel_task_run':
-        return true;
-      case 'get_task_run_status':
-        return { running: false, completed: 0, total: 0 };
 
       case 'get_model_stats':
         return { ...state.modelStats };

@@ -810,10 +810,23 @@ pub struct ChatSink {
     pub message_id: String,
     pub event_tx: tokio::sync::broadcast::Sender<Event>,
     pub run: Option<crate::agent_service::ExternalRunHandle>,
+    /// When set, every completed tool call is recorded to the shared stats
+    /// tracker (and the Turso time-series when `storage` is also set) —
+    /// parity with the retired direct chat path, which recorded after the
+    /// run from the flat result.
+    pub tool_stats: Option<nanna_agent::ToolStatsTracker>,
+    pub storage: Option<Arc<Storage>>,
+    /// The single item of a one-task (conversation-shaped) plan. Steps for
+    /// this item render with no `**[working]**` banner so a plain question
+    /// reads as a plain reply; items added later (interjections, replans)
+    /// are announced — by then there IS a run to attribute work to.
+    /// Shared (not per-clone) state: the finalizer sets it after seeding,
+    /// and the step runner's clone must see it.
+    pub quiet_item: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl ChatSink {
-    fn delta(&self, text: &str) {
+    pub(crate) fn delta(&self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -941,6 +954,38 @@ impl ChatSink {
                 *slot_duration = Some(duration_ms);
             }
         }
+        if let Some(stats) = &self.tool_stats {
+            let observation = nanna_agent::ToolObservation {
+                tool_name: name.to_string(),
+                success,
+                duration_ms,
+                output_size: output.len(),
+                error: (!success).then(|| output.to_string()),
+                session_id: Some(self.session_id.clone()),
+            };
+            let stats = stats.clone();
+            let storage = self.storage.clone();
+            let session_id = self.session_id.clone();
+            // Recording is async and this callback is sync — hand it off.
+            tokio::spawn(async move {
+                if let Some(storage) = storage {
+                    if let Err(e) = storage
+                        .log_tool_call(
+                            &observation.tool_name,
+                            observation.success,
+                            observation.duration_ms,
+                            observation.output_size,
+                            observation.error.as_deref(),
+                            Some(&session_id),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to log tool call to DB: {e}");
+                    }
+                }
+                stats.record(observation).await;
+            });
+        }
     }
 
     /// Announce which item the run is starting, so the transcript reads as
@@ -949,6 +994,15 @@ impl ChatSink {
     /// writes `Task #id: title`); if that line is ever absent the header
     /// degrades to the bare item id rather than failing.
     fn step_header(&self, request: &StepRequest) {
+        // Conversation-shaped turns (one-task plans) stay banner-free so the
+        // transcript feels like chat — see the `quiet_item` field.
+        if self
+            .quiet_item
+            .lock()
+            .is_ok_and(|quiet| *quiet == Some(request.item_id))
+        {
+            return;
+        }
         let kind = match request.step_kind {
             nanna_agent::harness::StepKind::Plan => "planning",
             nanna_agent::harness::StepKind::Verify => "verifying",
@@ -2050,6 +2104,150 @@ mod tests {
         let folded = fold_reports(&[]);
         assert_eq!(folded.steps_taken, 0);
         assert_eq!(folded.stop, StopReason::AllTasksDone);
+    }
+
+    // -----------------------------------------------------------------
+    // ChatSink → ExternalRunHandle (P19 navigation recovery)
+    // -----------------------------------------------------------------
+
+    fn external_run_handle() -> crate::agent_service::ExternalRunHandle {
+        crate::agent_service::ExternalRunHandle {
+            cancellation_flag: Arc::new(AtomicBool::new(false)),
+            accumulated_text: Arc::new(RwLock::new(String::new())),
+            accumulated_thinking: Arc::new(RwLock::new(String::new())),
+            active_tool_calls: Arc::new(RwLock::new(Vec::new())),
+            completed_tool_calls: Arc::new(RwLock::new(Vec::new())),
+            timeline: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn chat_sink(run: crate::agent_service::ExternalRunHandle) -> ChatSink {
+        let (event_tx, _) = tokio::sync::broadcast::channel(64);
+        ChatSink {
+            session_id: "s1".to_string(),
+            message_id: "m1".to_string(),
+            event_tx,
+            run: Some(run),
+            tool_stats: None,
+            storage: None,
+            quiet_item: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// REGRESSION (P19 live drive, 2026-07-24): tool calls vanished when the
+    /// user navigated away mid-run, because the harness streamed events only —
+    /// `get_run_state` recovery reads the ActiveChat buffers, and nothing was
+    /// filling them. Every sink callback must land in the shared run handle,
+    /// not just on the event bus.
+    #[tokio::test]
+    async fn tool_calls_survive_navigation_via_run_buffers() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+
+        sink.delta("running ls ");
+        sink.thinking("what files exist?");
+        sink.tool_start("c1", "exec", &json!({"cmd": "ls"}), None);
+        sink.tool_end("c1", "exec", "file.txt", true, 12);
+        sink.delta("done");
+
+        // What get_run_state serves after navigating away and back:
+        assert_eq!(run.accumulated_text.read().await.as_str(), "running ls done");
+        assert_eq!(
+            run.accumulated_thinking.read().await.as_str(),
+            "what files exist?"
+        );
+        assert!(
+            run.active_tool_calls.read().await.is_empty(),
+            "the call completed — it must not linger as active"
+        );
+        {
+            let done = run.completed_tool_calls.read().await;
+            assert_eq!(done.len(), 1);
+            assert_eq!(done[0].name, "exec");
+            assert_eq!(done[0].output, "file.txt");
+            assert!(done[0].success);
+        }
+
+        // And the journal persisted with the final message: text merged per
+        // burst, the tool call back-filled in place with its result.
+        let journal = run.timeline.lock().unwrap().clone();
+        assert_eq!(journal.len(), 4, "text, thinking, tool, text — in order");
+        assert!(matches!(
+            &journal[0],
+            crate::session::TimelineItem::Text { content, .. } if content == "running ls "
+        ));
+        assert!(matches!(
+            &journal[1],
+            crate::session::TimelineItem::Thinking { content, .. } if content == "what files exist?"
+        ));
+        assert!(matches!(
+            &journal[2],
+            crate::session::TimelineItem::Tool {
+                call_id,
+                output: Some(output),
+                success: Some(true),
+                duration_ms: Some(12),
+                ..
+            } if call_id == "c1" && output == "file.txt"
+        ));
+        assert!(matches!(
+            &journal[3],
+            crate::session::TimelineItem::Text { content, .. } if content == "done"
+        ));
+    }
+
+    /// "It should feel like the chat did before": a one-task plan is a
+    /// conversation-shaped turn and must stream with no `**[working]**`
+    /// banner. Items that join later (interjection, replan) are announced.
+    #[tokio::test]
+    async fn a_one_task_plan_streams_with_no_step_banner() {
+        let run = external_run_handle();
+        let sink = chat_sink(run.clone());
+        *sink.quiet_item.lock().unwrap() = Some(7);
+
+        let request = |item_id: i64| StepRequest {
+            item_id,
+            step_index: 0,
+            step_kind: nanna_agent::harness::StepKind::Execute,
+            prompt: format!("Task #{item_id}: reply to the user"),
+            tool_scope: Vec::new(),
+            token_budget: None,
+            max_iterations: None,
+            max_wall_clock: None,
+        };
+
+        sink.step_header(&request(7));
+        assert!(
+            run.accumulated_text.read().await.is_empty(),
+            "conversational turn: no banner"
+        );
+
+        sink.step_header(&request(9));
+        let streamed = run.accumulated_text.read().await.clone();
+        assert!(
+            streamed.contains("**[working]** reply to the user"),
+            "a second item means a real run — announce it (got: {streamed:?})"
+        );
+    }
+
+    /// Parity with the retired direct chat path: completed tool calls feed
+    /// the shared stats tracker (the recording is handed off to a task, so
+    /// poll briefly).
+    #[tokio::test]
+    async fn chat_tool_calls_are_recorded_to_tool_stats() {
+        let stats = nanna_agent::ToolStatsTracker::new();
+        let mut sink = chat_sink(external_run_handle());
+        sink.tool_stats = Some(stats.clone());
+
+        sink.tool_end("c1", "exec", "ok", true, 5);
+
+        for _ in 0..200 {
+            if stats.export_json().await.to_string().contains("exec") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("tool call was never recorded to stats");
     }
 }
 

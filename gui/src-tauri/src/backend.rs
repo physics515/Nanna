@@ -503,30 +503,6 @@ daemon_proxies! {
     channel_list();
     /// Get channel status
     channel_status(id: Option<&str>);
-
-    // --- Task operations ---
-    /// List tasks in a scope
-    task_list(scope: &str, session_id: Option<&str>, include_closed: Option<bool>);
-    /// Get one task with notes + activity
-    task_get(id: i64);
-    /// Create a task (pass-through payload)
-    task_create(payload: Value);
-    /// Partially update a task
-    task_update(id: i64, patch: Value);
-    /// Complete a task (with acceptance verification)
-    task_done(id: i64, workdir: Option<&str>);
-    /// Delete a task subtree
-    task_delete(id: i64);
-    /// Append a working note to a task
-    task_note(id: i64, content: &str);
-    /// Filter-language query over a scope's tasks
-    task_query(filter: &str, scope: &str, session_id: Option<&str>);
-    /// Start a long-horizon run (pass-through payload)
-    task_start_run(payload: Value);
-    /// Status of the scope's run
-    task_run_status(scope: &str, session_id: Option<&str>);
-    /// Cancel the scope's active run
-    task_cancel_run(scope: &str, session_id: Option<&str>);
 }
 
 impl Default for Backend {
