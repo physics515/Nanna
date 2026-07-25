@@ -1614,8 +1614,14 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
             one; the row is already deleted + overwritten. 4 tests in `crates/nanna-storage/tests/secure_delete.rs`
             (single-delete embedding absent-after / present-before; bulk 3-embedding; in-memory graceful; raw
             control present-after). 72 nanna-storage + 86 nanna-memory + nanna-daemon tests green; new code
-            clippy-clean. Still open: **(i)** the WAL never auto-checkpointing means it grows unbounded until an
-            explicit checkpoint — a separate durability/footprint concern worth a periodic-checkpoint task;
+            clippy-clean. Still open: **(i)** ~~unbounded WAL~~ **(corrected 2026-07-25 — the WAL is bounded)**:
+            a follow-up probe (12k inserts) showed turso **does** auto-checkpoint at the standard ~4 MB /
+            1000-page threshold and truncates the `-wal` file back down (4.1 MB → 41 KB), so there is no
+            growth bug — the "no checkpoint on close" observation only meant a *single* sub-threshold insert
+            stays in the WAL until the threshold or an explicit checkpoint. Note the auto-checkpoint is
+            **passive**: it copies the embedding page into the main file *unzeroed* before resetting the WAL,
+            which is exactly why the overwrite + explicit `TRUNCATE` above is still required (a plain delete
+            that races an auto-checkpoint leaves the ghost in the main `.db`, not just the WAL);
             **(ii)** the stronger backup/epoch threat (a `-wal` copied *before* the truncate, or the `busy`
             path) still wants the paper's **epoch key rotation** (encrypt vectors, discard key on delete);
             **(iii)** the HNSW-tombstone constraint below still stands for when an ANN index lands; **(iv)** wire
