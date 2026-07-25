@@ -1541,20 +1541,29 @@ feedback-driven process, extended with a **DSP-backed event timeline** where tim
       memories from the drift-exposed path entirely (see the drift fixture below). 1 test asserting the
       exact contract: Detailed duplicates fold, `clusters_formed == 0`, and the summarizer is invoked
       **zero** times (counted with an `AtomicUsize`, not inferred). nanna-memory 78 tests green.
-- [ ] *(discovered 2026-07-23)* **STATED vs OBSERVED provenance is not actually recorded — the
-      `fact_type` metadata key is read but never written.** Chasing the drift mitigation "verbatim-pin
-      user-stated memories" turned up that the distinction the reference notes describe under extraction
-      ("importance 1–5, STATED vs OBSERVED") does not exist in the code: `fact_type` appears only in
-      `nanna-daemon/src/control/memory.rs`, twice, both times *reading* it with
-      `.unwrap_or("stated")` for display — so **every memory reports itself as user-stated regardless of
-      origin**, and `ExtractedMemory` (`loop_runner.rs`) carries only `content`/`category`/`tags` with no
-      provenance field at all. Consequences: the GUI's fact-type column is decorative; the survey's
-      "source attribution (user statement > agent inference)" precedence rule has nothing to run on; and
-      the drift mitigation that would pin user-stated memories verbatim is **blocked** until provenance
-      is genuinely captured. Fix = add a provenance field to `ExtractedMemory`, have the extraction
-      prompt classify it, persist it into memory metadata, and only then build the pin on top. Note the
-      safe default when it lands: **absent provenance must NOT be treated as "stated"** (absence of
-      evidence isn't evidence of a user statement) — the current display default has it backwards.
+- [x] *(discovered 2026-07-23; captured 2026-07-25)* **STATED vs OBSERVED provenance is now genuinely
+      recorded — `fact_type` is written, not just read, and the dangerous default is fixed.** Before this,
+      `fact_type` appeared only in `control/memory.rs`, twice, both *reading* it with `.unwrap_or("stated")`
+      — so every memory reported as user-stated regardless of origin, and `ExtractedMemory` had no
+      provenance field at all. Now: a `MemoryProvenance { Stated, Observed }` enum
+      (`nanna-agent::loop_runner`, re-exported) whose `Default` is **`Observed`, never `Stated`** and whose
+      `from_label` only promotes an explicit case-insensitive "stated" (every other/absent/garbled label →
+      `Observed`, so an unlabeled memory can never impersonate a user assertion). The extraction prompt now
+      asks the model to classify each fact's provenance ("stated" = the user plainly said it; "observed" =
+      inferred/derived; when unsure → observed) with a worked two-item example; `ExtractedMemoryRaw` parses
+      the optional label and `filter_extracted_memories` maps it through `from_label`. Tool-result memories
+      are hard-coded `Observed` (agent output is never a user statement). Both auto-store callbacks
+      (`nanna-daemon/agent_service.rs` and `nanna-server/state.rs`) persist it into memory metadata under the
+      `fact_type` key. The two display reads default absent provenance to **"unknown"** now — not "stated"
+      — so legacy pre-provenance memories are shown as unknown, not falsely user-stated. 7 new unit tests
+      (`from_label` only-"stated"-is-stated incl. "statedly"→observed; default is observed; `as_str`;
+      `filter` carries + defaults provenance for stated/observed/garbage/missing; prompt asks for
+      provenance). 150 nanna-agent + 99 nanna-daemon tests green; nanna-agent/daemon/server build clean, new
+      code clippy- and fmt-clean. **Note (LLM-gated):** the *classification quality* rides on the extraction
+      model and can't be asserted unattended — the plumbing + conservative defaults are what's proven here.
+      This unblocks the drift mitigation: the verbatim-pin of user-stated memories can now be built on real
+      provenance (its own item), and the survey's "user statement > agent inference" precedence finally has
+      a real signal to run on.
 - [x] **Harden `create_consolidated_entry` against NaN** — the FSRS-scalar merge used
       `max_by(|a,b| a.partial_cmp(b).unwrap())`, which **panics the dreaming cycle** if any stored
       `importance`/`storage_strength` is NaN.

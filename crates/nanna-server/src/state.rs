@@ -398,7 +398,12 @@ impl AppState {
                     metadata.insert("category".to_string(), memory.category.clone());
                     metadata.insert("session_id".to_string(), session.clone());
                     metadata.insert("source".to_string(), "extraction".to_string());
-                    
+                    // Record STATED vs OBSERVED provenance (default Observed).
+                    metadata.insert(
+                        "fact_type".to_string(),
+                        memory.provenance.as_str().to_string(),
+                    );
+
                     match dreaming.remember(&memory.content, metadata).await {
                         Ok(id) => {
                             tracing::info!(

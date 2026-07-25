@@ -977,6 +977,12 @@ impl AgentService {
                             if let Some(ref service) = mem_service {
                                 let mut metadata = memory.tags.unwrap_or_default();
                                 metadata.insert("category".to_string(), memory.category.clone());
+                                // Persist provenance so the store records STATED vs
+                                // OBSERVED instead of everything defaulting to "stated".
+                                metadata.insert(
+                                    "fact_type".to_string(),
+                                    memory.provenance.as_str().to_string(),
+                                );
                                 // Derive importance from category. Memories never
                                 // expire — all categories are permanent.
                                 let importance: f32 = match memory.category.as_str() {
