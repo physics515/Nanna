@@ -182,6 +182,62 @@ the full suite, per-tier budgets, and harness.
 
 ---
 
+## Model benchmark: long-horizon endurance
+
+How well a **local** model drives the long-horizon harness, measured on the `live_endurance` eval:
+build `minidb`, a POSIX-shell key-value store, against **42 dependency-chained fail-to-pass tests**
+(SWE-bench style — the tests are the spec, and a feature counts only when its acceptance check
+passes). Reference GPU: RTX 4070 Ti SUPER 16 GB; Ollama; 4.5 h wall-clock cap.
+
+Reproduce:
+
+```bash
+export NANNA_EVAL_MODEL=lfm2.5:latest
+export NANNA_EVAL_HOURS=4.5
+# NANNA_EVAL_LOG (not RUST_LOG) — registry=debug, or successful tool calls are invisible
+export NANNA_EVAL_LOG="warn,nanna_tools::registry=debug"
+cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture live_endurance
+```
+
+### Endurance (42 features)
+
+| Model | Size | Verified | Steps | Tokens | Wall clock | Provider incidents |
+|---|---|---|---|---|---|---|
+| lfm2.5 | 5.2 GB | **1 / 42** | 497 | 5.5 M | 19 min | 0 |
+| gemma4:12b | 7.6 GB | _pending_ | — | — | — | — |
+| qwen3:4b | 2.5 GB | _pending_ | — | — | — | — |
+
+**Verified** counts only features whose acceptance check passed. Do not read the harness's
+in-flight `done=N` counter as a score — it counts *closed* tasks, and closed includes **cancelled**:
+one lfm2.5 run ended at `done=53` with **0** features verified.
+
+### What the harness fixes bought (lfm2.5, same model, same 42 features)
+
+| | before | after |
+|---|---|---|
+| features verified | 0 / 42 | 1 / 42 |
+| steps | 598 | 497 |
+| tokens | 7.8 M | 5.5 M |
+| task scope (42 seeded) | ballooned to 55 | 48 |
+| run outcome | poisoned itself (`minidb_data` created as a *directory*, breaking every test) | clean finish |
+
+The same fixes on the 5-task smoke suite took lfm2.5 from **3/5 in ~15 min** to **5/5 in 53 s**, at
+**25 k tokens/item** (down from 70 k). The gap between that and 1/42 is the honest headline: these
+models handle well-scoped single-file tasks and hit a wall on incrementally-built programs.
+
+### Reading the results
+
+- **A weak model is a harness test.** Every finding behind the "after" column came from watching a
+  5 GB model fail: unbounded re-decomposition, deletion of its own goals, double-escaped writes, and
+  tool scopes that were secretly cages. See [ROADMAP P20](ROADMAP.md).
+- **Capability is never gated.** `discover_tools` ships on every request, so a model can pull in any
+  tool mid-task — observed live, models reached for `code_search`, `explore` and `edit_file` that
+  were never in their task's scope.
+- **Model-generated code cannot kill the agent.** `exec` children are spawned in their own process
+  group; a script that signals its group no longer takes the daemon with it.
+
+---
+
 ## Building from source
 
 ```bash
