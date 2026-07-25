@@ -263,6 +263,19 @@ pub struct RunOptions {
     /// hint, not the whole registry — small models degrade past 5-10
     /// definitions). Ignored when `all_tools_active` is set.
     pub initial_active_tools: Vec<String>,
+    /// Send ONLY `initial_active_tools` — suppress the always-on core set
+    /// (`remember` / `recall` / `reflect` / `discover_tools`).
+    ///
+    /// An explicitly scoped step has already had its discovery done for it by
+    /// whoever wrote the scope, so `discover_tools` is not an escape hatch
+    /// there — it is a fifth option competing with the four tools that
+    /// actually do the work. Observed live (lfm2.5, endurance round 1): the
+    /// model burned steps re-running `discover_tools` for tools it already
+    /// held, tripping the tool-loop detector, and called `write_file` once in
+    /// 487 steps. The bound is not a magic number: it is "honour the caller's
+    /// explicit scope exactly". Ignored when the scope is empty (nothing to
+    /// restrict to) or `all_tools_active` is set.
+    pub restrict_to_active_tools: bool,
     /// Wall-clock budget for this run (P14 bounded blast radius).
     /// Exceeding it ends the run with `truncated = true`.
     pub max_wall_clock: Option<std::time::Duration>,
@@ -1502,7 +1515,11 @@ impl Agent {
 
             // Build and execute LLM request
             let mut request = self
-                .build_request_with_thinking(options.thinking_mode, &state.active_tools)
+                .build_request_with_thinking(
+                    options.thinking_mode,
+                    &state.active_tools,
+                    options.restrict_to_active_tools && !options.all_tools_active,
+                )
                 .await;
             if let Some(ref routed) = routed_model {
                 // Strip provider prefix for the API request model field
@@ -3439,11 +3456,20 @@ impl Agent {
         &self,
         thinking_override: Option<ThinkingMode>,
         active_tools: &HashSet<String>,
+        restrict_to_active: bool,
     ) -> AnthropicRequest {
         let ctx = self.context.read().await;
 
-        // Build the set of tool names to send: core + any activated via discover_tools
-        let mut names: HashSet<String> = CORE_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect();
+        // Build the set of tool names to send: core + any activated via
+        // discover_tools — unless the caller pinned an exact scope, in which
+        // case the core discovery/memory tools are omitted so the model sees
+        // only the tools its item actually needs (see
+        // `RunOptions::restrict_to_active_tools`).
+        let mut names: HashSet<String> = if restrict_to_active && !active_tools.is_empty() {
+            HashSet::new()
+        } else {
+            CORE_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect()
+        };
         names.extend(active_tools.iter().cloned());
 
         let tool_defs = self.tools.definitions_for_names(&names).await;

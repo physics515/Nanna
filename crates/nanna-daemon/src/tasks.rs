@@ -234,6 +234,40 @@ pub fn build_task_services(
                     let title = opt_string(&params, "title")
                         .or_else(|| opt_string(&params, "text"))
                         .ok_or_else(|| "title is required".to_string())?;
+
+                    // Idempotent add: re-adding a title that is ALREADY open
+                    // in this scope returns the existing item instead of a
+                    // second copy. Observed live (lfm2.5 smoke): 5 seeded
+                    // tasks became ~50 as the model re-decomposed the same
+                    // work every step — "Write data file with header and 3
+                    // rows" was created ten times — so the plan grew faster
+                    // than it was worked and the real items drowned. Only
+                    // OPEN items dedupe: a genuinely recurring chore
+                    // ("run the tests") must still be addable after the
+                    // previous one is closed, and reopening history would be
+                    // the worse failure.
+                    if let Some(existing) = storage
+                        .tasks()
+                        .list(&scope, scope_id.as_deref(), false)
+                        .await
+                        .map_err(err_str)?
+                        .into_iter()
+                        .find(|t| {
+                            t.parent_id == parent_id
+                                && t.title.trim().eq_ignore_ascii_case(title.trim())
+                        })
+                    {
+                        return Ok(json!({
+                            "task": task_to_json(&existing),
+                            "deduplicated": true,
+                            "note": format!(
+                                "Task #{} \"{}\" already exists and is still open — reusing it \
+                                 instead of creating a duplicate. Work on it rather than \
+                                 planning it again.",
+                                existing.id, existing.title
+                            ),
+                        }));
+                    }
                     // Ordering: a subtask inherits its parent's ladder
                     // position; a new root task appends AFTER everything
                     // (defaulting to 0 would jump the whole queue — observed
@@ -495,6 +529,35 @@ pub fn build_task_services(
                 Box::pin(async move {
                     let id = get_i64(&params, "id").ok_or_else(|| "id is required".to_string())?;
                     let actor = opt_string(&params, "actor");
+
+                    // A task carrying a machine-checkable acceptance check is
+                    // a CONTRACT — someone (the planner, the eval, the user)
+                    // defined what "done" means for it, and deleting it
+                    // destroys the only objective record of the goal. Erasing
+                    // it is never the right move: the honest outcomes are
+                    // finish it or cancel it, both of which keep the item and
+                    // its history. Observed live (lfm2.5 smoke): blocked on a
+                    // refusing write_file and holding only `write_file` and
+                    // `todo`, the model deleted a SEEDED plan item — the run
+                    // then died on a task the harness still expected to
+                    // verify. Scratch items the model invents carry no
+                    // acceptance and stay freely removable.
+                    let existing = storage.tasks().get(id).await.map_err(err_str)?;
+                    if existing.acceptance.is_some() {
+                        return Ok(json!({
+                            "removed": false,
+                            "refused": true,
+                            "note": format!(
+                                "Task #{} \"{}\" has a machine-checkable acceptance check, so it is \
+                                 a commitment rather than scratch work and was NOT deleted — it is \
+                                 fully intact. If the work is finished, complete it (the check runs \
+                                 automatically). If it should not be done at all, set its status to \
+                                 cancelled. Either way the record survives.",
+                                existing.id, existing.title
+                            ),
+                        }));
+                    }
+
                     let removed = storage
                         .tasks()
                         .delete(id, actor.as_deref())
@@ -1171,6 +1234,12 @@ impl AgentStepRunner {
         if !active.iter().any(|t| t == "todo") {
             active.push("todo".to_string());
         }
+        // An item that names its tools has had its discovery done already:
+        // send exactly those and drop the always-on core set, so a small
+        // model is not choosing between doing the work and re-discovering
+        // tools it already holds. Unscoped items keep the full core set —
+        // they have no other way to reach a tool.
+        let restrict_to_active = !request.tool_scope.is_empty();
 
         // Show the work as it happens: the step's text, thinking, and tool
         // activity stream through the same events a plain chat turn uses,
@@ -1216,6 +1285,7 @@ impl AgentStepRunner {
             max_wall_clock: request.max_wall_clock,
             step_kind: Some(request.step_kind),
             initial_active_tools: active,
+            restrict_to_active_tools: restrict_to_active,
             is_sub_agent: true,
             on_text,
             on_thinking,
@@ -2104,6 +2174,188 @@ mod tests {
         let folded = fold_reports(&[]);
         assert_eq!(folded.steps_taken, 0);
         assert_eq!(folded.stop, StopReason::AllTasksDone);
+    }
+
+    // -----------------------------------------------------------------
+    // todo-tool re-decomposition guard
+    // -----------------------------------------------------------------
+
+    async fn add_task(services: &HashMap<String, ServiceFn>, params: Value) -> Value {
+        services
+            .get("tasks.add")
+            .expect("tasks.add service")(params)
+        .await
+        .expect("add succeeds")
+    }
+
+    /// REGRESSION (lfm2.5 smoke, 2026-07-25): the model re-planned the same
+    /// work every step, turning 5 seeded tasks into ~50 — "Write data file
+    /// with header and 3 rows" was created ten times — so the plan grew
+    /// faster than it was worked. Re-adding an OPEN title reuses that item.
+    #[tokio::test]
+    async fn re_adding_an_open_title_reuses_the_existing_task() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        let first = add_task(
+            &services,
+            json!({"title": "Write data file", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let again = add_task(
+            &services,
+            json!({"title": "  write DATA file  ", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+
+        assert_eq!(
+            first["task"]["id"], again["task"]["id"],
+            "a re-add of an open title must reuse the item, not clone it"
+        );
+        assert_eq!(again["deduplicated"], json!(true));
+        let open = storage
+            .tasks()
+            .list("session", Some("s1"), false)
+            .await
+            .expect("list");
+        assert_eq!(open.len(), 1, "exactly one task exists");
+    }
+
+    /// The dedupe must not swallow a genuinely recurring chore: once the
+    /// previous one is closed, the same title is addable again.
+    #[tokio::test]
+    async fn the_same_title_is_addable_again_once_the_previous_one_is_closed() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        let first = add_task(
+            &services,
+            json!({"title": "run the tests", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let id = first["task"]["id"].as_i64().expect("id");
+        storage
+            .tasks()
+            .complete(id, Some("test"), None)
+            .await
+            .expect("complete");
+
+        let second = add_task(
+            &services,
+            json!({"title": "run the tests", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_ne!(
+            second["task"]["id"].as_i64(),
+            Some(id),
+            "a closed chore may be scheduled again"
+        );
+    }
+
+    /// Sibling scoping: the same subtask title under DIFFERENT parents is
+    /// legitimate ("write the header" for two different files).
+    #[tokio::test]
+    async fn the_same_title_under_a_different_parent_is_not_a_duplicate() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        let a = add_task(
+            &services,
+            json!({"title": "feature A", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let b = add_task(
+            &services,
+            json!({"title": "feature B", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let sub_a = add_task(
+            &services,
+            json!({"title": "write the header", "parent_id": a["task"]["id"]}),
+        )
+        .await;
+        let sub_b = add_task(
+            &services,
+            json!({"title": "write the header", "parent_id": b["task"]["id"]}),
+        )
+        .await;
+
+        assert_ne!(
+            sub_a["task"]["id"], sub_b["task"]["id"],
+            "same title under different parents is different work"
+        );
+    }
+
+    /// REGRESSION (lfm2.5 smoke, 2026-07-25): the model deleted a SEEDED
+    /// plan item it could not finish, and the run then panicked on a task the
+    /// harness still expected to verify. A task with an acceptance contract
+    /// is never the model's to erase.
+    #[tokio::test]
+    async fn a_task_with_an_acceptance_contract_cannot_be_deleted() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        let seeded = storage
+            .tasks()
+            .create(NewTask {
+                scope: "session".to_string(),
+                scope_id: Some("s1".to_string()),
+                title: "Create the greeting file".to_string(),
+                priority: 3,
+                acceptance: Some(json!({
+                    "kind": "regex", "path": "greeting.txt", "pattern": "hello"
+                })),
+                ..NewTask::default()
+            })
+            .await
+            .expect("seed");
+
+        let out = services
+            .get("tasks.remove")
+            .expect("tasks.remove service")(json!({ "id": seeded.id }))
+        .await
+        .expect("call succeeds");
+
+        assert_eq!(out["removed"], json!(false));
+        assert_eq!(out["refused"], json!(true));
+        assert!(
+            storage.tasks().get(seeded.id).await.is_ok(),
+            "the seeded task must still exist"
+        );
+    }
+
+    /// The guard must not make the store un-tidyable: scratch items the model
+    /// invents for itself carry no acceptance check and stay removable.
+    #[tokio::test]
+    async fn a_scratch_task_without_acceptance_is_still_removable() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        let scratch = add_task(
+            &services,
+            json!({"title": "think about it", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let id = scratch["task"]["id"].as_i64().expect("id");
+
+        let out = services
+            .get("tasks.remove")
+            .expect("tasks.remove service")(json!({ "id": id }))
+        .await
+        .expect("call succeeds");
+
+        assert_ne!(
+            out["removed"],
+            json!(false),
+            "a scratch item must actually be removed (the store reports a count)"
+        );
+        assert!(out.get("refused").is_none(), "no contract, so no refusal");
+        assert!(storage.tasks().get(id).await.is_err(), "scratch item is gone");
     }
 
     // -----------------------------------------------------------------

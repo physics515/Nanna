@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.11",
+  version: "0.1.13",
   output: "context",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the largest size the file has held (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
@@ -171,6 +171,40 @@ export default {
     // refusal so the model moves on instead of "repairing" internals.
     if (!input.force && hiwaterIsState(hiwaterKey(filePath))) {
       return fail("write_file skipped: " + filePath + " is write_file's internal bookkeeping. It maintains itself, is healthy, and never needs manual repair. Your own files are unaffected. Continue with your actual task.");
+    }
+
+    // Double-escaped content — REPAIRED, not refused. Observed live
+    // (lfm2.5): the model emitted "#!/bin/sh\ncase $1 in" with the
+    // backslash-n as TWO LITERAL CHARACTERS, so the "script" landed as one
+    // physical line and could never execute; every downstream acceptance
+    // check then failed on behaviour, hiding the real cause.
+    //
+    // Refusing was tried first and is WORSE: the model cannot see its own
+    // escaping (the defect is in how its output is serialized, not in its
+    // intent), so it resent byte-identical content three times, then began
+    // SHRINKING the file to appease the guard — heading straight for the
+    // truncation ratchet. A guard the model cannot satisfy is a wedge.
+    //
+    // The signature is unambiguous and needs no size threshold: content
+    // carrying two or more literal \n sequences describes three or more
+    // lines, so a complete absence of real newlines means the escaping was
+    // lost in transit, not that the author wanted one line. JSON-family
+    // files are exempt — \n inside a string is exactly how JSON encodes a
+    // newline, by spec. force=true writes bytes through untouched.
+    function escapedNewlineCount(path, text) {
+      if (text.indexOf("\n") !== -1) return 0; // real newlines present — fine
+      var lower = path.toLowerCase();
+      if (/\.(json|jsonl|ndjson|geojson)$/.test(lower)) return 0;
+      return text.split("\\n").length - 1;
+    }
+    var unescapedNewlines = 0;
+    if (!input.force) {
+      unescapedNewlines = escapedNewlineCount(filePath, fileContent);
+      if (unescapedNewlines >= 2) {
+        fileContent = fileContent.split("\\n").join("\n");
+      } else {
+        unescapedNewlines = 0;
+      }
     }
 
     var bytes = fileContent.length;
@@ -377,6 +411,17 @@ export default {
     // made the result exceed the context threshold, and the model read the
     // resulting truncation stub as "my write was discarded" (observed
     // live, round 7). The file on disk is the source of truth.
-    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." };
+    // A repair the model cannot see is a repair it will "fix" back. Announce
+    // WHAT changed, WHY, and that the write SUCCEEDED — an unexplained
+    // difference between what was sent and what landed reads as corruption.
+    var repairNote = "";
+    if (unescapedNewlines > 0) {
+      repairNote =
+        " NOTE: your content arrived with " + unescapedNewlines +
+        " literal backslash-n sequences and no real line breaks, which would have made the file one unusable line;" +
+        " they were converted to real newlines before writing. The write SUCCEEDED and the file is correct —" +
+        " nothing to redo. Send real line breaks next time and this note goes away.";
+    }
+    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + repairNote };
   }
 }
