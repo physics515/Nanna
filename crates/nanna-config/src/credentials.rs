@@ -334,7 +334,7 @@ impl SecureStore {
                         }
                     }
                     Err(keyring::Error::NoEntry) => {
-                        let key = random_key();
+                        let key = random_key()?;
                         if entry.set_password(&base64_encode(&key)).is_ok() {
                             return Ok(key);
                         }
@@ -354,7 +354,7 @@ impl SecureStore {
                 return Ok(key);
             }
         }
-        let key = random_key();
+        let key = random_key()?;
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -833,20 +833,20 @@ impl ClaudeCredentialManager {
 const ENC_MAGIC: &[u8; 8] = b"NANNAENC";
 const NONCE_LEN: usize = 12;
 
-fn random_key() -> [u8; 32] {
+/// Generate a fresh 32-byte AES-256 file-encryption key, **failing closed** if the
+/// OS RNG does.
+///
+/// The old body fell back to a `SystemTime`-nanos-derived key on `getrandom`
+/// failure — only ~30 bits of guessable entropy, so an attacker who obtained
+/// `credentials.enc` and knew roughly when the key was created could brute-force
+/// it. A getrandom failure is essentially never seen on a real system, and there
+/// is no safe weak fallback for a long-lived encryption key, so we refuse to mint
+/// one rather than mint a guessable one (matches [`random_nonce`]).
+fn random_key() -> Result<[u8; 32], CredentialError> {
     let mut key = [0u8; 32];
-    if getrandom::fill(&mut key).is_err() {
-        let tick = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        for (i, b) in key.iter_mut().enumerate() {
-            *b = ((tick >> ((i % 16) * 4)) as u8)
-                .wrapping_mul(31)
-                .wrapping_add(i as u8);
-        }
-    }
-    key
+    getrandom::fill(&mut key)
+        .map_err(|e| CredentialError::Crypto(format!("RNG failure generating file key: {e}")))?;
+    Ok(key)
 }
 
 /// Generate a fresh random AES-GCM nonce, **failing closed** if the OS RNG does.

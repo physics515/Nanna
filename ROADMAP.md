@@ -362,6 +362,11 @@ tool calling, agent loop with context management, scheduler (heartbeats, cron).
       wrong length) to fallible `Nonce::try_from`. 2 new tests (nonce is non-zero + unique across calls;
       encrypting the same plaintext+key twice yields **different** envelopes yet both decrypt back — an
       observable proof the nonce is fresh each call), 22 nanna-config tests green, no deprecation warnings.
+      *(same day)* **`random_key` given the same fail-closed treatment.** Its RNG-failure fallback derived
+      the 32-byte file key from `SystemTime` nanos — ~30 bits of guessable entropy, brute-forceable by an
+      attacker who has `credentials.enc` and a rough creation time. There is no safe weak fallback for a
+      long-lived key, so it now returns `Result` and propagates the getrandom error (both call sites in
+      `file_encryption_key` already return `Result`).
 - [x] Inconsistent application directory namespaces — config uses ProjectDirs::from("bot", "clawd", "Nanna") while credentials use ProjectDirs::from("com", "nanna", "nanna"), causing orphaned data and confused uninstall flows.
       *(2026-07-24)* **Unified on `com` / `nanna` / `nanna`.** New `nanna_config::{APP_QUALIFIER,
       APP_ORGANIZATION, APP_NAME, project_dirs, legacy_clawd_project_dirs}` is the single identity.
