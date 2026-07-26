@@ -7,7 +7,7 @@
     <!-- Collapsed rail -->
     <button
       v-if="collapsed"
-      class="rail glass-tag"
+      class="rail"
       :title="`Tasks: ${doneCount}/${tasks.length} done — click to expand`"
       @click="collapsed = false"
     >
@@ -16,7 +16,7 @@
     </button>
 
     <!-- Expanded panel -->
-    <div v-else class="panel glass-panel">
+    <div v-else class="panel">
       <div class="panel-header">
         <div class="flex items-center gap-2 min-w-0">
           <ListChecks class="w-4 h-4 text-nanna-primary shrink-0" />
@@ -202,7 +202,6 @@ watch(() => props.sessionId, () => { tasks.value = []; void load() })
   justify-content: space-between;
   gap: 8px;
   padding: 10px 12px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
 }
 .panel-body {
   overflow-y: auto;
@@ -218,7 +217,7 @@ watch(() => props.sessionId, () => { tasks.value = []; void load() })
   line-height: 1.35;
 }
 .task-row:hover {
-  background: rgba(148, 163, 184, 0.06);
+  background: rgba(148, 163, 184, 0.04);
 }
 .glyph {
   flex-shrink: 0;
@@ -250,7 +249,6 @@ watch(() => props.sessionId, () => { tasks.value = []; void load() })
 }
 .owner-agent {
   color: rgb(129 140 248);
-  background: rgba(129, 140, 248, 0.12);
 }
 .owner-self {
   color: var(--color-nanna-text-dim, rgba(148, 163, 184, 0.7));
