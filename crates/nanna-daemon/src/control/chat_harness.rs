@@ -43,7 +43,8 @@ use crate::tasks::{
     AgentPlanner, AgentStepRunner, ChatSink, PendingMessages, SessionInterjector, TursoTaskSource,
     seed_plan,
 };
-use nanna_agent::harness::LongHorizonConfig;
+use nanna_agent::harness::{Interjector, LongHorizonConfig};
+use nanna_storage::Storage;
 use nanna_agent::planner::{PLAN_DESCRIPTION_MAX_BYTES, PLAN_GOAL_MAX_BYTES};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -206,9 +207,23 @@ impl ControlPlane {
             let scope = "session".to_string();
             let scope_id = Some(session_id_owned.clone());
 
-            let plan = planner
-                .plan(&content_owned, conversation.as_deref())
-                .await;
+            // Unfinished work from an earlier turn is INFORMATION FOR THE
+            // MODEL, not an instruction to the harness. Owner directive
+            // (2026-07-25): *"the model should decide to resume or answer
+            // another question by the user … i don't think we should assume
+            // that the user wants to resume."* Previously the store decided
+            // silently: leftover items sorted ahead of the new plan, so a
+            // fresh question waited behind stale work nobody re-confirmed.
+            // Now the planner is shown what is outstanding and chooses.
+            let outstanding = open_work_context(&storage, &scope, scope_id.as_deref()).await;
+            let context = match (conversation.as_deref(), outstanding.as_deref()) {
+                (Some(convo), Some(work)) => Some(format!("{convo}\n\n{work}")),
+                (Some(convo), None) => Some(convo.to_string()),
+                (None, Some(work)) => Some(work.to_string()),
+                (None, None) => None,
+            };
+
+            let plan = planner.plan(&content_owned, context.as_deref()).await;
             tracing::info!(
                 session_id = %session_id_owned,
                 tasks = plan.tasks.len(),
@@ -254,7 +269,23 @@ impl ControlPlane {
                         ..LongHorizonConfig::default()
                     };
 
-                    let report = nanna_agent::harness::LongHorizonRunner::new(config)
+                    // Drain-before-release. The interjector is only polled
+                    // INSIDE the harness loop, before `next()`. A message that
+                    // arrives after the final poll therefore lands in
+                    // `pending` with no loop left to notice it: the run exits,
+                    // the claim is released, and nothing ever starts a run for
+                    // it — the user's message silently disappears. Observed
+                    // live: "the queue doesn't seem to ever make it to the
+                    // model even after the model reaches a stopping point."
+                    //
+                    // So: after the harness returns, re-check the queue and
+                    // run again for whatever arrived late. Bounded by
+                    // POST_RUN_DRAIN_MAX rather than `while !empty` — a user
+                    // typing steadily could otherwise keep one turn alive
+                    // forever, and any message past the bound is still safe in
+                    // `pending` for the next turn to claim.
+                    const POST_RUN_DRAIN_MAX: usize = 4;
+                    let mut report = nanna_agent::harness::LongHorizonRunner::new(config.clone())
                         .run_with_interjector(
                             &content_owned,
                             &source,
@@ -264,6 +295,41 @@ impl ControlPlane {
                             Some(&interjector),
                         )
                         .await;
+
+                    for sweep in 0..POST_RUN_DRAIN_MAX {
+                        if run_handle
+                            .cancellation_flag
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            break; // the user pressed Stop; do not start more work
+                        }
+                        let admitted = match interjector.interject().await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(message) => {
+                                tracing::warn!(%message, "post-run drain could not seed");
+                                break;
+                            }
+                        };
+                        tracing::info!(
+                            sweep,
+                            admitted,
+                            "message arrived after the last step boundary — running it now"
+                        );
+                        let extra = nanna_agent::harness::LongHorizonRunner::new(config.clone())
+                            .run_with_interjector(
+                                &content_owned,
+                                &source,
+                                &step_runner,
+                                &workdir,
+                                Some(run_handle.cancellation_flag.clone()),
+                                Some(&interjector),
+                            )
+                            .await;
+                        report.steps_taken += extra.steps_taken;
+                        report.items_completed += extra.items_completed;
+                        report.interjected_items += admitted + extra.interjected_items;
+                    }
 
                     // Run mechanics are shown only when there was a real run:
                     // a single-step reply stays a plain reply.
@@ -354,6 +420,56 @@ pub fn interjected_response(session_id: &str, depth: usize) -> Value {
         "content": "",
         "message": "admitted to the run in progress at the next step boundary",
     })
+}
+
+/// Render this scope's still-open work so the PLANNER can decide what to do
+/// with it — resume it, fold the new request into it, or leave it parked and
+/// answer the question that was actually asked.
+///
+/// Deliberately framed as a decision for the model rather than a directive:
+/// the store must not silently resume stale work just because it sorts first.
+/// `None` when nothing is outstanding, so an ordinary turn carries no extra
+/// prompt weight.
+///
+/// Bounded like every other injected context: at most
+/// [`OPEN_WORK_MAX`] items, titles clamped, so a scope with a runaway plan
+/// cannot crowd out the request itself.
+async fn open_work_context(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> Option<String> {
+    /// Enough to convey what is parked without displacing the request. A
+    /// model that needs the full list can read it with the todo tool.
+    const OPEN_WORK_MAX: usize = 10;
+
+    let open = storage.tasks().list(scope, scope_id, false).await.ok()?;
+    if open.is_empty() {
+        return None;
+    }
+    let total = open.len();
+    let mut out = String::from(
+        "## Unfinished work from earlier in this session\n\
+         These tasks are still open. Decide for yourself whether the user's new message means \
+         to continue them, to change them, or to set them aside and answer something else — \
+         do NOT assume a resume was requested:\n",
+    );
+    for task in open.iter().take(OPEN_WORK_MAX) {
+        let title = if task.title.len() > 120 {
+            let end = task.title.floor_char_boundary(120);
+            format!("{}…", &task.title[..end])
+        } else {
+            task.title.clone()
+        };
+        out.push_str(&format!("- #{} [{}] {}\n", task.id, task.status, title));
+    }
+    if total > OPEN_WORK_MAX {
+        out.push_str(&format!(
+            "- …and {} more (use the todo tool to see them all)\n",
+            total - OPEN_WORK_MAX
+        ));
+    }
+    Some(out)
 }
 
 /// Render recent conversation as role-tagged lines for prompt injection.
