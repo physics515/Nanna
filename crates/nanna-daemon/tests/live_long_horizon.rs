@@ -21,7 +21,7 @@ use nanna_agent::harness::{LongHorizonConfig, LongHorizonReport, LongHorizonRunn
 use nanna_daemon::llm_router::LlmRouter;
 use nanna_daemon::tasks::{AgentStepRunner, TursoTaskSource, build_task_services};
 use nanna_storage::{NewTask, Storage};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,8 +62,36 @@ struct EvalEnv {
     runner: AgentStepRunner,
 }
 
+/// Where a resumable eval keeps its state. `NANNA_EVAL_DIR` overrides;
+/// otherwise a stable per-model directory beside the repo's target dir.
+///
+/// Deliberately NOT a tempdir: a tempdir is deleted on drop, which is what
+/// made multi-hour runs unresumable.
+fn eval_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("NANNA_EVAL_DIR") {
+        return PathBuf::from(dir);
+    }
+    let slug: String = eval_model()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    std::env::temp_dir().join(format!("nanna-eval-{slug}"))
+}
+
 async fn build_env(workdir: &Path) -> EvalEnv {
-    let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+    // Persist to Turso on disk, never `:memory:`. The harness's core promise
+    // is "the store IS the checkpoint" — a run stopped by a provider
+    // incident, a pause, or a crash resumes by simply starting again. An
+    // in-memory store silently opted the eval OUT of that: a 3.5h run killed
+    // to free the GPU lost every completed feature and could not be resumed.
+    let db_path = workdir.join("eval-store.db");
+    let storage = Arc::new(
+        Storage::new(&nanna_storage::StorageConfig {
+            path: db_path.to_string_lossy().to_string(),
+        })
+        .await
+        .expect("storage"),
+    );
 
     let tools = Arc::new(nanna_tools::ToolRegistry::new());
     tools
@@ -813,15 +841,58 @@ async fn live_endurance() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(6.0);
 
-    let workspace = tempfile::tempdir().expect("tempdir");
-    let workdir = workspace.path().to_path_buf();
+    // Restorable end to end: a stable workdir + an on-disk Turso store, so
+    // stopping the run (pause, crash, provider incident) loses nothing and
+    // restarting picks up exactly where the plan stands. `NANNA_EVAL_FRESH=1`
+    // wipes it to start over.
+    let workdir = eval_state_dir();
+    if std::env::var("NANNA_EVAL_FRESH").is_ok_and(|v| v == "1") {
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+    std::fs::create_dir_all(&workdir).expect("eval state dir");
     let env = build_env(&workdir).await;
-    let plan_ids = seed_minidb_tasks(&env.storage, &workdir).await;
+
+    // Re-seeding an existing plan would duplicate all 42 features and reset
+    // progress, so seed ONLY when the scope is empty.
+    let existing = env
+        .storage
+        .tasks()
+        .list("session", Some(EVAL_SESSION), true)
+        .await
+        .expect("list tasks");
+    let (plan_ids, resumed) = if existing.is_empty() {
+        (seed_minidb_tasks(&env.storage, &workdir).await, false)
+    } else {
+        let mut ids: Vec<i64> = existing
+            .iter()
+            .filter(|t| t.acceptance.is_some() && t.parent_id.is_none())
+            .map(|t| t.id)
+            .collect();
+        ids.sort_unstable();
+        (ids, true)
+    };
     let total = plan_ids.len();
-    println!(
-        "endurance: {total} features seeded, wall-clock cap {hours}h, model {}",
-        eval_model()
-    );
+    let done_already = plan_ids.len()
+        - env
+            .storage
+            .tasks()
+            .list("session", Some(EVAL_SESSION), false)
+            .await
+            .map(|open| open.iter().filter(|t| plan_ids.contains(&t.id)).count())
+            .unwrap_or(total);
+    if resumed {
+        println!(
+            "endurance: RESUMED from {} — {total} features in the plan, {done_already} already closed, cap {hours}h, model {}",
+            workdir.display(),
+            eval_model()
+        );
+    } else {
+        println!(
+            "endurance: {total} features seeded at {}, wall-clock cap {hours}h, model {}",
+            workdir.display(),
+            eval_model()
+        );
+    }
 
     // Progress reporter: done/total every 2 minutes.
     let progress_storage = env.storage.clone();
