@@ -2550,6 +2550,16 @@ created rather than potentially walking up into us. Pinned by
 that terminates its own group; surviving to read the result IS the assertion. This was a real hole
 independent of the eval: any agent that writes and runs a script could take down its own daemon.
 
+- [x] **Eval state is restorable end to end (owner, 2026-07-25)** — *"we should never use any storage
+      that is in memory only. everything should persist via turso"* / *"at least be resume-able via a
+      simple continue prompt"*. `live_endurance` built its task store with `Storage::in_memory()` in a
+      `tempfile::tempdir()`, silently opting the eval OUT of the harness's core promise that **the
+      store IS the checkpoint** — so a 3.5 h gemma run stopped to free the GPU lost every completed
+      feature with nothing to resume from. The eval now opens a real Turso file in a stable directory
+      (`NANNA_EVAL_DIR`, else a per-model dir) and **seeds only when the scope is empty**; re-running
+      the identical command resumes and reports `RESUMED from … N already closed`. `NANNA_EVAL_FRESH=1`
+      starts over. Remaining `in_memory()` uses are isolated unit tests, which want a blank store.
+
 **Open:** `live_endurance` leaves a **zombie process** — observed alive ~1.5 h after printing its final
 summary, holding `live_long_horizon-*.exe` and failing every later build with `LNK1104`. The test
 function completes but the runtime never exits (suspect a lingering spawned task / connection pool).
