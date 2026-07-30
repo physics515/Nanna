@@ -1,7 +1,7 @@
 export default {
   name: "explore",
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Explore a directory and summarize its contents. Provides a quick overview of project structure, file types, and sizes.",
   parameters: {
     type: "object",

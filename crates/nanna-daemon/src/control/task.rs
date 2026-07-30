@@ -385,6 +385,7 @@ impl ControlPlane {
                     Some(event_tx.clone()),
                 );
                 let runner = AgentStepRunner {
+                    discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
                     router: router.clone(),
                     tools: tools.clone(),
                     agent_config: agent.agent_config().await,
@@ -393,6 +394,8 @@ impl ControlPlane {
                     stats: Some(self.model_stats.clone()),
                     // Background run: no transcript to stream into.
                     chat_sink: None,
+                    memory: None,
+                    workspace_id: None,
                 };
                 let mut config = LongHorizonConfig::default();
                 if let Some(secs) = max_wall_clock_secs {

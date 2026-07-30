@@ -133,6 +133,10 @@ pub enum DaemonEvent {
     TaskRunStarted { scope: String, #[serde(default)] scope_id: Option<String>, goal: String },
     TaskRunProgress { scope: String, #[serde(default)] scope_id: Option<String>, #[serde(default)] task_id: Option<i64>, kind: String, detail: serde_json::Value },
     TaskRunCompleted { scope: String, #[serde(default)] scope_id: Option<String>, report: serde_json::Value },
+    /// A workspace was registered or removed on the daemon. Payload-free by
+    /// design: the workspace SET is shared, which one is active is this
+    /// client's own view.
+    WorkspacesChanged,
 }
 
 /// Pending request waiting for response

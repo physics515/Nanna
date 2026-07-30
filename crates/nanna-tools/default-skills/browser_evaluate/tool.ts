@@ -1,7 +1,8 @@
 export default {
   name: "browser_evaluate",
+  requires: ["browser.evaluate"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Evaluate JavaScript code in a browser page context. Useful for extracting dynamic data or manipulating page state.",
   parameters: {
     type: "object",

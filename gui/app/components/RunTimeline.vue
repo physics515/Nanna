@@ -19,9 +19,13 @@
       />
 
       <!-- Visible assistant text between tool calls. The trailing OPEN text
-           segment is skipped while live — the streaming bubble renders it. -->
+           segment is skipped while live — the streaming bubble renders it.
+           Marker-only and whitespace-only segments are skipped too: models
+           emit stray newlines and bare TASK COMPLETE lines between tool
+           calls, and each opens its own segment (the previous item is a
+           tool), which otherwise draws an empty "☽ Nanna" card. -->
       <MessageBubble
-        v-else-if="item.kind === 'text' && !(isLive && idx === items.length - 1)"
+        v-else-if="item.kind === 'text' && !(isLive && idx === items.length - 1) && hasRenderableText(item.content)"
         variant="assistant"
       >
         <div class="flex items-start gap-2 sm:gap-3">
@@ -59,6 +63,13 @@ const props = defineProps<{
    *  bubble instead, and the trailing thinking segment shows as active. */
   isLive?: boolean
 }>()
+
+// An assistant bubble renders only if it has visible text once the harness
+// plumbing is stripped — the same invariant the page applies to its
+// historical and streaming bubbles.
+function hasRenderableText(content: string | null | undefined): boolean {
+  return stripHarnessMarkers(content ?? '').trim().length > 0
+}
 
 // Index-based keys: the journal is append-only (items never reorder or
 // vanish), and call_ids are NOT unique — Ollama synthesizes them per

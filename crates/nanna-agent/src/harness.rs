@@ -425,6 +425,14 @@ pub struct StepRequest {
     pub item_id: i64,
     pub step_index: usize,
     pub step_kind: StepKind,
+    /// The item's title, for status display.
+    ///
+    /// Carried explicitly rather than parsed back out of `prompt`: the old
+    /// reader took everything after `Task #id: `, so a replan step — whose
+    /// prompt line reads "…title has made no verifiable progress (5 steps
+    /// without the done-condition flipping)" — put that whole sentence on
+    /// screen as if it were the task name.
+    pub item_title: String,
     pub prompt: String,
     /// Tools to activate for the step (≤ a handful — small models degrade
     /// past 5-10 tool definitions).
@@ -560,6 +568,13 @@ pub enum StopReason {
 pub struct LongHorizonReport {
     pub stop: StopReason,
     pub steps_taken: usize,
+    /// Total tool calls made across every step.
+    ///
+    /// The signal for "this run ACTED on the world", which is what separates a
+    /// conversational reply from work in progress. Step and item counts cannot
+    /// carry that: a 42-feature build whose planner emits one task and whose
+    /// first step completes it looks numerically identical to "hi".
+    pub tool_calls: usize,
     pub items_completed: usize,
     /// Items completed on the model's claim alone (no acceptance check
     /// existed) — logged so unverified completions are visible.
@@ -662,12 +677,17 @@ pub fn build_replan_prompt(goal: &str, step: &TaskStep, stall_summary: &str) -> 
         "Task #{}: {} has made no verifiable progress ({stall_summary}).\n",
         step.id, step.title
     ));
+    // Describes the OPERATION, not a tool signature. Naming a tool and its
+    // exact arguments in a prompt that may not ship that tool's schema is how
+    // the model ends up obeying blind and guessing parameter names — measured
+    // at 53-66% malformed calls. Discovery is how it gets the real signature.
     prompt.push_str(&format!(
-        "Break it into 2-5 smaller subtasks using the todo tool: call \
-         todo(action='add', parent_id={}, title='...', acceptance={{...}}) once per subtask. \
-         Each subtask needs a machine-checkable acceptance (kind: command | file_exists | regex) \
-         wherever possible. Make the first subtask small enough to finish in one step. \
-         Do not attempt the work itself in this step — only decompose.\n",
+        "Break it into 2-5 smaller subtasks, added to the task store as children of \
+         task #{} — discover the task-management tool if you do not already have it. \
+         Each subtask needs a machine-checkable acceptance condition (a command to run, \
+         a file that must exist, or a pattern that must match) wherever possible. Make \
+         the first subtask small enough to finish in one step. Do not attempt the work \
+         itself in this step — only decompose.\n",
         step.id
     ));
     prompt
@@ -678,12 +698,27 @@ fn stable_prefix(goal: &str) -> String {
     format!(
         "== GOAL (immutable — this is the whole point of the run) ==\n{goal}\n\n\
          == HOW TO WORK ==\n\
-         You are executing one step of a long-running plan. The plan lives in the todo \
-         store — you do not need to remember anything between steps.\n\
+         You are executing one step of a long-running plan. You do not need to remember \
+         anything between steps — the plan and everything you have already done are kept \
+         for you.\n\
          - Advance the CURRENT TASK below by exactly one concrete action.\n\
-         - Use the tools provided; do not narrate actions you did not take.\n\
-         - Leave findings for future steps with todo(action='note', ...): notes are your \
-           only memory.\n\
+         - SAY WHAT YOU ARE DOING: open with ONE short sentence naming the action you are \
+           about to take and why it follows from the last result. Someone is watching this \
+           run and that sentence is all they see.\n\
+         - GET THE RIGHT TOOL FIRST. You start each run able to see only one tool, for \
+           discovering the others. Everything you need — running commands, reading, \
+           writing and editing files, searching your memory — exists and is waiting behind \
+           it. Ask for what the task needs, then use the real tool.\n\
+           Do not improvise around a tool you cannot see: writing a file by shell \
+           redirection instead of the file tool, or piping a heredoc instead of editing, \
+           skips the checks that keep this run alive and is how work gets silently lost.\n\
+         - Use the tools you have; do not narrate actions you did not take. Describe what \
+           actually happened, including failures — a wrong result reported honestly is worth \
+           more than a confident guess.\n\
+         - ONE artifact per job: change the real file in place. Do not build a parallel copy \
+           (`thing.sh` beside `thing`, `thing_v2`, `thing.new`) — whatever reads the real file \
+           keeps reading it, so work in a copy scores zero no matter how good it is. This \
+           applies to shell redirects too, not just the file tools.\n\
          - Never mark work done yourself: the harness verifies the task's done-condition \
            and records completion.\n\n"
     )
@@ -802,6 +837,7 @@ impl LongHorizonRunner {
         let mut interjected_items = 0usize;
         let started = Instant::now();
         let mut steps_taken = 0usize;
+        let mut tool_calls_total = 0usize;
         let mut items_completed = 0usize;
         let mut items_completed_unverified = 0usize;
         let mut items_abandoned = 0usize;
@@ -899,6 +935,7 @@ impl LongHorizonRunner {
                 item_id: step.id,
                 step_index: steps_taken,
                 step_kind,
+                item_title: step.title.clone(),
                 prompt,
                 tool_scope: step.tool_scope.clone(),
                 token_budget: cfg.step_token_budget,
@@ -972,6 +1009,7 @@ impl LongHorizonRunner {
             // Cross-step repetition = a stall the in-run detector cannot see.
             let repeated = steps_repeat(&item.last_tool_calls, &outcome.tool_calls);
             item.last_tool_calls.clone_from(&outcome.tool_calls);
+            tool_calls_total += outcome.tool_calls.len();
 
             // Verdict time. With a check, the environment is the only judge.
             match &step.acceptance {
@@ -1090,6 +1128,7 @@ impl LongHorizonRunner {
         LongHorizonReport {
             stop,
             steps_taken,
+            tool_calls: tool_calls_total,
             items_completed,
             items_completed_unverified,
             items_abandoned,
@@ -1689,7 +1728,15 @@ mod tests {
             .collect();
         assert_eq!(plan_steps.len(), 1, "exactly one replan step");
         assert!(plan_steps[0].prompt.contains("== REPLAN REQUIRED =="));
-        assert!(plan_steps[0].prompt.contains("parent_id=1"));
+        // The stalled item must be named so the subtasks are parented to it —
+        // but as the OPERATION, not as `parent_id=1` inside a literal tool
+        // signature. A prompt that spells out a call it may not ship the schema
+        // for teaches the model to guess argument names.
+        assert!(plan_steps[0].prompt.contains("children of task #1"));
+        assert!(
+            !plan_steps[0].prompt.contains("todo("),
+            "the replan prompt must not name a tool call verbatim"
+        );
         // Execute steps carry the item's tool scope and step bounds.
         let exec = requests
             .iter()

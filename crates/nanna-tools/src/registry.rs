@@ -647,6 +647,22 @@ impl ToolRegistry {
         let mut loaded = 0;
 
         for skill in discovered {
+            // A tool that declares `requires: [...]` is only registered when
+            // every named service is actually present. An advertised tool that
+            // can only fail is worse than an absent one: the model cannot tell
+            // "permanently broken" from "try again", so it retries. Observed
+            // live 2026-07-26 — with memory disabled, `reflect` failed on all
+            // 4 calls (`Service not found: memory.list`) and `list_reminders`
+            // on all 3 (`schedule.list`, registered nowhere), and the run
+            // spent its tail looping over them instead of building anything.
+            if let Some(missing) = missing_required_services(&skill.path, services) {
+                info!(
+                    name = %skill.name,
+                    missing = %missing.join(", "),
+                    "Skill not registered: required services unavailable"
+                );
+                continue;
+            }
             match load_skill_with_services(&skill.path, services, Some(Arc::downgrade(self))).await
             {
                 Ok(tool) => {
@@ -670,6 +686,7 @@ impl ToolRegistry {
         let tools = self.tools.read().await;
         tools.contains_key(name)
     }
+
 
     /// Get the number of registered tools
     pub async fn len(&self) -> usize {
@@ -804,6 +821,32 @@ fn result_log_preview(result: &ToolResult) -> String {
     } else {
         source.to_string()
     }
+}
+
+/// Services a skill declares as mandatory but the host does not provide.
+///
+/// Returns `None` when the skill is fine to register — either it declares no
+/// requirements, or every declared one is present. Any parse or read failure
+/// is also `None` (permissive): a tool must never disappear because its
+/// annotation could not be read.
+#[cfg(feature = "scripting")]
+fn missing_required_services(
+    skill_dir: &Path,
+    services: &HashMap<String, nanna_scripting::ServiceFn>,
+) -> Option<Vec<String>> {
+    // Scripted skills only (same tool.ts/tool.js precedence the loader uses);
+    // manifest/executable skills declare no service requirements.
+    let ts = skill_dir.join("tool.ts");
+    let source_path = if ts.exists() { ts } else { skill_dir.join("tool.js") };
+    let source = std::fs::read_to_string(source_path).ok()?;
+    let manifest = nanna_scripting::extract_manifest(&source)?;
+
+    let missing: Vec<String> = manifest
+        .requires
+        .into_iter()
+        .filter(|svc| !services.contains_key(svc))
+        .collect();
+    if missing.is_empty() { None } else { Some(missing) }
 }
 
 #[cfg(test)]

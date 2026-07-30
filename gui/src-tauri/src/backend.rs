@@ -285,6 +285,12 @@ impl Backend {
                             "session_id": session_id,
                         }));
                     }
+                    DaemonEvent::WorkspacesChanged => {
+                        // The frontend re-fetches; `list_workspaces` reads
+                        // through to the daemon, so no payload is needed and
+                        // this client's own active selection is untouched.
+                        let _ = app.emit("workspaces-changed", ());
+                    }
                     DaemonEvent::ContextUsage { session_id, used, window } => {
                         let _ = app.emit("context-usage", serde_json::json!({
                             "session_id": session_id,

@@ -899,12 +899,33 @@ impl TaskSource for TursoTaskSource {
 /// Runs one harness step as a fresh `Agent` with an isolated context — the
 /// re-anchor. Mirrors `AgentSpawnerImpl` construction.
 pub struct AgentStepRunner {
+    /// Tools the model has discovered so far in THIS harness run.
+    ///
+    /// Shared across steps so `discover_tools` is paid once per tool rather
+    /// than once per step — the runner is one object for the whole run, while
+    /// each step gets a fresh `RunState`.
+    pub discovered_tools: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
     pub router: Arc<LlmRouter>,
     pub tools: Arc<nanna_tools::ToolRegistry>,
     pub agent_config: nanna_agent::AgentConfig,
     pub system_prompt: String,
     pub workspace_root: Option<PathBuf>,
     pub stats: Option<nanna_agent::ModelStatsTracker>,
+    /// Memory sink for tool results.
+    ///
+    /// The design is "a tool result goes to MEMORY, and only a stub goes to
+    /// context — recall is how you get the full thing back". `loop_runner`
+    /// implements exactly that, but only when `RunOptions::on_memory` is set,
+    /// and it was set on the OLD direct-chat path only. When the harness
+    /// became the single chat path this runner replaced that one without
+    /// carrying the sink across, so the branch silently no-opped: a 4-hour
+    /// run made 1315 exec + 501 read_file + 87 edit_file calls and stored
+    /// NOTHING (observed 2026-07-27). Wiring it back restores the intended
+    /// behaviour for every turn, since every turn is now a harness run.
+    pub memory: Option<Arc<nanna_memory::MemoryService>>,
+    /// Workspace scope for stored memories, so a run's observations belong to
+    /// the workspace they happened in rather than leaking global.
+    pub workspace_id: Option<String>,
     /// When set, every step streams its text and tool activity into the
     /// session's chat transcript ("show your work as you go"). None for
     /// background runs that have no transcript to show.
@@ -1124,16 +1145,33 @@ impl ChatSink {
             nanna_agent::harness::StepKind::Verify => "verifying",
             nanna_agent::harness::StepKind::Execute => "working",
         };
-        let marker = format!("Task #{}: ", request.item_id);
-        let label = request
-            .prompt
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(&marker))
-            .map_or_else(
-                || format!("Task #{}", request.item_id),
-                std::string::ToString::to_string,
-            );
-        self.delta(&format!("\n\n**[{kind}]** {label}\n\n"));
+        let label = if request.item_title.trim().is_empty() {
+            format!("Task #{}", request.item_id)
+        } else {
+            request.item_title.clone()
+        };
+
+        // A step banner is run mechanics — it belongs in the journal the GUI
+        // renders as status, NOT in the message body. Written as text it also
+        // ended up in conversation history and was replayed to the model on
+        // later turns as if it had said it.
+        let _ = self.event_tx.send(Event::StepStarted {
+            session_id: self.session_id.clone(),
+            kind: kind.to_string(),
+            label: label.clone(),
+            item_id: request.item_id,
+        });
+        if let Some(run) = &self.run {
+            run.timeline
+                .lock()
+                .expect("timeline lock poisoned")
+                .push(crate::session::TimelineItem::Step {
+                    phase: kind.to_string(),
+                    label,
+                    item_id: request.item_id,
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+        }
     }
 }
 
@@ -1194,33 +1232,429 @@ fn is_empty_completion(outcome: &StepOutcome) -> bool {
     outcome.tool_calls.is_empty() && outcome.text.trim().is_empty() && outcome.output_tokens <= 8
 }
 
+/// A step that neither acted nor said anything: reasoning tokens were spent,
+/// but no tool ran and no text came back.
+///
+/// This is NOT a step result. A harness step exists to move an item, and
+/// thinking alone moves nothing — yet it used to be accepted as an outcome
+/// because the reasoning tokens put it over [`is_empty_completion`]'s bound.
+/// Observed live 2026-07-27: the same item was re-entered SEVEN times, each
+/// visit producing a "Thinking …" block and nothing else, and the run ended
+/// "8 steps · 0 items completed" with the artifact untouched for 19 minutes.
+///
+/// Distinct from an empty completion (a degraded provider emitting ~nothing),
+/// which is already handled: here the model is generating fine, it just did
+/// not commit to an action, so the retry re-anchors it with an explicit nudge.
+fn made_no_progress(outcome: &StepOutcome) -> bool {
+    outcome.tool_calls.is_empty() && outcome.text.trim().is_empty()
+}
+
+/// Appended to a step prompt after a no-progress attempt.
+///
+/// Says what was missing and what the only two acceptable shapes are. Kept
+/// short: the step prompt is already long, and a small model reads the tail.
+const NO_PROGRESS_NUDGE: &str = "\n\n[SYSTEM: your previous attempt at this step produced only \
+     reasoning — no tool call and no answer, so nothing changed. Do not think further about it. \
+     Either CALL A TOOL now (that is how work happens), or, if the step is genuinely already \
+     satisfied, reply with one short sentence saying so.]";
+
+/// The only tool definitions shipped with a step. Everything else is reached
+/// through `discover_tools`.
+///
+/// Two rules, and they are not in tension:
+///
+/// 1. **A plan never restricts capability.** Its `tool_scope` is a guess made
+///    before the work starts, and a step sealed inside that guess cannot do
+///    the job the step turned out to need. Observed 2026-07-27: a plan that
+///    scoped steps to `exec` produced 141 exec calls and ZERO write_file /
+///    read_file / edit_file — every file operation went through shell
+///    heredocs, sailing past the anti-erosion ratchet, the syntax gate and
+///    the fork refusals, which is why those guards never fired during the
+///    `minidb.sh` forks we spent hours chasing.
+///
+/// 2. **Context is not free.** Shipping ~30 schemas on every request costs
+///    thousands of tokens per step on a 32k window and measurably degrades
+///    small-model tool selection. So the request carries the minimum, and the
+///    model pulls in what it needs: `discover_tools` to reach any tool, and
+///    `recall` because memory is how a step recovers what it already knows
+///    (including the `[memory:…]` handles in its own context).
+///
+/// Anything activated stays active for the rest of the run, so discovery is
+/// paid once per tool, not once per step.
+/// ONE tool ships: the one that reaches every other tool.
+///
+/// Schemas are context, and on a 32k window the full set costs thousands of
+/// tokens per step and measurably degrades small-model tool selection. So the
+/// request carries `discover_tools` and nothing else, and the model pulls in
+/// what the task actually needs.
+///
+/// The hazard this creates is real and worth naming: a model that cannot see a
+/// file tool will write files by shell redirection instead, which bypasses the
+/// anti-erosion ratchet, the suffixed-fork guard and the path repair — every
+/// healing feature lives in the tools, so improvising around them silently
+/// loses work. Two things prevent it. `stable_prefix` tells the model plainly
+/// that the other tools exist behind discovery and that improvising around them
+/// is how work gets lost; and activation now persists for the whole run, so
+/// discovery is paid once rather than re-paid out of every step's iteration
+/// budget.
+///
+/// What must NOT come back is the previous compromise, where the prompt ordered
+/// the model to call `todo(action='note', …)` while `todo`'s schema was never
+/// sent. That is not gating, it is the prompt and the request disagreeing about
+/// what exists — and the model obeys blind. Measured 2026-07-28: malformed
+/// acceptance checks went from 3.1% of `todo` calls to 53-66%, and `exec` took
+/// 50 calls passing `query` (the only parameter name left in context) instead
+/// of `command`. If a prompt ever needs to name a tool, the answer is to fix
+/// the prompt, not to widen this list.
+const CORE_TOOLS: &[&str] = &["discover_tools"];
+
+/// Content not worth a memory: machine noise rather than an observation.
+///
+/// Deliberately narrow, and narrower than it used to be. This filter also
+/// matched six "failure shapes" — `"Error:"`, `"Command failed"` and friends —
+/// with `content.contains(s)` across the WHOLE body, not just the prefix.
+/// Upstream, `loop_runner` rewrites every unsuccessful tool result to
+/// `format!("Error: {…}")`, so the combination discarded **100% of failed tool
+/// calls**: 704 of them in one 2-hour run, with not a single ingest line in the
+/// whole day's log containing `FAILED`.
+///
+/// That is backwards. What went wrong is exactly what an agent must remember —
+/// an agent that cannot recall its own failures repeats them, which is what a
+/// long-horizon run looks like when it stalls. The substring form also ate
+/// SUCCESSFUL calls whose output merely mentioned an error: `cat ./minidb`
+/// stored nothing, twice, because the script contains its own error strings.
+/// The agent could not remember reading its own source.
+///
+/// Failure is now carried structurally instead — the episodic writer stamps
+/// `[tool → target — FAILED]` into the content and an `outcome` tag beside it —
+/// so it can be filtered at RECALL time by anyone who wants only successes,
+/// without being unwritable in the first place.
+fn is_low_signal_memory(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // Binary/garbled output. Judged by CONTROL characters and decode failures,
+    // not by "not ASCII" — the old test counted every non-ASCII char as noise,
+    // so 40 box-drawing characters in `tree` output, or any text in a
+    // non-Latin script, was classified as binary and deleted. It also flagged
+    // this very writer's own `[exec → cmd — ok]` header punctuation.
+    //
+    // Real binary shows up as C0 control bytes and U+FFFD replacement
+    // characters after a lossy decode; legitimate text does not.
+    let noise = trimmed
+        .chars()
+        .take(200)
+        .filter(|c| (c.is_control() && !c.is_whitespace()) || *c == '\u{FFFD}')
+        .count();
+    if noise > 40 {
+        return true;
+    }
+    // Heartbeat chatter is the machinery talking to itself — not an observation.
+    trimmed.starts_with("HEARTBEAT_OK")
+}
+
+/// Faults that mean the local runner's STATE is bad, not that the request
+/// was unlucky. These are healed by unloading/reloading the model; another
+/// identical request just re-hits the wedge.
+///
+/// - "empty completion": 200s with ~no generated tokens (stale KV checkpoint
+///   restore sending generation straight to a stop token).
+/// - "same token": the repetition watch caught a decoder emitting one token
+///   forever. Both were surfacing as "no done=true" stream aborts before the
+///   watch existed, and both come from the same degraded-runner condition.
+fn wedged_runner_error(message: &str) -> bool {
+    message.contains("empty completion") || message.contains("same token")
+}
+
+/// What one repetition abort looked like, kept so the next one can be
+/// recognised as the same fault rather than a fresh unlucky generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WedgeFingerprint {
+    /// The fragment the decoder was stuck on.
+    token: String,
+    /// Stream bytes received before the watch gave up.
+    bytes: usize,
+}
+
+impl WedgeFingerprint {
+    /// How far apart two abort lengths may sit and still be the same wedge,
+    /// as a divisor of the longer one (1/64 ≈ 1.6%).
+    ///
+    /// Derived from the two distances it has to separate, not picked for
+    /// feel. Same-wedge noise: a re-entered wedge reproduces its prefix to
+    /// within a couple of bytes (≤3 on ~2780, ≈0.1%). Different-wedge
+    /// distance: a different prompt's prefix has no relation to this one's,
+    /// so it differs by hundreds or thousands of bytes. Any bound between
+    /// those works; 1/64 sits ~15x above the noise and far below a real
+    /// difference, which is what makes the result insensitive to the exact
+    /// divisor rather than tuned to it.
+    const LENGTH_TOLERANCE_DIVISOR: usize = 64;
+
+    /// Whether `self` is the same wedge as `previous` — same stuck token,
+    /// same place it gave up.
+    ///
+    /// Compared as a band, not an equality, and that is the whole point.
+    /// Live evidence (2026-07-28, qwen3.5:9b, 12 aborts across one day):
+    /// every abort was stuck on `"0"` and every one landed between 2777 and
+    /// 2780 bytes, but consecutive attempts of a single step went 2780→2779,
+    /// 2779→2778, 2780→2779, 2780→2780 and 2777→2779. Sampling leaves the
+    /// prefix a byte or two different before it collapses, so requiring
+    /// equal byte counts would have recognised ONE of those five pairs and
+    /// left the other four to pay a full generation apiece.
+    ///
+    /// The token is the real fingerprint — the watch trips precisely because
+    /// the decoder is stuck on one specific token — and the length only has
+    /// to tell "the same collapse again" from "a different generation that
+    /// also collapsed".
+    fn is_repeat_of(&self, previous: &Self) -> bool {
+        if self.token != previous.token {
+            return false;
+        }
+        let tolerance = self.bytes.max(previous.bytes) / Self::LENGTH_TOLERANCE_DIVISOR;
+        self.bytes.abs_diff(previous.bytes) <= tolerance
+    }
+}
+
+/// Why the ladder is clearing the runner before the next attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WedgeReset {
+    /// This abort is the one we just saw. Nothing is learned by generating
+    /// against it again.
+    Confirmed,
+    /// The fault repeated, but not identically — the original ladder.
+    Repeated,
+}
+
+/// Whether to clear the runner before the next attempt, and why.
+///
+/// `current` is the wedge the last attempt aborted on; `previous` is the one
+/// the runner produced before it (from an earlier attempt, or an earlier
+/// step — see [`record_wedge`]). Both are `None` unless the last failure was
+/// a repetition abort carrying a fingerprint.
+fn wedge_reset_due(
+    attempt: usize,
+    last_err: &str,
+    current: Option<&WedgeFingerprint>,
+    previous: Option<&WedgeFingerprint>,
+) -> Option<WedgeReset> {
+    if !wedged_runner_error(last_err) {
+        return None;
+    }
+    // Same token, same abort point: the retry re-entered the same wedge, so
+    // the free first retry is not buying evidence — it already arrived.
+    if let (Some(cur), Some(prev)) = (current, previous) {
+        if cur.is_repeat_of(prev) {
+            return Some(WedgeReset::Confirmed);
+        }
+    }
+    // Otherwise the original rule: reset once the fault has repeated at all.
+    // This still covers "empty completion", which has no fingerprint to
+    // compare.
+    (attempt >= 2).then_some(WedgeReset::Repeated)
+}
+
+/// The last wedge seen from a given model's runner.
+///
+/// Global, and keyed by model, because a wedge is a property of the RUNNER
+/// rather than of the caller: one Ollama server serves every step and every
+/// chat turn, and [`reset_ollama_runner_for`] clears it for all of them. Same
+/// reasoning as the generation slot in `nanna-llm`, which is keyed by base URL.
+///
+/// Surviving across steps is what makes the comparison worth anything. Within
+/// one step the second wedge does not exist until `attempt` reaches 2 —
+/// exactly where the old ladder already reset — so a same-step-only check
+/// could never fire earlier than the rule it exists to pre-empt. Across steps
+/// it can, and that is the observed shape: 2026-07-28 18:53:53 aborted on one
+/// step and 18:55:23 aborted identically on the FIRST try of the next, which
+/// then spent a second full generation before the ladder acted at 18:55:32.
+fn wedge_store() -> &'static std::sync::Mutex<HashMap<String, WedgeFingerprint>> {
+    static WEDGES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, WedgeFingerprint>>> =
+        std::sync::OnceLock::new();
+    WEDGES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record `wedge` as the newest one for `model`, returning the one it
+/// replaced — i.e. the wedge to judge it against.
+///
+/// A poisoned lock carries no invalid state here (the map is only inserted
+/// into and removed from), so recover rather than propagate a panic into the
+/// retry path.
+fn record_wedge(model: &str, wedge: WedgeFingerprint) -> Option<WedgeFingerprint> {
+    wedge_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(model.to_string(), wedge)
+}
+
+/// Forget a model's last wedge, because its runner was just cleared.
+///
+/// Without this a reset would leave its own fingerprint behind, and the first
+/// wedge on the FRESH runner would match it and reset again immediately — the
+/// free retry has to come back when the state it was spent on is gone.
+fn forget_wedge(model: &str) {
+    wedge_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(model);
+}
+
+/// Forget every recorded wedge: a server restart clears every model's runner,
+/// not just the one that faulted.
+fn forget_all_wedges() {
+    wedge_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// A failed step attempt: the message the ladder logs and classifies, plus
+/// the wedge fingerprint when the failure was one.
+///
+/// [`AgentStepRunner::try_run_step`] used to return a bare `String`, and that
+/// was the one lossy boundary between the repetition watch — which knows the
+/// stuck token and the abort length exactly — and the retry ladder that has
+/// to act on them. Everything in between (`LlmError` → `AgentError`) already
+/// carried the structure.
+struct StepAttemptError {
+    message: String,
+    wedge: Option<WedgeFingerprint>,
+}
+
+impl From<String> for StepAttemptError {
+    fn from(message: String) -> Self {
+        Self { message, wedge: None }
+    }
+}
+
+impl StepAttemptError {
+    /// Flatten an agent error to its message, keeping the wedge fingerprint
+    /// when there is one.
+    fn from_agent(e: &nanna_agent::AgentError) -> Self {
+        let wedge = match e {
+            nanna_agent::AgentError::Llm(nanna_llm::LlmError::WedgedRunner {
+                token,
+                bytes_received,
+                ..
+            }) => Some(WedgeFingerprint { token: token.clone(), bytes: *bytes_received }),
+            _ => None,
+        };
+        Self { message: format!("step error: {e}"), wedge }
+    }
+}
+
+/// The runner ran out of GPU memory.
+///
+/// On CUDA this does not arrive as a clean allocation failure — the prefill
+/// compute buffer overruns and the driver reports an illegal memory access, so
+/// matching only on "out of memory" misses the form it actually takes here.
+fn gpu_memory_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("illegal memory access")
+        || m.contains("out of memory")
+        || m.contains("cuda error")
+        || m.contains("failed to allocate")
+}
+
 #[async_trait::async_trait]
 impl StepRunner for AgentStepRunner {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
         let mut last_err = String::new();
+        let mut nudge_pending = false;
+        // The wedge the last attempt aborted on, and the one the runner
+        // produced before it — the pair `wedge_reset_due` judges.
+        let mut cur_wedge: Option<WedgeFingerprint> = None;
+        let mut prev_wedge: Option<WedgeFingerprint> = None;
         for attempt in 0..=STEP_LLM_RETRIES {
             if attempt > 0 {
                 tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
                 let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
                 tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                // The degraded-runner state (empty 200s) survives plain
-                // retries — force a model unload/reload before the last try.
-                if attempt == STEP_LLM_RETRIES && last_err.contains("empty completion") {
+                // A WEDGED runner does not recover by being asked again: its
+                // state has to be cleared. Retrying one three times against
+                // the same wedge is how a run dies — observed 2026-07-27,
+                // 17 repetition aborts collapsing into back-to-back
+                // attempt=1,2,3 failures until the run ended.
+                //
+                // Two ways in. The fingerprint says this abort IS the last
+                // one (same stuck token, same abort point), which is already
+                // the evidence a retry would have bought — so act now.
+                // Failing that, the original ladder: reset from the SECOND
+                // retry, by which point the fault has repeated once, leaving
+                // the first retry free for a genuinely transient drop.
+                if let Some(reason) =
+                    wedge_reset_due(attempt, &last_err, cur_wedge.as_ref(), prev_wedge.as_ref())
+                {
+                    tracing::warn!(
+                        attempt,
+                        ?reason,
+                        "wedged runner — resetting it before the next attempt"
+                    );
+                    self.reset_ollama_runner().await;
+                }
+                // Out of VRAM is the one fault where repeating the request
+                // unchanged is guaranteed to fail again: the context we asked
+                // for does not fit. Shrink it and unload, so the retry brings
+                // the model back at a size that does.
+                //
+                // Acted on from the FIRST retry, unlike the wedge above. A
+                // wedge might be a blip worth one free retry; this cannot be —
+                // and the evidence for waiting is bad, since three runs died to
+                // exactly this fault repeating until the run ended.
+                if gpu_memory_error(&last_err)
+                    && nanna_llm::LlmClient::demote_context(&self.agent_config.model).is_some()
+                {
                     self.reset_ollama_runner().await;
                 }
             }
             // A fresh context per attempt: the re-anchor makes retries free —
-            // there is no partial transcript worth salvaging.
-            match self.try_run_step(&request).await {
+            // there is no partial transcript worth salvaging. After a
+            // no-progress attempt the prompt carries a nudge, so the retry is
+            // never a verbatim repeat of the request that just stalled.
+            let attempt_request = if nudge_pending {
+                let mut nudged = request.clone();
+                nudged.prompt.push_str(NO_PROGRESS_NUDGE);
+                nudged
+            } else {
+                request.clone()
+            };
+            // Each attempt is judged on its own: only a repetition abort
+            // refills these, so an interleaved network blip cannot leave a
+            // stale pair behind for the next wedge to match against.
+            cur_wedge = None;
+            prev_wedge = None;
+            match self.try_run_step(&attempt_request).await {
                 Ok(outcome) if is_empty_completion(&outcome) => {
                     dump_empty_step(&request, attempt);
                     last_err =
                         "empty completion (no text, no tool calls, ~0 tokens) from provider"
                             .to_string();
                 }
+                // Thought but did not act: not a result. Retry with the nudge
+                // rather than letting the item be marched forward on nothing.
+                Ok(outcome) if made_no_progress(&outcome) => {
+                    tracing::warn!(
+                        attempt,
+                        output_tokens = outcome.output_tokens,
+                        "step produced reasoning but no tool call and no text — retrying with a nudge"
+                    );
+                    nudge_pending = true;
+                    last_err =
+                        "no-progress step (reasoning only: no tool call, no answer)".to_string();
+                }
                 Ok(outcome) => return Ok(outcome),
-                Err(e) if is_transient_llm_error(&e) => last_err = e,
-                Err(e) => return Err(e),
+                Err(e) if is_transient_llm_error(&e.message) => {
+                    // Remember this wedge so the NEXT one can be recognised
+                    // as the same fault. `record_wedge` hands back what it
+                    // replaced, which is the previous attempt's wedge within
+                    // a step and the previous step's across one.
+                    if let Some(wedge) = e.wedge {
+                        prev_wedge = record_wedge(&self.agent_config.model, wedge.clone());
+                        cur_wedge = Some(wedge);
+                    }
+                    last_err = e.message;
+                }
+                Err(e) => return Err(e.message),
             }
         }
         Err(last_err)
@@ -1228,6 +1662,128 @@ impl StepRunner for AgentStepRunner {
 }
 
 impl AgentStepRunner {
+    /// Put the step's own output — its answer, and each reasoning block — into
+    /// memory, in the same `[kind → subject]` shape the episodic tool writer
+    /// uses, so answers, thoughts and actions all read alike on recall.
+    ///
+    /// Reasoning is stored per BLOCK rather than as one lump: the blocks are
+    /// already interleaved between tool calls, so one block is one thought
+    /// about one action — which is the unit a later step actually wants back.
+    async fn remember_step_narration(
+        &self,
+        request: &StepRequest,
+        result: &nanna_agent::AgentResponse,
+    ) {
+        let Some(sink) = self.memory_sink() else {
+            return;
+        };
+        let label = &request.item_title;
+
+        let text = result.text.trim();
+        if !text.is_empty() {
+            let mut tags = HashMap::new();
+            tags.insert("kind".to_string(), "assistant_text".to_string());
+            tags.insert("step".to_string(), label.clone());
+            sink(nanna_agent::ExtractedMemory {
+                content: format!("[said → {label}] {text}"),
+                category: "assistant_text".to_string(),
+                provenance: nanna_agent::MemoryProvenance::Observed,
+                tags: Some(tags),
+            })
+            .await;
+        }
+
+        let Some(reasoning) = result.reasoning.as_ref() else {
+            return;
+        };
+        // Providers that do not split reasoning still fill `content`; treat
+        // that as a single block rather than storing nothing.
+        let blocks: Vec<&str> = if reasoning.blocks.is_empty() {
+            vec![reasoning.content.as_str()]
+        } else {
+            reasoning.blocks.iter().map(|b| b.content.as_str()).collect()
+        };
+        let total = blocks.len();
+        for (idx, block) in blocks.into_iter().enumerate() {
+            let thought = block.trim();
+            if thought.is_empty() {
+                continue;
+            }
+            let mut tags = HashMap::new();
+            tags.insert("kind".to_string(), "thinking".to_string());
+            tags.insert("step".to_string(), label.clone());
+            tags.insert("block".to_string(), format!("{}/{total}", idx + 1));
+            sink(nanna_agent::ExtractedMemory {
+                content: format!("[thought → {label}] {thought}"),
+                category: "thinking".to_string(),
+                provenance: nanna_agent::MemoryProvenance::Observed,
+                tags: Some(tags),
+            })
+            .await;
+        }
+    }
+
+    /// The sink that puts tool results into memory, or `None` when no memory
+    /// service exists (then `loop_runner` keeps results in context as before,
+    /// which is the correct degradation — never silently lose the output).
+    fn memory_sink(&self) -> Option<nanna_agent::MemoryCallback> {
+        let service = self.memory.clone()?;
+        let workspace_id = self.workspace_id.clone();
+        Some(Box::new(move |memory: nanna_agent::ExtractedMemory| {
+            let service = service.clone();
+            let workspace_id = workspace_id.clone();
+            Box::pin(async move {
+                if is_low_signal_memory(&memory.content) {
+                    // INFO, not DEBUG. The daemon runs at INFO, so the old
+                    // debug! meant 704 discarded writes left no operator-visible
+                    // trace at all in a run whose store held 90 rows — the
+                    // shortfall was invisible until someone counted by hand.
+                    // A dropped memory is a fact about the run, not a detail.
+                    tracing::info!(
+                        category = %memory.category,
+                        bytes = memory.content.len(),
+                        "dropping low-signal memory (machine noise)"
+                    );
+                    return;
+                }
+                let mut metadata = memory.tags.unwrap_or_default();
+                metadata.insert("category".to_string(), memory.category.clone());
+                metadata.insert(
+                    "fact_type".to_string(),
+                    memory.provenance.as_str().to_string(),
+                );
+                // A tool result is raw episodic material — worth keeping, but
+                // it must not outrank a stated preference when recall ranks.
+                let importance: f32 = match memory.category.as_str() {
+                    "tool_result" => 1.5,
+                    "preference" | "identity" => 4.0,
+                    "fact" | "insight" => 3.5,
+                    _ => 3.0,
+                };
+                let stored = match &workspace_id {
+                    Some(ws) => {
+                        service
+                            .remember_scoped(
+                                &memory.content,
+                                metadata,
+                                importance,
+                                Some(ws.clone()),
+                            )
+                            .await
+                    }
+                    None => {
+                        service
+                            .remember_with_importance(&memory.content, metadata, importance)
+                            .await
+                    }
+                };
+                if let Err(e) = stored {
+                    tracing::warn!(error = %e, "failed to store tool result in memory");
+                }
+            })
+        }))
+    }
+
     /// Whether this runner's model is served by the local Ollama instance.
     /// Healing must be provider-aware: a `:free` suffix on an OpenRouter
     /// model id must never trigger local-server surgery.
@@ -1244,7 +1800,10 @@ impl AgentStepRunner {
         reset_ollama_runner_for(&self.agent_config.model).await;
     }
 
-    async fn try_run_step(&self, request: &StepRequest) -> Result<StepOutcome, String> {
+    async fn try_run_step(
+        &self,
+        request: &StepRequest,
+    ) -> Result<StepOutcome, StepAttemptError> {
         use nanna_agent::{Agent, AgentContext, RunOptions};
 
         // Name the item before its output starts arriving, so a multi-step
@@ -1281,18 +1840,37 @@ impl AgentStepRunner {
             agent = agent.with_stats(tracker.clone());
         }
 
-        // The step is always allowed the todo tool (notes are its only
-        // memory) on top of the item's scoped tools.
-        let mut active = request.tool_scope.clone();
-        if !active.iter().any(|t| t == "todo") {
-            active.push("todo".to_string());
+        // The plan's `tool_scope` does NOT gate anything. It is a guess made
+        // before the work started, and every time it has been enforced it has
+        // cost a run: scoped to a hallucinated "file" the model had nothing to
+        // work with (7/42), scoped to "exec" it shell-heredoc'd around every
+        // write guard (141 exec / 0 writes). A step reaches whatever the work
+        // turns out to need, through `discover_tools`.
+        if !request.tool_scope.is_empty() {
+            tracing::debug!(
+                scope = %request.tool_scope.join(", "),
+                "plan named tools for this step — treated as a hint, not a restriction"
+            );
         }
-        // An item that names its tools has had its discovery done already:
-        // send exactly those and drop the always-on core set, so a small
-        // model is not choosing between doing the work and re-discovering
-        // tools it already holds. Unscoped items keep the full core set —
-        // they have no other way to reach a tool.
-        let restrict_to_active = !request.tool_scope.is_empty();
+
+        // Context is the scarce resource, so the REQUEST carries only the core
+        // pair; the model activates the rest by discovering them, and what it
+        // activates persists for the run.
+        // Carry forward everything discovered earlier in THIS run. The doc
+        // above promised activation persists; `RunState::new()` per step meant
+        // it never did, so each step re-paid discovery out of its 8-iteration
+        // budget and then ran out — 40 of 45 steps in one run died at the cap
+        // with no text at all. Now discovery is paid once per tool per run,
+        // which is what the design said all along.
+        let active: Vec<String> = {
+            let discovered = self.discovered_tools.read().await;
+            CORE_TOOLS
+                .iter()
+                .map(|t| (*t).to_string())
+                .chain(discovered.iter().cloned())
+                .collect()
+        };
+        let restrict_to_active = true;
 
         // Show the work as it happens: the step's text, thinking, and tool
         // activity stream through the same events a plain chat turn uses,
@@ -1344,13 +1922,40 @@ impl AgentStepRunner {
             on_thinking,
             on_tool_start,
             on_tool_end,
+            // Tool results land in memory; context keeps only the stub.
+            on_memory: self.memory_sink(),
             ..Default::default()
         };
 
         let result = agent
             .run(&request.prompt, options)
             .await
-            .map_err(|e| format!("step error: {e}"))?;
+            // The one place the structured LLM error used to be flattened to
+            // prose. The wedge fingerprint is lifted out here instead.
+            .map_err(|e| StepAttemptError::from_agent(&e))?;
+
+        // The step's OWN words belong in memory too. Tool results were being
+        // captured; the model's answer and its reasoning were not captured
+        // anywhere. Assistant text reached memory at most once per user `Send`,
+        // from a tail block that runs only after the whole harness run ends —
+        // which a multi-hour run never reaches — and thinking blocks had no
+        // path at all: ~2500 produced, 0 stored, in one measured run.
+        //
+        // Captured verbatim and directly rather than by flipping
+        // `auto_extract_memories`, which spends an extra LLM call per step to
+        // produce a lossy semantic digest. What is wanted here is the record,
+        // not a précis of it — compressing is dreaming's job, done later with
+        // the whole corpus in view rather than one step at a time.
+        // Fold this step's discoveries into the run so the next step starts
+        // with them already in hand.
+        if !result.active_tools.is_empty() {
+            let mut discovered = self.discovered_tools.write().await;
+            for tool in &result.active_tools {
+                discovered.insert(tool.clone());
+            }
+        }
+
+        self.remember_step_narration(request, &result).await;
 
         let tool_calls = result
             .tool_calls
@@ -1416,6 +2021,7 @@ impl AgentPlanner {
             item_id: 0,
             step_index: 0,
             step_kind: nanna_agent::harness::StepKind::Plan,
+            item_title: "Planning".to_string(),
             prompt: build_plan_prompt(goal, context),
             tool_scope: Vec::new(),
             token_budget: None,
@@ -1819,6 +2425,9 @@ pub async fn restart_ollama_server() -> bool {
     }
 
     tracing::warn!("restarting the Ollama server (degraded runner state)");
+    // Every model's runner dies with the server, so every fingerprint
+    // describing one is now stale.
+    forget_all_wedges();
     #[cfg(windows)]
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/IM", "ollama.exe"])
@@ -1893,6 +2502,9 @@ pub(crate) async fn reset_ollama_runner_for(model: &str) {
     }
     let base = ollama_local_base();
     tracing::warn!(model = %model, "resetting Ollama runner (keep_alive=0) after transient failures");
+    // The runner this fingerprint described is about to stop existing, so the
+    // next wedge must be judged fresh rather than matched against it.
+    forget_wedge(model);
     let client = reqwest::Client::new();
     let _ = client
         .post(format!("{base}/api/generate"))
@@ -1912,6 +2524,7 @@ pub(crate) async fn reset_ollama_runner_for(model: &str) {
 /// over the aggregate.
 fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     let mut folded = segments.last().cloned().unwrap_or(LongHorizonReport {
+        tool_calls: 0,
         stop: StopReason::AllTasksDone,
         steps_taken: 0,
         items_completed: 0,
@@ -1926,6 +2539,7 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         interjected_items: 0,
     });
     folded.steps_taken = segments.iter().map(|r| r.steps_taken).sum();
+    folded.tool_calls = segments.iter().map(|r| r.tool_calls).sum();
     folded.items_completed = segments.iter().map(|r| r.items_completed).sum();
     folded.items_completed_unverified =
         segments.iter().map(|r| r.items_completed_unverified).sum();
@@ -1947,6 +2561,55 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Step outcomes: what counts as progress
+    // -----------------------------------------------------------------
+
+    fn outcome(text: &str, tools: usize, output_tokens: u64) -> StepOutcome {
+        StepOutcome {
+            text: text.to_string(),
+            input_tokens: 100,
+            output_tokens,
+            tool_calls: (0..tools)
+                .map(|i| StepToolCall {
+                    name: format!("tool_{i}"),
+                    input_digest: String::new(),
+                    output_digest: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn reasoning_without_action_is_not_progress() {
+        // The live failure: 50 words of thinking, no tool call, no answer.
+        // Reasoning tokens put it over the empty-completion bound, so it was
+        // accepted as a step result and the item was re-entered seven times.
+        let thinking_only = outcome("", 0, 240);
+        assert!(made_no_progress(&thinking_only));
+        assert!(
+            !is_empty_completion(&thinking_only),
+            "still not an empty completion — the provider is generating fine"
+        );
+    }
+
+    #[test]
+    fn acting_or_answering_counts_as_progress() {
+        assert!(!made_no_progress(&outcome("", 1, 300)), "a tool call is progress");
+        assert!(!made_no_progress(&outcome("done: 7/42 pass", 0, 300)), "an answer is progress");
+        assert!(
+            !made_no_progress(&outcome("  \n ", 1, 300)),
+            "blank text with a tool call is still progress"
+        );
+    }
+
+    #[test]
+    fn the_no_progress_nudge_demands_an_action() {
+        // The retry must not be a verbatim repeat of what just stalled.
+        assert!(NO_PROGRESS_NUDGE.contains("CALL A TOOL"));
+        assert!(NO_PROGRESS_NUDGE.contains("nothing changed"));
+    }
 
     // -----------------------------------------------------------------
     // Pending messages (interjection intake)
@@ -2175,6 +2838,7 @@ mod tests {
         stop: StopReason,
     ) -> LongHorizonReport {
         LongHorizonReport {
+            tool_calls: 0,
             stop,
             steps_taken: steps,
             items_completed: completed,
@@ -2568,8 +3232,12 @@ mod tests {
     }
 
     /// "It should feel like the chat did before": a one-task plan is a
-    /// conversation-shaped turn and must stream with no `**[working]**`
-    /// banner. Items that join later (interjection, replan) are announced.
+    /// conversation-shaped turn and is announced not at all. Items that join
+    /// later (interjection, replan) ARE announced — as a timeline Step, the
+    /// status row the GUI renders, never as text in the reply. Asserting on
+    /// `accumulated_text` here would pass again the moment a banner leaked
+    /// back into the message, so the test pins both halves: nothing in the
+    /// text, an entry in the journal.
     #[tokio::test]
     async fn a_one_task_plan_streams_with_no_step_banner() {
         let run = external_run_handle();
@@ -2577,6 +3245,7 @@ mod tests {
         *sink.quiet_item.lock().unwrap() = Some(7);
 
         let request = |item_id: i64| StepRequest {
+            item_title: format!("test item {item_id}"),
             item_id,
             step_index: 0,
             step_kind: nanna_agent::harness::StepKind::Execute,
@@ -2593,12 +3262,26 @@ mod tests {
             "conversational turn: no banner"
         );
 
+        assert!(
+            run.timeline.lock().unwrap().is_empty(),
+            "the quiet item must not even reach the journal"
+        );
+
         sink.step_header(&request(9));
         let streamed = run.accumulated_text.read().await.clone();
         assert!(
-            streamed.contains("**[working]** reply to the user"),
-            "a second item means a real run — announce it (got: {streamed:?})"
+            streamed.is_empty(),
+            "run mechanics must NEVER be message text (got: {streamed:?})"
         );
+        let journal = run.timeline.lock().unwrap().clone();
+        match journal.as_slice() {
+            [crate::session::TimelineItem::Step { phase, label, item_id, .. }] => {
+                assert_eq!(phase, "working");
+                assert_eq!(label, "test item 9", "the label is the item TITLE");
+                assert_eq!(*item_id, 9);
+            }
+            other => panic!("expected one Step entry, got: {other:?}"),
+        }
     }
 
     /// Parity with the retired direct chat path: completed tool calls feed
@@ -2832,5 +3515,180 @@ impl TaskRunManager {
                 resumes,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod wedged_runner_tests {
+    use super::wedged_runner_error;
+
+    /// REGRESSION (2026-07-27): the repetition watch started aborting wedged
+    /// streams, but the retry ladder only reset the runner when the message
+    /// said "empty completion" — so the new abort never triggered a reset and
+    /// three retries hit the same wedge. 17 aborts ended the run.
+    #[test]
+    fn both_wedge_shapes_trigger_a_reset() {
+        assert!(wedged_runner_error(
+            "empty completion (no text, no tool calls, ~0 tokens) from provider"
+        ));
+        assert!(wedged_runner_error(
+            "Ollama emitted the same token 20x in a row (\"0\") — a wedged runner, not a generation."
+        ));
+    }
+
+    use super::{wedge_reset_due, WedgeFingerprint, WedgeReset};
+
+    /// The wedge message as it actually arrives, so the tests below exercise
+    /// the same classification path the ladder does.
+    fn wedge_msg(bytes: usize) -> String {
+        format!(
+            "step error: LLM error: API error: 502 - Ollama emitted the same token 20x in a \
+             row (\"0\") — a wedged runner, not a generation. Aborted after {bytes} bytes so \
+             the step can be retried instead of waiting out the loop."
+        )
+    }
+
+    fn wedge(bytes: usize) -> WedgeFingerprint {
+        WedgeFingerprint { token: "0".to_string(), bytes }
+    }
+
+    /// The pair the change exists for: the retry re-entered the SAME wedge,
+    /// so the reset happens on the first retry instead of costing another
+    /// generation to re-learn it.
+    #[test]
+    fn an_identical_wedge_is_confirmed_and_reset_immediately() {
+        assert_eq!(
+            wedge_reset_due(1, &wedge_msg(2780), Some(&wedge(2780)), Some(&wedge(2780))),
+            Some(WedgeReset::Confirmed),
+            "equal abort lengths on the same token must not wait for attempt 2"
+        );
+    }
+
+    /// And the counter-case: a wedge that gave up somewhere else is a
+    /// different fault, so the free first retry stands.
+    #[test]
+    fn a_differently_sized_wedge_is_not_confirmed() {
+        assert_eq!(
+            wedge_reset_due(1, &wedge_msg(2780), Some(&wedge(2780)), Some(&wedge(400))),
+            None,
+            "unrelated abort lengths must leave the first retry free"
+        );
+        // A different stuck token is a different wedge even at the same length.
+        let other_token = WedgeFingerprint { token: "\n".to_string(), bytes: 2780 };
+        assert_eq!(
+            wedge_reset_due(1, &wedge_msg(2780), Some(&wedge(2780)), Some(&other_token)),
+            None,
+            "the stuck token is the fingerprint — a different one is a different fault"
+        );
+    }
+
+    /// REGRESSION (2026-07-28): the byte counts do NOT repeat exactly.
+    ///
+    /// Twelve aborts in one day, every one stuck on "0" and every one landing
+    /// in 2777-2780 bytes, but consecutive attempts of a single step went
+    /// 2780→2779, 2779→2778, 2780→2779, 2780→2780 and 2777→2779 — sampling
+    /// leaves the prefix a byte or two different before it collapses. An
+    /// equality test would have recognised one of these five and left the
+    /// other four to pay a full generation each, which is the entire cost the
+    /// confirmation exists to avoid.
+    #[test]
+    fn the_observed_near_miss_pairs_are_all_the_same_wedge() {
+        for (prev, cur) in [(2780, 2779), (2779, 2778), (2780, 2779), (2780, 2780), (2777, 2779)] {
+            assert_eq!(
+                wedge_reset_due(1, &wedge_msg(cur), Some(&wedge(cur)), Some(&wedge(prev))),
+                Some(WedgeReset::Confirmed),
+                "live pair {prev}→{cur} is the same wedge re-entered"
+            );
+        }
+    }
+
+    /// The original ladder still covers everything the fingerprint cannot:
+    /// a first wedge with nothing to compare against, and "empty completion",
+    /// which carries no fingerprint at all.
+    #[test]
+    fn the_repeat_ladder_still_backs_the_fingerprint() {
+        // First wedge of a run: no predecessor, so wait as before.
+        assert_eq!(wedge_reset_due(1, &wedge_msg(2780), Some(&wedge(2780)), None), None);
+        assert_eq!(
+            wedge_reset_due(2, &wedge_msg(2780), Some(&wedge(2780)), None),
+            Some(WedgeReset::Repeated)
+        );
+        // The other wedge shape has no fingerprint and is judged on repeats.
+        let empty = "empty completion (no text, no tool calls, ~0 tokens) from provider";
+        assert_eq!(wedge_reset_due(1, empty, None, None), None);
+        assert_eq!(wedge_reset_due(2, empty, None, None), Some(WedgeReset::Repeated));
+    }
+
+    /// A reset is an unload/reload. It must never fire for a fault that is
+    /// not the runner's state, however the fingerprints happen to line up.
+    #[test]
+    fn a_non_wedge_failure_never_resets() {
+        assert_eq!(
+            wedge_reset_due(3, "Stream error: connection reset", Some(&wedge(2780)), Some(&wedge(2780))),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_transient_faults_do_not_reset_the_runner() {
+        // Resetting unloads/reloads the model — far too expensive for a
+        // network blip, and it would add seconds to every recoverable drop.
+        for msg in [
+            "error sending request for url (http://127.0.0.1:11434/api/chat)",
+            "Stream error: connection reset",
+            "API error: 500 - internal",
+            "step error: LLM error: API error: 429 - rate limited",
+        ] {
+            assert!(!wedged_runner_error(msg), "must not reset for: {msg}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod core_tool_gating_tests {
+    use super::CORE_TOOLS;
+
+    /// The contract, in three directions.
+    ///
+    /// A plan must never restrict capability (enforcing its guess cost us two
+    /// runs: 7/42 when it scoped to a nonexistent "file", and 141-exec/0-write
+    /// when it scoped to "exec" and the model shell-heredoc'd around every
+    /// write guard).
+    ///
+    /// Exactly ONE tool ships, because schemas are context.
+    ///
+    /// And the prompt must not name tools it does not ship. `stable_prefix`
+    /// used to order a `todo(action='note', …)` call every step while `todo`'s
+    /// schema was never sent; the model obeyed blind and malformed acceptance
+    /// checks went from 3.1% to 53-66%. The fix was to stop the prompt naming
+    /// tools — not to widen this list. If this list grows again, check whether
+    /// a prompt is making promises the request does not keep.
+    #[test]
+    fn only_discovery_ships_by_default() {
+        assert_eq!(CORE_TOOLS, &["discover_tools"]);
+        assert!(
+            !CORE_TOOLS.contains(&"exec"),
+            "exec must be discovered, not shipped — schemas are context"
+        );
+        assert!(
+            !CORE_TOOLS.contains(&"write_file"),
+            "write_file must be discovered, not shipped"
+        );
+        assert!(
+            CORE_TOOLS.contains(&"discover_tools"),
+            "without discovery a step cannot reach anything at all"
+        );
+        assert!(
+            !CORE_TOOLS.contains(&"recall"),
+            "even memory search is discovered — one tool ships, and it is the one \
+             that reaches the others"
+        );
+        assert_eq!(
+            CORE_TOOLS.len(),
+            1,
+            "the list is one tool. Every past widening started as a good local \
+             reason and ended as the prompt and the request disagreeing about \
+             what the model can call"
+        );
     }
 }

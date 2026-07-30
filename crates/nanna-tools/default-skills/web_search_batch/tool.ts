@@ -1,7 +1,7 @@
 export default {
   name: "web_search_batch",
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Search the web for multiple queries at once. Returns grouped results for each query. Useful for research tasks requiring multiple searches.",
   parameters: {
     type: "object",

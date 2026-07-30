@@ -126,11 +126,32 @@ function serviceExecute(action, input, sessionId, scope) {
     }
 
     case "note": {
-      if (!input.id) { return "Error: 'id' is required for note"; }
       var content = input.content || input.text;
       if (!content) { return "Error: 'content' is required for note"; }
-      Nanna.service("tasks.note", { id: input.id, content: content, author: "agent" });
-      return "Note saved on task #" + input.id + ".";
+      // A note without an id belongs to the work in flight. The description
+      // promises "saves findings for future steps", so a model jotting a
+      // finding mid-task supplies content and no id -- demanding one turned
+      // 39% of todo calls into hard errors and sent models into retry loops
+      // (observed live 2026-07-26: 11 of 28 todo calls failed this way).
+      // There is exactly ONE actionable task by design, so "the current
+      // task" is unambiguous.
+      var noteId = input.id;
+      if (!noteId) {
+        var open = Nanna.service("tasks.list", {
+          scope: scope, session_id: sessionId, include_done: false
+        });
+        var candidates = (open && open.tasks) ? open.tasks : [];
+        for (var ni = 0; ni < candidates.length; ni++) {
+          if (candidates[ni].status === "in_progress") { noteId = candidates[ni].id; break; }
+        }
+        if (!noteId && candidates.length > 0) { noteId = candidates[0].id; }
+      }
+      if (!noteId) {
+        return "No task to note against: the note was NOT saved because there are no open tasks. " +
+               "Add a task first (action 'add'), or pass an explicit id. Nothing else went wrong.";
+      }
+      Nanna.service("tasks.note", { id: noteId, content: content, author: "agent" });
+      return "Note saved on task #" + noteId + ".";
     }
 
     case "query": {

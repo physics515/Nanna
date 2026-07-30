@@ -1,7 +1,8 @@
 export default {
   name: "ocr",
+  requires: ["vision.analyze"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Extract text from an image using optical character recognition. Works on screenshots, photos of documents, handwriting, etc.",
   parameters: {
     type: "object",

@@ -41,7 +41,9 @@ fn entry_to_new_memory(entry: &MemoryEntry) -> NewMemory {
         memory_id: entry.id.clone(),
         content: entry.content.clone(),
         embedding: Some(entry.embedding.clone()),
-        embedding_model: None, // Not tracked per-entry in MemoryEntry
+        // Now tracked. A NULL here is why a same-width vector from a different
+        // model was undetectable: the column existed, nothing ever filled it.
+        embedding_model: entry.embedding_model.clone(),
         session_id,
         metadata: metadata_value,
         tags: Vec::new(), // Tags are stored inside metadata for MemoryEntry
@@ -97,6 +99,16 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
     Some(MemoryEntry {
         id: mem.memory_id,
         content: mem.content,
+        // The DB keeps one vector per row plus the model that made it. Retained
+        // buckets live in RAM for the life of the daemon, so a provider that
+        // flaps mid-session costs nothing; across a restart only the persisted
+        // one survives and the rest are backfilled lazily.
+        embeddings: mem
+            .embedding_model
+            .clone()
+            .map(|model| HashMap::from([(model, embedding.clone())]))
+            .unwrap_or_default(),
+        embedding_model: mem.embedding_model.clone(),
         embedding,
         metadata,
         timestamp,
@@ -122,8 +134,23 @@ impl MemoryPersistence for TursoMemoryPersistence {
             Err(nanna_storage::StorageError::Database(ref e))
                 if e.to_string().contains("UNIQUE") || e.to_string().contains("unique") =>
             {
-                // Entry exists — update FSRS + content
+                // Entry exists — update FSRS + content + EMBEDDING.
+                //
+                // The embedding was missing here, which is why a backfilled
+                // vector never survived a restart: `set_embedding_for_model`
+                // saved the entry, the save fell into this branch, and the one
+                // field it had just computed was the one field not written.
                 let _ = self.repo.update_content(&entry.id, &entry.content).await;
+                if !entry.embedding.is_empty() {
+                    let _ = self
+                        .repo
+                        .update_embedding(
+                            &entry.id,
+                            &entry.embedding,
+                            entry.embedding_model.as_deref(),
+                        )
+                        .await;
+                }
                 let _ = self.repo.update_fsrs(
                     &entry.id,
                     entry.fsrs.stability,

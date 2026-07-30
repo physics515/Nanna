@@ -1,7 +1,7 @@
 export default {
   name: "read_file",
   version: "0.1.1",
-  output: "context",
+  output: "memory",
   description: "Read a file from the filesystem. Returns the file contents with line numbers. Supports optional offset and limit for reading portions of large files.",
   parameters: {
     type: "object",

@@ -97,6 +97,104 @@ fn classify_windows_command(trimmed: &str) -> WinShell {
     }
 }
 
+/// Translate `X:\a\b` drive paths into the `/x/a/b` form Git Bash understands.
+///
+/// In bash a backslash is an ESCAPE, so `cat > D:\Development\ws\minidb.sh`
+/// silently becomes `cat > D:Developmentwsminidb.sh` — a file with a garbage
+/// name, created without an error anyone can see. Observed live 2026-07-27: a
+/// run's largest and newest work (3 KB) landed in a file literally named
+/// `D:Developmentnanna-benchrun-qwen3-5-9bminidb.sh`, while the artifact the
+/// acceptance tests read sat frozen and half-finished.
+///
+/// This is the shell-layer half of "handle absolute and relative paths
+/// gracefully" — the tool layer already repairs argument paths; a command
+/// string needs the same courtesy, because the model cannot tell that the
+/// path form it was shown (native, with backslashes) is not the form the
+/// shell accepts.
+///
+/// Narrow by construction:
+/// - Only a drive-letter prefix (`X:\` or `X:/`) at a token boundary starts a
+///   rewrite, so `\d`, `\n`, `C:` alone, and Windows paths inside SINGLE
+///   quotes (bash's literal string) are untouched.
+/// - The rewrite ends at whitespace or a shell metacharacter, so redirections
+///   and pipes survive.
+/// - Forward slashes are already valid; those paths are normalized to `/x/…`
+///   too, which is the same location.
+#[cfg(windows)]
+fn normalize_drive_paths(command: &str) -> std::borrow::Cow<'_, str> {
+    let b = command.as_bytes();
+    let n = b.len();
+    // Fast path: a drive path needs a colon.
+    if !command.contains(':') {
+        return std::borrow::Cow::Borrowed(command);
+    }
+
+    let mut out = String::with_capacity(n);
+    let mut changed = false;
+    let mut i = 0usize;
+    let mut single_quote = false;
+    let mut prev_boundary = true;
+
+    while i < n {
+        let c = b[i];
+        if c == b'\'' {
+            single_quote = !single_quote;
+            out.push('\'');
+            i += 1;
+            prev_boundary = false;
+            continue;
+        }
+        // A literal single-quoted string is exactly what a careful author uses
+        // to protect a Windows path; never second-guess it.
+        if single_quote {
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+
+        let starts_drive = prev_boundary
+            && c.is_ascii_alphabetic()
+            && i + 2 < n
+            && b[i + 1] == b':'
+            && (b[i + 2] == b'\\' || b[i + 2] == b'/');
+
+        if starts_drive {
+            let drive = (c as char).to_ascii_lowercase();
+            out.push('/');
+            out.push(drive);
+            i += 2; // skip "X:"
+            while i < n {
+                let p = b[i];
+                if p == b' ' || p == b'\t' || p == b'"' || p == b'\'' || p == b'|'
+                    || p == b'>' || p == b'<' || p == b'&' || p == b';' || p == b'\n'
+                {
+                    break;
+                }
+                out.push(if p == b'\\' { '/' } else { p as char });
+                i += 1;
+            }
+            changed = true;
+            prev_boundary = false;
+            continue;
+        }
+
+        out.push(c as char);
+        prev_boundary = matches!(c, b' ' | b'\t' | b'"' | b'|' | b'&' | b';' | b'(' | b'\n' | b'=');
+        i += 1;
+    }
+
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(command)
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_drive_paths(command: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(command)
+}
+
 /// Rewrite the small set of cmd.exe idioms that Git Bash rejects.
 ///
 /// Currently only `cd /d <path>` → `cd <path>`. `/d` is a cmd.exe-only flag
@@ -384,13 +482,73 @@ impl NannaBridge {
             // there is genuinely no active workspace (global mode). `~`-prefixed
             // paths were already expanded above.
             if let Some(wd) = default_workdir {
-                return wd.join(p);
+                let literal = wd.join(p);
+                return Self::repair_redundant_prefix(p, wd).unwrap_or(literal);
             }
             if let Some(home) = Self::home_dir() {
                 return home.join(p);
             }
         }
         p.to_path_buf()
+    }
+
+    /// Repair a relative path that redundantly repeats the tail of the working
+    /// directory, e.g. `minidb-gui-qwen35/minidb` given a workdir that already
+    /// ends in `minidb-gui-qwen35`.
+    ///
+    /// A model that learns its location (from `pwd`, a prompt line, or an
+    /// earlier tool result) will sometimes address files by re-appending part
+    /// of that path to a cwd that already includes it. Taken literally that
+    /// silently creates a shadow tree one level deeper — observed live
+    /// 2026-07-26: an hour of edits landed in `<ws>/<ws-leaf>/minidb` while the
+    /// acceptance tests read `<ws>/minidb`, and the run scored 0.
+    ///
+    /// Rules, in order, so this never overrides a real file:
+    /// 1. If the literal join exists, it wins — a genuine nested directory of
+    ///    the same name is still addressable.
+    /// 2. Otherwise, for the longest overlap first, if the de-duplicated
+    ///    target exists, use it (reads and edits find the intended file).
+    /// 3. Otherwise, if the de-duplicated *parent* exists while the literal
+    ///    parent does not, use it (a write lands beside the files it belongs
+    ///    with instead of conjuring a duplicate directory).
+    ///
+    /// Returns `None` when nothing needs repairing, leaving the literal join.
+    fn repair_redundant_prefix(rel: &Path, workdir: &Path) -> Option<PathBuf> {
+        let literal = workdir.join(rel);
+        if literal.exists() {
+            return None;
+        }
+
+        let rel_parts: Vec<_> = rel.components().collect();
+        let wd_parts: Vec<_> = workdir.components().collect();
+        // The overlap can cover at most all but the last component of the
+        // relative path (something must remain to name the target), and at
+        // most the whole working directory.
+        let max_overlap = rel_parts.len().saturating_sub(1).min(wd_parts.len());
+
+        let mut fallback = None;
+        for k in (1..=max_overlap).rev() {
+            let head = &rel_parts[..k];
+            let wd_tail = &wd_parts[wd_parts.len() - k..];
+            if head != wd_tail {
+                continue;
+            }
+            let remainder: PathBuf = rel_parts[k..].iter().collect();
+            let candidate = workdir.join(&remainder);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            if fallback.is_none() {
+                let literal_parent_missing =
+                    literal.parent().is_some_and(|p| !p.exists());
+                let candidate_parent_exists =
+                    candidate.parent().is_some_and(Path::exists);
+                if literal_parent_missing && candidate_parent_exists {
+                    fallback = Some(candidate);
+                }
+            }
+        }
+        fallback
     }
 
     /// Resolve a path using the instance's default working directory.
@@ -469,6 +627,13 @@ impl NannaBridge {
         let normalized = normalize_cmdisms(command);
         #[cfg(windows)]
         let command: &str = normalized.as_ref();
+        // Then translate `D:\ws\file` → `/d/ws/file`, because bash reads those
+        // backslashes as escapes and would write a garbage-named file instead
+        // of failing loudly.
+        #[cfg(windows)]
+        let drive_normalized = normalize_drive_paths(command);
+        #[cfg(windows)]
+        let command: &str = drive_normalized.as_ref();
 
         // Determine shell based on OS.
         // On Windows, route commands to the appropriate shell:
@@ -1029,6 +1194,109 @@ fn strip_ansi_escapes(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // Path resolution: absolute and relative must BOTH work, and a relative
+    // path that redundantly repeats the workspace tail must not silently
+    // create a shadow tree (2026-07-26: an hour of edits landed in
+    // <ws>/<ws-leaf>/minidb while the tests read <ws>/minidb; run scored 0).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn bare_relative_path_resolves_into_the_workspace() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let resolved =
+            NannaBridge::resolve_path_with_workdir("minidb", Some(ws.path()));
+        assert_eq!(resolved, ws.path().join("minidb"));
+    }
+
+    #[test]
+    fn absolute_path_is_used_as_given() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let target = ws.path().join("sub").join("minidb");
+        let resolved = NannaBridge::resolve_path_with_workdir(
+            &target.to_string_lossy(),
+            Some(ws.path()),
+        );
+        assert_eq!(resolved, target, "an absolute path must not be re-rooted");
+    }
+
+    #[test]
+    fn redundant_workspace_prefix_finds_the_existing_file() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = ws.path().join("minidb-bench");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("minidb"), "#!/bin/sh\n").expect("write");
+
+        // The model addresses the file as if it were one level up.
+        let resolved =
+            NannaBridge::resolve_path_with_workdir("minidb-bench/minidb", Some(&root));
+        assert_eq!(
+            resolved,
+            root.join("minidb"),
+            "a redundantly prefixed path must resolve to the real file, \
+             not <ws>/minidb-bench/minidb"
+        );
+    }
+
+    #[test]
+    fn redundant_prefix_write_lands_beside_existing_files() {
+        // Nothing exists at either candidate yet (a fresh write). The target
+        // whose PARENT exists is the intended one; the literal join would
+        // conjure a duplicate directory.
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = ws.path().join("bench-ws");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let resolved =
+            NannaBridge::resolve_path_with_workdir("bench-ws/newfile.sh", Some(&root));
+        assert_eq!(resolved, root.join("newfile.sh"));
+    }
+
+    #[test]
+    fn a_real_nested_directory_of_the_same_name_still_wins() {
+        // The repair must never shadow a genuine file: if the literal path
+        // exists, it is what the caller meant.
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = ws.path().join("dup");
+        let nested = root.join("dup");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(nested.join("f.txt"), "nested").expect("write");
+        std::fs::write(root.join("f.txt"), "outer").expect("write");
+
+        let resolved = NannaBridge::resolve_path_with_workdir("dup/f.txt", Some(&root));
+        assert_eq!(
+            resolved,
+            nested.join("f.txt"),
+            "an existing literal target must take precedence over the repair"
+        );
+    }
+
+    #[test]
+    fn multi_segment_overlap_is_repaired() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = ws.path().join("a").join("b");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("f.txt"), "x").expect("write");
+
+        let resolved = NannaBridge::resolve_path_with_workdir("a/b/f.txt", Some(&root));
+        assert_eq!(resolved, root.join("f.txt"));
+    }
+
+    #[test]
+    fn unrelated_relative_path_is_left_alone() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = ws.path().join("ws");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let resolved =
+            NannaBridge::resolve_path_with_workdir("tests/test_01.sh", Some(&root));
+        assert_eq!(
+            resolved,
+            root.join("tests").join("test_01.sh"),
+            "a normal subdirectory path must be untouched"
+        );
+    }
+
     /// REGRESSION (2026-07-25): once models were told to run their own
     /// acceptance checks, `exec sh tests/test_NN.sh` killed the HARNESS —
     /// exit 0xffffffff, no panic — reproduced across two models, each dying
@@ -1267,5 +1535,60 @@ mod tests {
             .expect("exec should not error");
         assert!(out.success, "command should succeed, got {out:?}");
         assert_eq!(out.stdout.trim(), "c", "stdout was {:?}", out.stdout);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod drive_path_tests {
+    use super::normalize_drive_paths;
+
+    /// REGRESSION (2026-07-27): `cat > D:\ws\minidb.sh << 'EOF'` wrote a file
+    /// named `D:wsminidb.sh` — bash ate the backslashes as escapes, no error,
+    /// and 3 KB of the run's newest work went into a garbage name while the
+    /// real artifact sat frozen.
+    #[test]
+    fn windows_paths_become_posix_paths() {
+        for (input, want) in [
+            (
+                r"cat > D:\Development\ws\minidb.sh",
+                "cat > /d/Development/ws/minidb.sh",
+            ),
+            (r"cd D:\ws && ls", "cd /d/ws && ls"),
+            (r"sh C:\tools\run.sh", "sh /c/tools/run.sh"),
+            // Forward-slash drive paths are valid already but normalize the same.
+            ("cat D:/ws/f.txt", "cat /d/ws/f.txt"),
+        ] {
+            assert_eq!(normalize_drive_paths(input).as_ref(), want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_are_untouched() {
+        for input in [
+            "ls -la tests/",
+            "sh tests/test_01.sh && echo PASS",
+            r"grep -E '\d+' file.txt",          // a regex escape, not a path
+            r"echo 'D:\ws\literal'",          // single-quoted: the author meant it
+            r"printf 'a\tb\n'",
+            "curl http://localhost:11434/api/tags",
+        ] {
+            assert_eq!(
+                normalize_drive_paths(input).as_ref(),
+                input,
+                "must not rewrite: {input}"
+            );
+            assert!(
+                matches!(normalize_drive_paths(input), std::borrow::Cow::Borrowed(_)),
+                "no allocation for untouched input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirections_and_pipes_survive() {
+        assert_eq!(
+            normalize_drive_paths(r"cat D:\ws\a.txt | grep x > D:\ws\b.txt").as_ref(),
+            "cat /d/ws/a.txt | grep x > /d/ws/b.txt"
+        );
     }
 }

@@ -510,9 +510,61 @@ impl AgentContext {
     /// the prompt head and the model lost its own tool definitions, reducing
     /// it to narrated/confabulated tool calls. An oversized workspace context
     /// is cut at the cap with a visible marker instead.
+    /// The "you are here" line prepended to the workspace slice.
+    ///
+    /// Without it the model is never told where it is working: the system
+    /// prompt says nothing about a working directory and the workspace slice
+    /// carries only file *contents*, so the only way to learn the path is to
+    /// run `pwd` and reverse-engineer it. Observed live 2026-07-26: a model
+    /// did exactly that, then addressed files as `<workspace-leaf>/minidb`
+    /// — relative to a directory that already WAS the workspace — and spent
+    /// an hour editing a shadow copy one directory deeper while the tests
+    /// measured the real file.
+    ///
+    /// So: state the directory, and state that bare relative paths land in
+    /// it. The tools accept absolute paths too (and repair a redundantly
+    /// prefixed relative path), but not having to guess is cheaper than
+    /// recovering from a wrong guess.
+    fn workdir_preamble(&self) -> Option<String> {
+        let root = self.workspace_root.as_ref()?;
+        // The shell contract has to be stated. `exec` runs POSIX sh (Git Bash
+        // on Windows), but the working directory is shown in native form, and
+        // a Windows-looking path invites cmd.exe syntax. Observed live
+        // 2026-07-27: a run drifted from `ls`/`cat` into `dir`, `findstr`,
+        // `type` and `for %%f in (...)`, and 39 exec calls failed — the model
+        // had no way to know which shell it was talking to.
+        let shell_note = if cfg!(windows) {
+            "`exec` runs POSIX **sh** (via Git Bash), NOT cmd.exe or PowerShell — \
+             use `ls`, `cat`, `grep`, `sh script.sh`; `dir`, `type`, `findstr` and \
+             `%%VAR%%` will fail. In shell commands this directory is also reachable \
+             as a POSIX path."
+        } else {
+            "`exec` runs POSIX sh."
+        };
+        Some(format!(
+            "# Working directory\n\nYou are working in `{}`.\n\nRelative paths in \
+             tool calls resolve against this directory, so use `./minidb` or \
+             `tests/test_01.sh` — do NOT prefix them with the directory's own name. \
+             Absolute paths are accepted as well.\n\n{shell_note}",
+            root.display()
+        ))
+    }
+
     #[must_use]
     pub fn effective_system_prompt(&self) -> String {
-        match &self.workspace_context {
+        // The working-directory line is small, fixed-size, and must never be
+        // the thing that gets truncated, so it is joined AFTER the bounded
+        // workspace slice is assembled rather than counted against its cap.
+        // Placed LAST: identity and project context lead, and the concrete
+        // "where you are" sits closest to the conversation that acts on it.
+        let with_workdir = |body: String| -> String {
+            match self.workdir_preamble() {
+                Some(pre) if body.is_empty() => pre,
+                Some(pre) => format!("{body}\n\n{pre}"),
+                None => body,
+            }
+        };
+        let base = match &self.workspace_context {
             Some(ws_ctx) if !ws_ctx.is_empty() => {
                 let cap = self.workspace_context_cap_chars();
                 let bounded: std::borrow::Cow<'_, str> = if ws_ctx.len() > cap {
@@ -539,7 +591,8 @@ impl AgentContext {
                 }
             }
             _ => self.system_prompt.clone(),
-        }
+        };
+        with_workdir(base)
     }
 
     /// Maximum chars of workspace context to inject: a quarter of the model's
@@ -1014,6 +1067,7 @@ impl AgentContext {
         );
 
         let request = AnthropicRequest {
+            context_limit: None,
             model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: u32::try_from(model_info.max_output_tokens.min(2_048)).unwrap_or(u32::MAX),
@@ -1582,6 +1636,34 @@ mod tests {
         // Mirrors unknown_model_info floors (no per-model table).
         assert_eq!(ctx.hard_limit, nanna_llm::unknown_model_info("x", "").hard_input_limit());
         assert!(ctx.compression_threshold <= ctx.hard_limit);
+    }
+
+    #[test]
+    fn the_model_is_told_its_working_directory() {
+        // Live 2026-07-26: nothing in the prompt said where the agent was
+        // working, so the model learned the path from a `pwd` it happened to
+        // run, then addressed files as "<ws-leaf>/minidb" — one directory too
+        // deep — and edited a shadow copy for an hour while the acceptance
+        // tests read the real file.
+        let mut ctx = AgentContext::new("s");
+        ctx.system_prompt = "BASE".to_string();
+        ctx.workspace_root = Some(std::path::PathBuf::from("/tmp/bench-ws"));
+
+        let effective = ctx.effective_system_prompt();
+        assert!(effective.starts_with("BASE"), "identity still leads");
+        assert!(
+            effective.contains("bench-ws"),
+            "the working directory must appear in the prompt: {effective}"
+        );
+        assert!(
+            effective.contains("do NOT prefix"),
+            "the prompt must warn against re-prefixing the directory name"
+        );
+
+        // No workspace: nothing to claim, so nothing is added.
+        let mut global = AgentContext::new("s");
+        global.system_prompt = "BASE".to_string();
+        assert_eq!(global.effective_system_prompt(), "BASE");
     }
 
     #[test]

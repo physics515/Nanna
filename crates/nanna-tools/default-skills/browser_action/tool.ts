@@ -1,7 +1,8 @@
 export default {
   name: "browser_action",
+  requires: ["browser.action"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Perform an action in a browser page: click, type, scroll, or navigate. Useful for web automation and testing.",
   parameters: {
     type: "object",

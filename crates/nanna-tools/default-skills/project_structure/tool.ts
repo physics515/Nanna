@@ -2,7 +2,7 @@ export default {
   name: "project_structure",
   version: "0.1.0",
   timeout: 120,
-  output: "context",
+  output: "memory",
   description: "Display the directory tree structure of a project. Shows files with sizes and line counts, useful for understanding project layout.",
   parameters: {
     type: "object",

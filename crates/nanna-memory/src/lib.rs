@@ -32,6 +32,10 @@ pub use fsrs::{
 pub use service::{
     MemoryService, MemoryServiceConfig, RecallResult, EmbedFn,
     MemoryStats, MemoryListEntry, ConsolidationBands,
+    // Exported so the episodic writer chunks against the same bound the merge
+    // path caps against. Those two numbers drifting apart is precisely how a
+    // 4096-byte ceiling ended up silently rejecting 3200-char chunks.
+    MEMORY_CHUNK_MAX_CHARS, MEMORY_OBSERVATION_MAX_CHARS,
 };
 pub use retention::{
     measure_gated_recall, measure_recall, run_retention_cycle, CorpusParams,
@@ -145,7 +149,28 @@ pub trait MemoryPersistence: Send + Sync {
 pub struct MemoryEntry {
     pub id: String,
     pub content: String,
+    /// The embedding for the CURRENTLY active model — the one search compares
+    /// against. Empty means "not embedded by the active model yet", which is a
+    /// backfill job, not an error.
     pub embedding: Vec<f32>,
+    /// Which model produced [`Self::embedding`].
+    ///
+    /// Dimension alone cannot answer this: two different 1024-dim models
+    /// produce vectors that compare without asserting and mean nothing. Naming
+    /// the model is the only way to tell "the same vector space" from "the same
+    /// width".
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// Every embedding ever computed for this entry, keyed by model identity
+    /// (`provider:model`), including the active one.
+    ///
+    /// Providers flap — a rate-limited primary falls over and comes back on the
+    /// next call. Throwing away the previous vector on every switch meant each
+    /// flap cost a full re-embed of the store, and a flap back cost another.
+    /// Retained buckets make a switch-back free: rebinding is a lookup, and only
+    /// genuinely new (model, entry) pairs need work.
+    #[serde(default)]
+    pub embeddings: HashMap<String, Vec<f32>>,
     pub metadata: HashMap<String, String>,
     pub timestamp: i64,
     /// FSRS-6 cognitive state (stability, retrievability, etc.)
@@ -407,6 +432,28 @@ impl VectorStore {
     /// GPU-resident persistent buffers (upload once, search many times).
     ///
     /// See: `cargo bench -p nanna-gpu --bench gpu_vs_simd` for full results.
+    /// Cosine against a stored embedding, tolerating one of the wrong width.
+    ///
+    /// `cosine_similarity_f32` opens with `assert_eq!(a.len(), b.len())` — a
+    /// hard assert, and this crate's release profile sets `panic = "abort"`, so
+    /// a single stale row takes the whole daemon down. The search guard above
+    /// only validates the QUERY against config; it says nothing about what is
+    /// in the store, and the two genuinely can differ: changing embedding
+    /// provider changes the width, while every row already persisted keeps the
+    /// old one.
+    ///
+    /// A stale row is not a non-match, it is a row that cannot be compared yet.
+    /// Scoring it at the cosine floor keeps it out of every result without
+    /// pretending it was evaluated — and, unlike the assert, leaves the process
+    /// alive to re-embed it.
+    fn cosine_or_stale(query: &[f32], embedding: &[f32]) -> f32 {
+        if query.len() == embedding.len() {
+            cosine_similarity_f32(query, embedding)
+        } else {
+            -1.0
+        }
+    }
+
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(MemoryEntry, f32)> {
         if query_embedding.len() != self.config.get_dimension() {
             return Vec::new();
@@ -450,7 +497,7 @@ impl VectorStore {
                     // Fallback to SIMD
                     entries
                         .iter()
-                        .map(|entry| cosine_similarity_f32(&query, &entry.embedding))
+                        .map(|entry| Self::cosine_or_stale(&query, &entry.embedding))
                         .collect()
                 }
             }
@@ -463,17 +510,23 @@ impl VectorStore {
                 .collect()
         };
 
-        // Pair entries with similarities.
-        let mut scored: Vec<(MemoryEntry, f32)> = entries
-            .iter()
-            .zip(similarities)
-            .map(|(entry, sim)| (entry.clone(), sim))
+        // Rank by INDEX, then clone only the winners.
+        //
+        // This used to clone EVERY entry — embeddings included — into a Vec,
+        // sort that, and then throw all but `top_k` away. At 2048 dimensions
+        // each discarded clone is ~8 KB of memcpy, and `remember_scoped` runs a
+        // search on every single ingest, so the cost was O(store) per write and
+        // O(store²) across a run. Capturing every tool call raises the write
+        // count roughly forty-fold, which would have turned that from wasteful
+        // into a stall.
+        let mut ranked: Vec<(usize, f32)> = similarities.into_iter().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(top_k);
+        let scored: Vec<(MemoryEntry, f32)> = ranked
+            .into_iter()
+            .map(|(idx, sim)| (entries[idx].clone(), sim))
             .collect();
         drop(entries);
-
-        // Sort by similarity (descending) and take top-k
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
         scored
     }
 
@@ -804,6 +857,98 @@ impl VectorStore {
     ///
     /// Returns the number of entries re-embedded. Entries that fail to re-embed
     /// are removed (content was likely empty or the embed function errored).
+    /// Point every entry at its bucket for `model`, keeping all other buckets.
+    ///
+    /// This is what a provider switch costs now: a hash lookup per entry, no
+    /// network, no LLM. An entry that has been embedded by this model before —
+    /// because the router used it earlier and flapped away — comes back
+    /// instantly. An entry that has not is left with an empty active vector,
+    /// which search skips and [`Self::entries_missing_model`] reports for
+    /// backfill.
+    ///
+    /// Returns `(rebound, missing)`.
+    pub async fn rebind_to_model(&self, model: &str) -> (usize, usize) {
+        let mut entries = self.entries.write().await;
+        let (mut rebound, mut missing) = (0usize, 0usize);
+        for entry in entries.iter_mut() {
+            // Retain whatever the active vector currently is, so switching AWAY
+            // from a model never discards the work that produced it.
+            //
+            // Rows written before buckets existed carry a vector but no model
+            // name. Dropping those on the first rebind would throw away the
+            // entire store's existing embeddings — so they are kept under a
+            // width-tagged legacy key. That key can never be *matched* by a real
+            // provider (we do not know which model made it, and equal width is
+            // not equal vector space), but keeping it costs almost nothing and
+            // discarding it is irreversible.
+            if !entry.embedding.is_empty() {
+                let key = entry
+                    .embedding_model
+                    .clone()
+                    .unwrap_or_else(|| format!("legacy-{}d", entry.embedding.len()));
+                entry.embeddings.entry(key).or_insert_with(|| entry.embedding.clone());
+            }
+            match entry.embeddings.get(model) {
+                Some(vector) => {
+                    entry.embedding = vector.clone();
+                    entry.embedding_model = Some(model.to_string());
+                    rebound += 1;
+                }
+                None => {
+                    entry.embedding.clear();
+                    entry.embedding_model = None;
+                    missing += 1;
+                }
+            }
+        }
+        (rebound, missing)
+    }
+
+    /// Ids and content of entries with no bucket for `model`, oldest first.
+    ///
+    /// `limit` bounds one backfill pass so the filler yields between batches
+    /// instead of monopolising a rate-limited provider.
+    pub async fn entries_missing_model(&self, model: &str, limit: usize) -> Vec<(String, String)> {
+        let entries = self.entries.read().await;
+        entries
+            .iter()
+            .filter(|e| !e.embeddings.contains_key(model))
+            .take(limit)
+            .map(|e| (e.id.clone(), e.content.clone()))
+            .collect()
+    }
+
+    /// Record `embedding` as `model`'s vector for `id`, activating it when
+    /// `model` is the one currently bound.
+    pub async fn set_embedding_for_model(
+        &self,
+        id: &str,
+        model: &str,
+        embedding: Vec<f32>,
+        activate: bool,
+    ) -> Result<(), MemoryError> {
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return Err(MemoryError::NotFound(id.to_string()));
+        };
+        entry.embeddings.insert(model.to_string(), embedding.clone());
+        if activate {
+            entry.embedding = embedding;
+            entry.embedding_model = Some(model.to_string());
+        }
+        let snapshot = entry.clone();
+        drop(entries);
+        // Non-fatal, like every other write-through here: the in-memory cache is
+        // already correct, and a backfill that fails to persist just repeats on
+        // the next restart rather than losing the memory.
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_entry(&snapshot).await
+        {
+            warn!("Failed to persist backfilled embedding for {}: {}", snapshot.id, e);
+        }
+        Ok(())
+    }
+
     pub async fn re_embed_mismatched<F, Fut>(
         &self,
         expected_dim: usize,
@@ -968,6 +1113,8 @@ mod tests {
         let store = VectorStore::new(config);
 
         let entry = MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: "test1".to_string(),
             content: "Hello world".to_string(),
             embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -989,6 +1136,8 @@ mod tests {
 
     fn health_test_entry(id: &str) -> MemoryEntry {
         MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: id.to_string(),
             content: "c".to_string(),
             embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -1123,6 +1272,8 @@ mod tests {
 
     fn entry_dim8(id: &str) -> MemoryEntry {
         MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: id.to_string(),
             content: format!("content {id}"),
             embedding: vec![0.0; 8],
@@ -1193,6 +1344,8 @@ mod tests {
         let store = VectorStore::new(config);
         store
             .add(MemoryEntry {
+                embedding_model: None,
+                embeddings: HashMap::new(),
                 id: "s1".to_string(),
                 content: "persist me".to_string(),
                 embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],

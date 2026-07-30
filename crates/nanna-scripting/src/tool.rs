@@ -181,6 +181,21 @@ pub struct ToolManifest {
     pub output: OutputTarget,
     /// Timeout in seconds (None = use default 30s)
     pub timeout_secs: Option<u64>,
+    /// Host services this tool CANNOT work without, e.g. `["memory.list"]`.
+    ///
+    /// A tool whose requirements are unmet is not registered at all, so it is
+    /// never advertised to the model. Omit the field for tools that degrade
+    /// gracefully (the `todo` skill calls `tasks.*` but falls back to a JSON
+    /// file, so it must still load when storage is absent).
+    ///
+    /// Motivation, observed live 2026-07-26: with the memory service disabled
+    /// (no embedding provider) `reflect` was still offered and failed on every
+    /// single call with `Service not found: memory.list`; `list_reminders`
+    /// likewise, since `schedule.*` is registered nowhere in the daemon. A
+    /// model cannot tell "broken" from "try again", so it retried them in a
+    /// loop instead of doing the work.
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 /// Extract manifest from tool source (looks for default export)
@@ -205,7 +220,46 @@ pub fn extract_manifest(source: &str) -> Option<ToolManifest> {
         parameters: extract_parameters_schema(source),
         output,
         timeout_secs,
+        requires: extract_string_array_field(source, "requires"),
     })
+}
+
+/// Extract a manifest field declared as an array of string literals, e.g.
+/// `requires: ["memory.list", "memory.search"]`.
+///
+/// Deliberately narrow: it reads the bracketed block that follows the key and
+/// pulls out quoted items. Anything it cannot parse yields an empty list —
+/// which means "no requirements", the permissive default, so a malformed
+/// annotation can never silently hide a working tool.
+fn extract_string_array_field(source: &str, field: &str) -> Vec<String> {
+    let patterns = [format!("{field}:"), format!("{field} :")];
+    let Some(start) = patterns.iter().find_map(|p| source.find(p.as_str())) else {
+        return Vec::new();
+    };
+    let after = &source[start..];
+    let Some(open) = after.find('[') else {
+        return Vec::new();
+    };
+    let Some(close) = after[open..].find(']') else {
+        return Vec::new();
+    };
+    let block = &after[open + 1..open + close];
+
+    let mut out = Vec::new();
+    let mut rest = block;
+    while let Some(q) = rest.find(['"', '\'']) {
+        let quote = rest.as_bytes()[q] as char;
+        let value_start = q + 1;
+        let Some(end) = rest[value_start..].find(quote) else {
+            break;
+        };
+        let value = rest[value_start..value_start + end].trim().to_string();
+        if !value.is_empty() {
+            out.push(value);
+        }
+        rest = &rest[value_start + end + 1..];
+    }
+    out
 }
 
 /// Extract the JSON-Schema `parameters` object from a tool manifest source.
@@ -571,6 +625,54 @@ fn extract_string_field(source: &str, field: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_is_parsed_from_the_manifest() {
+        let src = r#"
+export default {
+  name: "reflect",
+  requires: ["memory.list", "memory.delete"],
+  version: "0.1.0",
+  description: "Review stored memories.",
+  parameters: { type: "object", properties: {} }
+}
+"#;
+        let m = extract_manifest(src).expect("manifest");
+        assert_eq!(m.name, "reflect");
+        assert_eq!(m.requires, vec!["memory.list", "memory.delete"]);
+    }
+
+    #[test]
+    fn a_tool_without_requires_declares_nothing() {
+        // The permissive default: todo calls tasks.* but falls back to a JSON
+        // file, so it must keep loading when storage is absent.
+        let src = r#"
+export default {
+  name: "todo",
+  description: "Task store.",
+  parameters: { type: "object", properties: {} }
+}
+"#;
+        let m = extract_manifest(src).expect("manifest");
+        assert!(m.requires.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_requires_annotation_hides_nothing() {
+        // Unparseable annotation must read as "no requirements" so a typo can
+        // never silently remove a working tool from the surface.
+        let src = r#"
+export default {
+  name: "weird",
+  requires: not_an_array,
+  description: "x"
+}
+"#;
+        let m = extract_manifest(src).expect("manifest");
+        assert!(m.requires.is_empty());
+    }
+
     use super::*;
 
     #[test]
