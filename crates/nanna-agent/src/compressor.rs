@@ -99,6 +99,7 @@ pub async fn compress_text_with_config(
     let model_info = client.get_model_info(model, model_cache.as_ref()).await;
     let max_tokens = u32::try_from(model_info.max_output_tokens.min(256)).unwrap_or(u32::MAX);
     let request = AnthropicRequest {
+        context_limit: None,
         model: model.to_string(),
         messages: vec![AnthropicMessage::user_text(prompt)],
         max_tokens,

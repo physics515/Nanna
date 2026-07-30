@@ -37,12 +37,56 @@ impl From<&Workspace> for WorkspaceInfo {
     }
 }
 
-/// List all registered workspaces
+/// List all registered workspaces, read through to the daemon.
+///
+/// The local registry is a CACHE, not the truth: the daemon owns registration,
+/// and anything registered after this client connected — by a script, another
+/// client, or a benchmark harness — would otherwise stay invisible until the
+/// app restarted. Observed 2026-07-29: a workspace created two minutes before
+/// the picker was opened simply wasn't in it.
+///
+/// Only the workspace SET is refreshed. Which workspace this client considers
+/// active is its own view state and is deliberately left alone, so a second
+/// client opening something never yanks this one's selection.
+///
+/// Best-effort: if the daemon is unreachable, serve the cache rather than
+/// failing the picker.
 #[tauri::command]
 pub async fn list_workspaces(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<Vec<WorkspaceInfo>, String> {
     let state_guard = state.read().await;
+
+    if let Ok(result) = state_guard.backend.workspace_list().await {
+        let records = result
+            .get("workspaces")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut registry = state_guard.workspaces.write().await;
+        for record in &records {
+            let (Some(id), Some(path)) = (
+                record.get("id").and_then(|v| v.as_str()),
+                record.get("path").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let path = std::path::PathBuf::from(path);
+            if registry.get(id).is_some() || !path.exists() {
+                continue;
+            }
+            let mut ws = Workspace::new(&path);
+            ws.id = id.to_string();
+            // Context load is for the workspace-file editing commands; a
+            // failure must not keep the workspace out of the picker.
+            if let Err(e) = ws.load_context().await {
+                warn!("Failed to load context for {path:?}: {e}");
+            }
+            registry.register(ws);
+        }
+    }
+
     let registry = state_guard.workspaces.read().await;
     Ok(registry.list().iter().map(|ws| WorkspaceInfo::from(*ws)).collect())
 }

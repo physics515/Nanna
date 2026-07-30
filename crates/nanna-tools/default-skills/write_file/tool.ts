@@ -1,7 +1,7 @@
 export default {
   name: "write_file",
   version: "0.1.13",
-  output: "context",
+  output: "memory",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the largest size the file has held (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
     type: "object",
@@ -17,6 +17,61 @@ export default {
     // models read as corruption and spiral on.
     function fail(message) {
       return { content: message, success: false };
+    }
+
+    // A refusal the model keeps re-earning has stopped being information.
+    //
+    // Observed live 2026-07-28 (qwen3.5:9b, 42-feature ladder): the fork guard
+    // correctly refused ./minidb.sh because ./minidb already existed, and named
+    // the right path and the exact call to make. The model read it and tried
+    // ./minidb.sh again — 74 times, 45% of every write attempt in the run. The
+    // guard prevented the damage and none of the waste.
+    //
+    // The explanation is not the problem; its SHAPE is. Each step re-anchors
+    // context, so every attempt is effectively the model's first, and a
+    // paragraph of reasoning is what a small model skims. So after a couple of
+    // identical refusals the message stops explaining and starts commanding:
+    // short, imperative, the correct call and nothing else to weigh against it.
+    //
+    // Counted per path, per workspace, in the same .nanna state dir as the
+    // ratchet. Fails OPEN in every direction — a missing or corrupt counter
+    // just yields the normal message.
+    var REFUSAL_STATE = ".nanna/write_refusals.json";
+    var REFUSAL_ESCALATE_AT = 2;
+    var REFUSAL_MAX_ENTRIES = 200;
+    function refusalCount(key) {
+      try {
+        var map = JSON.parse(Nanna.readFile(REFUSAL_STATE));
+        var n = map && map[key];
+        return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
+      } catch (e) {
+        return 0;
+      }
+    }
+    function refusalBump(key) {
+      try {
+        var map;
+        try { map = JSON.parse(Nanna.readFile(REFUSAL_STATE)); } catch (e2) { map = {}; }
+        if (!map || typeof map !== "object") map = {};
+        var next = (typeof map[key] === "number" && isFinite(map[key]) ? map[key] : 0) + 1;
+        map[key] = next;
+        var keys = Object.keys(map);
+        if (keys.length > REFUSAL_MAX_ENTRIES) {
+          for (var i = 0; i < keys.length - REFUSAL_MAX_ENTRIES; i++) delete map[keys[i]];
+        }
+        Nanna.writeFile(REFUSAL_STATE, JSON.stringify(map));
+        return next;
+      } catch (e) {
+        return 0;
+      }
+    }
+    // `blunt` replaces `normal` once this path has been refused repeatedly.
+    // Keyed "fork:<path>" and SHARED with edit_file on purpose: the model
+    // alternated between the two tools on the same doomed path, so a
+    // per-tool counter would let it spend the full quota twice over.
+    function failEscalating(pathKey, normal, blunt) {
+      var n = refusalBump("fork:" + pathKey);
+      return fail(n > REFUSAL_ESCALATE_AT ? blunt : normal);
     }
 
     // Anti-erosion ratchet (round-17 lesson): the 30% shrink floor used to be
@@ -296,6 +351,47 @@ export default {
       }
       if (copyHit) {
         return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite at or above the file's current size is always accepted).");
+      }
+
+      // SUFFIXED-COPY REFUSAL: writing `minidb.sh` while `minidb` exists.
+      //
+      // The marker list above catches renames that ANNOUNCE themselves
+      // (_v2, _backup, .new). This catches the quieter fork: keep the name,
+      // add an extension. Observed live 2026-07-27 — a run built ./minidb to
+      // 8/42 passing, then drifted onto ./minidb.sh and spent its remaining
+      // time improving a file the acceptance tests never read.
+      //
+      // Deliberately narrow: it fires only when the target's STEM is itself
+      // an existing file, i.e. the original carries no extension of its own.
+      // That is the copy instinct. Sibling formats keep working, because
+      // their stems are not files: config.json next to config.yaml, tool.ts
+      // next to tool.js, index.css next to index.html.
+      var lastDot = baseName.lastIndexOf(".");
+      if (lastDot > 0) {
+        var stem = baseName.substring(0, lastDot);
+        var dirPart = filePath.split("\\").join("/");
+        var slashAt = dirPart.lastIndexOf("/");
+        var stemPath = slashAt >= 0 ? dirPart.substring(0, slashAt + 1) + stem : stem;
+        // Nanna.stat THROWS when the path is absent, and its result carries
+        // {size, is_file, is_dir, modified} — there is no `exists` flag. The
+        // throw IS the existence check.
+        var originalStat = null;
+        try { originalStat = Nanna.stat(stemPath); } catch (e) { originalStat = null; }
+        if (originalStat && originalStat.is_file) {
+          return failEscalating(
+            hiwaterKey(filePath),
+            "WRITE REFUSED — '" + filePath + "' is '" + stem + "' with an extension added, and '" +
+            stem + "' already exists (" + (originalStat.size || 0) + " bytes). Nothing was written. " +
+            "That fork leaves two files and the real one stops improving — whatever reads '" + stem +
+            "' (tests, callers) will not see this content. Work on '" + stemPath + "' itself: " +
+            "edit_file(file_path=\"" + stemPath + "\", old_string=<exact current text>, new_string=<replacement>) " +
+            "for a targeted change, or write the complete content to '" + stemPath + "'.",
+            "STOP — '" + filePath + "' WILL NEVER BE ACCEPTED. You have tried it repeatedly. " +
+            "The only file that counts is '" + stemPath + "'. Send this exact call instead:\n" +
+            "    write_file(file_path=\"" + stemPath + "\", content=<the complete script>)\n" +
+            "Do not add an extension. Do not try '" + filePath + "' again."
+          );
+        }
       }
 
       // VALID CONTENT ALWAYS WINS (round-13 lesson): the earlier rail

@@ -113,19 +113,81 @@ pub fn summarize_with_failover(
         let router = Arc::clone(&router);
         let models = models.clone();
         Box::pin(async move {
+            // Wait out congestion rather than failing the cluster.
+            //
+            // A dream cycle asks for one summary per cluster, back to back, and
+            // a free tier allows 20 requests a minute — so the first cycle after
+            // this path started working burned its whole budget in one second
+            // and lost 20 of 22 clusters to 429s. Those clusters are not
+            // retried later; the consolidation simply does not happen, so the
+            // store keeps growing uncompressed all night.
+            //
+            // Congestion is a throughput limit, not a failure. Waiting spreads
+            // the cycle over a few minutes, which is the correct price. Only a
+            // model that is genuinely broken gets failed over.
+            const BACKOFF_SECS: [u64; 6] = [5, 15, 30, 60, 120, 240];
+
             let mut last_error = String::from("no summarization models configured");
-            for model in &models {
-                let request = nanna_llm::CompletionRequest::default()
-                    .with_model(model)
-                    .with_message(nanna_llm::Message::user(&prompt));
-                match router.complete(model, request).await {
-                    Ok(summary) => return Ok(summary),
-                    Err(e) => {
-                        tracing::warn!("Dream summarization model {model} failed: {e}");
-                        last_error = format!("{model}: {e}");
+            for (round, wait) in std::iter::once(0)
+                .chain(BACKOFF_SECS.iter().copied())
+                .enumerate()
+            {
+                if wait > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                }
+
+                let mut soonest_retry: Option<u64> = None;
+                let mut congested = 0usize;
+
+                for model in &models {
+                    let request = nanna_llm::CompletionRequest::default()
+                        .with_model(model)
+                        .with_message(nanna_llm::Message::user(&prompt));
+                    match router.complete(model, request).await {
+                        Ok(summary) => {
+                            if round > 0 {
+                                tracing::info!(
+                                    "Dream summarization cleared congestion after {round} wait(s)"
+                                );
+                            }
+                            return Ok(summary);
+                        }
+                        Err(e) if e.is_rate_limit() => {
+                            congested += 1;
+                            if let nanna_llm::LlmError::RateLimit { retry_after, .. } = &e
+                                && let Some(secs) = retry_after
+                            {
+                                soonest_retry =
+                                    Some(soonest_retry.map_or(*secs, |cur: u64| cur.min(*secs)));
+                            }
+                            last_error = format!("{model}: {e}");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Dream summarization model {model} failed: {e}");
+                            last_error = format!("{model}: {e}");
+                        }
                     }
                 }
+
+                if congested == 0 {
+                    break;
+                }
+
+                // The provider says when it will be ready; prefer that over the
+                // schedule, which only exists for providers that decline to say.
+                let next = soonest_retry.unwrap_or_else(|| {
+                    BACKOFF_SECS.get(round).copied().unwrap_or(240)
+                });
+                tracing::info!(
+                    "Dream summarization congested on all {} model(s) — waiting {}s",
+                    models.len(),
+                    next
+                );
+                if let Some(secs) = soonest_retry {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
             }
+
             Err(format!(
                 "all {} summarization model(s) failed; last error — {last_error}",
                 models.len()

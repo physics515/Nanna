@@ -172,7 +172,7 @@ pub fn build_plan_prompt(goal: &str, context: Option<&str>) -> String {
     prompt.push_str(
         "You are planning how to satisfy one request. Reply with ONE JSON array and no other text.\n\
          \n\
-         Each element: {\"title\": string, \"description\": string, \"acceptance\": object|null, \"tool_scope\": [string]}\n\
+         Each element: {\"title\": string, \"description\": string, \"acceptance\": object|null}\n\
          \n\
          RULES\n\
          1. Prefer ONE task. Emit multiple tasks only when the request truly has\n\
@@ -185,7 +185,8 @@ pub fn build_plan_prompt(goal: &str, context: Option<&str>) -> String {
               {\"kind\":\"command\",\"command\":\"cargo test\",\"timeout_secs\":120}\n\
               {\"kind\":\"file_exists\",\"path\":\"src/foo.rs\"}\n\
               {\"kind\":\"regex\",\"pattern\":\"ok\",\"path\":\"out.txt\"}\n\
-         3. `tool_scope` lists only tools that task needs; [] when unsure.\n\
+         3. Do NOT list tools for a task. Every step reaches whatever the work\n\
+            turns out to need; planning tools ahead only ever guessed wrong.\n\
          4. Titles are imperative and specific. No numbering, no markdown.\n\
          \n",
     );

@@ -1,5 +1,6 @@
 export default {
   name: "list_reminders",
+  requires: ["schedule.list"],
   version: "0.1.0",
   description: "List all active reminders showing their messages and remaining time.",
   parameters: {

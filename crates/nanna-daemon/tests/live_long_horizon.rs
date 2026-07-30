@@ -111,6 +111,9 @@ async fn build_env(workdir: &Path) -> EvalEnv {
     }
     let router = Arc::new(router);
     let runner = AgentStepRunner {
+        // Fresh per run: discovery is paid once per tool, then carried across
+        // this run's steps.
+        discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         router,
         tools,
         agent_config: nanna_agent::AgentConfig {
@@ -122,6 +125,12 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
         workspace_root: Some(workdir.to_path_buf()),
         stats: None,
+        // No memory service in the eval harness: it drives the runner directly,
+        // with no daemon to own the store. `loop_runner` degrades correctly on
+        // `None` — tool results stay in context instead of being stubbed behind
+        // a handle nothing could resolve.
+        memory: None,
+        workspace_id: None,
         // The eval drives the harness directly, with no chat session to
         // stream into — step output is judged by acceptance checks, not read.
         chat_sink: None,

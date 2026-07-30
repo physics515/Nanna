@@ -126,6 +126,24 @@ pub enum TimelineItem {
     /// Recorded so the journal explains why thinking/text may restart:
     /// the attempt after a fault regenerates rather than resumes.
     Fault { message: String, at: String },
+    /// The harness starting work on one plan item.
+    ///
+    /// This is run MECHANICS, not conversation. It used to be written into
+    /// the assistant's message as literal `**[working]** …` markdown, which
+    /// had three costs: the transcript read as a wall of banners instead of a
+    /// reply, the banners were persisted into conversation history and fed
+    /// back to the model as context on later turns, and they crowded out the
+    /// narration a watcher actually wants. As a timeline item the GUI can
+    /// render it as a status row that updates in place.
+    Step {
+        /// `working` | `planning` | `verifying`. Named `phase` because the
+        /// enum is internally tagged on `kind`.
+        phase: String,
+        /// Human-readable item title, e.g. "Implement the get command".
+        label: String,
+        item_id: i64,
+        at: String,
+    },
 }
 
 /// Resource totals for one run, for benchmarking models against each other

@@ -78,14 +78,83 @@ impl ControlPlane {
                     }
                 }
 
-                // Resolve workspace: session's workspace > globally active workspace
-                let effective_ws_id = if session.workspace_id.is_some() {
-                    session.workspace_id.clone()
-                } else {
-                    // Fall back to globally active workspace
+                // Resolve workspace: session's workspace > globally active workspace.
+                //
+                // The session's id is VALIDATED against the registry first. An
+                // id the registry does not contain used to suppress the
+                // fallback and then fail every lookup silently: the turn ran
+                // with no workspace context, `workspace_root = None`, and
+                // whatever `default_workdir` some earlier code path had left on
+                // the tool registry — i.e. it executed in a different
+                // directory than anyone believed, with no error anywhere. A
+                // session pointing at a workspace that no longer exists must
+                // degrade to the active one loudly, not run somewhere random.
+                let (effective_ws_id, ws_source) = {
                     let registry = self.workspaces.read().await;
-                    registry.active().map(|ws| ws.id.clone())
+                    let session_ws = session
+                        .workspace_id
+                        .clone()
+                        .filter(|id| registry.get(id).is_some());
+                    if session.workspace_id.is_some() && session_ws.is_none() {
+                        warn!(
+                            session_id = %session_id,
+                            missing = ?session.workspace_id,
+                            "session names a workspace the registry does not have — \
+                             falling back to the active workspace"
+                        );
+                    }
+                    match session_ws {
+                        Some(id) => (Some(id), "session"),
+                        None => (registry.active().map(|ws| ws.id.clone()), "active"),
+                    }
                 };
+
+                // Whatever we resolved, the tool working directory must match
+                // it — including when it resolved to NOTHING. Leaving the
+                // previous workspace's workdir in place is what turned "this
+                // session has no workspace" into "this session writes into the
+                // last session's directory".
+                if effective_ws_id.is_none() {
+                    if let Some(agent) = self.agent.as_ref() {
+                        agent.tools().set_default_workdir(None).await;
+                    }
+                }
+
+                // SAY which one won. The precedence itself is right, but it was
+                // silent, and a silent override is indistinguishable from a
+                // bug: activating a workspace over IPC appeared to work while
+                // every turn quietly used the session's instead. Three
+                // consecutive "fresh workspace" benchmark runs wrote into the
+                // FIRST workspace's directory before anyone noticed (one of
+                // them scored 0/42 while its artifact grew next door).
+                {
+                    let registry = self.workspaces.read().await;
+                    let active_id = registry.active().map(|ws| ws.id.clone());
+                    let path = effective_ws_id
+                        .as_ref()
+                        .and_then(|id| registry.get(id))
+                        .map(|ws| ws.path.display().to_string());
+                    let overridden = ws_source == "session"
+                        && active_id.is_some()
+                        && active_id != effective_ws_id;
+                    if overridden {
+                        info!(
+                            session_id = %session_id,
+                            using = ?effective_ws_id,
+                            path = ?path,
+                            active_workspace = ?active_id,
+                            "chat turn uses the SESSION's workspace, overriding the active one"
+                        );
+                    } else {
+                        info!(
+                            session_id = %session_id,
+                            source = ws_source,
+                            using = ?effective_ws_id,
+                            path = ?path,
+                            "chat turn workspace resolved"
+                        );
+                    }
+                }
 
                 // Inject workspace context (reload from disk so edits within the session are picked up)
                 if let Some(ref ws_id) = effective_ws_id {
@@ -146,9 +215,38 @@ impl ControlPlane {
                             .collect();
 
                         if !fresh_memories.is_empty() {
+                            // Bounded per memory, and it must be.
+                            //
+                            // These go in VERBATIM. A merged entry may now hold
+                            // four maximum-size observations, so five recalled
+                            // memories could push ~136 KB into the system prompt
+                            // of a model with a 32 k window — the recall meant to
+                            // orient the turn would instead evict the plan it was
+                            // recalled to serve.
+                            //
+                            // The owner's rule already says what to do here:
+                            // context gets a summary, and recall is how you get
+                            // the whole thing. So cut at a char boundary and say
+                            // so, rather than silently truncating or silently
+                            // flooding.
+                            const RECALL_INJECT_MAX_CHARS: usize = 1_200;
                             system_prompt.push_str("\n\n## Remembered Context\n");
                             for mem in fresh_memories {
-                                system_prompt.push_str(&format!("- {}\n", mem.content));
+                                if mem.content.chars().count() <= RECALL_INJECT_MAX_CHARS {
+                                    system_prompt.push_str(&format!("- {}\n", mem.content));
+                                    continue;
+                                }
+                                let head: String = mem
+                                    .content
+                                    .chars()
+                                    .take(RECALL_INJECT_MAX_CHARS)
+                                    .collect();
+                                system_prompt.push_str(&format!(
+                                    "- {head}…\n  [OPENING {RECALL_INJECT_MAX_CHARS} CHARS of a \
+                                     longer memory, shown so it cannot crowd out your context. \
+                                     Nothing was lost — recall(\"{}\") returns it whole.]\n",
+                                    mem.id
+                                ));
                             }
                         }
                     }

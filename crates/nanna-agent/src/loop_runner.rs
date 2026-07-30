@@ -363,6 +363,12 @@ pub struct AgentResponse {
     pub cumulative_output_tokens: u64,
     /// Per-iteration model stats (for UI display)
     pub model_stats: Vec<crate::model_stats::RequestModelStats>,
+    /// Tools the model discovered and activated during this run.
+    ///
+    /// Returned so a CALLER that drives many runs — the long-horizon harness
+    /// drives one per step — can carry activation forward. Without it every
+    /// step starts blind and re-pays discovery out of its 8-iteration budget.
+    pub active_tools: Vec<String>,
 }
 
 /// Reasoning content from thinking mode
@@ -2710,6 +2716,72 @@ impl Agent {
                 self.config.context_result_threshold
             };
 
+            // Memory gets EVERYTHING. `output_target` decides only what CONTEXT
+            // gets — the two were conflated, and the `Context` arm below never
+            // called `on_memory` at all. In one measured run that erased `todo`
+            // (232 calls) and `discover_tools` (139) from the store entirely:
+            // the agent could not recall its own plan or which tools it had
+            // found, only the shell output in between.
+            //
+            // The one true exclusion is the memory tools themselves. Storing
+            // what `recall` returns would copy a memory back into memory on
+            // every read, and `remember`/`day_dream` have already written
+            // theirs — so those are skipped to avoid duplication, exactly and
+            // only those.
+            // 12 hex chars, not 8. The handle is resolved by first-match, so a
+            // collision does not fail — it silently returns SOMEONE ELSE'S tool
+            // result as though it were yours. 32 bits reaches a 50% chance of
+            // some collision at ~77k records, which one long run can approach;
+            // 48 bits pushes that to ~20M.
+            let source_id = Uuid::new_v4().to_string().replace('-', "")[..12].to_string();
+            if !is_memory_tool(&name) {
+                if let Some(ref on_memory) = options.on_memory {
+                    let chunks = if result_content.len() > nanna_memory::MEMORY_CHUNK_MAX_CHARS {
+                        semantic_chunk(&result_content, nanna_memory::MEMORY_CHUNK_MAX_CHARS, 0.15)
+                    } else {
+                        vec![(0, result_content.clone())]
+                    };
+                    let total_chunks = chunks.len();
+
+                    // What the call WAS, so the episode is retrievable by its
+                    // subject and not just by words in its output. A bare output
+                    // blob answers "what did it say" but not "what did I do to
+                    // that file, and did it work" — which is what a future step
+                    // actually asks.
+                    let target = input
+                        .get("file_path")
+                        .or_else(|| input.get("path"))
+                        .or_else(|| input.get("command"))
+                        .or_else(|| input.get("query"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.chars().take(120).collect::<String>());
+                    let outcome = if response.result.success { "ok" } else { "FAILED" };
+
+                    for (idx, chunk_content) in &chunks {
+                        let mut tags = HashMap::new();
+                        tags.insert("tool".to_string(), name.clone());
+                        tags.insert("source_id".to_string(), source_id.clone());
+                        tags.insert("outcome".to_string(), outcome.to_string());
+                        if let Some(ref t) = target {
+                            tags.insert("target".to_string(), t.clone());
+                        }
+                        tags.insert("chunk".to_string(), format!("{}/{}", idx + 1, total_chunks));
+
+                        on_memory(ExtractedMemory {
+                            content: match &target {
+                                Some(t) => format!("[{name} → {t} — {outcome}] {chunk_content}"),
+                                None => format!("[{name} — {outcome}] {chunk_content}"),
+                            },
+                            category: "tool_result".to_string(),
+                            // A tool result is always agent-observed, never a user statement.
+                            provenance: MemoryProvenance::Observed,
+                            tags: Some(tags),
+                        })
+                        .await;
+                    }
+                }
+            }
+
             let final_content = match output_target {
                 OutputTarget::Context => {
                     // Context-targeted tools: never store in memory, never stub.
@@ -2780,49 +2852,77 @@ impl Agent {
                     }
                 }
                 OutputTarget::Memory => {
-                    // Default: store in memory, stub large results in context.
-                    let source_id = Uuid::new_v4().to_string()[..8].to_string();
-                    if let Some(ref on_memory) = options.on_memory {
-                        let chunks = if result_content.len() > 3200 {
-                            semantic_chunk(&result_content, 3200, 0.15)
-                        } else {
-                            vec![(0, result_content.clone())]
-                        };
-                        let total_chunks = chunks.len();
+                    // The episodic write already happened above, for every tool
+                    // regardless of target. This arm now decides one thing only:
+                    // what the model SEES in return.
 
-                        for (idx, chunk_content) in &chunks {
-                            let mut tags = HashMap::new();
-                            tags.insert("tool".to_string(), name.clone());
-                            tags.insert("source_id".to_string(), source_id.clone());
-                            tags.insert(
-                                "chunk".to_string(),
-                                format!("{}/{}", idx + 1, total_chunks),
-                            );
-
-                            on_memory(ExtractedMemory {
-                                content: format!("[Tool: {name}] {chunk_content}"),
-                                category: "tool_result".to_string(),
-                                // A tool result is always agent-observed, never a user statement.
-                                provenance: MemoryProvenance::Observed,
-                                tags: Some(tags),
-                            })
-                            .await;
-                        }
-                    }
-
-                    if options.on_memory.is_some() && result_content.len() > threshold {
-                        let chunk_count = (result_content.len() / 3200).max(1);
+                    // `inline: true` on the CALL says "I need this in front of
+                    // me, not behind a handle". The model is the only one who
+                    // knows whether it is about to reason over the whole thing
+                    // or merely needs it kept — so the choice belongs to it,
+                    // not to a byte threshold. It is still stored either way;
+                    // inline changes what CONTEXT gets, never what memory gets.
+                    //
+                    // Not a free pass: the point of stubbing is that context is
+                    // the scarce resource, and an inlined 200 KB result is how
+                    // a run ends up compacting away its own plan. So the
+                    // override is honoured up to a hard ceiling and then
+                    // truncated with the handle still offered.
+                    let wants_inline = input
+                        .get("inline")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    const INLINE_CEILING: usize = 24_000;
+                    if wants_inline && result_content.len() > INLINE_CEILING {
+                        let cut = truncate_boundary(&result_content, INLINE_CEILING);
                         format!(
-                            "[SUCCEEDED — the full {} -char result from '{}' was stored in \
-                             memory (source_id={}, {} chunks). WHY this stub: the result is \
-                             too large to keep in your limited context window; nothing was \
-                             lost. Use recall('query about {}') to retrieve specific \
-                             sections.]",
+                            "{}\n\n[inline was requested, but {} chars is past the {} -char \
+                             ceiling that protects your context. The FULL result is in memory: \
+                             recall(\"{}\") — add offset/limit to page through the rest. \
+                             Nothing was lost.]",
+                            &result_content[..cut],
+                            result_content.len(),
+                            INLINE_CEILING,
+                            source_id
+                        )
+                    } else if wants_inline {
+                        // Even a fully inlined result carries its handle: it
+                        // IS in memory, and a result the model can read now but
+                        // cannot address later is only half-stored.
+                        if options.on_memory.is_some() {
+                            format!("{result_content}\n[memory:{source_id}]")
+                        } else {
+                            result_content
+                        }
+                    } else if options.on_memory.is_some() && result_content.len() <= threshold {
+                        // Small results stay readable inline — the point of the
+                        // threshold — but they are stored too, so the handle
+                        // goes with them. One short line buys the ability to
+                        // recall this exact result later instead of hoping a
+                        // similarity query rediscovers it.
+                        format!("{result_content}\n[memory:{source_id}]")
+                    } else if options.on_memory.is_some() && result_content.len() > threshold {
+                        let chunk_count =
+                            (result_content.len() / nanna_memory::MEMORY_CHUNK_MAX_CHARS).max(1);
+                        let digest = extractive_summary(&result_content);
+                        // The stub is a HANDLE, not a hint. It names the id
+                        // that `recall` resolves, so retrieval is addressed
+                        // rather than guessed — the whole point of keeping the
+                        // result out of context is that it can be fetched back
+                        // exactly, not searched for by remembering the right
+                        // words. Says SUCCEEDED and "nothing was lost" up
+                        // front: an unexplained stub reads as corruption and
+                        // sends models into recovery spirals.
+                        format!(
+                            "{digest}\n\n[SUMMARY ONLY — the above is the head and tail of a \
+                             {} -char result from '{}', which SUCCEEDED and was stored whole in \
+                             memory as {} chunk(s); nothing was lost. The middle is not shown \
+                             here. recall(\"{}\") returns the full text; add offset/limit to \
+                             page through it.]",
                             result_content.len(),
                             name,
-                            source_id,
                             chunk_count,
-                            name
+                            source_id
                         )
                     } else {
                         result_content
@@ -3154,6 +3254,7 @@ impl Agent {
         drop(ctx);
 
         let request = AnthropicRequest {
+            context_limit: None,
             model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: 512,
@@ -3446,6 +3547,7 @@ impl Agent {
         );
 
         let request = AnthropicRequest {
+            context_limit: None,
             model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: 1024,
@@ -3562,6 +3664,7 @@ impl Agent {
         .unwrap_or(u32::MAX);
 
         AnthropicRequest {
+            context_limit: None,
             model: self.config.model.clone(),
             messages,
             max_tokens,
@@ -3851,6 +3954,7 @@ impl Agent {
         info!(model = %model_name, "Running memory extraction");
 
         let request = AnthropicRequest {
+            context_limit: None,
             model: model_name,
             messages: vec![AnthropicMessage::user_text(extraction_prompt)],
             max_tokens: 1024,
@@ -4167,6 +4271,7 @@ impl RunState {
         };
 
         AgentResponse {
+            active_tools: self.active_tools.iter().cloned().collect(),
             text: self.final_text,
             tool_calls: self.tool_records,
             iterations: self.iterations,
@@ -4221,6 +4326,58 @@ fn semantic_chunk(text: &str, target_chars: usize, overlap_pct: f32) -> Vec<(usi
 }
 
 /// Find the largest byte index <= max_bytes that is a valid char boundary.
+/// A content-bearing digest of a large tool result: its head and its tail.
+///
+/// A stub that carries only metadata ("18 KB stored, here is a handle") tells
+/// the model nothing about WHETHER to spend a recall on it. Head-and-tail is
+/// the cheap, faithful choice for the shapes tools actually produce: the head
+/// carries what ran and how it started, the tail carries the verdict — the
+/// exit line, the error, the "42 passed". No model call, so it costs nothing
+/// per tool call, and it never claims to be the whole thing.
+///
+/// The middle is what gets dropped, and the caller says so explicitly.
+/// Tools whose output must NOT be written back to memory.
+///
+/// The only sanctioned exclusion from "memory holds everything". `recall` and
+/// `recall_messages` return memories, so storing their output would copy a
+/// memory into memory on every read — the store would grow by re-reading
+/// itself, and each copy would look like fresh corroboration to the similarity
+/// bands. `remember`, `reflect` and `day_dream` have already written their real
+/// entry; their tool result is just the receipt.
+///
+/// Matched on the canonical name AND the bare aliases, because the model
+/// reaches these by several names and an alias slipping through would
+/// reintroduce the duplication silently.
+fn is_memory_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "recall" | "recall_messages" | "remember" | "reflect" | "day_dream" | "memory"
+    )
+}
+
+fn extractive_summary(content: &str) -> String {
+    const HEAD: usize = 600;
+    const TAIL: usize = 400;
+
+    let trimmed = content.trim();
+    if trimmed.len() <= HEAD + TAIL {
+        return trimmed.to_string();
+    }
+
+    let head_end = truncate_boundary(trimmed, HEAD);
+    let mut tail_start = trimmed.len().saturating_sub(TAIL);
+    while tail_start < trimmed.len() && !trimmed.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start.saturating_sub(head_end);
+
+    format!(
+        "{}\n… [{omitted} chars omitted from the middle] …\n{}",
+        &trimmed[..head_end],
+        &trimmed[tail_start..]
+    )
+}
+
 fn truncate_boundary(s: &str, max_bytes: usize) -> usize {
     if s.len() <= max_bytes {
         return s.len();
@@ -4780,5 +4937,42 @@ mod tests {
         assert!(matches!(asm.content_blocks[0], ContentBlock::Text { .. }));
         assert!(matches!(asm.content_blocks[1], ContentBlock::ToolUse { .. }));
         assert_eq!(asm.text, "hello world");
+    }
+}
+
+#[cfg(test)]
+mod stub_summary_tests {
+    use super::extractive_summary;
+
+    #[test]
+    fn a_short_result_is_returned_whole() {
+        let s = "PASS: 3 tests";
+        assert_eq!(extractive_summary(s), s);
+    }
+
+    #[test]
+    fn a_long_result_keeps_the_head_and_the_verdict() {
+        // The tail is where tools put the answer — exit status, error, count.
+        let body = "x".repeat(20_000);
+        let content = format!("$ sh tests/test_22.sh\n{body}\nFAIL(test_22): mset should exit 0");
+        let summary = extractive_summary(&content);
+
+        assert!(summary.contains("$ sh tests/test_22.sh"), "head kept: {summary}");
+        assert!(
+            summary.contains("FAIL(test_22): mset should exit 0"),
+            "the verdict at the tail must survive: {summary}"
+        );
+        assert!(summary.contains("omitted from the middle"), "must admit what it dropped");
+        assert!(summary.len() < 2_000, "a digest must be small: {}", summary.len());
+    }
+
+    #[test]
+    fn multibyte_content_does_not_panic() {
+        // Slicing on a byte offset inside a char would panic; the boundaries
+        // are what make this safe on real tool output (paths, prose, emoji).
+        let content = format!("héllo → {}\n… ✓ done", "é".repeat(5_000));
+        let summary = extractive_summary(&content);
+        assert!(summary.contains("héllo"));
+        assert!(summary.contains("done"));
     }
 }

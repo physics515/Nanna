@@ -27,6 +27,17 @@ impl ControlPlane {
         }
     }
 
+    /// Tell every connected client the known-workspace set changed.
+    ///
+    /// Registration is global state; activation is not, so this deliberately
+    /// carries no active id — see [`Event::WorkspacesChanged`]. Fire-and-forget:
+    /// a send error only means nobody is subscribed.
+    fn notify_workspaces_changed(&self) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(Event::WorkspacesChanged);
+        }
+    }
+
     pub(super) async fn handle_workspace(&self, _client_id: &str, action: WorkspaceAction) -> Value {
         match action {
             WorkspaceAction::List => {
@@ -108,6 +119,7 @@ impl ControlPlane {
 
                 info!("Registered workspace: {} ({})", name, id);
                 self.save_workspaces().await;
+                self.notify_workspaces_changed();
                 json!({ "status": "opened", "id": id, "name": name })
             }
             WorkspaceAction::Close { id } => {
@@ -119,6 +131,7 @@ impl ControlPlane {
                     if let Some(ref storage) = self.storage {
                         let _ = storage.workspaces().delete(&id).await;
                     }
+                    self.notify_workspaces_changed();
                     json!({ "status": "closed", "id": id })
                 } else {
                     json!({ "error": "not_found", "id": id })

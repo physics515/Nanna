@@ -1656,6 +1656,26 @@ impl AgentService {
         active.contains_key(session_id)
     }
 
+    /// Is ANY run in flight, in any session?
+    ///
+    /// The scheduler's gate. A local model server hands out one generation
+    /// slot: when an autonomous heartbeat/cron prompt starts a second run
+    /// while a chat is mid-generation, llama.cpp time-shares the slot,
+    /// swaps prompt caches, and *cancels* the in-flight task — which reaches
+    /// the client as `Ollama stream ended without completion (no done=true)`
+    /// and burns the harness's transient-retry budget healing a fault Nanna
+    /// inflicted on herself (observed live 2026-07-26: a 30-minute heartbeat
+    /// killed a chat turn three times over, ending it thinking-only).
+    ///
+    /// Deliberately "is a run registered" rather than "how long since the
+    /// last activity stamp": [`nanna_memory::ActivityClock`] is stamped once
+    /// per *request*, so a multi-hour run's idle time grows the whole way
+    /// through it and an idle-threshold gate would swing open mid-run —
+    /// precisely when it must stay shut.
+    pub async fn any_run_active(&self) -> bool {
+        !self.active_chats.read().await.is_empty()
+    }
+
     /// Get a snapshot of the current run state for a session.
     /// Includes sync metadata (message_count, last_message_id) from SessionManager.
     /// `include_timeline: false` skips cloning the run journal — periodic

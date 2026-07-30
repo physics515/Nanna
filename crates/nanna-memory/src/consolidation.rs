@@ -145,15 +145,41 @@ pub struct ClusteringWeights {
     pub importance_proximity: f32,
     /// How much similar age matters (merge memories from the same era)
     pub age_proximity: f32,
+    /// The timescale the age term is measured against, in minutes: how long the
+    /// store being consolidated has been accumulating.
+    ///
+    /// "Close in time" is only meaningful relative to how much time there is. An
+    /// hour apart is most of the history of a workspace three hours old and a
+    /// rounding error in one six months old, so a fixed half-life is wrong for
+    /// every store except the one it was tuned on — the previous 30-day constant
+    /// scored every pair inside a working session at ~0.99, which is the same as
+    /// having no age term at all.
+    ///
+    /// Set per run from the observed span of the memories themselves. The
+    /// default is a placeholder for callers that never set it.
+    #[serde(default = "default_time_span_minutes")]
+    pub time_span_minutes: f32,
+}
+
+/// One day, for callers that never set an observed span.
+fn default_time_span_minutes() -> f32 {
+    1440.0
 }
 
 impl Default for ClusteringWeights {
     fn default() -> Self {
+        // Similarity and time carry 80% between them: those are the two axes a
+        // dream actually groups along — what is this about, and when did it
+        // happen. Access counts and importance are real signals but secondary,
+        // and at 0.20 each they were able to out-vote a weak topical match and
+        // pull unrelated memories into the same cluster simply because both had
+        // never been recalled.
         Self {
-            similarity: 0.45,
-            recall_affinity: 0.20,
-            importance_proximity: 0.20,
-            age_proximity: 0.15,
+            similarity: 0.50,
+            recall_affinity: 0.10,
+            importance_proximity: 0.10,
+            age_proximity: 0.30,
+            time_span_minutes: default_time_span_minutes(),
         }
     }
 }
@@ -215,28 +241,52 @@ impl CompressionLevel {
         }
     }
 
-    /// Get the summarization prompt for this compression level
+    /// Get the consolidation prompt for this compression level.
+    ///
+    /// Compression IS the goal — the result must be materially smaller than
+    /// the material it replaces, or the store never stops growing. What
+    /// changes here is HOW: not detail-stripping ("remove examples, keep the
+    /// main point"), which leaves a thinner transcript, but generalisation —
+    /// finding the throughline across fragments and stating the general shape
+    /// once instead of the instances many times. That is what makes the
+    /// output both shorter AND worth more than its inputs.
+    ///
+    /// The one hard rule is honesty about provenance: interpretation is
+    /// welcome, invented facts are not.
     #[must_use]
     pub fn summarization_prompt(&self) -> &'static str {
         match self {
             Self::Essence => {
-                "Compress this memory to its absolute essence - a single word or very short phrase \
-                that captures the core concept. Remove all detail, keep only the kernel of meaning."
+                "Distil these related memories to the single idea underneath them. Not a \
+                label — the insight. One short line that someone who lived through all of \
+                them would nod at."
             }
             Self::Compressed => {
-                "Summarize this memory concisely. Keep only the key facts and main point. \
-                Remove examples, elaboration, and secondary details. 1-2 sentences maximum."
+                "These memories are related. Write the short version of what was going on \
+                and what it added up to, in 2-3 sentences. Generalise across them rather \
+                than listing them: name the pattern, not every instance. Keep only the \
+                details that would change a future decision."
             }
             Self::Standard => {
-                "Lightly summarize this memory. Keep the main content but remove redundancy \
-                and unnecessary verbosity. Preserve important details."
+                "These memories belong together. Replace them with one shorter account that \
+                says what was going on and what it amounts to. Generalise: where several \
+                fragments are instances of the same pattern, state the pattern ONCE instead \
+                of repeating the instances — that is where the compression comes from. Keep \
+                the specifics that would change a future decision (names, paths, numbers, \
+                outcomes) and drop the ones that would not. Flag anything here that \
+                contradicts something else; a contradiction noticed is worth more than a \
+                smooth story. Interpret freely, never invent, and say when you are inferring. \
+                Your output MUST be substantially shorter than the material you were given."
             }
             Self::Detailed => {
                 "Keep this memory as-is. No compression needed."
             }
             Self::Expand => {
-                "This is an important memory. If there are implicit connections, context, \
-                or insights that could be made explicit, add them. Enrich but don't invent."
+                "This material matters, so spend words where they earn their keep: make the \
+                connections explicit — what caused what, what it resembles, what it predicts, \
+                what is still unresolved. Even here the result should be no longer than the \
+                material it replaces: buy the space by generalising the repetitive parts. \
+                Mark speculation as speculation. Never invent facts."
             }
         }
     }
@@ -368,10 +418,26 @@ pub fn composite_cluster_score(
     let imp_diff = (a.fsrs.importance - b.fsrs.importance).abs();
     let importance_prox = (1.0 - imp_diff / 5.0).max(0.0); // normalize: max diff ~5
 
-    // 4. Age proximity: memories from the same time period are more likely related.
-    //    Uses the gap between timestamps relative to the older memory's age.
-    let age_diff_days = (a.timestamp - b.timestamp).unsigned_abs() as f32 / 86400.0;
-    let age_prox = (-age_diff_days / 30.0).exp(); // half-life ~30 days
+    // 4. Age proximity, measured against how long this store has existed.
+    //
+    //    This was `exp(-days / 30)` — a fixed 30-day half-life — so every pair
+    //    inside one working session scored ~0.99 and the age term contributed
+    //    nothing to the decision. But no fixed timescale can be right: an hour
+    //    apart is most of the history of a workspace three hours old, and a
+    //    rounding error in one six months old. The same absolute gap has to mean
+    //    different things in the two stores.
+    //
+    //    So the gap is expressed as a FRACTION of the store's own lifetime.
+    //    Simultaneous memories score 1.0, memories at opposite ends of the
+    //    store's history score 0.0, and everything in between is linear — which
+    //    makes a young workspace discriminate at minute scale and a mature one
+    //    at week scale, with no tuning constant to go stale.
+    let age_diff_minutes = (a.timestamp - b.timestamp).unsigned_abs() as f32 / 60.0;
+    // A store with no span yet (one memory, or all written in the same second)
+    // has no time axis to judge on — treat everything as contemporaneous rather
+    // than dividing by zero.
+    let span = weights.time_span_minutes.max(1.0);
+    let age_prox = (1.0 - age_diff_minutes / span).clamp(0.0, 1.0);
 
     // Weighted sum
     let total_weight = weights.similarity + weights.recall_affinity
@@ -587,6 +653,11 @@ pub fn create_consolidated_entry(
     MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         content: consolidated_content,
+        // A consolidated memory inherits no bucket: it is NEW text, so its
+        // vector belongs to whichever model just embedded it. The daemon stamps
+        // the model on write; until then it is simply unlabelled.
+        embedding_model: None,
+        embeddings: HashMap::new(),
         embedding: new_embedding,
         metadata,
         timestamp: now(),
@@ -712,6 +783,8 @@ mod tests {
     fn test_composite_score_identical() {
         let weights = ClusteringWeights::default();
         let entry = MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: "1".into(),
             content: "test".into(),
             embedding: vec![1.0, 0.0, 0.0],
@@ -728,6 +801,8 @@ mod tests {
     fn test_composite_score_different() {
         let weights = ClusteringWeights::default();
         let a = MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: "1".into(),
             content: "A".into(),
             embedding: vec![1.0, 0.0, 0.0],
@@ -737,6 +812,8 @@ mod tests {
             workspace_id: None,
         };
         let b = MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: "2".into(),
             content: "B".into(),
             embedding: vec![0.0, 1.0, 0.0],
@@ -758,6 +835,8 @@ mod tests {
 
         let memories = vec![
             MemoryEntry {
+                embedding_model: None,
+                embeddings: HashMap::new(),
                 id: "1".into(),
                 content: "A".into(),
                 embedding: vec![1.0, 0.0, 0.0],
@@ -767,6 +846,8 @@ mod tests {
                 workspace_id: None,
             },
             MemoryEntry {
+                embedding_model: None,
+                embeddings: HashMap::new(),
                 id: "2".into(),
                 content: "B".into(),
                 embedding: vec![0.99, 0.1, 0.0],
@@ -776,6 +857,8 @@ mod tests {
                 workspace_id: None,
             },
             MemoryEntry {
+                embedding_model: None,
+                embeddings: HashMap::new(),
                 id: "3".into(),
                 content: "C".into(),
                 embedding: vec![0.0, 1.0, 0.0],
@@ -797,6 +880,8 @@ mod tests {
     /// embedding/importance/recall, adjacent timestamps → composite score ≈ 1).
     fn similar_entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: id.to_string(),
             content: content.to_string(),
             embedding: vec![1.0, 0.0, 0.0],
@@ -1033,6 +1118,8 @@ mod tests {
     fn test_cluster_prompt() {
         let memories = vec![
             MemoryEntry {
+                embedding_model: None,
+                embeddings: HashMap::new(),
                 id: "1".to_string(),
                 content: "The user prefers dark mode".to_string(),
                 embedding: vec![1.0, 0.0],
@@ -1042,6 +1129,8 @@ mod tests {
                 workspace_id: None,
             },
             MemoryEntry {
+                embedding_model: None,
+                embeddings: HashMap::new(),
                 id: "2".to_string(),
                 content: "User likes dark themes in apps".to_string(),
                 embedding: vec![0.95, 0.1],
@@ -1068,6 +1157,8 @@ mod tests {
             ..FsrsState::default()
         };
         MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: id.to_string(),
             content: format!("memory {id}"),
             embedding: vec![1.0, 0.0],

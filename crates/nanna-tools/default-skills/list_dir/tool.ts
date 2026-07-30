@@ -1,7 +1,7 @@
 export default {
   name: "list_dir",
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "List files and directories in a path. Supports recursive listing.",
   parameters: {
     type: "object",

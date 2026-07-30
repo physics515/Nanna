@@ -1,7 +1,8 @@
 export default {
   name: "analyze_image",
+  requires: ["vision.analyze"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Analyze an image using a vision model. Describe contents, answer questions, or extract information from images.",
   parameters: {
     type: "object",
