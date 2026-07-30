@@ -25,10 +25,18 @@ On Windows the canonical tree is under `%APPDATA%\nanna\nanna\` (config) and
 `clawd\Nanna` paths are migrated automatically on first launch of a build
 that includes the path unification.
 
-**Memory is opt-in.** Auto-remembering every user/assistant turn is controlled
-by `[memory] auto_remember_messages` and defaults to **`false`**. The agent can
-still write memories deliberately via the `remember` tool; automatic extraction
-of explicit memories during a run is gated by `[memory] enabled`.
+**Memory is on, and opt-out.** Nanna remembers by design: tool calls and their
+results are recorded as they happen, and every user/assistant turn is written to
+long-term memory too — controlled by `[memory] auto_remember_messages`, which
+defaults to **`true`**. A memory that only holds what someone thought to save
+is a notebook, not a memory, and dreaming (which consolidates and compresses the
+store) has nothing to work with if nothing lands.
+
+All of it stays on your machine — see *What can leave the machine* below.
+
+If you would rather your conversation not be persisted locally, set
+`[memory] auto_remember_messages = false`. That switch is real and stays: chat
+content is your own words, distinct from the agent's record of its own work.
 
 ## What can leave the machine
 
@@ -66,9 +74,10 @@ outbound calls beyond whatever you implicitly ask for (e.g. `web_fetch`).
 
 ## How to opt out of memory
 
-- Set `[memory] enabled = false` to disable the memory service entirely.
-- Set `[memory] auto_remember_messages = false` (the default) to keep
-  deliberate `remember` / extraction without hoovering every turn.
+- Set `[memory] enabled = false` to disable the memory service entirely — this
+  also stops tool results being stored.
+- Set `[memory] auto_remember_messages = false` (default: `true`) to keep the
+  agent's own working record while leaving your conversation turns unstored.
 - Use the GUI **Settings → Data → Delete All Memories**, or the `clear_memories`
   daemon action, to wipe the store.
 - Pause is “turn `enabled` off”; there is no separate pause flag.

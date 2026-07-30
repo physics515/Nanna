@@ -1,7 +1,8 @@
 export default {
   name: "read_pdf",
+  requires: ["pdf.read"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Extract text from a PDF file. Returns the text content of the document.",
   parameters: {
     type: "object",

@@ -423,12 +423,23 @@ pub struct MemoryConfig {
     /// dream cycle is allowed to run. Dreaming competes with the live agent for
     /// the summarizer model and rewrites the store mid-conversation, so it waits
     /// for a genuine lull. Default: 300 (5 min).
-    /// When true, every user/assistant turn (≥3 words) is written into long-term
-    /// memory automatically. **Default false** — memory accumulation is opt-in so
-    /// a first-run install does not silently hoover conversation content. The
-    /// agent can still `remember` deliberately via the tool, and extraction of
-    /// explicit memories during a run is controlled separately.
-    #[serde(default)]
+    /// When true, every user/assistant turn (≥3 words) is written into
+    /// long-term memory automatically. **Default true.**
+    ///
+    /// Remembering is what this system IS: a memory that only holds what
+    /// someone thought to save is a notebook, not a memory. Dreaming is the
+    /// counterweight — it consolidates and generalises so the store stays
+    /// useful rather than merely large — and it has nothing to work with if
+    /// conversation never lands. Defaulting this off left the store with 3
+    /// entries after a four-hour run (observed 2026-07-27), one of which was
+    /// stale enough to send a later run chasing a file that no longer existed.
+    ///
+    /// The switch REMAINS, and remains honest, because chat content is the
+    /// user's own words rather than the agent's working record: tool calls and
+    /// their results are captured unconditionally (that is the harness doing
+    /// its job), but a person who does not want their conversation persisted
+    /// locally can still say so. See PRIVACY.md.
+    #[serde(default = "default_auto_remember_messages")]
     pub auto_remember_messages: bool,
 
     #[serde(default = "default_dream_idle_threshold_secs")]
@@ -466,6 +477,9 @@ pub struct MemoryConfig {
 fn default_max_compression_ratio() -> f32 { 0.50 }
 fn default_min_remaining_memories() -> usize { 20 }
 fn default_dream_idle_threshold_secs() -> u64 { 300 }
+
+/// Remembering conversation is the default: see the field docs.
+const fn default_auto_remember_messages() -> bool { true }
 fn default_dream_memory_pressure_count() -> usize { 5000 }
 fn default_use_embedded_ocr() -> bool { true }
 
@@ -484,7 +498,7 @@ impl Default for MemoryConfig {
             ],
             max_compression_ratio: default_max_compression_ratio(),
             min_remaining_memories: default_min_remaining_memories(),
-            auto_remember_messages: false,
+            auto_remember_messages: default_auto_remember_messages(),
             dream_idle_threshold_secs: default_dream_idle_threshold_secs(),
             dream_memory_pressure_count: default_dream_memory_pressure_count(),
             ocr_model_priority: vec![],
@@ -905,10 +919,20 @@ mod tests {
     }
 
     #[test]
-    fn auto_remember_messages_defaults_off() {
-        assert!(!MemoryConfig::default().auto_remember_messages);
-        // serde default for missing field is also false
+    fn conversation_is_remembered_by_default() {
+        // A memory that only holds what someone thought to save is a notebook.
+        assert!(MemoryConfig::default().auto_remember_messages);
+        // A config that predates the field gets the same behaviour.
         let parsed: MemoryConfig = toml::from_str("").unwrap();
+        assert!(parsed.auto_remember_messages);
+    }
+
+    #[test]
+    fn opting_out_of_conversation_capture_is_still_honoured() {
+        // The switch stays real: chat content is the user's own words, and
+        // "on by default" must not quietly become "cannot be turned off".
+        let parsed: MemoryConfig =
+            toml::from_str("auto_remember_messages = false").unwrap();
         assert!(!parsed.auto_remember_messages);
     }
 

@@ -54,6 +54,14 @@ pub struct MemoryService {
     pending_updates: RwLock<Vec<(String, Rating)>>,
     /// Runtime-adjustable minimum score (overrides config)
     min_score_override: RwLock<Option<f32>>,
+    /// Identity (`provider:model`) of the embedding model currently in use.
+    ///
+    /// The service only ever sees an opaque `embed_fn`, so it cannot name the
+    /// model that produced a vector — but a bucket keyed by anything less than
+    /// model identity is unsound, because two models of equal width produce
+    /// vectors that compare happily and mean nothing. The daemon owns the
+    /// router and stamps the name here on every switch.
+    active_embedding_model: RwLock<Option<String>>,
     /// Runtime dimension — updated atomically when probe detects a change.
     /// This allows `probe_and_align_dimension` to work on `&self` (behind Arc).
     runtime_dimension: AtomicUsize,
@@ -74,6 +82,7 @@ impl MemoryService {
             embed_fn: None,
             pending_updates: RwLock::new(Vec::new()),
             min_score_override: RwLock::new(None),
+            active_embedding_model: RwLock::new(None),
             runtime_dimension: AtomicUsize::new(dim),
         }
     }
@@ -152,28 +161,27 @@ impl MemoryService {
         let expected_dim = self.runtime_dimension.load(Ordering::Relaxed);
         if actual_dim == expected_dim {
             info!("Embedding dimension confirmed: {}", actual_dim);
-            return Ok(actual_dim);
+        } else {
+            warn!(
+                "Embedding model returns {} dims, expected {}. Reconfiguring and re-embedding.",
+                actual_dim, expected_dim
+            );
+            self.runtime_dimension.store(actual_dim, Ordering::Relaxed);
+            // Also update the VectorStore's dimension so add() accepts the new size
+            self.store.set_dimension(actual_dim);
         }
 
-        warn!(
-            "Embedding model returns {} dims, expected {}. Reconfiguring and re-embedding.",
-            actual_dim, expected_dim
-        );
-        self.runtime_dimension.store(actual_dim, Ordering::Relaxed);
-        // Also update the VectorStore's dimension so add() accepts the new size
-        self.store.set_dimension(actual_dim);
-
-        // Re-embed all entries that have the wrong dimension.
-        // Clone the embed_fn Arc so we can pass it into the closure.
-        let embed_fn_clone = Arc::clone(embed_fn);
-        let re_embedded = self.store.re_embed_mismatched(actual_dim, |text| {
-            let ef = Arc::clone(&embed_fn_clone);
-            async move { (ef)(&text).await }
-        }).await;
-
-        if re_embedded > 0 {
-            info!("Re-embedded {} entries to {} dimensions", re_embedded, actual_dim);
-        }
+        // Vector repair is NOT done here any more — `rebind_embeddings` plus
+        // `backfill_embeddings` own it. This function's only remaining job is to
+        // keep the configured width honest.
+        //
+        // It used to re-embed every mismatched row inline, which stopped the
+        // world to duplicate work the backfill was already doing. And
+        // re-embedding is the wrong answer to a width change regardless: it
+        // DISCARDS the previous provider's vectors, so a provider that flaps
+        // away and back — precisely what a rate-limited primary does — paid two
+        // full passes over the store to end up where it started. Buckets make
+        // the return trip a lookup.
 
         Ok(actual_dim)
     }
@@ -189,6 +197,91 @@ impl MemoryService {
     #[must_use]
     pub fn fsrs_params(&self) -> &FsrsParameters {
         &self.config.fsrs
+    }
+
+    /// Switch the store onto `model`, reusing every bucket already computed for
+    /// it and reporting how many entries still need one.
+    ///
+    /// This replaces re-embedding on provider switch. Providers flap — a
+    /// rate-limited primary fails over and is back on the next call — and
+    /// re-embedding the whole store in each direction made a flap cost two full
+    /// passes over every memory. Buckets make the return trip free.
+    pub async fn rebind_embeddings(&self, model: &str) -> (usize, usize) {
+        self.set_active_embedding_model(Some(model.to_string())).await;
+        let (rebound, missing) = self.store.rebind_to_model(model).await;
+        if missing > 0 {
+            info!(
+                "Rebound {rebound} memories to '{model}'; {missing} awaiting backfill \
+                 (they are unsearchable until then, not lost)"
+            );
+        } else {
+            info!("Rebound {rebound} memories to '{model}' — nothing to backfill");
+        }
+        (rebound, missing)
+    }
+
+    /// Embed up to `batch` entries that have no vector for `model` yet.
+    ///
+    /// Lazy on purpose. A switch must not stall the agent behind a full re-embed
+    /// of the store, and on a rate-limited provider it could not finish anyway —
+    /// so the gap is filled in bounded passes, newest work first, while the run
+    /// continues. Returns how many were filled; zero means the store is complete
+    /// for this model.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding provider is configured.
+    pub async fn backfill_embeddings(&self, model: &str, batch: usize) -> Result<usize, MemoryError> {
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
+        let pending = self.store.entries_missing_model(model, batch).await;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let active = self.active_embedding_model().await.as_deref() == Some(model);
+        let mut filled = 0usize;
+        for (id, content) in pending {
+            // A provider switch mid-backfill makes the rest of this batch belong
+            // to the wrong model. Stop and let the next pass pick up the new one.
+            if self.active_embedding_model().await.as_deref() != Some(model) && active {
+                debug!("Backfill for '{model}' abandoned — provider changed underneath it");
+                break;
+            }
+            match (embed_fn)(&content).await {
+                Ok(embedding) => {
+                    if let Err(e) = self
+                        .store
+                        .set_embedding_for_model(&id, model, embedding, active)
+                        .await
+                    {
+                        debug!("Backfill could not store embedding for {id}: {e}");
+                    } else {
+                        filled += 1;
+                    }
+                }
+                Err(e) => {
+                    // The router already waited out congestion before returning
+                    // an error, so this provider is genuinely unavailable. Leave
+                    // the rest for the next pass.
+                    warn!("Backfill for '{model}' stopped after {filled}: {e}");
+                    break;
+                }
+            }
+        }
+        if filled > 0 {
+            info!("Backfilled {filled} embeddings for '{model}'");
+        }
+        Ok(filled)
+    }
+
+    /// Name the embedding model now in use, so writes are bucketed under it.
+    pub async fn set_active_embedding_model(&self, model: Option<String>) {
+        *self.active_embedding_model.write().await = model;
+    }
+
+    /// Identity of the embedding model currently in use, if the daemon has said.
+    pub async fn active_embedding_model(&self) -> Option<String> {
+        self.active_embedding_model.read().await.clone()
     }
 
     /// Get the minimum similarity score threshold for recall
@@ -275,9 +368,12 @@ impl MemoryService {
 
         // Create new memory
         let id = uuid::Uuid::new_v4().to_string();
+        let active_model = self.active_embedding_model().await;
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
+            embedding_model: active_model.clone(),
+            embeddings: embedding_buckets(active_model.as_deref(), &embedding),
             embedding,
             metadata,
             timestamp: chrono_timestamp(),
@@ -358,7 +454,16 @@ impl MemoryService {
         // Most embedding models have 8192 token context; ~4 chars/token ≈ 30k chars safe limit
         let content = if content.len() > 30_000 {
             warn!("Truncating oversized memory content ({} chars) to 30000", content.len());
-            &content[..30_000]
+            // `&content[..30_000]` panics unless 30_000 lands on a char boundary,
+            // and `len()` is BYTES while the message says "chars". Any memory
+            // whose 30_000th byte falls inside a multi-byte sequence took the
+            // process down — one box-drawing character in `tree` output, one
+            // emoji in a log line, one accented word. Walk back to a boundary.
+            let mut end = 30_000;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            &content[..end]
         } else {
             content
         };
@@ -400,20 +505,35 @@ impl MemoryService {
                         .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
                         .await?;
                     self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+                    // Same invariant as `remember_scoped`: an unabsorbed fold
+                    // means the content landed nowhere, so it must still become
+                    // a row. Only a provable superset may discard.
+                    //
+                    // This is the path taken whenever no workspace is active, so
+                    // leaving it on the old behaviour would have made whether a
+                    // memory survives depend on whether a workspace happened to
+                    // be selected — the same bug, hiding one branch over.
                     if folded {
                         info!(
                             "Merged (importance): {} (sim: {:.3})",
                             truncate(&existing.content, 30),
                             similarity
                         );
-                    } else {
+                        return Ok((existing.id.clone(), action));
+                    }
+                    if existing.content.trim().contains(content.trim()) {
                         info!(
-                            "Related memory exists: {} (sim: {:.3})",
+                            "Related memory exists (already present): {} (sim: {:.3})",
                             truncate(&existing.content, 30),
                             similarity
                         );
+                        return Ok((existing.id.clone(), action));
                     }
-                    return Ok((existing.id.clone(), action));
+                    debug!(
+                        "Fold declined (bound); storing separately (sim: {:.3})",
+                        similarity
+                    );
+                    // fall through to create
                 }
                 _ => {
                     // Novel content or skipped reinforcement — fall through to create
@@ -430,9 +550,12 @@ impl MemoryService {
         // Normalize importance from 1-5 scale to 0.5-1.5 multiplier
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
         
+        let active_model = self.active_embedding_model().await;
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
+            embedding_model: active_model.clone(),
+            embeddings: embedding_buckets(active_model.as_deref(), &embedding),
             embedding,
             metadata: metadata.clone(),
             timestamp: chrono_timestamp(),
@@ -470,49 +593,106 @@ impl MemoryService {
         if let Some((existing, similarity)) = results.first() {
             let action = IngestAction::from_similarity(*similarity);
             
-            match action {
-                IngestAction::Reinforce | IngestAction::Update => {
-                    // Don't reinforce error memories
-                    if existing.content.contains("Error:") || existing.content.contains("Command failed") {
-                        info!("Skipping reinforcement of error memory: {} (sim: {:.3})", truncate(&existing.content, 30), similarity);
-                    } else {
-                        // On the Update band, fold new information into the existing
-                        // (scoped) memory before reinforcing — dedup, not accrete.
-                        let folded = if action == IngestAction::Update {
-                            self.fold_into_memory(embed_fn, &existing.id, &existing.content, content)
-                                .await?
-                        } else {
-                            false
-                        };
-                        self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
-                        if folded {
-                            info!(
-                                "Merged (scoped): {} (sim: {:.3})",
-                                truncate(&existing.content, 30),
-                                similarity
-                            );
-                        } else {
-                            info!(
-                                "Reinforced (scoped): {} (sim: {:.3})",
-                                truncate(&existing.content, 30),
-                                similarity
-                            );
-                        }
-                        return Ok((existing.id.clone(), action));
-                    }
+            // A near neighbour is a reason to STRENGTHEN it, never on its own a
+            // reason to throw the new observation away.
+            //
+            // The old code returned here for both the Reinforce and Update
+            // bands, so the incoming content survived only if `fold_into_memory`
+            // happened to absorb it. Measured over one 2-hour run
+            // (2026-07-27): 1307 ingests reached these bands and 1028 of them
+            // were folds that returned `false` — content written nowhere, and
+            // logged as "Reinforced", indistinguishable from a real duplicate.
+            // That single early return is most of why 2314 memory-target tool
+            // calls produced 54 rows.
+            //
+            // The invariant now: content is dropped ONLY when it is provably
+            // already in the store. Everything else falls through and creates a
+            // row. Squeezing the store is dreaming's job — it can see the whole
+            // corpus and narrate across it; the write path sees one neighbour
+            // and cannot tell redundancy from recurrence.
+            // An ADDRESSABLE record always gets its own row.
+            //
+            // Episodic writes carry a `source_id`, and the agent has already
+            // been handed `[memory:{source_id}]` in its context as a promise it
+            // can dereference later. Folding such a write into a neighbour keeps
+            // the text but destroys the address: the merged row's metadata still
+            // names the OLD source_id, so `recall("{new}")` resolves to nothing
+            // and the model is told its own handle is dead — for the majority of
+            // tool calls, since repeated commands are exactly what lands in the
+            // fold bands.
+            //
+            // So the fold bands are skipped whenever a handle was issued. This
+            // also happens to be the honest reading of "memory holds
+            // everything": deduplication is dreaming's job, done later with the
+            // whole corpus in view, not the write path's guess from one
+            // neighbour.
+            let addressable = metadata.contains_key("source_id");
+
+            if addressable && matches!(action, IngestAction::Reinforce | IngestAction::Update) {
+                // Still a genuine hit: strengthen the neighbour. Just do not
+                // absorb the new record into it and orphan its handle.
+                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+            }
+
+            if !addressable && matches!(action, IngestAction::Reinforce | IngestAction::Update) {
+                // The neighbour was a genuine hit either way: rate it.
+                self.pending_updates.write().await.push((existing.id.clone(), Rating::Good));
+
+                // Provably redundant: the existing entry already contains this
+                // text verbatim. Only this case may discard.
+                if existing.content.trim().contains(content.trim()) {
+                    info!(
+                        "Reinforced (scoped, already present): {} (sim: {:.3})",
+                        truncate(&existing.content, 30),
+                        similarity
+                    );
+                    return Ok((existing.id.clone(), action));
                 }
-                IngestAction::Create => {}
+
+                // Otherwise try to fold it in. `fold_into_memory` returns true
+                // only when the merged text actually differs from what was
+                // there — i.e. the content landed somewhere.
+                if self
+                    .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
+                    .await?
+                {
+                    info!(
+                        "Merged (scoped): {} (sim: {:.3})",
+                        truncate(&existing.content, 30),
+                        similarity
+                    );
+                    return Ok((existing.id.clone(), action));
+                }
+
+                // Not absorbed — the merge would have breached the byte bound.
+                // Keep the observation as its own entry rather than losing it.
+                debug!(
+                    "Fold declined (bound); storing separately (sim: {:.3})",
+                    similarity
+                );
             }
         }
 
-        // Create new memory with workspace scope
-        let id = uuid::Uuid::new_v4().to_string();
+        // Create new memory with workspace scope.
+        //
+        // The row id CARRIES the handle when one was issued. `resolve_memory_handle`
+        // already falls back to `id.starts_with(handle)`, but with a bare fresh
+        // uuid that fallback could only ever fire by a 1-in-4-billion accident —
+        // and if it did fire it would return an unrelated memory, which is worse
+        // than failing. Prefixing makes it a guarantee.
+        let id = match metadata.get("source_id") {
+            Some(source_id) => format!("{source_id}-{}", uuid::Uuid::new_v4()),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         let mut fsrs = FsrsState::new();
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
 
+        let active_model = self.active_embedding_model().await;
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
+            embedding_model: active_model.clone(),
+            embeddings: embedding_buckets(active_model.as_deref(), &embedding),
             embedding,
             metadata,
             timestamp: chrono_timestamp(),
@@ -962,9 +1142,37 @@ impl MemoryService {
             return Ok(result);
         }
 
+        // Measure how long this store has actually been accumulating, and judge
+        // "close in time" against that rather than against a constant.
+        //
+        // Derived from the memories themselves rather than plumbed in from the
+        // workspace record: the observed span IS the store's lifetime for
+        // clustering purposes, it needs no new dependency, and it stays correct
+        // for a workspace that sat idle for a month or was seeded from an import.
+        let config = {
+            let mut config = config.clone();
+            let span_minutes = {
+                let all = self.store.all_entries().await;
+                match (
+                    all.iter().map(|e| e.timestamp).min(),
+                    all.iter().map(|e| e.timestamp).max(),
+                ) {
+                    (Some(first), Some(last)) => (last - first) as f32 / 60.0,
+                    _ => 0.0,
+                }
+            };
+            config.clustering_weights.time_span_minutes = span_minutes.max(1.0);
+            info!(
+                "Consolidation timescale: store spans {:.1} hours",
+                span_minutes / 60.0
+            );
+            config
+        };
+        let config = &config;
+
         // Get all memories grouped by weight
         let bands = self.get_consolidation_bands().await;
-        
+
         // Process each band
         let band_entries = [
             (CompressionLevel::Essence, bands.essence),
@@ -1001,11 +1209,32 @@ impl MemoryService {
                 continue;
             }
 
-            // Detailed level is never summarized — deduped above, never paraphrased.
-            if compression_level == CompressionLevel::Detailed {
-                result.memories_processed += memories.len();
-                continue;
-            }
+            // `Detailed` used to end here for EVERYTHING, and that is why a long
+            // run's memories were never narrated while the run was happening:
+            // freshness holds them at the top of the weight bands for hours, so
+            // dreaming only ever reached them once they had decayed — by which
+            // time the day they belonged to was over. The owner's model is the
+            // opposite. Dreaming is what finds the throughline through a day,
+            // while the day is still in progress.
+            //
+            // The drift argument still stands, but only for the memories it was
+            // ever about. Paraphrasing a durable fact ("the port is 5149")
+            // degrades it, and that is worth protecting at high weight. An
+            // episodic record — a tool result, a thought — is high-volume and
+            // individually cheap, and is exactly the material meant to be
+            // compressed into narrative. So at `Detailed`, episodes consolidate
+            // and durable facts are left alone.
+            let memories = if compression_level == CompressionLevel::Detailed {
+                let (episodic, durable): (Vec<_>, Vec<_>) =
+                    memories.into_iter().partition(is_episodic_memory);
+                result.memories_processed += durable.len();
+                if episodic.is_empty() {
+                    continue;
+                }
+                episodic
+            } else {
+                memories
+            };
 
             // Cluster using composite score (similarity + recall + importance + age)
             let clusters = cluster_memories(memories, config);
@@ -1060,14 +1289,29 @@ impl MemoryService {
             }
         }
 
+        // `deduped` belongs in the summary: it is the only line that REMOVES
+        // rows, and leaving it out made a cycle that deleted 13 memories read
+        // as "0 merged" — compression looked like a no-op while the store
+        // visibly shrank underneath it.
         info!(
-            "Consolidation complete: {} processed, {} clusters, {} merged, {} expanded, {} errors",
+            "Consolidation complete: {} processed, {} clusters, {} merged, {} deduped, \
+             {} expanded, {} errors",
             result.memories_processed,
             result.clusters_formed,
             result.memories_merged,
+            result.memories_deduped,
             result.memories_expanded,
             result.errors.len()
         );
+
+        // A COUNT of errors is not a report of them. One observed cycle logged
+        // "89 processed, 0 clusters, 0 merged, 0 expanded, 5 errors" — a total
+        // no-op with five unexplained failures, and the strings describing them
+        // were built, stored on the result, and then dropped on the floor. Say
+        // what actually broke.
+        for error in &result.errors {
+            warn!("Consolidation error: {error}");
+        }
 
         Ok(result)
     }
@@ -1444,8 +1688,26 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+/// The largest single observation the episodic writer can hand us: one semantic
+/// chunk plus its `[tool → target — outcome] ` header (the target is itself
+/// capped at 120 chars, so 192 covers the header whole).
+///
+/// Exported so the producer chunks against the same number the consumer bounds
+/// against. Them drifting apart IS the bug this documents.
+pub const MEMORY_OBSERVATION_MAX_CHARS: usize = MEMORY_CHUNK_MAX_CHARS + 192;
+
+/// Chunk size the episodic writer splits large tool results into.
+pub const MEMORY_CHUNK_MAX_CHARS: usize = 3200;
+
 /// Maximum byte length of merged memory content — bounds accretion across repeated merges.
-const MEMORY_MERGE_MAX_BYTES: usize = 4096;
+///
+/// Derived, not picked: a merged entry must hold four maximum-size observations,
+/// doubled so multi-byte UTF-8 cannot shrink that to three. The old value was a
+/// flat 4096 — *below a single observation* once any of it was non-ASCII — so a
+/// row saturated after roughly one merge and then silently refused every fold
+/// after it. Twelve rows in the 2026-07-27 run sat at 3895-4076 bytes; the
+/// `sh ./minidb help` family alone lost ~349 folds to that ceiling.
+const MEMORY_MERGE_MAX_BYTES: usize = MEMORY_OBSERVATION_MAX_CHARS * 4 * 2;
 
 /// Merge `incoming` content into `existing`, deduplicating and bounding length.
 ///
@@ -1484,6 +1746,28 @@ fn find_duplicate_target(survivors: &[MemoryEntry], candidate: &MemoryEntry) -> 
         similarity.is_finite()
             && IngestAction::from_similarity(similarity) == IngestAction::Reinforce
     })
+}
+
+/// An episodic record — something the agent DID or THOUGHT — as opposed to a
+/// durable fact it was told.
+///
+/// Episodes come from the tool and step capture paths, which stamp a
+/// `source_id` on tool results and a `kind` on assistant text and reasoning
+/// blocks. They arrive in volume, each one is individually cheap, and they are
+/// the material dreaming exists to narrate into a throughline. Durable facts
+/// are the ones drift protection is for, so the two are treated differently at
+/// high weight.
+#[must_use]
+fn embedding_buckets(model: Option<&str>, embedding: &[f32]) -> HashMap<String, Vec<f32>> {
+    let mut buckets = HashMap::new();
+    if let Some(model) = model {
+        buckets.insert(model.to_string(), embedding.to_vec());
+    }
+    buckets
+}
+
+fn is_episodic_memory(entry: &MemoryEntry) -> bool {
+    entry.metadata.contains_key("source_id") || entry.metadata.contains_key("kind")
 }
 
 fn merge_memory_content(existing: &str, incoming: &str) -> String {
@@ -1640,6 +1924,8 @@ mod tests {
         let service = MemoryService::new(config).with_embed_fn(embed);
 
         let mk = |id: &str| MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: id.to_string(),
             content: format!("memory {id}"),
             embedding: vec![1.0, 0.0, 0.0],
@@ -1699,6 +1985,8 @@ mod tests {
         let service = MemoryService::new(config).with_embed_fn(embed);
 
         let entry = MemoryEntry {
+            embedding_model: None,
+            embeddings: HashMap::new(),
             id: "m".to_string(),
             content: ORIGINAL.to_string(),
             embedding: vec![1.0, 0.0, 0.0],
@@ -1770,6 +2058,8 @@ mod tests {
         MemoryEntry {
             id: id.to_string(),
             content: content.to_string(),
+            embedding_model: None,
+            embeddings: HashMap::new(),
             embedding,
             metadata: HashMap::new(),
             timestamp: 0,

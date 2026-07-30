@@ -718,6 +718,34 @@ impl MemoryRepository {
         Ok(result > 0)
     }
 
+    /// Update the embedding (and the model that produced it) for a memory.
+    ///
+    /// The save path is insert-then-update-on-conflict, and the update branch
+    /// wrote only content and FSRS — so an embedding computed for an EXISTING
+    /// row never reached disk. Every backfill after an embedding-model change
+    /// therefore ran again on the next boot: 739 rows re-embedded on each
+    /// restart, forever, with the log cheerfully reporting success each time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the statement fails.
+    pub async fn update_embedding(
+        &self,
+        memory_id: &str,
+        embedding: &[f32],
+        embedding_model: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let conn = self.conn.lock().await;
+        let result = conn
+            .execute(
+                "UPDATE memories SET embedding = ?1, embedding_model = ?2,                  updated_at = datetime('now') WHERE memory_id = ?3",
+                turso::params![bytes, embedding_model, memory_id],
+            )
+            .await?;
+        Ok(result > 0)
+    }
+
     /// Delete multiple memories by their `memory_id`s, destroying their embeddings
     /// on disk (see [`Self::delete`] for why a plain `DELETE` leaks them).
     ///

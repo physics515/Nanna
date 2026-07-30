@@ -1,20 +1,46 @@
 export default {
   name: "recall",
+  requires: ["memory.search", "memory.get"],
   version: "0.1.0",
-  description: "Search long-term memory for relevant information. Returns memories ranked by relevance to the query.",
+  description: "Read long-term memory. Two modes: pass a HANDLE (the id printed in a [memory:xxxxxxxx ...] stub) to fetch that exact stored result back, with optional offset/limit to page through a large one; or pass a search query to find memories ranked by relevance. Tool results too large for context are stored whole and replaced by a handle stub — this is how you get the full text back.",
   output: "context",
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", description: "Search query to find relevant memories" },
-      limit: { type: "integer", description: "Maximum number of results. Default: 5" }
+      query: { type: "string", description: "A handle from a [memory:xxxxxxxx] stub, or search terms" },
+      limit: { type: "integer", description: "Search: max results (default 5). Handle: max characters to return (default 4000)" },
+      offset: { type: "integer", description: "Handle mode only: start reading at this character offset" }
     },
     required: ["query"]
   },
   execute: function(input) {
     var query = input.query || input.search || input.text;
     if (!query) {
-      return "No query provided. Usage: recall({query: \"search terms\"})";
+      return "No query provided. Usage: recall({query: \"search terms\"}) or recall({query: \"<handle>\"})";
+    }
+
+    // Handle mode: a stub's id is an address, so resolve it exactly rather
+    // than hoping similarity search rediscovers the same text. Only bare
+    // id-shaped tokens qualify, so ordinary questions still search.
+    var looksLikeHandle = /^[0-9a-fA-F][0-9a-fA-F-]{5,}$/.test(query.trim());
+    if (looksLikeHandle) {
+      try {
+        var got = Nanna.service("memory.get", {
+          id: query.trim(),
+          offset: input.offset || 0,
+          limit: input.limit || 4000
+        });
+        if (got && got.content) {
+          var more = got.truncated
+            ? "\n\n[" + got.returned + " of " + got.total + " chars shown. Continue with recall({query: \"" +
+              query.trim() + "\", offset: " + (got.offset + got.returned) + "})]"
+            : "";
+          return got.content + more;
+        }
+      } catch (e) {
+        // Not a stored handle after all — fall through to search, which is
+        // the more useful answer for a token that merely looked like an id.
+      }
     }
     var results;
     try {

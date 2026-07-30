@@ -22,6 +22,94 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Watches a token stream for a wedged runner emitting one token forever.
+///
+/// Observed live 2026-07-27: thinking blocks of `"00000000000000…"` filling
+/// the GUI, and stream aborts landing on an identical 4306-byte / 31-line
+/// shape 46 times in one night — the same fault seen from two directions.
+/// Each occurrence cost a step's worth of GPU time and produced nothing.
+///
+/// Bounds, both derived from what real generation looks like rather than
+/// picked for feel:
+/// - Only fragments of **≤ 4 characters** are candidates. A sampler that
+///   wedges repeats a single token; a legitimately repeated long fragment is
+///   content, not a fault.
+/// - **40** consecutive identical fragments trips it. Real text repeats a
+///   short token a handful of times (indentation runs, `...`, a rule of
+///   dashes); it does not do so forty times without variation, while a
+///   wedged runner reaches forty almost immediately.
+#[derive(Debug, Default)]
+struct RepeatWatch {
+    last: Option<String>,
+    run: usize,
+}
+
+impl RepeatWatch {
+    /// Trip point, measured against the failure it exists to catch rather
+    /// than chosen for feel: the observed degenerate streams die at **31**
+    /// NDJSON lines (~30 emitted fragments), so a bound of 40 could never
+    /// fire — it was set by reasoning about legitimate text alone, and the
+    /// evidence for the real number was already in the logs. 20 sits below
+    /// the failure and far above ordinary repetition, which cannot reach it
+    /// because any non-candidate fragment resets the run.
+    const MAX_RUN: usize = 20;
+    const MAX_FRAGMENT_CHARS: usize = 4;
+
+    /// Record a fragment; returns the run length once it is degenerate.
+    fn observe(&mut self, fragment: &str) -> Option<usize> {
+        if fragment.trim().is_empty() || fragment.chars().count() > Self::MAX_FRAGMENT_CHARS {
+            // Not a candidate: any real content resets the watch, so a burst
+            // of indentation followed by prose never accumulates.
+            self.last = None;
+            self.run = 0;
+            return None;
+        }
+        if self.last.as_deref() == Some(fragment) {
+            self.run += 1;
+        } else {
+            self.last = Some(fragment.to_string());
+            self.run = 1;
+        }
+        (self.run >= Self::MAX_RUN).then_some(self.run)
+    }
+}
+
+/// The single generation slot a local Ollama server hands out, as a permit.
+///
+/// llama.cpp serves one generation at a time per slot. A second concurrent
+/// request does **not** queue politely behind the first: the server re-selects
+/// the slot, swaps prompt caches (`found better prompt` / `updating prompt
+/// cache`) and *cancels* the running task (`srv stop: cancel task`). The
+/// victim's HTTP stream then just ends — no `done: true` — which this client
+/// can only report as a provider incident, so the harness burns retry budget
+/// healing damage the daemon did to itself. Observed live 2026-07-26: a
+/// scheduled heartbeat killed a chat turn's generation three times running,
+/// each time ~4.3 KB / 31 NDJSON lines in.
+///
+/// One permit per base URL, so two genuinely separate servers keep separate
+/// slots and a single server is never asked to interleave. Waiting is the
+/// correct behaviour here — the alternative is not "more throughput" but two
+/// mutually-cancelling generations.
+///
+/// Scope: chat/completion generations only. Embeddings hit a different
+/// endpoint and are left alone.
+fn ollama_generation_slot(base_url: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let slots = SLOTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A poisoned lock carries no invalid state here (the map is only ever
+    // inserted into), so recover rather than propagate a panic into the
+    // request path.
+    let mut guard = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .entry(base_url.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
 #[derive(Error, Debug, Clone)]
 pub enum LlmError {
     #[error("HTTP error: {0}")]
@@ -39,6 +127,35 @@ pub enum LlmError {
         message: String,
         /// Seconds until rate limit resets (if available)
         retry_after: Option<u64>,
+    },
+    /// A local runner stuck emitting one token forever, caught by
+    /// [`RepeatWatch`].
+    ///
+    /// Structured rather than folded into [`LlmError::Api`] because the retry
+    /// ladder has to tell "this is the same wedge I just hit" from "one
+    /// unlucky generation", and that decision reads the token and the abort
+    /// length. Those were only ever present as prose inside the message, so
+    /// the caller's choice depended on re-parsing an error string — a
+    /// contract nothing enforced and any rewording would have broken.
+    ///
+    /// The rendered form is byte-identical to the 502 this used to be
+    /// (`from_api_response(502, …)`). That is load-bearing, not cosmetic:
+    /// `is_transient_llm_error` keys off `"API error: 5"` and
+    /// `wedged_runner_error` off `"same token"`, on both the harness and the
+    /// chat path. A variant that read differently would drop the wedge out of
+    /// the transient class and hard-fail the step instead of retrying it.
+    #[error(
+        "API error: 502 - Ollama emitted the same token {run}x in a row ({token:?}) — \
+         a wedged runner, not a generation. Aborted after {bytes_received} bytes so \
+         the step can be retried instead of waiting out the loop."
+    )]
+    WedgedRunner {
+        /// The fragment the decoder was stuck on.
+        token: String,
+        /// Consecutive repeats observed when the watch tripped.
+        run: usize,
+        /// Stream bytes received before the abort.
+        bytes_received: usize,
     },
     #[error("All fallback models exhausted")]
     AllModelsExhausted,
@@ -387,6 +504,11 @@ impl LlmError {
                 let msg_lower = message.to_lowercase();
                 msg_lower.contains("rate limit") || msg_lower.contains("rate_limit")
             }
+            // A wedged runner used to arrive as Api{status:502} and so fell
+            // into the 502 arm above. It is still exactly that fault — keep it
+            // falling back, or splitting the variant out would silently stop
+            // the router trying another model.
+            LlmError::WedgedRunner { .. } => true,
             // Network errors - might be transient
             LlmError::Http(_) => true,
             // Don't fallback on auth errors, JSON errors, etc.
@@ -406,12 +528,57 @@ impl LlmError {
         LlmError::Api { status, message }
     }
 
-    /// Try to parse retry-after seconds from error message
-    fn parse_retry_after(_message: &str) -> Option<u64> {
-        // Anthropic includes "try again later" but not specific timing
-        // Some APIs include "retry-after: X" in headers or body
-        // For now, return None - we can enhance this later
-        None
+    /// Try to parse retry-after seconds from an error message.
+    ///
+    /// Providers say when they will be ready and we were throwing it away —
+    /// OpenRouter's 429 body carries `"X-RateLimit-Reset":"1785222060000"`, a
+    /// millisecond epoch, and every caller was backing off on a guessed
+    /// schedule instead. Reading it turns "wait a made-up interval and hope"
+    /// into "wait exactly as long as they asked".
+    ///
+    /// Returns `None` when nothing usable is present, which keeps the caller's
+    /// own backoff as the fallback.
+    fn parse_retry_after(message: &str) -> Option<u64> {
+        /// A reset further out than this is a misread, not a real wait.
+        const MAX_PLAUSIBLE_WAIT_SECS: u64 = 3_600;
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+
+        // `X-RateLimit-Reset` — epoch, in seconds or milliseconds depending on
+        // the provider. Disambiguated by magnitude rather than by trusting
+        // either convention.
+        let from_reset = message
+            .split("X-RateLimit-Reset")
+            .nth(1)
+            .and_then(|rest| {
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u64>().ok()
+            })
+            .map(|reset| if reset > 100_000_000_000 { reset / 1000 } else { reset })
+            .and_then(|reset_secs| reset_secs.checked_sub(now_secs));
+
+        // `retry-after: N` / `"retry_after": N` — plain seconds.
+        let from_retry_after = ["retry-after", "retry_after"].iter().find_map(|key| {
+            let rest = message.to_lowercase();
+            let idx = rest.find(key)?;
+            let digits: String = rest[idx + key.len()..]
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u64>().ok()
+        });
+
+        from_reset
+            .or(from_retry_after)
+            .filter(|secs| *secs > 0 && *secs <= MAX_PLAUSIBLE_WAIT_SECS)
     }
 }
 
@@ -682,6 +849,17 @@ pub struct AnthropicRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
     pub max_tokens: u32,
+    /// Context window to ask the local runner for (Ollama `num_ctx`).
+    ///
+    /// Not part of the Anthropic wire format — skipped on serialization — but
+    /// it has to ride with the request because only the caller knows how much
+    /// context this model can be given on THIS machine. A 12B model's KV cache
+    /// at 32k does not fit beside its weights on a 16 GB card already lending
+    /// 5 GB to the desktop, and the overrun arrives as
+    /// `CUDA error: an illegal memory access was encountered` rather than a
+    /// clean allocation failure.
+    #[serde(skip_serializing, default)]
+    pub context_limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -941,6 +1119,354 @@ impl LlmClient {
     /// faults while the server logged a client cancel of an actively
     /// decoding task); a fresh connection per request costs sub-millisecond
     /// on loopback.
+/// Gemma's reserved stop sentinels: `<unused0>` through `<unused98>`.
+///
+/// These are the model's own end-of-turn markers. Ollama's chat template is
+/// meant to consume them; when it does not, they arrive as ordinary assistant
+/// content immediately before the stream closes without a `done=true` message.
+/// Recognising one lets the client close the turn cleanly instead of treating a
+/// finished reply as an aborted generation.
+///
+/// Deliberately exact: the whole delta must be the sentinel. A reply that merely
+/// mentions `<unused50>` in prose is text, not a stop.
+/// The text before a trailing Gemma stop sentinel, if there is one.
+///
+/// Returns `None` when the content does not end in a sentinel, so callers can
+/// pass ordinary text through untouched.
+fn strip_trailing_stop_sentinel(content: &str) -> Option<&str> {
+    let trimmed = content.trim_end();
+    let open = trimmed.rfind("<unused")?;
+    if !trimmed.ends_with('>') {
+        return None;
+    }
+    let digits = &trimmed[open + "<unused".len()..trimmed.len() - 1];
+    if digits.is_empty() || digits.len() > 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(&content[..open])
+}
+
+fn is_gemma_stop_sentinel(content: &str) -> bool {
+    let trimmed = content.trim();
+    let Some(digits) = trimmed
+        .strip_prefix("<unused")
+        .and_then(|rest| rest.strip_suffix('>'))
+    else {
+        return false;
+    };
+    !digits.is_empty() && digits.len() <= 2 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+    /// The `num_ctx` to ask Ollama for on THIS request.
+    ///
+    /// Every Ollama call site must go through here. The streaming and
+    /// non-streaming builders are separate code paths that both talk to the
+    /// same runner on the same GPU, and a sizing rule applied to only one of
+    /// them is not a rule — it is a coin flip decided by which path the caller
+    /// happened to take. (Observed: the first cut of this landed on the
+    /// non-streaming builder alone, while the agent loop streams exclusively,
+    /// so it would have had no effect on the thing it was written to fix.)
+    ///
+    /// Source order: what the caller explicitly asked for, then the live
+    /// measurement, then the env override, then a safe constant.
+    fn resolve_num_ctx(request: &AnthropicRequest) -> u32 {
+        if let Some(explicit) = request.context_limit {
+            return explicit;
+        }
+        if let Some(latched) = Self::latched_num_ctx(&request.model) {
+            return latched;
+        }
+        // Explicit beats computed. `NANNA_OLLAMA_NUM_CTX` is set by someone who
+        // measured THIS machine with THIS model; `fit_context_to_free_vram` has
+        // only inferred a size from free bytes. Having the heuristic win was a
+        // silent override of a deliberate setting, and it was expensive: the
+        // same model on the same mission scored 31/42 at the operator's 16384
+        // and 8/42 once the heuristic promoted it to 32768. Fitting in VRAM is
+        // necessary, not sufficient — a 9B model given twice the window does
+        // not use it well, it loses the thread and rewrites work it had passing.
+        //
+        // Nothing here makes an oversized model unrunnable: a value that really
+        // is too large still fails once and gets walked down by
+        // `demote_context`, which is the mechanism that belongs on this.
+        let sized = Self::env_num_ctx()
+            .or_else(|| Self::fit_context_to_free_vram(&request.model))
+            .unwrap_or(16_384);
+        Self::latch_num_ctx(&request.model, sized);
+        sized
+    }
+
+    /// The operator's explicit context size, if they set one.
+    fn env_num_ctx() -> Option<u32> {
+        std::env::var("NANNA_OLLAMA_NUM_CTX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v >= 2048)
+    }
+
+    fn ctx_latch() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+        static LATCH: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, u32>>,
+        > = std::sync::OnceLock::new();
+        LATCH.get_or_init(Default::default)
+    }
+
+    /// The latch is keyed on the bare model name. The request carries
+    /// `gemma4:12b` while callers hold the routed `ollama/gemma4:12b`, and two
+    /// spellings of one model means the demotion writes an entry the request
+    /// path never reads — a self-correcting loop that silently corrects
+    /// nothing.
+    fn ctx_latch_key(model: &str) -> String {
+        model.strip_prefix("ollama/").unwrap_or(model).to_string()
+    }
+
+    fn latched_num_ctx(model: &str) -> Option<u32> {
+        Self::ctx_latch()
+            .lock()
+            .ok()?
+            .get(&Self::ctx_latch_key(model))
+            .copied()
+    }
+
+    fn latch_num_ctx(model: &str, ctx: u32) {
+        if let Ok(mut g) = Self::ctx_latch().lock() {
+            g.insert(Self::ctx_latch_key(model), ctx);
+        }
+    }
+
+    /// Drop `model` to the next smaller context bucket after the runner failed
+    /// in a way that means it ran out of GPU memory. Returns the new size, or
+    /// `None` if it is already at the floor.
+    ///
+    /// This is the half of the sizing loop that measurement cannot supply.
+    /// Sizing happens on the FIRST request, which is structurally the most
+    /// optimistic moment there is — the desktop compositor has not grown, the
+    /// embedder has not loaded, and this model's own weights are not yet
+    /// resident. Re-measuring on later turns does not fix it: by then free VRAM
+    /// is dominated by our own allocation, and acting on it would change
+    /// `num_ctx`, which makes Ollama evict and reload the model, which frees
+    /// the memory that justified the change. The only signal that is both late
+    /// enough to be honest and unambiguous is the failure itself.
+    pub fn demote_context(model: &str) -> Option<u32> {
+        const BUCKETS: [u32; 4] = [32_768, 16_384, 8_192, 4_096];
+        let key = Self::ctx_latch_key(model);
+        let mut guard = Self::ctx_latch().lock().ok()?;
+        let current = guard.get(&key).copied().unwrap_or(BUCKETS[0]);
+        let next = BUCKETS.iter().copied().find(|b| *b < current)?;
+        guard.insert(key, next);
+        tracing::warn!(
+            model,
+            from = current,
+            to = next,
+            "GPU memory failure — dropping context a bucket and retrying"
+        );
+        Some(next)
+    }
+
+    /// Largest context that fits in the VRAM free *right now*, or `None` when
+    /// the GPU cannot be queried (no NVIDIA tooling, or a non-CUDA backend) —
+    /// in which case the caller falls back to a fixed size.
+    ///
+    /// Deliberately empirical. The analytic route needs the model's
+    /// sliding-window interleave and KV quantisation to be known, and getting
+    /// those wrong is worse than measuring: for gemma4:12b the naive formula
+    /// predicts 1.5 MB/token and the truth is ~10 KB/token, a 150x error. Two
+    /// numbers we can actually read — free VRAM and the model's file size —
+    /// plus a reserve for the prefill compute buffer, give a bound that adapts
+    /// to whatever else is on the card.
+    fn fit_context_to_free_vram(model: &str) -> Option<u32> {
+        let free_bytes = Self::nvidia_free_vram_bytes()? as f64;
+        let weights_bytes = Self::ollama_model_size_bytes(model)? as f64;
+        let (ours_resident, others_resident) = Self::ollama_resident_vram(model);
+        Some(Self::fit_context_for_budget(
+            free_bytes,
+            weights_bytes,
+            ours_resident as f64,
+            others_resident as f64,
+        ))
+    }
+
+    /// VRAM currently held by `model` and, separately, by every OTHER model the
+    /// runner has resident — the embedder, chiefly.
+    ///
+    /// Both halves matter and they pull in opposite directions, so they are
+    /// measured rather than assumed. Guessing the second one at 2.5 GB (a
+    /// plausible embedder size) against an actual 0.32 GB was enough on its own
+    /// to drive the budget negative and pin the context at the 4096 floor.
+    fn ollama_resident_vram(model: &str) -> (u64, u64) {
+        let name = model.strip_prefix("ollama/").unwrap_or(model);
+        let Ok(out) = std::process::Command::new("curl")
+            .args(["-s", "http://127.0.0.1:11434/api/ps"])
+            .output()
+        else {
+            return (0, 0);
+        };
+        let body = String::from_utf8_lossy(&out.stdout);
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) else {
+            return (0, 0);
+        };
+        let Some(models) = parsed.get("models").and_then(serde_json::Value::as_array) else {
+            return (0, 0);
+        };
+        let (mut ours, mut others) = (0u64, 0u64);
+        for m in models {
+            let vram = m
+                .get("size_vram")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if m.get("name").and_then(serde_json::Value::as_str) == Some(name) {
+                ours += vram;
+            } else {
+                others += vram;
+            }
+        }
+        (ours, others)
+    }
+
+    /// The arithmetic of [`Self::fit_context_to_free_vram`], split out from the
+    /// measurements so it can be tested against the runs we actually observed
+    /// rather than only against itself.
+    fn fit_context_for_budget(
+        free_bytes: f64,
+        weights_bytes: f64,
+        ours_resident: f64,
+        others_resident: f64,
+    ) -> u32 {
+        /// Per-context-token VRAM cost: KV cache plus the attention scratch the
+        /// prefill graph allocates.
+        ///
+        /// Measured, not derived, and the derivation is the reason. gemma4:12b
+        /// reports `sliding_window = 1024` with `key_length_swa = 256`, so most
+        /// of its 48 layers attend over a fixed 1024-token window and their KV
+        /// does NOT grow with `n_ctx` at all — only the few full-attention
+        /// layers do. Without knowing the exact interleave (Ollama does not
+        /// report it) any closed form is a guess, and the naive one is off by
+        /// 150x. So: KV measured directly at 10.5 KB/token
+        /// ((8.4 GB - 8.1 GB) / (32768 - 4096)), plus ~32 KB/token for the
+        /// full-attention scratch (`n_ubatch 512 x n_head 16 x 4 bytes`).
+        ///
+        /// Reading high is the safe direction — it costs context, not a run.
+        const BYTES_PER_CTX_TOKEN: f64 = 43_000.0;
+        /// Floor on what to set aside for an embedder that has not loaded yet.
+        /// It arrives on the first `remember` and stays co-resident for the
+        /// rest of the run, so budgeting as though it will never come is how a
+        /// run that measured fine at minute one dies at minute ten.
+        const EMBEDDER_RESERVE: f64 = 1.0 * 1024.0 * 1024.0 * 1024.0;
+        /// Driver allocations, fragmentation, the fixed part of the compute
+        /// graph, and the desktop's own growth after we measure.
+        ///
+        /// That last term is the reason this is not smaller. Sizing runs on the
+        /// first request, which is the emptiest the card will be all run: the
+        /// GUI's webview alone was measured taking a further 0.8 GB in the
+        /// minute after the daemon came up. Budgeting against that instant
+        /// without slack is how the first request picks a size the tenth
+        /// request cannot honour.
+        const SLACK: f64 = 1.2 * 1024.0 * 1024.0 * 1024.0;
+        /// Below this a run is not worth starting; above it, diminishing
+        /// returns for an agent whose steps rarely exceed a few thousand
+        /// tokens.
+        const MIN_CTX: u32 = 4_096;
+        const MAX_CTX: u32 = 32_768;
+
+        // Add back what THIS model already holds before subtracting what it
+        // costs, so the answer does not depend on whether it happens to be
+        // loaded yet.
+        //
+        // Without this the function contradicts itself: before the load it sees
+        // a free card and picks a large context; after the load the same card
+        // looks 8 GB poorer, it picks the 4096 floor, and because Ollama keys a
+        // resident instance on its options, that new number evicts and reloads
+        // the model — which frees the memory that justified shrinking, so the
+        // next turn picks large again. Measured live: this path pinned
+        // gemma4:12b to 4096 on a card with 10.4 GB genuinely available.
+        let effective_free = free_bytes + ours_resident;
+        let reserve = others_resident.max(EMBEDDER_RESERVE) + SLACK;
+        let usable = effective_free - weights_bytes - reserve;
+        if usable <= 0.0 {
+            return MIN_CTX;
+        }
+        let raw = (usable / BYTES_PER_CTX_TOKEN) as u64;
+
+        // Snap DOWN to a power-of-two bucket.
+        //
+        // Not cosmetic: Ollama keys a loaded model instance partly on its
+        // options, so a changed `num_ctx` evicts and reloads the model — tens
+        // of seconds of stall and a VRAM churn, mid-run. "Every turn" has to
+        // mean the value is *rechecked* every turn, not that it is free to
+        // wander: free VRAM drifting by a few hundred MB as the desktop
+        // breathes must not reload a 7.5 GB model. Buckets make the answer
+        // stable across ordinary drift while still moving when something real
+        // changes (a game starts, the embedder loads).
+        const BUCKETS: [u32; 4] = [32_768, 16_384, 8_192, 4_096];
+        let fitted = BUCKETS
+            .iter()
+            .copied()
+            .find(|b| u64::from(*b) <= raw)
+            .unwrap_or(MIN_CTX);
+        fitted.clamp(MIN_CTX, MAX_CTX)
+    }
+
+    /// Free VRAM in bytes, via `nvidia-smi`. `None` on any non-NVIDIA or
+    /// tooling-absent system, which is a normal answer, not an error.
+    fn nvidia_free_vram_bytes() -> Option<u64> {
+        let out = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let mib: u64 = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(mib * 1024 * 1024)
+    }
+
+    /// On-disk size of an Ollama model, a good proxy for its resident weights.
+    ///
+    /// Cached per model name for the life of the process: free VRAM is the
+    /// term that has to be live, but a model's file size cannot change while
+    /// we are mid-run against it, and this runs on every single request.
+    fn ollama_model_size_bytes(model: &str) -> Option<u64> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        let name = model.strip_prefix("ollama/").unwrap_or(model).to_string();
+
+        if let Ok(guard) = cache.lock() {
+            if let Some(hit) = guard.get(&name) {
+                return *hit;
+            }
+        }
+
+        let looked_up = (|| {
+            let out = std::process::Command::new("curl")
+                .args(["-s", "http://127.0.0.1:11434/api/tags"])
+                .output()
+                .ok()?;
+            let body = String::from_utf8_lossy(&out.stdout);
+            let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
+            parsed
+                .get("models")?
+                .as_array()?
+                .iter()
+                .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+                .and_then(|m| m.get("size"))
+                .and_then(serde_json::Value::as_u64)
+        })();
+
+        // A miss is cached too. If the model is not in `/api/tags` it will not
+        // appear later either, and retrying a failed lookup on every request
+        // would spawn a process per turn to learn the same thing.
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(name, looked_up);
+        }
+        looked_up
+    }
+
     fn build_ollama_http_client() -> Client {
         Client::builder()
             .read_timeout(std::time::Duration::from_secs(120))
@@ -1586,9 +2112,50 @@ impl LlmClient {
         // (unlimited) let a degraded runner emit degenerate tokens without
         // end; the caller's max_tokens already accounts for thinking room.
         options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
-        // Request 32K context so the agent has room for system prompt + conversation.
-        // Ollama models default to small contexts (e.g. 8K) even if they support more.
-        options.insert("num_ctx".to_string(), serde_json::json!(32768));
+        // Context size the CALLER asked for, falling back to 32K.
+        //
+        // This was hardcoded to 32768 for every Ollama model, which ignores the
+        // `context_limit` the request already carries and, worse, ignores what
+        // the GPU can actually hold. A 12B model's KV cache at 32k does not fit
+        // beside its own 8.4 GB of weights on a 16 GB card that is already
+        // giving 5 GB to the desktop — and the failure mode is not a clean
+        // out-of-memory error, it is `CUDA error: an illegal memory access was
+        // encountered` mid-generation, which surfaces here as a truncated
+        // stream. Observed live 2026-07-28: gemma4:12b died this way three
+        // times in three minutes while qwen3.5:9b (6.7 GB) never once did.
+        //
+        // Honouring the request means a model that does not fit at 32k can be
+        // run at a size that does, instead of being unrunnable.
+        //
+        // Source order: what the caller asked for, then `NANNA_OLLAMA_NUM_CTX`,
+        // then 32k. The env override exists because the right value is a
+        // property of THIS MACHINE — how much VRAM is left once the model's
+        // weights and the desktop have taken theirs — and nothing inside the
+        // agent knows that. A per-model config field is the proper home for it;
+        // until then this is the knob that makes an oversized model runnable
+        // instead of unrunnable.
+        // Size the context to the GPU as it is RIGHT NOW, every turn.
+        //
+        // A constant cannot be right here. 32k was unrunnable for a 12B model on
+        // a 16 GB card sharing with the desktop; 16k would be leaving most of a
+        // 24 GB card unused; and the amount of VRAM the desktop holds changes
+        // when the user opens a browser or closes a game. The only honest input
+        // is free memory measured at the moment of the request.
+        //
+        // What actually runs out is NOT the KV cache — measured on gemma4:12b,
+        // that is ~10 KB/token, so even 32k costs under 0.4 GB. It is the
+        // prefill compute buffer, which scales with how much prompt is pushed
+        // through at once, and which overruns as
+        // `CUDA error: an illegal memory access was encountered` rather than a
+        // clean allocation failure. So the budget reserves a fraction of free
+        // VRAM for it instead of spending everything on cache.
+        let num_ctx = Self::resolve_num_ctx(request);
+        tracing::info!(
+            model = %request.model,
+            num_ctx,
+            "sized ollama context to free VRAM"
+        );
+        options.insert("num_ctx".to_string(), serde_json::json!(num_ctx));
         // qwen3.5's Modelfile ships presence_penalty=1.5 (Qwen's thinking-mode
         // anti-repetition default). Code REQUIRES repetition, and at 1.5 the
         // model visibly degraded working multi-function files into semicolon
@@ -1662,6 +2229,7 @@ impl LlmClient {
             .collect();
 
         let anthropic_request = AnthropicRequest {
+            context_limit: None,
             model: request.model.clone(),
             messages,
             max_tokens: request.max_tokens.unwrap_or(4096),
@@ -1807,6 +2375,11 @@ impl LlmClient {
             stream: false,
             options,
         };
+
+        // Same single-slot discipline as the streaming path: a non-streaming
+        // completion still occupies the server's one generation slot, and
+        // firing it into a live stream cancels that stream.
+        let _slot = ollama_generation_slot(&self.base_url).acquire_owned().await;
 
         let response = self.apply_ollama_auth(self
             .http
@@ -3129,6 +3702,12 @@ impl LlmClient {
         let request = request.clone();
 
         stream! {
+            // Hold the server's single generation slot for the WHOLE stream.
+            // The permit lives as long as this generator, so it is released
+            // when the stream finishes, errors, or is dropped mid-flight.
+            // Acquire before building the body: the wait is the point.
+            let _slot = ollama_generation_slot(&base_url).acquire_owned().await;
+
             let (messages_json, tools_json) = anthropic_to_ollama_request(&request);
 
             let mut body = serde_json::json!({
@@ -3150,8 +3729,20 @@ impl LlmClient {
             // (unlimited) let a degraded runner emit degenerate tokens without
             // end; the caller's max_tokens already accounts for thinking room.
             options.insert("num_predict".to_string(), serde_json::json!(request.max_tokens));
-            // Request 32K context (Ollama models default to small contexts).
-            options.insert("num_ctx".to_string(), serde_json::json!(32768));
+            // Size the context to the GPU as it is RIGHT NOW, every turn — see
+            // `resolve_num_ctx`. This is the path the agent loop takes, so a
+            // constant here is the one that actually decides whether a run
+            // survives: 32k was unrunnable for a 12B model on a 16 GB card
+            // sharing with the desktop, and it failed as
+            // `CUDA error: an illegal memory access was encountered` rather
+            // than as a clean allocation failure.
+            let num_ctx = Self::resolve_num_ctx(&request);
+            tracing::info!(
+                model = %request.model,
+                num_ctx,
+                "sized ollama context to free VRAM (stream)"
+            );
+            options.insert("num_ctx".to_string(), serde_json::json!(num_ctx));
             // qwen3.5's Modelfile ships presence_penalty=1.5 (Qwen's thinking-
             // mode anti-repetition default). Code REQUIRES repetition, and at
             // 1.5 the model visibly degraded working multi-function files into
@@ -3203,11 +3794,15 @@ impl LlmClient {
             let mut bytes_received = 0usize;
             let mut lines_parsed = 0usize;
             let mut thinking_block_started = false;
+            let mut saw_stop_sentinel = false;
             let mut text_block_started = false;
             let mut tool_block_count = 0usize;
             // Ollama thinking uses block index 0 (same as Anthropic);
             // text starts at index 1 when thinking is present, or 0 otherwise.
             let mut next_block_index = 0usize;
+            // Degenerate-repetition watch (see RepeatWatch).
+            let mut repeat_watch = RepeatWatch::default();
+            let mut last_line: Option<String> = None;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -3240,6 +3835,11 @@ impl LlmClient {
                         continue;
                     };
                     lines_parsed += 1;
+                    // Keep the last line so an abort can show what the model
+                    // was actually emitting when the body stopped. Without it
+                    // a truncation is indistinguishable from a wedged decoder,
+                    // which is exactly the ambiguity that has cost two runs.
+                    last_line = Some(line.clone());
 
                     // Check for done
                     let done = obj["done"].as_bool().unwrap_or(false);
@@ -3247,6 +3847,24 @@ impl LlmClient {
                     // Stream thinking content (qwen3 and other thinking models)
                     // Ollama returns thinking tokens in message.thinking.
                     // Emit proper ContentBlockStart/Stop to match Anthropic's block structure.
+                    // Cut a wedged runner short instead of waiting out its loop.
+                    if let Some(frag) = obj["message"]["thinking"]
+                        .as_str()
+                        .or_else(|| obj["message"]["content"].as_str())
+                    {
+                        if let Some(run) = repeat_watch.observe(frag) {
+                            if thinking_block_started || text_block_started {
+                                yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                            }
+                            yield Err(LlmError::WedgedRunner {
+                                token: frag.to_string(),
+                                run,
+                                bytes_received,
+                            });
+                            return;
+                        }
+                    }
+
                     if let Some(thinking) = obj["message"]["thinking"].as_str() {
                         if !thinking.is_empty() {
                             if !thinking_block_started {
@@ -3265,6 +3883,31 @@ impl LlmClient {
                     // Stream text content.
                     // When text starts arriving and thinking was active, close the thinking block first.
                     if let Some(content) = obj["message"]["content"].as_str() {
+                        // Gemma's reserved sentinels (`<unused0>`..`<unused98>`)
+                        // are stop markers the chat template is supposed to
+                        // consume. Ollama passes them through as ordinary
+                        // content and then simply stops the stream, with no
+                        // done=true — so the terminator we need arrives
+                        // disguised as text. Note it, drop it from the visible
+                        // output, and let the end-of-stream handler close the
+                        // turn cleanly instead of reporting an aborted
+                        // generation. Observed live 2026-07-28: 57 such 502s in
+                        // one gemma4:12b run, each discarding a complete reply.
+                        let content = if Self::is_gemma_stop_sentinel(content) {
+                            saw_stop_sentinel = true;
+                            tracing::info!("ollama: model stop sentinel seen (exact)");
+                            ""
+                        } else if let Some(prefix) = Self::strip_trailing_stop_sentinel(content) {
+                            // The sentinel can also arrive glued to the end of
+                            // real text ("...all tests pass.<unused50>"), where
+                            // an exact-match test never fires. Keep the words,
+                            // drop the marker, remember that the turn ended.
+                            saw_stop_sentinel = true;
+                            tracing::info!("ollama: model stop sentinel seen (trailing)");
+                            prefix
+                        } else {
+                            content
+                        };
                         if !content.is_empty() {
                             // Close thinking block when transitioning to text
                             if thinking_block_started {
@@ -3369,6 +4012,48 @@ impl LlmClient {
                 }
             }
 
+            // A final NDJSON object that arrived without its trailing newline
+            // would otherwise sit in `buffer` unparsed and be reported as an
+            // aborted generation. Cheap to honour, and it can only ever turn
+            // a false 502 into the success it actually was.
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(buffer.trim()) {
+                if obj["done"].as_bool().unwrap_or(false) {
+                    if thinking_block_started || text_block_started {
+                        yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                    }
+                    let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
+                    yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                    return;
+                }
+            }
+
+            // A sentinel-terminated stream is a COMPLETE turn.
+            //
+            // The check below exists for genuinely aborted generations, and it
+            // must stay — a degraded runner streams degenerate tokens and drops
+            // the connection, and delivering that as a successful reply is how
+            // garbage reached the GUI. But gemma ends its turn by EMITTING a
+            // reserved `<unusedNN>` token and then closing, which is a normal
+            // stop wearing an abort's clothing. The content before it is a
+            // finished reply; discarding it cost one run 57 complete responses
+            // and ultimately the whole benchmark.
+            if saw_stop_sentinel {
+                if thinking_block_started {
+                    yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                }
+                if text_block_started {
+                    yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
+                }
+                let stop_reason = if tool_block_count > 0 { "tool_use" } else { "end_turn" };
+                tracing::info!(
+                    bytes_received,
+                    lines_parsed,
+                    "ollama stream closed on a model stop sentinel rather than done=true"
+                );
+                yield Ok(StreamEvent::MessageStop { stop_reason: stop_reason.to_string() });
+                return;
+            }
+
             // The stream ended with no done=true terminator: an ABORTED
             // generation. A degraded Ollama runner streams degenerate tokens
             // and drops the stream with no final message (observed live) —
@@ -3381,11 +4066,31 @@ impl LlmClient {
             if text_block_started {
                 yield Ok(StreamEvent::ContentBlockStop { index: next_block_index });
             }
+            // Say what was left unparsed. A bare byte/line count cannot
+            // distinguish "the provider hung up mid-token" from "we dropped a
+            // terminator", and 68 of these in one night taught us nothing
+            // about which. A bounded tail of the residual buffer makes the
+            // next occurrence self-diagnosing.
+            let tail_note = match &last_line {
+                Some(line) => {
+                    let shown: String = line.chars().take(200).collect();
+                    format!(" Last line before the cut: {shown}")
+                }
+                None => " No NDJSON line was ever parsed.".to_string(),
+            };
+            let residue = buffer.trim();
+            let residue_note = if residue.is_empty() {
+                format!("nothing was left unparsed (the stream simply stopped).{tail_note}")
+            } else {
+                let tail: String = residue.chars().rev().take(160).collect::<Vec<_>>()
+                    .into_iter().rev().collect();
+                format!("{} unparsed bytes remained, ending: {tail}", residue.len())
+            };
             yield Err(LlmError::from_api_response(
                 502,
                 format!(
                     "Ollama stream ended without completion (no done=true) after \
-                     {bytes_received} bytes / {lines_parsed} NDJSON lines"
+                     {bytes_received} bytes / {lines_parsed} NDJSON lines — {residue_note}"
                 ),
             ));
         }
@@ -3730,6 +4435,7 @@ impl LlmClient {
                     };
 
                     let anthropic_request = AnthropicRequest {
+                        context_limit: None,
                         model: request.model.clone(),
                         messages: all_messages,
                         max_tokens: request.max_tokens.unwrap_or(4096),
@@ -3819,6 +4525,7 @@ impl LlmClient {
                     };
 
                     let anthropic_request = AnthropicRequest {
+                        context_limit: None,
                         model: request.model.clone(),
                         messages: all_messages,
                         max_tokens: request.max_tokens.unwrap_or(4096),
@@ -4275,6 +4982,272 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    // -----------------------------------------------------------------
+    // Context sizing
+    // -----------------------------------------------------------------
+
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    /// The two runs we actually have evidence from, on the same 16 GB card
+    /// with ~11.8 GB free at rest:
+    ///
+    ///   qwen3.5:9b  (6.59 GB) ran 4h30m clean at 32768.
+    ///   gemma4:12b  (7.56 GB) died at 32768 with
+    ///               `CUDA error: an illegal memory access was encountered`,
+    ///               three times in three minutes.
+    ///
+    /// A sizing rule that hands 32768 to both is the rule we already know is
+    /// broken, so it is the thing worth pinning: the ~1 GB of extra weights
+    /// has to be enough to move gemma down a bucket.
+    /// Measured on the bench machine 2026-07-28: 16 GB card, ~5.1 GB held by
+    /// the desktop and the GUI's webview, leaving ~10.45 GB actually available
+    /// to the runner.
+    const FREE_UNLOADED: f64 = 10.45 * GB;
+    const EMBEDDER_VRAM: f64 = 0.32 * GB;
+
+    #[test]
+    fn sizing_separates_the_model_that_ran_from_the_one_that_crashed() {
+        let qwen =
+            LlmClient::fit_context_for_budget(FREE_UNLOADED, 6.59 * GB, 0.0, EMBEDDER_VRAM);
+        let gemma =
+            LlmClient::fit_context_for_budget(FREE_UNLOADED, 7.56 * GB, 0.0, EMBEDDER_VRAM);
+
+        assert_eq!(qwen, 32_768, "qwen3.5:9b demonstrably ran 4h30m at 32k");
+        assert!(
+            gemma < 32_768,
+            "gemma4:12b crashed at 32k three times; sizing must not return it, got {gemma}"
+        );
+        assert!(
+            gemma >= 16_384,
+            "gemma still needs a workable window, got {gemma}"
+        );
+    }
+
+    /// The bug this function shipped with once: sizing changed the moment the
+    /// model finished loading, and since Ollama keys a resident instance on its
+    /// options, that change evicts and reloads it — which restores the memory
+    /// that justified the change.
+    #[test]
+    fn sizing_does_not_change_when_the_model_finishes_loading() {
+        let weights = 7.56 * GB;
+        let before =
+            LlmClient::fit_context_for_budget(FREE_UNLOADED, weights, 0.0, EMBEDDER_VRAM);
+        // Once resident it holds weights + KV, and free VRAM drops by that much.
+        let held = 8.06 * GB;
+        let after = LlmClient::fit_context_for_budget(
+            FREE_UNLOADED - held,
+            weights,
+            held,
+            EMBEDDER_VRAM,
+        );
+        assert_eq!(
+            before, after,
+            "loading the model must not resize its own context"
+        );
+    }
+
+    #[test]
+    fn sizes_are_always_buckets() {
+        for free in [2.0, 6.0, 9.0, 10.45, 14.0, 40.0] {
+            let got =
+                LlmClient::fit_context_for_budget(free * GB, 7.56 * GB, 0.0, EMBEDDER_VRAM);
+            assert!(
+                [4_096, 8_192, 16_384, 32_768].contains(&got),
+                "free={free}GB gave a non-bucket size {got}"
+            );
+        }
+    }
+
+    /// Stability across turns comes from the latch, not from bucketing — a
+    /// budget that lands near a bucket edge WILL cross it on ordinary drift.
+    /// Since a changed `num_ctx` makes Ollama evict and reload the model, the
+    /// size has to be decided once and then only ever walked down deliberately.
+    #[test]
+    fn a_latched_size_survives_re_measurement_and_only_walks_down() {
+        let model = "test-latch-model:1b";
+        LlmClient::latch_num_ctx(model, 32_768);
+        assert_eq!(LlmClient::latched_num_ctx(model), Some(32_768));
+
+        // Demotion steps one bucket at a time...
+        assert_eq!(LlmClient::demote_context(model), Some(16_384));
+        assert_eq!(LlmClient::demote_context(model), Some(8_192));
+        assert_eq!(LlmClient::demote_context(model), Some(4_096));
+        // ...and stops at the floor rather than shrinking to nothing.
+        assert_eq!(LlmClient::demote_context(model), None);
+        assert_eq!(LlmClient::latched_num_ctx(model), Some(4_096));
+    }
+
+    /// The routed name and the request name are different spellings of one
+    /// model; if they key different latch entries, demotion corrects nothing.
+    #[test]
+    fn the_latch_ignores_the_provider_prefix() {
+        LlmClient::latch_num_ctx("ollama/test-prefix-model:1b", 16_384);
+        assert_eq!(
+            LlmClient::latched_num_ctx("test-prefix-model:1b"),
+            Some(16_384),
+            "demotion keyed on the routed name must reach the request path"
+        );
+        assert_eq!(
+            LlmClient::demote_context("ollama/test-prefix-model:1b"),
+            Some(8_192)
+        );
+        assert_eq!(LlmClient::latched_num_ctx("test-prefix-model:1b"), Some(8_192));
+    }
+
+    /// The regression this guards: the VRAM heuristic used to run FIRST and the
+    /// env var was only consulted when measuring failed, so an operator's
+    /// deliberate 16384 was silently promoted to a computed 32768. Same model,
+    /// same mission, 31/42 became 8/42.
+    ///
+    /// Serialised against `an_absent_or_junk_override_falls_through_to_sizing`
+    /// because the environment is process-global.
+    #[test]
+    fn an_explicit_override_beats_the_vram_heuristic() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: edition 2024 requires this; the lock above keeps the two
+        // env-touching tests from overlapping, and nothing else reads this key.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "16384") };
+
+        let mut request = request_with_tool_history(serde_json::json!({}));
+        request.model = "test-env-precedence:1b".to_string();
+        request.context_limit = None;
+
+        assert_eq!(
+            LlmClient::resolve_num_ctx(&request),
+            16_384,
+            "an explicit override must win over whatever the card measures"
+        );
+
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+    }
+
+    /// ...but the override must not become a silent floor of its own: absent or
+    /// unusable values fall through to sizing rather than to a wrong constant.
+    #[test]
+    fn an_absent_or_junk_override_falls_through_to_sizing() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+        assert_eq!(LlmClient::env_num_ctx(), None);
+
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "not-a-number") };
+        assert_eq!(LlmClient::env_num_ctx(), None, "garbage must not be honoured");
+
+        // Too small to hold a system prompt plus one tool round.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "512") };
+        assert_eq!(LlmClient::env_num_ctx(), None, "an unusable size is not a setting");
+
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(Default::default)
+    }
+
+    /// A big co-resident model is real pressure and must actually shrink the
+    /// window, unlike the assumed-constant it replaced.
+    #[test]
+    fn a_large_co_resident_model_shrinks_the_window() {
+        let tight =
+            LlmClient::fit_context_for_budget(FREE_UNLOADED, 7.56 * GB, 0.0, 2.5 * GB);
+        assert!(tight < 16_384, "2.5 GB of neighbour must cost context, got {tight}");
+    }
+
+    #[test]
+    fn a_card_with_nothing_left_still_returns_a_runnable_floor() {
+        assert_eq!(
+            LlmClient::fit_context_for_budget(4.0 * GB, 7.56 * GB, 0.0, 0.0),
+            4_096
+        );
+        assert_eq!(LlmClient::fit_context_for_budget(0.0, 0.0, 0.0, 0.0), 4_096);
+    }
+
+    // -----------------------------------------------------------------
+    // Degenerate-repetition watch
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_wedged_runner_is_caught() {
+        // The live shape: the same one-character token forever.
+        let mut w = RepeatWatch::default();
+        let mut tripped_at = None;
+        for i in 1..=60 {
+            if let Some(run) = w.observe("0") {
+                tripped_at = Some((i, run));
+                break;
+            }
+        }
+        let (i, run) = tripped_at.expect("a stuck token must be caught");
+        assert_eq!(i, RepeatWatch::MAX_RUN, "must trip exactly at the bound");
+        assert_eq!(run, RepeatWatch::MAX_RUN);
+    }
+
+    #[test]
+    fn ordinary_repetition_is_left_alone() {
+        // Indentation and ellipses repeat legitimately -- just not 40x.
+        let mut w = RepeatWatch::default();
+        for _ in 0..(RepeatWatch::MAX_RUN - 1) {
+            assert!(w.observe("  ").is_none(), "whitespace is not a candidate");
+        }
+        // Real content RESETS the run, so separated bursts never accumulate
+        // into a false positive — this is what keeps the guard off normal
+        // output that happens to repeat a short token in places. Counts are
+        // expressed against the bound so lowering it can't silently make
+        // this test vacuous (it did exactly that at 40 → 20).
+        let burst = RepeatWatch::MAX_RUN - 1;
+        let mut w2 = RepeatWatch::default();
+        for _ in 0..burst {
+            assert!(w2.observe(".").is_none());
+        }
+        assert!(w2.observe(" and then some prose").is_none());
+        for _ in 0..burst {
+            assert!(
+                w2.observe(".").is_none(),
+                "the run must restart after intervening content"
+            );
+        }
+    }
+
+    /// The wedge carries its own fingerprint, and still renders as the 502 it
+    /// used to be.
+    ///
+    /// Both halves are contracts. The fields exist so the daemon's retry
+    /// ladder can compare one wedge against the next without parsing prose;
+    /// the rendered text is what `is_transient_llm_error` ("API error: 5") and
+    /// `wedged_runner_error` ("same token") match on, so a reword here would
+    /// stop wedges being retried at all.
+    #[test]
+    fn a_wedge_carries_structure_and_keeps_its_rendered_form() {
+        let err = LlmError::WedgedRunner {
+            token: "0".to_string(),
+            run: RepeatWatch::MAX_RUN,
+            bytes_received: 2780,
+        };
+        let LlmError::WedgedRunner { token, run, bytes_received } = &err else {
+            panic!("must stay a distinct variant the caller can match on");
+        };
+        assert_eq!((token.as_str(), *run, *bytes_received), ("0", 20, 2780));
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("API error: 5"), "must stay transient: {rendered}");
+        assert!(rendered.contains("same token"), "must stay a wedge: {rendered}");
+        assert!(rendered.contains("2780 bytes"), "must still say where it gave up: {rendered}");
+        // And it must keep taking the 502 fallback path it took as an Api error.
+        assert!(err.should_fallback());
+    }
+
+    #[test]
+    fn a_repeated_long_fragment_is_content_not_a_fault() {
+        let mut w = RepeatWatch::default();
+        for _ in 0..200 {
+            assert!(
+                w.observe("SELECT * FROM t;").is_none(),
+                "long repeated fragments are legitimate output"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -4309,6 +5282,7 @@ mod tests {
             stream: None,
             thinking: None,
             cache_control: None,
+            context_limit: None,
         }
     }
 
@@ -4651,5 +5625,59 @@ mod tests {
             tiny.conversation_history_budget(10_000, 10_000, 5_000),
             tiny.hard_input_limit()
         );
+    }
+}
+
+#[cfg(test)]
+mod gemma_sentinel_tests {
+    use super::LlmClient;
+
+    /// The exact payload that cost a benchmark run: gemma4:12b emitted
+    /// `<unused50>` as assistant content and Ollama closed the stream with no
+    /// `done=true`, 57 times, each discarding a complete reply.
+    #[test]
+    fn recognises_gemma_stop_sentinels() {
+        for sentinel in ["<unused50>", "<unused0>", "<unused98>", " <unused7> "] {
+            assert!(
+                LlmClient::is_gemma_stop_sentinel(sentinel),
+                "must recognise {sentinel} as a stop marker"
+            );
+        }
+    }
+
+    /// The sentinel glued to the end of real text — the form an exact-match
+    /// test silently misses, which is why the first version of this fix did
+    /// not stop the 502s.
+    #[test]
+    fn strips_a_trailing_sentinel_and_keeps_the_words() {
+        assert_eq!(
+            LlmClient::strip_trailing_stop_sentinel("all tests pass.<unused50>"),
+            Some("all tests pass.")
+        );
+        assert_eq!(LlmClient::strip_trailing_stop_sentinel("<unused7>"), Some(""));
+        assert_eq!(LlmClient::strip_trailing_stop_sentinel("no marker here"), None);
+        assert_eq!(LlmClient::strip_trailing_stop_sentinel("<unused50> leads"), None);
+        assert_eq!(LlmClient::strip_trailing_stop_sentinel("<unusedfoo>"), None);
+    }
+
+    /// Must stay exact. A reply that DISCUSSES the token is prose, and
+    /// swallowing it would silently truncate the model's answer — the same
+    /// class of bug as the 502, pointing the other way.
+    #[test]
+    fn leaves_ordinary_text_alone() {
+        for text in [
+            "<unused50> is a reserved token",
+            "the answer is 42",
+            "<unusedfoo>",
+            "<unused>",
+            "<unused123>",
+            "",
+            "<think>",
+        ] {
+            assert!(
+                !LlmClient::is_gemma_stop_sentinel(text),
+                "must NOT treat {text:?} as a stop marker"
+            );
+        }
     }
 }

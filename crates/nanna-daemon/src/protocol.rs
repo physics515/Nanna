@@ -668,6 +668,16 @@ pub enum Event {
         delta: String,
     },
 
+    /// The harness moved on to a plan item. Run mechanics for a status row,
+    /// never message content — see `TimelineItem::Step`.
+    StepStarted {
+        session_id: String,
+        /// `working` | `planning` | `verifying`
+        kind: String,
+        label: String,
+        item_id: i64,
+    },
+
     // Tool events
     ToolStart {
         session_id: String,
@@ -705,6 +715,18 @@ pub enum Event {
         id: String,
         name: String,
     },
+
+    /// The set of known workspaces changed — one was registered or removed.
+    ///
+    /// Carries no payload and says nothing about which workspace is active.
+    /// Activation is a per-client view concern: several clients may sit in
+    /// different workspaces at once, and pushing an active id would yank one
+    /// client's view because another opened something. Clients re-fetch the
+    /// list and leave their own selection alone.
+    ///
+    /// Without this a workspace registered after a client connected stayed
+    /// invisible to it until restart.
+    WorkspacesChanged,
 
     // Memory events
     MemoryCreated {

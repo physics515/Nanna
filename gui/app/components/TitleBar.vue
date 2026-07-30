@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, inject, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Bell } from 'lucide-vue-next'
 import { useGroundGlass } from '~/composables/useGroundGlass'
@@ -126,15 +127,26 @@ function manageWorkspaces() {
   navigateTo('/workspaces')
 }
 
+// The daemon owns workspace registration, so anything registered while this
+// window is open — by a script, a harness, or another client — must show up
+// without a restart. Refreshing the list only; the current tab is this
+// client's own view and is never reassigned from a remote event.
+let unlistenWorkspaces: UnlistenFn | null = null
+
 onMounted(async () => {
   appWindow = getCurrentWindow()
   maximized.value = await appWindow.isMaximized()
   document.addEventListener('click', closeDropdown)
+  unlistenWorkspaces = await listen('workspaces-changed', () => {
+    void loadWorkspaces()
+  })
+  void loadWorkspaces()
   setTimeout(() => { ready.value = true }, 200)
 })
 
 onUnmounted(() => {
   document.removeEventListener('click', closeDropdown)
+  unlistenWorkspaces?.()
 })
 
 async function minimize() {

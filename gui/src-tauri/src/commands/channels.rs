@@ -93,6 +93,11 @@ pub async fn save_channel_config(
                 phone_number_id: config.get("phone_number_id").cloned(),
                 access_token: config.get("access_token").cloned(),
                 verify_token: config.get("verify_token").cloned(),
+                // HMAC key for `X-Hub-Signature-256` on inbound webhook POSTs.
+                // Threaded through rather than defaulted to None: leaving it
+                // unset here would let the GUI silently save a Cloud API
+                // channel whose webhook accepts unauthenticated posts.
+                app_secret: config.get("app_secret").cloned(),
                 session_name: config.get("session_name").cloned(),
                 allowed_contacts,
             });

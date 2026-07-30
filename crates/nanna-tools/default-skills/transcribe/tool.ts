@@ -1,7 +1,8 @@
 export default {
   name: "transcribe",
+  requires: ["audio.transcribe"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Transcribe audio to text using a speech-to-text service.",
   parameters: {
     type: "object",

@@ -1,7 +1,7 @@
 export default {
   name: "edit_file",
   version: "0.1.6",
-  output: "context",
+  output: "memory",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. Use write_file only for new files or full rewrites.",
   parameters: {
     type: "object",
@@ -21,6 +21,35 @@ export default {
     // and spiral on. A structured failure surfaces as clean corrective text.
     function fail(message) {
       return { content: message, success: false };
+    }
+
+    // Repeat-refusal escalation, shared with write_file — see the long note
+    // there. Same state file and the same "fork:" key prefix, so attempts
+    // alternating between the two tools accumulate on ONE counter instead of
+    // each tool granting the model a fresh allowance. Fails open throughout.
+    var REFUSAL_STATE = ".nanna/write_refusals.json";
+    var REFUSAL_ESCALATE_AT = 2;
+    var REFUSAL_MAX_ENTRIES = 200;
+    function refusalBump(key) {
+      try {
+        var map;
+        try { map = JSON.parse(Nanna.readFile(REFUSAL_STATE)); } catch (e2) { map = {}; }
+        if (!map || typeof map !== "object") map = {};
+        var next = (typeof map[key] === "number" && isFinite(map[key]) ? map[key] : 0) + 1;
+        map[key] = next;
+        var keys = Object.keys(map);
+        if (keys.length > REFUSAL_MAX_ENTRIES) {
+          for (var i = 0; i < keys.length - REFUSAL_MAX_ENTRIES; i++) delete map[keys[i]];
+        }
+        Nanna.writeFile(REFUSAL_STATE, JSON.stringify(map));
+        return next;
+      } catch (e) {
+        return 0;
+      }
+    }
+    function failEscalating(pathKey, normal, blunt) {
+      var n = refusalBump("fork:" + pathKey);
+      return fail(n > REFUSAL_ESCALATE_AT ? blunt : normal);
     }
 
     // Anti-erosion ratchet state, shared with write_file v0.1.11 / file_buffer
@@ -70,6 +99,26 @@ export default {
         // State persistence is best-effort.
       }
     }
+    // The high-water mark for a path, or 0 when there is no trustworthy one.
+    //
+    // Trust rule matches write_file's: the recorded `hi` is only meaningful
+    // while the tools have been the sole mutators. If the size on disk is not
+    // what we last left there, something else changed the file deliberately
+    // and the mark is stale — re-base to disk truth rather than judging
+    // against a size that no longer exists.
+    function hiwaterFloorBase(path, currentSize) {
+      try {
+        var key = hiwaterKey(path);
+        if (hiwaterIsBuffer(key) || hiwaterIsState(key)) return 0;
+        var entry = hiwaterLoad()[key];
+        if (!entry || typeof entry.hi !== "number" || !isFinite(entry.hi)) return 0;
+        if (typeof entry.last !== "number" || entry.last !== currentSize) return 0;
+        return entry.hi;
+      } catch (e) {
+        return 0;
+      }
+    }
+
     function hiwaterRecord(path, newSize, prevSize) {
       try {
         var key = hiwaterKey(path);
@@ -373,6 +422,82 @@ export default {
       if (syntaxRefusal) return fail(syntaxRefusal);
     }
 
+    // SUFFIXED-COPY REFUSAL, shared with write_file (full design comment there).
+    //
+    // Same lesson as the ratchet floor immediately below, learned the same way:
+    // a guard that lives in only one tool does not protect the file, it just
+    // decides which tool gets used to damage it. write_file refused a write to
+    // './minidb.sh' 17 times while './minidb' existed — and the model moved to
+    // edit_file, which had no such check, and made 24 successful edits to the
+    // fork. 2029 bytes of work went into a file the acceptance tests never read.
+    //
+    // Narrow, exactly as in write_file: it fires only when the target's STEM is
+    // itself an existing file, i.e. the original carries no extension of its
+    // own. Sibling formats are untouched — config.json beside config.yaml,
+    // tool.ts beside tool.js — because their stems are not files.
+    var forkBase = filePath.split("\\").join("/");
+    var forkSlash = forkBase.lastIndexOf("/");
+    var forkName = forkSlash >= 0 ? forkBase.substring(forkSlash + 1) : forkBase;
+    var forkDot = forkName.lastIndexOf(".");
+    if (forkDot > 0) {
+      var forkStem = forkName.substring(0, forkDot);
+      var forkStemPath = forkSlash >= 0
+        ? forkBase.substring(0, forkSlash + 1) + forkStem
+        : forkStem;
+      var forkStat = null;
+      try { forkStat = Nanna.stat(forkStemPath); } catch (eFork) { forkStat = null; }
+      if (forkStat && forkStat.is_file) {
+        // Escalates on repetition — see the note in write_file. Half the
+        // wasted fork attempts in the live run came through edit_file, so a
+        // guard that only hardens on one of the two paths leaves the loop
+        // fully open on the other.
+        return failEscalating(
+          hiwaterKey(filePath),
+          "EDIT REFUSED — '" + filePath + "' is '" + forkStem + "' with an extension " +
+            "added, and '" + forkStem + "' already exists (" + (forkStat.size || 0) + " bytes). " +
+            "Nothing was edited. Improving this copy cannot help: whatever reads '" + forkStem +
+            "' — the tests, the callers — will never see it, so the work scores zero no matter " +
+            "how good it is.\nMake the change in '" + forkStemPath + "' itself.",
+          "STOP — '" + filePath + "' WILL NEVER BE ACCEPTED. You have tried it repeatedly. " +
+            "The only file that counts is '" + forkStemPath + "'. Send this exact call instead:\n" +
+            "    edit_file(file_path=\"" + forkStemPath + "\", old_string=<exact current text>, new_string=<replacement>)\n" +
+            "Do not add an extension. Do not try '" + filePath + "' again."
+        );
+      }
+    }
+
+    // The ratchet floor applies to the RESULT, not to the tool that produced it.
+    //
+    // write_file refuses a write below 30% of the high-water mark and, in the
+    // refusal, points the model at edit_file — which had no floor at all,
+    // because "deletion is edit_file's job". So the guard did not fail, it
+    // HERDED: measured 2026-07-28, write_file refused 13 times, the model moved
+    // to edit_file, and seven edits took a working minidb from 9691 bytes to
+    // 3941. The score went 17/42 to 3/42. A floor one tool can walk under is
+    // not a floor.
+    //
+    // Deletion is still this tool's job — removing a section, a function, a
+    // whole feature all stay possible, and each individual edit here can be
+    // arbitrarily large. What is refused is the RESULT falling under the same
+    // line write_file defends: below 30% of the largest the file has ever been,
+    // whether that takes one edit or twenty. Anything above the floor is
+    // untouched, so ordinary editing never sees this.
+    var floorBase = hiwaterFloorBase(filePath, content.length);
+    if (floorBase > 500 && updated.length < content.length && updated.length < floorBase * 0.3) {
+      return {
+        content: "EDIT REFUSED — the file was NOT modified and is fully intact. " +
+          "This edit would leave " + filePath + " at " + updated.length + " bytes, but it has " +
+          "held " + floorBase + " bytes (" + Math.round(updated.length / floorBase * 100) +
+          "% of that). Deleting that much in one step is almost always an accident — a " +
+          "stale old_string matching more than you meant, or a rewrite sent as an edit.\n" +
+          "Nothing was lost: read_file " + filePath + " to see what is actually there, then " +
+          "make the change you intended against the real current text. If you genuinely mean " +
+          "to remove most of the file, do it in separate edits that each take out one named " +
+          "section — that way a mistake costs one section instead of the whole file.",
+        success: false
+      };
+    }
+
     try {
       Nanna.writeFile(filePath, updated);
     } catch (e2) {
@@ -387,8 +512,7 @@ export default {
     // guard armed across surgical edits — otherwise every edit looks
     // out-of-band and hands the next rewrite a fresh current-size floor (the
     // 2-call nibble+rewrite erosion loop from the verify round). Best-effort,
-    // fails open; deliberately NO shrink refusal here (deletion is this
-    // tool's job — the guard's own refusals steer deletions to edit_file).
+    // fails open.
     hiwaterRecord(filePath, updated.length, content.length);
 
     return { content: "Edited " + filePath + ": replaced " + replaced + " occurrence(s). File is now " + updated.length + " characters.", success: true };

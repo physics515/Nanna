@@ -1,7 +1,7 @@
 export default {
   name: "search_file",
   version: "0.1.1",
-  output: "context",
+  output: "memory",
   description: "Search within a single file for a pattern and return matching lines with surrounding context. Useful for finding specific functions, variables, or text in large files without reading the entire file. Returns line numbers so you can follow up with read_file for a broader view.",
   parameters: {
     type: "object",

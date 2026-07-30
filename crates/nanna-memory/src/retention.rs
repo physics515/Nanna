@@ -400,6 +400,8 @@ impl RetentionCorpus {
                 memories.push(MemoryEntry {
                     id: format!("t{topic}-m{member}"),
                     content: format!("topic:{topic} memory {member}"),
+                    embedding_model: None,
+                    embeddings: HashMap::new(),
                     embedding,
                     metadata,
                     timestamp: topic_last_access,
@@ -588,6 +590,8 @@ mod tests {
                 metadata.insert(TOPIC_METADATA_KEY.to_string(), "0".to_string());
 
                 MemoryEntry {
+                    embedding_model: None,
+                    embeddings: HashMap::new(),
                     id: format!("drift-{index}"),
                     content,
                     embedding,

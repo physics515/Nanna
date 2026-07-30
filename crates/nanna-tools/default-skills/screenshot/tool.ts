@@ -1,7 +1,8 @@
 export default {
   name: "screenshot",
+  requires: ["screenshot.capture"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Take a screenshot of the current desktop or a specific window. Returns the screenshot as a base64-encoded PNG.",
   parameters: {
     type: "object",

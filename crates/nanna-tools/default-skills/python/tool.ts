@@ -1,7 +1,8 @@
 export default {
   name: "python",
+  requires: ["python.exec"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Execute Python code or manage saved scripts. Embedded interpreter — no system Python required. Supports standard library (os, json, re, pathlib, collections, math, etc). No pip/third-party packages. Use for file manipulation, data processing, batch edits, text transforms, and scripting.",
   parameters: {
     type: "object",

@@ -166,3 +166,71 @@ async fn shrink_guard_still_refuses_fragments() {
     assert!(err.contains("NOT modified"), "got: {err}");
     assert_eq!(std::fs::read_to_string(&real).unwrap().len(), 1_000);
 }
+
+/// REGRESSION (2026-07-27): a run built `./minidb` to 8/42 acceptance checks
+/// passing, then forked onto `./minidb.sh` and spent the rest of its time
+/// improving a file the tests never read. The marker list catches renames
+/// that announce themselves (`_v2`, `_backup`, `.new`); this is the quiet
+/// fork — same name, extension added.
+#[tokio::test]
+async fn adding_an_extension_to_an_existing_file_is_refused() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("minidb");
+    std::fs::write(&original, "#!/bin/sh\necho original\n").unwrap();
+
+    let fork = dir.path().join("minidb.sh").to_string_lossy().into_owned();
+    let err = run_fail(
+        json!({ "file_path": fork, "content": "#!/bin/sh\necho fork\n" }),
+        dir.path(),
+    )
+    .await;
+
+    assert!(err.contains("WRITE REFUSED"), "got: {err}");
+    assert!(err.contains("minidb"), "must name the original: {err}");
+    assert!(err.contains("edit_file"), "must offer the way forward: {err}");
+    assert!(
+        !dir.path().join("minidb.sh").exists(),
+        "the fork must not be created"
+    );
+}
+
+/// The refusal must stay narrow: sibling FORMATS are legitimate. Their stems
+/// are not themselves files, which is exactly what distinguishes them from a
+/// copy of an extensionless original.
+#[tokio::test]
+async fn sibling_formats_are_still_allowed() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.yaml"), "a: 1\n").unwrap();
+
+    let target = dir.path().join("config.json").to_string_lossy().into_owned();
+    run_write(
+        json!({ "file_path": target, "content": "{\"a\": 1}\n" }),
+        dir.path(),
+    )
+    .await
+    .expect("writing a sibling format must succeed");
+    assert!(dir.path().join("config.json").exists());
+}
+
+/// A brand-new suffixed file with no extensionless original is ordinary work.
+#[tokio::test]
+async fn a_suffixed_name_with_no_original_is_fine() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("build.sh").to_string_lossy().into_owned();
+    run_write(
+        json!({ "file_path": target, "content": "#!/bin/sh\nmake\n" }),
+        dir.path(),
+    )
+    .await
+    .expect("a fresh script name must succeed");
+    assert!(dir.path().join("build.sh").exists());
+}

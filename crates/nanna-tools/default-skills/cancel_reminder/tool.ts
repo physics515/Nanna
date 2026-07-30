@@ -1,5 +1,6 @@
 export default {
   name: "cancel_reminder",
+  requires: ["schedule.cancel"],
   version: "0.1.0",
   description: "Cancel an active reminder by its ID.",
   parameters: {

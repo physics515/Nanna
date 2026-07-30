@@ -314,12 +314,132 @@ use std::time::Duration;
 /// This allows the `session.history` service to return messages for the current session.
 pub type SharedSessionHistory = Arc<tokio::sync::RwLock<Vec<crate::session::SessionMessage>>>;
 
+/// Resolve a memory handle — including one whose memory has since been
+/// consolidated away by dreaming.
+///
+/// Context stubs quote a handle, so "the full result is in memory, use the
+/// handle" is a promise the store must keep. But dreaming REPLACES clusters:
+/// it writes one consolidated memory and forgets the originals. A handle
+/// captured before that would dangle, and the model would be told a result it
+/// was explicitly promised no longer exists — the worst possible answer,
+/// because it reads as data loss when the content is actually still there in
+/// generalised form.
+///
+/// Consolidation already records `consolidated_from` (the ids it absorbed),
+/// so the trail exists; this follows it. Resolution order:
+/// 1. the entry's own id,
+/// 2. the `source_id` tag shared by the chunks of one tool result,
+/// 3. **forwarding**: any memory that lists this handle in `consolidated_from`,
+/// 4. an unambiguous id prefix (stubs carry a short id).
+///
+/// Forwarding is transitive by construction: a consolidation of a
+/// consolidation carries the intermediate id, and the walk repeats. The hop
+/// limit only stops a cycle that a corrupt store could otherwise turn into a
+/// hang.
+/// The whole text behind a handle: every chunk sharing its `source_id`, in order.
+///
+/// A large tool result is split into N rows that share one `source_id`, but
+/// `resolve_memory_handle` returns a single row — so paging ran off the end of
+/// chunk 1 and reported `truncated: false`, while the stub sitting in the
+/// model's context promised the result "was stored whole in memory as {N}
+/// chunk(s)" and that recall "returns the full text". A model reading a fifth
+/// of a 42-case test run and being told nothing was missing will report on what
+/// it saw. Reassemble, rather than keep a promise the retrieval path was not
+/// keeping.
+async fn assemble_handle_content(
+    memory: &Arc<MemoryService>,
+    entry: &nanna_memory::MemoryListEntry,
+) -> String {
+    let Some(source_id) = entry.metadata.get("source_id") else {
+        return entry.content.clone();
+    };
+    let mut chunks: Vec<(usize, String)> = memory
+        .list_all()
+        .await
+        .into_iter()
+        .filter(|e| e.metadata.get("source_id").is_some_and(|s| s == source_id))
+        .map(|e| {
+            let idx = e
+                .metadata
+                .get("chunk")
+                .and_then(|c| c.split('/').next()?.parse::<usize>().ok())
+                .unwrap_or(1);
+            (idx, e.content)
+        })
+        .collect();
+    if chunks.len() <= 1 {
+        return entry.content.clone();
+    }
+    chunks.sort_by_key(|(idx, _)| *idx);
+    chunks
+        .into_iter()
+        .map(|(_, content)| content)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn resolve_memory_handle(
+    memory: &Arc<MemoryService>,
+    handle: &str,
+) -> Result<nanna_memory::MemoryListEntry, String> {
+    const MAX_FORWARD_HOPS: usize = 8;
+
+    let all = memory.list_all().await;
+    let direct = |needle: &str| -> Option<nanna_memory::MemoryListEntry> {
+        all.iter()
+            .find(|e| e.id == needle)
+            .or_else(|| {
+                all.iter()
+                    .find(|e| e.metadata.get("source_id").is_some_and(|s| s == needle))
+            })
+            .cloned()
+    };
+
+    if let Some(found) = direct(handle) {
+        return Ok(found);
+    }
+
+    // Follow the consolidation trail: who absorbed this id?
+    let mut needle = handle.to_string();
+    for _ in 0..MAX_FORWARD_HOPS {
+        let successor = all.iter().find(|e| {
+            e.metadata
+                .get("consolidated_from")
+                .is_some_and(|sources| sources.split(',').any(|s| s.trim() == needle))
+                || e.metadata
+                    .get("sources")
+                    .is_some_and(|sources| sources.split(',').any(|s| s.trim() == needle))
+        });
+        match successor {
+            Some(entry) => {
+                if let Some(found) = direct(&entry.id) {
+                    return Ok(found);
+                }
+                needle = entry.id.clone();
+            }
+            None => break,
+        }
+    }
+
+    all.iter()
+        .find(|e| e.id.starts_with(handle))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "no memory matches handle '{handle}'. It was not found directly, and nothing \
+                 in the store lists it as a source, so it was not consolidated into another \
+                 memory either — it may predate this store or have been deleted outright."
+            )
+        })
+}
+
 fn build_script_services(
     memory: &Option<Arc<MemoryService>>,
     spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
     session_history: SharedSessionHistory,
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
+    summarizer: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
 
@@ -488,6 +608,194 @@ fn build_script_services(
                         .map(|e| json!({"id": e.id, "content": e.content, "weight": e.weight}))
                         .collect();
                     Ok(Value::Array(items))
+                })
+            }),
+        );
+    }
+
+    // memory.get — read ONE memory by id, with a byte range.
+    //
+    // The store had only "search by similarity" and "list everything", which
+    // is why a tool result kept in memory could not be pointed at from
+    // context: a stub naming an id had no way to dereference it. This is the
+    // first piece of a file-like surface (read a range, later append/replace)
+    // so "the full result lives in memory, a stub lives in context" actually
+    // has a retrieval path.
+    if let Some(mem) = memory {
+        let mem_get = mem.clone();
+        services.insert(
+            "memory.get".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_get.clone();
+                Box::pin(async move {
+                    let id = params
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "id is required".to_string())?
+                        .to_string();
+                    let offset =
+                        params.get("offset").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+                    // Default cap keeps a huge tool result from re-flooding
+                    // the context the stub existed to protect.
+                    let limit = params
+                        .get("limit")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(4_000) as usize;
+
+                    let entry = resolve_memory_handle(&mem, &id).await?;
+                    let content = assemble_handle_content(&mem, &entry).await;
+
+                    let total = content.len();
+                    let start = offset.min(total);
+                    let end = start.saturating_add(limit).min(total);
+                    // Never split a UTF-8 char.
+                    let mut s = start;
+                    while s < total && !content.is_char_boundary(s) { s += 1; }
+                    let mut e = end;
+                    while e < total && !content.is_char_boundary(e) { e += 1; }
+
+                    // If the handle forwarded, SAY SO. Silently returning a
+                    // consolidated narration where raw output was asked for
+                    // is how a model concludes its data was corrupted; the
+                    // note explains that dreaming folded the original in and
+                    // that nothing was lost, only generalised.
+                    let forwarded = entry.id != id
+                        && entry.metadata.get("source_id").is_none_or(|s| s != &id);
+                    let mut out = json!({
+                        "id": entry.id,
+                        "content": &entry.content[s..e],
+                        "offset": s,
+                        "returned": e - s,
+                        "total": total,
+                        "truncated": e < total,
+                    });
+                    if forwarded {
+                        out["forwarded_from"] = json!(id);
+                        out["note"] = json!(format!(
+                            "'{id}' was consolidated during dreaming; this is the memory that \
+                             absorbed it ({}). The original text was generalised into this one, \
+                             not deleted.",
+                            entry.id
+                        ));
+                    }
+                    Ok(out)
+                })
+            }),
+        );
+    }
+
+    // memory.append / memory.replace — the write half of the file-like
+    // surface. Without them a memory can only be created or forgotten, so a
+    // record that has become WRONG (an action narrated as a fact, e.g.
+    // "creating minidb.sh at D:\…" nine hours after that file stopped
+    // existing) can only be duplicated or destroyed, never corrected. Append
+    // gives a running record per subject instead of N disconnected islands.
+    if let Some(mem) = memory {
+        let mem_append = mem.clone();
+        services.insert(
+            "memory.append".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_append.clone();
+                Box::pin(async move {
+                    let handle = params
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "id is required".to_string())?
+                        .to_string();
+                    let addition = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "content is required".to_string())?
+                        .to_string();
+                    let entry = resolve_memory_handle(&mem, &handle).await?;
+                    let combined = format!("{}\n{addition}", entry.content);
+                    mem.update_content(&entry.id, &combined)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({ "id": entry.id, "total": combined.len() }))
+                })
+            }),
+        );
+
+        let mem_replace = mem.clone();
+        services.insert(
+            "memory.replace".to_string(),
+            Arc::new(move |params: Value| {
+                let mem = mem_replace.clone();
+                Box::pin(async move {
+                    let handle = params
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "id is required".to_string())?
+                        .to_string();
+                    let old = params
+                        .get("old")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "old is required".to_string())?
+                        .to_string();
+                    let new = params
+                        .get("new")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let entry = resolve_memory_handle(&mem, &handle).await?;
+                    let hits = entry.content.matches(&old).count();
+                    if hits == 0 {
+                        // Same contract as edit_file: refuse rather than
+                        // guess, and say what is actually there.
+                        let preview: String = entry.content.chars().take(160).collect();
+                        return Err(format!(
+                            "'{old}' does not appear in memory {}. Nothing was changed. It \
+                             begins: {preview}",
+                            entry.id
+                        ));
+                    }
+                    let updated = entry.content.replace(&old, &new);
+                    mem.update_content(&entry.id, &updated)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({
+                        "id": entry.id,
+                        "replaced": hits,
+                        "total": updated.len(),
+                    }))
+                })
+            }),
+        );
+    }
+
+    // memory.summarize — concatenate texts and summarize them with the
+    // summarization model chain. The `day_dream` tool is the model-facing
+    // half: dreaming already does this on a schedule, and this lets the model
+    // ask for it deliberately when it notices related fragments piling up.
+    if let Some((router, models)) = summarizer {
+        services.insert(
+            "memory.summarize".to_string(),
+            Arc::new(move |params: Value| {
+                let router = router.clone();
+                let models = models.clone();
+                Box::pin(async move {
+                    let texts: Vec<String> = params
+                        .get("texts")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if texts.is_empty() {
+                        return Err("texts must be a non-empty array".to_string());
+                    }
+                    let joined = texts.join("
+
+---
+
+");
+                    let summarize =
+                        crate::dream_summarizer::summarize_with_failover(router, models);
+                    let summary = summarize(joined).await?;
+                    Ok(json!({ "summary": summary }))
                 })
             }),
         );
@@ -683,16 +991,40 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
 }
 
+/// A credential from the environment, falling back to the secure store.
+///
+/// The store is where the GUI puts keys the user types in, so a key that is
+/// only ever read from the environment is a key the user cannot set. Anthropic
+/// and OpenAI already got their store fallback further down this file; the
+/// others never did, and OpenRouter's absence was load-bearing — the dream
+/// summarizer is configured to OpenRouter models by default, so every
+/// consolidation failed with `Missing API key for provider: OpenRouter` while
+/// the key sat in the store the whole time. Dreaming had never once run.
+fn credential(env_var: &str, store_key: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+    }
+    SecureStore::new()
+        .get(store_key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: "anthropic".to_string(),
-            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+            anthropic_api_key: credential("ANTHROPIC_API_KEY", credentials::keys::ANTHROPIC_API_KEY),
             anthropic_oauth_token: None,
             anthropic_use_oauth: false,
-            openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
-            openrouter_api_key: std::env::var("OPENROUTER_API_KEY").ok(),
-            github_token: std::env::var("GITHUB_TOKEN").ok(),
+            openai_api_key: credential("OPENAI_API_KEY", credentials::keys::OPENAI_API_KEY),
+            openrouter_api_key: credential(
+                "OPENROUTER_API_KEY",
+                credentials::keys::OPENROUTER_API_KEY,
+            ),
+            github_token: credential("GITHUB_TOKEN", credentials::keys::GITHUB_TOKEN),
             ollama_host: "http://localhost:11434".to_string(),
             ollama_api_key: std::env::var("OLLAMA_API_KEY").ok(),
             api_key: None, // Legacy
@@ -1243,6 +1575,22 @@ impl DaemonServer {
                             // (tools, memory, model fallback) in a task-scoped
                             // session that is not persisted to the session store.
                             let session_id = format!("scheduled-{}", task.id);
+                            // Idle gate: never start an autonomous prompt on top
+                            // of a live run. A local model server serves one
+                            // generation at a time, so a heartbeat firing into a
+                            // streaming chat gets the slot time-shared and the
+                            // chat's generation CANCELLED — surfacing as a bogus
+                            // "provider incident" the harness then heals against
+                            // (observed live 2026-07-26). Skipping loses nothing:
+                            // a heartbeat exists to work during a lull, and the
+                            // next tick picks up whatever was due.
+                            if agent.any_run_active().await {
+                                debug!(
+                                    "Skipping scheduled task '{}': a run is already in flight",
+                                    task.name
+                                );
+                                (true, Some("Skipped (a run is in flight)".to_string()), None)
+                            } else {
                             // An autonomous agent run (heartbeat / cron / task
                             // prompt) is the daemon actively using the model, so
                             // it counts as activity too — defer the dream cycle
@@ -1276,6 +1624,7 @@ impl DaemonServer {
                                     error!("Scheduled task '{}' failed: {}", task.name, e.message);
                                     (false, None, Some(e.message))
                                 }
+                            }
                             }
                         }
                     };
@@ -2022,25 +2371,72 @@ impl DaemonServer {
                                 let old_gen =
                                     gen_tracker.swap(new_gen, std::sync::atomic::Ordering::Relaxed);
                                 if new_gen != old_gen {
-                                    // Provider switched — trigger re-embed in background
+                                    // Provider switched — realign the store BEFORE
+                                    // this write is allowed to land.
+                                    //
+                                    // This used to `tokio::spawn` the probe and
+                                    // return immediately, so the write that
+                                    // detected the switch — and every write
+                                    // racing it — went into a store still full
+                                    // of the previous provider's vectors. Two
+                                    // widths then coexisted, which is not a
+                                    // degraded search but a broken one: the
+                                    // comparison either asserts or, at equal
+                                    // widths from different models, silently
+                                    // returns nonsense.
+                                    //
+                                    // A width change means everything must be
+                                    // re-embedded, and the only safe moment is
+                                    // before the next write. It costs a stall.
+                                    // That is what it costs.
+                                    //
+                                    // The `swap` above is the stampede guard:
+                                    // it is atomic, so exactly one caller
+                                    // observes the change and does the work.
                                     if let Some(mem) = mem_cell.get() {
-                                        let mem = mem.clone();
-                                        tokio::spawn(async move {
-                                            tracing::info!(
-                                                "Embedding provider changed (gen {} → {}), probing dimension and re-embedding if needed...",
-                                                old_gen,
-                                                new_gen
-                                            );
-                                            match mem.probe_and_align_dimension().await {
-                                                Ok(dim) => tracing::info!(
-                                                    "Dimension probe complete: {} dims",
-                                                    dim
-                                                ),
-                                                Err(e) => {
-                                                    tracing::warn!("Dimension probe failed: {}", e)
+                                        let model = router.active_provider().await.to_string();
+                                        tracing::info!(
+                                            "Embedding provider changed (gen {} → {}) — rebinding \
+                                             the store to '{}'",
+                                            old_gen,
+                                            new_gen,
+                                            model
+                                        );
+
+                                        // Rebinding is a hash lookup per entry:
+                                        // no network, no re-embed, and a switch
+                                        // BACK to a model used earlier is free
+                                        // because its bucket was retained.
+                                        let (_, missing) = mem.rebind_embeddings(&model).await;
+
+                                        // Whatever this model has never embedded
+                                        // gets filled in lazily, in bounded
+                                        // passes, while the run continues. It
+                                        // must not be done inline: the store can
+                                        // hold thousands of entries and the
+                                        // provider we just failed over to may be
+                                        // the rate-limited one.
+                                        if missing > 0 {
+                                            let mem = mem.clone();
+                                            tokio::spawn(async move {
+                                                const BATCH: usize = 64;
+                                                loop {
+                                                    match mem
+                                                        .backfill_embeddings(&model, BATCH)
+                                                        .await
+                                                    {
+                                                        Ok(0) => break,
+                                                        Ok(_) => {}
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Backfill for '{model}' halted: {e}"
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                        });
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -2200,6 +2596,29 @@ impl DaemonServer {
                     {
                         let memory_for_probe = memory_arc.clone();
                         let model_name = self.embedding.model.clone();
+                        // Bind the store to the model that is about to write to
+                        // it, BEFORE any probe or write. Without this the first
+                        // entries of a session get bucketed under `None` — they
+                        // would be re-embedded on the next switch instead of
+                        // being reusable, which is the whole point of buckets.
+                        let bind_model = embed_router.active_provider().await.to_string();
+                        let memory_for_bind = memory_arc.clone();
+                        tokio::spawn(async move {
+                            let (_, missing) = memory_for_bind.rebind_embeddings(&bind_model).await;
+                            if missing > 0 {
+                                const BATCH: usize = 64;
+                                loop {
+                                    match memory_for_bind.backfill_embeddings(&bind_model, BATCH).await {
+                                        Ok(0) => break,
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            warn!("Startup backfill for '{bind_model}' halted: {e}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
                         tokio::spawn(async move {
                             match memory_for_probe.probe_and_align_dimension().await {
                                 Ok(actual_dim) => {
@@ -2306,12 +2725,17 @@ impl DaemonServer {
                 None
             };
 
+            let summarizer_models = crate::dream_summarizer::summarization_models(
+                &self.config.agent.summarization_priority,
+                std::slice::from_ref(&self.config.agent.model),
+            );
             let services = build_script_services(
                 &memory,
                 spawner_arc,
                 session_history.clone(),
                 workspace_id_for_services.clone(),
                 self.storage.clone(),
+                Some((router.clone(), summarizer_models)),
             );
 
             if let Some(ref dir) = tools_dir {

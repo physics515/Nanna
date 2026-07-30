@@ -1,7 +1,8 @@
 export default {
   name: "browser_screenshot",
+  requires: ["browser.screenshot"],
   version: "0.1.0",
-  output: "context",
+  output: "memory",
   description: "Take a screenshot of a web page. Returns the screenshot as a base64-encoded PNG.",
   parameters: {
     type: "object",
