@@ -1200,6 +1200,16 @@ impl StepRunner for AgentStepRunner {
         let mut last_err = String::new();
         for attempt in 0..=STEP_LLM_RETRIES {
             if attempt > 0 {
+                // Stop pressed while the failed attempt ran: don't sleep out
+                // a backoff and burn a whole fresh step after the user asked
+                // to abort.
+                if request
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return Err(last_err);
+                }
                 tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
                 let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
                 tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
@@ -1336,6 +1346,12 @@ impl AgentStepRunner {
             max_iterations: request.max_iterations,
             token_budget: request.token_budget,
             max_wall_clock: request.max_wall_clock,
+            // The Stop button's flag. Without this the agent loop streams and
+            // executes tools until the step ends on its own — observed live
+            // (2026-07-30): Stop had no effect for minutes because the flag
+            // was only polled between harness steps, and a chat turn is
+            // usually ONE step.
+            cancellation_flag: request.cancel.clone(),
             step_kind: Some(request.step_kind),
             initial_active_tools: active,
             restrict_to_active_tools: restrict_to_active,
@@ -1421,6 +1437,9 @@ impl AgentPlanner {
             token_budget: None,
             max_iterations: Some(PLAN_ITERATIONS),
             max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
+            // Planning is bounded by PLAN_TIMEOUT_SECS; a Stop during it
+            // costs at most that window before the harness sees the flag.
+            cancel: None,
         };
 
         let outcome = tokio::time::timeout(
@@ -2585,6 +2604,7 @@ mod tests {
             token_budget: None,
             max_iterations: None,
             max_wall_clock: None,
+            cancel: None,
         };
 
         sink.step_header(&request(7));

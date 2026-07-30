@@ -432,6 +432,13 @@ pub struct StepRequest {
     pub token_budget: Option<u64>,
     pub max_iterations: Option<usize>,
     pub max_wall_clock: Option<Duration>,
+    /// The run's shared cancellation flag — the SAME `Arc` the Stop button
+    /// flips. The harness polls it only at step boundaries, and a step can
+    /// legitimately run for many minutes (a chat turn's one-task plan IS a
+    /// single step); the runner must thread this into the in-step agent loop
+    /// so Stop aborts the in-flight LLM stream and skips queued tool calls
+    /// instead of waiting the step out.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /// One tool call as seen from outside a step (digests, not payloads — the
@@ -904,6 +911,7 @@ impl LongHorizonRunner {
                 token_budget: cfg.step_token_budget,
                 max_iterations: Some(cfg.step_iterations),
                 max_wall_clock: Some(remaining_wall),
+                cancel: cancel.clone(),
             };
 
             let outcome = match runner.run_step(request).await {
@@ -967,6 +975,16 @@ impl LongHorizonRunner {
             let tail = text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
             if !tail.is_empty() {
                 let _ = source.add_note(step.id, &tail).await;
+            }
+
+            // A cancelled step is a truncated step: its text is not a
+            // verdictable claim, and an acceptance command run now is work
+            // after the user said stop. Findings are already noted above.
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                break StopReason::Cancelled;
             }
 
             // Cross-step repetition = a stall the in-run detector cannot see.
@@ -1796,6 +1814,77 @@ mod tests {
             .await;
         assert_eq!(report.stop, StopReason::Cancelled);
         assert_eq!(report.steps_taken, 0);
+    }
+
+    /// REGRESSION (GUI live drive, 2026-07-30): Stop had no effect for
+    /// minutes because the flag reached only the harness boundary — the
+    /// in-step agent loop got `cancellation_flag: None`. Every step request
+    /// must carry the SAME flag the Stop button flips, so the runner can
+    /// abort the in-flight stream, not just decline the next step.
+    #[tokio::test]
+    async fn every_step_request_carries_the_runs_cancel_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "answer", None)).await;
+        let runner = ScriptedRunner::new(vec![Ok(outcome("TASK COMPLETE"))]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), Some(cancel.clone()))
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone, "{report:?}");
+
+        let requests = runner.requests.lock().await;
+        assert!(!requests.is_empty());
+        for request in requests.iter() {
+            let threaded = request
+                .cancel
+                .as_ref()
+                .expect("the step request must carry the run's cancel flag");
+            assert!(
+                Arc::ptr_eq(threaded, &cancel),
+                "must be the SAME Arc the Stop button flips, not a fresh flag"
+            );
+        }
+    }
+
+    /// Flips its step's own cancel flag mid-step and returns partial output —
+    /// the scripted stand-in for the real agent loop observing
+    /// `RunOptions.cancellation_flag` while a stream is in flight.
+    struct CancelsDuringItsStep;
+
+    #[async_trait::async_trait]
+    impl StepRunner for CancelsDuringItsStep {
+        async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
+            request
+                .cancel
+                .as_ref()
+                .expect("the flag is threaded into the step")
+                .store(true, Ordering::Relaxed);
+            Ok(outcome("partial work\n\n[Cancelled by user]"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_injected_mid_step_stops_the_run_at_that_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "first", None)).await;
+        source.push(step(2, "second", None)).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &CancelsDuringItsStep, dir.path(), Some(cancel))
+            .await;
+        assert_eq!(report.stop, StopReason::Cancelled);
+        assert_eq!(report.steps_taken, 1, "the second item must never start");
+        assert!(
+            source.completions.lock().await.is_empty(),
+            "a truncated step is not a verdictable claim — nothing completes"
+        );
+        assert_eq!(
+            source.notes.lock().await.len(),
+            1,
+            "the cancelled step's partial findings still land in the store"
+        );
     }
 
     #[tokio::test]
