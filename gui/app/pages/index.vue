@@ -108,7 +108,7 @@
           </div>
           <!-- Content bubble only when the timeline carries no text of its
                own (older runs journaled before text capture existed). -->
-          <div v-if="!timelineHasText(msg.timeline)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+          <div v-if="!timelineHasText(msg.timeline) && hasSpokenText(msg.content)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
             <MessageBubble variant="assistant">
               <div class="flex items-start gap-2 sm:gap-3">
                 <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
@@ -149,8 +149,12 @@
             </div>
           </div>
 
-          <!-- Message bubble -->
-          <div class="max-w-[1800px] mx-auto" :class="msg.role === 'user' ? 'ml-4 sm:ml-12' : 'mr-4 sm:mr-12'">
+          <!-- Message bubble — text only; a turn that just acted has none. -->
+          <div
+            v-if="msg.role === 'user' || hasSpokenText(msg.content)"
+            class="max-w-[1800px] mx-auto"
+            :class="msg.role === 'user' ? 'ml-4 sm:ml-12' : 'mr-4 sm:mr-12'"
+          >
             <MessageBubble :variant="msg.role">
               <div class="flex items-start gap-2 sm:gap-3">
                 <UiAvatar
@@ -218,15 +222,16 @@
            the trailing open text segment — earlier text lives in the
            timeline where it happened, so nothing renders twice. When the
            journal's tail is a tool/thinking item there is no open text, so
-           the bubble hides entirely rather than sit hollow. -->
-      <div v-if="isStreaming && (liveBubbleContent || !liveTimeline.length)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
+           the bubble hides entirely rather than sit hollow — and a tail
+           that is only harness markers or whitespace counts as no text. -->
+      <div v-if="isStreaming && (liveBubbleHasText || !liveTimeline.length)" class="max-w-[1800px] mx-auto mr-4 sm:mr-12">
         <MessageBubble variant="assistant">
           <div class="flex items-start gap-2 sm:gap-3">
             <UiAvatar variant="accent" fallback="☽" size="sm" class="flex-shrink-0 sm:hidden" />
             <UiAvatar variant="accent" fallback="☽" class="flex-shrink-0 hidden sm:flex" />
             <div class="flex-1">
               <div class="text-xs text-nanna-text-dim mb-1">☽ Nanna</div>
-              <div v-if="liveBubbleContent" class="prose prose-invert prose-sm max-w-none">
+              <div v-if="liveBubbleHasText" class="prose prose-invert prose-sm max-w-none">
                 <MarkdownContent :content="stripHarnessMarkers(liveBubbleContent)" />
                 <span class="cursor-blink inline-block ml-0.5">▋</span>
               </div>
@@ -467,8 +472,31 @@ const liveBubbleContent = computed(() => {
   return streamingContent.value
 })
 
+// The streaming bubble renders only when the open segment has something to
+// SHOW — a tail of harness markers or bare whitespace would otherwise draw
+// an empty card with just a cursor.
+const liveBubbleHasText = computed(() =>
+  stripHarnessMarkers(liveBubbleContent.value).trim().length > 0
+)
+
 function timelineHasText(items: TimelineEntry[] | undefined): boolean {
-  return !!items?.some(item => item.kind === 'text' && (item.content ?? '').trim().length > 0)
+  return !!items?.some(item => item.kind === 'text' && hasSpokenText(item.content))
+}
+
+// Does this message have anything to SAY, as opposed to things it did?
+//
+// A tool-using turn is normally all thinking and tool calls with no prose —
+// the model acts instead of narrating. Rendering a bubble for those produced a
+// run timeline littered with empty "☽ Nanna" cards (observed live on the
+// benchmark), which reads as the model failing to answer when in fact it was
+// working. Thinking and tool calls already have their own cards above; the
+// bubble is only for text.
+//
+// Checked AFTER stripHarnessMarkers, because a turn whose entire content was
+// harness bookkeeping renders blank once the markers come out — the marker is
+// exactly the case that looked like an empty reply.
+function hasSpokenText(content: string | undefined | null): boolean {
+  return stripHarnessMarkers(content ?? '').trim().length > 0
 }
 
 // Benchmark line under a completed run: tokens spent + time taken, so
