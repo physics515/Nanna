@@ -518,8 +518,13 @@ impl LlmError {
 
     /// Parse an API error response to extract rate limit info
     pub fn from_api_response(status: u16, message: String) -> Self {
-        // Check if it's a rate limit error
-        if status == 429 || message.to_lowercase().contains("rate_limit") {
+        // Both spellings are real: OpenAI-style bodies say "rate_limit_exceeded",
+        // OpenRouter's human-form message says "Rate limit exceeded". Matching
+        // only the underscore form silently declassified OpenRouter's — and a
+        // rate limit that isn't classified as one is retried at full speed,
+        // which is the one response a rate limit must never get.
+        let lowered = message.to_lowercase();
+        if status == 429 || lowered.contains("rate_limit") || lowered.contains("rate limit") {
             // Try to extract retry-after from the message
             let retry_after = Self::parse_retry_after(&message);
             return LlmError::RateLimit { message, retry_after };
@@ -2367,16 +2372,26 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         }
 
         if let Ok(err) = serde_json::from_str::<ErrorEnvelope>(trimmed) {
-            // An error body inside a 200: report the API's own message and code
-            // so callers treat it as the failure it is.
-            let code = err
+            // An error body inside a 200: classify by the code the ENVELOPE
+            // carries, not the transport status. OpenRouter wraps its 429s in
+            // an HTTP 200, and classifying that as status 200 turns a rate
+            // limit into a generic failure — which the failover walk then
+            // retries at full speed, the exact opposite of what a rate limit
+            // asks for.
+            let embedded_code = err.error.code.as_ref().and_then(|c| {
+                c.as_u64()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .or_else(|| c.as_str().and_then(|s| s.parse().ok()))
+            });
+            let code_note = err
                 .error
                 .code
+                .as_ref()
                 .map(|c| format!(" (code {c})"))
                 .unwrap_or_default();
             return Err(LlmError::from_api_response(
-                status,
-                format!("{}{code}", err.error.message),
+                embedded_code.unwrap_or(status),
+                format!("{}{code_note}", err.error.message),
             ));
         }
 
@@ -5806,6 +5821,34 @@ mod gemma_sentinel_tests {
             msg.contains("Rate limit exceeded"),
             "the API's own message must survive: {msg}"
         );
+    }
+
+    /// A 200-wrapped 429 must CLASSIFY as a rate limit, not merely mention one:
+    /// only `LlmError::RateLimit` engages the summarizer's backoff walk, and a
+    /// rate limit that classifies as a generic failure gets retried at full
+    /// speed — the one response it must never get.
+    #[test]
+    fn wrapped_rate_limit_classifies_as_rate_limit() {
+        // Numeric code, as OpenRouter sends it.
+        let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day","code":429}}"#;
+        let err = LlmClient::parse_openai_completion(200, body).expect_err("must fail");
+        assert!(err.is_rate_limit(), "numeric embedded 429 must classify: {err}");
+
+        // String code — some providers quote it.
+        let body = r#"{"error":{"message":"slow down","code":"429"}}"#;
+        let err = LlmClient::parse_openai_completion(200, body).expect_err("must fail");
+        assert!(err.is_rate_limit(), "string embedded 429 must classify: {err}");
+
+        // No code at all, but the human-form message — OpenRouter's spelling
+        // has a space, which the old matcher (underscore only) missed.
+        let body = r#"{"error":{"message":"Rate limit exceeded, retry later"}}"#;
+        let err = LlmClient::parse_openai_completion(200, body).expect_err("must fail");
+        assert!(err.is_rate_limit(), "message text must classify: {err}");
+
+        // Negative space: an unrelated error must NOT classify as a rate limit.
+        let body = r#"{"error":{"message":"model not found","code":404}}"#;
+        let err = LlmClient::parse_openai_completion(200, body).expect_err("must fail");
+        assert!(!err.is_rate_limit(), "404 is not a rate limit: {err}");
     }
 
     /// A body that is neither shape must be reported WITH a snippet of itself.
