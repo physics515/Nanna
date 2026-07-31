@@ -599,44 +599,157 @@ impl LlmError {
 // failure was a dream cycle firing one request per cluster in the same second
 // and losing 20 of 22 clusters to 429s.)
 
-/// One pacing clock per paced provider. Separate mutexes, not one map behind
+/// Per-provider pacing state: when we last asked, and what the provider last
+/// TOLD US about our budget.
+///
+/// The provider's own numbers beat any constant: `X-RateLimit-Remaining` /
+/// `X-RateLimit-Reset` reflect the actual account's tier and the actual
+/// window, which published docs cannot. The static
+/// [`Provider::min_request_spacing`] is only the bootstrap prior, used until
+/// the first response teaches us the truth.
+#[derive(Default)]
+struct PaceState {
+    /// When the previous request to this provider was issued.
+    last_request: Option<tokio::time::Instant>,
+    /// Requests the provider said we had left, decremented optimistically as
+    /// we send (the header confirming it arrives one response later).
+    remaining: Option<u64>,
+    /// When the provider said the window refills.
+    reset_at: Option<tokio::time::Instant>,
+}
+
+impl PaceState {
+    /// How long the next request must wait, given `now`.
+    ///
+    /// Pure — all clock reads happen at the caller — so the policy is testable
+    /// without real time:
+    /// - Provider said the window has refilled (`reset_at` in the past): no
+    ///   wait; the budget is fresh even if we never saw the new headers.
+    /// - Provider said how much budget remains: spread it evenly across the
+    ///   time left in the window (`(reset_at - now) / remaining`). A generous
+    ///   budget yields spacing BELOW the static prior — dynamic runs faster,
+    ///   not just safer. `remaining == 0` waits out the window.
+    /// - Nothing learned yet: the static published-limit prior.
+    fn required_wait(
+        &self,
+        now: tokio::time::Instant,
+        fallback_spacing: tokio::time::Duration,
+    ) -> tokio::time::Duration {
+        let since_last = self
+            .last_request
+            .map(|prev| now.saturating_duration_since(prev));
+
+        let spacing = match (self.reset_at, self.remaining) {
+            (Some(reset_at), _) if reset_at <= now => return tokio::time::Duration::ZERO,
+            (Some(reset_at), Some(0)) => return reset_at.saturating_duration_since(now),
+            (Some(reset_at), Some(remaining)) => {
+                let window_left = reset_at.saturating_duration_since(now);
+                // u32 clamp is safe: a `remaining` beyond u32::MAX means the
+                // spacing is zero at any window length we could measure.
+                window_left / u32::try_from(remaining).unwrap_or(u32::MAX)
+            }
+            _ => fallback_spacing,
+        };
+
+        match since_last {
+            None => tokio::time::Duration::ZERO,
+            Some(elapsed) => spacing.saturating_sub(elapsed),
+        }
+    }
+
+    /// Fold a provider's rate-limit headers into the state.
+    ///
+    /// `reset_in` is relative (converted from the header's epoch by the
+    /// caller, which owns the wall clock) so this stays pure and testable.
+    fn learn(&mut self, remaining: Option<u64>, reset_in: Option<tokio::time::Duration>) {
+        if let Some(remaining) = remaining {
+            self.remaining = Some(remaining);
+        }
+        if let Some(reset_in) = reset_in {
+            self.reset_at = Some(tokio::time::Instant::now() + reset_in);
+        }
+    }
+}
+
+/// One pacing gate per paced provider. Separate mutexes, not one map behind
 /// one lock: the lock is held across the pacing sleep deliberately (concurrent
 /// same-provider callers must serialize, or they all measure from the same
 /// "last" stamp and fire together), and holding a shared lock across that
 /// sleep would stall OTHER providers for no reason.
-fn pace_gate(provider: Provider) -> Option<&'static tokio::sync::Mutex<Option<tokio::time::Instant>>> {
+fn pace_gate(provider: Provider) -> Option<&'static tokio::sync::Mutex<PaceState>> {
     use std::sync::OnceLock;
     use tokio::sync::Mutex;
-    static OPENROUTER: OnceLock<Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
-    static GITHUB: OnceLock<Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
+    static OPENROUTER: OnceLock<Mutex<PaceState>> = OnceLock::new();
+    static GITHUB: OnceLock<Mutex<PaceState>> = OnceLock::new();
     match provider {
-        Provider::OpenRouter => Some(OPENROUTER.get_or_init(|| Mutex::new(None))),
-        Provider::GitHubModels => Some(GITHUB.get_or_init(|| Mutex::new(None))),
+        Provider::OpenRouter => Some(OPENROUTER.get_or_init(|| Mutex::new(PaceState::default()))),
+        Provider::GitHubModels => Some(GITHUB.get_or_init(|| Mutex::new(PaceState::default()))),
         _ => None,
     }
 }
 
-/// Hold a request to `provider` until its published minimum spacing has passed
-/// since the previous one, process-wide across all clients and callers.
+/// Hold a request to `provider` until its pacing allows it, process-wide
+/// across all clients and callers.
 ///
 /// Public so callers that reach a paced provider WITHOUT an [`LlmClient`]
 /// (a future embedding path, for instance) can share the same clock. No-op
 /// for providers without a published quota.
 pub async fn pace_provider_requests(provider: Provider) {
-    let Some(spacing) = provider.min_request_spacing() else {
+    let Some(fallback) = provider.min_request_spacing() else {
         return;
     };
     let Some(gate) = pace_gate(provider) else {
         return;
     };
-    let mut last = gate.lock().await;
-    if let Some(prev) = *last {
-        let elapsed = prev.elapsed();
-        if elapsed < spacing {
-            tokio::time::sleep(spacing - elapsed).await;
-        }
+    let mut state = gate.lock().await;
+    let wait = state.required_wait(tokio::time::Instant::now(), fallback);
+    if wait > tokio::time::Duration::ZERO {
+        tokio::time::sleep(wait).await;
     }
-    *last = Some(tokio::time::Instant::now());
+    state.last_request = Some(tokio::time::Instant::now());
+    // The request we are about to send spends one unit of whatever budget the
+    // provider last reported; the confirming header arrives one response late.
+    state.remaining = state.remaining.map(|r| r.saturating_sub(1));
+}
+
+/// Teach the pacing gate what a response's rate-limit headers said.
+///
+/// Reads `x-ratelimit-remaining` and `x-ratelimit-reset` (OpenRouter sends the
+/// reset as an epoch in milliseconds, GitHub in seconds — disambiguated by
+/// magnitude, same rule as [`LlmError::parse_retry_after`]). Uses `try_lock`
+/// rather than awaiting: losing one update to contention is fine — the next
+/// response repeats the lesson — while awaiting here would stall response
+/// handling behind another caller's pacing sleep.
+fn learn_rate_limit_headers(provider: Provider, headers: &reqwest::header::HeaderMap) {
+    let Some(gate) = pace_gate(provider) else {
+        return;
+    };
+    let header_u64 = |name: &str| -> Option<u64> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            // Some providers send floats ("59.0"); take the integer part.
+            .and_then(|s| s.split('.').next()?.trim().parse::<u64>().ok())
+    };
+    let remaining = header_u64("x-ratelimit-remaining");
+    let reset_in = header_u64("x-ratelimit-reset").and_then(|reset| {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let reset_secs = if reset > 100_000_000_000 { reset / 1000 } else { reset };
+        // A reset in the past yields None here; `required_wait` treats a
+        // stale window as refilled anyway once reset_at lapses.
+        reset_secs
+            .checked_sub(now_secs)
+            .map(tokio::time::Duration::from_secs)
+    });
+    if remaining.is_none() && reset_in.is_none() {
+        return;
+    }
+    if let Ok(mut state) = gate.try_lock() {
+        state.learn(remaining, reset_in);
+    }
 }
 
 /// LLM Provider
@@ -652,9 +765,13 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// Minimum spacing between consecutive requests to this provider, derived
-    /// from the provider's PUBLISHED request-per-minute quota — never a tuning
-    /// knob. `None` means "do not pace", and every `None` is a decision:
+    /// Bootstrap spacing between consecutive requests to this provider,
+    /// derived from the provider's PUBLISHED request-per-minute quota — never
+    /// a tuning knob. This is only the PRIOR: the moment a response arrives,
+    /// its `x-ratelimit-*` headers supersede it (see
+    /// [`PaceState::required_wait`]) because headers reflect the actual
+    /// account's tier, which docs cannot. `None` means "do not pace", and
+    /// every `None` is a decision:
     ///
     /// - `OpenRouter`: free tier publishes 20 requests/minute → 60s/20 = 3s.
     ///   The free `:free` models are what this codebase configures.
@@ -2153,6 +2270,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
+        learn_rate_limit_headers(self.provider, response.headers());
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = response.text().await.unwrap_or_default();
@@ -2373,6 +2491,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
+        learn_rate_limit_headers(self.provider, response.headers());
         let status = response.status().as_u16();
         let text = response.text().await?;
         if !(200..300).contains(&status) {
@@ -3673,6 +3792,7 @@ impl LlmClient {
         request: &AnthropicRequest,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
         let http = self.http.clone();
+        let provider = self.provider;
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let request = request.clone();
@@ -3707,6 +3827,7 @@ impl LlmClient {
                     return;
                 }
             };
+            learn_rate_limit_headers(provider, response.headers());
 
             if !response.status().is_success() {
                 let status = response.status().as_u16();
@@ -4419,6 +4540,7 @@ impl LlmClient {
                     return;
                 }
             };
+            learn_rate_limit_headers(provider, response.headers());
 
             if !response.status().is_success() {
                 let status = response.status().as_u16();
@@ -6018,5 +6140,107 @@ mod gemma_sentinel_tests {
             pace_provider_requests(Provider::ClaudeProxy).await;
         }
         assert_eq!(t0.elapsed(), tokio::time::Duration::ZERO);
+    }
+
+    // =========================================================================
+    // Dynamic pacing policy (PaceState::required_wait is pure — no clocks)
+    // =========================================================================
+
+    use super::PaceState;
+    use tokio::time::{Duration, Instant};
+
+    /// A generous provider-reported budget must run FASTER than the static
+    /// prior — dynamic pacing is not just a safety brake.
+    #[tokio::test(start_paused = true)]
+    async fn ample_reported_budget_beats_the_static_prior() {
+        let now = Instant::now();
+        let state = PaceState {
+            last_request: Some(now),
+            remaining: Some(100),
+            reset_at: Some(now + Duration::from_secs(60)),
+        };
+        let wait = state.required_wait(now, Duration::from_secs(3));
+        assert!(
+            wait <= Duration::from_millis(600),
+            "100 requests over 60s is 600ms spacing, got {wait:?}"
+        );
+    }
+
+    /// A scarce budget spreads evenly across the window instead of burning out
+    /// early: 5 left with 50s to go means one every 10s, prior be damned.
+    #[tokio::test(start_paused = true)]
+    async fn scarce_reported_budget_stretches_beyond_the_prior() {
+        let now = Instant::now();
+        let state = PaceState {
+            last_request: Some(now),
+            remaining: Some(5),
+            reset_at: Some(now + Duration::from_secs(50)),
+        };
+        let wait = state.required_wait(now, Duration::from_secs(3));
+        assert_eq!(wait, Duration::from_secs(10));
+    }
+
+    /// An exhausted budget waits out the window — the provider said no.
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_waits_for_the_reset() {
+        let now = Instant::now();
+        let state = PaceState {
+            last_request: Some(now),
+            remaining: Some(0),
+            reset_at: Some(now + Duration::from_secs(17)),
+        };
+        assert_eq!(
+            state.required_wait(now, Duration::from_secs(3)),
+            Duration::from_secs(17)
+        );
+    }
+
+    /// A lapsed window means a refilled budget: no wait, even though the stale
+    /// `remaining` still reads zero.
+    #[tokio::test(start_paused = true)]
+    async fn lapsed_window_means_refilled_budget() {
+        let now = Instant::now();
+        let state = PaceState {
+            last_request: Some(now),
+            remaining: Some(0),
+            reset_at: Some(now - Duration::from_secs(1)),
+        };
+        assert_eq!(state.required_wait(now, Duration::from_secs(3)), Duration::ZERO);
+    }
+
+    /// Before any response has taught us anything, the published prior rules.
+    #[tokio::test(start_paused = true)]
+    async fn unlearned_state_uses_the_prior() {
+        let now = Instant::now();
+        let state = PaceState {
+            last_request: Some(now),
+            remaining: None,
+            reset_at: None,
+        };
+        assert_eq!(
+            state.required_wait(now, Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        // …and a cold start (no previous request at all) never waits.
+        assert_eq!(
+            PaceState::default().required_wait(now, Duration::from_secs(3)),
+            Duration::ZERO
+        );
+    }
+
+    /// Elapsed time since the previous request counts against the spacing —
+    /// the gate enforces spacing, it does not add latency on top of it.
+    #[tokio::test(start_paused = true)]
+    async fn elapsed_time_counts_toward_the_spacing() {
+        let now = Instant::now();
+        let state = PaceState {
+            last_request: Some(now - Duration::from_secs(2)),
+            remaining: None,
+            reset_at: None,
+        };
+        assert_eq!(
+            state.required_wait(now, Duration::from_secs(3)),
+            Duration::from_secs(1)
+        );
     }
 }
