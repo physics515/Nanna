@@ -2268,16 +2268,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             temperature: Option<f32>,
         }
 
-        #[derive(Deserialize)]
-        struct OpenAIResponse {
-            choices: Vec<Choice>,
-        }
-
-        #[derive(Deserialize)]
-        struct Choice {
-            message: Message,
-        }
-
         let body = OpenAIRequest {
             model: &request.model,
             messages: &request.messages,
@@ -2294,18 +2284,107 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_api_response(status, message));
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        if !(200..300).contains(&status) {
+            return Err(LlmError::from_api_response(status, text));
+        }
+        Self::parse_openai_completion(status, &text)
+    }
+
+    /// Decode an OpenAI-compatible completion body without assuming the happy
+    /// shape.
+    ///
+    /// A blind `response.json::<T>()` here reported every mismatch as reqwest's
+    /// opaque "error decoding response body", and OpenRouter produces three
+    /// legitimate mismatches: whitespace keep-alive padding ahead of the JSON
+    /// while a reasoning model thinks, `content: null` with the text in a
+    /// `reasoning` field, and — the expensive one — **HTTP 200 whose body is an
+    /// `{"error": ...}` envelope** (free-tier rate limits, moderation, upstream
+    /// failures). That last one made a stored, working API key look absent:
+    /// every dream-summarization call failed with the same opaque error (386
+    /// times on 2026-07-30 alone, zero successes ever), the owner kept
+    /// re-entering the key, and nothing changed because the key was never the
+    /// problem.
+    ///
+    /// Rules: real errors surface with the API's own message (so failover and
+    /// backoff can react to rate limits), and an undecodable body is reported
+    /// WITH a snippet of itself — this failure class must never be opaque
+    /// again.
+    fn parse_openai_completion(status: u16, text: &str) -> Result<String, LlmError> {
+        #[derive(Deserialize)]
+        struct OpenAIResponse {
+            choices: Vec<Choice>,
+        }
+        #[derive(Deserialize)]
+        struct Choice {
+            message: ResponseMessage,
+        }
+        /// Response-side message: unlike the request struct, `content` may be
+        /// null (reasoning models), and the usable text may live in `reasoning`.
+        #[derive(Deserialize)]
+        struct ResponseMessage {
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            reasoning: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ErrorEnvelope {
+            error: ErrorBody,
+        }
+        #[derive(Deserialize)]
+        struct ErrorBody {
+            #[serde(default)]
+            message: String,
+            #[serde(default)]
+            code: Option<serde_json::Value>,
         }
 
-        let result: OpenAIResponse = response.json().await?;
-        Ok(result
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default())
+        // serde tolerates leading whitespace, but trim anyway so the snippet in
+        // the undecodable-body error starts at the content, not the padding.
+        let trimmed = text.trim_start();
+
+        if let Ok(ok) = serde_json::from_str::<OpenAIResponse>(trimmed) {
+            if let Some(choice) = ok.choices.first() {
+                let content = choice.message.content.as_deref().unwrap_or("");
+                if !content.trim().is_empty() {
+                    return Ok(content.to_string());
+                }
+                // Reasoning models sometimes put everything in `reasoning` and
+                // leave `content` empty; a summary built from the reasoning is
+                // better than reporting an empty success.
+                if let Some(reasoning) = &choice.message.reasoning {
+                    if !reasoning.trim().is_empty() {
+                        return Ok(reasoning.clone());
+                    }
+                }
+            }
+            return Err(LlmError::from_api_response(
+                status,
+                "completion succeeded but contained no text".to_string(),
+            ));
+        }
+
+        if let Ok(err) = serde_json::from_str::<ErrorEnvelope>(trimmed) {
+            // An error body inside a 200: report the API's own message and code
+            // so callers treat it as the failure it is.
+            let code = err
+                .error
+                .code
+                .map(|c| format!(" (code {c})"))
+                .unwrap_or_default();
+            return Err(LlmError::from_api_response(
+                status,
+                format!("{}{code}", err.error.message),
+            ));
+        }
+
+        let snippet: String = trimmed.chars().take(300).collect();
+        Err(LlmError::from_api_response(
+            status,
+            format!("undecodable completion body: {snippet:?}"),
+        ))
     }
 
     async fn complete_ollama(&self, request: &CompletionRequest) -> Result<String, LlmError> {
@@ -5679,5 +5758,73 @@ mod gemma_sentinel_tests {
                 "must NOT treat {text:?} as a stop marker"
             );
         }
+    }
+
+    // =========================================================================
+    // OpenAI-compatible completion body decoding (OpenRouter reality)
+    // =========================================================================
+    // Shapes below are taken from live OpenRouter responses captured 2026-07-31
+    // while diagnosing why a stored, WORKING key produced 386 straight
+    // "error decoding response body" failures and zero successful dreams.
+
+    /// OpenRouter pads a slow reasoning model's response with whitespace
+    /// keep-alive before the JSON — observed live on nemotron-3-ultra.
+    #[test]
+    fn decodes_whitespace_padded_completion() {
+        let body = format!(
+            "{}{}",
+            "\n         \n\n         \n\n         \n",
+            r#"{"id":"gen-1","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"OK","refusal":null,"reasoning":"The user wants OK."}}],"usage":{"prompt_tokens":18,"completion_tokens":20}}"#
+        );
+        assert_eq!(
+            LlmClient::parse_openai_completion(200, &body).expect("padded body must decode"),
+            "OK"
+        );
+    }
+
+    /// Reasoning models may return `content: null` with the text in
+    /// `reasoning`; an empty-success is worse than using what was sent.
+    #[test]
+    fn falls_back_to_reasoning_when_content_is_null() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":null,"reasoning":"Summary: the notes describe minidb progress."}}]}"#;
+        assert_eq!(
+            LlmClient::parse_openai_completion(200, body).expect("reasoning fallback"),
+            "Summary: the notes describe minidb progress."
+        );
+    }
+
+    /// The expensive one: OpenRouter returns HTTP 200 whose body is an error
+    /// envelope (free-tier rate limits, moderation). This must surface as an
+    /// error carrying the API's message — swallowing it as a decode failure is
+    /// what made a working key look absent for two days.
+    #[test]
+    fn surfaces_error_envelope_inside_http_200() {
+        let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day","code":429}}"#;
+        let err = LlmClient::parse_openai_completion(200, body).expect_err("error body is an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Rate limit exceeded"),
+            "the API's own message must survive: {msg}"
+        );
+    }
+
+    /// A body that is neither shape must be reported WITH a snippet of itself.
+    /// "error decoding response body" with no body was the whole two-day bug.
+    #[test]
+    fn undecodable_body_includes_a_snippet() {
+        let err = LlmClient::parse_openai_completion(200, ": OPENROUTER PROCESSING")
+            .expect_err("garbage is an error");
+        assert!(
+            err.to_string().contains("OPENROUTER PROCESSING"),
+            "snippet missing from: {err}"
+        );
+    }
+
+    /// A valid completion with no usable text anywhere is a failure, not an
+    /// empty-string success that would be stored as a real summary.
+    #[test]
+    fn empty_completion_is_an_error_not_empty_success() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"","reasoning":""}}]}"#;
+        assert!(LlmClient::parse_openai_completion(200, body).is_err());
     }
 }
