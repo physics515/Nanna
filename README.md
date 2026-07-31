@@ -201,11 +201,17 @@ cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture liv
 
 ### Endurance (42 features)
 
-| Model | Size | Verified | Steps | Tokens | Wall clock | Provider incidents |
-|---|---|---|---|---|---|---|
-| lfm2.5 | 5.2 GB | **1 / 42** | 497 | 5.5 M | 19 min | 0 |
-| gemma4:12b | 7.6 GB | _pending_ | — | — | — | — |
-| qwen3:4b | 2.5 GB | _pending_ | — | — | — | — |
+**Frozen-harness series, 2026-07-30/31** — every model ran the identical harness (paged tool
+discovery, `num_ctx=16384`, read-only tests, 4-hour snapshot scored from a pristine copy), driven
+through the GUI chat like a real user session:
+
+| Model | Size | Verified at 4 h | Notes |
+|---|---|---|---|
+| qwen3.5:9b | 6.7 GB | **32 / 42** | beat the prior 31/42 reference; wall at test_22; 0 CUDA faults |
+| lfm2.5 | 5.2 GB | **2 / 42** | never passed test_01; read-loop profile (1,129 reads vs 18 edits at 1 h) |
+| gemma4:12b | 7.6 GB | **DNF** | CUDA fault spiral under desktop VRAM pressure; still faults + demotes off 16 k on a quiet card |
+
+Earlier single-run data (pre-series harness): lfm2.5 1/42 · 497 steps · 5.5 M tokens · 19 min.
 
 **Verified** counts only features whose acceptance check passed. Do not read the harness's
 in-flight `done=N` counter as a score — it counts *closed* tasks, and closed includes **cancelled**:

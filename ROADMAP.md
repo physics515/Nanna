@@ -2752,6 +2752,67 @@ summary, holding `live_long_horizon-*.exe` and failing every later build with `L
 function completes but the runtime never exits (suspect a lingering spawned task / connection pool).
 Until fixed, kill stale `live_long_horizon*` processes before rebuilding.
 
+#### P20 frozen-harness series (2026-07-30/31, shipped in v0.3.0) — the harness carries a mid model to reference quality
+
+GUI-driven (owner: *"we never run headless — we want to test what the user sees"*), identical
+conditions per model (paged discovery, `num_ctx=16384`, read-only tests, detached 4-hour snapshot
+scorer). **Official: qwen3.5:9b 32/42 — beat the 31/42 reference. gemma4:12b DNF (infra).
+lfm2.5 2/42.** What the series surfaced and fixed:
+
+- [x] **Explicit context size beats the VRAM heuristic** — the heuristic silently promoted a
+      deliberate 16384 to a computed 32768 and the same model on the same mission fell 31/42 → 8/42;
+      a wider window is not a better one for a 9 B model. `NANNA_OLLAMA_NUM_CTX` now wins; the
+      fault-driven demotion ladder handles genuinely-oversized values. (PR #129)
+- [x] **Tool discovery pages by default** — `discover_tools(query:"all")` used to activate the whole
+      30-tool catalogue; every later request carried all 30 definitions and gemma spent 2 h in
+      wonder/web_search without creating the artifact (58 self-invented tasks incl. "Explore Solar
+      Energy concepts"). Ranked search, 6/page (derived: core 4 + 6 = top of the 5–10 band small
+      models handle), partial lists announce themselves. Cross-turn carry-forward was tried and
+      REVERTED — carrying all activated tools forward reproduced the same overload. (PR #129)
+- [x] **Stop aborts the in-flight step** — clicked twice on a live run with no effect; the flag was
+      only checked at step boundaries. (PR #127)
+- [x] **Empty assistant bubbles eliminated** — stray newline deltas / bare `TASK COMPLETE` markers
+      opened text segments that rendered as blank "☽ Nanna" cards. (PR #129, RunTimeline tests)
+- [x] **`explore` told the truth for the first time** — reported "0 directories, 0 files" for every
+      real directory (depth computed against absolute paths); lfm looped on it 204 times in 80 min.
+      (PR #128)
+- [x] **OpenRouter responses decode as they actually arrive** — whitespace keep-alive padding,
+      `content:null` reasoning bodies, and HTTP-200 `{"error":…}` envelopes all died as reqwest's
+      opaque "error decoding response body" (386×/day, 0 dreams ever); a stored, WORKING key looked
+      absent for two days and the owner kept re-entering it. Bodies parse deliberately now and
+      undecodable ones carry a snippet of themselves. (PR #130)
+- [x] **Rate limits classified, spaced, and learned** — 200-wrapped 429s classify as `RateLimit`
+      (embedded code beats transport status; both "rate_limit" and "Rate limit" spellings) and engage
+      the existing backoff; provider-level pacing shares one clock per provider across every caller;
+      the static published-limit spacings (OpenRouter 3 s, GitHub 4 s) are only priors — each
+      response's `x-ratelimit-*` headers re-teach the budget, spread evenly across the live window.
+      (PRs #131–#133)
+- [x] **Workspaces sync live** — daemon `WorkspacesChanged` event + GUI read-through listing; a
+      workspace registered after GUI launch used to stay invisible until restart. Registration is
+      global state, activation stays per-client (multi-workspace concurrency is a feature, not a
+      bug — owner). (PR #129)
+- [x] **Autonomy resilience at the bench layer** — tests `chmod -w` (lfm attempted to edit the spec
+      via `file_buffer` staging; blocked, originals byte-intact), `exec` refuses clobbering redirects
+      over ratchet-protected files, escalating fork refusals, snapshot scoring with per-test
+      timeouts (a looping WIP implementation hung the scorer once).
+
+**Open from the series:**
+- [ ] **Step-boundary stalls** — memory-maintenance storms at step boundaries stalled qwen 40 min
+      (self-recovered) and killed lfm's tail (dream-summarizer congestion loop, never recovered).
+      Root cause was the OpenRouter decode bug above; verify the fix ends the stalls on the next
+      long run's dream lines.
+- [ ] **gemma4:12b is unstable on this card** — quiet-desktop midnight run cut faults 15-per-29-min
+      → ~4/h (desktop VRAM pressure confirmed as the spiral trigger) but it still faulted and
+      demoted off 16 k while alone on the card, froze its artifact at 571 B after 19 min. Needs a
+      driver/llama.cpp investigation before its number means anything.
+- [ ] **tests-dir gap** — `chmod -w` locks files but the DIRECTORY stays writable (lfm dropped
+      staging debris beside the specs). Lock the dir for future series.
+- [ ] **GUI stale pane on workspace switch** — selecting a workspace keeps rendering the previous
+      session's chat until a new chat is created.
+- [ ] **Killed runs orphan `llama-server`** — holds GB of VRAM invisibly (`ollama ps` stops listing
+      it; `keep_alive=0` doesn't reclaim it); wrote off gemma for a day. Sweep by process name
+      before sizing anything.
+
 ---
 
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
