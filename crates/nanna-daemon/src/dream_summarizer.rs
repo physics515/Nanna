@@ -13,45 +13,12 @@
 use crate::llm_router::LlmRouter;
 use nanna_llm::RequestBuilder;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-/// Minimum spacing between consecutive OpenRouter requests from dream cycles.
-///
-/// OpenRouter's free tier allows 20 requests per minute; 60s / 20 = 3s. The
-/// bound is the published limit, not a tuning knob. A dream cycle issues one
-/// request per cluster back to back, and before this gate existed the first
-/// working cycle spent its entire minute budget in about one second and lost
-/// 20 of 22 clusters to 429s. Reactive backoff cleans up after that mistake;
-/// this stops it being made.
-const OPENROUTER_MIN_SPACING: tokio::time::Duration = tokio::time::Duration::from_secs(3);
-
-/// When the previous OpenRouter-bound request was issued, across every dream
-/// cluster and cycle in the process. `tokio::time::Instant` so tests can drive
-/// it with paused time.
-static LAST_OPENROUTER_REQUEST: OnceLock<tokio::sync::Mutex<Option<tokio::time::Instant>>> =
-    OnceLock::new();
-
-/// Hold OpenRouter-bound requests to [`OPENROUTER_MIN_SPACING`].
-///
-/// Non-OpenRouter models pass through untouched — local Ollama has no request
-/// quota, and stalling it 3s per cluster would slow every dream for no reason.
-/// The lock is held across the sleep deliberately: concurrent callers must
-/// serialize, or they would all measure from the same "last" stamp and fire
-/// together anyway.
-async fn respect_provider_spacing(model: &str) {
-    if !model.starts_with("openrouter/") {
-        return;
-    }
-    let gate = LAST_OPENROUTER_REQUEST.get_or_init(|| tokio::sync::Mutex::new(None));
-    let mut last = gate.lock().await;
-    if let Some(prev) = *last {
-        let elapsed = prev.elapsed();
-        if elapsed < OPENROUTER_MIN_SPACING {
-            tokio::time::sleep(OPENROUTER_MIN_SPACING - elapsed).await;
-        }
-    }
-    *last = Some(tokio::time::Instant::now());
-}
+// NOTE: request pacing for rate-limited providers is NOT done here. It lives
+// at the provider level in `nanna_llm::pace_openrouter`, awaited inside every
+// OpenRouter-bound request path — so chat, dream summarization, and any future
+// caller draw from one shared clock instead of pacing themselves and
+// collectively burning the same quota.
 
 /// Smallest summarizer context window we will ever size a cluster against.
 ///
@@ -179,7 +146,6 @@ pub fn summarize_with_failover(
                 let mut congested = 0usize;
 
                 for model in &models {
-                    respect_provider_spacing(model).await;
                     let request = nanna_llm::CompletionRequest::default()
                         .with_model(model)
                         .with_message(nanna_llm::Message::user(&prompt));
@@ -278,34 +244,4 @@ mod tests {
         assert!(!summarization_models(&[], &v(&["b"])).is_empty());
     }
 
-    /// Back-to-back OpenRouter requests must be held to the derived 3s spacing
-    /// (20/min free tier) — the first working dream cycle fired one request per
-    /// cluster in the same second and lost 20 of 22 clusters to 429s.
-    #[tokio::test(start_paused = true)]
-    async fn openrouter_requests_are_spaced() {
-        let t0 = tokio::time::Instant::now();
-        respect_provider_spacing("openrouter/openrouter/free").await;
-        respect_provider_spacing("openrouter/nvidia/nemotron:free").await;
-        respect_provider_spacing("openrouter/openrouter/free").await;
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed >= OPENROUTER_MIN_SPACING * 2,
-            "three consecutive calls must span at least two spacing intervals, got {elapsed:?}"
-        );
-    }
-
-    /// Local models have no quota; stalling them would slow every dream for
-    /// nothing.
-    #[tokio::test(start_paused = true)]
-    async fn local_models_are_never_stalled() {
-        let t0 = tokio::time::Instant::now();
-        for _ in 0..5 {
-            respect_provider_spacing("ollama/qwen3.5:9b").await;
-        }
-        assert_eq!(
-            t0.elapsed(),
-            tokio::time::Duration::ZERO,
-            "non-OpenRouter models must pass through untouched"
-        );
-    }
 }
