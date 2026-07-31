@@ -587,6 +587,58 @@ impl LlmError {
     }
 }
 
+// =============================================================================
+// Provider request pacing
+// =============================================================================
+//
+// Enforced at the PROVIDER level so every caller that routes through a
+// rate-limited provider — chat, dream summarization, embeddings, anything —
+// draws from ONE clock per provider instead of each pacing itself and
+// collectively burning the shared quota. (The gate first lived in the dream
+// summarizer alone, which protected dreams and nobody else; the observed
+// failure was a dream cycle firing one request per cluster in the same second
+// and losing 20 of 22 clusters to 429s.)
+
+/// One pacing clock per paced provider. Separate mutexes, not one map behind
+/// one lock: the lock is held across the pacing sleep deliberately (concurrent
+/// same-provider callers must serialize, or they all measure from the same
+/// "last" stamp and fire together), and holding a shared lock across that
+/// sleep would stall OTHER providers for no reason.
+fn pace_gate(provider: Provider) -> Option<&'static tokio::sync::Mutex<Option<tokio::time::Instant>>> {
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+    static OPENROUTER: OnceLock<Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
+    static GITHUB: OnceLock<Mutex<Option<tokio::time::Instant>>> = OnceLock::new();
+    match provider {
+        Provider::OpenRouter => Some(OPENROUTER.get_or_init(|| Mutex::new(None))),
+        Provider::GitHubModels => Some(GITHUB.get_or_init(|| Mutex::new(None))),
+        _ => None,
+    }
+}
+
+/// Hold a request to `provider` until its published minimum spacing has passed
+/// since the previous one, process-wide across all clients and callers.
+///
+/// Public so callers that reach a paced provider WITHOUT an [`LlmClient`]
+/// (a future embedding path, for instance) can share the same clock. No-op
+/// for providers without a published quota.
+pub async fn pace_provider_requests(provider: Provider) {
+    let Some(spacing) = provider.min_request_spacing() else {
+        return;
+    };
+    let Some(gate) = pace_gate(provider) else {
+        return;
+    };
+    let mut last = gate.lock().await;
+    if let Some(prev) = *last {
+        let elapsed = prev.elapsed();
+        if elapsed < spacing {
+            tokio::time::sleep(spacing - elapsed).await;
+        }
+    }
+    *last = Some(tokio::time::Instant::now());
+}
+
 /// LLM Provider
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -597,6 +649,34 @@ pub enum Provider {
     /// Claude Max/Pro proxy (OpenAI-compatible, uses claude-max-api-proxy)
     ClaudeProxy,
     Ollama,
+}
+
+impl Provider {
+    /// Minimum spacing between consecutive requests to this provider, derived
+    /// from the provider's PUBLISHED request-per-minute quota — never a tuning
+    /// knob. `None` means "do not pace", and every `None` is a decision:
+    ///
+    /// - `OpenRouter`: free tier publishes 20 requests/minute → 60s/20 = 3s.
+    ///   The free `:free` models are what this codebase configures.
+    /// - `GitHubModels`: free tier publishes 15 requests/minute → 60s/15 = 4s.
+    /// - `Anthropic` / `OpenAI`: limits are ACCOUNT-TIER dependent (Anthropic
+    ///   tier 1 is 50 RPM, tier 4 is 4000; OpenAI similar). Pacing everyone to
+    ///   the lowest tier would throttle paid accounts in the chat hot path for
+    ///   no reason; both providers answer bursts with 429 + retry-after, which
+    ///   the reactive layer honors. Proactive pacing here would need the
+    ///   account's actual tier, which nothing exposes.
+    /// - `ClaudeProxy`: fronts an Anthropic subscription; same reasoning.
+    /// - `Ollama`: local — the only quota is the GPU itself.
+    #[must_use]
+    pub const fn min_request_spacing(self) -> Option<tokio::time::Duration> {
+        match self {
+            Provider::OpenRouter => Some(tokio::time::Duration::from_secs(3)),
+            Provider::GitHubModels => Some(tokio::time::Duration::from_secs(4)),
+            Provider::Anthropic | Provider::OpenAI | Provider::ClaudeProxy | Provider::Ollama => {
+                None
+            }
+        }
+    }
 }
 
 /// Message role
@@ -1972,6 +2052,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Native Anthropic API implementation for complete_anthropic
     async fn complete_anthropic_native(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        pace_provider_requests(self.provider).await;
         let is_oauth = self.is_oauth();
 
         // Store original tools for reverse mapping
@@ -2048,6 +2129,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Convert AnthropicRequest → OpenAI chat completions and execute
     async fn complete_anthropic_via_openai(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        pace_provider_requests(self.provider).await;
         let (messages_json, tools_json) = anthropic_to_openai_request(request);
 
         let mut body = serde_json::json!({
@@ -2095,6 +2177,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     /// Convert AnthropicRequest → Ollama /api/chat and execute
     async fn complete_anthropic_via_ollama(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        pace_provider_requests(self.provider).await;
         let (messages_json, tools_json) = anthropic_to_ollama_request(request);
 
         let mut body = serde_json::json!({
@@ -2263,6 +2346,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     async fn complete_openai(&self, request: &CompletionRequest) -> Result<String, LlmError> {
+        pace_provider_requests(self.provider).await;
         #[derive(Serialize)]
         struct OpenAIRequest<'a> {
             model: &'a str,
@@ -2403,6 +2487,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     }
 
     async fn complete_ollama(&self, request: &CompletionRequest) -> Result<String, LlmError> {
+        pace_provider_requests(self.provider).await;
         // Ollama uses a slightly different format from OpenAI
         #[derive(Serialize)]
         struct OllamaMessage<'a> {
@@ -3371,6 +3456,9 @@ impl LlmClient {
         let request = request.clone();
 
         stream! {
+            // One gate for every streamed request regardless of which backend
+            // serves it — a stream spends the same quota as a completion.
+            pace_provider_requests(provider).await;
             match provider {
                 Provider::Anthropic => {
                     let raw = self.stream_anthropic_native(&request);
@@ -4200,8 +4288,12 @@ impl LlmClient {
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let request = request.clone();
+        let provider = self.provider;
 
         stream! {
+            // Same pacing gate as the non-streaming paths — a streamed chat
+            // request spends the same quota as any other.
+            pace_provider_requests(provider).await;
             // === Request types ===
             #[derive(Serialize)]
             struct OpenAIMessage {
@@ -5724,7 +5816,7 @@ mod tests {
 
 #[cfg(test)]
 mod gemma_sentinel_tests {
-    use super::LlmClient;
+    use super::{pace_provider_requests, LlmClient, Provider};
 
     /// The exact payload that cost a benchmark run: gemma4:12b emitted
     /// `<unused50>` as assistant content and Ollama closed the stream with no
@@ -5869,5 +5961,62 @@ mod gemma_sentinel_tests {
     fn empty_completion_is_an_error_not_empty_success() {
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"","reasoning":""}}]}"#;
         assert!(LlmClient::parse_openai_completion(200, body).is_err());
+    }
+
+    // =========================================================================
+    // Provider request pacing
+    // =========================================================================
+
+    /// Back-to-back requests to a paced provider must be held to its derived
+    /// spacing — the first working dream cycle fired one request per cluster
+    /// in the same second and lost 20 of 22 clusters to 429s.
+    #[tokio::test(start_paused = true)]
+    async fn paced_provider_requests_are_spaced() {
+        let spacing = Provider::OpenRouter
+            .min_request_spacing()
+            .expect("OpenRouter is paced");
+        let t0 = tokio::time::Instant::now();
+        pace_provider_requests(Provider::OpenRouter).await;
+        pace_provider_requests(Provider::OpenRouter).await;
+        pace_provider_requests(Provider::OpenRouter).await;
+        assert!(
+            t0.elapsed() >= spacing * 2,
+            "three consecutive calls must span two intervals, got {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// Each paced provider has its OWN clock: pacing one must not delay the
+    /// other, or the gate reintroduces the cross-caller contention it exists
+    /// to remove.
+    ///
+    /// Measured on `GitHubModels`, which no OTHER test touches — the clocks
+    /// are process-global and the paced-spacing test stamps OpenRouter's, so
+    /// measuring OpenRouter here would depend on test ordering.
+    #[tokio::test(start_paused = true)]
+    async fn provider_clocks_are_independent() {
+        pace_provider_requests(Provider::OpenRouter).await;
+        let t0 = tokio::time::Instant::now();
+        // GitHub's first-ever call: its own (empty) clock is what matters;
+        // OpenRouter's just-stamped clock must not be consulted.
+        pace_provider_requests(Provider::GitHubModels).await;
+        assert_eq!(
+            t0.elapsed(),
+            tokio::time::Duration::ZERO,
+            "a different provider's clock must not impose a wait"
+        );
+    }
+
+    /// Providers without a published quota are never stalled: local Ollama's
+    /// only quota is the GPU, and tier-dependent clouds are handled reactively.
+    #[tokio::test(start_paused = true)]
+    async fn unpaced_providers_are_never_stalled() {
+        let t0 = tokio::time::Instant::now();
+        for _ in 0..5 {
+            pace_provider_requests(Provider::Ollama).await;
+            pace_provider_requests(Provider::Anthropic).await;
+            pace_provider_requests(Provider::ClaudeProxy).await;
+        }
+        assert_eq!(t0.elapsed(), tokio::time::Duration::ZERO);
     }
 }

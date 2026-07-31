@@ -26,3 +26,8 @@ nanna-config = { path = "../nanna-config", optional = true }
 
 # Optional exact OpenAI token counting
 tiktoken-rs = { version = "0.12", optional = true }
+
+[dev-dependencies]
+# `start_paused` virtual-time tests for the OpenRouter request-spacing gate —
+# real 3s sleeps in tests would be the slow alternative.
+tokio = { workspace = true, features = ["test-util"] }
