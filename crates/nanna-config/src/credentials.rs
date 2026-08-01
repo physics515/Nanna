@@ -28,6 +28,8 @@ const KEYRING_SERVICE: &str = "nanna";
 /// Credential key names
 pub mod keys {
     pub const ANTHROPIC_API_KEY: &str = "anthropic_api_key";
+    pub const ANTHROPIC_OAUTH_TOKEN: &str = "anthropic_oauth_token";
+    pub const OLLAMA_API_KEY: &str = "ollama_api_key";
     pub const OPENAI_API_KEY: &str = "openai_api_key";
     pub const OPENROUTER_API_KEY: &str = "openrouter_api_key";
     pub const GITHUB_TOKEN: &str = "github_token";

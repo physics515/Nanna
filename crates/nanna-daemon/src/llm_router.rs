@@ -5,15 +5,17 @@
 //! Includes health-aware model selection (stats-informed routing).
 
 use nanna_agent::ModelStatsTracker;
+use nanna_config::ClaudeCredentialManager;
+use nanna_config::credentials::{SecureStore, keys};
 use nanna_llm::{LlmClient, ModelInfo, ModelInfoCache, CompletionRequest, LlmError};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, debug, warn};
 
 /// Provider identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProviderId {
     Anthropic,
     OpenAI,
@@ -23,6 +25,18 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
+    /// Stable lowercase name, matching the provider ids the GUI uses
+    /// (`anthropic`, `openai`, `openrouter`, `github`, `ollama`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            ProviderId::Anthropic => "anthropic",
+            ProviderId::OpenAI => "openai",
+            ProviderId::OpenRouter => "openrouter",
+            ProviderId::GitHubModels => "github",
+            ProviderId::Ollama => "ollama",
+        }
+    }
+
     /// Parse provider from model string prefix
     pub fn from_model(model: &str) -> Self {
         let lower = model.to_lowercase();
@@ -96,22 +110,17 @@ impl ModelHealth {
 
 /// Multi-provider LLM router
 pub struct LlmRouter {
-    /// Available providers and their clients
-    providers: HashMap<ProviderId, Arc<LlmClient>>,
+    /// Available providers and their clients.
+    ///
+    /// Behind a lock so the provider set can be rebuilt at runtime (config
+    /// reload after the user authenticates a new provider) while the router is
+    /// shared as `Arc<LlmRouter>` across the daemon. Guards are held only for
+    /// map access — never across an await — so a std lock suffices.
+    providers: RwLock<HashMap<ProviderId, Arc<LlmClient>>>,
     /// Model info cache
     model_cache: Option<ModelInfoCache>,
     /// Shared model stats tracker for health-aware routing (set post-init)
     stats: Arc<tokio::sync::RwLock<Option<ModelStatsTracker>>>,
-}
-
-impl Clone for LlmRouter {
-    fn clone(&self) -> Self {
-        Self {
-            providers: self.providers.clone(),
-            model_cache: self.model_cache.clone(),
-            stats: self.stats.clone(),
-        }
-    }
 }
 
 impl LlmRouter {
@@ -119,7 +128,7 @@ impl LlmRouter {
     pub fn new() -> Self {
         let model_cache = ModelInfoCache::default_location();
         Self {
-            providers: HashMap::new(),
+            providers: RwLock::new(HashMap::new()),
             model_cache,
             stats: Arc::new(tokio::sync::RwLock::new(None)),
         }
@@ -130,75 +139,186 @@ impl LlmRouter {
         *self.stats.write().await = Some(stats);
     }
 
+    fn insert_provider(&self, provider: ProviderId, client: LlmClient) {
+        self.providers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(provider, Arc::new(client));
+    }
+
+    /// Snapshot the client for one provider (guard dropped before return, so
+    /// callers can await on the client freely).
+    fn client_for(&self, provider: ProviderId) -> Option<Arc<LlmClient>> {
+        self.providers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&provider)
+            .cloned()
+    }
+
+    /// Rebuild the provider set from resolved credentials, replacing the
+    /// current map. Safe to call on a shared `Arc<LlmRouter>`; requests
+    /// in flight keep the client `Arc` they already snapshotted.
+    ///
+    /// Returns `(added, removed)` provider ids (sorted) and logs the diff —
+    /// this is the runtime path that config reload drives, so a provider the
+    /// user authenticates after boot registers without a daemon restart.
+    pub fn rebuild(&self, creds: &ProviderCredentials) -> (Vec<ProviderId>, Vec<ProviderId>) {
+        let mut new_map: HashMap<ProviderId, Arc<LlmClient>> = HashMap::new();
+
+        match &creds.anthropic {
+            Some(AnthropicCredential::OAuth(token)) => {
+                new_map.insert(
+                    ProviderId::Anthropic,
+                    Arc::new(LlmClient::anthropic_oauth(token)),
+                );
+            }
+            Some(AnthropicCredential::ApiKey(key)) => {
+                new_map.insert(ProviderId::Anthropic, Arc::new(LlmClient::anthropic(key)));
+            }
+            None => {}
+        }
+        if let Some(ref key) = creds.openai_api_key {
+            new_map.insert(ProviderId::OpenAI, Arc::new(LlmClient::openai(key)));
+        }
+        if let Some(ref key) = creds.openrouter_api_key {
+            new_map.insert(ProviderId::OpenRouter, Arc::new(LlmClient::openrouter(key)));
+        }
+        if let Some(ref token) = creds.github_token {
+            new_map.insert(
+                ProviderId::GitHubModels,
+                Arc::new(LlmClient::github_models(token)),
+            );
+        }
+        // Ollama needs no credential: a local instance is always addressable.
+        let ollama = match creds.ollama_api_key {
+            Some(ref key) => LlmClient::ollama_with_key(&creds.ollama_host, key),
+            None => LlmClient::ollama(&creds.ollama_host),
+        };
+        new_map.insert(ProviderId::Ollama, Arc::new(ollama));
+
+        let (mut added, mut removed) = {
+            let mut guard = self
+                .providers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let added: Vec<ProviderId> = new_map
+                .keys()
+                .filter(|p| !guard.contains_key(p))
+                .copied()
+                .collect();
+            let removed: Vec<ProviderId> = guard
+                .keys()
+                .filter(|p| !new_map.contains_key(p))
+                .copied()
+                .collect();
+            *guard = new_map;
+            (added, removed)
+        };
+        added.sort_unstable();
+        removed.sort_unstable();
+
+        if added.is_empty() && removed.is_empty() {
+            debug!("LLM provider rebuild: no membership change");
+        } else {
+            info!(
+                "LLM provider rebuild: added={:?}, removed={:?}, now={:?}",
+                added,
+                removed,
+                self.available_providers_sorted()
+            );
+        }
+        (added, removed)
+    }
+
     /// Add an Anthropic provider
-    pub fn with_anthropic(mut self, api_key: &str) -> Self {
+    pub fn with_anthropic(self, api_key: &str) -> Self {
         info!("Adding Anthropic provider to router");
-        self.providers.insert(ProviderId::Anthropic, Arc::new(LlmClient::anthropic(api_key)));
+        self.insert_provider(ProviderId::Anthropic, LlmClient::anthropic(api_key));
         self
     }
 
     /// Add an Anthropic provider with OAuth
-    pub fn with_anthropic_oauth(mut self, oauth_token: &str) -> Self {
+    pub fn with_anthropic_oauth(self, oauth_token: &str) -> Self {
         info!("Adding Anthropic OAuth provider to router");
-        self.providers.insert(ProviderId::Anthropic, Arc::new(LlmClient::anthropic_oauth(oauth_token)));
+        self.insert_provider(
+            ProviderId::Anthropic,
+            LlmClient::anthropic_oauth(oauth_token),
+        );
         self
     }
 
     /// Add an OpenAI provider
-    pub fn with_openai(mut self, api_key: &str) -> Self {
+    pub fn with_openai(self, api_key: &str) -> Self {
         info!("Adding OpenAI provider to router");
-        self.providers.insert(ProviderId::OpenAI, Arc::new(LlmClient::openai(api_key)));
+        self.insert_provider(ProviderId::OpenAI, LlmClient::openai(api_key));
         self
     }
 
     /// Add an OpenRouter provider
-    pub fn with_openrouter(mut self, api_key: &str) -> Self {
+    pub fn with_openrouter(self, api_key: &str) -> Self {
         info!("Adding OpenRouter provider to router");
-        self.providers.insert(ProviderId::OpenRouter, Arc::new(LlmClient::openrouter(api_key)));
+        self.insert_provider(ProviderId::OpenRouter, LlmClient::openrouter(api_key));
         self
     }
 
     /// Add a GitHub Models provider
-    pub fn with_github_models(mut self, token: &str) -> Self {
+    pub fn with_github_models(self, token: &str) -> Self {
         info!("Adding GitHub Models provider to router");
-        self.providers.insert(ProviderId::GitHubModels, Arc::new(LlmClient::github_models(token)));
+        self.insert_provider(ProviderId::GitHubModels, LlmClient::github_models(token));
         self
     }
 
     /// Add an Ollama provider
-    pub fn with_ollama(mut self, host: &str) -> Self {
+    pub fn with_ollama(self, host: &str) -> Self {
         info!("Adding Ollama provider to router");
-        self.providers.insert(ProviderId::Ollama, Arc::new(LlmClient::ollama(host)));
+        self.insert_provider(ProviderId::Ollama, LlmClient::ollama(host));
         self
     }
 
     /// Add an Ollama provider with API key authentication
-    pub fn with_ollama_authenticated(mut self, host: &str, api_key: &str) -> Self {
+    pub fn with_ollama_authenticated(self, host: &str, api_key: &str) -> Self {
         info!("Adding Ollama provider to router (authenticated)");
-        self.providers.insert(ProviderId::Ollama, Arc::new(LlmClient::ollama_with_key(host, api_key)));
+        self.insert_provider(
+            ProviderId::Ollama,
+            LlmClient::ollama_with_key(host, api_key),
+        );
         self
     }
 
     /// Check if a provider is available
     pub fn has_provider(&self, provider: ProviderId) -> bool {
-        self.providers.contains_key(&provider)
+        self.providers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&provider)
     }
 
     /// Get all available providers
     pub fn available_providers(&self) -> Vec<ProviderId> {
-        self.providers.keys().copied().collect()
+        self.providers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// All available providers, sorted — for stable log lines and IPC payloads.
+    pub fn available_providers_sorted(&self) -> Vec<ProviderId> {
+        let mut providers = self.available_providers();
+        providers.sort_unstable();
+        providers
     }
 
     /// Check if we can handle a given model
     pub fn can_handle(&self, model: &str) -> bool {
-        let provider = ProviderId::from_model(model);
-        self.providers.contains_key(&provider)
+        self.client_for(ProviderId::from_model(model)).is_some()
     }
 
     /// Get the client for a model
     pub fn client_for_model(&self, model: &str) -> Option<Arc<LlmClient>> {
-        let provider = ProviderId::from_model(model);
-        self.providers.get(&provider).cloned()
+        self.client_for(ProviderId::from_model(model))
     }
 
     /// Strip provider prefix from a model name.
@@ -212,15 +332,15 @@ impl LlmRouter {
     /// Used for sub-agent spawning where we need a client but don't know the model yet.
     pub fn primary_client(&self) -> Option<Arc<LlmClient>> {
         // Priority order: Anthropic > OpenAI > OpenRouter > GitHub > Ollama
-        for provider in &[
+        for provider in [
             ProviderId::Anthropic,
             ProviderId::OpenAI,
             ProviderId::OpenRouter,
             ProviderId::GitHubModels,
             ProviderId::Ollama,
         ] {
-            if let Some(client) = self.providers.get(provider) {
-                return Some(client.clone());
+            if let Some(client) = self.client_for(provider) {
+                return Some(client);
             }
         }
         None
@@ -233,7 +353,7 @@ impl LlmRouter {
 
         debug!("Getting model info for {} via {:?}", actual_model, provider);
 
-        if let Some(client) = self.providers.get(&provider) {
+        if let Some(client) = self.client_for(provider) {
             client.get_model_info(actual_model, self.model_cache.as_ref()).await
         } else {
             // Provider client missing: cache first, else universal floor (no name table).
@@ -367,7 +487,8 @@ impl LlmRouter {
 
         debug!("Routing completion for {} to {:?}", actual_model, provider);
 
-        let client = self.providers.get(&provider)
+        let client = self
+            .client_for(provider)
             .ok_or_else(|| LlmError::MissingApiKey(format!("{:?}", provider)))?;
 
         // Update model in request
@@ -384,9 +505,179 @@ impl Default for LlmRouter {
     }
 }
 
+/// The one resolved credential the Anthropic provider will use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnthropicCredential {
+    /// OAuth access token (Claude Pro/Max via `claude setup-token` / CLI login)
+    OAuth(String),
+    /// Plain API key
+    ApiKey(String),
+}
+
+/// Credentials resolved for provider construction.
+///
+/// Resolution (config → keyring → Claude CLI) is separated from client
+/// construction ([`LlmRouter::rebuild`]) so construction is deterministic and
+/// unit-testable, and so boot and config-reload share one chain instead of the
+/// reload silently skipping registration (the boot-only split-brain this
+/// module used to have).
+#[derive(Debug, Clone)]
+pub struct ProviderCredentials {
+    pub anthropic: Option<AnthropicCredential>,
+    pub openai_api_key: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub github_token: Option<String>,
+    pub ollama_host: String,
+    pub ollama_api_key: Option<String>,
+}
+
+/// `Some(trimmed)` only for a non-blank value — a `Some("")` credential must
+/// not register a provider that then fails every call.
+fn non_empty(value: Option<&String>) -> Option<String> {
+    value
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(String::from)
+}
+
+/// Keyring lookup with the same non-blank rule as config values.
+fn store_credential(store: &SecureStore, key: &str) -> Option<String> {
+    store.get(key).ok().and_then(|v| non_empty(Some(&v)))
+}
+
+/// Load the Claude CLI's OAuth credential, refreshing it first if it has
+/// expired. The daemon used to hand the raw access token to the router with no
+/// expiry check, so a stale CLI login produced a provider whose every call 401'd.
+async fn claude_cli_oauth_token() -> Option<String> {
+    let manager = ClaudeCredentialManager::new();
+    let loaded = manager.load().ok()?;
+    if !loaded.credential.is_expired() {
+        return Some(loaded.credential.access_token);
+    }
+    if !loaded.credential.can_refresh() {
+        warn!(
+            "Claude CLI OAuth token is expired and has no refresh token; skipping Anthropic provider"
+        );
+        return None;
+    }
+    match manager.refresh_token(&loaded.credential).await {
+        Ok(refreshed) => {
+            if let Err(e) = manager.save(&refreshed, loaded.source) {
+                warn!("Refreshed Claude CLI OAuth token but failed to save it: {e}");
+            }
+            info!("Refreshed expired Claude CLI OAuth token for Anthropic provider");
+            Some(refreshed.access_token)
+        }
+        Err(e) => {
+            warn!("Claude CLI OAuth token expired and refresh failed: {e}");
+            None
+        }
+    }
+}
+
+impl ProviderCredentials {
+    /// Resolve provider credentials from the daemon's LLM config, falling back
+    /// to the OS keyring and finally the Claude CLI's own credentials.
+    ///
+    /// Per provider, first source wins:
+    /// - Anthropic: config OAuth token (when OAuth mode is on) → keyring OAuth
+    ///   token → config API key → keyring API key → Claude CLI OAuth (refreshed
+    ///   when expired). An enabled OAuth flag with a missing token falls
+    ///   through — the boot chain used to dead-end there, registering no
+    ///   Anthropic provider even though the CLI held valid credentials.
+    /// - OpenAI / OpenRouter / GitHub: config key → keyring key.
+    /// - Ollama: always present (host needs no credential; blank key = anonymous).
+    pub async fn resolve(llm: &crate::server::LlmConfig) -> Self {
+        let store = SecureStore::new();
+
+        let anthropic = if llm.anthropic_use_oauth
+            && let Some(token) = non_empty(llm.anthropic_oauth_token.as_ref())
+                .or_else(|| store_credential(&store, keys::ANTHROPIC_OAUTH_TOKEN))
+        {
+            debug!("Anthropic credential: OAuth token from config/keyring");
+            Some(AnthropicCredential::OAuth(token))
+        } else if let Some(key) = non_empty(llm.anthropic_api_key.as_ref())
+            .or_else(|| store_credential(&store, keys::ANTHROPIC_API_KEY))
+        {
+            debug!("Anthropic credential: API key from config/keyring");
+            Some(AnthropicCredential::ApiKey(key))
+        } else if let Some(token) = claude_cli_oauth_token().await {
+            debug!("Anthropic credential: Claude CLI OAuth token");
+            Some(AnthropicCredential::OAuth(token))
+        } else {
+            None
+        };
+
+        Self {
+            anthropic,
+            openai_api_key: non_empty(llm.openai_api_key.as_ref())
+                .or_else(|| store_credential(&store, keys::OPENAI_API_KEY)),
+            openrouter_api_key: non_empty(llm.openrouter_api_key.as_ref())
+                .or_else(|| store_credential(&store, keys::OPENROUTER_API_KEY)),
+            github_token: non_empty(llm.github_token.as_ref())
+                .or_else(|| store_credential(&store, keys::GITHUB_TOKEN)),
+            ollama_host: llm.ollama_host.clone(),
+            ollama_api_key: non_empty(llm.ollama_api_key.as_ref()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ProviderId;
+    use super::{AnthropicCredential, LlmRouter, ProviderCredentials, ProviderId};
+
+    /// The live failure this guards: a provider authenticated after boot must
+    /// register on rebuild (no daemon restart), and one whose credential goes
+    /// away must drop — with the untouched providers staying registered.
+    #[test]
+    fn rebuild_registers_and_removes_providers_at_runtime() {
+        let router = LlmRouter::new();
+        assert!(!router.has_provider(ProviderId::Anthropic));
+        assert!(!router.can_handle("claude-fable-5"));
+
+        let creds = ProviderCredentials {
+            anthropic: Some(AnthropicCredential::OAuth("test-token".into())),
+            openai_api_key: None,
+            openrouter_api_key: Some("sk-or-test".into()),
+            github_token: None,
+            ollama_host: "http://localhost:11434".into(),
+            ollama_api_key: None,
+        };
+        let (added, removed) = router.rebuild(&creds);
+        assert_eq!(
+            added,
+            vec![
+                ProviderId::Anthropic,
+                ProviderId::OpenRouter,
+                ProviderId::Ollama
+            ]
+        );
+        assert!(removed.is_empty());
+        // The exact live symptom: a bare Claude model name must now route.
+        assert!(router.can_handle("claude-fable-5"));
+
+        let creds = ProviderCredentials {
+            anthropic: None,
+            ..creds
+        };
+        let (added, removed) = router.rebuild(&creds);
+        assert!(added.is_empty());
+        assert_eq!(removed, vec![ProviderId::Anthropic]);
+        assert!(!router.can_handle("claude-fable-5"));
+        assert!(router.has_provider(ProviderId::OpenRouter));
+        assert!(router.has_provider(ProviderId::Ollama));
+    }
+
+    #[test]
+    fn blank_credentials_never_count() {
+        // A Some("") key must not register a provider that 401s on every call.
+        assert_eq!(super::non_empty(Some(&"   ".to_string())), None);
+        assert_eq!(super::non_empty(None), None);
+        assert_eq!(
+            super::non_empty(Some(&" sk-x ".to_string())),
+            Some("sk-x".to_string())
+        );
+    }
 
     #[test]
     fn from_model_infers_provider_by_prefix() {

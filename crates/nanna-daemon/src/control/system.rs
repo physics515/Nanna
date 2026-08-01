@@ -29,6 +29,21 @@ impl ControlPlane {
                 let workspace_count = self.workspaces.read().await.len();
                 let scheduler_available = self.scheduler.is_some();
 
+                // The router's live provider set. This is what actually routes
+                // a chat request — the GUI model picker gates on this instead
+                // of its own login state, so the two can't split-brain about
+                // which providers exist.
+                let llm_providers: Vec<&'static str> = self
+                    .router
+                    .as_ref()
+                    .map(|r| {
+                        r.available_providers_sorted()
+                            .into_iter()
+                            .map(crate::llm_router::ProviderId::name)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // Durable-store health: a corrupt row skipped on load leaves the
                 // store degraded — surface it rather than a silent empty store.
                 let (memory_degraded, memory_corrupt_rows) = if let Some(ref m) = self.memory {
@@ -65,6 +80,7 @@ impl ControlPlane {
                     "tools_available": self.tools.is_some(),
                     "tool_count": tool_count,
                     "scheduler_available": scheduler_available,
+                    "llm_providers": llm_providers,
                     "config_path": self.config_path,
                 })
             }

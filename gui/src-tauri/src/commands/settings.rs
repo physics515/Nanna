@@ -424,6 +424,20 @@ pub async fn set_provider_api_key(
 // Anthropic OAuth Login (via `claude setup-token`)
 // =============================================================================
 
+/// Persist the OAuth token where the daemon can actually read it back.
+///
+/// `Config::save()` strips secrets from the file on disk; the OS keyring is
+/// the durable home `Config::load()` re-hydrates from. Without this
+/// write-through the token lived only in the GUI's process memory — the
+/// daemon's config reload found `anthropic_use_oauth = true` with no token
+/// anywhere, so no Anthropic provider ever registered.
+fn persist_oauth_token_to_keyring(token: &str) {
+    use nanna_config::credentials::{SecureStore, keys};
+    if let Err(e) = SecureStore::new().set(keys::ANTHROPIC_OAUTH_TOKEN, token) {
+        error!("Failed to store OAuth token in keyring: {e}");
+    }
+}
+
 /// Run `claude setup-token` to authenticate via Claude Code CLI
 /// This opens a browser for OAuth, then imports the resulting credentials
 #[tauri::command]
@@ -458,6 +472,7 @@ pub async fn run_claude_setup_token(
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
+    persist_oauth_token_to_keyring(&loaded.credential.access_token);
 
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save OAuth token: {}", e);
@@ -500,6 +515,7 @@ pub async fn import_claude_code_credentials(
             let mut state_guard = state.write().await;
             state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
             state_guard.config.llm.anthropic_use_oauth = true;
+            persist_oauth_token_to_keyring(&refreshed.access_token);
 
             if let Err(e) = state_guard.config.save() {
                 error!("Failed to save config: {}", e);
@@ -522,8 +538,9 @@ pub async fn import_claude_code_credentials(
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
+    persist_oauth_token_to_keyring(&loaded.credential.access_token);
 
-    // Persist to config (the daemon rebuilds its LLM client on reload)
+    // Persist to config (the daemon rebuilds its LLM providers on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save OAuth token: {}", e);
     }
@@ -549,8 +566,9 @@ pub async fn save_anthropic_oauth_token(
     // Save the token and enable OAuth mode
     state_guard.config.llm.anthropic_oauth_token = Some(token.clone());
     state_guard.config.llm.anthropic_use_oauth = true;
+    persist_oauth_token_to_keyring(&token);
 
-    // Persist to config (the daemon rebuilds its LLM client on reload)
+    // Persist to config (the daemon rebuilds its LLM providers on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save OAuth token: {}", e);
     }
@@ -570,7 +588,17 @@ pub async fn logout_anthropic_oauth(
     state_guard.config.llm.anthropic_oauth_token = None;
     state_guard.config.llm.anthropic_use_oauth = false;
 
-    // Persist to config (the daemon rebuilds its LLM client on reload)
+    // Remove the durable copy too — the daemon re-hydrates config from the
+    // keyring on reload, so a lingering token would resurrect the login.
+    {
+        use nanna_config::credentials::{SecureStore, keys};
+        if let Err(e) = SecureStore::new().delete(keys::ANTHROPIC_OAUTH_TOKEN) {
+            // A missing entry is normal (never logged in on this machine).
+            info!("Keyring OAuth token not removed: {e}");
+        }
+    }
+
+    // Persist to config (the daemon rebuilds its LLM providers on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config after logout: {}", e);
     }
@@ -631,6 +659,30 @@ pub async fn get_credential_status() -> Result<CredentialStatus, String> {
     }
 }
 
+/// Providers the daemon's LLM router can route to right now.
+///
+/// The model picker gates native provider entries on this list, not on
+/// GUI-local login state — the two can disagree (e.g. an OAuth login the
+/// daemon hasn't registered yet), and only the daemon actually routes chat.
+/// Errors when the daemon is unreachable or predates `llm_providers`, so the
+/// frontend can fall back to local gating instead of showing an empty picker.
+#[tauri::command]
+pub async fn get_daemon_providers(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    let status = state_guard.backend.system_status().await?;
+    status
+        .get("llm_providers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect()
+        })
+        .ok_or_else(|| "daemon did not report llm_providers".to_string())
+}
+
 /// Refresh the OAuth token if expired or expiring soon
 #[tauri::command]
 pub async fn refresh_oauth_token(
@@ -654,9 +706,10 @@ pub async fn refresh_oauth_token(
         warn!("Failed to save refreshed token to source: {}", e);
     }
 
-    // Update the config cache and let the daemon rebuild its client on reload.
+    // Update the config cache and let the daemon rebuild its providers on reload.
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
+    persist_oauth_token_to_keyring(&refreshed.access_token);
 
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
