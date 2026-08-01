@@ -200,9 +200,12 @@ impl ControlPlane {
         // Load config from disk
         let (config, config_path, data_dir) = match Config::load() {
             Ok(cfg) => {
-                // Try to get config path from nanna_config
+                // Save must target the same file `Config::load()` reads. This
+                // used to point at {data_dir}/config.toml while load reads
+                // {config_dir}/config.toml — every control-plane config write
+                // landed in a file nothing ever read back.
+                let path = Config::default_config_path().ok();
                 let data = nanna_config::Config::default_data_dir().ok();
-                let path = data.as_ref().map(|d| d.join("config.toml"));
                 (cfg.with_env_overrides(), path, data)
             }
             Err(_) => (Config::default().with_env_overrides(), None, None),

@@ -606,6 +606,17 @@ function installInPage(options = {}) {
       case 'run_claude_setup_token':
         return true;
 
+      // Daemon-reported provider availability (the model pickers gate on this,
+      // not on GUI-local key state). Mirror the real daemon: a provider exists
+      // when its credential does; Ollama always registers.
+      case 'get_daemon_providers':
+        return [
+          ...(state.config.anthropic_api_key ? ['anthropic'] : []),
+          ...(state.config.openai_api_key ? ['openai'] : []),
+          ...(state.config.openrouter_api_key ? ['openrouter'] : []),
+          'ollama',
+        ];
+
       case 'get_close_mode':
         return 'ask';
       case 'set_close_mode':
