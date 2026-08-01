@@ -50,7 +50,7 @@
 
             <!-- Status Indicators -->
             <div class="flex items-center gap-1 shrink-0">
-              <span v-if="!getModel(modelId)?.available" class="text-xs text-nanna-warning" :title="getModel(modelId)?.provider === 'ollama' ? 'Ollama not connected' : 'No API key'">⚠️</span>
+              <span v-if="!getModel(modelId)?.available" class="text-xs text-nanna-warning" :title="unavailableReason(modelId)">⚠️ unavailable</span>
             </div>
 
             <!-- Remove Button -->
@@ -194,6 +194,16 @@ function onDragEnd() {
 // Helper to get model info by ID
 function getModel(id: string): ModelOption | undefined {
   return props.allModels.find(m => m.id === id)
+}
+
+// Why a selected model can't currently run. An id missing from the catalog
+// entirely is the stale-selection case: its provider was configured once,
+// isn't anymore, and runs against it fail until that changes.
+function unavailableReason(id: string): string {
+  const model = getModel(id)
+  if (!model) return 'Provider not configured — runs with this model will fail until its API key or backend is set up'
+  if (model.provider === 'ollama') return 'Ollama not connected'
+  return 'No API key'
 }
 
 // Models not in the active list
