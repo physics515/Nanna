@@ -242,9 +242,9 @@ impl ControlPlane {
                 );
                 final_sink.delta(&format!(
                     "_could not run: no provider is configured for model '{model}'. \
-                     Pick a different model in Settings → Models, or add the \
-                     provider's credentials and restart the daemon — providers \
-                     register at boot._"
+                     Add the provider's credential in Settings — it registers \
+                     live, no restart needed — or pick a model from an \
+                     available provider in Settings → Models._"
                 ));
             } else {
                 // Unfinished work from an earlier turn is INFORMATION FOR THE
