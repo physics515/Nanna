@@ -617,7 +617,7 @@ pub async fn logout_anthropic_oauth(
     state_guard.config.llm.anthropic_oauth_token = None;
     state_guard.config.llm.anthropic_use_oauth = false;
 
-    // Persist to config (the daemon rebuilds its LLM client on reload)
+    // Persist to config (the daemon rebuilds its LLM providers on reload)
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config after logout: {}", e);
     }
@@ -678,6 +678,30 @@ pub async fn get_credential_status() -> Result<CredentialStatus, String> {
     }
 }
 
+/// Providers the daemon's LLM router can route to right now.
+///
+/// The model picker gates native provider entries on this list, not on
+/// GUI-local login state — the two can disagree (e.g. an OAuth login the
+/// daemon hasn't registered yet), and only the daemon actually routes chat.
+/// Errors when the daemon is unreachable or predates `llm_providers`, so the
+/// frontend can fall back to local gating instead of showing an empty picker.
+#[tauri::command]
+pub async fn get_daemon_providers(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Vec<String>, String> {
+    let state_guard = state.read().await;
+    let status = state_guard.backend.system_status().await?;
+    status
+        .get("llm_providers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect()
+        })
+        .ok_or_else(|| "daemon did not report llm_providers".to_string())
+}
+
 /// Refresh the OAuth token if expired or expiring soon
 #[tauri::command]
 pub async fn refresh_oauth_token(
@@ -708,7 +732,7 @@ pub async fn refresh_oauth_token(
         warn!("Failed to persist refreshed OAuth token to secure store: {e}");
     }
 
-    // Update the config cache and let the daemon rebuild its client on reload.
+    // Update the config cache and let the daemon rebuild its providers on reload.
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
 

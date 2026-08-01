@@ -1012,6 +1012,31 @@ fn credential(env_var: &str, store_key: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+impl LlmConfig {
+    /// Build the daemon's LLM credential view from the user config file.
+    ///
+    /// The single source of truth for this field mapping — used at boot
+    /// ([`DaemonBuilder::from_nanna_config`]) and on every control-plane config
+    /// mutation (`control::config`), so the provider set the router rebuilds
+    /// from is always derived exactly the way boot derived it.
+    #[must_use]
+    pub fn from_nanna(config: &nanna_config::Config) -> Self {
+        Self {
+            provider: config.llm.provider.clone(),
+            anthropic_api_key: config.llm.api_key.clone(),
+            anthropic_oauth_token: config.llm.anthropic_oauth_token.clone(),
+            anthropic_use_oauth: config.llm.anthropic_use_oauth,
+            openai_api_key: config.llm.openai_api_key.clone(),
+            openrouter_api_key: config.llm.openrouter_api_key.clone(),
+            github_token: config.llm.github_token.clone(),
+            // Ollama host is stored in memory config
+            ollama_host: config.memory.ollama_host.clone(),
+            ollama_api_key: config.llm.ollama_api_key.clone(),
+            api_key: config.llm.api_key.clone(),
+        }
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -2114,89 +2139,15 @@ impl DaemonServer {
         ),
         crate::DaemonError,
     > {
-        // Create LLM router with all available providers
-        let mut router = LlmRouter::new();
-        let store = SecureStore::new();
-
-        // Add Anthropic if credentials available
-        if self.config.llm.anthropic_use_oauth {
-            // Env override wins (matches Config::load_secrets_from_store
-            // precedence); otherwise resolve from the durable stores, which
-            // refreshes a stale token instead of silently skipping the
-            // provider or booting with a token that can only 401.
-            let env_token = std::env::var("ANTHROPIC_OAUTH_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty());
-            if let Some(token) = env_token {
-                info!("Adding Anthropic provider (OAuth from env)");
-                router = router.with_anthropic_oauth(&token);
-            } else {
-                match nanna_config::resolve_anthropic_oauth(&store).await {
-                    Ok(cred) => {
-                        info!("Adding Anthropic provider (OAuth from durable store)");
-                        router = router.with_anthropic_oauth(&cred.access_token);
-                    }
-                    Err(e) => {
-                        if let Some(ref oauth_token) = self.config.llm.anthropic_oauth_token {
-                            warn!("OAuth resolution failed ({e}); using config-provided token");
-                            router = router.with_anthropic_oauth(oauth_token);
-                        } else {
-                            warn!("Anthropic OAuth enabled but no usable credential: {e}");
-                        }
-                    }
-                }
-            }
-        } else if let Some(ref api_key) = self.config.llm.anthropic_api_key {
-            info!("Adding Anthropic provider (API key from config)");
-            router = router.with_anthropic(api_key);
-        } else if let Ok(api_key) = store.get(credentials::keys::ANTHROPIC_API_KEY) {
-            info!("Adding Anthropic provider (API key from keyring)");
-            router = router.with_anthropic(&api_key);
-        } else if let Ok(cred) = nanna_config::resolve_anthropic_oauth(&store).await {
-            // OAuth mode not explicitly on, but an OAuth credential exists
-            // (nanna store or Claude CLI login) — refreshed if it was stale.
-            info!("Adding Anthropic provider (OAuth fallback)");
-            router = router.with_anthropic_oauth(&cred.access_token);
-        }
-
-        // Add OpenAI if credentials available
-        if let Some(ref api_key) = self.config.llm.openai_api_key {
-            info!("Adding OpenAI provider (from config)");
-            router = router.with_openai(api_key);
-        } else if let Ok(api_key) = store.get(credentials::keys::OPENAI_API_KEY) {
-            info!("Adding OpenAI provider (from keyring)");
-            router = router.with_openai(&api_key);
-        }
-
-        // Add OpenRouter if credentials available
-        if let Some(ref api_key) = self.config.llm.openrouter_api_key {
-            info!("Adding OpenRouter provider (from config)");
-            router = router.with_openrouter(api_key);
-        } else if let Ok(api_key) = store.get(credentials::keys::OPENROUTER_API_KEY) {
-            info!("Adding OpenRouter provider (from keyring)");
-            router = router.with_openrouter(&api_key);
-        }
-
-        // Add GitHub Models if token available
-        if let Some(ref token) = self.config.llm.github_token {
-            info!("Adding GitHub Models provider (from config)");
-            router = router.with_github_models(token);
-        } else if let Ok(token) = store.get(credentials::keys::GITHUB_TOKEN) {
-            info!("Adding GitHub Models provider (from keyring)");
-            router = router.with_github_models(&token);
-        }
-
-        // Add Ollama (optionally with API key for remote instances)
-        info!("Adding Ollama provider at {}", self.config.llm.ollama_host);
-        if let Some(ref key) = self.config.llm.ollama_api_key {
-            if !key.is_empty() {
-                router = router.with_ollama_authenticated(&self.config.llm.ollama_host, key);
-            } else {
-                router = router.with_ollama(&self.config.llm.ollama_host);
-            }
-        } else {
-            router = router.with_ollama(&self.config.llm.ollama_host);
-        }
+        // Create LLM router with all available providers. The same resolution
+        // + construction runs again on every control-plane config mutation
+        // (see `control::config`), so a provider the user authenticates after
+        // boot registers without a daemon restart — registration used to be
+        // boot-only, leaving the GUI and daemon split-brained about which
+        // providers exist.
+        let router = LlmRouter::new();
+        let creds = crate::llm_router::ProviderCredentials::resolve(&self.config.llm).await;
+        router.rebuild(&creds);
 
         let available = router.available_providers();
         if available.is_empty() {
@@ -2969,16 +2920,9 @@ impl DaemonBuilder {
 
         let mut builder = Self::new();
 
-        // Set LLM configuration - copy all provider credentials
-        builder.config.llm.provider = config.llm.provider.clone();
-        builder.config.llm.anthropic_api_key = config.llm.api_key.clone(); // Anthropic API key
-        builder.config.llm.anthropic_oauth_token = config.llm.anthropic_oauth_token.clone();
-        builder.config.llm.anthropic_use_oauth = config.llm.anthropic_use_oauth;
-        builder.config.llm.openai_api_key = config.llm.openai_api_key.clone();
-        builder.config.llm.openrouter_api_key = config.llm.openrouter_api_key.clone();
-        builder.config.llm.github_token = config.llm.github_token.clone();
-        // Ollama host is stored in memory config
-        builder.config.llm.ollama_host = config.memory.ollama_host.clone();
+        // Set LLM configuration - copy all provider credentials (shared with
+        // the control-plane reload path so both derive providers identically)
+        builder.config.llm = LlmConfig::from_nanna(&config);
 
         // Set embedding configuration from Nanna memory config
         builder.embedding.provider = config.memory.embedding_provider.clone();
