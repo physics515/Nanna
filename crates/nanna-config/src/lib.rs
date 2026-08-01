@@ -604,13 +604,13 @@ impl Config {
         if let Some(v) = self.llm.anthropic_oauth_token.take() {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                store.set("anthropic_oauth_token", trimmed)?;
+                store.set(keys::ANTHROPIC_OAUTH_TOKEN, trimmed)?;
             }
         }
         if let Some(v) = self.llm.ollama_api_key.take() {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                store.set("ollama_api_key", trimmed)?;
+                store.set(keys::OLLAMA_API_KEY, trimmed)?;
             }
         }
         Ok(())
@@ -642,8 +642,8 @@ impl Config {
         fill(&mut self.llm.openrouter_api_key, keys::OPENROUTER_API_KEY, "OPENROUTER_API_KEY");
         fill(&mut self.llm.github_token, keys::GITHUB_TOKEN, "GITHUB_TOKEN");
         fill(&mut self.tools.brave_api_key, keys::BRAVE_API_KEY, "BRAVE_API_KEY");
-        fill(&mut self.llm.ollama_api_key, "ollama_api_key", "OLLAMA_API_KEY");
-        fill(&mut self.llm.anthropic_oauth_token, "anthropic_oauth_token", "ANTHROPIC_OAUTH_TOKEN");
+        fill(&mut self.llm.ollama_api_key, keys::OLLAMA_API_KEY, "OLLAMA_API_KEY");
+        fill(&mut self.llm.anthropic_oauth_token, keys::ANTHROPIC_OAUTH_TOKEN, "ANTHROPIC_OAUTH_TOKEN");
     }
 
     /// Get default config path.

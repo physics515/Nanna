@@ -11,6 +11,7 @@
 import { computed, inject, provide, ref, type InjectionKey } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { ModelOption } from '~/components/ModelPriorityList.vue'
+import { isProviderAvailable } from '~/lib/providerAvailability'
 
 export interface ToolInfo {
   name: string
@@ -121,20 +122,57 @@ function createSettingsPageStore() {
   const claudeProxyModels = ref<ModelInfo[]>([])
   const claudeProxyHealthy = ref(false)
 
+  /**
+   * Providers the DAEMON's router can route to right now (null = daemon not
+   * queried / unreachable). The daemon is authoritative for picker gating:
+   * offering a model the daemon can't route means every chat turn dies with
+   * "No provider available", so GUI-local login state only gates as a
+   * fallback when this is null. See isProviderAvailable().
+   */
+  const daemonProviders = ref<string[] | null>(null)
+
+  async function refreshDaemonProviders() {
+    try {
+      daemonProviders.value = await invoke<string[]>('get_daemon_providers')
+    } catch (e) {
+      console.warn('Daemon provider list unavailable, gating on local credentials:', e)
+      daemonProviders.value = null
+    }
+  }
+
+  const anthropicAvailable = computed(() => isProviderAvailable(
+    daemonProviders.value,
+    'anthropic',
+    Boolean(settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in),
+  ))
+  const openaiAvailable = computed(() => isProviderAvailable(
+    daemonProviders.value,
+    'openai',
+    Boolean(settings.value?.openai_key_set),
+  ))
+  const openrouterAvailable = computed(() => isProviderAvailable(
+    daemonProviders.value,
+    'openrouter',
+    Boolean(settings.value?.openrouter_key_set),
+  ))
+  const githubAvailable = computed(() => isProviderAvailable(
+    daemonProviders.value,
+    'github',
+    Boolean(settings.value?.github_key_set),
+  ))
+
   const allChatModels = computed<ModelOption[]>(() => {
     const models: ModelOption[] = []
 
     // Anthropic models (dynamically fetched from API)
-    // Available if either API key is set or OAuth is logged in
-    const anthropicAvailable = settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in
-    if (anthropicAvailable && anthropicModels.value.length > 0) {
+    if (anthropicAvailable.value && anthropicModels.value.length > 0) {
       for (const m of anthropicModels.value) {
         models.push({ id: m.id, name: m.name, provider: 'anthropic', available: true })
       }
     }
 
     // OpenAI models (dynamically fetched from API)
-    if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    if (openaiAvailable.value && openaiModels.value.length > 0) {
       const chatModels = openaiModels.value.filter(m =>
         m.id.startsWith('gpt-') || m.id.startsWith('o1') || m.id.startsWith('o3') || m.id.startsWith('chatgpt')
       )
@@ -145,14 +183,14 @@ function createSettingsPageStore() {
 
     // OpenRouter models (dynamically fetched from API)
     // Prefix with openrouter/ so parse_model_id recognizes the provider
-    if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    if (openrouterAvailable.value && openrouterModels.value.length > 0) {
       for (const m of openrouterModels.value) {
         models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
       }
     }
 
     // GitHub Models (dynamically fetched from API)
-    if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    if (githubAvailable.value && githubModels.value.length > 0) {
       for (const m of githubModels.value) {
         models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
       }
@@ -182,7 +220,7 @@ function createSettingsPageStore() {
     }
 
     // OpenAI embedding models
-    if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    if (openaiAvailable.value && openaiModels.value.length > 0) {
       const embeddingModels = openaiModels.value.filter(m => m.id.startsWith('text-embedding'))
       for (const m of embeddingModels) {
         models.push({ id: `openai/${m.id}`, name: m.name, provider: 'openai', available: true })
@@ -190,14 +228,14 @@ function createSettingsPageStore() {
     }
 
     // OpenRouter embedding models (from dedicated embeddings endpoint)
-    if (settings.value?.openrouter_key_set && openrouterEmbeddingModels.value.length > 0) {
+    if (openrouterAvailable.value && openrouterEmbeddingModels.value.length > 0) {
       for (const m of openrouterEmbeddingModels.value) {
         models.push({ id: `openrouter/${m.id}`, name: `${m.name} (OpenRouter)`, provider: 'openrouter', available: true })
       }
     }
 
     // GitHub embedding models
-    if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    if (githubAvailable.value && githubModels.value.length > 0) {
       const embeddingModels = githubModels.value.filter(m =>
         m.id.includes('embed') || m.id.includes('embedding')
       )
@@ -219,15 +257,14 @@ function createSettingsPageStore() {
     }
 
     // Anthropic models
-    const anthropicAvailable = settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in
-    if (anthropicAvailable && anthropicModels.value.length > 0) {
+    if (anthropicAvailable.value && anthropicModels.value.length > 0) {
       for (const m of anthropicModels.value) {
         models.push({ id: `anthropic/${m.id}`, name: m.name, provider: 'anthropic', available: true })
       }
     }
 
     // OpenAI models
-    if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    if (openaiAvailable.value && openaiModels.value.length > 0) {
       const chatModels = openaiModels.value.filter(m =>
         m.id.startsWith('gpt-') || m.id.startsWith('o1') || m.id.startsWith('o3') || m.id.startsWith('chatgpt')
       )
@@ -237,14 +274,14 @@ function createSettingsPageStore() {
     }
 
     // OpenRouter models
-    if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    if (openrouterAvailable.value && openrouterModels.value.length > 0) {
       for (const m of openrouterModels.value) {
         models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
       }
     }
 
     // GitHub Models
-    if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    if (githubAvailable.value && githubModels.value.length > 0) {
       for (const m of githubModels.value) {
         models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
       }
@@ -257,8 +294,7 @@ function createSettingsPageStore() {
     const models: ModelOption[] = []
 
     // Anthropic claude-3+ (vision capable)
-    const anthropicAvailable = settings.value?.anthropic_key_set || settings.value?.anthropic_oauth_logged_in
-    if (anthropicAvailable && anthropicModels.value.length > 0) {
+    if (anthropicAvailable.value && anthropicModels.value.length > 0) {
       for (const m of anthropicModels.value) {
         if (isVisionCapable(m.id, 'anthropic')) {
           models.push({ id: m.id, name: m.name, provider: 'anthropic', available: true })
@@ -267,7 +303,7 @@ function createSettingsPageStore() {
     }
 
     // OpenAI vision models
-    if (settings.value?.openai_key_set && openaiModels.value.length > 0) {
+    if (openaiAvailable.value && openaiModels.value.length > 0) {
       for (const m of openaiModels.value) {
         if (isVisionCapable(m.id, 'openai')) {
           models.push({ id: m.id, name: m.name, provider: 'openai', available: true })
@@ -288,7 +324,7 @@ function createSettingsPageStore() {
     }
 
     // OpenRouter vision models
-    if (settings.value?.openrouter_key_set && openrouterModels.value.length > 0) {
+    if (openrouterAvailable.value && openrouterModels.value.length > 0) {
       for (const m of openrouterModels.value) {
         if (isVisionCapable(m.id, 'openrouter')) {
           models.push({ id: `openrouter/${m.id}`, name: m.name, provider: 'openrouter', available: true })
@@ -297,7 +333,7 @@ function createSettingsPageStore() {
     }
 
     // GitHub vision models
-    if (settings.value?.github_key_set && githubModels.value.length > 0) {
+    if (githubAvailable.value && githubModels.value.length > 0) {
       for (const m of githubModels.value) {
         if (isVisionCapable(m.id, 'github')) {
           models.push({ id: `github/${m.id}`, name: m.name, provider: 'github', available: true })
@@ -330,6 +366,10 @@ function createSettingsPageStore() {
   async function loadSettings() {
     try {
       settings.value = await invoke<ExtendedSettings>('get_extended_settings')
+
+      // The daemon's live provider set gates the model pickers; re-query it on
+      // every settings (re)load so a login/logout is reflected immediately.
+      await refreshDaemonProviders()
 
       // Let each tab repopulate its own state from the fresh settings
       for (const hook of settingsLoadedHooks) {
@@ -501,6 +541,12 @@ function createSettingsPageStore() {
     githubModels,
     claudeProxyModels,
     claudeProxyHealthy,
+    daemonProviders,
+    refreshDaemonProviders,
+    anthropicAvailable,
+    openaiAvailable,
+    openrouterAvailable,
+    githubAvailable,
     allChatModels,
     allEmbeddingModels,
     allSummarizationModels,

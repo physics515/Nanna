@@ -6,7 +6,25 @@ impl ControlPlane {
     // =========================================================================
     // Config Handlers
     // =========================================================================
-    
+
+    /// Rebuild the LLM router's provider set from a config snapshot.
+    ///
+    /// Provider registration used to happen only at boot; the GUI would save a
+    /// credential and call config-reload "so the daemon rebuilds its LLM
+    /// client", but nothing did — every call to the newly-authenticated
+    /// provider failed with "No provider available" until a daemon restart.
+    /// Runs after every config mutation (set/reset/reload/import), with the
+    /// config write lock already released — credential resolution may hit the
+    /// OS keyring and refresh an expired Claude CLI token over the network.
+    async fn rebuild_llm_providers(&self, config: &Config) {
+        let Some(router) = self.router.as_ref() else {
+            return;
+        };
+        let llm = crate::server::LlmConfig::from_nanna(config);
+        let creds = crate::llm_router::ProviderCredentials::resolve(&llm).await;
+        router.rebuild(&creds);
+    }
+
     pub(super) async fn handle_config(&self, _client_id: &str, action: ConfigAction) -> Value {
         match action {
             ConfigAction::Get { path } => {
@@ -102,6 +120,13 @@ impl ControlPlane {
                             }
                         }
 
+                        // Re-derive the router's provider set (registration is
+                        // not boot-only). Lock released first: resolution can
+                        // block on keyring/network.
+                        let snapshot = config.clone();
+                        drop(config);
+                        self.rebuild_llm_providers(&snapshot).await;
+
                         json!({ "status": "updated", "path": path })
                     }
                     Err(e) => json!({ "error": "invalid_config", "message": e.to_string() })
@@ -136,6 +161,10 @@ impl ControlPlane {
                         ).await;
                     }
 
+                    let snapshot = config.clone();
+                    drop(config);
+                    self.rebuild_llm_providers(&snapshot).await;
+
                     json!({ "status": "reset" })
                 }
             }
@@ -158,6 +187,13 @@ impl ControlPlane {
                                 Some(config.llm.model_priority.clone()),
                             ).await;
                         }
+
+                        // This is the reload the GUI triggers after saving a
+                        // credential — the step that makes a post-boot login
+                        // actually reach the router.
+                        let snapshot = config.clone();
+                        drop(config);
+                        self.rebuild_llm_providers(&snapshot).await;
 
                         json!({ "status": "reloaded" })
                     }
@@ -190,6 +226,11 @@ impl ControlPlane {
                         }
                         
                         info!("Config imported");
+
+                        let snapshot = config.clone();
+                        drop(config);
+                        self.rebuild_llm_providers(&snapshot).await;
+
                         json!({ "status": "imported" })
                     }
                     Err(e) => json!({ "error": "import_failed", "message": e })
