@@ -5,7 +5,6 @@
 //! Includes health-aware model selection (stats-informed routing).
 
 use nanna_agent::ModelStatsTracker;
-use nanna_config::ClaudeCredentialManager;
 use nanna_config::credentials::{SecureStore, keys};
 use nanna_llm::{LlmClient, ModelInfo, ModelInfoCache, CompletionRequest, LlmError};
 use serde::Serialize;
@@ -545,34 +544,53 @@ fn store_credential(store: &SecureStore, key: &str) -> Option<String> {
     store.get(key).ok().and_then(|v| non_empty(Some(&v)))
 }
 
-/// Load the Claude CLI's OAuth credential, refreshing it first if it has
-/// expired. The daemon used to hand the raw access token to the router with no
-/// expiry check, so a stale CLI login produced a provider whose every call 401'd.
-async fn claude_cli_oauth_token() -> Option<String> {
-    let manager = ClaudeCredentialManager::new();
-    let loaded = manager.load().ok()?;
-    if !loaded.credential.is_expired() {
-        return Some(loaded.credential.access_token);
-    }
-    if !loaded.credential.can_refresh() {
-        warn!(
-            "Claude CLI OAuth token is expired and has no refresh token; skipping Anthropic provider"
-        );
-        return None;
-    }
-    match manager.refresh_token(&loaded.credential).await {
-        Ok(refreshed) => {
-            if let Err(e) = manager.save(&refreshed, loaded.source) {
-                warn!("Refreshed Claude CLI OAuth token but failed to save it: {e}");
+/// Resolve the Anthropic credential.
+///
+/// OAuth mode: env override (`ANTHROPIC_OAUTH_TOKEN`, matching
+/// `Config::load_secrets_from_store` precedence) → durable stores via
+/// [`nanna_config::resolve_anthropic_oauth`] (envelope-aware: refreshes a
+/// stale token and mirrors Claude CLI logins into the nanna store, instead
+/// of registering a provider whose every call 401s) → config-held token →
+/// fall through to an API key. Non-OAuth mode: config/keyring API key first,
+/// then any durable OAuth credential (nanna store or Claude CLI login).
+async fn resolve_anthropic(
+    llm: &crate::server::LlmConfig,
+    store: &SecureStore,
+) -> Option<AnthropicCredential> {
+    if llm.anthropic_use_oauth {
+        if let Ok(v) = std::env::var("ANTHROPIC_OAUTH_TOKEN")
+            && let Some(token) = non_empty(Some(&v))
+        {
+            debug!("Anthropic credential: OAuth token from env");
+            return Some(AnthropicCredential::OAuth(token));
+        }
+        match nanna_config::resolve_anthropic_oauth(store).await {
+            Ok(cred) => {
+                debug!("Anthropic credential: OAuth from durable store (refreshed if stale)");
+                return Some(AnthropicCredential::OAuth(cred.access_token));
             }
-            info!("Refreshed expired Claude CLI OAuth token for Anthropic provider");
-            Some(refreshed.access_token)
-        }
-        Err(e) => {
-            warn!("Claude CLI OAuth token expired and refresh failed: {e}");
-            None
+            Err(e) => {
+                if let Some(token) = non_empty(llm.anthropic_oauth_token.as_ref()) {
+                    warn!("OAuth resolution failed ({e}); using config-provided token");
+                    return Some(AnthropicCredential::OAuth(token));
+                }
+                warn!("Anthropic OAuth enabled but no usable credential ({e}); trying API key");
+            }
         }
     }
+    if let Some(key) = non_empty(llm.anthropic_api_key.as_ref())
+        .or_else(|| store_credential(store, keys::ANTHROPIC_API_KEY))
+    {
+        debug!("Anthropic credential: API key from config/keyring");
+        return Some(AnthropicCredential::ApiKey(key));
+    }
+    if !llm.anthropic_use_oauth
+        && let Ok(cred) = nanna_config::resolve_anthropic_oauth(store).await
+    {
+        debug!("Anthropic credential: durable OAuth fallback (nanna store / Claude CLI)");
+        return Some(AnthropicCredential::OAuth(cred.access_token));
+    }
+    None
 }
 
 impl ProviderCredentials {
@@ -580,33 +598,17 @@ impl ProviderCredentials {
     /// to the OS keyring and finally the Claude CLI's own credentials.
     ///
     /// Per provider, first source wins:
-    /// - Anthropic: config OAuth token (when OAuth mode is on) → keyring OAuth
-    ///   token → config API key → keyring API key → Claude CLI OAuth (refreshed
-    ///   when expired). An enabled OAuth flag with a missing token falls
-    ///   through — the boot chain used to dead-end there, registering no
+    /// - Anthropic: see [`resolve_anthropic`] — OAuth env/durable-store/config
+    ///   chain (refreshing stale tokens) → config API key → keyring API key →
+    ///   durable OAuth fallback. An enabled OAuth flag with a missing token
+    ///   falls through — the boot chain used to dead-end there, registering no
     ///   Anthropic provider even though the CLI held valid credentials.
     /// - OpenAI / OpenRouter / GitHub: config key → keyring key.
     /// - Ollama: always present (host needs no credential; blank key = anonymous).
     pub async fn resolve(llm: &crate::server::LlmConfig) -> Self {
         let store = SecureStore::new();
 
-        let anthropic = if llm.anthropic_use_oauth
-            && let Some(token) = non_empty(llm.anthropic_oauth_token.as_ref())
-                .or_else(|| store_credential(&store, keys::ANTHROPIC_OAUTH_TOKEN))
-        {
-            debug!("Anthropic credential: OAuth token from config/keyring");
-            Some(AnthropicCredential::OAuth(token))
-        } else if let Some(key) = non_empty(llm.anthropic_api_key.as_ref())
-            .or_else(|| store_credential(&store, keys::ANTHROPIC_API_KEY))
-        {
-            debug!("Anthropic credential: API key from config/keyring");
-            Some(AnthropicCredential::ApiKey(key))
-        } else if let Some(token) = claude_cli_oauth_token().await {
-            debug!("Anthropic credential: Claude CLI OAuth token");
-            Some(AnthropicCredential::OAuth(token))
-        } else {
-            None
-        };
+        let anthropic = resolve_anthropic(llm, &store).await;
 
         Self {
             anthropic,

@@ -65,6 +65,26 @@ fn print_credentials_status(
     }
 }
 
+/// Persist an OAuth credential durably and point the config at OAuth mode.
+///
+/// The SecureStore is the durable home — `Config::save` strips secrets from
+/// config.toml, so a login that only touches the config dies with the process.
+fn persist_oauth_credential(credential: &nanna_config::OAuthCredential) {
+    if let Err(e) = nanna_config::SecureStore::new().save_anthropic_oauth(credential) {
+        warn!("Failed to persist OAuth token to secure store: {}", e);
+        println!("⚠ Could not persist token to the secure store: {e}");
+    }
+
+    let mut config = Config::load().unwrap_or_default();
+    config.llm.anthropic_oauth_token = Some(credential.access_token.clone());
+    config.llm.anthropic_use_oauth = true;
+    if let Err(e) = config.save() {
+        warn!("Failed to save config: {}", e);
+    } else {
+        println!("   Config updated to use OAuth");
+    }
+}
+
 /// Import Claude CLI credentials into Nanna config
 async fn import_credentials(
     manager: &nanna_config::ClaudeCredentialManager,
@@ -82,7 +102,7 @@ async fn import_credentials(
                 CredentialSource::LinuxSecretService => "Linux Secret Service",
             };
 
-            if loaded.credential.is_expired() {
+            let credential = if loaded.credential.is_expired() {
                 println!("⚠ Warning: Token is expired");
                 if loaded.credential.can_refresh() {
                     println!("   Attempting refresh...");
@@ -95,6 +115,7 @@ async fn import_credentials(
                             if let Some(ref sub) = new_cred.subscription_type {
                                 println!("   Subscription: {sub}");
                             }
+                            new_cred
                         }
                         Err(e) => {
                             println!("❌ Refresh failed: {e}");
@@ -116,16 +137,10 @@ async fn import_credentials(
                     let hours = secs / 3600;
                     println!("   Expires in: {hours}h");
                 }
-            }
+                loaded.credential
+            };
 
-            let mut config = Config::load().unwrap_or_default();
-            config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
-            config.llm.anthropic_use_oauth = true;
-            if let Err(e) = config.save() {
-                warn!("Failed to save config: {}", e);
-            } else {
-                println!("   Config updated to use OAuth");
-            }
+            persist_oauth_credential(&credential);
         }
         Err(e) => {
             println!("❌ No credentials found: {e}");
@@ -158,14 +173,12 @@ fn setup_credentials(
         return;
     }
 
+    // `claude setup-token` PRINTS the minted token for the user to copy; it
+    // does NOT write the CLI credential store. Only a prior `claude login`
+    // leaves something for `load()` to find — and it may be stale.
     match manager.load() {
-        Ok(loaded) => {
-            let mut config = Config::load().unwrap_or_default();
-            config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
-            config.llm.anthropic_use_oauth = true;
-            if let Err(e) = config.save() {
-                warn!("Failed to save config: {}", e);
-            }
+        Ok(loaded) if !loaded.credential.is_expired() => {
+            persist_oauth_credential(&loaded.credential);
 
             println!("\n✅ Authentication complete!");
             if let Some(ref sub) = loaded.credential.subscription_type {
@@ -173,8 +186,15 @@ fn setup_credentials(
             }
             println!("   Nanna is now configured to use OAuth");
         }
+        Ok(_) => {
+            println!("\n⚠ The CLI credential store only has an expired token.");
+            println!("   Copy the token that `claude setup-token` printed above and run:");
+            println!("   nanna with ANTHROPIC_OAUTH_TOKEN=<token>, or paste it in the GUI settings.");
+        }
         Err(e) => {
             println!("\n⚠ Setup completed but couldn't import credentials: {e}");
+            println!("   Copy the token that `claude setup-token` printed above and run:");
+            println!("   nanna with ANTHROPIC_OAUTH_TOKEN=<token>, or paste it in the GUI settings.");
         }
     }
 }
@@ -199,11 +219,7 @@ async fn refresh_credentials(
                         warn!("Failed to save to original source: {}", e);
                     }
 
-                    let mut config = Config::load().unwrap_or_default();
-                    config.llm.anthropic_oauth_token = Some(new_cred.access_token.clone());
-                    if let Err(e) = config.save() {
-                        warn!("Failed to save config: {}", e);
-                    }
+                    persist_oauth_credential(&new_cred);
 
                     println!("✅ Token refreshed!");
                     if let Some(secs) = new_cred.seconds_until_expiry() {
@@ -228,6 +244,13 @@ async fn refresh_credentials(
 /// Clear stored OAuth credentials
 fn clear_credentials() {
     println!("🗑 Clearing OAuth Credentials...\n");
+
+    // The SecureStore is the durable home — clearing only the config would
+    // log the user right back in at the next launch's hydration.
+    if let Err(e) = nanna_config::SecureStore::new().delete_anthropic_oauth() {
+        warn!("Failed to remove stored OAuth token: {}", e);
+        println!("⚠ Could not remove the token from the secure store: {e}");
+    }
 
     let mut config = Config::load().unwrap_or_default();
     config.llm.anthropic_oauth_token = None;

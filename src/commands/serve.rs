@@ -145,8 +145,10 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         llm: LlmConfig {
             provider: config.llm.provider.clone(),
             anthropic_api_key: config.llm.api_key.clone(),
-            anthropic_oauth_token: None,
-            anthropic_use_oauth: false,
+            // `config` was hydrated from the SecureStore at load; keep OAuth
+            // state in sync with the daemon path (DaemonBuilder::from_nanna_config).
+            anthropic_oauth_token: config.llm.anthropic_oauth_token.clone(),
+            anthropic_use_oauth: config.llm.anthropic_use_oauth,
             openai_api_key: config.llm.openai_api_key.clone(),
             openrouter_api_key: config.llm.openrouter_api_key.clone(),
             github_token: config.llm.github_token.clone(),

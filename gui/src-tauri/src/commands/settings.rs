@@ -409,6 +409,9 @@ pub async fn set_provider_api_key(
             error!("Failed to store API key in keyring: {e}");
             return Err(format!("failed to store API key securely: {e}"));
         }
+        // migrate_secrets_to_keyring() blanks every secret it stores; refill so
+        // in-memory state (and the OAuth badge) keeps the session's credentials.
+        state_guard.config.load_secrets_from_store();
     }
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
@@ -424,22 +427,32 @@ pub async fn set_provider_api_key(
 // Anthropic OAuth Login (via `claude setup-token`)
 // =============================================================================
 
-/// Persist the OAuth token where the daemon can actually read it back.
+/// Durably persist an OAuth login, then update live state and nudge the daemon.
 ///
-/// `Config::save()` strips secrets from the file on disk; the OS keyring is
-/// the durable home `Config::load()` re-hydrates from. Without this
-/// write-through the token lived only in the GUI's process memory — the
-/// daemon's config reload found `anthropic_use_oauth = true` with no token
-/// anywhere, so no Anthropic provider ever registered.
-fn persist_oauth_token_to_keyring(token: &str) {
-    use nanna_config::credentials::{SecureStore, keys};
-    if let Err(e) = SecureStore::new().set(keys::ANTHROPIC_OAUTH_TOKEN, token) {
-        error!("Failed to store OAuth token in keyring: {e}");
+/// The SecureStore is written FIRST and a failure aborts the login: the config
+/// cache is session-only (`strip_secrets_for_disk` blanks the token in
+/// config.toml on every save), so a login that never reaches the store is
+/// exactly the restart-logout bug this path exists to prevent.
+async fn persist_oauth_login(
+    state: &Arc<RwLock<AppState>>,
+    credential: &nanna_config::OAuthCredential,
+) -> Result<(), String> {
+    nanna_config::SecureStore::new()
+        .save_anthropic_oauth(credential)
+        .map_err(|e| format!("Failed to store OAuth token securely: {e}"))?;
+
+    let mut state_guard = state.write().await;
+    state_guard.config.llm.anthropic_oauth_token = Some(credential.access_token.clone());
+    state_guard.config.llm.anthropic_use_oauth = true;
+    if let Err(e) = state_guard.config.save() {
+        error!("Failed to save config: {e}");
     }
+    let _ = state_guard.backend.config_reload().await;
+    Ok(())
 }
 
 /// Run `claude setup-token` to authenticate via Claude Code CLI
-/// This opens a browser for OAuth, then imports the resulting credentials
+/// This opens a browser for OAuth, then persists the resulting credential
 #[tauri::command]
 pub async fn run_claude_setup_token(
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -457,31 +470,61 @@ pub async fn run_claude_setup_token(
 
     info!("Running claude setup-token...");
 
-    // Run claude setup-token (this will open browser and wait for auth)
-    ClaudeCredentialManager::run_setup_token()
-        .map_err(|e| format!("Failed to run claude setup-token: {}", e))?;
+    // `claude setup-token` PRINTS the minted token — it does NOT write the CLI
+    // credential file (verified on Windows, claude 2.1.71) — so capture its
+    // output and parse the token out. The child is a blocking process.
+    let captured = tokio::task::spawn_blocking(ClaudeCredentialManager::run_setup_token_captured)
+        .await
+        .map_err(|e| format!("setup-token task failed: {e}"))?
+        .map_err(|e| {
+            format!(
+                "Failed to run claude setup-token: {e}\n\n\
+                 Run `claude setup-token` in a terminal and paste the token instead."
+            )
+        })?;
 
-    info!("claude setup-token completed");
+    let credential = if let Some(cred) = captured {
+        info!("claude setup-token completed (token captured from output)");
+        cred
+    } else {
+        // No token in the output — fall back to the CLI credential store
+        // (`claude login`), refusing to silently import a stale token.
+        let manager = ClaudeCredentialManager::new();
+        let loaded = manager.load().map_err(|e| {
+            format!(
+                "setup-token printed no token and no CLI credentials were found: {e}. \
+                 Run `claude setup-token` in a terminal and paste the token instead."
+            )
+        })?;
+        if loaded.credential.is_expired() {
+            if !loaded.credential.can_refresh() {
+                return Err(
+                    "setup-token printed no token and the CLI credential store is stale. \
+                     Run `claude setup-token` in a terminal and paste the token instead."
+                        .to_string(),
+                );
+            }
+            let refreshed = manager
+                .refresh_token(&loaded.credential)
+                .await
+                .map_err(|e| format!("CLI credentials expired and refresh failed: {e}"))?;
+            if let Err(e) = manager.save(&refreshed, loaded.source) {
+                warn!("Failed to save refreshed token to its CLI source: {e}");
+            }
+            refreshed
+        } else {
+            loaded.credential
+        }
+    };
 
-    // Now import the credentials that were saved
-    let manager = ClaudeCredentialManager::new();
-    let loaded = manager.load()
-        .map_err(|e| format!("Failed to load credentials after setup: {}", e))?;
+    let subscription = credential
+        .subscription_type
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
 
-    // Save the token
-    let mut state_guard = state.write().await;
-    state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
-    state_guard.config.llm.anthropic_use_oauth = true;
-    persist_oauth_token_to_keyring(&loaded.credential.access_token);
+    persist_oauth_login(state.inner(), &credential).await?;
 
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save OAuth token: {}", e);
-    }
-    let _ = state_guard.backend.config_reload().await;
-
-    let subscription = loaded.credential.subscription_type.unwrap_or_else(|| "unknown".to_string());
     info!("Successfully authenticated via claude setup-token (subscription: {})", subscription);
-
     Ok(format!("Successfully authenticated! Subscription: {}", subscription))
 }
 
@@ -511,16 +554,7 @@ pub async fn import_claude_code_credentials(
                 warn!("Failed to save refreshed token: {}", e);
             }
 
-            // Update state with refreshed token
-            let mut state_guard = state.write().await;
-            state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
-            state_guard.config.llm.anthropic_use_oauth = true;
-            persist_oauth_token_to_keyring(&refreshed.access_token);
-
-            if let Err(e) = state_guard.config.save() {
-                error!("Failed to save config: {}", e);
-            }
-            let _ = state_guard.backend.config_reload().await;
+            persist_oauth_login(state.inner(), &refreshed).await?;
 
             info!("Token refreshed and imported (subscription: {:?})", refreshed.subscription_type);
             return Ok(());
@@ -534,17 +568,7 @@ pub async fn import_claude_code_credentials(
         loaded.credential.subscription_type
     );
 
-    // Save the token and enable OAuth mode
-    let mut state_guard = state.write().await;
-    state_guard.config.llm.anthropic_oauth_token = Some(loaded.credential.access_token.clone());
-    state_guard.config.llm.anthropic_use_oauth = true;
-    persist_oauth_token_to_keyring(&loaded.credential.access_token);
-
-    // Persist to config (the daemon rebuilds its LLM providers on reload)
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save OAuth token: {}", e);
-    }
-    let _ = state_guard.backend.config_reload().await;
+    persist_oauth_login(state.inner(), &loaded.credential).await?;
 
     info!("Successfully imported Claude Code credentials");
     Ok(())
@@ -556,23 +580,22 @@ pub async fn save_anthropic_oauth_token(
     state: State<'_, Arc<RwLock<AppState>>>,
     token: String,
 ) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-
     let token = token.trim().to_string();
     if token.is_empty() {
         return Err("Token cannot be empty".to_string());
     }
 
-    // Save the token and enable OAuth mode
-    state_guard.config.llm.anthropic_oauth_token = Some(token.clone());
-    state_guard.config.llm.anthropic_use_oauth = true;
-    persist_oauth_token_to_keyring(&token);
-
-    // Persist to config (the daemon rebuilds its LLM providers on reload)
-    if let Err(e) = state_guard.config.save() {
-        error!("Failed to save OAuth token: {}", e);
-    }
-    let _ = state_guard.backend.config_reload().await;
+    // A pasted `claude setup-token` token is long-lived and carries no
+    // refresh token or expiry.
+    let credential = nanna_config::OAuthCredential {
+        access_token: token,
+        refresh_token: None,
+        expires_at: None,
+        subscription_type: None,
+        account_id: None,
+        organization_id: None,
+    };
+    persist_oauth_login(state.inner(), &credential).await?;
 
     info!("Anthropic OAuth token saved");
     Ok(())
@@ -583,20 +606,16 @@ pub async fn save_anthropic_oauth_token(
 pub async fn logout_anthropic_oauth(
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<(), String> {
+    // Remove the durable credential first — if this fails the user would be
+    // silently logged back in at next launch, so surface it instead.
+    nanna_config::SecureStore::new()
+        .delete_anthropic_oauth()
+        .map_err(|e| format!("Failed to remove stored OAuth token: {e}"))?;
+
     let mut state_guard = state.write().await;
 
     state_guard.config.llm.anthropic_oauth_token = None;
     state_guard.config.llm.anthropic_use_oauth = false;
-
-    // Remove the durable copy too — the daemon re-hydrates config from the
-    // keyring on reload, so a lingering token would resurrect the login.
-    {
-        use nanna_config::credentials::{SecureStore, keys};
-        if let Err(e) = SecureStore::new().delete(keys::ANTHROPIC_OAUTH_TOKEN) {
-            // A missing entry is normal (never logged in on this machine).
-            info!("Keyring OAuth token not removed: {e}");
-        }
-    }
 
     // Persist to config (the daemon rebuilds its LLM providers on reload)
     if let Err(e) = state_guard.config.save() {
@@ -706,10 +725,16 @@ pub async fn refresh_oauth_token(
         warn!("Failed to save refreshed token to source: {}", e);
     }
 
+    // Keep the durable store current so the refreshed token (not the stale
+    // one) is what the next launch rehydrates. Preserves anthropic_use_oauth
+    // as-is: refreshing does not opt the user into OAuth mode.
+    if let Err(e) = nanna_config::SecureStore::new().save_anthropic_oauth(&refreshed) {
+        warn!("Failed to persist refreshed OAuth token to secure store: {e}");
+    }
+
     // Update the config cache and let the daemon rebuild its providers on reload.
     let mut state_guard = state.write().await;
     state_guard.config.llm.anthropic_oauth_token = Some(refreshed.access_token.clone());
-    persist_oauth_token_to_keyring(&refreshed.access_token);
 
     if let Err(e) = state_guard.config.save() {
         error!("Failed to save config: {}", e);
@@ -861,6 +886,17 @@ pub async fn set_ollama_api_key(
         error!("{err_msg}");
         return Err(err_msg);
     }
+    if key.is_empty() {
+        // Clearing the key must also clear its durable home, or the hydration
+        // below (and at every launch) resurrects the old value.
+        match nanna_config::SecureStore::new().delete(nanna_config::credentials::keys::OLLAMA_API_KEY) {
+            Ok(()) | Err(nanna_config::CredentialError::NotFound) => {}
+            Err(e) => return Err(format!("Failed to remove stored Ollama API key: {e}")),
+        }
+    }
+    // migrate_secrets_to_keyring() blanks every secret it stores; refill so
+    // in-memory state (and the OAuth badge) keeps the session's credentials.
+    state_guard.config.load_secrets_from_store();
     match state_guard.config.save() {
         Ok(()) => {
             info!("Ollama API key saved to OS keychain");
