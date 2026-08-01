@@ -2120,9 +2120,31 @@ impl DaemonServer {
 
         // Add Anthropic if credentials available
         if self.config.llm.anthropic_use_oauth {
-            if let Some(ref oauth_token) = self.config.llm.anthropic_oauth_token {
-                info!("Adding Anthropic provider (OAuth)");
-                router = router.with_anthropic_oauth(oauth_token);
+            // Env override wins (matches Config::load_secrets_from_store
+            // precedence); otherwise resolve from the durable stores, which
+            // refreshes a stale token instead of silently skipping the
+            // provider or booting with a token that can only 401.
+            let env_token = std::env::var("ANTHROPIC_OAUTH_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            if let Some(token) = env_token {
+                info!("Adding Anthropic provider (OAuth from env)");
+                router = router.with_anthropic_oauth(&token);
+            } else {
+                match nanna_config::resolve_anthropic_oauth(&store).await {
+                    Ok(cred) => {
+                        info!("Adding Anthropic provider (OAuth from durable store)");
+                        router = router.with_anthropic_oauth(&cred.access_token);
+                    }
+                    Err(e) => {
+                        if let Some(ref oauth_token) = self.config.llm.anthropic_oauth_token {
+                            warn!("OAuth resolution failed ({e}); using config-provided token");
+                            router = router.with_anthropic_oauth(oauth_token);
+                        } else {
+                            warn!("Anthropic OAuth enabled but no usable credential: {e}");
+                        }
+                    }
+                }
             }
         } else if let Some(ref api_key) = self.config.llm.anthropic_api_key {
             info!("Adding Anthropic provider (API key from config)");
@@ -2130,9 +2152,11 @@ impl DaemonServer {
         } else if let Ok(api_key) = store.get(credentials::keys::ANTHROPIC_API_KEY) {
             info!("Adding Anthropic provider (API key from keyring)");
             router = router.with_anthropic(&api_key);
-        } else if let Ok(loaded) = nanna_config::ClaudeCredentialManager::new().load() {
-            info!("Adding Anthropic provider (Claude CLI OAuth)");
-            router = router.with_anthropic_oauth(&loaded.credential.access_token);
+        } else if let Ok(cred) = nanna_config::resolve_anthropic_oauth(&store).await {
+            // OAuth mode not explicitly on, but an OAuth credential exists
+            // (nanna store or Claude CLI login) — refreshed if it was stale.
+            info!("Adding Anthropic provider (OAuth fallback)");
+            router = router.with_anthropic_oauth(&cred.access_token);
         }
 
         // Add OpenAI if credentials available
