@@ -104,7 +104,20 @@ async fn setup_state(
     backend: Arc<Backend>,
     log_buffer: LogBuffer,
 ) -> Result<AppState, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Config::load().unwrap_or_default().with_env_overrides();
+    let mut config = Config::load().unwrap_or_default().with_env_overrides();
+
+    // `Config::load` already hydrated `llm.anthropic_oauth_token` from the
+    // SecureStore/env. If OAuth mode is on but nothing was found there (e.g. a
+    // login that predates durable OAuth persistence), fall back to the Claude
+    // CLI credential store so the badge and native-model gating survive a
+    // restart. Cheap and local — the daemon owns actual request auth.
+    if config.llm.anthropic_use_oauth
+        && config.llm.anthropic_oauth_token.is_none()
+        && let Ok(loaded) = nanna_config::ClaudeCredentialManager::new().load()
+    {
+        info!("Rehydrated Anthropic OAuth token from Claude CLI credential store");
+        config.llm.anthropic_oauth_token = Some(loaded.credential.access_token);
+    }
 
     let workspaces = Arc::new(RwLock::new(load_workspaces_from_daemon(&backend).await));
 
@@ -214,6 +227,7 @@ pub fn run() {
             commands::settings::logout_anthropic_oauth,
             commands::settings::get_credential_status,
             commands::settings::refresh_oauth_token,
+            commands::settings::get_daemon_providers,
             commands::settings::check_env_var,
             // Cognitive memory (FSRS-6 + dreaming)
             commands::memory::get_cognitive_memory_stats,

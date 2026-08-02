@@ -28,10 +28,20 @@ const KEYRING_SERVICE: &str = "nanna";
 /// Credential key names
 pub mod keys {
     pub const ANTHROPIC_API_KEY: &str = "anthropic_api_key";
+    /// Anthropic OAuth access token (bare string; what request auth sends).
+    /// Same key `Config::load_secrets_from_store` hydrates from.
+    pub const ANTHROPIC_OAUTH_TOKEN: &str = "anthropic_oauth_token";
+    /// Full Anthropic OAuth credential as a JSON envelope.
+    ///
+    /// Carries the access token plus refresh token and expiry when the login
+    /// flow had them — that is what makes startup token refresh possible. The
+    /// bare-token key above is kept in lockstep for the config hydration path.
+    pub const ANTHROPIC_OAUTH_CREDENTIAL: &str = "anthropic_oauth_credential";
     pub const OPENAI_API_KEY: &str = "openai_api_key";
     pub const OPENROUTER_API_KEY: &str = "openrouter_api_key";
     pub const GITHUB_TOKEN: &str = "github_token";
     pub const BRAVE_API_KEY: &str = "brave_api_key";
+    pub const OLLAMA_API_KEY: &str = "ollama_api_key";
     pub const TELEGRAM_BOT_TOKEN: &str = "telegram_bot_token";
     pub const DISCORD_BOT_TOKEN: &str = "discord_bot_token";
     pub const SLACK_BOT_TOKEN: &str = "slack_bot_token";
@@ -220,28 +230,104 @@ impl SecureStore {
     pub fn list_keys(&self) -> Vec<String> {
         let known_keys = [
             keys::ANTHROPIC_API_KEY,
+            keys::ANTHROPIC_OAUTH_TOKEN,
+            keys::ANTHROPIC_OAUTH_CREDENTIAL,
             keys::OPENAI_API_KEY,
             keys::OPENROUTER_API_KEY,
             keys::GITHUB_TOKEN,
             keys::BRAVE_API_KEY,
+            keys::OLLAMA_API_KEY,
             keys::TELEGRAM_BOT_TOKEN,
             keys::DISCORD_BOT_TOKEN,
             keys::SLACK_BOT_TOKEN,
             keys::WHATSAPP_ACCESS_TOKEN,
             keys::ELEVENLABS_API_KEY,
         ];
-        
+
         known_keys
             .iter()
             .filter(|k| self.exists(k))
             .map(|k| k.to_string())
             .collect()
     }
-    
+
+    // =========================================================================
+    // Anthropic OAuth credential (durable home for GUI/CLI OAuth logins)
+    // =========================================================================
+
+    /// Durably persist an Anthropic OAuth login.
+    ///
+    /// Writes the full JSON envelope (access + refresh token + expiry) under
+    /// [`keys::ANTHROPIC_OAUTH_CREDENTIAL`] and the bare access token under
+    /// [`keys::ANTHROPIC_OAUTH_TOKEN`] — the latter is what
+    /// `Config::load_secrets_from_store` hydrates `llm.anthropic_oauth_token`
+    /// from, so both keys must stay in lockstep.
+    ///
+    /// # Errors
+    /// Returns an error when the credential cannot be serialized or the
+    /// backing store rejects the write.
+    pub fn save_anthropic_oauth(&self, cred: &OAuthCredential) -> Result<(), CredentialError> {
+        debug_assert!(
+            !cred.access_token.is_empty(),
+            "OAuth access token must not be empty"
+        );
+        let json = serde_json::to_string(cred)?;
+        self.set(keys::ANTHROPIC_OAUTH_CREDENTIAL, &json)?;
+        self.set(keys::ANTHROPIC_OAUTH_TOKEN, &cred.access_token)
+    }
+
+    /// Load the stored Anthropic OAuth credential.
+    ///
+    /// Prefers the JSON envelope (has refresh token + expiry). Falls back to
+    /// the bare access-token key — a token pasted from `claude setup-token`
+    /// has no refresh token or expiry, and an unreadable envelope must not
+    /// take a still-valid token down with it.
+    ///
+    /// # Errors
+    /// Returns [`CredentialError::NotFound`] when neither key is stored, or
+    /// the backing store's error when it cannot be read.
+    pub fn load_anthropic_oauth(&self) -> Result<OAuthCredential, CredentialError> {
+        match self.get(keys::ANTHROPIC_OAUTH_CREDENTIAL) {
+            Ok(json) => match serde_json::from_str::<OAuthCredential>(&json) {
+                Ok(cred) => return Ok(cred),
+                Err(e) => warn!("Stored OAuth envelope unreadable ({e}); trying bare token"),
+            },
+            Err(CredentialError::NotFound) => {}
+            Err(e) => warn!("Could not read OAuth envelope ({e}); trying bare token"),
+        }
+        let access_token = self.get(keys::ANTHROPIC_OAUTH_TOKEN)?;
+        Ok(OAuthCredential {
+            access_token,
+            refresh_token: None,
+            expires_at: None,
+            subscription_type: None,
+            account_id: None,
+            organization_id: None,
+        })
+    }
+
+    /// Remove every stored Anthropic OAuth key (logout). Absent keys are not
+    /// an error — logout of a logged-out store is a no-op, not a failure.
+    ///
+    /// # Errors
+    /// Returns the backing store's error when a present key cannot be removed.
+    pub fn delete_anthropic_oauth(&self) -> Result<(), CredentialError> {
+        for key in [
+            keys::ANTHROPIC_OAUTH_CREDENTIAL,
+            keys::ANTHROPIC_OAUTH_TOKEN,
+        ] {
+            match self.delete(key) {
+                Ok(()) | Err(CredentialError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     // =========================================================================
     // File Fallback (for systems without keyring support)
     // =========================================================================
-    
+
     fn credentials_file_path(&self) -> Result<PathBuf, CredentialError> {
         if let Some(dir) = &self.file_dir {
             return Ok(dir.join("credentials.enc"));
@@ -787,31 +873,59 @@ impl ClaudeCredentialManager {
         Ok(loaded)
     }
 
-    /// Check if Claude CLI is installed and available
-    pub fn is_claude_cli_available() -> bool {
-        let cmd = if cfg!(windows) { "claude.cmd" } else { "claude" };
-
-        std::process::Command::new(cmd)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    /// Candidate program names for the Claude Code CLI, in resolution order.
+    ///
+    /// On Windows the CLI ships two ways: the native installer puts
+    /// `claude.exe` on PATH (found by plain `claude` via `CreateProcess`'s
+    /// implicit `.exe`), while the npm wrapper installs `claude.cmd` (which
+    /// `Command::new("claude")` can NOT spawn — batch files need their
+    /// extension). Trying only `claude.cmd` made the native install invisible.
+    const fn claude_cli_candidates() -> &'static [&'static str] {
+        if cfg!(windows) {
+            &["claude", "claude.cmd"]
+        } else {
+            &["claude"]
+        }
     }
 
-    /// Run `claude setup-token` to authenticate via browser
+    /// The first Claude CLI candidate that answers `--version`, if any.
+    fn find_claude_cli() -> Option<&'static str> {
+        Self::claude_cli_candidates().iter().copied().find(|cmd| {
+            std::process::Command::new(cmd)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+    }
+
+    /// Check if Claude CLI is installed and available
+    #[must_use]
+    pub fn is_claude_cli_available() -> bool {
+        Self::find_claude_cli().is_some()
+    }
+
+    /// Run `claude setup-token` interactively (inherited stdio).
     ///
-    /// This opens the browser for OAuth flow and waits for completion.
-    /// The credentials will be saved by the CLI and can be loaded afterwards.
+    /// Suitable for a real terminal where the user can see the CLI's UI and
+    /// complete the browser flow. NOTE: `claude setup-token` PRINTS the minted
+    /// token for the user to copy (its success screen says to export it as
+    /// `CLAUDE_CODE_OAUTH_TOKEN`); it does NOT write
+    /// `~/.claude/.credentials.json` — verified against claude 2.1.71 on
+    /// Windows. Callers must not assume the CLI credential store was updated.
     ///
     /// # Errors
     /// Returns error if the CLI is not available or the command fails.
     pub fn run_setup_token() -> Result<(), CredentialError> {
-        let cmd = if cfg!(windows) { "claude.cmd" } else { "claude" };
+        let cmd = Self::find_claude_cli().ok_or_else(|| {
+            CredentialError::RefreshFailed("Claude Code CLI not found on PATH".to_string())
+        })?;
 
         let status = std::process::Command::new(cmd)
             .arg("setup-token")
             .status()
-            .map_err(|e| CredentialError::RefreshFailed(format!("Failed to run claude setup-token: {}", e)))?;
+            .map_err(|e| {
+                CredentialError::RefreshFailed(format!("Failed to run claude setup-token: {e}"))
+            })?;
 
         if status.success() {
             Ok(())
@@ -822,6 +936,168 @@ impl ClaudeCredentialManager {
             )))
         }
     }
+
+    /// Run `claude setup-token` with captured output and parse the minted
+    /// token out of it.
+    ///
+    /// This is the GUI-safe variant: a Tauri app on Windows has no console, so
+    /// the CLI's terminal UI is invisible there anyway — capturing stdout is
+    /// the only way the token (which the CLI only PRINTS, never persists) can
+    /// reach us. stdin is explicitly null so the child can never block waiting
+    /// for input nanna cannot provide.
+    ///
+    /// Returns `Ok(Some(credential))` when a token was parsed from the output
+    /// (`setup-token` tokens are long-lived and carry no refresh token or
+    /// expiry), `Ok(None)` when the command succeeded but printed no
+    /// recognizable token.
+    ///
+    /// # Errors
+    /// Returns error if the CLI is not available or exits non-zero (the
+    /// stderr tail is included so the user sees the real reason).
+    pub fn run_setup_token_captured() -> Result<Option<OAuthCredential>, CredentialError> {
+        let cmd = Self::find_claude_cli().ok_or_else(|| {
+            CredentialError::RefreshFailed("Claude Code CLI not found on PATH".to_string())
+        })?;
+
+        let output = std::process::Command::new(cmd)
+            .arg("setup-token")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| {
+                CredentialError::RefreshFailed(format!("Failed to run claude setup-token: {e}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail: String = stderr
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return Err(CredentialError::RefreshFailed(format!(
+                "claude setup-token failed (exit {:?}): {}",
+                output.status.code(),
+                tail.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(
+            extract_oauth_token(&stdout).map(|access_token| OAuthCredential {
+                access_token,
+                refresh_token: None,
+                expires_at: None,
+                subscription_type: None,
+                account_id: None,
+                organization_id: None,
+            }),
+        )
+    }
+}
+
+/// Resolve a usable Anthropic OAuth credential from every durable source,
+/// refreshing a stale one when a refresh token is available.
+///
+/// Order: nanna's own [`SecureStore`] (where GUI/CLI logins persist) first,
+/// then the Claude Code CLI credential store (`claude login`). A credential
+/// found in the CLI store is mirrored into the [`SecureStore`] so the next
+/// boot no longer depends on the CLI. Fails closed: an expired credential
+/// that cannot be refreshed is never returned.
+///
+/// # Errors
+/// Returns the last source's error when no source yields a usable credential.
+pub async fn resolve_anthropic_oauth(
+    store: &SecureStore,
+) -> Result<OAuthCredential, CredentialError> {
+    match store.load_anthropic_oauth() {
+        Ok(cred) if !cred.is_expired() => return Ok(cred),
+        Ok(cred) if cred.can_refresh() => {
+            match ClaudeCredentialManager::new().refresh_token(&cred).await {
+                Ok(fresh) => {
+                    if let Err(e) = store.save_anthropic_oauth(&fresh) {
+                        warn!("Refreshed OAuth token but failed to persist it: {e}");
+                    }
+                    return Ok(fresh);
+                }
+                Err(e) => warn!("Stored OAuth token expired and refresh failed: {e}"),
+            }
+        }
+        Ok(_) => warn!("Stored OAuth token expired with no refresh token; trying Claude CLI store"),
+        Err(CredentialError::NotFound) => {}
+        Err(e) => warn!("Could not read stored OAuth credential ({e}); trying Claude CLI store"),
+    }
+
+    // `load_and_refresh` also saves a refreshed token back to its CLI source.
+    let loaded = ClaudeCredentialManager::new().load_and_refresh().await?;
+    if let Err(e) = store.save_anthropic_oauth(&loaded.credential) {
+        warn!("Failed to mirror Claude CLI OAuth credential into secure store: {e}");
+    }
+    Ok(loaded.credential)
+}
+
+/// Extract an Anthropic OAuth access token (`sk-ant-oat…`) from CLI output.
+///
+/// Strips ANSI escape sequences first (the CLI renders through a terminal UI
+/// library), then takes the longest run of token characters starting at the
+/// literal `sk-ant-oat` prefix. The 40-char floor rejects prose that merely
+/// mentions the prefix; real tokens are ~100+ chars. Known limit: a token
+/// hard-wrapped mid-string by a narrow terminal won't reassemble — callers
+/// treat `None` as "fall back to other credential sources", never as failure.
+fn extract_oauth_token(output: &str) -> Option<String> {
+    const PREFIX: &str = "sk-ant-oat";
+    const MIN_LEN: usize = 40;
+    let clean = strip_ansi(output);
+    let start = clean.find(PREFIX)?;
+    let token: String = clean[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (token.len() >= MIN_LEN).then_some(token)
+}
+
+/// Drop ANSI CSI/OSC escape sequences, keeping printable text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: ESC [ … final byte in @–~
+            Some('[') => {
+                chars.next();
+                for e in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&e) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ESC ] … terminated by BEL or ESC \
+            Some(']') => {
+                chars.next();
+                while let Some(e) = chars.next() {
+                    if e == '\u{07}' {
+                        break;
+                    }
+                    if e == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Two-char escapes (ESC c, ESC 7, …): drop the next char.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 
@@ -1064,6 +1340,123 @@ mod tests {
         let raw = std::fs::read(temp_dir.path().join("credentials.enc")).unwrap();
         assert!(raw.starts_with(b"NANNAENC"));
         assert!(!String::from_utf8_lossy(&raw).contains("legacy_secret"));
+    }
+
+    #[test]
+    fn oauth_login_survives_restart_roundtrip() {
+        // The bug this guards: OAuth logins lived only in the in-memory Config
+        // (strip_secrets_for_disk blanks the token on every save), so a restart
+        // logged the user out. The durable home is the SecureStore; prove a
+        // fresh store instance over the same dir (= app restart) sees the login.
+        let temp_dir = TempDir::new().unwrap();
+        let cred = OAuthCredential {
+            access_token: "sk-ant-oat01-roundtrip-access".to_string(),
+            refresh_token: Some("refresh-me".to_string()),
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + 3600 * 1000),
+            subscription_type: Some("max".to_string()),
+            account_id: Some("acct_1".to_string()),
+            organization_id: None,
+        };
+
+        SecureStore::file_only_at(temp_dir.path().to_path_buf())
+            .save_anthropic_oauth(&cred)
+            .unwrap();
+
+        // "Restart": a brand-new store instance rooted at the same dir.
+        let store = SecureStore::file_only_at(temp_dir.path().to_path_buf());
+        let loaded = store.load_anthropic_oauth().unwrap();
+        assert_eq!(loaded.access_token, cred.access_token);
+        assert_eq!(loaded.refresh_token, cred.refresh_token);
+        assert_eq!(loaded.expires_at, cred.expires_at);
+        assert_eq!(loaded.subscription_type, cred.subscription_type);
+        assert_eq!(loaded.account_id, cred.account_id);
+
+        // The bare-token key (config hydration path) stays in lockstep.
+        assert_eq!(
+            store.get(keys::ANTHROPIC_OAUTH_TOKEN).unwrap(),
+            cred.access_token
+        );
+
+        // Logout removes both keys; logging out twice is a no-op, not an error.
+        store.delete_anthropic_oauth().unwrap();
+        assert!(matches!(
+            store.load_anthropic_oauth(),
+            Err(CredentialError::NotFound)
+        ));
+        assert!(matches!(
+            store.get(keys::ANTHROPIC_OAUTH_TOKEN),
+            Err(CredentialError::NotFound)
+        ));
+        store.delete_anthropic_oauth().unwrap();
+    }
+
+    #[test]
+    fn oauth_load_falls_back_to_bare_token() {
+        // A token pasted from `claude setup-token` is stored bare (no envelope,
+        // no refresh/expiry). Load must synthesize a usable credential from it.
+        let temp_dir = TempDir::new().unwrap();
+        let store = SecureStore::file_only_at(temp_dir.path().to_path_buf());
+        store
+            .set(keys::ANTHROPIC_OAUTH_TOKEN, "sk-ant-oat01-bare-token")
+            .unwrap();
+
+        let loaded = store.load_anthropic_oauth().unwrap();
+        assert_eq!(loaded.access_token, "sk-ant-oat01-bare-token");
+        assert_eq!(loaded.refresh_token, None);
+        assert!(!loaded.is_expired(), "no expiry info means assumed valid");
+        assert!(!loaded.can_refresh());
+    }
+
+    #[test]
+    fn oauth_load_survives_corrupt_envelope() {
+        // A garbled envelope must not take a still-valid bare token down with it.
+        let temp_dir = TempDir::new().unwrap();
+        let store = SecureStore::file_only_at(temp_dir.path().to_path_buf());
+        store
+            .set(keys::ANTHROPIC_OAUTH_CREDENTIAL, "{not json")
+            .unwrap();
+        store
+            .set(keys::ANTHROPIC_OAUTH_TOKEN, "sk-ant-oat01-still-good")
+            .unwrap();
+
+        let loaded = store.load_anthropic_oauth().unwrap();
+        assert_eq!(loaded.access_token, "sk-ant-oat01-still-good");
+    }
+
+    #[test]
+    fn extract_oauth_token_parses_cli_output() {
+        let token = format!("sk-ant-oat01-{}", "A".repeat(90));
+
+        // Plain output.
+        assert_eq!(
+            extract_oauth_token(&format!("Your token:\n\n  {token}\n\nStore it safely.")),
+            Some(token.clone())
+        );
+
+        // ANSI-styled output (the CLI renders through a terminal UI library).
+        let styled = format!("\u{1b}[1m\u{1b}[32m{token}\u{1b}[0m");
+        assert_eq!(extract_oauth_token(&styled), Some(token.clone()));
+
+        // Trailing punctuation/quotes never join the token.
+        assert_eq!(
+            extract_oauth_token(&format!("token \"{token}\".")),
+            Some(token)
+        );
+
+        // Prose that merely mentions the prefix is rejected (under the floor).
+        assert_eq!(
+            extract_oauth_token("tokens look like sk-ant-oat01-..."),
+            None
+        );
+        assert_eq!(extract_oauth_token("no token here"), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc() {
+        assert_eq!(strip_ansi("\u{1b}[1;32mhi\u{1b}[0m"), "hi");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
+        assert_eq!(strip_ansi("\u{1b}]8;;url\u{1b}\\link"), "link");
+        assert_eq!(strip_ansi("plain"), "plain");
     }
 
     #[test]

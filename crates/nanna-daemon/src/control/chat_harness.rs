@@ -224,129 +224,125 @@ impl ControlPlane {
             let scope = "session".to_string();
             let scope_id = Some(session_id_owned.clone());
 
-            // Unfinished work from an earlier turn is INFORMATION FOR THE
-            // MODEL, not an instruction to the harness. Owner directive
-            // (2026-07-25): *"the model should decide to resume or answer
-            // another question by the user … i don't think we should assume
-            // that the user wants to resume."* Previously the store decided
-            // silently: leftover items sorted ahead of the new plan, so a
-            // fresh question waited behind stale work nobody re-confirmed.
-            // Now the planner is shown what is outstanding and chooses.
-            let outstanding = open_work_context(&storage, &scope, scope_id.as_deref()).await;
-            let context = match (conversation.as_deref(), outstanding.as_deref()) {
-                (Some(convo), Some(work)) => Some(format!("{convo}\n\n{work}")),
-                (Some(convo), None) => Some(convo.to_string()),
-                (None, Some(work)) => Some(work.to_string()),
-                (None, None) => None,
-            };
+            // Deterministic fail-fast: the planner and every harness step
+            // resolve the provider the same way, so a model no provider
+            // serves has already decided the whole turn. Without this check
+            // the turn still "runs": the planner falls back to a single-task
+            // plan, both step attempts fail identically, poison containment
+            // cancels the item, and the run exits AllTasksDone with zero
+            // steps and nothing streamed — the user sees their prompt struck
+            // through as a cancelled task and no reply at all (observed live
+            // 2026-07-31, priority set to bare "claude-fable-5" with only
+            // OpenRouter configured). Say why instead, and seed no task that
+            // is born dead.
+            let model = step_runner.agent_config.model.clone();
+            if step_runner.router.client_for_model(&model).is_none() {
+                tracing::warn!(
+                    %model,
+                    "chat turn cannot run: no provider serves the configured model"
+                );
+                final_sink.delta(&format!(
+                    "_could not run: no provider is configured for model '{model}'. \
+                     Add the provider's credential in Settings — it registers \
+                     live, no restart needed — or pick a model from an \
+                     available provider in Settings → Models._"
+                ));
+            } else {
+                // Unfinished work from an earlier turn is INFORMATION FOR THE
+                // MODEL, not an instruction to the harness. Owner directive
+                // (2026-07-25): *"the model should decide to resume or answer
+                // another question by the user … i don't think we should assume
+                // that the user wants to resume."* Previously the store decided
+                // silently: leftover items sorted ahead of the new plan, so a
+                // fresh question waited behind stale work nobody re-confirmed.
+                // Now the planner is shown what is outstanding and chooses.
+                let outstanding = open_work_context(&storage, &scope, scope_id.as_deref()).await;
+                let context = match (conversation.as_deref(), outstanding.as_deref()) {
+                    (Some(convo), Some(work)) => Some(format!("{convo}\n\n{work}")),
+                    (Some(convo), None) => Some(convo.to_string()),
+                    (None, Some(work)) => Some(work.to_string()),
+                    (None, None) => None,
+                };
 
-            let plan = planner
-                .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
-                .await;
-            tracing::info!(
-                session_id = %session_id_owned,
-                tasks = plan.tasks.len(),
-                origin = ?plan.origin,
-                "planned a chat turn"
-            );
-
-            // Stop pressed while planning ran: seed nothing and start no
-            // work. An empty seed makes the harness run below a no-op — its
-            // first cancel check fires before any step — so the turn falls
-            // straight through to the persist/release tail.
-            let seeded = if run_handle.cancel.is_cancelled() {
+                let plan = planner
+                    .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
+                    .await;
                 tracing::info!(
                     session_id = %session_id_owned,
-                    "cancelled during planning — skipping the run"
+                    tasks = plan.tasks.len(),
+                    origin = ?plan.origin,
+                    "planned a chat turn"
                 );
-                Ok(Vec::new())
-            } else {
-                seed_plan(&storage, &scope, scope_id.as_deref(), &plan, false).await
-            };
-            match seeded {
-                Err(message) => {
-                    tracing::warn!(%message, "could not seed the chat plan");
-                    final_sink.delta(&format!("_could not start the run: {message}_"));
-                }
-                Ok(ids) => {
-                    // A one-task plan is a conversation-shaped turn: mark its
-                    // item quiet so the transcript reads as a plain reply,
-                    // with no step banner. Items added later (interjections,
-                    // replans) get banners — by then there IS a run to show.
-                    if let (1, Some(id)) = (ids.len(), ids.first()) {
-                        if let Ok(mut quiet) = final_sink.quiet_item.lock() {
-                            *quiet = Some(*id);
-                        }
-                    }
 
-                    let source = TursoTaskSource::new(
-                        storage.clone(),
-                        scope.clone(),
-                        scope_id.clone(),
-                        "chat".to_string(),
-                        Some(event_tx.clone()),
+                // Stop pressed while planning ran: seed nothing and start no
+                // work. An empty seed makes the harness run below a no-op — its
+                // first cancel check fires before any step — so the turn falls
+                // straight through to the persist/release tail.
+                let seeded = if run_handle.cancel.is_cancelled() {
+                    tracing::info!(
+                        session_id = %session_id_owned,
+                        "cancelled during planning — skipping the run"
                     );
-                    let interjector = SessionInterjector {
-                        storage: storage.clone(),
-                        scope: scope.clone(),
-                        scope_id: scope_id.clone(),
-                        pending: pending.clone(),
-                        planner: planner.clone(),
-                        actor: "chat".to_string(),
-                        event_tx: Some(event_tx.clone()),
-                        cancel: Some(run_handle.cancel.clone()),
-                    };
-                    let workdir = workspace_root.unwrap_or_else(|| PathBuf::from("."));
-                    let config = LongHorizonConfig {
-                        actor: "chat".to_string(),
-                        ..LongHorizonConfig::default()
-                    };
-
-                    // Drain-before-release. The interjector is only polled
-                    // INSIDE the harness loop, before `next()`. A message that
-                    // arrives after the final poll therefore lands in
-                    // `pending` with no loop left to notice it: the run exits,
-                    // the claim is released, and nothing ever starts a run for
-                    // it — the user's message silently disappears. Observed
-                    // live: "the queue doesn't seem to ever make it to the
-                    // model even after the model reaches a stopping point."
-                    //
-                    // So: after the harness returns, re-check the queue and
-                    // run again for whatever arrived late. Bounded by
-                    // POST_RUN_DRAIN_MAX rather than `while !empty` — a user
-                    // typing steadily could otherwise keep one turn alive
-                    // forever, and any message past the bound is still safe in
-                    // `pending` for the next turn to claim.
-                    const POST_RUN_DRAIN_MAX: usize = 4;
-                    let mut report = nanna_agent::harness::LongHorizonRunner::new(config.clone())
-                        .run_with_interjector(
-                            &content_owned,
-                            &source,
-                            &step_runner,
-                            &workdir,
-                            Some(run_handle.cancel.clone()),
-                            Some(&interjector),
-                        )
-                        .await;
-
-                    for sweep in 0..POST_RUN_DRAIN_MAX {
-                        if run_handle.cancel.is_cancelled() {
-                            break; // the user pressed Stop; do not start more work
-                        }
-                        let admitted = match interjector.interject().await {
-                            Ok(0) => break,
-                            Ok(n) => n,
-                            Err(message) => {
-                                tracing::warn!(%message, "post-run drain could not seed");
-                                break;
+                    Ok(Vec::new())
+                } else {
+                    seed_plan(&storage, &scope, scope_id.as_deref(), &plan, false).await
+                };
+                match seeded {
+                    Err(message) => {
+                        tracing::warn!(%message, "could not seed the chat plan");
+                        final_sink.delta(&format!("_could not start the run: {message}_"));
+                    }
+                    Ok(ids) => {
+                        // A one-task plan is a conversation-shaped turn: mark its
+                        // item quiet so the transcript reads as a plain reply,
+                        // with no step banner. Items added later (interjections,
+                        // replans) get banners — by then there IS a run to show.
+                        if let (1, Some(id)) = (ids.len(), ids.first()) {
+                            if let Ok(mut quiet) = final_sink.quiet_item.lock() {
+                                *quiet = Some(*id);
                             }
-                        };
-                        tracing::info!(
-                            sweep,
-                            admitted,
-                            "message arrived after the last step boundary — running it now"
+                        }
+
+                        let source = TursoTaskSource::new(
+                            storage.clone(),
+                            scope.clone(),
+                            scope_id.clone(),
+                            "chat".to_string(),
+                            Some(event_tx.clone()),
                         );
-                        let extra = nanna_agent::harness::LongHorizonRunner::new(config.clone())
+                        let interjector = SessionInterjector {
+                            storage: storage.clone(),
+                            scope: scope.clone(),
+                            scope_id: scope_id.clone(),
+                            pending: pending.clone(),
+                            planner: planner.clone(),
+                            actor: "chat".to_string(),
+                            event_tx: Some(event_tx.clone()),
+                            cancel: Some(run_handle.cancel.clone()),
+                        };
+                        let workdir = workspace_root.unwrap_or_else(|| PathBuf::from("."));
+                        let config = LongHorizonConfig {
+                            actor: "chat".to_string(),
+                            ..LongHorizonConfig::default()
+                        };
+
+                        // Drain-before-release. The interjector is only polled
+                        // INSIDE the harness loop, before `next()`. A message that
+                        // arrives after the final poll therefore lands in
+                        // `pending` with no loop left to notice it: the run exits,
+                        // the claim is released, and nothing ever starts a run for
+                        // it — the user's message silently disappears. Observed
+                        // live: "the queue doesn't seem to ever make it to the
+                        // model even after the model reaches a stopping point."
+                        //
+                        // So: after the harness returns, re-check the queue and
+                        // run again for whatever arrived late. Bounded by
+                        // POST_RUN_DRAIN_MAX rather than `while !empty` — a user
+                        // typing steadily could otherwise keep one turn alive
+                        // forever, and any message past the bound is still safe in
+                        // `pending` for the next turn to claim.
+                        const POST_RUN_DRAIN_MAX: usize = 4;
+                        let mut report = nanna_agent::harness::LongHorizonRunner::new(config.clone())
                             .run_with_interjector(
                                 &content_owned,
                                 &source,
@@ -356,173 +352,25 @@ impl ControlPlane {
                                 Some(&interjector),
                             )
                             .await;
-                        report.steps_taken += extra.steps_taken;
-                        report.items_completed += extra.items_completed;
-                        report.interjected_items += admitted + extra.interjected_items;
-                    }
 
-                    // Keep a MISSION alive while there is still work to plan.
-                    //
-                    // `AllTasksDone` means "the current plan drained", not
-                    // "the goal is met". A 9B planner decomposes a 42-feature
-                    // build into a handful of tasks, so the turn used to end
-                    // minutes in with the goal barely started — observed live
-                    // 2026-07-27: ended normally at 15 minutes, 2 of 42
-                    // acceptance checks passing. The multi-hour runs this is
-                    // meant to match came from a fully seeded ladder, which
-                    // chat never gets.
-                    //
-                    // So: re-plan from the CURRENT state (the store is the
-                    // truth, and the workspace is on disk for the model to
-                    // inspect) and keep going. Termination is loop-until-dry
-                    // rather than a step count: when a planning round adds no
-                    // new open work twice running, the goal is as done as this
-                    // planner can make it.
-                    //
-                    // Only missions continue — but "mission" is about WORK
-                    // DONE, not plan size. Gating on `ids.len() > 1` was
-                    // wrong: this planner routinely emits ONE task for a
-                    // 42-feature build ("Build minidb CLI by iterating
-                    // through all 42 test files"), so the gate stayed shut on
-                    // exactly the runs it exists for — observed 2026-07-27, a
-                    // one-task plan ran 67 tool calls over 12 minutes and then
-                    // ended at 4/42 with continuation never firing.
-                    //
-                    // `steps_taken > 1` was still not the honest signal, and it
-                    // failed the same way one rung down. Observed 2026-07-28: a
-                    // 42-feature build produced a ONE-task plan whose FIRST step
-                    // made 13 tool calls, wrote a file, ran a test, and then
-                    // marked its single task done. `ids.len() > 1` was false and
-                    // `steps_taken > 1` was false, so the continuation loop
-                    // never ran a single round and a mission meant to last hours
-                    // ended 90 seconds in, at 1/42.
-                    //
-                    // Counting steps and items cannot separate a mission from a
-                    // greeting, because both can be one of each. What separates
-                    // them is whether the run ACTED: a conversational turn
-                    // answers from the model's head and calls no tools, while
-                    // anything that touched the world may have left work behind.
-                    // So the question asked here is "did this run do anything?",
-                    // and if it did, the loop below is allowed to ask whether
-                    // more remains. It is a cheap question — the dry-round
-                    // counter closes it out after two empty rounds.
-                    const CONTINUATION_ROUNDS_MAX: usize = 60;
-                    const CONTINUATION_DRY_ROUNDS: usize = 2;
-                    /// Rounds a run may end in an ERROR stop and still be retried.
-                    ///
-                    /// `AllTasksDone` used to be the only continuable stop, which
-                    /// meant one transient Turso error in `TursoTaskSource::next`,
-                    /// or three consecutive 502s tripping the runner's error cap,
-                    /// silently ended an overnight run. The mission's termination
-                    /// criterion should be "no more work can be planned", not
-                    /// "the last step happened to exit by the happy path".
-                    const CONTINUATION_ERROR_ROUNDS: usize = 3;
-
-                    // Say how the run ended, always. Every exit produces a report
-                    // and it was simply discarded, so recovering WHY a run stopped
-                    // took a database query. It should take a grep.
-                    tracing::info!(
-                        stop = ?report.stop,
-                        steps = report.steps_taken,
-                        tool_calls = report.tool_calls,
-                        items = report.items_completed,
-                        false_success = report.false_success_claims,
-                        "chat harness run finished"
-                    );
-
-                    let is_mission =
-                        ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
-                    let mut error_rounds = 0usize;
-                    let mut dry_rounds = 0usize;
-                    let mut continuations = 0usize;
-                    while is_mission
-                        && {
-                            use nanna_agent::harness::StopReason;
-                            match report.stop {
-                                StopReason::AllTasksDone => true,
-                                // Transient: the store hiccuped or the model
-                                // failed a few times in a row. Worth another
-                                // round, but bounded so a hard fault cannot spin.
-                                StopReason::SourceError { .. } | StopReason::RunnerErrors { .. } => {
-                                    error_rounds += 1;
-                                    if error_rounds <= CONTINUATION_ERROR_ROUNDS {
-                                        tracing::warn!(
-                                            stop = ?report.stop,
-                                            round = error_rounds,
-                                            "run ended on an error — retrying rather than                                              abandoning the mission"
-                                        );
-                                        true
-                                    } else {
-                                        tracing::error!(
-                                            stop = ?report.stop,
-                                            "run keeps failing — giving up after {} error rounds",
-                                            CONTINUATION_ERROR_ROUNDS
-                                        );
-                                        false
-                                    }
-                                }
-                                // Deliberate: the user stopped it, or the budget
-                                // is genuinely spent. Do not paper over these.
-                                _ => false,
+                        for sweep in 0..POST_RUN_DRAIN_MAX {
+                            if run_handle.cancel.is_cancelled() {
+                                break; // the user pressed Stop; do not start more work
                             }
-                        }
-                        && dry_rounds < CONTINUATION_DRY_ROUNDS
-                        && continuations < CONTINUATION_ROUNDS_MAX
-                        && !run_handle.cancel.is_cancelled()
-                    {
-                        continuations += 1;
-                        let outstanding =
-                            open_work_context(&storage, &scope, scope_id.as_deref()).await;
-                        let ctx = match (conversation.as_deref(), outstanding.as_deref()) {
-                            (Some(c), Some(w)) => Some(format!("{c}\n\n{w}")),
-                            (Some(c), None) => Some(c.to_string()),
-                            (None, Some(w)) => Some(w.to_string()),
-                            (None, None) => None,
-                        };
-                        let next_plan = planner
-                            .plan(&content_owned, ctx.as_deref(), Some(&run_handle.cancel))
-                            .await;
-                        // Stop pressed while the continuation round planned:
-                        // the mission is over — seed nothing.
-                        if run_handle.cancel.is_cancelled() {
-                            break;
-                        }
-                        let seeded = seed_plan(
-                            &storage,
-                            &scope,
-                            scope_id.as_deref(),
-                            &next_plan,
-                            false,
-                        )
-                        .await
-                        .unwrap_or_default();
-                        // seed_plan reuses an existing open task for a repeated
-                        // title, so "nothing new" shows up as an empty plan or
-                        // as a store with nothing open. Counted, never peeked
-                        // with `next()` — that CLAIMS an item, and a probe must
-                        // not consume the work it is probing for.
-                        let has_work = storage
-                            .tasks()
-                            .counts(&scope, scope_id.as_deref())
-                            .await
-                            .is_ok_and(|(open, _closed)| open > 0);
-                        if seeded.is_empty() || !has_work {
-                            dry_rounds += 1;
+                            let admitted = match interjector.interject().await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(message) => {
+                                    tracing::warn!(%message, "post-run drain could not seed");
+                                    break;
+                                }
+                            };
                             tracing::info!(
-                                continuations,
-                                dry_rounds,
-                                "mission continuation planned no new work"
+                                sweep,
+                                admitted,
+                                "message arrived after the last step boundary — running it now"
                             );
-                            continue;
-                        }
-                        dry_rounds = 0;
-                        tracing::info!(
-                            continuations,
-                            new_tasks = seeded.len(),
-                            "mission continues — the goal is not done yet"
-                        );
-                        let more =
-                            nanna_agent::harness::LongHorizonRunner::new(config.clone())
+                            let extra = nanna_agent::harness::LongHorizonRunner::new(config.clone())
                                 .run_with_interjector(
                                     &content_owned,
                                     &source,
@@ -532,31 +380,246 @@ impl ControlPlane {
                                     Some(&interjector),
                                 )
                                 .await;
-                        report.steps_taken += more.steps_taken;
-                        report.tool_calls += more.tool_calls;
-                        report.items_completed += more.items_completed;
-                        report.interjected_items += more.interjected_items;
-                        report.stop = more.stop;
-                    }
+                            report.steps_taken += extra.steps_taken;
+                            report.tool_calls += extra.tool_calls;
+                            report.items_completed += extra.items_completed;
+                            report.items_abandoned += extra.items_abandoned;
+                            report.interjected_items += admitted + extra.interjected_items;
+                            if extra.last_runner_error.is_some() {
+                                report.last_runner_error = extra.last_runner_error;
+                            }
+                            // The drain segment ran last, so its stop describes
+                            // where the turn actually ended up — same rule as
+                            // `fold_reports`.
+                            report.stop = extra.stop;
+                        }
 
-                    // Run mechanics are shown only when there was a real run:
-                    // a single-step reply stays a plain reply.
-                    let multi_step = report.steps_taken > 1
-                        || report.items_completed > 1
-                        || report.interjected_items > 0;
-                    if multi_step {
-                        final_sink.delta(&format!(
-                            "\n\n_{} step{} · {} item{} completed{}_",
-                            report.steps_taken,
-                            if report.steps_taken == 1 { "" } else { "s" },
-                            report.items_completed,
-                            if report.items_completed == 1 { "" } else { "s" },
-                            if report.interjected_items > 0 {
-                                format!(" · {} interjected", report.interjected_items)
-                            } else {
-                                String::new()
-                            },
-                        ));
+                        // Keep a MISSION alive while there is still work to plan.
+                        //
+                        // `AllTasksDone` means "the current plan drained", not
+                        // "the goal is met". A 9B planner decomposes a 42-feature
+                        // build into a handful of tasks, so the turn used to end
+                        // minutes in with the goal barely started — observed live
+                        // 2026-07-27: ended normally at 15 minutes, 2 of 42
+                        // acceptance checks passing. The multi-hour runs this is
+                        // meant to match came from a fully seeded ladder, which
+                        // chat never gets.
+                        //
+                        // So: re-plan from the CURRENT state (the store is the
+                        // truth, and the workspace is on disk for the model to
+                        // inspect) and keep going. Termination is loop-until-dry
+                        // rather than a step count: when a planning round adds no
+                        // new open work twice running, the goal is as done as this
+                        // planner can make it.
+                        //
+                        // Only missions continue — but "mission" is about WORK
+                        // DONE, not plan size. Gating on `ids.len() > 1` was
+                        // wrong: this planner routinely emits ONE task for a
+                        // 42-feature build ("Build minidb CLI by iterating
+                        // through all 42 test files"), so the gate stayed shut on
+                        // exactly the runs it exists for — observed 2026-07-27, a
+                        // one-task plan ran 67 tool calls over 12 minutes and then
+                        // ended at 4/42 with continuation never firing.
+                        //
+                        // `steps_taken > 1` was still not the honest signal, and it
+                        // failed the same way one rung down. Observed 2026-07-28: a
+                        // 42-feature build produced a ONE-task plan whose FIRST step
+                        // made 13 tool calls, wrote a file, ran a test, and then
+                        // marked its single task done. `ids.len() > 1` was false and
+                        // `steps_taken > 1` was false, so the continuation loop
+                        // never ran a single round and a mission meant to last hours
+                        // ended 90 seconds in, at 1/42.
+                        //
+                        // Counting steps and items cannot separate a mission from a
+                        // greeting, because both can be one of each. What separates
+                        // them is whether the run ACTED: a conversational turn
+                        // answers from the model's head and calls no tools, while
+                        // anything that touched the world may have left work behind.
+                        // So the question asked here is "did this run do anything?",
+                        // and if it did, the loop below is allowed to ask whether
+                        // more remains. It is a cheap question — the dry-round
+                        // counter closes it out after two empty rounds.
+                        const CONTINUATION_ROUNDS_MAX: usize = 60;
+                        const CONTINUATION_DRY_ROUNDS: usize = 2;
+                        /// Rounds a run may end in an ERROR stop and still be retried.
+                        ///
+                        /// `AllTasksDone` used to be the only continuable stop, which
+                        /// meant one transient Turso error in `TursoTaskSource::next`,
+                        /// or three consecutive 502s tripping the runner's error cap,
+                        /// silently ended an overnight run. The mission's termination
+                        /// criterion should be "no more work can be planned", not
+                        /// "the last step happened to exit by the happy path".
+                        const CONTINUATION_ERROR_ROUNDS: usize = 3;
+
+                        // Say how the run ended, always. Every exit produces a report
+                        // and it was simply discarded, so recovering WHY a run stopped
+                        // took a database query. It should take a grep.
+                        tracing::info!(
+                            stop = ?report.stop,
+                            steps = report.steps_taken,
+                            tool_calls = report.tool_calls,
+                            items = report.items_completed,
+                            false_success = report.false_success_claims,
+                            "chat harness run finished"
+                        );
+
+                        let is_mission =
+                            ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
+                        let mut error_rounds = 0usize;
+                        let mut dry_rounds = 0usize;
+                        let mut continuations = 0usize;
+                        while is_mission
+                            && {
+                                use nanna_agent::harness::StopReason;
+                                match report.stop {
+                                    StopReason::AllTasksDone => true,
+                                    // Transient: the store hiccuped or the model
+                                    // failed a few times in a row. Worth another
+                                    // round, but bounded so a hard fault cannot spin.
+                                    StopReason::SourceError { .. } | StopReason::RunnerErrors { .. } => {
+                                        error_rounds += 1;
+                                        if error_rounds <= CONTINUATION_ERROR_ROUNDS {
+                                            tracing::warn!(
+                                                stop = ?report.stop,
+                                                round = error_rounds,
+                                                "run ended on an error — retrying rather than                                              abandoning the mission"
+                                            );
+                                            true
+                                        } else {
+                                            tracing::error!(
+                                                stop = ?report.stop,
+                                                "run keeps failing — giving up after {} error rounds",
+                                                CONTINUATION_ERROR_ROUNDS
+                                            );
+                                            false
+                                        }
+                                    }
+                                    // Deliberate: the user stopped it, or the budget
+                                    // is genuinely spent. Do not paper over these.
+                                    _ => false,
+                                }
+                            }
+                            && dry_rounds < CONTINUATION_DRY_ROUNDS
+                            && continuations < CONTINUATION_ROUNDS_MAX
+                            && !run_handle.cancel.is_cancelled()
+                        {
+                            continuations += 1;
+                            let outstanding =
+                                open_work_context(&storage, &scope, scope_id.as_deref()).await;
+                            let ctx = match (conversation.as_deref(), outstanding.as_deref()) {
+                                (Some(c), Some(w)) => Some(format!("{c}\n\n{w}")),
+                                (Some(c), None) => Some(c.to_string()),
+                                (None, Some(w)) => Some(w.to_string()),
+                                (None, None) => None,
+                            };
+                            let next_plan = planner
+                                .plan(&content_owned, ctx.as_deref(), Some(&run_handle.cancel))
+                                .await;
+                            // Stop pressed while the continuation round planned:
+                            // the mission is over — seed nothing.
+                            if run_handle.cancel.is_cancelled() {
+                                break;
+                            }
+                            let seeded = seed_plan(
+                                &storage,
+                                &scope,
+                                scope_id.as_deref(),
+                                &next_plan,
+                                false,
+                            )
+                            .await
+                            .unwrap_or_default();
+                            // seed_plan reuses an existing open task for a repeated
+                            // title, so "nothing new" shows up as an empty plan or
+                            // as a store with nothing open. Counted, never peeked
+                            // with `next()` — that CLAIMS an item, and a probe must
+                            // not consume the work it is probing for.
+                            let has_work = storage
+                                .tasks()
+                                .counts(&scope, scope_id.as_deref())
+                                .await
+                                .is_ok_and(|(open, _closed)| open > 0);
+                            if seeded.is_empty() || !has_work {
+                                dry_rounds += 1;
+                                tracing::info!(
+                                    continuations,
+                                    dry_rounds,
+                                    "mission continuation planned no new work"
+                                );
+                                continue;
+                            }
+                            dry_rounds = 0;
+                            tracing::info!(
+                                continuations,
+                                new_tasks = seeded.len(),
+                                "mission continues — the goal is not done yet"
+                            );
+                            let more =
+                                nanna_agent::harness::LongHorizonRunner::new(config.clone())
+                                    .run_with_interjector(
+                                        &content_owned,
+                                        &source,
+                                        &step_runner,
+                                        &workdir,
+                                        Some(run_handle.cancel.clone()),
+                                        Some(&interjector),
+                                    )
+                                    .await;
+                            report.steps_taken += more.steps_taken;
+                            report.tool_calls += more.tool_calls;
+                            report.items_completed += more.items_completed;
+                            report.items_abandoned += more.items_abandoned;
+                            report.interjected_items += more.interjected_items;
+                            if more.last_runner_error.is_some() {
+                                report.last_runner_error = more.last_runner_error;
+                            }
+                            report.stop = more.stop;
+                        }
+
+                        // A run that failed must SAY it failed. Poison
+                        // containment can drain the whole plan through
+                        // abandonment and exit `AllTasksDone` having streamed
+                        // nothing — which rendered as no reply at all, the
+                        // user's prompt just struck through as a cancelled
+                        // task (observed live 2026-07-31). Announce WHAT
+                        // stopped the run and WHY, in the transcript the user
+                        // is actually looking at.
+                        if let Some(notice) = failure_notice(&report) {
+                            tracing::warn!(
+                                stop = ?report.stop,
+                                last_runner_error = report.last_runner_error.as_deref(),
+                                "chat run failed — surfacing the reason in the transcript"
+                            );
+                            final_sink.delta(&notice);
+                        }
+
+                        // Run mechanics are shown only when there was a real run:
+                        // a single-step reply stays a plain reply.
+                        let multi_step = report.steps_taken > 1
+                            || report.items_completed > 1
+                            || report.interjected_items > 0;
+                        if multi_step {
+                            final_sink.delta(&format!(
+                                "\n\n_{} step{} · {} item{} completed{}{}_",
+                                report.steps_taken,
+                                if report.steps_taken == 1 { "" } else { "s" },
+                                report.items_completed,
+                                if report.items_completed == 1 { "" } else { "s" },
+                                // Abandoned work is part of the run's honest
+                                // arithmetic — "3 items completed" from a
+                                // 5-item plan must not read as done.
+                                if report.items_abandoned > 0 {
+                                    format!(" · {} abandoned", report.items_abandoned)
+                                } else {
+                                    String::new()
+                                },
+                                if report.interjected_items > 0 {
+                                    format!(" · {} interjected", report.interjected_items)
+                                } else {
+                                    String::new()
+                                },
+                            ));
+                        }
                     }
                 }
             }
@@ -628,6 +691,44 @@ pub fn interjected_response(session_id: &str, depth: usize) -> Value {
         "content": "",
         "message": "admitted to the run in progress at the next step boundary",
     })
+}
+
+/// The user-visible line for a run that ended in failure, or `None` when the
+/// ending needs no announcement (success, or a deliberate stop like Cancelled
+/// or an exhausted budget — those were asked for).
+///
+/// Two failure shapes are announced, per "summaries must announce
+/// themselves" — WHAT stopped and WHY, stated where the user is looking:
+/// - an error stop (`RunnerErrors` / `SourceError`);
+/// - `AllTasksDone` that completed nothing while abandoning something — the
+///   poison-containment path, where a deterministic runner fault drains the
+///   plan through abandonment and exits by the happy path.
+///
+/// Partial runs (some items completed, some abandoned) are NOT an error
+/// banner; the run-stats line carries the abandoned count instead.
+fn failure_notice(report: &nanna_agent::harness::LongHorizonReport) -> Option<String> {
+    use nanna_agent::harness::StopReason;
+    let why = match &report.stop {
+        StopReason::RunnerErrors { message } => format!("the model kept failing: {message}"),
+        StopReason::SourceError { message } => format!("the task store failed: {message}"),
+        StopReason::AllTasksDone
+            if report.items_completed == 0 && report.items_abandoned > 0 =>
+        {
+            report.last_runner_error.clone().unwrap_or_else(|| {
+                "every planned task was abandoned without completing".to_string()
+            })
+        }
+        _ => return None,
+    };
+    // Separate from streamed step text when there was any; a run that never
+    // took a step starts its (only) message cleanly.
+    let sep = if report.steps_taken > 0 { "\n\n" } else { "" };
+    let verb = if report.steps_taken == 0 {
+        "could not run"
+    } else {
+        "could not finish"
+    };
+    Some(format!("{sep}_{verb}: {why}_"))
 }
 
 /// Render this scope's still-open work so the PLANNER can decide what to do
@@ -787,6 +888,7 @@ pub(super) fn sanitize_timeline(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use nanna_agent::harness::{LongHorizonReport, StopReason};
 
     fn msg(role: MessageRole, content: &str) -> SessionMessage {
         SessionMessage {
@@ -800,6 +902,108 @@ mod tests {
             timeline: Vec::new(),
             usage: None,
         }
+    }
+
+    fn report(
+        stop: StopReason,
+        steps: usize,
+        completed: usize,
+        abandoned: usize,
+        last_err: Option<&str>,
+    ) -> LongHorizonReport {
+        LongHorizonReport {
+            stop,
+            steps_taken: steps,
+            tool_calls: 0,
+            items_completed: completed,
+            items_completed_unverified: 0,
+            items_abandoned: abandoned,
+            last_runner_error: last_err.map(String::from),
+            replans: 0,
+            false_success_claims: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            wall_clock_secs: 0,
+            tokens_per_completed_item: None,
+            interjected_items: 0,
+        }
+    }
+
+    #[test]
+    fn failure_notice_surfaces_a_fully_abandoned_plan() {
+        // The live 2026-07-31 shape: provider fault → poison containment →
+        // AllTasksDone with zero steps. The notice must carry the error.
+        let r = report(
+            StopReason::AllTasksDone,
+            0,
+            0,
+            1,
+            Some("No provider available for model 'claude-fable-5'"),
+        );
+        let notice = failure_notice(&r).expect("a drained-by-abandonment run must announce itself");
+        assert!(notice.contains("could not run"), "{notice}");
+        assert!(
+            notice.contains("No provider available for model 'claude-fable-5'"),
+            "{notice}"
+        );
+        assert!(
+            !notice.starts_with('\n'),
+            "nothing streamed, so no separator: {notice:?}"
+        );
+    }
+
+    #[test]
+    fn failure_notice_falls_back_when_no_runner_error_was_recorded() {
+        // Fruitless-step abandonment records no runner error; the notice must
+        // still say the plan was abandoned rather than staying silent.
+        let notice = failure_notice(&report(StopReason::AllTasksDone, 0, 0, 2, None))
+            .expect("abandonment without an error still announces itself");
+        assert!(notice.contains("abandoned"), "{notice}");
+    }
+
+    #[test]
+    fn failure_notice_reports_error_stops_and_separates_from_streamed_text() {
+        let r = report(
+            StopReason::RunnerErrors {
+                message: "step error: 502".to_string(),
+            },
+            4,
+            1,
+            0,
+            Some("step error: 502"),
+        );
+        let notice = failure_notice(&r).expect("an error stop is a failure");
+        assert!(
+            notice.starts_with("\n\n"),
+            "steps streamed text — the notice needs a separator: {notice:?}"
+        );
+        assert!(notice.contains("could not finish"), "{notice}");
+        assert!(notice.contains("502"), "{notice}");
+
+        let r = report(
+            StopReason::SourceError {
+                message: "storage exploded".to_string(),
+            },
+            0,
+            0,
+            0,
+            None,
+        );
+        let notice = failure_notice(&r).expect("a source error is a failure");
+        assert!(notice.contains("task store"), "{notice}");
+    }
+
+    #[test]
+    fn failure_notice_stays_quiet_on_success_and_deliberate_stops() {
+        // Clean success.
+        assert!(failure_notice(&report(StopReason::AllTasksDone, 3, 2, 0, None)).is_none());
+        // The user pressed Stop — do not dress it up as a fault.
+        assert!(failure_notice(&report(StopReason::Cancelled, 0, 0, 1, Some("x"))).is_none());
+        // Budget stops were asked for.
+        assert!(failure_notice(&report(StopReason::WallClockExhausted, 9, 3, 0, None)).is_none());
+        // Partial completion: the run-stats line carries the abandoned count;
+        // an error banner would overstate the failure.
+        assert!(failure_notice(&report(StopReason::AllTasksDone, 5, 2, 1, Some("x"))).is_none());
     }
 
     #[test]

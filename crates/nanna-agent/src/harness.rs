@@ -586,6 +586,14 @@ pub struct LongHorizonReport {
     /// existed) — logged so unverified completions are visible.
     pub items_completed_unverified: usize,
     pub items_abandoned: usize,
+    /// The most recent step-runner error seen during the run, kept so a
+    /// caller can say WHY when the plan drained through abandonment rather
+    /// than completion. Poison containment turns a deterministic runner
+    /// fault (e.g. "no provider for the configured model") into abandoned
+    /// items and a clean `AllTasksDone` — without this field that failure is
+    /// indistinguishable from a finished run.
+    #[serde(default)]
+    pub last_runner_error: Option<String>,
     pub replans: usize,
     /// Completion claims that the acceptance check refuted (the
     /// "false success" counter — the P14 anti-drift keystone at work).
@@ -852,6 +860,7 @@ impl LongHorizonRunner {
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut consecutive_errors = 0usize;
+        let mut last_runner_error: Option<String> = None;
         let mut progress: HashMap<i64, ItemProgress> = HashMap::new();
 
         let stop = loop {
@@ -954,6 +963,7 @@ impl LongHorizonRunner {
                 }
                 Err(message) => {
                     consecutive_errors += 1;
+                    last_runner_error = Some(message.clone());
                     let item = progress.entry(step.id).or_default();
                     item.runner_errors += 1;
                     // Poison containment: when the failure follows one item
@@ -1143,6 +1153,7 @@ impl LongHorizonRunner {
             items_completed,
             items_completed_unverified,
             items_abandoned,
+            last_runner_error,
             replans,
             false_success_claims,
             input_tokens,
@@ -1598,6 +1609,7 @@ mod tests {
         assert_eq!(report.stop, StopReason::AllTasksDone);
         assert_eq!(report.steps_taken, 0);
         assert_eq!(report.tokens_per_completed_item, None);
+        assert_eq!(report.last_runner_error, None, "no error, nothing to carry");
     }
 
     #[tokio::test]
@@ -1949,6 +1961,39 @@ mod tests {
         assert_eq!(report.stop, StopReason::AllTasksDone, "{report:?}");
         assert_eq!(report.items_abandoned, 1, "poisoned item abandoned");
         assert_eq!(report.items_completed, 1, "healthy item still completed");
+        assert_eq!(
+            report.last_runner_error.as_deref(),
+            Some("empty completion"),
+            "the error that poisoned the item survives into the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_runner_error_reports_why_the_plan_drained() {
+        // The live 2026-07-31 failure: a model whose provider is not
+        // configured fails every run_step call identically. Poison
+        // containment abandons the only item and the run exits AllTasksDone
+        // with zero steps — numerically identical to a finished run. The
+        // report must still carry the error so the caller can say WHY.
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "the user's prompt", None)).await;
+        let runner = ScriptedRunner::new(vec![
+            Err("No provider available for model 'claude-fable-5'".to_string()),
+            Err("No provider available for model 'claude-fable-5'".to_string()),
+        ]);
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone, "{report:?}");
+        assert_eq!(report.steps_taken, 0);
+        assert_eq!(report.items_completed, 0);
+        assert_eq!(report.items_abandoned, 1);
+        assert_eq!(
+            report.last_runner_error.as_deref(),
+            Some("No provider available for model 'claude-fable-5'"),
+            "the report must name the fault that emptied the plan"
+        );
     }
 
     #[tokio::test]
@@ -1971,6 +2016,7 @@ mod tests {
         assert!(matches!(report.stop, StopReason::RunnerErrors { .. }), "{report:?}");
         assert_eq!(report.steps_taken, 0, "failed steps are not progress");
         assert_eq!(report.items_abandoned, 1, "first item was contained as poisoned");
+        assert_eq!(report.last_runner_error.as_deref(), Some("boom"));
     }
 
     #[tokio::test]

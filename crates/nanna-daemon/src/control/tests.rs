@@ -101,6 +101,61 @@ async fn dreaming_orchestrator_shares_the_control_plane_memory_store() {
     );
 }
 
+/// The boot-only-registration regression (2026-07-31): a credential added
+/// through the control plane's config path must register its provider on the
+/// LIVE router — the GUI saves a key and calls config-reload expecting exactly
+/// this, but the provider map used to be frozen at daemon startup, so every
+/// call to the new provider died with "No provider available" until a restart.
+///
+/// Uses `ConfigAction::Set` rather than `Reload` so the test never touches the
+/// real on-disk config; both actions run the same rebuild helper. The config
+/// credential wins before any keyring/CLI fallback, so the assertions are
+/// deterministic on any machine.
+#[tokio::test]
+async fn config_set_rebuilds_llm_router_providers() {
+    let router = Arc::new(crate::llm_router::LlmRouter::new());
+    let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    cp.router = Some(Arc::clone(&router));
+
+    assert!(
+        !router.has_provider(crate::llm_router::ProviderId::OpenRouter),
+        "fresh router must start with no providers"
+    );
+
+    let resp = cp
+        .handle(
+            "test",
+            Action::Config(ConfigAction::Set {
+                path: "llm.openrouter_api_key".into(),
+                value: json!("sk-or-test"),
+            }),
+        )
+        .await;
+    assert_eq!(resp["status"], "updated");
+
+    assert!(
+        router.has_provider(crate::llm_router::ProviderId::OpenRouter),
+        "config mutation must register the new provider on the live router"
+    );
+    assert!(
+        router.has_provider(crate::llm_router::ProviderId::Ollama),
+        "Ollama registers unconditionally on every rebuild"
+    );
+
+    // /status must report the daemon-side provider list the GUI picker gates on.
+    let status = cp
+        .handle("test", Action::System(SystemAction::Status))
+        .await;
+    let providers: Vec<&str> = status["llm_providers"]
+        .as_array()
+        .expect("status must carry llm_providers")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(providers.contains(&"openrouter"));
+    assert!(providers.contains(&"ollama"));
+}
+
 /// Negative space: with no memory configured at all, consolidation reports the
 /// missing store rather than reaching the dreaming gate.
 #[tokio::test]

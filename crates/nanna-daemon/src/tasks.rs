@@ -2597,6 +2597,7 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         items_completed: 0,
         items_completed_unverified: 0,
         items_abandoned: 0,
+        last_runner_error: None,
         replans: 0,
         false_success_claims: 0,
         input_tokens: 0,
@@ -2617,6 +2618,12 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.output_tokens = segments.iter().map(|r| r.output_tokens).sum();
     folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
     folded.interjected_items = segments.iter().map(|r| r.interjected_items).sum();
+    // Like the stop reason, the newest recorded error is the one that
+    // describes where the run ended up.
+    folded.last_runner_error = segments
+        .iter()
+        .rev()
+        .find_map(|r| r.last_runner_error.clone());
     folded.tokens_per_completed_item = if folded.items_completed > 0 {
         Some((folded.input_tokens + folded.output_tokens) / folded.items_completed as u64)
     } else {
@@ -2911,6 +2918,7 @@ mod tests {
             items_completed: completed,
             items_completed_unverified: 0,
             items_abandoned: 0,
+            last_runner_error: None,
             replans: 0,
             false_success_claims: 0,
             input_tokens: tokens_in,
