@@ -5,12 +5,12 @@
 use crate::llm_router::LlmRouter;
 use crate::protocol::Event;
 use crate::session::{MessageRole, RunUsage, SessionId, SessionMessage, TimelineItem, ToolCallRecord};
-use nanna_agent::{Agent, AgentConfig, ModelTier, RunOptions, ThinkingMode};
+use nanna_agent::{Agent, AgentConfig, CancelToken, ModelTier, RunOptions, ThinkingMode};
 use nanna_llm::{AnthropicMessage, ModelInfo, ModelInfoCache};
 use nanna_memory::MemoryService;
 use nanna_tools::ToolRegistry;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -125,8 +125,10 @@ struct ActiveChat {
     // Used for future session tracking features
     _session_id: SessionId,
     cancelled: bool,
-    /// Shared cancellation flag passed into the agent loop for cooperative cancellation
-    cancellation_flag: Arc<AtomicBool>,
+    /// Shared cancellation token passed into the agent loop. Cancelling it
+    /// aborts the in-flight LLM stream and tool calls, not just the next
+    /// loop-boundary check.
+    cancel: CancelToken,
     started_at: chrono::DateTime<chrono::Utc>,
     /// Accumulated streamed text (shared with on_text callback)
     accumulated_text: Arc<tokio::sync::RwLock<String>>,
@@ -300,7 +302,7 @@ pub struct CompletedToolCallInfo {
 /// persistence work identically to the in-service chat path.
 #[derive(Clone)]
 pub struct ExternalRunHandle {
-    pub cancellation_flag: Arc<AtomicBool>,
+    pub cancel: CancelToken,
     pub accumulated_text: Arc<tokio::sync::RwLock<String>>,
     pub accumulated_thinking: Arc<tokio::sync::RwLock<String>>,
     pub active_tool_calls: Arc<tokio::sync::RwLock<Vec<ActiveToolCallInfo>>>,
@@ -551,7 +553,7 @@ impl AgentService {
     /// path — a leaked entry would make the session look busy forever.
     pub async fn register_external_run(&self, session_id: &str) -> ExternalRunHandle {
         let handle = ExternalRunHandle {
-            cancellation_flag: Arc::new(AtomicBool::new(false)),
+            cancel: CancelToken::new(),
             accumulated_text: Arc::new(tokio::sync::RwLock::new(String::new())),
             accumulated_thinking: Arc::new(tokio::sync::RwLock::new(String::new())),
             active_tool_calls: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -564,7 +566,7 @@ impl AgentService {
             ActiveChat {
                 _session_id: session_id.to_string(),
                 cancelled: false,
-                cancellation_flag: handle.cancellation_flag.clone(),
+                cancel: handle.cancel.clone(),
                 started_at: chrono::Utc::now(),
                 accumulated_text: handle.accumulated_text.clone(),
                 accumulated_thinking: handle.accumulated_thinking.clone(),
@@ -658,7 +660,7 @@ impl AgentService {
         let context_used = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let context_window_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let run_started = std::time::Instant::now();
-        let cancellation_flag = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
 
         // Register this chat as active (for streaming state tracking)
         {
@@ -666,7 +668,7 @@ impl AgentService {
             active.insert(session_id.to_string(), ActiveChat {
                 _session_id: session_id.to_string(),
                 cancelled: false,
-                cancellation_flag: cancellation_flag.clone(),
+                cancel: cancel.clone(),
                 started_at: chrono::Utc::now(),
                 accumulated_text: accumulated.clone(),
                 accumulated_thinking: accumulated_thinking.clone(),
@@ -882,7 +884,7 @@ impl AgentService {
             let tokens_in_for_tool_start = run_input_tokens.clone();
             let tokens_out_for_tool_start = run_output_tokens.clone();
             let options = RunOptions {
-                cancellation_flag: Some(cancellation_flag.clone()),
+                cancel: Some(cancel.clone()),
                 on_text: Some(Box::new(move |chunk: &str| {
                     // Accumulate text for run state recovery
                     if let Ok(mut buf) = accumulated_for_cb.try_write() {
@@ -1282,7 +1284,7 @@ impl AgentService {
                     if provider == crate::llm_router::ProviderId::Ollama
                         && Self::is_server_down_error(&error_str)
                         && server_down_waits < CHAT_SERVER_DOWN_WAITS_MAX
-                        && !cancellation_flag.load(Ordering::Relaxed)
+                        && !cancel.is_cancelled()
                     {
                         server_down_waits += 1;
                         warn!(
@@ -1331,7 +1333,7 @@ impl AgentService {
 
                     if crate::tasks::is_transient_llm_error(&error_str)
                         && !Self::is_rate_limit_error(&error_str)
-                        && !cancellation_flag.load(Ordering::Relaxed)
+                        && !cancel.is_cancelled()
                         && same_model_retries < CHAT_TRANSIENT_RETRIES_MAX
                     {
                         same_model_retries += 1;
@@ -1351,7 +1353,7 @@ impl AgentService {
                         // arriving mid-backoff must not bounce the shared
                         // Ollama server for a chat nobody is waiting on.
                         if provider == crate::llm_router::ProviderId::Ollama
-                            && !cancellation_flag.load(Ordering::Relaxed)
+                            && !cancel.is_cancelled()
                         {
                             // Second failure: unload the model to clear a
                             // degraded runner. Final retry: restart the
@@ -1554,12 +1556,14 @@ impl AgentService {
         None
     }
     
-    /// Cancel an active chat
+    /// Cancel an active chat. Abortive: waking the token drops the
+    /// in-flight LLM stream and tool awaits immediately — the run does not
+    /// wait for the next token batch or step boundary to notice.
     pub async fn cancel(&self, session_id: &str) -> bool {
         let mut active = self.active_chats.write().await;
         if let Some(chat) = active.get_mut(session_id) {
             chat.cancelled = true;
-            chat.cancellation_flag.store(true, Ordering::Relaxed);
+            chat.cancel.cancel();
             true
         } else {
             false

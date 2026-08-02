@@ -21,13 +21,13 @@ use nanna_agent::harness::{
     StepOutcome, StepRequest, StepRunner, StepToolCall, StopReason, TaskSource, TaskStep,
 };
 use nanna_agent::planner::{Plan, build_plan_prompt, plan_or_fallback};
+use nanna_agent::CancelToken;
 use nanna_scripting::ServiceFn;
 use nanna_storage::{NewTask, Storage, StorageError, Task, TaskPatch};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -1573,13 +1573,24 @@ impl StepRunner for AgentStepRunner {
                 if request
                     .cancel
                     .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                    .is_some_and(CancelToken::is_cancelled)
                 {
                     return Err(last_err);
                 }
                 tracing::warn!(attempt, error = %last_err, "retrying step after transient LLM error");
                 let backoff = STEP_RETRY_BACKOFF_SECS[attempt - 1];
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                let sleep = tokio::time::sleep(std::time::Duration::from_secs(backoff));
+                // A Stop arriving mid-backoff aborts the sleep too — the
+                // user is not waiting on a retry they just cancelled.
+                if let Some(token) = request.cancel.as_ref() {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => return Err(last_err),
+                        () = sleep => {}
+                    }
+                } else {
+                    sleep.await;
+                }
                 // A WEDGED runner does not recover by being asked again: its
                 // state has to be cleared. Retrying one three times against
                 // the same wedge is how a run dies — observed 2026-07-27,
@@ -1924,12 +1935,12 @@ impl AgentStepRunner {
             max_iterations: request.max_iterations,
             token_budget: request.token_budget,
             max_wall_clock: request.max_wall_clock,
-            // The Stop button's flag. Without this the agent loop streams and
-            // executes tools until the step ends on its own — observed live
-            // (2026-07-30): Stop had no effect for minutes because the flag
-            // was only polled between harness steps, and a chat turn is
+            // The Stop button's token. Without this the agent loop streams
+            // and executes tools until the step ends on its own — observed
+            // live (2026-07-30): Stop had no effect for minutes because the
+            // flag was only polled between harness steps, and a chat turn is
             // usually ONE step.
-            cancellation_flag: request.cancel.clone(),
+            cancel: request.cancel.clone(),
             step_kind: Some(request.step_kind),
             initial_active_tools: active,
             restrict_to_active_tools: restrict_to_active,
@@ -2017,12 +2028,12 @@ const PLAN_ITERATIONS: usize = 1;
 /// planning is just a step whose prompt asks for JSON and whose tool scope is
 /// empty.
 pub struct AgentPlanner {
-    pub runner: Arc<AgentStepRunner>,
+    pub runner: Arc<dyn StepRunner>,
 }
 
 impl AgentPlanner {
     #[must_use]
-    pub const fn new(runner: Arc<AgentStepRunner>) -> Self {
+    pub const fn new(runner: Arc<dyn StepRunner>) -> Self {
         Self { runner }
     }
 
@@ -2030,7 +2041,17 @@ impl AgentPlanner {
     ///
     /// Never returns an error: a planner problem must not cost the user a
     /// turn. The returned `Plan::origin` records which path was taken.
-    pub async fn plan(&self, goal: &str, context: Option<&str>) -> Plan {
+    ///
+    /// `cancel` is the run's Stop token: planning sits in front of every
+    /// turn, so a Stop during it must abort the planning call immediately
+    /// rather than wait out `PLAN_TIMEOUT_SECS` (observed live 2026-07-31:
+    /// Stop during planning hung the turn for the full 30s window). The
+    /// caller decides what a cancelled plan means — chat skips seeding and
+    /// running it.
+    pub async fn plan(&self, goal: &str, context: Option<&str>, cancel: Option<&CancelToken>) -> Plan {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Plan::single(goal);
+        }
         let request = StepRequest {
             // Planning is not attached to an item yet; the store assigns ids
             // when the plan is seeded.
@@ -2043,16 +2064,26 @@ impl AgentPlanner {
             token_budget: None,
             max_iterations: Some(PLAN_ITERATIONS),
             max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
-            // Planning is bounded by PLAN_TIMEOUT_SECS; a Stop during it
-            // costs at most that window before the harness sees the flag.
-            cancel: None,
+            // Threaded so the in-step LLM call aborts on Stop too.
+            cancel: cancel.cloned(),
         };
 
-        let outcome = tokio::time::timeout(
+        let planning = tokio::time::timeout(
             std::time::Duration::from_secs(PLAN_TIMEOUT_SECS),
             self.runner.run_step(request),
-        )
-        .await;
+        );
+        let outcome = if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                outcome = planning => outcome,
+                () = token.cancelled() => {
+                    tracing::info!("planning cancelled — degrading to the single-task plan");
+                    return Plan::single(goal);
+                }
+            }
+        } else {
+            planning.await
+        };
 
         match outcome {
             Ok(Ok(step)) => plan_or_fallback(goal, &step.text),
@@ -2200,6 +2231,9 @@ pub struct SessionInterjector {
     pub planner: Arc<AgentPlanner>,
     pub actor: String,
     pub event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+    /// The run's Stop token, so a cancel arriving while an interjection is
+    /// being planned aborts that planning call instead of waiting it out.
+    pub cancel: Option<CancelToken>,
 }
 
 impl SessionInterjector {
@@ -2248,8 +2282,22 @@ impl Interjector for SessionInterjector {
         }
 
         let mut admitted = 0usize;
-        for message in messages {
-            let plan = self.planner.plan(&message, None).await;
+        let mut queue = messages.into_iter();
+        while let Some(message) = queue.next() {
+            let plan = self
+                .planner
+                .plan(&message, None, self.cancel.as_ref())
+                .await;
+            // Stop pressed while this interjection was being planned: do not
+            // seed work nobody will run. The drained messages go back to
+            // `pending` so the next turn claims them instead of losing them.
+            if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                self.pending.push(message).await;
+                for rest in queue {
+                    self.pending.push(rest).await;
+                }
+                return Ok(admitted);
+            }
             // Yield before seeding so the new tasks are the only candidates
             // not outranked by an in-progress item.
             if let Err(e) = self.yield_current_item().await {
@@ -3161,12 +3209,77 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Planner cancellation (abortive Stop)
+    // -----------------------------------------------------------------
+
+    /// A runner that never returns — the stand-in for a wedged or slow
+    /// provider mid-planning.
+    struct NeverReturns;
+
+    #[async_trait::async_trait]
+    impl StepRunner for NeverReturns {
+        async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+            std::future::pending().await
+        }
+    }
+
+    /// Stop during planning must abort the planning call immediately, not
+    /// wait out the 30s planner timeout (observed live 2026-07-31: Stop in
+    /// the planning phase hung the turn for the full window).
+    #[tokio::test]
+    async fn a_cancel_during_planning_returns_the_fallback_plan_promptly() {
+        let planner = AgentPlanner::new(Arc::new(NeverReturns));
+        let cancel = CancelToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stop.cancel();
+        });
+        let plan = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            planner.plan("build the thing", None, Some(&cancel)),
+        )
+        .await
+        .expect("cancel must abort planning promptly, not wait out the timeout");
+        assert_eq!(plan.origin, nanna_agent::PlanOrigin::Fallback);
+    }
+
+    /// Counts how often it is asked to plan.
+    struct CountsCalls(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl StepRunner for CountsCalls {
+        async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(StepOutcome {
+                text: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    /// A turn cancelled before planning starts must not invoke the model at
+    /// all — the caller then skips seeding, so no run ever starts.
+    #[tokio::test]
+    async fn an_already_cancelled_plan_never_invokes_the_runner() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let planner = AgentPlanner::new(Arc::new(CountsCalls(calls.clone())));
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let plan = planner.plan("hello", None, Some(&cancel)).await;
+        assert_eq!(plan.origin, nanna_agent::PlanOrigin::Fallback);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------
     // ChatSink → ExternalRunHandle (P19 navigation recovery)
     // -----------------------------------------------------------------
 
     fn external_run_handle() -> crate::agent_service::ExternalRunHandle {
         crate::agent_service::ExternalRunHandle {
-            cancellation_flag: Arc::new(AtomicBool::new(false)),
+            cancel: nanna_agent::CancelToken::new(),
             accumulated_text: Arc::new(RwLock::new(String::new())),
             accumulated_thinking: Arc::new(RwLock::new(String::new())),
             active_tool_calls: Arc::new(RwLock::new(Vec::new())),
@@ -3327,7 +3440,7 @@ mod tests {
 
 /// A live long-horizon run.
 struct ActiveRun {
-    cancel: Arc<AtomicBool>,
+    cancel: CancelToken,
     goal: String,
     started_at: chrono::DateTime<chrono::Utc>,
 }
@@ -3400,7 +3513,7 @@ impl TaskRunManager {
             runs.insert(
                 key.clone(),
                 ActiveRun {
-                    cancel: Arc::new(AtomicBool::new(false)),
+                    cancel: CancelToken::new(),
                     goal: goal.clone(),
                     started_at: chrono::Utc::now(),
                 },
@@ -3506,7 +3619,7 @@ impl TaskRunManager {
         let key = Self::scope_key(scope, scope_id);
         let runs = self.runs.read().await;
         runs.get(&key).is_some_and(|run| {
-            run.cancel.store(true, Ordering::Relaxed);
+            run.cancel.cancel();
             true
         })
     }

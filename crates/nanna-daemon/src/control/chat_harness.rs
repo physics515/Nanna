@@ -23,9 +23,10 @@
 //! 3. **Recoverable.** The run registers with
 //!    [`crate::agent_service::AgentService::register_external_run`], so
 //!    navigation away and back rebuilds the live view (`get_run_state`), the
-//!    Stop button works (`cancel` flips the shared flag the harness polls at
-//!    step boundaries), and the full run timeline is persisted with the final
-//!    message instead of evaporating with the stream.
+//!    Stop button works (`cancel` wakes the shared token, aborting the
+//!    in-flight LLM stream and tool calls, and skipping planning/seeding),
+//!    and the full run timeline is persisted with the final message instead
+//!    of evaporating with the stream.
 //! 4. **Interject.** A message sent while a run is live does not queue behind
 //!    it: it is admitted at the next step boundary and jumps the plan, so the
 //!    user is answered at the first available opportunity rather than in
@@ -239,7 +240,9 @@ impl ControlPlane {
                 (None, None) => None,
             };
 
-            let plan = planner.plan(&content_owned, context.as_deref()).await;
+            let plan = planner
+                .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
+                .await;
             tracing::info!(
                 session_id = %session_id_owned,
                 tasks = plan.tasks.len(),
@@ -247,7 +250,20 @@ impl ControlPlane {
                 "planned a chat turn"
             );
 
-            match seed_plan(&storage, &scope, scope_id.as_deref(), &plan, false).await {
+            // Stop pressed while planning ran: seed nothing and start no
+            // work. An empty seed makes the harness run below a no-op — its
+            // first cancel check fires before any step — so the turn falls
+            // straight through to the persist/release tail.
+            let seeded = if run_handle.cancel.is_cancelled() {
+                tracing::info!(
+                    session_id = %session_id_owned,
+                    "cancelled during planning — skipping the run"
+                );
+                Ok(Vec::new())
+            } else {
+                seed_plan(&storage, &scope, scope_id.as_deref(), &plan, false).await
+            };
+            match seeded {
                 Err(message) => {
                     tracing::warn!(%message, "could not seed the chat plan");
                     final_sink.delta(&format!("_could not start the run: {message}_"));
@@ -278,6 +294,7 @@ impl ControlPlane {
                         planner: planner.clone(),
                         actor: "chat".to_string(),
                         event_tx: Some(event_tx.clone()),
+                        cancel: Some(run_handle.cancel.clone()),
                     };
                     let workdir = workspace_root.unwrap_or_else(|| PathBuf::from("."));
                     let config = LongHorizonConfig {
@@ -307,16 +324,13 @@ impl ControlPlane {
                             &source,
                             &step_runner,
                             &workdir,
-                            Some(run_handle.cancellation_flag.clone()),
+                            Some(run_handle.cancel.clone()),
                             Some(&interjector),
                         )
                         .await;
 
                     for sweep in 0..POST_RUN_DRAIN_MAX {
-                        if run_handle
-                            .cancellation_flag
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
+                        if run_handle.cancel.is_cancelled() {
                             break; // the user pressed Stop; do not start more work
                         }
                         let admitted = match interjector.interject().await {
@@ -338,7 +352,7 @@ impl ControlPlane {
                                 &source,
                                 &step_runner,
                                 &workdir,
-                                Some(run_handle.cancellation_flag.clone()),
+                                Some(run_handle.cancel.clone()),
                                 Some(&interjector),
                             )
                             .await;
@@ -454,9 +468,7 @@ impl ControlPlane {
                         }
                         && dry_rounds < CONTINUATION_DRY_ROUNDS
                         && continuations < CONTINUATION_ROUNDS_MAX
-                        && !run_handle
-                            .cancellation_flag
-                            .load(std::sync::atomic::Ordering::Relaxed)
+                        && !run_handle.cancel.is_cancelled()
                     {
                         continuations += 1;
                         let outstanding =
@@ -467,7 +479,14 @@ impl ControlPlane {
                             (None, Some(w)) => Some(w.to_string()),
                             (None, None) => None,
                         };
-                        let next_plan = planner.plan(&content_owned, ctx.as_deref()).await;
+                        let next_plan = planner
+                            .plan(&content_owned, ctx.as_deref(), Some(&run_handle.cancel))
+                            .await;
+                        // Stop pressed while the continuation round planned:
+                        // the mission is over — seed nothing.
+                        if run_handle.cancel.is_cancelled() {
+                            break;
+                        }
                         let seeded = seed_plan(
                             &storage,
                             &scope,
@@ -509,7 +528,7 @@ impl ControlPlane {
                                     &source,
                                     &step_runner,
                                     &workdir,
-                                    Some(run_handle.cancellation_flag.clone()),
+                                    Some(run_handle.cancel.clone()),
                                     Some(&interjector),
                                 )
                                 .await;

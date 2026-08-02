@@ -5,6 +5,7 @@
 //!
 //! Implements the agentic loop with tool calling, memory, and context management.
 
+pub mod cancel;
 mod chunker;
 pub mod compressor;
 mod context;
@@ -28,6 +29,7 @@ pub mod mcp;
 pub use nanna_workspace;
 pub use nanna_workspace::{Workspace, WorkspaceFiles, WorkspaceManager, WorkspaceTemplate};
 
+pub use cancel::CancelToken;
 pub use context::{
     AgentContext, ContextIsolation, ContextSummary, ContextSummarizationConfig, plausible_summary,
 };
