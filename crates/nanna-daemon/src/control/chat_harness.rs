@@ -42,7 +42,7 @@ use super::{ControlPlane, Value, json};
 use crate::session::{MessageRole, SessionMessage, TimelineItem};
 use crate::tasks::{
     AgentPlanner, AgentStepRunner, ChatSink, PendingMessages, SessionInterjector, TursoTaskSource,
-    demote_in_progress, seed_plan,
+    closed_task_ids, demote_in_progress, seed_continuation, seed_plan,
 };
 use nanna_agent::harness::{Interjector, LongHorizonConfig};
 use nanna_storage::Storage;
@@ -51,6 +51,29 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Continuation rounds one mission turn may run before it is forcibly ended.
+///
+/// Bound justification: the dry-round counter is the real exit; this only
+/// brakes a planner that keeps inventing genuinely new titles forever, and 60
+/// rounds of real new work is a session the user should be steering anyway.
+const CONTINUATION_ROUNDS_MAX: usize = 60;
+
+/// Consecutive rounds that plan no new work before the mission is done.
+///
+/// Bound justification: one dry round can be a planner hiccup; two in a row
+/// means re-planning from the current store state finds nothing left — the
+/// goal is as done as this planner can make it.
+const CONTINUATION_DRY_ROUNDS: usize = 2;
+
+/// Rounds a run may end in an ERROR stop and still be retried.
+///
+/// `AllTasksDone` used to be the only continuable stop, which meant one
+/// transient Turso error in `TursoTaskSource::next`, or three consecutive
+/// 502s tripping the runner's error cap, silently ended an overnight run. The
+/// mission's termination criterion should be "no more work can be planned",
+/// not "the last step happened to exit by the happy path".
+const CONTINUATION_ERROR_ROUNDS: usize = 3;
 
 /// Per-session interjection intake, shared between the chat handler (which
 /// pushes) and the live run's [`SessionInterjector`] (which drains).
@@ -269,6 +292,17 @@ impl ControlPlane {
                     (None, None) => None,
                 };
 
+                // The turn-start boundary for continuation dedup: tasks
+                // already closed NOW belong to history, and only titles
+                // closed AFTER this snapshot count as work this turn did
+                // (see `seed_continuation`). On a store error the baseline
+                // degrades to empty, which OVER-filters — continuation rounds
+                // then dedup against all of history and the mission ends
+                // early rather than treadmilling.
+                let closed_before_turn = closed_task_ids(&storage, &scope, scope_id.as_deref())
+                    .await
+                    .unwrap_or_default();
+
                 let plan = planner
                     .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
                     .await;
@@ -444,18 +478,6 @@ impl ControlPlane {
                         // and if it did, the loop below is allowed to ask whether
                         // more remains. It is a cheap question — the dry-round
                         // counter closes it out after two empty rounds.
-                        const CONTINUATION_ROUNDS_MAX: usize = 60;
-                        const CONTINUATION_DRY_ROUNDS: usize = 2;
-                        /// Rounds a run may end in an ERROR stop and still be retried.
-                        ///
-                        /// `AllTasksDone` used to be the only continuable stop, which
-                        /// meant one transient Turso error in `TursoTaskSource::next`,
-                        /// or three consecutive 502s tripping the runner's error cap,
-                        /// silently ended an overnight run. The mission's termination
-                        /// criterion should be "no more work can be planned", not
-                        /// "the last step happened to exit by the happy path".
-                        const CONTINUATION_ERROR_ROUNDS: usize = 3;
-
                         // Say how the run ended, always. Every exit produces a report
                         // and it was simply discarded, so recovering WHY a run stopped
                         // took a database query. It should take a grep.
@@ -525,20 +547,26 @@ impl ControlPlane {
                             if run_handle.cancel.is_cancelled() {
                                 break;
                             }
-                            let seeded = seed_plan(
+                            // Dedup against titles this turn already CLOSED: the
+                            // finished copy cannot be reused (only OPEN titles
+                            // dedupe at add), so a planner that re-emits the work
+                            // it just completed would seed a fresh clone every
+                            // round and the dry detector would never trip —
+                            // observed live 2026-08-02 (session 7ccc455a), one
+                            // question re-planned eleven times to ROUNDS_MAX. An
+                            // all-duplicate plan seeds nothing and counts dry.
+                            let seeded = seed_continuation(
                                 &storage,
                                 &scope,
                                 scope_id.as_deref(),
                                 &next_plan,
-                                false,
+                                &closed_before_turn,
                             )
                             .await
                             .unwrap_or_default();
-                            // seed_plan reuses an existing open task for a repeated
-                            // title, so "nothing new" shows up as an empty plan or
-                            // as a store with nothing open. Counted, never peeked
-                            // with `next()` — that CLAIMS an item, and a probe must
-                            // not consume the work it is probing for.
+                            // Open work is counted, never peeked with `next()` —
+                            // that CLAIMS an item, and a probe must not consume
+                            // the work it is probing for.
                             let has_work = storage
                                 .tasks()
                                 .counts(&scope, scope_id.as_deref())
@@ -1082,6 +1110,82 @@ mod tests {
         // Partial completion: the run-stats line carries the abandoned count;
         // an error banner would overstate the failure.
         assert!(failure_notice(&report(StopReason::AllTasksDone, 5, 2, 1, Some("x"))).is_none());
+    }
+
+    /// REGRESSION (live 2026-08-02, session 7ccc455a): one conversational
+    /// question ("difference between a mutex and a semaphore?") became an
+    /// eleven-round treadmill — every continuation round re-planned the same
+    /// goal, the previous copy was CLOSED so seeding created a fresh clone
+    /// (tasks #2033..#2044), and the dry detector never tripped until
+    /// `CONTINUATION_ROUNDS_MAX`. This drives the loop's exact round
+    /// arithmetic against a real store with a planner that re-emits the same
+    /// goal every round: with closed-title dedup, two consecutive
+    /// all-duplicate rounds end the mission and the goal is worked ONCE.
+    #[tokio::test]
+    async fn two_all_duplicate_continuation_rounds_end_the_mission() {
+        use crate::tasks::{closed_task_ids, seed_continuation, seed_plan};
+        use nanna_agent::planner::Plan;
+
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let scope = "session";
+        let scope_id = Some("s1");
+        let goal = "Explain the difference between a mutex and a semaphore";
+
+        // Turn start: snapshot the closed baseline, seed the initial plan,
+        // and let the "run" complete its single task.
+        let closed_before_turn = closed_task_ids(&storage, scope, scope_id)
+            .await
+            .expect("baseline");
+        let ids = seed_plan(&storage, scope, scope_id, &Plan::single(goal), false)
+            .await
+            .expect("initial seed");
+        for id in &ids {
+            storage
+                .tasks()
+                .complete(*id, Some("test"), None)
+                .await
+                .expect("complete");
+        }
+
+        // The continuation loop's round accounting, with the planner
+        // behaviour observed live: the same single-task plan every round.
+        let mut dry_rounds = 0usize;
+        let mut continuations = 0usize;
+        while dry_rounds < CONTINUATION_DRY_ROUNDS && continuations < CONTINUATION_ROUNDS_MAX {
+            continuations += 1;
+            let seeded =
+                seed_continuation(&storage, scope, scope_id, &Plan::single(goal), &closed_before_turn)
+                    .await
+                    .unwrap_or_default();
+            if seeded.is_empty() {
+                dry_rounds += 1;
+                continue;
+            }
+            dry_rounds = 0;
+            for id in &seeded {
+                storage
+                    .tasks()
+                    .complete(*id, Some("test"), None)
+                    .await
+                    .expect("complete");
+            }
+        }
+
+        assert_eq!(
+            continuations, CONTINUATION_DRY_ROUNDS,
+            "the mission ends after two dry rounds, not at ROUNDS_MAX"
+        );
+        let all = storage
+            .tasks()
+            .list(scope, scope_id, true)
+            .await
+            .expect("list");
+        assert_eq!(
+            all.len(),
+            1,
+            "the goal was worked once, never treadmilled: {:?}",
+            all.iter().map(|t| &t.title).collect::<Vec<_>>()
+        );
     }
 
     #[test]
