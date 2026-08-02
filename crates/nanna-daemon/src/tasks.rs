@@ -25,7 +25,7 @@ use nanna_agent::CancelToken;
 use nanna_scripting::ServiceFn;
 use nanna_storage::{NewTask, Storage, StorageError, Task, TaskPatch};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -252,10 +252,7 @@ pub fn build_task_services(
                         .await
                         .map_err(err_str)?
                         .into_iter()
-                        .find(|t| {
-                            t.parent_id == parent_id
-                                && t.title.trim().eq_ignore_ascii_case(title.trim())
-                        })
+                        .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
                     {
                         return Ok(json!({
                             "task": task_to_json(&existing),
@@ -2189,6 +2186,108 @@ pub async fn seed_plan(
     Ok(ids)
 }
 
+/// Whitespace- and ASCII-case-insensitive title identity — the same rule the
+/// `tasks.add` idempotent-reuse check applies, so "is this the same task?"
+/// has exactly one definition.
+#[must_use]
+pub fn same_title(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Ids of every closed (`done` or `cancelled`) task in a scope.
+///
+/// Captured by the chat harness at TURN START as the baseline for
+/// [`seed_continuation`]: only tasks that close after this snapshot count as
+/// "work this turn already did". An id snapshot rather than a timestamp bound
+/// because a cancelled task carries no completion stamp and the store's
+/// datetime strings would need parsing — set difference is exact.
+pub async fn closed_task_ids(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> Result<HashSet<i64>, String> {
+    Ok(storage
+        .tasks()
+        .list(scope, scope_id, true)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|t| t.status == "done" || t.status == "cancelled")
+        .map(|t| t.id)
+        .collect())
+}
+
+/// Seed a CONTINUATION round's plan, dropping tasks this turn already closed.
+///
+/// A continuation round re-plans the same goal, and a small planner routinely
+/// re-emits the very task the run just finished. [`seed_plan`] would create it
+/// again — the earlier copy is CLOSED, so the open-title reuse in `tasks.add`
+/// never applies — and the loop treadmills: observed live 2026-08-02 (session
+/// 7ccc455a), one conversational question was re-planned ELEVEN times
+/// ("Explain the difference between a mutex and a semaphore", tasks
+/// #2033..#2044) and re-answered for 20+ minutes until `ROUNDS_MAX`.
+///
+/// The convergence criterion is principled, not a cap: work the run has
+/// ALREADY COMPLETED this turn is by definition not new work. A proposed task
+/// whose title matches ([`same_title`]) a title closed since
+/// `closed_before_turn` was captured is dropped; a plan that is empty after
+/// the drop seeds nothing and the caller counts a dry round. Titles closed
+/// BEFORE the turn never filter — a user may legitimately re-ask yesterday's
+/// question — and genuinely new titles (decomposed subtasks, next features)
+/// seed exactly as before.
+pub async fn seed_continuation(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+    plan: &Plan,
+    closed_before_turn: &HashSet<i64>,
+) -> Result<Vec<i64>, String> {
+    let closed_this_turn: Vec<String> = storage
+        .tasks()
+        .list(scope, scope_id, true)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|t| {
+            (t.status == "done" || t.status == "cancelled") && !closed_before_turn.contains(&t.id)
+        })
+        .map(|t| t.title)
+        .collect();
+    let fresh: Vec<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| {
+            !closed_this_turn
+                .iter()
+                .any(|closed| same_title(closed, &task.title))
+        })
+        .cloned()
+        .collect();
+    if fresh.is_empty() {
+        // Everything proposed was already worked this turn: a dry round, not
+        // an error — the caller's dry counter is the mission's exit.
+        return Ok(Vec::new());
+    }
+    if fresh.len() < plan.tasks.len() {
+        tracing::info!(
+            proposed = plan.tasks.len(),
+            fresh = fresh.len(),
+            "continuation re-proposed finished work — seeding only the new tasks"
+        );
+    }
+    seed_plan(
+        storage,
+        scope,
+        scope_id,
+        &Plan {
+            tasks: fresh,
+            origin: plan.origin,
+        },
+        false,
+    )
+    .await
+}
+
 /// Put every `in_progress` item in a scope back to `pending`.
 ///
 /// Two callers, one invariant: `next()` sorts `in_progress` first ("resume
@@ -3279,6 +3378,162 @@ mod tests {
             sub_a["task"]["id"], sub_b["task"]["id"],
             "same title under different parents is different work"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // mission-continuation seeding: closed-title dedup
+    // -----------------------------------------------------------------
+
+    /// REGRESSION (live 2026-08-02, session 7ccc455a): the continuation loop
+    /// re-planned an already-answered question because the finished copy was
+    /// CLOSED — only open titles dedupe at add — so every round seeded a
+    /// fresh clone and the dry detector never tripped. A continuation plan
+    /// made ONLY of titles this turn closed (done OR cancelled, in any case /
+    /// whitespace dress) must seed nothing: that is the dry-round signal.
+    #[tokio::test]
+    async fn continuation_plan_of_only_closed_titles_is_dry() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+
+        let ids = seed_plan(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["Explain mutexes", "Compare semaphores"]),
+            false,
+        )
+        .await
+        .expect("initial seed");
+        // The run closes one by completion and one by cancellation (poison
+        // containment cancels) — both are "closed", both must dedup.
+        storage
+            .tasks()
+            .complete(ids[0], Some("test"), None)
+            .await
+            .expect("complete");
+        storage
+            .tasks()
+            .update(
+                ids[1],
+                TaskPatch {
+                    status: Some("cancelled".to_string()),
+                    ..TaskPatch::default()
+                },
+                Some("test"),
+            )
+            .await
+            .expect("cancel");
+
+        let seeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["  explain MUTEXES ", "compare semaphores"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert!(seeded.is_empty(), "an all-duplicate round is dry");
+        let (open, closed) = storage
+            .tasks()
+            .counts("session", Some("s1"))
+            .await
+            .expect("counts");
+        assert_eq!(open, 0, "no clone was seeded");
+        assert_eq!(closed, 2, "the store still holds only the original work");
+    }
+
+    /// A genuine mission keeps continuing: a mixed continuation plan seeds
+    /// exactly the titles the turn has NOT already closed.
+    #[tokio::test]
+    async fn continuation_seeds_only_the_new_titles() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+
+        let ids = seed_plan(&storage, "session", Some("s1"), &plan_of(&["step 1"]), false)
+            .await
+            .expect("initial seed");
+        storage
+            .tasks()
+            .complete(ids[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        let seeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["step 1", "step 2"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert_eq!(seeded.len(), 1, "only the new title seeds");
+        let open = storage
+            .tasks()
+            .list("session", Some("s1"), false)
+            .await
+            .expect("list");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].title, "step 2");
+    }
+
+    /// The turn-start boundary matters: a title closed BEFORE the turn began
+    /// is history, not this turn's work — the planner may legitimately
+    /// schedule it again mid-mission.
+    #[tokio::test]
+    async fn continuation_does_not_filter_titles_closed_before_the_turn() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let old = seed_plan(&storage, "session", Some("s1"), &plan_of(&["old chore"]), false)
+            .await
+            .expect("yesterday's seed");
+        storage
+            .tasks()
+            .complete(old[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        // Turn start: the chore is already closed, so it is in the baseline.
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+        let seeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["old chore"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert_eq!(seeded.len(), 1, "history never dedups a continuation");
+    }
+
+    /// Initial turn seeding must NOT dedup against closed history at all: a
+    /// user may re-ask today what was answered yesterday, and `seed_plan` is
+    /// the initial path. Only continuation rounds carry the closed-title
+    /// guard.
+    #[tokio::test]
+    async fn initial_seeding_is_unaffected_by_closed_history() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let first = seed_plan(&storage, "session", Some("s1"), &plan_of(&["run the tests"]), false)
+            .await
+            .expect("first turn");
+        storage
+            .tasks()
+            .complete(first[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        let second = seed_plan(&storage, "session", Some("s1"), &plan_of(&["run the tests"]), false)
+            .await
+            .expect("the same request on a later turn seeds again");
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0], first[0], "a fresh task, not the closed one");
     }
 
     /// REGRESSION (lfm2.5 smoke, 2026-07-25): the model deleted a SEEDED
