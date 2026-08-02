@@ -1,5 +1,6 @@
 //! Agent loop runner
 
+use crate::cancel::CancelToken;
 use crate::{AgentContext, AgentError, ContextSummarizationConfig, prompts};
 use nanna_llm::{
     AnthropicMessage, AnthropicRequest, CacheControl, ContentBlock, ImageSource, LlmClient,
@@ -268,8 +269,11 @@ pub struct RunOptions {
     pub on_tool_start: Option<ToolStartCallback>,
     /// Callback for tool end events (called after each tool execution)
     pub on_tool_end: Option<ToolEndCallback>,
-    /// Shared flag for cooperative cancellation (set to true to stop the agent loop)
-    pub cancellation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared cancellation token. Polled at loop boundaries AND raced
+    /// against every in-flight LLM/tool await, so Stop aborts a silent
+    /// stream (or a long tool call) immediately instead of waiting for the
+    /// next token batch to arrive.
+    pub cancel: Option<CancelToken>,
     /// Image attachments for the current message: Vec<(base64_data, media_type)>
     pub attachments: Vec<(String, String)>,
     /// Checkpoint callback: fired after each iteration with current conversation state.
@@ -416,6 +420,7 @@ pub struct ToolCallRecord {
 }
 
 /// Internal result from LLM call
+#[derive(Default)]
 struct LlmResult {
     text: String,
     tool_uses: Vec<(String, String, Value)>,
@@ -1315,11 +1320,9 @@ impl Agent {
 
         // Agent loop
         loop {
-            // Check cancellation flag
-            if let Some(ref flag) = options.cancellation_flag {
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return self.finish_cancelled(state, &options).await;
-                }
+            // Check cancellation
+            if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                return self.finish_cancelled(state, &options).await;
             }
 
             // Bounded blast radius (P14): a per-run wall-clock cap set by the
@@ -1808,12 +1811,10 @@ impl Agent {
                 state.final_text = result.text;
             }
             // Mid-stream cancel closes the LLM call with partial text; fold it and exit.
-            if let Some(ref flag) = options.cancellation_flag {
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Content blocks may already be stored above — finish_cancelled
-                    // de-dupes the cancel marker message.
-                    return self.finish_cancelled(state, &options).await;
-                }
+            if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                // Content blocks may already be stored above — finish_cancelled
+                // de-dupes the cancel marker message.
+                return self.finish_cancelled(state, &options).await;
             }
 
             // If no tool calls, check for narration loop before exiting
@@ -2272,9 +2273,23 @@ impl Agent {
                     on_text,
                     options.on_thinking.as_ref(),
                     state,
-                    options.cancellation_flag.as_ref(),
+                    options.cancel.as_ref(),
                 )
                 .await
+            } else if let Some(token) = options.cancel.as_ref() {
+                // Abortive cancel on the non-streaming path: drop the
+                // in-flight request the moment Stop is pressed instead of
+                // waiting out the provider. The empty result flows into the
+                // caller's post-call cancel check, which exits through
+                // finish_cancelled with the run's partial text intact.
+                tokio::select! {
+                    biased;
+                    result = self.call_llm_sync(request, state) => result,
+                    () = token.cancelled() => {
+                        info!("Non-streaming LLM call aborted by cancel");
+                        Ok(LlmResult::default())
+                    }
+                }
             } else {
                 self.call_llm_sync(request, state).await
             };
@@ -2300,7 +2315,22 @@ impl Agent {
                             "Rate limited, retrying in {}s (attempt {}/{})",
                             wait_secs, attempt, max_retries
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        let backoff =
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs));
+                        if let Some(token) = options.cancel.as_ref() {
+                            tokio::select! {
+                                biased;
+                                () = token.cancelled() => {
+                                    info!("Cancel during rate-limit backoff — abandoning the retry");
+                                    // Empty result → the caller's cancel check
+                                    // finishes the run via finish_cancelled.
+                                    return Ok(LlmResult::default());
+                                }
+                                () = backoff => {}
+                            }
+                        } else {
+                            backoff.await;
+                        }
                         continue;
                     }
                     return result;
@@ -2316,7 +2346,7 @@ impl Agent {
         on_text: &StreamCallback,
         on_thinking: Option<&ThinkingCallback>,
         state: &mut RunState,
-        cancellation_flag: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        cancel: Option<&CancelToken>,
     ) -> Result<LlmResult, AgentError> {
         use futures::StreamExt;
         use std::pin::pin;
@@ -2332,14 +2362,28 @@ impl Agent {
         let mut cache_creation_tokens = 0u32;
         let mut narration_check_len = 0usize; // track text length at last narration check
 
-        while let Some(event) = stream.next().await {
-            if let Some(flag) = cancellation_flag {
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    info!("Stream cancelled mid-token batch — returning partial");
-                    // Incomplete tool JSON is discarded; text/thinking already accumulated.
-                    break;
+        loop {
+            // Race the stream read against cancellation. A poll at batch
+            // arrival alone is not enough: a model deep in a silent
+            // reasoning stretch produces no events, so no batch ever
+            // arrives to carry the check — the request stayed live for
+            // minutes after Stop (observed 2026-07-31). Breaking here
+            // drops `stream`, which closes the in-flight HTTP response.
+            let event = if let Some(token) = cancel {
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => {
+                        info!("Stream aborted by cancel — dropping the in-flight response");
+                        // Incomplete tool JSON is discarded; text/thinking
+                        // already accumulated survive in the partial result.
+                        break;
+                    }
+                    event = stream.next() => event,
                 }
-            }
+            } else {
+                stream.next().await
+            };
+            let Some(event) = event else { break };
             match event? {
                 StreamEvent::TextDelta { text, .. } => {
                     on_text(&text);
@@ -2541,6 +2585,26 @@ impl Agent {
     ) -> Vec<ContentBlock> {
         let mut tool_results = Vec::new();
 
+        // Abortive cancel: once Stop is pressed, queued tool calls are not
+        // dispatched at all. Each still gets a tool_result block so the
+        // assistant turn's tool_use blocks stay paired in context.
+        if options.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+            info!(
+                count = tool_uses.len(),
+                "Cancelled before tool dispatch — skipping queued tool calls"
+            );
+            return tool_uses
+                .iter()
+                .map(|(id, _, _)| ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: "[Skipped: the user cancelled the run before this tool \
+                              started. Nothing was executed.]"
+                        .to_string(),
+                    is_error: Some(true),
+                })
+                .collect();
+        }
+
         // Finalize any pending reasoning block before tool execution
         if let Some((_, name, _)) = tool_uses.first() {
             state.finalize_reasoning_block(Some(name.clone()));
@@ -2592,7 +2656,43 @@ impl Agent {
             })
             .collect();
 
-        let results = futures::future::join_all(tool_futures).await;
+        // Race the whole batch against cancellation: a long `exec` used to
+        // pin Stop until it finished on its own. On cancel the futures are
+        // dropped — the RUN returns now; any blocking work underneath (a
+        // spawned process, a Boa script on a blocking thread) may still run
+        // to completion in the background, and its output is discarded.
+        let results = if let Some(token) = options.cancel.as_ref() {
+            tokio::select! {
+                biased;
+                joined = futures::future::join_all(tool_futures) => joined,
+                () = token.cancelled() => {
+                    const INTERRUPTED: &str =
+                        "[Interrupted: the user cancelled the run while this tool was \
+                         executing. The underlying operation may still have completed in \
+                         the background; its output was discarded.]";
+                    info!(
+                        count = tool_calls_with_meta.len(),
+                        "Cancelled mid-tool-execution — abandoning in-flight tool calls"
+                    );
+                    let mut interrupted = Vec::new();
+                    for (id, name, _input, _) in &tool_calls_with_meta {
+                        // Close the UI's tool chips: every on_tool_start fired
+                        // in Phase 1 gets its matching end.
+                        if let Some(ref cb) = options.on_tool_end {
+                            cb(id, name, INTERRUPTED, false, 0, None);
+                        }
+                        interrupted.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: INTERRUPTED.to_string(),
+                            is_error: Some(true),
+                        });
+                    }
+                    return interrupted;
+                }
+            }
+        } else {
+            futures::future::join_all(tool_futures).await
+        };
 
         // Phase 3: Process results sequentially (callbacks, state updates, memory)
         for ((id, name, input, _), (response, duration_ms)) in

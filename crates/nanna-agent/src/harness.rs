@@ -15,8 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::cancel::CancelToken;
 use std::time::{Duration, Instant};
 
 pub use crate::loop_runner::StepKind;
@@ -494,13 +493,13 @@ pub struct StepRequest {
     pub token_budget: Option<u64>,
     pub max_iterations: Option<usize>,
     pub max_wall_clock: Option<Duration>,
-    /// The run's shared cancellation flag — the SAME `Arc` the Stop button
-    /// flips. The harness polls it only at step boundaries, and a step can
+    /// The run's shared cancellation token — the SAME token the Stop button
+    /// cancels. The harness polls it only at step boundaries, and a step can
     /// legitimately run for many minutes (a chat turn's one-task plan IS a
     /// single step); the runner must thread this into the in-step agent loop
     /// so Stop aborts the in-flight LLM stream and skips queued tool calls
     /// instead of waiting the step out.
-    pub cancel: Option<Arc<AtomicBool>>,
+    pub cancel: Option<CancelToken>,
 }
 
 /// One tool call as seen from outside a step (digests, not payloads — the
@@ -883,7 +882,7 @@ impl LongHorizonRunner {
         source: &dyn TaskSource,
         runner: &dyn StepRunner,
         workdir: &Path,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelToken>,
     ) -> LongHorizonReport {
         self.run_with_interjector(goal, source, runner, workdir, cancel, None)
             .await
@@ -899,7 +898,7 @@ impl LongHorizonRunner {
         source: &dyn TaskSource,
         runner: &dyn StepRunner,
         workdir: &Path,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelToken>,
         interjector: Option<&dyn Interjector>,
     ) -> LongHorizonReport {
         let cfg = &self.config;
@@ -919,10 +918,7 @@ impl LongHorizonRunner {
         let mut progress: HashMap<i64, ItemProgress> = HashMap::new();
 
         let stop = loop {
-            if cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
+            if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
                 break StopReason::Cancelled;
             }
             if started.elapsed() >= cfg.max_wall_clock {
@@ -1081,10 +1077,7 @@ impl LongHorizonRunner {
             // A cancelled step is a truncated step: its text is not a
             // verdictable claim, and an acceptance command run now is work
             // after the user said stop. Findings are already noted above.
-            if cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
+            if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
                 break StopReason::Cancelled;
             }
 
@@ -1247,6 +1240,7 @@ fn text_tail(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use tokio::sync::Mutex;
 
     // -----------------------------------------------------------------
@@ -1943,7 +1937,8 @@ mod tests {
         let source = MemorySource::default();
         source.push(step(1, "any", None)).await;
         let runner = ScriptedRunner::new(vec![]);
-        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel = CancelToken::new();
+        cancel.cancel();
         let report = LongHorizonRunner::new(fast_config())
             .run("goal", &source, &runner, dir.path(), Some(cancel))
             .await;
@@ -1953,7 +1948,7 @@ mod tests {
 
     /// REGRESSION (GUI live drive, 2026-07-30): Stop had no effect for
     /// minutes because the flag reached only the harness boundary — the
-    /// in-step agent loop got `cancellation_flag: None`. Every step request
+    /// in-step agent loop got `cancel: None`. Every step request
     /// must carry the SAME flag the Stop button flips, so the runner can
     /// abort the in-flight stream, not just decline the next step.
     #[tokio::test]
@@ -1962,7 +1957,7 @@ mod tests {
         let source = MemorySource::default();
         source.push(step(1, "answer", None)).await;
         let runner = ScriptedRunner::new(vec![Ok(outcome("TASK COMPLETE"))]);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
         let report = LongHorizonRunner::new(fast_config())
             .run("goal", &source, &runner, dir.path(), Some(cancel.clone()))
             .await;
@@ -1976,15 +1971,15 @@ mod tests {
                 .as_ref()
                 .expect("the step request must carry the run's cancel flag");
             assert!(
-                Arc::ptr_eq(threaded, &cancel),
-                "must be the SAME Arc the Stop button flips, not a fresh flag"
+                CancelToken::same_token(threaded, &cancel),
+                "must be the SAME token the Stop button cancels, not a fresh one"
             );
         }
     }
 
-    /// Flips its step's own cancel flag mid-step and returns partial output —
+    /// Cancels its step's own token mid-step and returns partial output —
     /// the scripted stand-in for the real agent loop observing
-    /// `RunOptions.cancellation_flag` while a stream is in flight.
+    /// `RunOptions.cancel` while a stream is in flight.
     struct CancelsDuringItsStep;
 
     #[async_trait::async_trait]
@@ -1993,8 +1988,8 @@ mod tests {
             request
                 .cancel
                 .as_ref()
-                .expect("the flag is threaded into the step")
-                .store(true, Ordering::Relaxed);
+                .expect("the token is threaded into the step")
+                .cancel();
             Ok(outcome("partial work\n\n[Cancelled by user]"))
         }
     }
@@ -2005,7 +2000,7 @@ mod tests {
         let source = MemorySource::default();
         source.push(step(1, "first", None)).await;
         source.push(step(2, "second", None)).await;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
         let report = LongHorizonRunner::new(fast_config())
             .run("goal", &source, &CancelsDuringItsStep, dir.path(), Some(cancel))
             .await;
