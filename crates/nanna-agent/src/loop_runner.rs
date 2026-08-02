@@ -323,6 +323,15 @@ pub struct RunOptions {
     /// [`MISSION_STALL_ROUNDS_MAX`] consecutive tool-free rounds. Lets a
     /// single user prompt drive hours of continuous work.
     pub mission_mode: bool,
+    /// The live work item's title (a harness step's `StepRequest::item_title`)
+    /// — the TASK ANCHOR that every injected steering text opens with, so a
+    /// mid-run notice reads as an aside within the task instead of a
+    /// conversation reset (observed live 2026-08-02: gemma4:12b answered an
+    /// injected nudge with assistant greetings and forgot the feature under
+    /// construction for 3.9 hours). When absent, the run falls back to its
+    /// goal line — the first non-empty line of the user message — and if that
+    /// is empty too the header is omitted, never fabricated.
+    pub task_anchor: Option<String>,
 }
 
 /// What kind of work a harness-driven step is doing (P14).
@@ -522,6 +531,74 @@ const ZERO_INFO_BREAKER_AFTER: usize = 3;
 /// machinery.
 const BREAKER_REPLAY_MAX_BYTES: usize = 2000;
 
+/// Byte bound on the task-anchor rendered at the head of every injected
+/// steering text ([`anchor_header`]).
+///
+/// Derivation: the anchor is a one-line LABEL whose only job is to keep the
+/// model oriented on its task while a meta-instruction interrupts it — it
+/// must never dominate the notice it introduces. The largest bounded notice
+/// payload is [`BREAKER_REPLAY_MAX_BYTES`] (2000); a tenth of that keeps the
+/// header a label rather than a second payload, while comfortably fitting
+/// every real item title the task store produces (planner titles are short
+/// noun phrases; the endurance evals' longest observed title is well under
+/// 120 bytes).
+pub const TASK_ANCHOR_MAX_BYTES: usize = 200;
+
+/// The explicit continuation command that CLOSES every injected steering
+/// text.
+///
+/// Why it exists (observed live 2026-08-02, 4h endurance eval,
+/// ollama/gemma4:12b — 2/42 features): after breaker/nudge notices fired,
+/// the model treated the injected meta-text as a fresh conversation opener,
+/// ACKNOWLEDGED it with literal assistant greetings ("Please provide your
+/// request or task, and I will be happy to assist you!"), forgot the feature
+/// under construction, and wrote no code for the remaining 3.9 hours. Every
+/// steering injection therefore ends with this command: no greeting, no
+/// asking for input, and an unambiguous statement of what the next message
+/// must be. Greeting-bait phrasing ("let me know", "how can I help") is
+/// banned from every template — asserted by the denylist test.
+pub const STEERING_CONTINUATION: &str = "Do not greet or ask for input. Continue the task \
+    above now: your next message must be a tool call or the task's final answer.";
+
+/// Render the task-anchor header that OPENS every injected steering text.
+///
+/// A mid-run meta-instruction is the same capture class as the
+/// workspace-ROADMAP bug (PR #146): text that arrives with system/user
+/// authority and no task framing reads to a small model as a conversation
+/// RESET. The header re-states the work context FIRST, so the notice below
+/// it is read as an aside within the task rather than a replacement for it.
+///
+/// `None` (or a blank anchor) renders as an empty string — a plain run with
+/// no resolvable goal omits the header rather than fabricating one. The
+/// rendered anchor is bounded at [`TASK_ANCHOR_MAX_BYTES`] on a char
+/// boundary, with the cut announced by an ellipsis.
+fn anchor_header(task_anchor: Option<&str>) -> String {
+    let Some(task) = task_anchor.map(str::trim).filter(|t| !t.is_empty()) else {
+        return String::new();
+    };
+    let end = truncate_boundary(task, TASK_ANCHOR_MAX_BYTES);
+    if end < task.len() {
+        format!("[HARNESS NOTE — you are mid-task: {}…]\n", &task[..end])
+    } else {
+        format!("[HARNESS NOTE — you are mid-task: {task}]\n")
+    }
+}
+
+/// Resolve the run's task anchor once at run start.
+///
+/// Precedence: the caller's explicit anchor (the harness step's live item
+/// title, plumbed through [`RunOptions::task_anchor`]) wins; a plain run
+/// falls back to the run's goal line — the first non-empty line of the user
+/// message that started it. Neither exists → `None`, and every header
+/// renders empty ([`anchor_header`]) rather than fabricating context.
+fn resolve_task_anchor(explicit: Option<&str>, message: &str) -> Option<String> {
+    explicit
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .or_else(|| message.lines().map(str::trim).find(|l| !l.is_empty()))
+        .map(str::to_string)
+}
+
 /// Per-key bookkeeping shared by the two repetition breakers: the
 /// repeat-FAILURE breaker (identical calls that keep failing) and the
 /// zero-information breaker (identical calls that keep succeeding with
@@ -621,7 +698,17 @@ fn canonical_json(v: &Value) -> String {
 /// call was not executed), WHY (it already failed identically N times, with
 /// the last error replayed), and WHAT TO DO instead (change arguments or
 /// tool; only this exact shape is disabled).
-fn repeat_failure_breaker_notice(name: &str, failures: usize, last_error: &str) -> String {
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`],
+/// so a small model reads the notice as an aside within its task instead of
+/// a conversation reset.
+fn repeat_failure_breaker_notice(
+    task_anchor: Option<&str>,
+    name: &str,
+    failures: usize,
+    last_error: &str,
+) -> String {
     let end = truncate_boundary(last_error, BREAKER_REPLAY_MAX_BYTES);
     let replay = if end < last_error.len() {
         format!(
@@ -633,13 +720,15 @@ fn repeat_failure_breaker_notice(name: &str, failures: usize, last_error: &str) 
         last_error.to_string()
     };
     format!(
-        "[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these exact \
+        "{header}[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these exact \
          arguments already failed {failures} times in a row in this run; the last error \
          was: {replay}\n\
          Repeating the identical call cannot succeed, so this exact call is disabled for \
          the rest of this run — it now fails instantly instead of re-running a known \
          failure. Change the arguments or use a different tool: `{name}` itself still \
-         works, and any call with different arguments executes normally."
+         works, and any call with different arguments executes normally.\n\
+         {STEERING_CONTINUATION}",
+        header = anchor_header(task_anchor)
     )
 }
 
@@ -661,7 +750,16 @@ fn repeat_failure_breaker_notice(name: &str, failures: usize, last_error: &str) 
 ///
 /// `excerpt` is the storage-time-bounded replay text; `full_len` is the byte
 /// length of the original result, so a cut can announce itself.
-fn zero_info_breaker_notice(name: &str, repeats: usize, excerpt: &str, full_len: usize) -> String {
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+fn zero_info_breaker_notice(
+    task_anchor: Option<&str>,
+    name: &str,
+    repeats: usize,
+    excerpt: &str,
+    full_len: usize,
+) -> String {
     let replay = if excerpt.len() < full_len {
         format!(
             "{excerpt}… [result truncated for replay — the full result was already shown \
@@ -671,7 +769,7 @@ fn zero_info_breaker_notice(name: &str, repeats: usize, excerpt: &str, full_len:
         excerpt.to_string()
     };
     format!(
-        "[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these exact \
+        "{header}[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these exact \
          arguments already succeeded {repeats} times in a row in this run with a \
          byte-identical result every time — repeating it yields zero new information. \
          The result is UNCHANGED; if you were polling for a change, this unchanged result \
@@ -680,7 +778,9 @@ fn zero_info_breaker_notice(name: &str, repeats: usize, excerpt: &str, full_len:
          Act on the result you already have, change the arguments (e.g. a cursor, offset, \
          or different target), or use a different tool; this exact call is paused for the \
          rest of this run unless its arguments change. `{name}` itself still works, and \
-         any call with different arguments executes normally."
+         any call with different arguments executes normally.\n\
+         {STEERING_CONTINUATION}",
+        header = anchor_header(task_anchor)
     )
 }
 
@@ -749,7 +849,10 @@ fn is_unknown_tool_error(error: Option<&str>) -> bool {
 /// ([`BREAKER_REPLAY_MAX_BYTES`]) and a cut announces itself. Sorted so the
 /// notice is deterministic — repeated short-circuits replay byte-identical
 /// text instead of shuffling the list.
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
 fn discovery_pause_notice(
+    task_anchor: Option<&str>,
     name: &str,
     zero_delta_calls: usize,
     available: &HashSet<String>,
@@ -768,12 +871,14 @@ fn discovery_pause_notice(
         joined
     };
     format!(
-        "[DISCOVERY PAUSED] This call was NOT executed. The last {zero_delta_calls} \
+        "{header}[DISCOVERY PAUSED] This call was NOT executed. The last {zero_delta_calls} \
          `{name}` calls in a row each succeeded but activated ZERO new tools — every \
          tool they found is already active, so rephrasing the query again cannot add \
          anything. All relevant tools are already active — use them; discovery is \
          paused for the rest of this run (it will un-pause if a tool call fails due \
-         to a missing tool). Your currently active tools ({total}): {listed}"
+         to a missing tool). Your currently active tools ({total}): {listed}\n\
+         {STEERING_CONTINUATION}",
+        header = anchor_header(task_anchor)
     )
 }
 
@@ -1230,25 +1335,36 @@ pub fn wrapup_nudge_due(
     Some(level)
 }
 
-/// Render an escalating wrap-up nudge as an injectable `[SYSTEM: ...]` message.
+/// Render an escalating wrap-up nudge as an injectable user-role message.
+///
+/// Task-anchored (the injected-notice reset bug — observed live 2026-08-02,
+/// gemma4:12b treating an injected `[SYSTEM: …]` nudge as a conversation
+/// reset and greeting instead of working): opens with the [`anchor_header`]
+/// work context, states the steer in one imperative sentence, and closes
+/// with [`STEERING_CONTINUATION`].
 #[must_use]
-pub fn wrapup_nudge_message(level: NudgeLevel, iteration: usize) -> String {
-    match level {
+pub fn wrapup_nudge_message(
+    level: NudgeLevel,
+    iteration: usize,
+    task_anchor: Option<&str>,
+) -> String {
+    let steer = match level {
         NudgeLevel::Gentle => format!(
-            "[SYSTEM: You've made {iteration} tool calls — this is a long run. If you're \
-             making steady progress, keep going and take as long as you need. If you're going \
-             in circles or repeating the same actions, pause and respond with what you have.]"
+            "You have made {iteration} tool calls in this run: if each call is making steady \
+             progress, keep going and take as long as you need, but if you are circling, change \
+             approach."
         ),
         NudgeLevel::Firm => format!(
-            "[SYSTEM: {iteration} tool calls and still going. If the task is nearly done, finish \
-             it. Otherwise consider wrapping up with a progress report — you can continue in the \
-             next turn.]"
+            "You have made {iteration} tool calls: finish the task if it is nearly done, \
+             otherwise state your concrete progress so far and take the single most useful \
+             next action."
         ),
         NudgeLevel::Urgent => format!(
-            "[SYSTEM: You've made {iteration} tool calls — a very long run. Please wrap up now and \
-             respond to the user with your progress so far. You can pick this up again next turn.]"
+            "You have made {iteration} tool calls — wrap up now: state what you have completed \
+             so far and finish the task with your best current answer."
         ),
-    }
+    };
+    format!("{}{steer} {STEERING_CONTINUATION}", anchor_header(task_anchor))
 }
 
 /// Ceiling on completion-claim instructions injected per step.
@@ -1288,12 +1404,96 @@ pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
 /// the protocol at the moment it is needed; it only PROMPTS the claim — the
 /// harness acceptance flow still judges it, so nothing here can fabricate
 /// success.
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
 #[must_use]
-pub const fn claim_nudge_message() -> &'static str {
-    "[SYSTEM] You have already executed successful write/exec work this step. \
-     If the task's goal is met, STOP calling tools and reply now: state your \
-     final answer and end with TASK COMPLETE on its own line. Only continue \
-     with tools if something specific is missing — name it first."
+pub fn claim_nudge_message(task_anchor: Option<&str>) -> String {
+    format!(
+        "{}You have already executed successful write/exec work this step. \
+         If the task's goal is met, STOP calling tools and reply now: state your \
+         final answer and end with TASK COMPLETE on its own line. Only continue \
+         with tools if something specific is missing — name it first. \
+         {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Render the tool-call-loop nudge — the FIRST rung of the repetition
+/// ladder (the sibling breakers in `execute_tools` sit one rung above it).
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context, states the steer in one imperative
+/// sentence, and closes with [`STEERING_CONTINUATION`].
+#[must_use]
+pub fn tool_loop_nudge_message(task_anchor: Option<&str>) -> String {
+    format!(
+        "{}You called the same tool with the same arguments twice and got the identical \
+         result both times — repeating the call cannot change the outcome, so change your \
+         approach: use a different tool, different arguments, or state in one line what \
+         is blocking you. {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Render the narration-loop recovery nudge: the model described tool calls
+/// in prose without emitting any — nothing it narrated actually happened.
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+#[must_use]
+pub fn narration_nudge_message(task_anchor: Option<&str>) -> String {
+    format!(
+        "{}You narrated tool calls instead of actually executing them — NOTHING you \
+         described happened (no files were read or written), so call the tools directly \
+         (read_file, write_file, exec, etc.) with no narration. {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Render the repetitive-output recovery nudge: the model re-emitted the
+/// same substantial line(s) — a known small-model generation loop.
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+#[must_use]
+pub fn repetition_nudge_message(task_anchor: Option<&str>) -> String {
+    format!(
+        "{}Your last response repeated the same line(s) over and over — you are stuck in a \
+         generation loop, so stop repeating yourself: take stock of what you actually \
+         know, then either call a tool that makes real progress or give the task's final \
+         answer in one concise pass. {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Render the thinking-spiral recovery nudge: the model's reasoning went in
+/// circles (analysis paralysis) without producing text or tool calls.
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+#[must_use]
+pub fn thinking_spiral_nudge_message(task_anchor: Option<&str>) -> String {
+    format!(
+        "{}You were stuck in a reasoning loop — STOP deliberating and act: call \
+         `discover_tools` if you need more tools (it unlocks file operations, shell \
+         commands via exec, and web access), then use the appropriate tool immediately. \
+         {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Render the 80%-token-budget status note.
+///
+/// Task-anchored (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+#[must_use]
+pub fn budget_warning_message(cumulative: u64, budget: u64, task_anchor: Option<&str>) -> String {
+    format!(
+        "{}Token budget status: {cumulative} of {budget} tokens used (over 80%) — finish \
+         the current step and wrap up within budget. {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
 }
 
 /// Detect repetitive text by checking if the same line appears multiple times.
@@ -1659,6 +1859,10 @@ impl Agent {
         let max_iterations = options.max_iterations.or(self.config.max_iterations);
         let run_started = std::time::Instant::now();
         let mut state = RunState::new();
+        // Resolve the task anchor once: the harness step's item title, else
+        // the run's goal line. Every injected steering text opens with it so
+        // a mid-run notice never reads as a conversation reset.
+        state.task_anchor = resolve_task_anchor(options.task_anchor.as_deref(), message);
 
         // Add user message with optional budget awareness
         self.add_user_message_with_budget(message, &options).await;
@@ -1718,9 +1922,10 @@ impl Agent {
                 let cumulative = u64::from(state.input_tokens) + u64::from(state.output_tokens);
                 if !state.budget_warned && cumulative * 100 / budget.max(1) >= 80 {
                     state.budget_warned = true;
-                    let note = format!(
-                        "[SYSTEM: token budget status — {cumulative} of {budget} tokens used \
-                         (over 80%). Finish the current step and wrap up within budget.]"
+                    let note = budget_warning_message(
+                        cumulative,
+                        budget,
+                        state.task_anchor.as_deref(),
                     );
                     let mut ctx = self.context.write().await;
                     ctx.messages.push(AnthropicMessage::user_text(&note));
@@ -1762,7 +1967,8 @@ impl Agent {
                 self.config.nudge_interval_iterations,
                 state.wrapup_nudge_count,
             ) {
-                let msg = wrapup_nudge_message(level, state.iterations);
+                let msg =
+                    wrapup_nudge_message(level, state.iterations, state.task_anchor.as_deref());
                 state.wrapup_nudge_count += 1;
                 info!(
                     iteration = state.iterations,
@@ -2125,11 +2331,7 @@ impl Agent {
                 state.current_reasoning.clear();
 
                 let nudge = AnthropicMessage::user_text(
-                    "You were stuck in a reasoning loop. STOP deliberating and ACT. \
-                     You have tools available — use `discover_tools` to see all of them. \
-                     It unlocks file operations (read_file, write_file, list_dir, explore), \
-                     shell commands (exec), web access (web_search, web_fetch), and more. \
-                     Call discover_tools NOW, then use the appropriate tool to answer the question.",
+                    thinking_spiral_nudge_message(state.task_anchor.as_deref()),
                 );
                 {
                     let mut ctx = self.context.write().await;
@@ -2202,13 +2404,9 @@ impl Agent {
                     self.store_assistant_response(&result.content_blocks).await;
 
                     // Inject a user-role nudge to break the pattern
-                    let nudge = AnthropicMessage::user_text(
-                        "[SYSTEM] You narrated tool calls instead of actually executing them. \
-                         NOTHING you described actually happened — no files were read or written. \
-                         You MUST use tool calls (read_file, write_file, exec, etc.) to perform actions. \
-                         Describing an action in text does NOT execute it. \
-                         Start over: call the tools directly with NO narration.",
-                    );
+                    let nudge = AnthropicMessage::user_text(narration_nudge_message(
+                        state.task_anchor.as_deref(),
+                    ));
                     {
                         let mut ctx = self.context.write().await;
                         ctx.messages.push(nudge);
@@ -2231,12 +2429,9 @@ impl Agent {
                     // Store the broken response so the model sees what it did
                     self.store_assistant_response(&result.content_blocks).await;
 
-                    let nudge = AnthropicMessage::user_text(
-                        "[SYSTEM] Your last response repeated the same line(s) over and over — \
-                         you appear to be stuck in a generation loop. Do not repeat yourself. \
-                         Take stock of what you actually know, then either call a tool to make \
-                         real progress or give your final answer in one concise pass.",
-                    );
+                    let nudge = AnthropicMessage::user_text(repetition_nudge_message(
+                        state.task_anchor.as_deref(),
+                    ));
                     {
                         let mut ctx = self.context.write().await;
                         ctx.messages.push(nudge);
@@ -2264,13 +2459,9 @@ impl Agent {
                     state.current_reasoning.clear();
 
                     // Inject a firm nudge that grounds the model on its available tools
-                    let nudge = AnthropicMessage::user_text(
-                        "You were stuck in a reasoning loop. STOP deliberating and ACT. \
-                         You have tools available — use `discover_tools` to see all of them. \
-                         It unlocks file operations (read_file, write_file, list_dir, explore), \
-                         shell commands (exec), web access (web_search, web_fetch), and more. \
-                         Call discover_tools NOW, then use the appropriate tool to answer the question.",
-                    );
+                    let nudge = AnthropicMessage::user_text(thinking_spiral_nudge_message(
+                        state.task_anchor.as_deref(),
+                    ));
                     {
                         let mut ctx = self.context.write().await;
                         ctx.messages.push(nudge);
@@ -2501,12 +2692,9 @@ impl Agent {
                     last_tool = state.tool_records.last().map_or("", |r| r.name.as_str()),
                     "🔂 Tool-call loop detected — injecting nudge"
                 );
-                let nudge = AnthropicMessage::user_text(
-                    "[SYSTEM] You called the same tool with the same arguments twice and got \
-                     the identical result both times. Repeating the call will not change the \
-                     outcome. Change your approach: use a different tool, different arguments, \
-                     or report what is blocking you.",
-                );
+                let nudge = AnthropicMessage::user_text(tool_loop_nudge_message(
+                    state.task_anchor.as_deref(),
+                ));
                 let mut ctx = self.context.write().await;
                 ctx.messages.push(nudge);
             }
@@ -2606,7 +2794,8 @@ impl Agent {
             claim_nudges = state.claim_nudge_count,
             "🏁 Successful work but no completion claim — injecting claim instruction"
         );
-        let nudge = AnthropicMessage::user_text(claim_nudge_message());
+        let nudge =
+            AnthropicMessage::user_text(claim_nudge_message(state.task_anchor.as_deref()));
         let mut ctx = self.context.write().await;
         ctx.messages.push(nudge);
         true
@@ -3132,6 +3321,7 @@ impl Agent {
                         options.restrict_to_active_tools && !options.all_tools_active,
                     );
                     return Some(discovery_pause_notice(
+                        state.task_anchor.as_deref(),
                         name,
                         state.zero_delta_discovery_streak,
                         &available,
@@ -3147,6 +3337,7 @@ impl Agent {
                              repeatedly — short-circuiting without execution"
                         );
                         Some(repeat_failure_breaker_notice(
+                            state.task_anchor.as_deref(),
                             name,
                             entry.failure_count,
                             &entry.last_error,
@@ -3160,6 +3351,7 @@ impl Agent {
                              short-circuiting without execution"
                         );
                         Some(zero_info_breaker_notice(
+                            state.task_anchor.as_deref(),
                             name,
                             entry.identical_success_count,
                             &entry.last_success_excerpt,
@@ -4983,6 +5175,10 @@ struct RunState {
     discovery_tool_names: HashSet<String>,
     /// Whether the 80% token-budget status has been surfaced to the model
     budget_warned: bool,
+    /// The resolved task anchor for this run ([`resolve_task_anchor`]):
+    /// the harness step's item title, else the run's goal line, else `None`.
+    /// Every injected steering text opens with it ([`anchor_header`]).
+    task_anchor: Option<String>,
     /// How many wrap-up nudges have been injected (escalates over time)
     wrapup_nudge_count: usize,
     /// Mission mode: auto-continuation rounds fired so far (unbounded while
@@ -5038,6 +5234,7 @@ impl RunState {
             discovery_paused: false,
             discovery_tool_names: HashSet::new(),
             budget_warned: false,
+            task_anchor: None,
             wrapup_nudge_count: 0,
             mission_rounds: 0,
             mission_stall_rounds: 0,
@@ -5422,11 +5619,11 @@ mod tests {
 
     #[test]
     fn nudge_message_mentions_the_iteration_and_never_stops() {
-        let msg = wrapup_nudge_message(NudgeLevel::Gentle, 512);
+        let msg = wrapup_nudge_message(NudgeLevel::Gentle, 512, None);
         assert!(msg.contains("512"));
         // Gentle nudge invites continuing, not stopping.
         assert!(msg.to_lowercase().contains("keep going"));
-        assert!(wrapup_nudge_message(NudgeLevel::Urgent, 999).contains("999"));
+        assert!(wrapup_nudge_message(NudgeLevel::Urgent, 999, None).contains("999"));
     }
 
     #[test]
@@ -5877,7 +6074,7 @@ mod repeat_failure_breaker_tests {
 
     #[test]
     fn the_breaker_notice_announces_itself() {
-        let notice = repeat_failure_breaker_notice("explore", 3, "timeout after 30s");
+        let notice = repeat_failure_breaker_notice(None, "explore", 3, "timeout after 30s");
         // WHAT happened, WHY, and WHAT to do instead — a failure that does
         // not explain itself reads as corruption and spirals small models.
         assert!(notice.contains("NOT executed"));
@@ -5888,7 +6085,7 @@ mod repeat_failure_breaker_tests {
 
         // A huge error is replayed bounded, and the cut announces itself.
         let big = "e".repeat(BREAKER_REPLAY_MAX_BYTES * 3);
-        let bounded = repeat_failure_breaker_notice("explore", 3, &big);
+        let bounded = repeat_failure_breaker_notice(None, "explore", 3, &big);
         assert!(bounded.len() < big.len());
         assert!(bounded.contains("truncated for replay"));
     }
@@ -6105,7 +6302,7 @@ mod zero_info_breaker_tests {
     #[test]
     fn the_zero_info_notice_announces_itself() {
         let result = "dir listing: src, tests";
-        let notice = zero_info_breaker_notice("explore", 3, result, result.len());
+        let notice = zero_info_breaker_notice(None, "explore", 3, result, result.len());
         // WHAT happened, WHY, the result it already has, and WHAT to do
         // instead — an unexplained notice reads as corruption and spirals
         // small models.
@@ -6124,7 +6321,7 @@ mod zero_info_breaker_tests {
         // failed silently — disk (the real result) stays the truth.
         let excerpt = "r".repeat(BREAKER_REPLAY_MAX_BYTES);
         let bounded =
-            zero_info_breaker_notice("explore", 3, &excerpt, BREAKER_REPLAY_MAX_BYTES * 3);
+            zero_info_breaker_notice(None, "explore", 3, &excerpt, BREAKER_REPLAY_MAX_BYTES * 3);
         assert!(bounded.contains("truncated for replay"));
         assert!(bounded.contains("SUCCEEDED"));
     }
@@ -6409,7 +6606,7 @@ mod claim_nudge_tests {
 
     #[test]
     fn the_instruction_announces_the_claim_protocol() {
-        let msg = claim_nudge_message();
+        let msg = claim_nudge_message(None);
         assert!(msg.contains("TASK COMPLETE on its own line"));
         assert!(msg.contains("STOP calling tools"));
         // It prompts the claim conditionally — it never asserts completion.
@@ -6711,7 +6908,7 @@ mod discovery_pause_tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let notice = discovery_pause_notice("discover_tools", 3, &available);
+        let notice = discovery_pause_notice(None, "discover_tools", 3, &available);
         // WHAT happened, WHY, WHAT the model already has, and WHAT to do —
         // an unexplained notice reads as corruption and spirals small models.
         assert!(notice.contains("NOT executed"));
@@ -6731,7 +6928,7 @@ mod discovery_pause_tests {
 
         // A pathological tool population is replayed bounded, cut announced.
         let huge: HashSet<String> = (0..2000).map(|i| format!("tool_{i:04}")).collect();
-        let bounded = discovery_pause_notice("discover_tools", 3, &huge);
+        let bounded = discovery_pause_notice(None, "discover_tools", 3, &huge);
         assert!(bounded.len() < BREAKER_REPLAY_MAX_BYTES * 2);
         assert!(bounded.contains("tool list truncated"));
         assert!(bounded.contains("2000 tools"), "the cut states the total");
@@ -6900,5 +7097,182 @@ mod discovery_pause_tests {
         assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 6);
         let (content, _) = content_of(block);
         assert!(content.contains("DISCOVERY PAUSED"), "got: {content}");
+    }
+}
+
+/// The injected-notice reset bug (2026-08-02 endurance eval, gemma4:12b,
+/// 2/42 features): after breaker/nudge notices fired, the model answered the
+/// meta-instruction with literal assistant greetings, forgot the feature
+/// under construction, and wrote no code for 3.9 hours. These tests pin the
+/// fix for EVERY injected steering template at once: each opens with the
+/// task-anchor header when step context exists, each closes with the
+/// explicit continuation command, and none contains greeting-bait phrasing.
+#[cfg(test)]
+mod anchored_steering_tests {
+    use super::*;
+
+    const ANCHOR: &str = "Build the CSV export feature";
+
+    /// Greeting-bait phrases banned from every injected steering text: a
+    /// small model reads them as a fresh conversational opening and resets
+    /// into greeting mode. Lowercased; templates are checked lowercased.
+    const GREETING_BAIT: &[&str] = &[
+        "let me know",
+        "how can i help",
+        "how may i help",
+        "how can i assist",
+        "how may i assist",
+        "happy to help",
+        "happy to assist",
+        "feel free to",
+        "what would you like",
+        "provide your request",
+        "here to help",
+        "anything else",
+    ];
+
+    /// Every template the loop can inject into the model's context mid-run,
+    /// rendered with the given anchor. New injection sites belong HERE the
+    /// moment they exist — this list is the denylist's coverage.
+    fn all_injected_templates(anchor: Option<&str>) -> Vec<(&'static str, String)> {
+        let available: HashSet<String> = ["exec", "read_file"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        vec![
+            ("tool_loop_nudge", tool_loop_nudge_message(anchor)),
+            ("narration_nudge", narration_nudge_message(anchor)),
+            ("repetition_nudge", repetition_nudge_message(anchor)),
+            ("thinking_spiral_nudge", thinking_spiral_nudge_message(anchor)),
+            ("claim_nudge", claim_nudge_message(anchor)),
+            ("budget_warning", budget_warning_message(800, 1000, anchor)),
+            (
+                "wrapup_gentle",
+                wrapup_nudge_message(NudgeLevel::Gentle, 500, anchor),
+            ),
+            (
+                "wrapup_firm",
+                wrapup_nudge_message(NudgeLevel::Firm, 600, anchor),
+            ),
+            (
+                "wrapup_urgent",
+                wrapup_nudge_message(NudgeLevel::Urgent, 700, anchor),
+            ),
+            (
+                "repeat_failure_breaker",
+                repeat_failure_breaker_notice(anchor, "explore", 3, "timeout after 30s"),
+            ),
+            (
+                "zero_info_breaker",
+                zero_info_breaker_notice(anchor, "explore", 3, "state: idle", 11),
+            ),
+            (
+                "discovery_pause",
+                discovery_pause_notice(anchor, "discover_tools", 3, &available),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_injected_template_opens_with_the_anchor_when_step_context_exists() {
+        let expected = format!("[HARNESS NOTE — you are mid-task: {ANCHOR}]\n");
+        for (name, text) in all_injected_templates(Some(ANCHOR)) {
+            assert!(
+                text.starts_with(&expected),
+                "{name} must OPEN with the work context, got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_injected_template_closes_with_the_continuation_command() {
+        for anchor in [Some(ANCHOR), None] {
+            for (name, text) in all_injected_templates(anchor) {
+                assert!(
+                    text.ends_with(STEERING_CONTINUATION),
+                    "{name} (anchor: {anchor:?}) must CLOSE with the continuation \
+                     command, got: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_injected_template_contains_greeting_bait() {
+        for anchor in [Some(ANCHOR), None] {
+            let mut texts = all_injected_templates(anchor);
+            // Mission-mode prods and the contract are injected too — same bar.
+            texts.push(("mission_verify", mission_verify_message()));
+            texts.push((
+                "mission_continue_early",
+                mission_continue_message(1, 1, "- exec ok", "main.py"),
+            ));
+            texts.push((
+                "mission_continue_late",
+                mission_continue_message(7, 3, "- exec ok", "main.py"),
+            ));
+            texts.push((
+                "mission_convergence",
+                mission_convergence_message(12, 4, "- exec ok: PASS"),
+            ));
+            texts.push(("mission_contract", MISSION_MODE_CONTRACT.to_string()));
+            for (name, text) in texts {
+                let lower = text.to_lowercase();
+                for phrase in GREETING_BAIT {
+                    assert!(
+                        !lower.contains(phrase),
+                        "{name} (anchor: {anchor:?}) contains greeting-bait \
+                         {phrase:?} — small models reset on it: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_step_context_the_header_is_omitted_never_fabricated() {
+        for (name, text) in all_injected_templates(None) {
+            assert!(
+                !text.contains("[HARNESS NOTE — you are mid-task:"),
+                "{name} must not fabricate a task anchor, got: {text}"
+            );
+        }
+        // Blank anchors are the same as no anchor.
+        assert_eq!(anchor_header(None), "");
+        assert_eq!(anchor_header(Some("   ")), "");
+    }
+
+    #[test]
+    fn the_anchor_is_bounded_and_announces_its_cut() {
+        let huge = "t".repeat(TASK_ANCHOR_MAX_BYTES * 3);
+        let header = anchor_header(Some(huge.as_str()));
+        // Bounded well under the notice payload bound, cut announced.
+        assert!(header.len() <= TASK_ANCHOR_MAX_BYTES + 64, "got {} bytes", header.len());
+        assert!(header.contains('…'), "the cut must announce itself: {header}");
+        assert!(header.ends_with("]\n"), "the header stays well-formed: {header}");
+        // The bound respects char boundaries (no panic, no broken UTF-8).
+        let unicode = "é".repeat(TASK_ANCHOR_MAX_BYTES);
+        let _ = anchor_header(Some(unicode.as_str()));
+    }
+
+    #[test]
+    fn resolve_task_anchor_prefers_the_explicit_title_then_the_goal_line() {
+        // Explicit title (the harness step's live item title) wins.
+        assert_eq!(
+            resolve_task_anchor(Some("Build CSV export"), "do the thing\nmore detail"),
+            Some("Build CSV export".to_string())
+        );
+        // Blank explicit title falls back to the run's goal line.
+        assert_eq!(
+            resolve_task_anchor(Some("  "), "\n  Fix the login bug  \ndetails"),
+            Some("Fix the login bug".to_string())
+        );
+        assert_eq!(
+            resolve_task_anchor(None, "Fix the login bug"),
+            Some("Fix the login bug".to_string())
+        );
+        // Nothing to anchor on → None, and the header is omitted.
+        assert_eq!(resolve_task_anchor(None, "   \n  "), None);
+        assert_eq!(resolve_task_anchor(Some(""), ""), None);
     }
 }
