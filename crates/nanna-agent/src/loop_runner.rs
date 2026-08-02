@@ -684,6 +684,99 @@ fn zero_info_breaker_notice(name: &str, repeats: usize, excerpt: &str, full_len:
     )
 }
 
+/// Consecutive zero-delta discovery calls — a discovery-style result (one
+/// carrying an `activate_tools` array) that adds NOTHING new to the run's
+/// active tool set — after which discovery is paused: further calls to the
+/// discovery tool(s) short-circuit to a structured notice instead of
+/// dispatching.
+///
+/// The per-shape sibling breakers above never see this loop: each paraphrase
+/// ("write a file and read a file" → "list files and search files" → "list
+/// files and directory structure" → …) is a fresh (tool + args) key, so
+/// neither streak ever builds. The invariant signal is semantic, not textual:
+/// a discovery call that activates zero new tools has provably added nothing
+/// to the run, whatever its query text says.
+///
+/// Derivation (the same ladder rung as [`REPEAT_FAILURE_BREAKER_AFTER`] and
+/// [`ZERO_INFO_BREAKER_AFTER`], not a magic cap): the soft loop nudge fires
+/// after 2 repeats, and the hard rung sits exactly one rung above it so the
+/// model keeps one full post-nudge attempt. 2 (nudge trigger) + 1 (post-nudge
+/// chance) = 3.
+///
+/// Observed live 2026-08-02 (ollama/gemma4:12b, daemon): `discover_tools`
+/// called 103 times in ONE turn, each with a slightly different query; every
+/// call succeeded and not one activated a new tool, so the paraphrase stream
+/// sailed straight past both per-shape breakers.
+///
+/// This is NOT an iteration cap, and it never strands the model: discovery
+/// un-pauses the moment a tool call fails to resolve
+/// ([`is_unknown_tool_error`]) — the one signal discovery could genuinely
+/// help with.
+const ZERO_DELTA_DISCOVERY_BREAKER_AFTER: usize = 3;
+
+/// Marker prefix of the registry's unknown-tool resolution error
+/// (`ToolRegistry::execute` — `"Tool not found: {name}. Use discover_tools
+/// to see available tools."`).
+///
+/// The loop consumes registry responses purely through `ToolResponse` (no
+/// side channel), so the unknown-tool signal is recognized by this prefix.
+/// The coupling to the literal text is pinned by the
+/// `unknown_tool_error_prefix_matches_the_registry` test.
+const UNKNOWN_TOOL_ERROR_PREFIX: &str = "Tool not found:";
+
+/// Whether a tool failure is the registry's unknown-tool resolution error —
+/// the model asked for a tool that does not resolve (exact, case-insensitive,
+/// or fuzzy). This is the one failure discovery could genuinely fix, so it is
+/// the discovery-pause un-pause condition.
+fn is_unknown_tool_error(error: Option<&str>) -> bool {
+    error.is_some_and(|e| e.starts_with(UNKNOWN_TOOL_ERROR_PREFIX))
+}
+
+/// Render the discovery-pause notice.
+///
+/// Structured notice — RETURNED to the model as a normal `{content,
+/// success: false}` tool result, never thrown — and it announces itself
+/// (project rule: notices announce themselves): WHAT happened (the call was
+/// not executed), WHY (the last K discovery calls each activated zero new
+/// tools), WHAT the model already has (the active tools, listed by name),
+/// and WHAT TO DO instead (use them; discovery un-pauses on a missing-tool
+/// failure).
+///
+/// `available` is the exact set of tool definitions the model receives with
+/// every request, so the list is bounded by the registered-tool population;
+/// a pathological registry could still bloat the notice, so the rendered
+/// list shares the sibling breakers' replay bound
+/// ([`BREAKER_REPLAY_MAX_BYTES`]) and a cut announces itself. Sorted so the
+/// notice is deterministic — repeated short-circuits replay byte-identical
+/// text instead of shuffling the list.
+fn discovery_pause_notice(
+    name: &str,
+    zero_delta_calls: usize,
+    available: &HashSet<String>,
+) -> String {
+    let mut names: Vec<&str> = available.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let total = names.len();
+    let joined = names.join(", ");
+    let end = truncate_boundary(&joined, BREAKER_REPLAY_MAX_BYTES);
+    let listed = if end < joined.len() {
+        format!(
+            "{}… [tool list truncated — {total} tools are active in total]",
+            &joined[..end]
+        )
+    } else {
+        joined
+    };
+    format!(
+        "[DISCOVERY PAUSED] This call was NOT executed. The last {zero_delta_calls} \
+         `{name}` calls in a row each succeeded but activated ZERO new tools — every \
+         tool they found is already active, so rephrasing the query again cannot add \
+         anything. All relevant tools are already active — use them; discovery is \
+         paused for the rest of this run (it will un-pause if a tool call fails due \
+         to a missing tool). Your currently active tools ({total}): {listed}"
+    )
+}
+
 /// Detect degenerate narration loops in streaming text.
 ///
 /// Returns `true` if the text shows signs of the model narrating tool usage
@@ -3017,6 +3110,33 @@ impl Agent {
         let breaker_notices: Vec<Option<String>> = tool_calls_with_meta
             .iter()
             .map(|(_, name, input, _)| {
+                // Zero-delta discovery guard — name-level, checked before the
+                // per-shape breakers because it must subsume every paraphrase:
+                // a fresh query string per call is exactly the loop this guard
+                // exists for (discover_tools ×103, each query slightly
+                // different), so keying on arguments would be self-defeating.
+                // `discovery_tool_names` is learned semantically in Phase 3
+                // (any tool whose result carried `activate_tools`), so any
+                // future discovery-style skill is guarded the same way.
+                if state.discovery_paused
+                    && state.discovery_tool_names.contains(&name.to_lowercase())
+                {
+                    warn!(
+                        tool = %name,
+                        zero_delta_streak = state.zero_delta_discovery_streak,
+                        "⛔ Discovery paused: repeated discovery calls activated \
+                         zero new tools — short-circuiting without execution"
+                    );
+                    let available = tool_names_for_request(
+                        &state.active_tools,
+                        options.restrict_to_active_tools && !options.all_tools_active,
+                    );
+                    return Some(discovery_pause_notice(
+                        name,
+                        state.zero_delta_discovery_streak,
+                        &available,
+                    ));
+                }
                 let key = repeat_call_key(name, input);
                 state.repeat_calls.get(&key).and_then(|entry| {
                     if entry.failure_count >= REPEAT_FAILURE_BREAKER_AFTER {
@@ -3189,18 +3309,70 @@ impl Agent {
                 );
             }
 
-            // Check for activate_tools in structured data (from discover_tools)
-            if let Some(ref data) = response.result.data {
-                if let Some(activate) = data.get("activate_tools") {
-                    if let Some(arr) = activate.as_array() {
-                        for tool_name in arr {
-                            if let Some(s) = tool_name.as_str() {
-                                info!(tool = s, "Activating tool via discover_tools");
-                                state.active_tools.insert(s.to_string());
-                            }
-                        }
+            // Check for activate_tools in structured data (from discover_tools
+            // or any future discovery-style skill).
+            if let Some(arr) = response
+                .result
+                .data
+                .as_ref()
+                .and_then(|data| data.get("activate_tools"))
+                .and_then(Value::as_array)
+            {
+                let mut newly_activated = 0usize;
+                for tool_name in arr.iter().filter_map(Value::as_str) {
+                    if state.active_tools.insert(tool_name.to_string()) {
+                        info!(tool = tool_name, "Activating tool via discovery");
+                        newly_activated += 1;
                     }
                 }
+                // Zero-delta discovery bookkeeping. The name is learned
+                // semantically — whatever tool returned `activate_tools` IS
+                // a discovery tool, no name hard-coded — and lowercased so a
+                // case-variant call cannot dodge the paused-name check in
+                // Phase 1.5. A short-circuited call never reaches here (its
+                // notice response carries no data), so the streak counts
+                // only real executions.
+                state.discovery_tool_names.insert(name.to_lowercase());
+                if newly_activated == 0 {
+                    state.zero_delta_discovery_streak += 1;
+                    if state.zero_delta_discovery_streak >= ZERO_DELTA_DISCOVERY_BREAKER_AFTER
+                        && !state.discovery_paused
+                    {
+                        warn!(
+                            tool = %name,
+                            zero_delta_streak = state.zero_delta_discovery_streak,
+                            "⛔ Discovery paused: {} consecutive discovery calls \
+                             activated zero new tools",
+                            state.zero_delta_discovery_streak
+                        );
+                        state.discovery_paused = true;
+                    }
+                } else {
+                    // At least one NEW tool: discovery is earning its keep —
+                    // the streak restarts from zero.
+                    state.zero_delta_discovery_streak = 0;
+                }
+            }
+
+            // Un-pause discovery on the one signal it can genuinely help
+            // with: the model asked for a tool that does not resolve. The
+            // unknown-tool error is raised in the dispatch path
+            // (`ToolRegistry::execute`) and its own guidance tells the model
+            // to use discover_tools, so the pause must lift before the model
+            // follows that guidance. The streak resets too: the un-pause
+            // grants a full fresh K-window to hunt for the missing tool.
+            if state.discovery_paused
+                && !short_circuited
+                && !response.result.success
+                && is_unknown_tool_error(response.result.error.as_deref())
+            {
+                info!(
+                    tool = %name,
+                    "🔓 Unknown tool requested — un-pausing discovery \
+                     (it may genuinely help now)"
+                );
+                state.discovery_paused = false;
+                state.zero_delta_discovery_streak = 0;
             }
 
             // Strip write content from stored tool call record (same as context blocks)
@@ -4788,6 +4960,27 @@ struct RunState {
     /// results, breakers after [`REPEAT_FAILURE_BREAKER_AFTER`] identical
     /// failures / [`ZERO_INFO_BREAKER_AFTER`] identical successes.
     repeat_calls: HashMap<String, RepeatCallState>,
+    /// Zero-delta discovery guard: consecutive discovery-style results (any
+    /// tool result carrying an `activate_tools` array — see the activation
+    /// handling in `execute_tools`) that activated zero NEW tools. Counted
+    /// across paraphrases — the per-shape `repeat_calls` streaks above never
+    /// build when every call varies its query text. Reset by a discovery
+    /// that activates at least one new tool, and by the un-pause below.
+    /// Non-discovery calls in between do not touch it: the streak is over
+    /// discovery calls, not iterations.
+    zero_delta_discovery_streak: usize,
+    /// Engaged when the streak above reaches
+    /// [`ZERO_DELTA_DISCOVERY_BREAKER_AFTER`]: calls to any name in
+    /// `discovery_tool_names` short-circuit to [`discovery_pause_notice`]
+    /// instead of dispatching. Cleared (with the streak) by an unknown-tool
+    /// failure ([`is_unknown_tool_error`]) — the one signal discovery could
+    /// genuinely help with.
+    discovery_paused: bool,
+    /// Lowercased names of tools observed to return `activate_tools` data
+    /// this run. Learned semantically rather than hard-coded, so any future
+    /// discovery-style skill is guarded the moment its first result proves
+    /// it is one. Bounded by the registered-tool population.
+    discovery_tool_names: HashSet<String>,
     /// Whether the 80% token-budget status has been surfaced to the model
     budget_warned: bool,
     /// How many wrap-up nudges have been injected (escalates over time)
@@ -4841,6 +5034,9 @@ impl RunState {
             claim_nudge_count: 0,
             claim_nudge_iteration: 0,
             repeat_calls: HashMap::new(),
+            zero_delta_discovery_streak: 0,
+            discovery_paused: false,
+            discovery_tool_names: HashSet::new(),
             budget_warned: false,
             wrapup_nudge_count: 0,
             mission_rounds: 0,
@@ -6369,5 +6565,340 @@ mod claim_nudge_tests {
         state.iterations += CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS + 5;
         assert!(!a.maybe_inject_claim_nudge(&mut state, &options).await);
         assert_eq!(state.claim_nudge_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod discovery_pause_tests {
+    use super::*;
+    use nanna_tools::{Tool, ToolDefinition, ToolError};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Scripted discovery mock: every call SUCCEEDS and returns the current
+    /// `activate` list as `data.activate_tools` — the same shape the real
+    /// `discover_tools` skill produces. `executions` counts REAL dispatches;
+    /// the guard assertions are that this counter stops moving. Deliberately
+    /// NOT named `discover_tools`: the guard must learn discovery-ness from
+    /// the `activate_tools` payload, not from a hard-coded name.
+    struct ScriptedDiscovery {
+        executions: Arc<AtomicUsize>,
+        activate: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ScriptedDiscovery {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "find_tools".to_string(),
+                description: "test discovery skill with a scripted result".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            let names = self.activate.lock().unwrap().clone();
+            Ok(
+                ToolResult::success(format!("Activated {} tools", names.len()))
+                    .with_data(serde_json::json!({ "activate_tools": names })),
+            )
+        }
+    }
+
+    /// Plain counting tool — proves the pause disables discovery only, never
+    /// ordinary work.
+    struct HammerTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for HammerTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "hammer".to_string(),
+                description: "test tool that always succeeds".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success("clang"))
+        }
+    }
+
+    struct Fixture {
+        agent: Agent,
+        discovery_executions: Arc<AtomicUsize>,
+        hammer_executions: Arc<AtomicUsize>,
+        activate: Arc<StdMutex<Vec<String>>>,
+    }
+
+    async fn fixture(activate: Vec<&str>) -> Fixture {
+        let discovery_executions = Arc::new(AtomicUsize::new(0));
+        let hammer_executions = Arc::new(AtomicUsize::new(0));
+        let activate = Arc::new(StdMutex::new(
+            activate.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        ));
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(ScriptedDiscovery {
+                executions: Arc::clone(&discovery_executions),
+                activate: Arc::clone(&activate),
+            })
+            .await;
+        tools
+            .register(HammerTool {
+                executions: Arc::clone(&hammer_executions),
+            })
+            .await;
+        // Never contacted: `execute_tools` is driven directly and the mock
+        // results are small enough to bypass all summarization paths.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Fixture {
+            agent: Agent::new(AgentConfig::default(), llm, tools),
+            discovery_executions,
+            hammer_executions,
+            activate,
+        }
+    }
+
+    /// Dispatch one call through the real tool path and return its
+    /// `tool_result` block.
+    async fn call(agent: &Agent, state: &mut RunState, name: &str, input: Value) -> ContentBlock {
+        let uses = vec![(Uuid::new_v4().to_string(), name.to_string(), input)];
+        let mut blocks = agent
+            .execute_tools(&uses, state, &RunOptions::default(), None)
+            .await;
+        assert_eq!(blocks.len(), 1);
+        blocks.remove(0)
+    }
+
+    /// One discovery call with a distinct paraphrased query per call — the
+    /// exact live pattern (103 paraphrases) the per-shape breakers miss.
+    async fn discover(agent: &Agent, state: &mut RunState, query: &str) -> ContentBlock {
+        call(
+            agent,
+            state,
+            "find_tools",
+            serde_json::json!({ "query": query }),
+        )
+        .await
+    }
+
+    fn content_of(block: ContentBlock) -> (String, Option<bool>) {
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = block
+        else {
+            panic!("expected a tool_result block");
+        };
+        (content, is_error)
+    }
+
+    #[test]
+    fn the_discovery_pause_notice_announces_itself() {
+        let available: HashSet<String> = ["exec", "read_file", "discover_tools"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let notice = discovery_pause_notice("discover_tools", 3, &available);
+        // WHAT happened, WHY, WHAT the model already has, and WHAT to do —
+        // an unexplained notice reads as corruption and spirals small models.
+        assert!(notice.contains("NOT executed"));
+        assert!(notice.contains("ZERO new tools"));
+        assert!(notice.contains("already active — use them"));
+        assert!(notice.contains("discovery is paused"), "got: {notice}");
+        assert!(
+            notice.contains("un-pause if a tool call fails due to a missing tool"),
+            "the escape hatch must be spelled out: {notice}"
+        );
+        // The active tools are listed by name, deterministically sorted.
+        assert!(
+            notice.contains("discover_tools, exec, read_file"),
+            "got: {notice}"
+        );
+        assert!(notice.contains("(3)"), "states how many tools are active");
+
+        // A pathological tool population is replayed bounded, cut announced.
+        let huge: HashSet<String> = (0..2000).map(|i| format!("tool_{i:04}")).collect();
+        let bounded = discovery_pause_notice("discover_tools", 3, &huge);
+        assert!(bounded.len() < BREAKER_REPLAY_MAX_BYTES * 2);
+        assert!(bounded.contains("tool list truncated"));
+        assert!(bounded.contains("2000 tools"), "the cut states the total");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_error_prefix_matches_the_registry() {
+        // Pins the cross-crate coupling: the un-pause detector recognizes the
+        // exact error the registry raises in the dispatch path for a call
+        // that fails resolution. If the registry rewords it, this fails.
+        let f = fixture(vec![]).await;
+        let mut state = RunState::new();
+        let block = call(
+            &f.agent,
+            &mut state,
+            "zzz_completely_absent",
+            serde_json::json!({}),
+        )
+        .await;
+        let (content, is_error) = content_of(block);
+        assert_eq!(is_error, Some(true));
+        assert!(
+            content.contains(UNKNOWN_TOOL_ERROR_PREFIX),
+            "the registry's unknown-tool error must carry the pinned prefix: {content}"
+        );
+        // And the detector recognizes the raw error text itself.
+        assert!(is_unknown_tool_error(Some(
+            "Tool not found: zzz. Use discover_tools to see available tools."
+        )));
+        assert!(!is_unknown_tool_error(Some("Execution failed: boom")));
+        assert!(!is_unknown_tool_error(None));
+    }
+
+    #[tokio::test]
+    async fn k_zero_delta_discoveries_then_short_circuit_with_active_tools_list() {
+        let f = fixture(vec!["exec", "read_file"]).await;
+        let mut state = RunState::new();
+
+        // Call 1 activates two NEW tools — real progress, streak stays 0.
+        discover(&f.agent, &mut state, "write a file and read a file").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 1);
+        assert!(state.active_tools.contains("exec"));
+        assert!(state.active_tools.contains("read_file"));
+
+        // Calls 2–4 keep "finding" the same tools under fresh paraphrases:
+        // zero delta each. All three still execute — the model gets its full
+        // K-window — and a non-discovery call in between does not reset the
+        // streak (the streak is over discovery calls, not iterations).
+        discover(&f.agent, &mut state, "list files and search files").await;
+        discover(&f.agent, &mut state, "list files and directory structure").await;
+        call(&f.agent, &mut state, "hammer", serde_json::json!({})).await;
+        discover(&f.agent, &mut state, "file listing and searching").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 4);
+
+        // Call 5 — yet another paraphrase — is short-circuited: the counting
+        // mock proves no dispatch, and the notice is structured and returned.
+        let block = discover(&f.agent, &mut state, "read files and write files").await;
+        assert_eq!(
+            f.discovery_executions.load(Ordering::SeqCst),
+            4,
+            "the paused discovery call must not be dispatched"
+        );
+        let (content, is_error) = content_of(block);
+        assert_eq!(is_error, Some(true), "returned as a notice, never thrown");
+        assert!(content.contains("DISCOVERY PAUSED"), "got: {content}");
+        assert!(content.contains("NOT executed"));
+        assert!(
+            content.contains("exec") && content.contains("read_file"),
+            "the notice must list the currently active tools by name: {content}"
+        );
+        assert!(content.contains("use them"), "got: {content}");
+
+        // Every further paraphrase stays short-circuited — this is exactly
+        // the stream the per-(tool+args) breakers can never catch.
+        discover(&f.agent, &mut state, "tools for editing code").await;
+        discover(&f.agent, &mut state, "tools for searching code").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 4);
+
+        // …while ordinary tools keep working: only discovery is paused.
+        let block = call(&f.agent, &mut state, "hammer", serde_json::json!({})).await;
+        let (content, is_error) = content_of(block);
+        assert_eq!(is_error, None, "non-discovery tools must be untouched");
+        assert_eq!(content, "clang");
+        assert_eq!(f.hammer_executions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_discovery_that_activates_a_new_tool_resets_the_streak() {
+        let f = fixture(vec!["exec"]).await;
+        let mut state = RunState::new();
+
+        // Call 1: delta 1 (new). Calls 2–3: zero delta — streak at 2.
+        discover(&f.agent, &mut state, "run a shell command").await;
+        discover(&f.agent, &mut state, "execute a program").await;
+        discover(&f.agent, &mut state, "launch a process").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 3);
+
+        // Call 4 finds ONE genuinely new tool: the streak resets — discovery
+        // is earning its keep again.
+        f.activate.lock().unwrap().push("todo".to_string());
+        discover(&f.agent, &mut state, "track my tasks").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 4);
+        assert!(state.active_tools.contains("todo"));
+
+        // It now takes K fresh zero-delta discoveries to pause…
+        for (i, q) in ["plan my tasks", "manage a todo list", "organize work"]
+            .iter()
+            .enumerate()
+        {
+            discover(&f.agent, &mut state, q).await;
+            assert_eq!(
+                f.discovery_executions.load(Ordering::SeqCst),
+                5 + i,
+                "post-reset zero-delta discovery {} must still execute",
+                i + 1
+            );
+        }
+        // …and only the next one is short-circuited.
+        let block = discover(&f.agent, &mut state, "task management tools").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 7);
+        let (content, _) = content_of(block);
+        assert!(content.contains("DISCOVERY PAUSED"), "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_failure_un_pauses_discovery() {
+        // Discovery that never activates anything: paused after K calls.
+        let f = fixture(vec![]).await;
+        let mut state = RunState::new();
+        for q in ["find tools", "list capabilities", "what can you do"] {
+            discover(&f.agent, &mut state, q).await;
+        }
+        let block = discover(&f.agent, &mut state, "show me the tools").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 3);
+        let (content, _) = content_of(block);
+        assert!(content.contains("DISCOVERY PAUSED"), "got: {content}");
+
+        // A call to a tool that does not resolve — the one failure discovery
+        // could genuinely fix — lifts the pause.
+        let block = call(
+            &f.agent,
+            &mut state,
+            "zzz_completely_absent",
+            serde_json::json!({}),
+        )
+        .await;
+        let (content, is_error) = content_of(block);
+        assert_eq!(is_error, Some(true));
+        assert!(content.contains("Tool not found"), "got: {content}");
+
+        // Discovery dispatches for real again, with a full fresh K-window…
+        for (i, q) in ["find the missing tool", "search skills", "any zzz tool?"]
+            .iter()
+            .enumerate()
+        {
+            discover(&f.agent, &mut state, q).await;
+            assert_eq!(
+                f.discovery_executions.load(Ordering::SeqCst),
+                4 + i,
+                "post-un-pause discovery {} must dispatch again",
+                i + 1
+            );
+        }
+        // …and if the hunt still activates nothing new, the guard re-engages.
+        let block = discover(&f.agent, &mut state, "really, any new tool?").await;
+        assert_eq!(f.discovery_executions.load(Ordering::SeqCst), 6);
+        let (content, _) = content_of(block);
+        assert!(content.contains("DISCOVERY PAUSED"), "got: {content}");
     }
 }
