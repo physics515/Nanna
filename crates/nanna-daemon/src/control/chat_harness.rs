@@ -844,16 +844,69 @@ pub(super) fn conversation_context(messages: &[SessionMessage]) -> Option<String
     Some(lines.join("\n"))
 }
 
+/// The claim marker `nanna_agent::harness::step_claims_completion` verdicts
+/// on. The model emits it, so matching is case-insensitive.
+const CLAIM_MARKER: &str = "TASK COMPLETE";
+
+/// Loop-recovery steering markers the agent loop may inject into a turn.
+/// Steering is harness-to-model, never conversation: everything from the
+/// marker to the end of its line is harness-fabricated, so the line is cut at
+/// the marker. Emitted by our own code, so matching is exact.
+const NUDGE_MARKERS: &[&str] = &["[THINKING SPIRAL DETECTED]"];
+
+/// Case-insensitive `strip_prefix` (ASCII markers only). `get` guards the
+/// UTF-8 boundary a byte-length slice could split.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
+/// Case-insensitive `strip_suffix` (ASCII markers only).
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = s.len().checked_sub(suffix.len())?;
+    let tail = s.get(split..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &s[..split])
+}
+
+/// Per-line strip: `None` drops the line, `Some` keeps (possibly peeled)
+/// text. Recursion terminates because every recursive call shrinks the line
+/// by at least one marker length.
+fn strip_marker_line(line: &str) -> Option<&str> {
+    for marker in NUDGE_MARKERS {
+        if let Some(pos) = line.find(marker) {
+            let head = line[..pos].trim_end();
+            return if head.is_empty() { None } else { strip_marker_line(head) };
+        }
+    }
+    let trimmed = line.trim();
+    if trimmed.eq_ignore_ascii_case(CLAIM_MARKER) {
+        return None;
+    }
+    // Stream glue: the claim marker fused with a neighboring line when the
+    // newline between them was lost (observed live 2026-08-02: "TASK
+    // COMPLETE[THINKING SPIRAL DETECTED]..."). Glue never introduces spaces,
+    // so a whitespace boundary reads as genuine prose and survives.
+    if let Some(rest) = strip_prefix_ci(trimmed, CLAIM_MARKER) {
+        if !rest.starts_with(char::is_whitespace) {
+            return strip_marker_line(rest);
+        }
+    }
+    if let Some(rest) = strip_suffix_ci(trimmed, CLAIM_MARKER) {
+        if !rest.ends_with(char::is_whitespace) {
+            return strip_marker_line(rest);
+        }
+    }
+    Some(line)
+}
+
 /// Remove harness plumbing from user-visible text: the `TASK COMPLETE`
 /// claim marker the harness verdicts on (a line matching
 /// `nanna_agent::harness::step_claims_completion`'s predicate — trimmed,
-/// case-insensitive, on its own line). Inline mentions are left alone; only
-/// whole marker lines are dropped.
+/// case-insensitive, on its own line, plus the glued prefix/suffix shapes
+/// stream fusion produces) and loop-steering nudge markers. Space-separated
+/// inline mentions are left alone.
 pub(super) fn strip_harness_markers(text: &str) -> String {
-    let mut out: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().eq_ignore_ascii_case("TASK COMPLETE"))
-        .collect();
+    let mut out: Vec<&str> = text.lines().filter_map(strip_marker_line).collect();
     // Marker lines at the end often leave a dangling blank line behind them.
     while out.last().is_some_and(|line| line.trim().is_empty()) {
         out.pop();
@@ -1065,6 +1118,46 @@ mod tests {
     fn strip_harness_markers_trims_dangling_trailing_blanks() {
         assert_eq!(strip_harness_markers("answer: 4\n\nTASK COMPLETE\n"), "answer: 4");
         assert_eq!(strip_harness_markers("TASK COMPLETE"), "");
+    }
+
+    #[test]
+    fn strip_harness_markers_cuts_lines_at_nudge_markers() {
+        // The whole nudge line is fabricated steering — dropped outright.
+        assert_eq!(
+            strip_harness_markers(
+                "[THINKING SPIRAL DETECTED] I was overthinking. Let me act instead of deliberate."
+            ),
+            ""
+        );
+        // Stream glue onto real prose: the fabricated tail is cut, prose stays.
+        assert_eq!(
+            strip_harness_markers("checking the cache[THINKING SPIRAL DETECTED] I was overthinking."),
+            "checking the cache"
+        );
+    }
+
+    #[test]
+    fn strip_harness_markers_peels_glued_claim_markers() {
+        // The live 2026-08-02 shape: claim marker fused to a nudge that the
+        // lost newline glued onto the same line.
+        let text = "ran both checks concurrently.\n\nTASK COMPLETE[THINKING SPIRAL DETECTED] \
+                    I was overthinking. Let me act instead of deliberate.";
+        assert_eq!(strip_harness_markers(text), "ran both checks concurrently.");
+        // Suffix glue: prose that lost its newline before the claim line.
+        assert_eq!(
+            strip_harness_markers("all checks green.TASK COMPLETE"),
+            "all checks green."
+        );
+        // Doubled marker collapses to nothing.
+        assert_eq!(strip_harness_markers("TASK COMPLETEtask complete"), "");
+    }
+
+    #[test]
+    fn strip_harness_markers_keeps_space_separated_mentions() {
+        // Glue never introduces spaces, so a whitespace boundary is prose —
+        // even at the start or end of a line.
+        let text = "TASK COMPLETE is the marker I emit\nwe are almost TASK COMPLETE";
+        assert_eq!(strip_harness_markers(text), text);
     }
 
     #[test]
