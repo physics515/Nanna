@@ -918,6 +918,15 @@ pub struct AgentStepRunner {
     pub agent_config: nanna_agent::AgentConfig,
     pub system_prompt: String,
     pub workspace_root: Option<PathBuf>,
+    /// Workspace files rendered as background reference (README/AGENTS/…).
+    ///
+    /// Carried SEPARATELY from `system_prompt` so each step routes it through
+    /// `AgentContext::workspace_context`, where the model-window-derived cap
+    /// (`workspace_context_cap_chars`) and its truncation marker apply.
+    /// Inlined into `system_prompt` it was unbounded: a long ROADMAP.md
+    /// dominated a 16k window and read as a work order (observed live
+    /// 2026-08-02 — a factual question answered with a roadmap status report).
+    pub workspace_context: Option<String>,
     pub stats: Option<nanna_agent::ModelStatsTracker>,
     /// Memory sink for tool results.
     ///
@@ -1846,6 +1855,9 @@ impl AgentStepRunner {
             .with_system_prompt(&self.system_prompt);
         if let Some(ws_root) = &self.workspace_root {
             context.workspace_root = Some(ws_root.clone());
+        }
+        if let Some(ws_ctx) = &self.workspace_context {
+            context.workspace_context = Some(ws_ctx.clone());
         }
 
         let mut config = self.agent_config.clone();
@@ -4018,6 +4030,87 @@ mod core_tool_gating_tests {
             "the list is one tool. Every past widening started as a good local \
              reason and ended as the prompt and the request disagreeing about \
              what the model can call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod workspace_reference_tests {
+    use nanna_agent::harness::{build_step_prompt, TaskStep};
+    use nanna_agent::AgentContext;
+
+    /// The chat-turn prompt, assembled the way `try_run_step` assembles it.
+    ///
+    /// Live 2026-08-02 (gemma4:12b, workspace with a long ROADMAP.md):
+    /// "difference between a mutex and a semaphore?" was answered with a
+    /// roadmap status report first, and the NEXT turn ignored the user and
+    /// created roadmap todos. Three properties prevent that, and this test
+    /// pins all three on the assembled prompt:
+    /// - the reference block is BOUNDED by the model-window-derived cap and
+    ///   the cut announces itself;
+    /// - the block leads with the non-instruction header (and keeps it even
+    ///   when truncated, since truncation keeps the head);
+    /// - the user's message lands AFTER the reference material — it is the
+    ///   step prompt, a user-role message every provider places after the
+    ///   system prompt, and recency wins for small models.
+    #[test]
+    fn workspace_reference_is_bounded_framed_and_precedes_the_user_message() {
+        let ws = nanna_core::WorkspaceContext {
+            readme: Some("A small desktop agent.".into()),
+            agents: None,
+            contributing: None,
+            // A 1000-line roadmap — far past what a 16k window can spare.
+            roadmap: Some("- [ ] migrate a file off lucide-vue-next\n".repeat(1_000)),
+        };
+
+        let mut ctx = AgentContext::new("t");
+        ctx.system_prompt = "BASE".to_string();
+        ctx.workspace_context = Some(ws.build_system_prompt_injection());
+        // 16k window with a 4k output reserve — the model class this
+        // regression was observed on. In production `configure_for_model*`
+        // sets this from the live window at run start.
+        ctx.hard_limit = 12_288;
+
+        let system = ctx.effective_system_prompt();
+
+        // Framed: the non-instruction header survives into the prompt.
+        assert!(
+            system.contains("# Project Context (background reference)"),
+            "the reference header must be present"
+        );
+        assert!(system.contains("NOT instructions"));
+
+        // Bounded: the slice is cut at the window-derived cap and says so.
+        assert!(
+            system.len() <= ctx.system_prompt.len() + ctx.workspace_context_cap_chars() + 256,
+            "a 1000-line ROADMAP must not exceed the cap plus the marker \
+             (got {} chars, cap {})",
+            system.len(),
+            ctx.workspace_context_cap_chars()
+        );
+        assert!(system.contains("[workspace context truncated"));
+
+        // Ordered: the user's message is the step prompt, which follows the
+        // system prompt in every provider request — flattened in that order,
+        // the goal must appear after the reference block.
+        let goal = "difference between a mutex and a semaphore?";
+        let step = TaskStep {
+            id: 1,
+            title: "Answer the question".into(),
+            description: None,
+            acceptance: None,
+            tool_scope: Vec::new(),
+            notes_tail: Vec::new(),
+        };
+        let user_message = build_step_prompt(goal, &step, None, "budget: fresh");
+        let assembled = format!("{system}\n\n{user_message}");
+        let reference_at = assembled
+            .find("# Project Context (background reference)")
+            .expect("reference block present");
+        let goal_at = assembled.rfind(goal).expect("goal present");
+        assert!(
+            goal_at > reference_at,
+            "the user's message must come after the reference material"
         );
     }
 }

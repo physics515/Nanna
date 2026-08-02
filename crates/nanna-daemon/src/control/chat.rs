@@ -157,6 +157,7 @@ impl ControlPlane {
                 }
 
                 // Inject workspace context (reload from disk so edits within the session are picked up)
+                let mut workspace_context: Option<String> = None;
                 if let Some(ref ws_id) = effective_ws_id {
                     {
                         let mut registry = self.workspaces.write().await;
@@ -178,10 +179,18 @@ impl ControlPlane {
                             Do NOT search in home directory or other locations unless explicitly asked.\n"
                         ));
 
-                        // Add workspace context files (README.md, AGENTS.md, ROADMAP.md, …)
+                        // Workspace files (README.md, AGENTS.md, ROADMAP.md, …) ride
+                        // OUTSIDE the system prompt: as `AgentContext::workspace_context`
+                        // each step bounds them at the model-window-derived cap
+                        // (`workspace_context_cap_chars`) with a marker that announces
+                        // the cut. Appended here they were unbounded — a long
+                        // ROADMAP.md dominated a 16k window and read as a work order
+                        // (observed live 2026-08-02: "mutex vs semaphore?" answered
+                        // with a roadmap status report, next turn created roadmap
+                        // todos unasked).
                         let ws_context = ws.context.build_system_prompt_injection();
                         if !ws_context.is_empty() {
-                            system_prompt.push_str(&format!("\n{}", ws_context));
+                            workspace_context = Some(ws_context);
                         }
                     }
                 }
@@ -307,6 +316,7 @@ impl ControlPlane {
                         system_prompt,
                         conversation,
                         workspace_root,
+                        workspace_context,
                     )
                     .await
                 {

@@ -124,6 +124,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         },
         system_prompt: nanna_agent::prompts::DEFAULT_SYSTEM_PROMPT.to_string(),
         workspace_root: Some(workdir.to_path_buf()),
+        workspace_context: None,
         stats: None,
         // No memory service in the eval harness: it drives the runner directly,
         // with no daemon to own the store. `loop_runner` degrades correctly on

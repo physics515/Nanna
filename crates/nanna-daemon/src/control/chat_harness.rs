@@ -121,6 +121,7 @@ impl ControlPlane {
         system_prompt: String,
         conversation: Option<String>,
         workspace_root: Option<PathBuf>,
+        workspace_context: Option<String>,
     ) -> Result<Option<String>, String> {
         let (Some(agent), Some(router), Some(tools), Some(storage), Some(event_tx)) = (
             self.agent.clone(),
@@ -187,6 +188,7 @@ impl ControlPlane {
             agent_config: agent.agent_config().await,
             system_prompt,
             workspace_root: workspace_root.clone(),
+            workspace_context,
             stats: Some(self.model_stats.clone()),
             chat_sink: Some(sink),
             // Tool results go to memory, a stub goes to context.
@@ -203,6 +205,9 @@ impl ControlPlane {
             agent_config: step_runner.agent_config.clone(),
             system_prompt: step_runner.system_prompt.clone(),
             workspace_root: step_runner.workspace_root.clone(),
+            // The planner sees the same bounded reference: acting on ROADMAP
+            // items nobody asked for is precisely a planning failure.
+            workspace_context: step_runner.workspace_context.clone(),
             stats: step_runner.stats.clone(),
             // Planning calls no tools, so it has nothing to remember.
             memory: None,
