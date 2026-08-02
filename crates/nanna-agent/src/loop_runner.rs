@@ -1879,19 +1879,18 @@ impl Agent {
                     continue;
                 }
 
-                // Detect thinking spiral: model spent a lot of reasoning tokens
-                // going in circles without producing useful output
-                if !state.thinking_spiral_nudged
-                    && state.final_text.contains("[THINKING SPIRAL DETECTED]")
-                {
+                // Thinking spiral: the stream handler aborted mid-reasoning and
+                // flagged it out-of-band (no marker text — see the abort site)
+                if !state.thinking_spiral_nudged && state.thinking_spiral_detected {
                     warn!(
                         reasoning_tokens = state.reasoning_tokens,
                         iteration = state.iterations,
                         "🌀 Thinking spiral recovery — injecting action nudge and retrying"
                     );
                     state.thinking_spiral_nudged = true;
+                    state.thinking_spiral_detected = false;
 
-                    // Clear the spiral marker text
+                    // The aborted turn contributes nothing user-visible
                     state.final_text.clear();
                     // Clear accumulated reasoning so the model starts fresh
                     state.reasoning_content.clear();
@@ -2361,6 +2360,9 @@ impl Agent {
         let mut cache_read_tokens = 0u32;
         let mut cache_creation_tokens = 0u32;
         let mut narration_check_len = 0usize; // track text length at last narration check
+        // Re-arm per call: a spiral flag left unconsumed (e.g. the abort raced
+        // finalized tool calls) must not fire recovery on a healthy later round.
+        state.thinking_spiral_detected = false;
 
         loop {
             // Race the stream read against cancellation. A poll at batch
@@ -2440,10 +2442,13 @@ impl Agent {
                             thinking_tokens = state.reasoning_tokens,
                             "🌀 Thinking spiral detected — aborting stream and forcing action"
                         );
-                        // Break out of the stream; the main loop will see no tool calls
-                        // and no text, so we inject a forced-action response
-                        asm.text = "[THINKING SPIRAL DETECTED] I was overthinking. Let me act instead of deliberate.".to_string();
-                        on_text(&asm.text);
+                        // Signal the main loop out-of-band; the recovery nudge
+                        // is harness-to-model steering, not conversation, so
+                        // nothing goes through on_text (an echoed marker became
+                        // the persisted chat reply, observed live 2026-08-02).
+                        // Partial text is discarded with the aborted stream.
+                        state.thinking_spiral_detected = true;
+                        asm.text.clear();
                         break;
                     }
                 }
@@ -4286,6 +4291,11 @@ struct RunState {
     repetition_nudged: bool,
     /// Whether we've already injected a thinking-spiral nudge (only retry once)
     thinking_spiral_nudged: bool,
+    /// Streaming aborted on a detected thinking spiral this iteration.
+    /// Out-of-band steering signal consumed by the recovery nudge — never
+    /// rendered as text (a marker echoed through on_text became the
+    /// persisted chat reply, observed live 2026-08-02).
+    thinking_spiral_detected: bool,
     /// Whether we've already injected a tool-call-loop nudge (only once)
     tool_loop_nudged: bool,
     /// Whether the 80% token-budget status has been surfaced to the model
@@ -4336,6 +4346,7 @@ impl RunState {
             narration_nudged: false,
             repetition_nudged: false,
             thinking_spiral_nudged: false,
+            thinking_spiral_detected: false,
             tool_loop_nudged: false,
             budget_warned: false,
             wrapup_nudge_count: 0,
