@@ -42,7 +42,7 @@ use super::{ControlPlane, Value, json};
 use crate::session::{MessageRole, SessionMessage, TimelineItem};
 use crate::tasks::{
     AgentPlanner, AgentStepRunner, ChatSink, PendingMessages, SessionInterjector, TursoTaskSource,
-    seed_plan,
+    demote_in_progress, seed_plan,
 };
 use nanna_agent::harness::{Interjector, LongHorizonConfig};
 use nanna_storage::Storage;
@@ -620,6 +620,26 @@ impl ControlPlane {
                                 },
                             ));
                         }
+                    }
+                }
+            }
+
+            // A cancelled run's in-flight items must not auto-resume:
+            // `next()` sorts `in_progress` first, so a leftover from a
+            // stopped turn would silently outrank the user's next message
+            // (observed live 2026-08-02: a cancelled turn's continuation task
+            // ran before the fresh question). Demote them to pending — still
+            // open, still shown to the planner as unfinished work per the
+            // owner directive above, just no longer at the head of the queue.
+            if run_handle.cancel.is_cancelled() {
+                match demote_in_progress(&storage, &scope, scope_id.as_deref(), "chat").await {
+                    Ok(0) => {}
+                    Ok(demoted) => tracing::info!(
+                        demoted,
+                        "cancelled turn — in-flight items returned to pending"
+                    ),
+                    Err(message) => {
+                        tracing::warn!(%message, "could not demote the cancelled turn's items");
                     }
                 }
             }
