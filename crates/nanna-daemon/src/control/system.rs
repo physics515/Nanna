@@ -90,7 +90,19 @@ impl ControlPlane {
             }
             SystemAction::Shutdown => {
                 info!("Shutdown requested");
-                json!({ "status": "shutting_down" })
+                if let Some(tx) = self.shutdown_tx.clone() {
+                    // Fire after a short grace so the response below flushes to
+                    // the requesting client before the IPC server tears down.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        let _ = tx.send(());
+                    });
+                    json!({ "status": "shutting_down" })
+                } else {
+                    // Minimal construction with no shutdown handle: say so
+                    // instead of pretending — callers fall back to a tree-kill.
+                    json!({ "status": "unsupported", "error": "no shutdown handle wired" })
+                }
             }
             SystemAction::Version => {
                 json!({

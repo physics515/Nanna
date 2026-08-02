@@ -1223,6 +1223,19 @@ impl DaemonServer {
         info!("Starting Nanna daemon...");
         info!("Data directory: {:?}", self.config.data_dir);
 
+        // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
+        // every exec/acceptance process inherits membership, so the OS reaps
+        // the whole tree when this process dies for any reason — clean stop,
+        // `taskkill /F`, or a crash. Closes the leak where daemon restarts
+        // orphaned in-flight `powershell.exe`/`bash.exe` children (89 counted
+        // on 2026-08-01). Survivable on failure: log and run uncontained.
+        #[cfg(windows)]
+        if crate::job::adopt_kill_on_close_job() {
+            info!("Job Object adopted — child processes cannot outlive the daemon");
+        } else {
+            warn!("Job Object adoption failed — exec children may outlive an unclean daemon exit");
+        }
+
         // Ensure data directory exists
         std::fs::create_dir_all(&self.config.data_dir)?;
 
@@ -1684,7 +1697,8 @@ impl DaemonServer {
         .with_workspace_id(workspace_id_for_services)
         .with_scheduler(scheduler)
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
-        .with_memory_recovery(self.memory_recovery.clone());
+        .with_memory_recovery(self.memory_recovery.clone())
+        .with_shutdown(self.shutdown_tx.clone());
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
         }

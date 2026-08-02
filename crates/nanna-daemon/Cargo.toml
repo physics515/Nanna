@@ -77,7 +77,9 @@ windows-service = "0.8"
 # Process-liveness check for the PID-file single-instance guard.
 # (Shelling out to `tasklist` mis-reported live PIDs as dead when the
 # subprocess failed, letting a second daemon clobber the lock.)
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# Win32_System_JobObjects + Win32_Security: kill-on-close Job Object (job.rs)
+# so exec/acceptance children can never outlive the daemon process.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }

@@ -98,6 +98,11 @@ pub struct ControlPlane {
     /// Every chat turn is a harness run; a message that arrives while one is
     /// live joins it at the next step boundary instead of queueing behind it.
     chat_runs: Arc<chat_harness::ChatRunRegistry>,
+    /// Daemon shutdown signal, so `SystemAction::Shutdown` can actually stop
+    /// the daemon (clients like the GUI prefer a graceful IPC stop over a
+    /// hard kill). `None` in minimal test constructions — the handler then
+    /// reports the request as unsupported instead of pretending to stop.
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl ControlPlane {
@@ -130,6 +135,7 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            shutdown_tx: None,
         }
     }
 
@@ -186,6 +192,7 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            shutdown_tx: None,
         }
     }
 
@@ -244,7 +251,16 @@ impl ControlPlane {
             dreaming: None,
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
+            shutdown_tx: None,
         }
+    }
+
+    /// Wire the daemon's shutdown signal so `SystemAction::Shutdown` can
+    /// trigger a real graceful stop.
+    #[must_use]
+    pub fn with_shutdown(mut self, tx: tokio::sync::broadcast::Sender<()>) -> Self {
+        self.shutdown_tx = Some(tx);
+        self
     }
 
     /// Set the tools directory for reading tool source files

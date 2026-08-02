@@ -273,15 +273,45 @@ async fn run_command_check(command: &str, workdir: &Path, timeout: Duration) -> 
     }
 }
 
+/// Kill a process and its descendants, best-effort. Mirrors
+/// `kill_process_tree` in `nanna-scripting/src/bridge.rs` (this crate can't
+/// reach it — nanna-scripting sits behind nanna-tools' optional `scripting`
+/// feature); keep the two in sync.
+async fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(not(windows))]
+    {
+        // pid is a fresh process-group id from the kernel: it fits i32, and a
+        // failed signal (group already gone) is exactly the no-op we want.
+        #[allow(clippy::cast_possible_wrap)]
+        let pgid = -(pid as i32);
+        // SAFETY: kill(2) with a negative pgid signals a process group we
+        // created; `process_group(0)` at spawn put the child in its own
+        // group, so this can never reach our own.
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
+    }
+}
+
 /// Run a shell command, returning (exit code, combined stdout+stderr).
 ///
 /// On Windows this prefers Git Bash `sh` when on PATH (matching the exec
 /// tool's POSIX routing) and falls back to `cmd /C`.
 ///
-/// Known limitation: on timeout, `kill_on_drop` kills the shell but not its
-/// grandchildren (Windows has no process groups without Job Objects) — a
-/// wedged workload can outlive the check. The timeout still keeps the run
-/// loop live, which is the property that matters here.
+/// Lifecycle matches the exec tool (`bridge.rs`): the child runs in its own
+/// process group so a check that signals its group can't reach us, and a
+/// timeout kills the whole tree — the shell *and* any wedged grandchild —
+/// instead of `kill_on_drop`'s shell-only reap, which let a stuck workload
+/// outlive the check and hold workspace/build locks.
 async fn run_shell(
     command: &str,
     workdir: &Path,
@@ -293,10 +323,34 @@ async fn run_shell(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| format!("timed out after {}s", timeout.as_secs()))?
-        .map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        // Console events (Ctrl+C / Ctrl+Break) raised by or for the child
+        // stop at the child. Same flag as the exec tool.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(unix)]
+    {
+        // Own process group: isolates group signals AND gives the timeout
+        // path a pgid to kill.
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    // Capture the pid before the wait future consumes the child, so a timeout
+    // can kill the whole tree rooted here (not just the shell).
+    let pid = child.id();
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    let output = tokio::select! {
+        res = &mut wait => res.map_err(|e| e.to_string())?,
+        () = tokio::time::sleep(timeout) => {
+            if let Some(pid) = pid {
+                kill_process_tree(pid).await;
+            }
+            return Err(format!("timed out after {}s", timeout.as_secs()));
+        }
+    };
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     if combined.len() > ACCEPTANCE_READ_MAX_BYTES {
@@ -1458,6 +1512,28 @@ mod tests {
             timeout_secs: None,
         };
         assert!(!fail.run(dir.path()).await.passed);
+    }
+
+    #[tokio::test]
+    async fn run_shell_timeout_errors_and_returns_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        // A sleeper that works under every shell run_shell can route to.
+        #[cfg(windows)]
+        let command = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        let command = "sleep 30";
+
+        let started = std::time::Instant::now();
+        let result = run_shell(command, dir.path(), Duration::from_secs(1)).await;
+        let err = result.expect_err("a 30s sleeper must time out at 1s");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        // Bound: 1s timeout + tree-kill (taskkill subprocess on Windows).
+        // 10s is a generous ceiling for a loaded CI machine; the pre-fix
+        // hang mode was the full 30s sleeper duration.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout path must not wait for the workload"
+        );
     }
 
     #[test]
