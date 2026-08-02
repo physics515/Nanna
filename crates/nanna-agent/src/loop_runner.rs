@@ -6,7 +6,7 @@ use nanna_llm::{
     AnthropicMessage, AnthropicRequest, CacheControl, ContentBlock, ImageSource, LlmClient,
     StreamEvent, ToolDefinition as LlmToolDef,
 };
-use nanna_tools::{OutputTarget, ToolCall, ToolRegistry};
+use nanna_tools::{OutputTarget, ToolCall, ToolRegistry, ToolResponse, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -453,6 +453,122 @@ fn detect_tool_call_loop(records: &[ToolCallRecord]) -> bool {
         return false;
     }
     last.name == prev.name && last.input == prev.input && last.output == prev.output
+}
+
+/// Consecutive identical failures of one exact call shape (tool name +
+/// canonicalized input) after which the repeat-failure breaker engages:
+/// further identical calls short-circuit to an instant structured failure
+/// without executing.
+///
+/// Derivation (a rung on the existing escalation ladder, not a magic cap):
+/// [`detect_tool_call_loop`] needs two identical consecutive records to fire,
+/// so the soft loop nudge is injected immediately after the 2nd identical
+/// failure. The breaker sits exactly one rung above that nudge — the model
+/// gets one full post-nudge attempt (the 3rd call), and only when it fails
+/// identically again, proving the soft steer did not change behavior, does
+/// the hard breaker engage. 2 (nudge trigger) + 1 (post-nudge chance) = 3.
+///
+/// Observed live 2026-08-02 (gemma4:12b): `explore` called with identical
+/// `{}` 12+ times, each failing identically after 30 s; the nudge fired and
+/// changed nothing; the turn wedged for 20+ minutes. Past this threshold the
+/// breaker converts each repeat from 30 wasted seconds into an instant,
+/// instructive failure. This is NOT an iteration cap — only the one
+/// provably-broken call shape is disabled; everything else runs unbounded.
+const REPEAT_FAILURE_BREAKER_AFTER: usize = 3;
+
+/// Byte bound on the error text replayed inside a breaker notice.
+///
+/// Derivation: the notice is re-injected into context on EVERY
+/// short-circuited call, and the full error already reached the model each of
+/// the [`REPEAT_FAILURE_BREAKER_AFTER`] times the call actually ran — the
+/// replay is a reminder, not the primary delivery. 2000 bytes is the floor of
+/// the dynamic `context_result_threshold` (`(max_tokens * 2).clamp(2000,
+/// 32000)`): the largest size guaranteed to reach context untouched for every
+/// model size, so the notice itself can never trip the summarization or
+/// compression machinery.
+const BREAKER_ERROR_REPLAY_MAX_BYTES: usize = 2000;
+
+/// Per-key consecutive-failure bookkeeping for the repeat-failure breaker.
+#[derive(Debug, Clone, Default)]
+struct RepeatFailure {
+    /// Consecutive failures of this exact call shape (cleared by any success).
+    count: usize,
+    /// Error text of the most recent real failure, replayed (bounded) in the
+    /// breaker notice so the model sees WHY the call shape is disabled.
+    last_error: String,
+}
+
+/// Canonical repetition key for a tool call: name + canonicalized input JSON.
+///
+/// Object keys are sorted recursively because JSON object member order
+/// carries no meaning — `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same call
+/// and must share one failure count. Array order is preserved: it IS
+/// meaningful. The unit separator (U+001F) joins name and input; it cannot
+/// appear in a tool name, so no (name, input) pair can collide with a
+/// differently-split one.
+fn repeat_failure_key(name: &str, input: &Value) -> String {
+    format!("{name}\u{1f}{}", canonical_json(input))
+}
+
+/// Serialize a JSON value with recursively sorted object keys.
+///
+/// `serde_json`'s default `Map` happens to be sorted (`BTreeMap`), but that
+/// is a feature-flag accident — `preserve_order` flips it to insertion order.
+/// The breaker key must not change meaning if a transitive dependency enables
+/// that flag, so ordering is enforced here explicitly.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let members: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        Value::String(k.clone()),
+                        canonical_json(&map[k.as_str()])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", members.join(","))
+        }
+        Value::Array(items) => {
+            let members: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", members.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Render the breaker's short-circuit notice.
+///
+/// This is structured failure content — RETURNED to the model as a normal
+/// `{content, success: false}` tool result, never thrown — and it announces
+/// itself (project rule: failures announce themselves): WHAT happened (the
+/// call was not executed), WHY (it already failed identically N times, with
+/// the last error replayed), and WHAT TO DO instead (change arguments or
+/// tool; only this exact shape is disabled).
+fn repeat_failure_breaker_notice(name: &str, failures: usize, last_error: &str) -> String {
+    let end = truncate_boundary(last_error, BREAKER_ERROR_REPLAY_MAX_BYTES);
+    let replay = if end < last_error.len() {
+        format!(
+            "{}… [error text truncated for replay — the full error was already shown each \
+             time the call actually ran]",
+            &last_error[..end]
+        )
+    } else {
+        last_error.to_string()
+    };
+    format!(
+        "[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these exact \
+         arguments already failed {failures} times in a row in this run; the last error \
+         was: {replay}\n\
+         Repeating the identical call cannot succeed, so this exact call is disabled for \
+         the rest of this run — it now fails instantly instead of re-running a known \
+         failure. Change the arguments or use a different tool: `{name}` itself still \
+         works, and any call with different arguments executes normally."
+    )
 }
 
 /// Detect degenerate narration loops in streaming text.
@@ -2110,7 +2226,12 @@ impl Agent {
             // Tool-call loop detector (P14): same tool + same args + same
             // result twice in a row means the model is grinding, not
             // progressing. Small models loop; this is cheap to detect and
-            // expensive to ignore.
+            // expensive to ignore. This soft nudge is the FIRST rung of the
+            // repetition ladder; when the calls are also FAILING and the
+            // nudge changes nothing, the repeat-failure breaker in
+            // `execute_tools` engages one rung above it
+            // (REPEAT_FAILURE_BREAKER_AFTER) and short-circuits further
+            // identical calls without executing them.
             if !state.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
                 state.tool_loop_nudged = true;
                 warn!(
@@ -2639,6 +2760,32 @@ impl Agent {
             ));
         }
 
+        // Phase 1.5: repeat-failure breaker — one rung above the tool-call-loop
+        // nudge. A call shape that has already failed REPEAT_FAILURE_BREAKER_AFTER
+        // times in a row is provably broken: executing it again costs real time
+        // (observed live 2026-08-02: 30 s per identical failing explore{}) and
+        // cannot succeed, and small models ignore the soft nudge. Such calls
+        // short-circuit to an instant structured failure. Decided HERE, before
+        // dispatch, because the bookkeeping lives on `state`, which the parallel
+        // execution futures below cannot touch.
+        let breaker_notices: Vec<Option<String>> = tool_calls_with_meta
+            .iter()
+            .map(|(_, name, input, _)| {
+                let key = repeat_failure_key(name, input);
+                state.repeat_failures.get(&key).and_then(|f| {
+                    (f.count >= REPEAT_FAILURE_BREAKER_AFTER).then(|| {
+                        warn!(
+                            tool = %name,
+                            consecutive_failures = f.count,
+                            "⛔ Repeat-failure breaker: identical call already failed \
+                             repeatedly — short-circuiting without execution"
+                        );
+                        repeat_failure_breaker_notice(name, f.count, &f.last_error)
+                    })
+                })
+            })
+            .collect();
+
         // Phase 2: Execute all tools in parallel
         info!(
             "🚀 Executing {} tools in parallel",
@@ -2646,11 +2793,27 @@ impl Agent {
         );
         let tool_futures: Vec<_> = tool_calls_with_meta
             .iter()
-            .map(|(_, name, _, call)| {
+            .zip(breaker_notices.iter())
+            .map(|((_, name, _, call), breaker_notice)| {
                 let name = name.clone();
                 let call = call.clone();
+                let breaker_notice = breaker_notice.clone();
                 let tools = Arc::clone(&self.tools);
                 async move {
+                    // Short-circuited by the repeat-failure breaker: the
+                    // structured failure is RETURNED instantly (never thrown);
+                    // the tool is not dispatched at all — zero seconds spent.
+                    if let Some(notice) = breaker_notice {
+                        let response = ToolResponse {
+                            id: call.id.clone(),
+                            name: name.clone(),
+                            result: ToolResult::error(notice),
+                            // Context: the notice must reach the model
+                            // verbatim, never stubbed behind a memory handle.
+                            output_target: OutputTarget::Context,
+                        };
+                        return (response, 0u64);
+                    }
                     let start = std::time::Instant::now();
                     info!(tool = %name, "Executing tool");
                     let response = tools.execute(call).await;
@@ -2700,8 +2863,11 @@ impl Agent {
         };
 
         // Phase 3: Process results sequentially (callbacks, state updates, memory)
-        for ((id, name, input, _), (response, duration_ms)) in
-            tool_calls_with_meta.into_iter().zip(results.into_iter())
+        for (((id, name, input, _), (response, duration_ms)), short_circuited) in
+            tool_calls_with_meta
+                .into_iter()
+                .zip(results.into_iter())
+                .zip(breaker_notices.iter().map(Option::is_some))
         {
             if duration_ms > 10_000 {
                 warn!(
@@ -2798,6 +2964,25 @@ impl Agent {
                 success: response.result.success,
                 duration_ms,
             });
+
+            // Repeat-failure breaker bookkeeping. A short-circuited call never
+            // ran, so it neither extends nor clears anything — only real
+            // executions count. A success on the exact shape wipes its slate
+            // clean; a different input is a different key and is untouched.
+            if !short_circuited {
+                let key = repeat_failure_key(&name, &input);
+                if response.result.success {
+                    state.repeat_failures.remove(&key);
+                } else {
+                    let entry = state.repeat_failures.entry(key).or_default();
+                    entry.count += 1;
+                    entry.last_error = response
+                        .result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                }
+            }
 
             let result_content = if response.result.success {
                 response.result.content
@@ -4298,6 +4483,12 @@ struct RunState {
     thinking_spiral_detected: bool,
     /// Whether we've already injected a tool-call-loop nudge (only once)
     tool_loop_nudged: bool,
+    /// Repeat-failure breaker bookkeeping: consecutive failures per exact
+    /// call shape ([`repeat_failure_key`]). Shares the repetition machinery's
+    /// home with the loop-nudge detector above it on the escalation ladder:
+    /// nudge after 2 identical results, breaker after
+    /// [`REPEAT_FAILURE_BREAKER_AFTER`] identical failures.
+    repeat_failures: HashMap<String, RepeatFailure>,
     /// Whether the 80% token-budget status has been surfaced to the model
     budget_warned: bool,
     /// How many wrap-up nudges have been injected (escalates over time)
@@ -4348,6 +4539,7 @@ impl RunState {
             thinking_spiral_nudged: false,
             thinking_spiral_detected: false,
             tool_loop_nudged: false,
+            repeat_failures: HashMap::new(),
             budget_warned: false,
             wrapup_nudge_count: 0,
             mission_rounds: 0,
@@ -5085,5 +5277,239 @@ mod stub_summary_tests {
         let summary = extractive_summary(&content);
         assert!(summary.contains("héllo"));
         assert!(summary.contains("done"));
+    }
+}
+
+#[cfg(test)]
+mod repeat_failure_breaker_tests {
+    use super::*;
+    use nanna_tools::{Tool, ToolDefinition, ToolError};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Counting mock tool: fails with a fixed error while `fail` is set,
+    /// succeeds otherwise. `executions` counts REAL dispatches — the breaker
+    /// assertions are that this counter stops moving.
+    struct FlakyTool {
+        executions: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for FlakyTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "flaky".to_string(),
+                description: "test tool that fails on demand".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                // Structured failure, RETURNED not thrown — the repo rule the
+                // breaker itself must also honor.
+                Ok(ToolResult::error("boom: the disk is on fire"))
+            } else {
+                Ok(ToolResult::success("ok"))
+            }
+        }
+    }
+
+    async fn flaky_agent(fail: Arc<AtomicBool>, executions: Arc<AtomicUsize>) -> Agent {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(FlakyTool { executions, fail }).await;
+        // Never contacted: `execute_tools` is driven directly and the mock
+        // results are small enough to bypass all summarization paths.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(AgentConfig::default(), llm, tools)
+    }
+
+    /// Dispatch one `flaky` call through the real tool path and return its
+    /// tool_result block.
+    async fn run_once(agent: &Agent, state: &mut RunState, input: Value) -> ContentBlock {
+        let uses = vec![(Uuid::new_v4().to_string(), "flaky".to_string(), input)];
+        let mut blocks = agent
+            .execute_tools(&uses, state, &RunOptions::default(), None)
+            .await;
+        assert_eq!(blocks.len(), 1);
+        blocks.remove(0)
+    }
+
+    #[test]
+    fn canonical_json_sorts_object_keys_and_keeps_array_order() {
+        let v = serde_json::json!({"b": [2, 1], "a": {"z": true, "y": null}});
+        // Objects sort recursively (member order carries no meaning); arrays
+        // keep their order (it does).
+        assert_eq!(canonical_json(&v), r#"{"a":{"y":null,"z":true},"b":[2,1]}"#);
+        // The key carries the tool name, unambiguously separated.
+        assert_eq!(
+            repeat_failure_key("explore", &serde_json::json!({})),
+            "explore\u{1f}{}"
+        );
+        assert_ne!(
+            repeat_failure_key("explore", &serde_json::json!({"path": "a"})),
+            repeat_failure_key("explore", &serde_json::json!({"path": "b"})),
+            "different arguments are different keys"
+        );
+    }
+
+    #[test]
+    fn the_breaker_notice_announces_itself() {
+        let notice = repeat_failure_breaker_notice("explore", 3, "timeout after 30s");
+        // WHAT happened, WHY, and WHAT to do instead — a failure that does
+        // not explain itself reads as corruption and spirals small models.
+        assert!(notice.contains("NOT executed"));
+        assert!(notice.contains("3 times"));
+        assert!(notice.contains("timeout after 30s"));
+        assert!(notice.contains("disabled for the rest of this run"));
+        assert!(notice.contains("different tool"));
+
+        // A huge error is replayed bounded, and the cut announces itself.
+        let big = "e".repeat(BREAKER_ERROR_REPLAY_MAX_BYTES * 3);
+        let bounded = repeat_failure_breaker_notice("explore", 3, &big);
+        assert!(bounded.len() < big.len());
+        assert!(bounded.contains("truncated for replay"));
+    }
+
+    #[tokio::test]
+    async fn k_identical_failures_then_short_circuit_without_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let agent = flaky_agent(fail, Arc::clone(&executions)).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // The first K identical failures all execute for real.
+        for i in 1..=REPEAT_FAILURE_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+            assert_eq!(executions.load(Ordering::SeqCst), i, "call {i} must execute");
+        }
+
+        // Call K+1 is short-circuited: the counting mock proves no execution,
+        // and the result is a structured, self-announcing failure.
+        let block = run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER,
+            "the breaker must not dispatch the tool"
+        );
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = block
+        else {
+            panic!("expected a tool_result block");
+        };
+        assert_eq!(is_error, Some(true), "returned as failure, never thrown");
+        assert!(content.contains("REPEAT-FAILURE BREAKER"), "got: {content}");
+        assert!(content.contains("NOT executed"));
+        assert!(
+            content.contains(&format!("{REPEAT_FAILURE_BREAKER_AFTER} times")),
+            "states how often it failed: {content}"
+        );
+        assert!(
+            content.contains("the disk is on fire"),
+            "replays the last error: {content}"
+        );
+
+        // And it stays disabled for the rest of the run.
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(executions.load(Ordering::SeqCst), REPEAT_FAILURE_BREAKER_AFTER);
+    }
+
+    #[tokio::test]
+    async fn different_arguments_are_a_different_key_and_still_execute() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let agent = flaky_agent(fail, Arc::clone(&executions)).await;
+        let mut state = RunState::new();
+
+        // Engage the breaker on the {} shape.
+        for _ in 0..=REPEAT_FAILURE_BREAKER_AFTER {
+            run_once(&agent, &mut state, serde_json::json!({})).await;
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), REPEAT_FAILURE_BREAKER_AFTER);
+
+        // A different input on the SAME tool executes normally — the breaker
+        // disables one call shape, never the tool.
+        let block = run_once(&agent, &mut state, serde_json::json!({"path": "src"})).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER + 1,
+            "a different input must be dispatched"
+        );
+        let ContentBlock::ToolResult { content, .. } = block else {
+            panic!("expected a tool_result block");
+        };
+        assert!(
+            !content.contains("REPEAT-FAILURE BREAKER"),
+            "a real execution result, not a breaker notice: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_clears_the_failure_count_for_that_shape() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let agent = flaky_agent(Arc::clone(&fail), Arc::clone(&executions)).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Two failures — one below the breaker threshold.
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+
+        // A success on the exact same shape wipes its slate clean.
+        fail.store(false, Ordering::SeqCst);
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+
+        // It now takes K fresh consecutive failures to engage the breaker.
+        fail.store(true, Ordering::SeqCst);
+        for i in 1..=REPEAT_FAILURE_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                3 + i,
+                "post-success failure {i} must still execute"
+            );
+        }
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            3 + REPEAT_FAILURE_BREAKER_AFTER,
+            "breaker re-engages only after K new consecutive failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nudge_rung_fires_before_the_breaker_rung() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(true));
+        let agent = flaky_agent(fail, Arc::clone(&executions)).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // After two identical failures the soft loop-nudge condition is
+        // already met (same tool + args + result twice in a row)…
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert!(
+            detect_tool_call_loop(&state.tool_records),
+            "the soft nudge must get its chance first"
+        );
+
+        // …while the breaker is not: the 3rd identical call still executes —
+        // the post-nudge chance the K = 2 + 1 derivation promises.
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+
+        // Only the 4th is short-circuited.
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
     }
 }
