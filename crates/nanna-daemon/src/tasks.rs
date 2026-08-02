@@ -1959,6 +1959,12 @@ impl AgentStepRunner {
             // usually ONE step.
             cancel: request.cancel.clone(),
             step_kind: Some(request.step_kind),
+            // Task anchor for injected steering texts (breaker notices,
+            // nudges): the live item title keeps a mid-run meta-instruction
+            // reading as an aside within THIS task instead of a conversation
+            // reset. An empty title falls back (inside the loop) to the
+            // step prompt's goal line rather than fabricating a header.
+            task_anchor: Some(request.item_title.clone()).filter(|t| !t.trim().is_empty()),
             initial_active_tools: active,
             restrict_to_active_tools: restrict_to_active,
             is_sub_agent: true,
