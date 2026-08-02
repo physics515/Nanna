@@ -1,12 +1,15 @@
-// Standalone regression test for the explore tool's depth handling.
-// Run with: node test-explore-depth.mjs
+// Standalone regression test for the explore tool's bounded, level-by-level
+// walk. Run with: node test-explore-depth.mjs
 //
-// Recursive Nanna.listDir returns FULL paths (walkdir entry.path()), e.g.
-// "D:\Development\nanna-bench\run-x\tests\test_01.sh". The original tool
-// counted raw path separators against maxDepth, so every entry under a
-// nested root was skipped and explore(".") reported "0 directories, 0
-// files, 0B total". These tests stub Nanna.listDir with the real return
-// shapes and assert non-zero counts and correct depth cutoffs.
+// History: v0.1.x opened with Nanna.listDir(path, true) — a RECURSIVE walk of
+// the whole workspace marshalled into Boa before any depth filtering. On a
+// real monorepo (node_modules/.git/target = hundreds of thousands of entries)
+// every call hit the 30s Boa deadline and returned success=false, which the
+// model retry-looped (observed live 2026-08-02). v0.2.0 walks level-by-level
+// with NON-recursive bounded listDir calls, skips noise dirs, caps visited
+// entries at 1000 (derived from the ~2KB context output budget), and returns
+// structured {content, success:false} on inaccessible roots. These tests stub
+// Nanna.listDir with a per-directory map and assert that contract.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -22,14 +25,37 @@ function loadTool(listDirImpl) {
   return module.exports;
 }
 
-function run(entries, input) {
-  const tool = loadTool(() => entries);
-  return tool.execute(input || {});
+// Stub a filesystem: tree maps directory path -> entry array, keyed exactly
+// as the tool constructs paths (root as given, children as parent + "/" +
+// name). Records every call so tests can assert the walk's shape.
+function makeStub(tree) {
+  const calls = [];
+  const listDir = (path, recursive, max) => {
+    calls.push({ path, recursive, max });
+    if (recursive) {
+      throw new Error("explore must never request a recursive walk");
+    }
+    if (typeof max !== "number" || max < 1) {
+      throw new Error("explore must always pass a positive entry bound, got: " + max);
+    }
+    if (!(path in tree)) {
+      throw new Error("Failed to read directory: " + path);
+    }
+    return tree[path].slice(0, max);
+  };
+  return { listDir, calls };
 }
 
-function summary(output) {
-  const m = output.match(/(\d+) directories, (\d+) files, (\S+) total/);
-  if (!m) throw new Error("no summary line in output:\n" + output);
+function run(tree, input) {
+  const stub = makeStub(tree);
+  const tool = loadTool(stub.listDir);
+  const result = tool.execute(input || {});
+  return { result, calls: stub.calls };
+}
+
+function summary(content) {
+  const m = content.match(/(\d+) directories, (\d+) files, (\S+) total/);
+  if (!m) throw new Error("no summary line in output:\n" + content);
   return { dirs: Number(m[1]), files: Number(m[2]), size: m[3] };
 }
 
@@ -48,104 +74,101 @@ function check(name, actual, expected) {
 const d = (name) => ({ name, entry_type: "dir", size: 0 });
 const f = (name, size) => ({ name, entry_type: "file", size: size ?? 100 });
 
-// 1. The observed live failure: explore(".") over a workspace whose resolved
-// root is several directories deep; listDir returns absolute backslash paths.
+// 1. Default depth 2: root children + their children counted; depth-3 dirs
+// are counted as dirs but never listed.
 {
-  const root = "D:\\Development\\nanna-bench\\run-x";
-  const entries = [d(root + "\\tests")];
-  for (let i = 1; i <= 42; i++) {
-    entries.push(f(root + "\\tests\\test_" + String(i).padStart(2, "0") + ".sh"));
-  }
-  const out = run(entries, { path: "." });
-  check("dot root, absolute backslash returns", summary(out), {
-    dirs: 1,
-    files: 42,
-    size: "4.1KB",
-  });
-  check("dot root counts .sh extension", out.includes(".sh: 42 files"), true);
-}
-
-// 2. Absolute root passed explicitly: prefix strip, depth-3 entry excluded
-// at the default depth of 2.
-{
-  const entries = [
-    d("D:/proj/src"),
-    f("D:/proj/src/main.rs"),
-    d("D:/proj/src/deep"),
-    f("D:/proj/src/deep/excluded.rs"),
-  ];
-  const out = run(entries, { path: "D:/proj" });
-  check("absolute root, default depth cutoff", summary(out), {
-    dirs: 2,
-    files: 1,
-    size: "100B",
-  });
-}
-
-// 3. Same tree, root given with backslashes and a trailing separator.
-{
-  const entries = [
-    d("D:\\proj\\src"),
-    f("D:\\proj\\src\\main.rs"),
-    d("D:\\proj\\src\\deep"),
-    f("D:\\proj\\src\\deep\\excluded.rs"),
-  ];
-  const out = run(entries, { path: "D:\\proj\\" });
-  check("trailing-backslash root", summary(out), {
-    dirs: 2,
-    files: 1,
-    size: "100B",
-  });
-}
-
-// 4. depth: 1 keeps only the root's direct children.
-{
-  const entries = [
-    d("D:/proj/src"),
-    f("D:/proj/top.md"),
-    f("D:/proj/src/main.rs"),
-  ];
-  const out = run(entries, { path: "D:/proj", depth: 1 });
-  check("depth 1 keeps direct children only", summary(out), {
-    dirs: 1,
-    files: 1,
-    size: "100B",
-  });
-}
-
-// 5. Root-relative returns (tolerated even though the current bridge sends
-// absolute paths).
-{
-  const entries = [d("tests"), f("tests/a.sh"), f("tests/b.sh")];
-  const out = run(entries, { path: "." });
-  check("relative returns", summary(out), { dirs: 1, files: 2, size: "200B" });
-}
-
-// 6. Root that doesn't literally prefix the entries (case-mismatched drive
-// letter): falls back to the shallowest-entry baseline instead of skipping
-// everything.
-{
-  const entries = [
-    d("D:/proj/src"),
-    f("D:/proj/src/main.rs"),
-    f("D:/proj/src/deep/excluded.rs"),
-  ];
-  const out = run(entries, { path: "d:/proj" });
-  check("case-mismatched root falls back to baseline", summary(out), {
-    dirs: 1,
-    files: 1,
-    size: "100B",
-  });
-}
-
-// 7. Empty listing still reports inaccessible, not a zero summary.
-{
-  const out = run([], { path: "." });
-  check(
-    "empty listing",
-    out.startsWith("Empty or inaccessible directory"),
-    true
+  const { result, calls } = run(
+    {
+      ".": [d("src"), f("a.md", 100)],
+      "./src": [f("main.rs", 200), d("deep")],
+      "./src/deep": [f("never-listed.rs", 1)],
+    },
+    { path: "." }
   );
+  check("default depth counts", summary(result.content), {
+    dirs: 2,
+    files: 2,
+    size: "300B",
+  });
+  check("depth-3 dir never listed", calls.some((c) => c.path === "./src/deep"), false);
+  check("success flag", result.success, true);
+  check(".rs tallied", result.content.includes(".rs: 1 files"), true);
+}
+
+// 2. depth 1 lists only the root.
+{
+  const { result, calls } = run(
+    {
+      ".": [d("src"), f("top.md")],
+      "./src": [f("main.rs")],
+    },
+    { path: ".", depth: 1 }
+  );
+  check("depth 1 counts", summary(result.content), { dirs: 1, files: 1, size: "100B" });
+  check("depth 1 issues a single listing", calls.length, 1);
+}
+
+// 3. Noise dirs are counted, never descended, and announced.
+{
+  const { result, calls } = run(
+    {
+      ".": [d("node_modules"), d("src"), f("a.rs", 10)],
+      "./src": [f("b.rs", 10)],
+      // "./node_modules" intentionally absent: listing it would throw.
+    },
+    { path: "." }
+  );
+  check("skip counts", summary(result.content), { dirs: 2, files: 2, size: "20B" });
+  check(
+    "node_modules never listed",
+    calls.some((c) => c.path === "./node_modules"),
+    false
+  );
+  check("skip announced", result.content.includes("node_modules"), true);
+  check("skip labelled", result.content.includes("never descended"), true);
+}
+
+// 4. Entry cap: a 1100-entry directory trips the 1000-entry budget, counts
+// are marked partial, and the output says so with narrowing guidance.
+{
+  const big = [];
+  for (let i = 0; i < 1100; i++) big.push(f("f" + i + ".log", 1));
+  const { result, calls } = run({ ".": big }, { path: "." });
+  check("cap trips at 1000", summary(result.content).files, 1000);
+  check("cap announced", result.content.includes("stopped at 1000 entries"), true);
+  check("cap suggests narrowing", result.content.includes("path/depth"), true);
+  check("partial marker", result.content.includes("partial"), true);
+  check("bounded request (budget + 1)", calls[0].max, 1001);
+}
+
+// 5. Inaccessible root returns a STRUCTURED failure, never a throw (thrown
+// script errors reach the model under scary prefixes → retry spirals).
+{
+  const { result } = run({}, { path: "./no-such-dir" });
+  check("failure is structured", result.success, false);
+  check("failure names the path", result.content.includes("no-such-dir"), true);
+  check("failure is instructive", result.content.includes("exists"), true);
+}
+
+// 6. Unreadable SUBdirectory is skipped and announced, not fatal.
+{
+  const { result } = run(
+    {
+      ".": [d("ok"), d("broken"), f("a.txt", 5)],
+      "./ok": [f("b.txt", 5)],
+      // "./broken" absent -> listing throws mid-walk.
+    },
+    { path: "." }
+  );
+  check("subdir failure not fatal", result.success, true);
+  check("subdir failure announced", result.content.includes("could not be read"), true);
+}
+
+// 7. Empty root is an observation, not an error.
+{
+  const { result } = run({ ".": [] }, { path: "." });
+  check("empty dir success", result.success, true);
+  check("empty dir stated", result.content.includes("Empty directory"), true);
 }
 
 if (failures > 0) {

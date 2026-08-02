@@ -1,6 +1,6 @@
 export default {
   name: "explore",
-  version: "0.1.1",
+  version: "0.2.0",
   output: "context",
   description: "Explore a directory and summarize its contents. Provides a quick overview of project structure, file types, and sizes.",
   parameters: {
@@ -12,121 +12,173 @@ export default {
     required: []
   },
   execute: function(input) {
-    var dirPath = input.path || ".";
-    var maxDepth = input.depth || 2;
-
-    var entries = Nanna.listDir(dirPath, true);
-    if (!entries || entries.length === 0) {
-      return "Empty or inaccessible directory: " + dirPath;
+    var dirPath = String(input.path || ".");
+    var maxDepth = parseInt(input.depth, 10);
+    if (!isFinite(maxDepth) || maxDepth < 1) {
+      maxDepth = 2;
     }
 
-    // Recursive listDir returns FULL paths (walkdir entry.path()), not names
-    // relative to the listed root, so depth must be measured against the root.
-    // Counting raw separators would exceed maxDepth for every entry once the
-    // root itself sits a few directories deep.
+    // Entry budget, derived from the output constraint (not a magic cap):
+    // this tool declares output:"context", so its result is inlined into the
+    // model's context and truncated at the boundary around 2KB
+    // (context_result_threshold). A visited entry can only reach that 2KB as
+    // an aggregate count or a listed top-level name, and counts stop being
+    // decision-relevant past 3 significant digits — so once 1000 entries are
+    // tallied, further walking cannot change what the model reads; it only
+    // burns the 30s script deadline (each entry is a per-object Boa marshal,
+    // which is what timed out the old whole-workspace recursive walk).
+    var MAX_ENTRIES = 1000;
 
-    // Normalize the requested root for prefix matching: forward slashes, no
-    // trailing slash, no leading "./". A bare "." resolves daemon-side to the
-    // workdir, whose absolute location this script cannot see, so it yields
-    // no usable prefix.
-    var rootPrefix = String(dirPath).replace(/\\/g, "/");
-    while (rootPrefix.length > 1 && rootPrefix.charAt(rootPrefix.length - 1) === "/") {
-      rootPrefix = rootPrefix.slice(0, rootPrefix.length - 1);
-    }
-    while (rootPrefix.lastIndexOf("./", 0) === 0) {
-      rootPrefix = rootPrefix.slice(2);
-    }
-    if (rootPrefix === "." || rootPrefix === "/") {
-      rootPrefix = "";
-    }
+    // Heavy/noise directories are counted but never descended into — in a
+    // real workspace node_modules/.git/target alone hold hundreds of
+    // thousands of entries. Mirrors the bridge's recursive-walk ignore list.
+    // Every skip is announced in the output.
+    var SKIP_DIRS = [
+      "node_modules", ".git", "target", "dist", "build", ".venv", "venv",
+      "__pycache__", ".next", ".nuxt", ".cache"
+    ];
 
-    var names = [];
-    var i;
-    for (i = 0; i < entries.length; i++) {
-      names.push(String(entries[i].name).replace(/\\/g, "/"));
-    }
+    // Top-level listing bound: of the ~2KB context budget, the fixed
+    // sections (header, counts, file types, notes) use roughly 600B,
+    // leaving ~1400B; at ~35B per name line that is ~40 lines.
+    var MAX_LISTED = 40;
 
-    // Make names root-relative. Strip the root when it literally prefixes
-    // every entry (an absolute root was passed). Otherwise fall back to the
-    // shallowest entry as the depth-1 baseline: the walk always yields the
-    // root's direct children, so the minimum segment count is depth 1. The
-    // baseline covers "." roots, relative roots resolved daemon-side, and
-    // listings that already come back root-relative.
-    var allPrefixed = rootPrefix.length > 0;
-    for (i = 0; allPrefixed && i < names.length; i++) {
-      if (names[i].lastIndexOf(rootPrefix + "/", 0) !== 0) {
-        allPrefixed = false;
-      }
-    }
-
-    var depths = [];
-    if (allPrefixed) {
-      for (i = 0; i < names.length; i++) {
-        names[i] = names[i].slice(rootPrefix.length + 1);
-        depths.push(names[i].split("/").length);
-      }
-    } else {
-      var segCounts = [];
-      var minSegs = -1;
-      for (i = 0; i < names.length; i++) {
-        segCounts.push(names[i].split("/").length);
-        if (minSegs === -1 || segCounts[i] < minSegs) {
-          minSegs = segCounts[i];
-        }
-      }
-      for (i = 0; i < names.length; i++) {
-        depths.push(segCounts[i] - minSegs + 1);
-      }
-    }
-
+    var visited = 0;
+    var capped = false;
     var dirs = 0;
     var files = 0;
     var totalSize = 0;
     var extCounts = {};
+    var skippedCounts = {};
+    var skippedAny = false;
+    var unreadable = 0;
+    var topLevel = [];
 
-    for (i = 0; i < entries.length; i++) {
-      if (depths[i] > maxDepth) continue;
-
-      var e = entries[i];
-      if (e.entry_type === "dir") {
-        dirs++;
-      } else {
-        files++;
-        totalSize += e.size || 0;
-        var base = names[i];
-        var slash = base.lastIndexOf("/");
-        if (slash >= 0) {
-          base = base.slice(slash + 1);
+    // Level-by-level walk with bounded, NON-recursive listings. The FIFO
+    // queue finishes each depth before starting the next, so when the entry
+    // budget trips it is the deepest (least informative) entries that drop.
+    var queue = [{ path: dirPath, depth: 1 }];
+    while (queue.length > 0 && !capped) {
+      var cur = queue.shift();
+      var entries;
+      try {
+        // Request one more than the remaining budget: an overflow-length
+        // return proves the directory holds more than we will visit.
+        entries = Nanna.listDir(cur.path, false, MAX_ENTRIES - visited + 1);
+      } catch (e) {
+        if (cur.depth === 1) {
+          // Root itself is unreadable: structured failure, never a throw
+          // (thrown script errors reach the model under scary prefixes).
+          return {
+            content: "explore failed: cannot list \"" + dirPath + "\": " + String(e) +
+              ". Check that the path exists, is a directory, and is readable.",
+            success: false
+          };
         }
-        var dot = base.lastIndexOf(".");
-        if (dot > 0 && dot < base.length - 1) {
-          var ext = base.slice(dot + 1).toLowerCase();
-          extCounts[ext] = (extCounts[ext] || 0) + 1;
+        unreadable++;
+        continue;
+      }
+
+      for (var i = 0; i < entries.length; i++) {
+        if (visited >= MAX_ENTRIES) {
+          capped = true;
+          break;
+        }
+        visited++;
+        var e = entries[i];
+        var name = String(e.name);
+        var isDir = e.entry_type === "dir";
+        if (isDir) {
+          dirs++;
+          if (SKIP_DIRS.indexOf(name) >= 0) {
+            skippedCounts[name] = (skippedCounts[name] || 0) + 1;
+            skippedAny = true;
+          } else if (cur.depth < maxDepth) {
+            queue.push({ path: cur.path + "/" + name, depth: cur.depth + 1 });
+          }
+        } else {
+          files++;
+          totalSize += e.size || 0;
+          var dot = name.lastIndexOf(".");
+          if (dot > 0 && dot < name.length - 1) {
+            var ext = name.slice(dot + 1).toLowerCase();
+            extCounts[ext] = (extCounts[ext] || 0) + 1;
+          }
+        }
+        if (cur.depth === 1) {
+          topLevel.push(isDir ? name + "/" : name);
         }
       }
     }
 
+    if (visited === 0) {
+      return {
+        content: "# " + dirPath + "\nEmpty directory (0 entries).",
+        success: true
+      };
+    }
+
     var lines = [];
-    lines.push("# " + dirPath);
-    lines.push(dirs + " directories, " + files + " files, " + formatSize(totalSize) + " total");
+    lines.push("# " + dirPath + " (depth " + maxDepth + ")");
+    lines.push(
+      dirs + " directories, " + files + " files, " + formatSize(totalSize) +
+      " total" + (capped ? " (partial — see note below)" : "")
+    );
     lines.push("");
 
-    // Top file types
+    if (topLevel.length > 0) {
+      topLevel.sort(function(a, b) {
+        var aDir = a.charAt(a.length - 1) === "/";
+        var bDir = b.charAt(b.length - 1) === "/";
+        if (aDir !== bDir) return aDir ? -1 : 1;
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
+      lines.push("Top-level:");
+      var shown = topLevel.slice(0, MAX_LISTED);
+      for (var t = 0; t < shown.length; t++) {
+        lines.push("  " + shown[t]);
+      }
+      if (topLevel.length > MAX_LISTED) {
+        lines.push("  ... +" + (topLevel.length - MAX_LISTED) + " more (listing capped to fit the context budget)");
+      }
+      lines.push("");
+    }
+
     var extList = [];
     for (var extName in extCounts) {
       extList.push({ ext: extName, count: extCounts[extName] });
     }
     extList.sort(function(a, b) { return b.count - a.count; });
-
     if (extList.length > 0) {
       lines.push("File types:");
       var top = extList.slice(0, 10);
       for (var j = 0; j < top.length; j++) {
         lines.push("  ." + top[j].ext + ": " + top[j].count + " files");
       }
+      lines.push("");
     }
 
-    return lines.join("\n");
+    if (skippedAny) {
+      var skipParts = [];
+      for (var s = 0; s < SKIP_DIRS.length; s++) {
+        var sk = SKIP_DIRS[s];
+        if (skippedCounts[sk]) {
+          skipParts.push(skippedCounts[sk] > 1 ? sk + " x" + skippedCounts[sk] : sk);
+        }
+      }
+      lines.push("Skipped noise dirs (counted, never descended): " + skipParts.join(", "));
+    }
+    if (unreadable > 0) {
+      lines.push("Note: " + unreadable + " subdirector" + (unreadable === 1 ? "y" : "ies") + " could not be read and were skipped.");
+    }
+    if (capped) {
+      lines.push(
+        "NOTE: stopped at " + MAX_ENTRIES + " entries; counts above cover only the entries visited " +
+        "(shallowest first) and more exist beyond them. Narrow with path/depth for a complete view."
+      );
+    }
+
+    return { content: lines.join("\n"), success: true };
   }
 }
 
