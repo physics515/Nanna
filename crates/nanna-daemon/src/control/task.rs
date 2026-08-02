@@ -391,6 +391,9 @@ impl ControlPlane {
                     agent_config: agent.agent_config().await,
                     system_prompt: self.system_prompt.read().await.clone(),
                     workspace_root,
+                    // Background runs never carried the workspace files; the
+                    // goal names its own work.
+                    workspace_context: None,
                     stats: Some(self.model_stats.clone()),
                     // Background run: no transcript to stream into.
                     chat_sink: None,
