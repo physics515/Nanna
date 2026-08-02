@@ -38,10 +38,11 @@ pub use registry::{
     RegisteredAgent,
 };
 pub use loop_runner::{
-    Agent, AgentConfig, AgentResponse, EmotionalContext, ExtractedMemory, MemoryCallback,
+    Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
+    EmotionalContext, ExtractedMemory, MemoryCallback,
     MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions,
     StepKind, StreamCallback, TaskComplexity, ThinkingCallback, ThinkingMode, ToolCallRecord,
-    wrapup_nudge_due, wrapup_nudge_message,
+    claim_nudge_message, wrapup_nudge_due, wrapup_nudge_message,
 };
 pub use multi::{
     AgentCoordinator, AgentEntry, AgentMessage, BackgroundTask, CriticalPathMetrics,

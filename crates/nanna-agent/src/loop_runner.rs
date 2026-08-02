@@ -1158,6 +1158,51 @@ pub fn wrapup_nudge_message(level: NudgeLevel, iteration: usize) -> String {
     }
 }
 
+/// Ceiling on completion-claim instructions injected per step.
+///
+/// Derivation (a rung, not a cap): one direct instruction plus exactly one
+/// escalation repeat — the same single-repeat standard as the sibling
+/// nudge rungs (each detector injects once; only the late wrap-up ladder
+/// escalates further, and it stays available above this rung). If the
+/// model ignores the instruction twice, more copies are noise: the step
+/// then ends through the existing steps_without_progress → replan →
+/// abandon ladder, which this rung exists to make REACHABLE faster for
+/// claim-failure, never to replace. Nothing here stops the loop.
+pub const CLAIM_NUDGES_MAX: usize = 2;
+
+/// Iterations of continued tool churn after the first claim instruction
+/// before the one escalation repeat is injected.
+///
+/// Derivation (the loop-nudge cadence, not a magic number): the loop-nudge
+/// rung directly below this one ([`detect_tool_call_loop`]) needs two
+/// consecutive identical records — two churn iterations — to conclude a
+/// steer is being ignored. The claim instruction is held to the same
+/// evidence standard: two full post-instruction iterations that still call
+/// tools instead of claiming prove it was ignored, and only then does the
+/// single repeat fire.
+pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
+
+/// The direct completion-claim instruction — the rung above the tool-loop
+/// nudge on the escalation ladder.
+///
+/// Observed live 2026-08-02 (gemma4:12b, two independent probes): the model
+/// COMPLETED the step's real work (write_file + read_file succeeded,
+/// artifact verified on disk) but never emitted the `TASK COMPLETE` claim
+/// the harness verdicts on, so steps_without_progress climbed through
+/// replans until an external cancel at 20 minutes. Small local models lose
+/// the claim protocol from the system prompt under context churn
+/// (qwen3.5:9b emits it; gemma4:12b does not). This instruction re-teaches
+/// the protocol at the moment it is needed; it only PROMPTS the claim — the
+/// harness acceptance flow still judges it, so nothing here can fabricate
+/// success.
+#[must_use]
+pub const fn claim_nudge_message() -> &'static str {
+    "[SYSTEM] You have already executed successful write/exec work this step. \
+     If the task's goal is met, STOP calling tools and reply now: state your \
+     final answer and end with TASK COMPLETE on its own line. Only continue \
+     with tools if something specific is missing — name it first."
+}
+
 /// Detect repetitive text by checking if the same line appears multiple times.
 /// Returns `true` if significant repetition is found.
 fn detect_repetition(text: &str) -> bool {
@@ -2336,6 +2381,15 @@ impl Agent {
                 }
             }
 
+            // Direct completion-claim rung: work is done, tools keep coming,
+            // the claim never does — teach the claim protocol directly.
+            // Evaluated BEFORE the loop-nudge detector below on purpose: on
+            // the iteration the loop nudge first fires this still sees
+            // `tool_loop_nudged == false`, so the model always gets one full
+            // post-loop-nudge attempt before this rung engages — the same
+            // 2 + 1 derivation as the sibling breakers.
+            self.maybe_inject_claim_nudge(&mut state, &options).await;
+
             // Tool-call loop detector (P14): same tool + same args + same
             // result twice in a row means the model is grinding, not
             // progressing. Small models loop; this is cheap to detect and
@@ -2393,6 +2447,76 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Direct completion-claim rung — the rung above the tool-loop nudge on
+    /// the escalation ladder. Injects [`claim_nudge_message`] when ALL of:
+    ///
+    /// - (a) this run holds at least one SUCCESSFUL side-effectful tool call
+    ///   ([`is_work_evidence_tool`]) — evidence the step's real work happened;
+    /// - (b) the tool-loop nudge already fired this step and got its full
+    ///   post-nudge attempt (call-site ordering guarantees the attempt);
+    /// - (c) the model is still issuing tool calls (the call site is the
+    ///   tool-calls branch) without the `TASK COMPLETE` claim the harness
+    ///   verdicts on ([`crate::harness::step_claims_completion`]).
+    ///
+    /// Fires at most [`CLAIM_NUDGES_MAX`] times per step; the repeat only
+    /// after [`CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS`] more churn iterations
+    /// prove the first instruction was ignored. Harness step runs only
+    /// (`step_kind` set): the claim protocol does not exist in plain or
+    /// mission-mode runs (mission mode has its own contract and prods).
+    ///
+    /// Out-of-band by construction (the PR #145 pattern): the instruction
+    /// joins the model context as a user-role message and never touches
+    /// `on_text` or accumulated text, so it cannot leak into the persisted
+    /// chat reply. It only PROMPTS the claim — the harness acceptance flow
+    /// (`step_claims_completion`, false_success_claims) judges it unchanged.
+    /// Returns whether an instruction was injected.
+    async fn maybe_inject_claim_nudge(&self, state: &mut RunState, options: &RunOptions) -> bool {
+        if options.step_kind.is_none() || options.mission_mode {
+            return false;
+        }
+        // (b) — the softer rung gets its chance first.
+        if !state.tool_loop_nudged {
+            return false;
+        }
+        // (c) — the latest text already claims completion: the model found
+        // the protocol on its own; prompting again would be noise.
+        if crate::harness::step_claims_completion(&state.final_text) {
+            return false;
+        }
+        // (a) — no successful side-effectful work yet means the grind is not
+        // a claim failure; the loop nudge and breakers own that case.
+        if !state
+            .tool_records
+            .iter()
+            .any(|r| r.success && is_work_evidence_tool(&r.name))
+        {
+            return false;
+        }
+        match state.claim_nudge_count {
+            0 => {}
+            1 => {
+                let since = state.iterations.saturating_sub(state.claim_nudge_iteration);
+                if since < CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS {
+                    return false;
+                }
+            }
+            // CLAIM_NUDGES_MAX reached: the steps_without_progress → replan →
+            // abandon ladder is the authority from here.
+            _ => return false,
+        }
+        state.claim_nudge_count += 1;
+        state.claim_nudge_iteration = state.iterations;
+        warn!(
+            iteration = state.iterations,
+            claim_nudges = state.claim_nudge_count,
+            "🏁 Successful work but no completion claim — injecting claim instruction"
+        );
+        let nudge = AnthropicMessage::user_text(claim_nudge_message());
+        let mut ctx = self.context.write().await;
+        ctx.messages.push(nudge);
+        true
     }
 
     async fn add_user_message_with_budget(&self, message: &str, options: &RunOptions) {
@@ -4648,6 +4772,13 @@ struct RunState {
     thinking_spiral_detected: bool,
     /// Whether we've already injected a tool-call-loop nudge (only once)
     tool_loop_nudged: bool,
+    /// Completion-claim rung: direct claim instructions injected this step
+    /// (bounded by [`CLAIM_NUDGES_MAX`] — one instruction + one repeat).
+    claim_nudge_count: usize,
+    /// Iteration at which the last claim instruction was injected; the
+    /// escalation repeat waits [`CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS`] more
+    /// churn iterations before concluding the first was ignored.
+    claim_nudge_iteration: usize,
     /// Sibling-breaker bookkeeping per exact call shape
     /// ([`repeat_call_key`]): consecutive failures (repeat-failure breaker)
     /// and consecutive byte-identical successes (zero-information breaker)
@@ -4707,6 +4838,8 @@ impl RunState {
             thinking_spiral_nudged: false,
             thinking_spiral_detected: false,
             tool_loop_nudged: false,
+            claim_nudge_count: 0,
+            claim_nudge_iteration: 0,
             repeat_calls: HashMap::new(),
             budget_warned: false,
             wrapup_nudge_count: 0,
@@ -4868,6 +5001,26 @@ fn is_write_tool(name: &str) -> bool {
         name,
         "write_file" | "write" | "Write" | "create_tool" | "file_buffer"
     )
+}
+
+/// Tools whose SUCCESSFUL execution is evidence of real side-effectful work
+/// — the set the completion-claim rung accepts as proof the step actually
+/// did something.
+///
+/// Derived from the existing write classification rather than an
+/// independent list: [`is_write_tool`] names every file-writing tool (the
+/// same set the skill-side write-guard/ratchet protects), extended by the
+/// in-place editor and the shell — the two other tools the ratchet guards
+/// (the exec skill refuses clobbering redirects to ratchet-protected files
+/// precisely because both change the world). Read/search/list calls can
+/// succeed forever without changing anything outside the context window,
+/// so they are never claim evidence.
+fn is_work_evidence_tool(name: &str) -> bool {
+    is_write_tool(name)
+        || matches!(
+            name,
+            "edit_file" | "edit" | "Edit" | "exec" | "bash" | "Bash"
+        )
 }
 
 #[cfg(test)]
@@ -5978,5 +6131,243 @@ mod zero_info_breaker_tests {
         // Only the 4th is short-circuited.
         run_once(&agent, &mut state, input).await;
         assert_eq!(executions.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod claim_nudge_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn agent() -> Agent {
+        // Never contacted: `maybe_inject_claim_nudge` is driven directly on a
+        // mock RunState — no LLM round trip, no tool dispatch.
+        let tools = Arc::new(ToolRegistry::new());
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(AgentConfig::default(), llm, tools)
+    }
+
+    fn record(name: &str, success: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "t".to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+            output: "ok".to_string(),
+            success,
+            duration_ms: 1,
+        }
+    }
+
+    /// A RunState in the observed live shape (gemma4:12b, 2026-08-02): the
+    /// real work SUCCEEDED, the loop nudge already fired, and the latest
+    /// text still has no claim — all of (a) + (b) + (c).
+    fn eligible_state() -> RunState {
+        let mut state = RunState::new();
+        state.tool_records.push(record("write_file", true));
+        state.tool_loop_nudged = true;
+        state.final_text = "Now let me check the file again.".to_string();
+        state.iterations = 10;
+        state
+    }
+
+    fn step_options() -> RunOptions {
+        RunOptions {
+            step_kind: Some(StepKind::Execute),
+            ..RunOptions::default()
+        }
+    }
+
+    #[test]
+    fn work_evidence_is_the_side_effect_set() {
+        // The write classification (write-guard/ratchet protected) plus the
+        // in-place editor and the shell — success there changes the world.
+        for name in [
+            "write_file",
+            "write",
+            "Write",
+            "file_buffer",
+            "create_tool",
+            "edit_file",
+            "edit",
+            "Edit",
+            "exec",
+            "bash",
+            "Bash",
+        ] {
+            assert!(is_work_evidence_tool(name), "{name} must count as work evidence");
+        }
+        // Reads/searches can succeed forever without changing anything.
+        for name in [
+            "read_file",
+            "read",
+            "explore",
+            "code_search",
+            "list_dir",
+            "recall",
+            "discover_tools",
+            "web_search",
+        ] {
+            assert!(!is_work_evidence_tool(name), "{name} must NOT count as work evidence");
+        }
+    }
+
+    #[test]
+    fn the_instruction_announces_the_claim_protocol() {
+        let msg = claim_nudge_message();
+        assert!(msg.contains("TASK COMPLETE on its own line"));
+        assert!(msg.contains("STOP calling tools"));
+        // It prompts the claim conditionally — it never asserts completion.
+        assert!(msg.contains("If the task's goal is met"));
+        assert!(msg.contains("name it first"));
+    }
+
+    #[tokio::test]
+    async fn fires_only_when_all_three_conditions_hold() {
+        // All of (a) + (b) + (c): fires.
+        let a = agent();
+        let mut state = eligible_state();
+        assert!(a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+
+        // (a) missing — only read successes: the grind is not claim failure.
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_records = vec![record("read_file", true), record("explore", true)];
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+
+        // (a) missing — the side-effectful call FAILED: failure is not work
+        // evidence, prompting a claim on it would invite a false success.
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_records = vec![record("write_file", false)];
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+
+        // (b) missing — the softer loop-nudge rung has not fired yet.
+        let a = agent();
+        let mut state = eligible_state();
+        state.tool_loop_nudged = false;
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+
+        // (c) missing — the latest text already claims completion.
+        let a = agent();
+        let mut state = eligible_state();
+        state.final_text = "wrote it\nTASK COMPLETE".to_string();
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &step_options()).await);
+    }
+
+    #[tokio::test]
+    async fn only_harness_step_runs_get_the_instruction() {
+        // No step_kind: the claim protocol does not exist in this run.
+        let a = agent();
+        let mut state = eligible_state();
+        assert!(
+            !a.maybe_inject_claim_nudge(&mut state, &RunOptions::default())
+                .await
+        );
+
+        // Mission mode has its own contract (MISSION COMPLETE) and prods.
+        let a = agent();
+        let mut state = eligible_state();
+        let options = RunOptions {
+            step_kind: Some(StepKind::Execute),
+            mission_mode: true,
+            ..RunOptions::default()
+        };
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &options).await);
+    }
+
+    #[tokio::test]
+    async fn injection_is_out_of_band_and_never_streams() {
+        let streamed = Arc::new(StdMutex::new(String::new()));
+        let sink = Arc::clone(&streamed);
+        let options = RunOptions {
+            step_kind: Some(StepKind::Execute),
+            on_text: Some(Box::new(move |chunk: &str| {
+                sink.lock().unwrap().push_str(chunk);
+            })),
+            ..RunOptions::default()
+        };
+
+        let a = agent();
+        let mut state = eligible_state();
+        let before = a.context.read().await.messages.len();
+        assert!(a.maybe_inject_claim_nudge(&mut state, &options).await);
+
+        // The instruction reached the model context as a user-role message…
+        let ctx = a.context.read().await;
+        assert_eq!(ctx.messages.len(), before + 1);
+        let last =
+            serde_json::to_string(ctx.messages.last().expect("injected message")).unwrap();
+        assert!(last.contains("TASK COMPLETE on its own line"), "got: {last}");
+        assert!(last.contains("\"user\""), "steering is user-role, got: {last}");
+
+        // …and NOTHING went through on_text (PR #145: an echoed marker once
+        // became the persisted chat reply).
+        assert!(
+            streamed.lock().unwrap().is_empty(),
+            "nudge must not stream to the user"
+        );
+        // Nor did it touch the run's accumulated/final text.
+        assert!(!state.final_text.contains("TASK COMPLETE"));
+        assert!(state.streamed_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fires_at_most_twice_with_churn_between() {
+        let a = agent();
+        let mut state = eligible_state();
+        let options = step_options();
+
+        // First instruction fires immediately once (a)+(b)+(c) hold.
+        assert!(a.maybe_inject_claim_nudge(&mut state, &options).await);
+        assert_eq!(state.claim_nudge_count, 1);
+
+        // Same iteration and the next one: the model has not had the
+        // loop-nudge-cadence worth of churn to ignore it yet.
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &options).await);
+        state.iterations += 1;
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &options).await);
+
+        // After CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS churn iterations the one
+        // escalation repeat fires.
+        state.iterations += 1;
+        assert!(a.maybe_inject_claim_nudge(&mut state, &options).await);
+        assert_eq!(state.claim_nudge_count, CLAIM_NUDGES_MAX);
+
+        // And never a third, however long the churn continues — from here
+        // the steps_without_progress → replan → abandon ladder is the
+        // authority.
+        state.iterations += 100;
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &options).await);
+        assert_eq!(state.claim_nudge_count, CLAIM_NUDGES_MAX);
+
+        // Exactly two instructions reached the context.
+        let ctx = a.context.read().await;
+        let injected = ctx
+            .messages
+            .iter()
+            .filter(|m| {
+                serde_json::to_string(m)
+                    .unwrap()
+                    .contains("TASK COMPLETE on its own line")
+            })
+            .count();
+        assert_eq!(injected, CLAIM_NUDGES_MAX);
+    }
+
+    #[tokio::test]
+    async fn a_claim_after_the_first_instruction_silences_the_repeat() {
+        let a = agent();
+        let mut state = eligible_state();
+        let options = step_options();
+
+        assert!(a.maybe_inject_claim_nudge(&mut state, &options).await);
+
+        // The model obeys: its next text carries the claim. However much
+        // churn follows, the rung stays quiet — it prompts the claim, it
+        // never nags past one.
+        state.final_text = "All done.\nTASK COMPLETE".to_string();
+        state.iterations += CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS + 5;
+        assert!(!a.maybe_inject_claim_nudge(&mut state, &options).await);
+        assert_eq!(state.claim_nudge_count, 1);
     }
 }
