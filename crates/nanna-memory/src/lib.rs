@@ -389,11 +389,18 @@ impl VectorStore {
 
     /// Add a memory entry.
     ///
+    /// An EMPTY active embedding is legal: it is the queued-for-backfill state
+    /// ([`MemoryEntry::embedding`] documents it) that a write racing a provider
+    /// switch lands in — the entry is kept, unsearchable until backfill embeds
+    /// it under the current binding. Only a non-empty vector claims to be
+    /// searchable, so only that is held to the bound width.
+    ///
     /// # Errors
     ///
-    /// Returns `MemoryError::DimensionMismatch` if the embedding dimension is wrong.
+    /// Returns `MemoryError::DimensionMismatch` if a non-empty embedding has
+    /// the wrong dimension.
     pub async fn add(&self, mut entry: MemoryEntry) -> Result<(), MemoryError> {
-        if entry.embedding.len() != self.config.get_dimension() {
+        if !entry.embedding.is_empty() && entry.embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
                 expected: self.config.get_dimension(),
                 got: entry.embedding.len(),
@@ -478,7 +485,15 @@ impl VectorStore {
         // See: docs/benchmarks/gpu-vs-simd-analysis.md
         const GPU_THRESHOLD: usize = 50_000;
 
-        let similarities: Vec<f32> = if entry_count >= GPU_THRESHOLD && self.has_gpu() {
+        // The GPU path flattens every embedding into one width-uniform buffer,
+        // so a single stale or queued-for-backfill row (empty vector after a
+        // rebind, old width after a provider switch) would misalign the whole
+        // batch. Those rows can exist by design; when any is present, take the
+        // SIMD path, which scores them at the stale floor row-by-row.
+        let similarities: Vec<f32> = if entry_count >= GPU_THRESHOLD
+            && self.has_gpu()
+            && entries.iter().all(|e| e.embedding.len() == query.len())
+        {
             // GPU path: batch all vectors together
             debug!("Using GPU for {} vectors (above {} threshold)", entry_count, GPU_THRESHOLD);
             let gpu = self.gpu.as_ref().unwrap();
@@ -502,11 +517,14 @@ impl VectorStore {
                 }
             }
         } else {
-            // SIMD path — fast for all practical memory store sizes
+            // SIMD path — fast for all practical memory store sizes.
+            // `cosine_or_stale`, not the raw cosine: the raw kernel asserts
+            // equal widths and this profile aborts on panic, so one stale or
+            // queued row would take the daemon down mid-search.
             debug!("Using SIMD ({}) for {} vectors", nanna_simd::simd_tier(), entry_count);
             entries
                 .iter()
-                .map(|entry| cosine_similarity_f32(&query, &entry.embedding))
+                .map(|entry| Self::cosine_or_stale(&query, &entry.embedding))
                 .collect()
         };
 
@@ -693,19 +711,31 @@ impl VectorStore {
     /// separately. Persists the full updated entry (upsert) so the durable
     /// content and embedding never diverge from the in-memory cache.
     ///
+    /// `model` names the binding that produced `embedding`. Rewriting content
+    /// invalidates EVERY previously computed vector for this entry, so the
+    /// bucket map is reset to just the incoming vector — leaving other models'
+    /// buckets in place would let a later rebind resurrect a vector for text
+    /// that no longer exists.
+    ///
+    /// An empty `embedding` is the queued-for-backfill state (same convention
+    /// as [`Self::add`]): the content lands, the vectors are cleared, and the
+    /// entry is unsearchable until backfill re-embeds it under the current
+    /// binding.
+    ///
     /// # Errors
     ///
-    /// Returns `DimensionMismatch` if `embedding` has the wrong dimension, or
-    /// `NotFound` if no entry has the given `id`.
+    /// Returns `DimensionMismatch` if a non-empty `embedding` has the wrong
+    /// dimension, or `NotFound` if no entry has the given `id`.
     pub async fn update_content_and_embedding(
         &self,
         id: &str,
         content: &str,
         mut embedding: Vec<f32>,
+        model: Option<&str>,
     ) -> Result<(), MemoryError> {
         debug_assert!(!id.is_empty(), "memory id must not be empty");
         debug_assert!(!content.is_empty(), "merged content must not be empty");
-        if embedding.len() != self.config.get_dimension() {
+        if !embedding.is_empty() && embedding.len() != self.config.get_dimension() {
             return Err(MemoryError::DimensionMismatch {
                 expected: self.config.get_dimension(),
                 got: embedding.len(),
@@ -722,6 +752,15 @@ impl VectorStore {
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
         entry.content = content.to_string();
+        entry.embeddings.clear();
+        if embedding.is_empty() {
+            entry.embedding_model = None;
+        } else {
+            entry.embedding_model = model.map(str::to_string);
+            if let Some(model) = model {
+                entry.embeddings.insert(model.to_string(), embedding.clone());
+            }
+        }
         entry.embedding = embedding;
         let snapshot = entry.clone();
         drop(entries);
@@ -920,6 +959,13 @@ impl VectorStore {
 
     /// Record `embedding` as `model`'s vector for `id`, activating it when
     /// `model` is the one currently bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DimensionMismatch` when `activate` is set and the vector does
+    /// not match the bound width — an activated vector goes straight into the
+    /// search path, so this is the last gate against a backfill racing a
+    /// provider switch.
     pub async fn set_embedding_for_model(
         &self,
         id: &str,
@@ -927,6 +973,12 @@ impl VectorStore {
         embedding: Vec<f32>,
         activate: bool,
     ) -> Result<(), MemoryError> {
+        if activate && embedding.len() != self.config.get_dimension() {
+            return Err(MemoryError::DimensionMismatch {
+                expected: self.config.get_dimension(),
+                got: embedding.len(),
+            });
+        }
         let mut entries = self.entries.write().await;
         let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
             return Err(MemoryError::NotFound(id.to_string()));
@@ -1387,5 +1439,97 @@ mod tests {
 
         assert_eq!(memory.len(), 3);  // Trimmed to max
         assert_eq!(memory.messages[0].role, "assistant");  // First message was trimmed
+    }
+
+    /// The queued-for-backfill state must be writable: an entry whose vector
+    /// raced a provider switch arrives with an empty embedding, and rejecting
+    /// it (the old `0 != dim` mismatch) is exactly the write-failure loop the
+    /// incident produced.
+    #[tokio::test]
+    async fn add_accepts_a_queued_entry_awaiting_backfill() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        });
+        let mut queued = entry_dim8("queued");
+        queued.embedding = Vec::new();
+        store.add(queued).await.expect("a queued entry is a legal write");
+
+        // A non-empty wrong-width vector is still a hard error — only the
+        // explicit queued state is exempt from the width gate.
+        let mut wrong = entry_dim8("wrong");
+        wrong.embedding = vec![0.5; 3];
+        let err = store.add(wrong).await.expect_err("wrong width still rejected");
+        assert!(matches!(err, MemoryError::DimensionMismatch { expected: 8, got: 3 }));
+    }
+
+    /// A queued row in the store must be skipped by search, not panic it: the
+    /// raw SIMD cosine asserts equal widths and this crate aborts on panic, so
+    /// before the fix one queued row took the daemon down on the next recall.
+    #[tokio::test]
+    async fn search_skips_queued_rows_instead_of_panicking() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        });
+        let good = MemoryEntry {
+            embedding: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..entry_dim8("good")
+        };
+        store.add(good).await.unwrap();
+        let mut queued = entry_dim8("queued");
+        queued.embedding = Vec::new();
+        store.add(queued).await.unwrap();
+
+        let results = store
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .await;
+        assert_eq!(results.len(), 2, "both rows are ranked");
+        assert_eq!(results[0].0.id, "good");
+        assert!(results[0].1 > 0.99);
+        assert!(
+            results[1].1 <= -1.0 + f32::EPSILON,
+            "the queued row scores at the stale floor, below any min_score"
+        );
+    }
+
+    /// Rewriting content invalidates every previously computed vector, so the
+    /// bucket map must reset to just the producing model's — a later rebind
+    /// must never resurrect a vector for text that no longer exists.
+    #[tokio::test]
+    async fn update_content_and_embedding_resets_stale_buckets() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            use_f16: false,
+        });
+        let mut entry = entry_dim8("m");
+        entry.embedding_model = Some("prov:a".into());
+        entry.embeddings.insert("prov:a".into(), vec![0.0; 8]);
+        entry.embeddings.insert("prov:old".into(), vec![0.0; 4]);
+        store.add(entry).await.unwrap();
+
+        store
+            .update_content_and_embedding("m", "rewritten", vec![1.0; 8], Some("prov:a"))
+            .await
+            .unwrap();
+        let updated = store.get("m").await.unwrap();
+        assert_eq!(updated.content, "rewritten");
+        assert_eq!(updated.embedding_model.as_deref(), Some("prov:a"));
+        assert_eq!(
+            updated.embeddings.keys().collect::<Vec<_>>(),
+            vec!["prov:a"],
+            "only the producing model's bucket survives a rewrite"
+        );
+
+        // The queued form of the same rewrite: content lands, vectors clear.
+        store
+            .update_content_and_embedding("m", "rewritten again", Vec::new(), None)
+            .await
+            .unwrap();
+        let queued = store.get("m").await.unwrap();
+        assert_eq!(queued.content, "rewritten again");
+        assert!(queued.embedding.is_empty(), "queued for backfill");
+        assert!(queued.embeddings.is_empty());
+        assert_eq!(queued.embedding_model, None);
     }
 }

@@ -11,7 +11,6 @@ use crate::{
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -61,10 +60,16 @@ pub struct MemoryService {
     /// model identity is unsound, because two models of equal width produce
     /// vectors that compare happily and mean nothing. The daemon owns the
     /// router and stamps the name here on every switch.
+    ///
+    /// This lock is ALSO the binding lock for the expected dimension: the
+    /// store's width latch only ever changes while the write half is held
+    /// ([`Self::rebind_embeddings`], [`Self::probe_and_align_dimension`]), so a
+    /// reader holding the read half sees `(model, width)` as one consistent
+    /// pair. The failover incident this encodes: the router switched 2048→768
+    /// and rebound the model, but the width latch stayed at 2048 — every write
+    /// for the next several minutes failed `DimensionMismatch` while the log
+    /// said the store had been rebound.
     active_embedding_model: RwLock<Option<String>>,
-    /// Runtime dimension — updated atomically when probe detects a change.
-    /// This allows `probe_and_align_dimension` to work on `&self` (behind Arc).
-    runtime_dimension: AtomicUsize,
 }
 
 impl MemoryService {
@@ -75,7 +80,6 @@ impl MemoryService {
             dimension: std::sync::atomic::AtomicUsize::new(config.dimension),
             use_f16: true,
         };
-        let dim = config.dimension;
         Self {
             config,
             store: VectorStore::new(store_config),
@@ -83,7 +87,6 @@ impl MemoryService {
             pending_updates: RwLock::new(Vec::new()),
             min_score_override: RwLock::new(None),
             active_embedding_model: RwLock::new(None),
-            runtime_dimension: AtomicUsize::new(dim),
         }
     }
 
@@ -158,18 +161,22 @@ impl MemoryService {
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
 
         let actual_dim = test_embedding.len();
-        let expected_dim = self.runtime_dimension.load(Ordering::Relaxed);
+        // Take the binding lock AFTER the embed call returns (never across the
+        // await — the daemon's embed_fn rebinds on a provider switch and would
+        // deadlock), so the width correction cannot tear a rebind in half.
+        let binding = self.active_embedding_model.write().await;
+        let expected_dim = self.store.dimension();
         if actual_dim == expected_dim {
             info!("Embedding dimension confirmed: {}", actual_dim);
         } else {
             warn!(
-                "Embedding model returns {} dims, expected {}. Reconfiguring and re-embedding.",
+                "Embedding model returns {} dims, expected {}. Reconfiguring; mismatched \
+                 entries will be backfilled.",
                 actual_dim, expected_dim
             );
-            self.runtime_dimension.store(actual_dim, Ordering::Relaxed);
-            // Also update the VectorStore's dimension so add() accepts the new size
             self.store.set_dimension(actual_dim);
         }
+        drop(binding);
 
         // Vector repair is NOT done here any more — `rebind_embeddings` plus
         // `backfill_embeddings` own it. This function's only remaining job is to
@@ -188,9 +195,13 @@ impl MemoryService {
 
     /// Get the current embedding dimension (may differ from initial config
     /// if the embedding model changed at runtime).
+    ///
+    /// Delegates to the store's latch — the ONE width every write is checked
+    /// against. A second copy here is exactly what went stale in the failover
+    /// incident, so there isn't one.
     #[must_use]
     pub fn dimension(&self) -> usize {
-        self.runtime_dimension.load(Ordering::Relaxed)
+        self.store.dimension()
     }
 
     /// Get FSRS parameters
@@ -199,23 +210,34 @@ impl MemoryService {
         &self.config.fsrs
     }
 
-    /// Switch the store onto `model`, reusing every bucket already computed for
-    /// it and reporting how many entries still need one.
+    /// Switch the store onto `model` at `dimension`, reusing every bucket
+    /// already computed for it and reporting how many entries still need one.
     ///
     /// This replaces re-embedding on provider switch. Providers flap — a
     /// rate-limited primary fails over and is back on the next call — and
     /// re-embedding the whole store in each direction made a flap cost two full
     /// passes over every memory. Buckets make the return trip free.
-    pub async fn rebind_embeddings(&self, model: &str) -> (usize, usize) {
-        self.set_active_embedding_model(Some(model.to_string())).await;
+    ///
+    /// Model and dimension move as ONE binding, under one lock. The 2026-08-02
+    /// failover left them split: the model rebound 2048→768 but the width latch
+    /// did not, so every subsequent write failed `DimensionMismatch` until a
+    /// restart. `dimension` is the width of the vector the new provider just
+    /// produced — the caller always has one in hand, because a switch is only
+    /// ever observed on a successful embed.
+    pub async fn rebind_embeddings(&self, model: &str, dimension: usize) -> (usize, usize) {
+        assert!(dimension > 0, "a provider that produced a vector has a positive width");
+        let mut binding = self.active_embedding_model.write().await;
+        *binding = Some(model.to_string());
+        self.store.set_dimension(dimension);
         let (rebound, missing) = self.store.rebind_to_model(model).await;
+        drop(binding);
         if missing > 0 {
             info!(
-                "Rebound {rebound} memories to '{model}'; {missing} awaiting backfill \
-                 (they are unsearchable until then, not lost)"
+                "Rebound {rebound} memories to '{model}' ({dimension} dims); {missing} awaiting \
+                 backfill (they are unsearchable until then, not lost)"
             );
         } else {
-            info!("Rebound {rebound} memories to '{model}' — nothing to backfill");
+            info!("Rebound {rebound} memories to '{model}' ({dimension} dims) — nothing to backfill");
         }
         (rebound, missing)
     }
@@ -233,25 +255,37 @@ impl MemoryService {
     /// Returns `MemoryError` if no embedding provider is configured.
     pub async fn backfill_embeddings(&self, model: &str, batch: usize) -> Result<usize, MemoryError> {
         let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
+
+        // The embed_fn produces vectors from whatever provider is CURRENTLY
+        // active — so filling `model`'s bucket is only sound while `model` IS
+        // the active binding. Filling any other bucket from here poisons it
+        // with another model's vectors (wrong space, usually wrong width).
+        // Not hypothetical: the startup backfill kept "completing" a dead
+        // primary's bucket with fallback vectors after a mid-run failover.
+        if self.active_embedding_model().await.as_deref() != Some(model) {
+            debug!("Backfill for '{model}' skipped — it is not the active binding");
+            return Ok(0);
+        }
         let pending = self.store.entries_missing_model(model, batch).await;
         if pending.is_empty() {
             return Ok(0);
         }
 
-        let active = self.active_embedding_model().await.as_deref() == Some(model);
         let mut filled = 0usize;
         for (id, content) in pending {
-            // A provider switch mid-backfill makes the rest of this batch belong
-            // to the wrong model. Stop and let the next pass pick up the new one.
-            if self.active_embedding_model().await.as_deref() != Some(model) && active {
-                debug!("Backfill for '{model}' abandoned — provider changed underneath it");
-                break;
-            }
             match (embed_fn)(&content).await {
                 Ok(embedding) => {
+                    // Re-check AFTER the embed, not before it: a provider
+                    // switch lands inside the embed call (the daemon's
+                    // embed_fn rebinds before returning), and the vector in
+                    // hand then belongs to the new provider, not `model`.
+                    if self.active_embedding_model().await.as_deref() != Some(model) {
+                        debug!("Backfill for '{model}' abandoned — provider changed underneath it");
+                        break;
+                    }
                     if let Err(e) = self
                         .store
-                        .set_embedding_for_model(&id, model, embedding, active)
+                        .set_embedding_for_model(&id, model, embedding, true)
                         .await
                     {
                         debug!("Backfill could not store embedding for {id}: {e}");
@@ -274,14 +308,20 @@ impl MemoryService {
         Ok(filled)
     }
 
-    /// Name the embedding model now in use, so writes are bucketed under it.
-    pub async fn set_active_embedding_model(&self, model: Option<String>) {
-        *self.active_embedding_model.write().await = model;
-    }
-
     /// Identity of the embedding model currently in use, if the daemon has said.
     pub async fn active_embedding_model(&self) -> Option<String> {
         self.active_embedding_model.read().await.clone()
+    }
+
+    /// The current binding as one consistent `(model, dimension)` pair.
+    ///
+    /// The width latch only moves under the model write-lock, so reading it
+    /// while holding the read half cannot observe a torn (new model, old
+    /// width) state — which is precisely the split-brain this exists to
+    /// prevent.
+    pub async fn active_binding(&self) -> (Option<String>, usize) {
+        let model = self.active_embedding_model.read().await;
+        (model.clone(), self.store.dimension())
     }
 
     /// Get the minimum similarity score threshold for recall
@@ -368,12 +408,14 @@ impl MemoryService {
 
         // Create new memory
         let id = uuid::Uuid::new_v4().to_string();
-        let active_model = self.active_embedding_model().await;
+        let (active_model, bound_dim) = self.active_binding().await;
+        let (embedding_model, embedding, embeddings) =
+            resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
-            embedding_model: active_model.clone(),
-            embeddings: embedding_buckets(active_model.as_deref(), &embedding),
+            embedding_model,
+            embeddings,
             embedding,
             metadata,
             timestamp: chrono_timestamp(),
@@ -414,10 +456,43 @@ impl MemoryService {
         let merged_embedding = (embed_fn)(&merged)
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-        self.store
-            .update_content_and_embedding(existing_id, &merged, merged_embedding)
+        self.rewrite_with_binding(existing_id, &merged, merged_embedding)
             .await?;
         Ok(true)
+    }
+
+    /// Rewrite `id` to `content` with `embedding`, resolved against the
+    /// CURRENT binding: a vector whose width no longer matches (the provider
+    /// switched while it was being computed) is discarded and the entry queued
+    /// for backfill instead of failing the rewrite — the merged content must
+    /// land either way. Returns the vector actually stored (empty when
+    /// queued), so callers can keep in-memory copies in step.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::NotFound` if no entry has the given `id`.
+    async fn rewrite_with_binding(
+        &self,
+        id: &str,
+        content: &str,
+        embedding: Vec<f32>,
+    ) -> Result<Vec<f32>, MemoryError> {
+        let (model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.store
+                .update_content_and_embedding(id, content, embedding.clone(), model.as_deref())
+                .await?;
+            return Ok(embedding);
+        }
+        info!(
+            "Rewrite of {id} raced a provider switch ({} dims vs bound {bound_dim}) — \
+             content updated, vector queued for backfill",
+            embedding.len()
+        );
+        self.store
+            .update_content_and_embedding(id, content, Vec::new(), None)
+            .await?;
+        Ok(Vec::new())
     }
 
     /// Remember something - store with embedding.
@@ -550,12 +625,14 @@ impl MemoryService {
         // Normalize importance from 1-5 scale to 0.5-1.5 multiplier
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
         
-        let active_model = self.active_embedding_model().await;
+        let (active_model, bound_dim) = self.active_binding().await;
+        let (embedding_model, embedding, embeddings) =
+            resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
-            embedding_model: active_model.clone(),
-            embeddings: embedding_buckets(active_model.as_deref(), &embedding),
+            embedding_model,
+            embeddings,
             embedding,
             metadata: metadata.clone(),
             timestamp: chrono_timestamp(),
@@ -687,12 +764,14 @@ impl MemoryService {
         let mut fsrs = FsrsState::new();
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
 
-        let active_model = self.active_embedding_model().await;
+        let (active_model, bound_dim) = self.active_binding().await;
+        let (embedding_model, embedding, embeddings) =
+            resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
             id: id.clone(),
             content: content.to_string(),
-            embedding_model: active_model.clone(),
-            embeddings: embedding_buckets(active_model.as_deref(), &embedding),
+            embedding_model,
+            embeddings,
             embedding,
             metadata,
             timestamp: chrono_timestamp(),
@@ -1493,10 +1572,10 @@ impl MemoryService {
             let embedding = (embed_fn)(merged)
                 .await
                 .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-            self.store
-                .update_content_and_embedding(&survivor.id, merged, embedding.clone())
-                .await?;
-            Some(embedding)
+            // Empty when the rewrite raced a provider switch and queued for
+            // backfill — the caller's copy must reflect that, not the stale
+            // vector.
+            Some(self.rewrite_with_binding(&survivor.id, merged, embedding).await?)
         };
 
         let inherited_importance = survivor.fsrs.importance.max(source.fsrs.importance);
@@ -1603,8 +1682,7 @@ impl MemoryService {
             let embedding = (embed_fn)(&expanded)
                 .await
                 .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-            self.store
-                .update_content_and_embedding(&memory.id, &expanded, embedding)
+            self.rewrite_with_binding(&memory.id, &expanded, embedding)
                 .await?;
             debug!("Expanded memory {}: {} -> {} chars", memory.id, memory.content.len(), expanded.len());
         }
@@ -1757,13 +1835,40 @@ fn find_duplicate_target(survivors: &[MemoryEntry], candidate: &MemoryEntry) -> 
 /// the material dreaming exists to narrate into a throughline. Durable facts
 /// are the ones drift protection is for, so the two are treated differently at
 /// high weight.
+/// Active vector, model stamp, and bucket map for a fresh entry, resolved
+/// against the CURRENT binding.
+///
+/// A vector whose width differs from the binding's was produced under a
+/// binding that changed while the write was in flight (provider failover
+/// mid-call). It cannot be kept: as the active vector it would fail the
+/// store's width gate, and bucketed under the new model it would poison that
+/// bucket with another model's space. So the vector is discarded and the
+/// entry QUEUED — empty active vector, no buckets — for backfill under the
+/// current binding. The write always lands; losing a vector costs temporary
+/// searchability, losing the write cost the memory (the 2026-08-02 incident
+/// WARN-failed every write for minutes).
+///
+/// Pure so the race policy is testable without a store.
 #[must_use]
-fn embedding_buckets(model: Option<&str>, embedding: &[f32]) -> HashMap<String, Vec<f32>> {
-    let mut buckets = HashMap::new();
-    if let Some(model) = model {
-        buckets.insert(model.to_string(), embedding.to_vec());
+fn resolve_entry_vectors(
+    model: Option<String>,
+    bound_dim: usize,
+    embedding: Vec<f32>,
+) -> (Option<String>, Vec<f32>, HashMap<String, Vec<f32>>) {
+    if embedding.len() != bound_dim {
+        info!(
+            "Embedding width {} does not match the current binding ({} dims) — \
+             entry queued for backfill instead of failing the write",
+            embedding.len(),
+            bound_dim
+        );
+        return (None, Vec::new(), HashMap::new());
     }
-    buckets
+    let mut buckets = HashMap::new();
+    if let Some(ref model) = model {
+        buckets.insert(model.clone(), embedding.clone());
+    }
+    (model, embedding, buckets)
 }
 
 fn is_episodic_memory(entry: &MemoryEntry) -> bool {
@@ -1797,6 +1902,7 @@ fn merge_memory_content(existing: &str, incoming: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_memory_service_no_embed() {
@@ -2445,5 +2551,169 @@ mod tests {
         let merged = service.get(&id1).await.expect("memory still present");
         assert!(merged.content.contains("sky is blue"));
         assert!(merged.content.contains("deep blue"));
+    }
+
+    /// An embed stub whose vector width is switchable mid-test — the shape of
+    /// a provider failover as the service sees it.
+    fn switchable_width_embed(width: &Arc<AtomicUsize>) -> EmbedFn {
+        let width = width.clone();
+        Arc::new(move |_text: &str| {
+            let n = width.load(Ordering::SeqCst);
+            Box::pin(async move { Ok(vec![0.5_f32; n]) })
+        })
+    }
+
+    /// The 2026-08-02 incident: the router failed over 2048→768 and rebound
+    /// the model, but the width latch stayed at 2048 — every write after the
+    /// switch failed "Embedding dimension mismatch" for minutes. The binding
+    /// is one pair now: after a rebind the write path must accept the new
+    /// width, and the pre-switch entries must flow back in through backfill.
+    #[tokio::test]
+    async fn dimension_follows_a_provider_switch() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let config = MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(switchable_width_embed(&width));
+
+        service.rebind_embeddings("prov:a", 4).await;
+        let (first_id, _) = service
+            .remember_with_importance("the harbor light was green", HashMap::new(), 3.0)
+            .await
+            .expect("write under the first binding");
+
+        // Failover: the fallback provider embeds at width 8.
+        width.store(8, Ordering::SeqCst);
+        service.rebind_embeddings("prov:b", 8).await;
+        assert_eq!(service.dimension(), 8, "the width latch moved with the model");
+
+        let (second_id, _) = service
+            .remember_with_importance("the tide table was wrong", HashMap::new(), 3.0)
+            .await
+            .expect("a write AFTER the switch must store at the new width, not error");
+        let second = service.store.get(&second_id).await.expect("stored");
+        assert_eq!(second.embedding.len(), 8);
+        assert_eq!(second.embedding_model.as_deref(), Some("prov:b"));
+
+        // The pre-switch entry has no bucket for prov:b: unsearchable, not
+        // lost — and backfill (targeting the CURRENT binding) completes it.
+        let first = service.store.get(&first_id).await.expect("still present");
+        assert!(first.embedding.is_empty(), "awaiting backfill after the rebind");
+        let filled = service
+            .backfill_embeddings("prov:b", 16)
+            .await
+            .expect("backfill runs");
+        assert_eq!(filled, 1);
+        let first = service.store.get(&first_id).await.expect("still present");
+        assert_eq!(first.embedding.len(), 8, "re-embedded under the new binding");
+        assert_eq!(first.embedding_model.as_deref(), Some("prov:b"));
+    }
+
+    /// A write whose embed call itself carries the switch (the daemon's
+    /// embed_fn rebinds before returning) hands back a vector of the OLD
+    /// width. That write must land as a queued-for-backfill entry — never
+    /// error, which is what produced the per-write WARN loop.
+    #[tokio::test]
+    async fn a_write_racing_the_switch_queues_for_backfill() {
+        let cell: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let flip = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let width = Arc::new(AtomicUsize::new(4));
+        let cell_for_fn = cell.clone();
+        let flip_for_fn = flip.clone();
+        let width_for_fn = width.clone();
+        let embed: EmbedFn = Arc::new(move |_text: &str| {
+            let cell = cell_for_fn.clone();
+            let flip = flip_for_fn.clone();
+            let width = width_for_fn.clone();
+            Box::pin(async move {
+                if flip.swap(false, Ordering::SeqCst) {
+                    // The failover lands INSIDE the embed call, like the
+                    // daemon's embed_fn rebinding before it returns — every
+                    // LATER embed comes from the new provider at width 8…
+                    let service = cell.get().expect("service registered").clone();
+                    service.rebind_embeddings("prov:b", 8).await;
+                    width.store(8, Ordering::SeqCst);
+                    // …but THIS call's vector was produced at the old width.
+                    return Ok(vec![0.5_f32; 4]);
+                }
+                Ok(vec![0.5_f32; width.load(Ordering::SeqCst)])
+            })
+        });
+        let config = MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        };
+        let service = Arc::new(MemoryService::new(config).with_embed_fn(embed));
+        assert!(cell.set(service.clone()).is_ok(), "first set");
+        service.rebind_embeddings("prov:a", 4).await;
+
+        flip.store(true, Ordering::SeqCst);
+        let (id, action) = service
+            .remember_with_importance("the ferry left early", HashMap::new(), 3.0)
+            .await
+            .expect("a write racing the switch must land, not fail");
+        assert!(matches!(action, IngestAction::Create));
+
+        let entry = service.store.get(&id).await.expect("the write landed");
+        assert!(entry.embedding.is_empty(), "the stale vector was not stored");
+        assert!(entry.embeddings.is_empty(), "no bucket poisoned with it either");
+
+        // Backfill under the new binding makes it searchable again.
+        let filled = service
+            .backfill_embeddings("prov:b", 16)
+            .await
+            .expect("backfill runs");
+        assert_eq!(filled, 1);
+        let entry = service.store.get(&id).await.expect("still present");
+        assert_eq!(entry.embedding.len(), 8);
+    }
+
+    /// The post-switch corruption from the incident log: "Backfilled N
+    /// embeddings for 'openrouter:…'" AFTER the router had moved to ollama —
+    /// the drain kept filling the dead provider's bucket with the new
+    /// provider's vectors. Backfill must refuse a binding that is not active.
+    #[tokio::test]
+    async fn backfill_refuses_a_binding_that_is_not_active() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let config = MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        };
+        let service = MemoryService::new(config).with_embed_fn(switchable_width_embed(&width));
+
+        // Written before any binding was stamped: no bucket at all, so it is
+        // pending for whichever model binds next.
+        let (id, _) = service
+            .remember_with_importance("the anchor chain rattled", HashMap::new(), 3.0)
+            .await
+            .expect("write");
+        service.rebind_embeddings("prov:a", 4).await;
+
+        // Provider fails over before the drain for prov:a gets there.
+        width.store(8, Ordering::SeqCst);
+        service.rebind_embeddings("prov:b", 8).await;
+
+        let filled = service
+            .backfill_embeddings("prov:a", 16)
+            .await
+            .expect("the call itself succeeds");
+        assert_eq!(filled, 0, "a non-active binding must not be filled");
+        let entry = service.store.get(&id).await.expect("present");
+        assert!(
+            !entry.embeddings.contains_key("prov:a"),
+            "the dead binding's bucket was not poisoned with the new provider's vectors"
+        );
+
+        // The ACTIVE binding drains normally.
+        let filled = service
+            .backfill_embeddings("prov:b", 16)
+            .await
+            .expect("backfill runs");
+        assert_eq!(filled, 1);
+        let entry = service.store.get(&id).await.expect("present");
+        assert_eq!(entry.embedding.len(), 8);
+        assert_eq!(entry.embedding_model.as_deref(), Some("prov:b"));
     }
 }
