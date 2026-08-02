@@ -1110,6 +1110,25 @@ fn scheduled_consolidation_config(
     .with_summarizer_context_window(summarizer_context_window_tokens)
 }
 
+/// Fill `model`'s missing embeddings in bounded batches until the store is
+/// complete for it, the provider stalls, or the binding moves on — the service
+/// refuses to fill a bucket that is not the active binding, so a stale drain
+/// exits on its next pass instead of poisoning a dead provider's bucket.
+async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
+    // 64 per pass: small enough that a provider switch mid-drain is noticed
+    // within one batch, large enough to amortize the per-pass pending scan.
+    const BATCH: usize = 64;
+    loop {
+        match mem.backfill_embeddings(model, BATCH).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Backfill for '{model}' halted: {e}");
+                break;
+            }
+        }
+    }
+}
 
 /// The main daemon server
 pub struct DaemonServer {
@@ -1148,7 +1167,7 @@ impl DaemonServer {
     ///
     /// A failure here is **not** fatal — see the call site.
     async fn probe_embedding_dimension(router: &EmbeddingRouter) -> Result<usize, String> {
-        let (embedding, _provider_changed) = router.embed_one("dimension probe").await?;
+        let (embedding, _switched_to) = router.embed_one("dimension probe").await?;
         if embedding.is_empty() {
             return Err("embedding provider returned an empty vector".to_string());
         }
@@ -2337,10 +2356,7 @@ impl DaemonServer {
                     let embed_router = Arc::new(embed_router);
 
                     // Create embedding function that routes through the EmbeddingRouter.
-                    // Tracks the router generation to detect provider switches.
                     let router_for_fn = embed_router.clone();
-                    let last_generation =
-                        Arc::new(std::sync::atomic::AtomicU64::new(embed_router.generation()));
                     // Placeholder for memory service — set after construction via lazy init
                     let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
                         Arc::new(tokio::sync::OnceCell::new());
@@ -2349,84 +2365,56 @@ impl DaemonServer {
                     let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
                         let router = router_for_fn.clone();
                         let text = text.to_string();
-                        let gen_tracker = last_generation.clone();
                         let mem_cell = mem_cell_for_fn.clone();
                         Box::pin(async move {
-                            let (embedding, provider_changed) = router.embed_one(&text).await?;
+                            let (embedding, switched_to) = router.embed_one(&text).await?;
 
-                            // If the provider changed, check if we need to re-embed
-                            if provider_changed {
-                                let new_gen = router.generation();
-                                let old_gen =
-                                    gen_tracker.swap(new_gen, std::sync::atomic::Ordering::Relaxed);
-                                if new_gen != old_gen {
-                                    // Provider switched — realign the store BEFORE
-                                    // this write is allowed to land.
-                                    //
-                                    // This used to `tokio::spawn` the probe and
-                                    // return immediately, so the write that
-                                    // detected the switch — and every write
-                                    // racing it — went into a store still full
-                                    // of the previous provider's vectors. Two
-                                    // widths then coexisted, which is not a
-                                    // degraded search but a broken one: the
-                                    // comparison either asserts or, at equal
-                                    // widths from different models, silently
-                                    // returns nonsense.
-                                    //
-                                    // A width change means everything must be
-                                    // re-embedded, and the only safe moment is
-                                    // before the next write. It costs a stall.
-                                    // That is what it costs.
-                                    //
-                                    // The `swap` above is the stampede guard:
-                                    // it is atomic, so exactly one caller
-                                    // observes the change and does the work.
-                                    if let Some(mem) = mem_cell.get() {
-                                        let model = router.active_provider().await.to_string();
-                                        tracing::info!(
-                                            "Embedding provider changed (gen {} → {}) — rebinding \
-                                             the store to '{}'",
-                                            old_gen,
-                                            new_gen,
-                                            model
-                                        );
+                            // Provider switched — realign the store BEFORE this
+                            // write is allowed to land, so it validates against
+                            // the new binding rather than the dead provider's.
+                            //
+                            // The router reports the switch to exactly ONE
+                            // caller (the one whose call flipped the live
+                            // active index), so this is stampede-safe without
+                            // any generation bookkeeping here. And the vector
+                            // in hand came from `switched_to` itself, so
+                            // `(model, embedding.len())` is a consistent pair
+                            // by construction — reading the active provider
+                            // back from the router here could race a second
+                            // switch and rebind the store to a torn
+                            // (new model, old width) state. That torn state is
+                            // the 2026-08-02 incident: model rebound, width
+                            // latch stale, every write failing
+                            // "expected 2048, got 768" for minutes.
+                            if let Some(provider) = switched_to
+                                && let Some(mem) = mem_cell.get()
+                            {
+                                let model = provider.to_string();
+                                tracing::info!(
+                                    "Embedding provider changed — rebinding the store to \
+                                     '{}' ({} dims)",
+                                    model,
+                                    embedding.len()
+                                );
 
-                                        // Rebinding is a hash lookup per entry:
-                                        // no network, no re-embed, and a switch
-                                        // BACK to a model used earlier is free
-                                        // because its bucket was retained.
-                                        let (_, missing) = mem.rebind_embeddings(&model).await;
+                                // Rebinding is a hash lookup per entry: no
+                                // network, no re-embed, and a switch BACK to a
+                                // model used earlier is free because its bucket
+                                // was retained.
+                                let (_, missing) =
+                                    mem.rebind_embeddings(&model, embedding.len()).await;
 
-                                        // Whatever this model has never embedded
-                                        // gets filled in lazily, in bounded
-                                        // passes, while the run continues. It
-                                        // must not be done inline: the store can
-                                        // hold thousands of entries and the
-                                        // provider we just failed over to may be
-                                        // the rate-limited one.
-                                        if missing > 0 {
-                                            let mem = mem.clone();
-                                            tokio::spawn(async move {
-                                                const BATCH: usize = 64;
-                                                loop {
-                                                    match mem
-                                                        .backfill_embeddings(&model, BATCH)
-                                                        .await
-                                                    {
-                                                        Ok(0) => break,
-                                                        Ok(_) => {}
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                "Backfill for '{model}' halted: {e}"
-                                                            );
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
+                                // Whatever this model has never embedded gets
+                                // filled in lazily, in bounded passes, while
+                                // the run continues. It must not be done
+                                // inline: the store can hold thousands of
+                                // entries and the provider we just failed over
+                                // to may be the rate-limited one.
+                                if missing > 0 {
+                                    let mem = mem.clone();
+                                    tokio::spawn(async move {
+                                        drain_backfill(&mem, &model).await;
+                                    });
                                 }
                             }
 
@@ -2593,19 +2581,13 @@ impl DaemonServer {
                         let bind_model = embed_router.active_provider().await.to_string();
                         let memory_for_bind = memory_arc.clone();
                         tokio::spawn(async move {
-                            let (_, missing) = memory_for_bind.rebind_embeddings(&bind_model).await;
+                            // The probed (or seeded) dimension travels WITH the
+                            // model — the binding is one pair, never two
+                            // independently-updated latches.
+                            let (_, missing) =
+                                memory_for_bind.rebind_embeddings(&bind_model, dimension).await;
                             if missing > 0 {
-                                const BATCH: usize = 64;
-                                loop {
-                                    match memory_for_bind.backfill_embeddings(&bind_model, BATCH).await {
-                                        Ok(0) => break,
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            warn!("Startup backfill for '{bind_model}' halted: {e}");
-                                            break;
-                                        }
-                                    }
-                                }
+                                drain_backfill(&memory_for_bind, &bind_model).await;
                             }
                         });
                         tokio::spawn(async move {
@@ -2619,6 +2601,15 @@ impl DaemonServer {
                                         info!(
                                             "Embedding dimension corrected: {dimension} → {actual_dim} for model {model_name}"
                                         );
+                                        // Writes that landed under the stale
+                                        // width were queued for backfill, not
+                                        // failed — drain them now that the
+                                        // binding is honest.
+                                        if let Some(model) =
+                                            memory_for_probe.active_embedding_model().await
+                                        {
+                                            drain_backfill(&memory_for_probe, &model).await;
+                                        }
                                     }
                                 }
                                 Err(e) => {
