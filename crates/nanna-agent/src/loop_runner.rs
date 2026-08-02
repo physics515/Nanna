@@ -476,38 +476,110 @@ fn detect_tool_call_loop(records: &[ToolCallRecord]) -> bool {
 /// provably-broken call shape is disabled; everything else runs unbounded.
 const REPEAT_FAILURE_BREAKER_AFTER: usize = 3;
 
-/// Byte bound on the error text replayed inside a breaker notice.
+/// Consecutive byte-identical SUCCESSFUL results of one exact call shape
+/// (tool name + canonicalized input) after which the zero-information
+/// breaker engages: further identical calls short-circuit before dispatch
+/// with a notice replaying the result the model already has.
+///
+/// Derivation (the same ladder rung as [`REPEAT_FAILURE_BREAKER_AFTER`], not
+/// a magic cap): [`detect_tool_call_loop`] needs two identical consecutive
+/// records to fire, so the soft loop nudge is injected immediately after the
+/// 2nd identical result. The breaker sits exactly one rung above that nudge —
+/// the model gets one full post-nudge attempt (the 3rd call), and only when
+/// that too returns byte-identical output, proving the soft steer changed
+/// nothing, does the hard breaker engage on the 4th attempt.
+/// 2 (nudge trigger) + 1 (post-nudge chance) = 3.
+///
+/// Observed live 2026-08-02 (ollama/gemma4:12b, daemon session 423e4f0e):
+/// with its actual task already complete and verified on disk, the model
+/// called `explore` 57 times and `discover_tools` 32 times — every call
+/// SUCCEEDED with essentially the same content, so the repeat-FAILURE
+/// breaker stayed silent, the loop nudge fired and was ignored, and the run
+/// ground through replans on a finished item for 15+ minutes until it was
+/// cancelled externally. Success is not progress when it carries zero new
+/// information. This is NOT an iteration cap — only the one provably
+/// information-free call shape is paused; everything else runs unbounded.
+///
+/// Deliberate trade (run health over poll convenience): a legitimate
+/// unchanged-poll loop — an identical read waiting for external change —
+/// trips this after 3 identical results. The notice explicitly tells the
+/// model the result is UNCHANGED, which for a poll IS the information,
+/// delivered at zero cost; a poll that must keep running has to vary its
+/// arguments (e.g. a cursor or attempt counter) or use a different mechanism.
+const ZERO_INFO_BREAKER_AFTER: usize = 3;
+
+/// Byte bound on the text replayed inside a breaker notice — the last error
+/// (repeat-failure breaker) or the last identical result (zero-information
+/// breaker).
 ///
 /// Derivation: the notice is re-injected into context on EVERY
-/// short-circuited call, and the full error already reached the model each of
-/// the [`REPEAT_FAILURE_BREAKER_AFTER`] times the call actually ran — the
-/// replay is a reminder, not the primary delivery. 2000 bytes is the floor of
-/// the dynamic `context_result_threshold` (`(max_tokens * 2).clamp(2000,
-/// 32000)`): the largest size guaranteed to reach context untouched for every
-/// model size, so the notice itself can never trip the summarization or
-/// compression machinery.
-const BREAKER_ERROR_REPLAY_MAX_BYTES: usize = 2000;
+/// short-circuited call, and the full text already reached the model each of
+/// the K times the call actually ran — the replay is a reminder, not the
+/// primary delivery. 2000 bytes is the floor of the dynamic
+/// `context_result_threshold` (`(max_tokens * 2).clamp(2000, 32000)`): the
+/// largest size guaranteed to reach context untouched for every model size,
+/// so the notice itself can never trip the summarization or compression
+/// machinery.
+const BREAKER_REPLAY_MAX_BYTES: usize = 2000;
 
-/// Per-key consecutive-failure bookkeeping for the repeat-failure breaker.
+/// Per-key bookkeeping shared by the two repetition breakers: the
+/// repeat-FAILURE breaker (identical calls that keep failing) and the
+/// zero-information breaker (identical calls that keep succeeding with
+/// byte-identical output). The two are siblings on the same
+/// [`repeat_call_key`]: a success resets the failure streak and a failure
+/// resets the success-identity streak, so their state lives adjacent in one
+/// struct per call shape.
 #[derive(Debug, Clone, Default)]
-struct RepeatFailure {
+struct RepeatCallState {
     /// Consecutive failures of this exact call shape (cleared by any success).
-    count: usize,
+    failure_count: usize,
     /// Error text of the most recent real failure, replayed (bounded) in the
-    /// breaker notice so the model sees WHY the call shape is disabled.
+    /// failure-breaker notice so the model sees WHY the call shape is disabled.
     last_error: String,
+    /// Consecutive successes of this exact call shape whose result content
+    /// hashed identically (cleared by any failure; reset to 1 by a success
+    /// with a new hash — a poll that observes change is untouched).
+    identical_success_count: usize,
+    /// Hash of the last successful result's content bytes
+    /// ([`result_content_hash`]). `None` until a success is observed, and
+    /// after any failure.
+    last_success_hash: Option<u64>,
+    /// Bounded excerpt of the last successful result, replayed in the
+    /// zero-information notice. Bounded at STORAGE time (unlike `last_error`,
+    /// which errors keep small on their own): successful tool results can be
+    /// arbitrarily large, this lives in per-run state for the whole run, and
+    /// the notice replays at most [`BREAKER_REPLAY_MAX_BYTES`] anyway.
+    last_success_excerpt: String,
+    /// Full byte length of the last successful result, so the notice can
+    /// announce when the replayed excerpt is a cut.
+    last_success_len: usize,
 }
 
 /// Canonical repetition key for a tool call: name + canonicalized input JSON.
+/// Shared by both sibling breakers ([`RepeatCallState`]).
 ///
 /// Object keys are sorted recursively because JSON object member order
 /// carries no meaning — `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same call
-/// and must share one failure count. Array order is preserved: it IS
+/// and must share one bookkeeping entry. Array order is preserved: it IS
 /// meaningful. The unit separator (U+001F) joins name and input; it cannot
 /// appear in a tool name, so no (name, input) pair can collide with a
 /// differently-split one.
-fn repeat_failure_key(name: &str, input: &Value) -> String {
+fn repeat_call_key(name: &str, input: &Value) -> String {
     format!("{name}\u{1f}{}", canonical_json(input))
+}
+
+/// Hash a tool result's content bytes for the zero-information breaker's
+/// identical-result comparison.
+///
+/// `std`'s `DefaultHasher` (SipHash-1-3): no new dependency, and per-run
+/// in-process comparison needs no cross-process stability. A collision would
+/// make one CHANGED result read as unchanged (~2⁻⁶⁴ per comparison) — the
+/// cost would be a breaker notice one result early, not data loss.
+fn result_content_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.as_bytes().hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Serialize a JSON value with recursively sorted object keys.
@@ -550,7 +622,7 @@ fn canonical_json(v: &Value) -> String {
 /// the last error replayed), and WHAT TO DO instead (change arguments or
 /// tool; only this exact shape is disabled).
 fn repeat_failure_breaker_notice(name: &str, failures: usize, last_error: &str) -> String {
-    let end = truncate_boundary(last_error, BREAKER_ERROR_REPLAY_MAX_BYTES);
+    let end = truncate_boundary(last_error, BREAKER_REPLAY_MAX_BYTES);
     let replay = if end < last_error.len() {
         format!(
             "{}… [error text truncated for replay — the full error was already shown each \
@@ -568,6 +640,47 @@ fn repeat_failure_breaker_notice(name: &str, failures: usize, last_error: &str) 
          the rest of this run — it now fails instantly instead of re-running a known \
          failure. Change the arguments or use a different tool: `{name}` itself still \
          works, and any call with different arguments executes normally."
+    )
+}
+
+/// Render the zero-information breaker's short-circuit notice.
+///
+/// Structured notice — RETURNED to the model as a normal `{content,
+/// success: false}` tool result, never thrown — and it announces itself
+/// (project rule: notices announce themselves): WHAT happened (the call was
+/// not executed), WHY (the last K executions all succeeded with
+/// byte-identical results — zero new information), the result it already has
+/// (bounded replay, cut announced), and WHAT TO DO instead (act on it,
+/// change the arguments, or change tools).
+///
+/// Poll caveat — deliberate trade for run health: an identical read waiting
+/// for external change trips this after K identical results. The notice
+/// explicitly says the result is UNCHANGED, which for a poll IS the
+/// information, delivered here at zero cost; a poll that must keep running
+/// has to vary its arguments (e.g. a cursor) or use another mechanism.
+///
+/// `excerpt` is the storage-time-bounded replay text; `full_len` is the byte
+/// length of the original result, so a cut can announce itself.
+fn zero_info_breaker_notice(name: &str, repeats: usize, excerpt: &str, full_len: usize) -> String {
+    let replay = if excerpt.len() < full_len {
+        format!(
+            "{excerpt}… [result truncated for replay — the full result was already shown \
+             each time the call actually ran; the operation itself SUCCEEDED]"
+        )
+    } else {
+        excerpt.to_string()
+    };
+    format!(
+        "[ZERO-INFORMATION BREAKER] This call was NOT executed. `{name}` with these exact \
+         arguments already succeeded {repeats} times in a row in this run with a \
+         byte-identical result every time — repeating it yields zero new information. \
+         The result is UNCHANGED; if you were polling for a change, this unchanged result \
+         IS your answer, delivered without re-running the call. The result you already \
+         have:\n{replay}\n\
+         Act on the result you already have, change the arguments (e.g. a cursor, offset, \
+         or different target), or use a different tool; this exact call is paused for the \
+         rest of this run unless its arguments change. `{name}` itself still works, and \
+         any call with different arguments executes normally."
     )
 }
 
@@ -2227,11 +2340,13 @@ impl Agent {
             // result twice in a row means the model is grinding, not
             // progressing. Small models loop; this is cheap to detect and
             // expensive to ignore. This soft nudge is the FIRST rung of the
-            // repetition ladder; when the calls are also FAILING and the
-            // nudge changes nothing, the repeat-failure breaker in
-            // `execute_tools` engages one rung above it
-            // (REPEAT_FAILURE_BREAKER_AFTER) and short-circuits further
-            // identical calls without executing them.
+            // repetition ladder; when the nudge changes nothing, the sibling
+            // breakers in `execute_tools` engage one rung above it and
+            // short-circuit further identical calls without executing them:
+            // the repeat-failure breaker (REPEAT_FAILURE_BREAKER_AFTER) for
+            // calls that keep failing identically, the zero-information
+            // breaker (ZERO_INFO_BREAKER_AFTER) for calls that keep
+            // succeeding with byte-identical results.
             if !state.tool_loop_nudged && detect_tool_call_loop(&state.tool_records) {
                 state.tool_loop_nudged = true;
                 warn!(
@@ -2760,28 +2875,55 @@ impl Agent {
             ));
         }
 
-        // Phase 1.5: repeat-failure breaker — one rung above the tool-call-loop
+        // Phase 1.5: the sibling breakers — one rung above the tool-call-loop
         // nudge. A call shape that has already failed REPEAT_FAILURE_BREAKER_AFTER
         // times in a row is provably broken: executing it again costs real time
         // (observed live 2026-08-02: 30 s per identical failing explore{}) and
-        // cannot succeed, and small models ignore the soft nudge. Such calls
-        // short-circuit to an instant structured failure. Decided HERE, before
-        // dispatch, because the bookkeeping lives on `state`, which the parallel
-        // execution futures below cannot touch.
+        // cannot succeed. A call shape that has already SUCCEEDED
+        // ZERO_INFO_BREAKER_AFTER times in a row with byte-identical output is
+        // provably information-free: executing it again cannot teach the model
+        // anything it does not already have (observed live 2026-08-02: explore
+        // ×57 + discover_tools ×32, all succeeding identically, wedging a
+        // finished run for 15+ minutes). Small models ignore the soft nudge in
+        // both cases, so such calls short-circuit to an instant structured
+        // notice. Decided HERE, before dispatch, because the bookkeeping lives
+        // on `state`, which the parallel execution futures below cannot touch.
+        // The two arms are mutually exclusive per key: each streak resets the
+        // other, so at most one can be at threshold.
         let breaker_notices: Vec<Option<String>> = tool_calls_with_meta
             .iter()
             .map(|(_, name, input, _)| {
-                let key = repeat_failure_key(name, input);
-                state.repeat_failures.get(&key).and_then(|f| {
-                    (f.count >= REPEAT_FAILURE_BREAKER_AFTER).then(|| {
+                let key = repeat_call_key(name, input);
+                state.repeat_calls.get(&key).and_then(|entry| {
+                    if entry.failure_count >= REPEAT_FAILURE_BREAKER_AFTER {
                         warn!(
                             tool = %name,
-                            consecutive_failures = f.count,
+                            consecutive_failures = entry.failure_count,
                             "⛔ Repeat-failure breaker: identical call already failed \
                              repeatedly — short-circuiting without execution"
                         );
-                        repeat_failure_breaker_notice(name, f.count, &f.last_error)
-                    })
+                        Some(repeat_failure_breaker_notice(
+                            name,
+                            entry.failure_count,
+                            &entry.last_error,
+                        ))
+                    } else if entry.identical_success_count >= ZERO_INFO_BREAKER_AFTER {
+                        warn!(
+                            tool = %name,
+                            identical_successes = entry.identical_success_count,
+                            "⛔ Zero-information breaker: identical call already \
+                             succeeded repeatedly with byte-identical results — \
+                             short-circuiting without execution"
+                        );
+                        Some(zero_info_breaker_notice(
+                            name,
+                            entry.identical_success_count,
+                            &entry.last_success_excerpt,
+                            entry.last_success_len,
+                        ))
+                    } else {
+                        None
+                    }
                 })
             })
             .collect();
@@ -2800,8 +2942,8 @@ impl Agent {
                 let breaker_notice = breaker_notice.clone();
                 let tools = Arc::clone(&self.tools);
                 async move {
-                    // Short-circuited by the repeat-failure breaker: the
-                    // structured failure is RETURNED instantly (never thrown);
+                    // Short-circuited by one of the sibling breakers: the
+                    // structured notice is RETURNED instantly (never thrown);
                     // the tool is not dispatched at all — zero seconds spent.
                     if let Some(notice) = breaker_notice {
                         let response = ToolResponse {
@@ -2965,17 +3107,40 @@ impl Agent {
                 duration_ms,
             });
 
-            // Repeat-failure breaker bookkeeping. A short-circuited call never
-            // ran, so it neither extends nor clears anything — only real
-            // executions count. A success on the exact shape wipes its slate
-            // clean; a different input is a different key and is untouched.
+            // Sibling-breaker bookkeeping. A short-circuited call never ran,
+            // so it neither extends nor clears anything — only real executions
+            // count. A different input is a different key and is untouched.
+            // The two streaks reset each other: a success wipes the failure
+            // streak, a failure wipes the success-identity streak — an
+            // ALTERNATING call is making some kind of progress and trips
+            // neither breaker.
             if !short_circuited {
-                let key = repeat_failure_key(&name, &input);
+                let key = repeat_call_key(&name, &input);
+                let entry = state.repeat_calls.entry(key).or_default();
                 if response.result.success {
-                    state.repeat_failures.remove(&key);
+                    entry.failure_count = 0;
+                    entry.last_error.clear();
+                    let hash = result_content_hash(&response.result.content);
+                    if entry.last_success_hash == Some(hash) {
+                        entry.identical_success_count += 1;
+                    } else {
+                        // A DIFFERENT result restarts the streak at 1 — a
+                        // poll that observes change is untouched.
+                        entry.identical_success_count = 1;
+                        entry.last_success_hash = Some(hash);
+                        let end = truncate_boundary(
+                            &response.result.content,
+                            BREAKER_REPLAY_MAX_BYTES,
+                        );
+                        entry.last_success_excerpt = response.result.content[..end].to_string();
+                        entry.last_success_len = response.result.content.len();
+                    }
                 } else {
-                    let entry = state.repeat_failures.entry(key).or_default();
-                    entry.count += 1;
+                    entry.identical_success_count = 0;
+                    entry.last_success_hash = None;
+                    entry.last_success_excerpt.clear();
+                    entry.last_success_len = 0;
+                    entry.failure_count += 1;
                     entry.last_error = response
                         .result
                         .error
@@ -4483,12 +4648,15 @@ struct RunState {
     thinking_spiral_detected: bool,
     /// Whether we've already injected a tool-call-loop nudge (only once)
     tool_loop_nudged: bool,
-    /// Repeat-failure breaker bookkeeping: consecutive failures per exact
-    /// call shape ([`repeat_failure_key`]). Shares the repetition machinery's
-    /// home with the loop-nudge detector above it on the escalation ladder:
-    /// nudge after 2 identical results, breaker after
-    /// [`REPEAT_FAILURE_BREAKER_AFTER`] identical failures.
-    repeat_failures: HashMap<String, RepeatFailure>,
+    /// Sibling-breaker bookkeeping per exact call shape
+    /// ([`repeat_call_key`]): consecutive failures (repeat-failure breaker)
+    /// and consecutive byte-identical successes (zero-information breaker)
+    /// live adjacent in one [`RepeatCallState`] because each streak resets
+    /// the other. Shares the repetition machinery's home with the loop-nudge
+    /// detector above it on the escalation ladder: nudge after 2 identical
+    /// results, breakers after [`REPEAT_FAILURE_BREAKER_AFTER`] identical
+    /// failures / [`ZERO_INFO_BREAKER_AFTER`] identical successes.
+    repeat_calls: HashMap<String, RepeatCallState>,
     /// Whether the 80% token-budget status has been surfaced to the model
     budget_warned: bool,
     /// How many wrap-up nudges have been injected (escalates over time)
@@ -4539,7 +4707,7 @@ impl RunState {
             thinking_spiral_nudged: false,
             thinking_spiral_detected: false,
             tool_loop_nudged: false,
-            repeat_failures: HashMap::new(),
+            repeat_calls: HashMap::new(),
             budget_warned: false,
             wrapup_nudge_count: 0,
             mission_rounds: 0,
@@ -5348,12 +5516,12 @@ mod repeat_failure_breaker_tests {
         assert_eq!(canonical_json(&v), r#"{"a":{"y":null,"z":true},"b":[2,1]}"#);
         // The key carries the tool name, unambiguously separated.
         assert_eq!(
-            repeat_failure_key("explore", &serde_json::json!({})),
+            repeat_call_key("explore", &serde_json::json!({})),
             "explore\u{1f}{}"
         );
         assert_ne!(
-            repeat_failure_key("explore", &serde_json::json!({"path": "a"})),
-            repeat_failure_key("explore", &serde_json::json!({"path": "b"})),
+            repeat_call_key("explore", &serde_json::json!({"path": "a"})),
+            repeat_call_key("explore", &serde_json::json!({"path": "b"})),
             "different arguments are different keys"
         );
     }
@@ -5370,7 +5538,7 @@ mod repeat_failure_breaker_tests {
         assert!(notice.contains("different tool"));
 
         // A huge error is replayed bounded, and the cut announces itself.
-        let big = "e".repeat(BREAKER_ERROR_REPLAY_MAX_BYTES * 3);
+        let big = "e".repeat(BREAKER_REPLAY_MAX_BYTES * 3);
         let bounded = repeat_failure_breaker_notice("explore", 3, &big);
         assert!(bounded.len() < big.len());
         assert!(bounded.contains("truncated for replay"));
@@ -5495,6 +5663,305 @@ mod repeat_failure_breaker_tests {
         let input = serde_json::json!({});
 
         // After two identical failures the soft loop-nudge condition is
+        // already met (same tool + args + result twice in a row)…
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert!(
+            detect_tool_call_loop(&state.tool_records),
+            "the soft nudge must get its chance first"
+        );
+
+        // …while the breaker is not: the 3rd identical call still executes —
+        // the post-nudge chance the K = 2 + 1 derivation promises.
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+
+        // Only the 4th is short-circuited.
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod zero_info_breaker_tests {
+    use super::*;
+    use nanna_tools::{Tool, ToolDefinition, ToolError};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    /// Counting mock tool: succeeds with the current `output` text while
+    /// `fail` is unset, fails with a fixed error otherwise. `executions`
+    /// counts REAL dispatches — the breaker assertions are that this counter
+    /// stops moving.
+    struct SteadyTool {
+        executions: Arc<AtomicUsize>,
+        output: Arc<StdMutex<String>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SteadyTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "steady".to_string(),
+                description: "test tool that returns a settable result".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                // Structured failure, RETURNED not thrown — the repo rule.
+                Ok(ToolResult::error("boom: transient failure"))
+            } else {
+                Ok(ToolResult::success(self.output.lock().unwrap().clone()))
+            }
+        }
+    }
+
+    async fn steady_agent(
+        executions: Arc<AtomicUsize>,
+        output: Arc<StdMutex<String>>,
+        fail: Arc<AtomicBool>,
+    ) -> Agent {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(SteadyTool {
+            executions,
+            output,
+            fail,
+        })
+        .await;
+        // Never contacted: `execute_tools` is driven directly and the mock
+        // results are small enough to bypass all summarization paths.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(AgentConfig::default(), llm, tools)
+    }
+
+    /// Dispatch one `steady` call through the real tool path and return its
+    /// tool_result block.
+    async fn run_once(agent: &Agent, state: &mut RunState, input: Value) -> ContentBlock {
+        let uses = vec![(Uuid::new_v4().to_string(), "steady".to_string(), input)];
+        let mut blocks = agent
+            .execute_tools(&uses, state, &RunOptions::default(), None)
+            .await;
+        assert_eq!(blocks.len(), 1);
+        blocks.remove(0)
+    }
+
+    #[test]
+    fn the_zero_info_notice_announces_itself() {
+        let result = "dir listing: src, tests";
+        let notice = zero_info_breaker_notice("explore", 3, result, result.len());
+        // WHAT happened, WHY, the result it already has, and WHAT to do
+        // instead — an unexplained notice reads as corruption and spirals
+        // small models.
+        assert!(notice.contains("NOT executed"));
+        assert!(notice.contains("3 times"));
+        assert!(notice.contains("byte-identical"));
+        // The poll caveat delivered in-band: unchanged IS the information.
+        assert!(notice.contains("UNCHANGED"));
+        assert!(notice.contains(result), "replays the result: {notice}");
+        assert!(notice.contains("Act on the result you already have"));
+        assert!(notice.contains("paused for the rest of this run"));
+        assert!(notice.contains("unless its arguments change"));
+        assert!(notice.contains("different tool"));
+
+        // A cut excerpt announces itself and never claims the operation
+        // failed silently — disk (the real result) stays the truth.
+        let excerpt = "r".repeat(BREAKER_REPLAY_MAX_BYTES);
+        let bounded =
+            zero_info_breaker_notice("explore", 3, &excerpt, BREAKER_REPLAY_MAX_BYTES * 3);
+        assert!(bounded.contains("truncated for replay"));
+        assert!(bounded.contains("SUCCEEDED"));
+    }
+
+    #[tokio::test]
+    async fn k_identical_successes_then_short_circuit_without_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("state: idle".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent = steady_agent(Arc::clone(&executions), output, fail).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // The first K identical successes all execute for real.
+        for i in 1..=ZERO_INFO_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+            assert_eq!(executions.load(Ordering::SeqCst), i, "call {i} must execute");
+        }
+
+        // Call K+1 is short-circuited: the counting mock proves no execution,
+        // and the result is a structured, self-announcing notice.
+        let block = run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER,
+            "the breaker must not dispatch the tool"
+        );
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = block
+        else {
+            panic!("expected a tool_result block");
+        };
+        assert_eq!(is_error, Some(true), "returned as a notice, never thrown");
+        assert!(content.contains("ZERO-INFORMATION BREAKER"), "got: {content}");
+        assert!(content.contains("NOT executed"));
+        assert!(
+            content.contains(&format!("{ZERO_INFO_BREAKER_AFTER} times")),
+            "states how often it repeated: {content}"
+        );
+        assert!(
+            content.contains("state: idle"),
+            "replays the result the model already has: {content}"
+        );
+
+        // And it stays paused for the rest of the run.
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(executions.load(Ordering::SeqCst), ZERO_INFO_BREAKER_AFTER);
+    }
+
+    #[tokio::test]
+    async fn a_huge_identical_result_is_replayed_bounded_with_the_cut_announced() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let big = "z".repeat(BREAKER_REPLAY_MAX_BYTES * 2);
+        let output = Arc::new(StdMutex::new(big.clone()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent = steady_agent(Arc::clone(&executions), output, fail).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        for _ in 0..=ZERO_INFO_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+        }
+        let block = run_once(&agent, &mut state, input).await;
+        assert_eq!(executions.load(Ordering::SeqCst), ZERO_INFO_BREAKER_AFTER);
+        let ContentBlock::ToolResult { content, .. } = block else {
+            panic!("expected a tool_result block");
+        };
+        // The excerpt is bounded at storage time: the notice is strictly
+        // smaller than the raw result it stands in for, and the cut says so.
+        assert!(content.len() < big.len(), "replay must be bounded");
+        assert!(content.contains("truncated for replay"), "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn a_changed_result_resets_the_identity_streak() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("state: pending".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent = steady_agent(Arc::clone(&executions), Arc::clone(&output), fail).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Two identical results — one below the breaker threshold.
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+
+        // The environment changes: a poll that observes change is untouched.
+        *output.lock().unwrap() = "state: done".to_string();
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+
+        // It now takes K fresh identical results to engage the breaker: the
+        // change reset the streak to 1, so two more identical calls execute…
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            5,
+            "post-change identical calls below K must still execute"
+        );
+        // …and only the next identical call is short-circuited.
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn different_arguments_are_a_different_key_and_still_execute() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("page 1 of 1".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent = steady_agent(Arc::clone(&executions), output, fail).await;
+        let mut state = RunState::new();
+
+        // Engage the breaker on the {} shape.
+        for _ in 0..=ZERO_INFO_BREAKER_AFTER {
+            run_once(&agent, &mut state, serde_json::json!({})).await;
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), ZERO_INFO_BREAKER_AFTER);
+
+        // A different input on the SAME tool executes normally — the breaker
+        // pauses one call shape, never the tool. Varying an argument (a
+        // cursor) is exactly the escape hatch the notice prescribes.
+        let block = run_once(&agent, &mut state, serde_json::json!({"cursor": 2})).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 1,
+            "a different input must be dispatched"
+        );
+        let ContentBlock::ToolResult { content, .. } = block else {
+            panic!("expected a tool_result block");
+        };
+        assert!(
+            !content.contains("ZERO-INFORMATION BREAKER"),
+            "a real execution result, not a breaker notice: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_resets_the_success_identity_streak() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("steady output".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent = steady_agent(Arc::clone(&executions), output, Arc::clone(&fail)).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Two identical successes — one below the breaker threshold.
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+
+        // A failure on the exact same shape wipes the identity streak (the
+        // sibling rule; the mirror direction — success clears the failure
+        // streak — is covered in repeat_failure_breaker_tests).
+        fail.store(true, Ordering::SeqCst);
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+        fail.store(false, Ordering::SeqCst);
+
+        // It now takes K fresh identical successes to engage the breaker.
+        for i in 1..=ZERO_INFO_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                3 + i,
+                "post-failure identical success {i} must still execute"
+            );
+        }
+        run_once(&agent, &mut state, input).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            3 + ZERO_INFO_BREAKER_AFTER,
+            "breaker re-engages only after K new identical successes"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nudge_rung_fires_before_the_breaker_rung() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("same answer".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent = steady_agent(Arc::clone(&executions), output, fail).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // After two identical successes the soft loop-nudge condition is
         // already met (same tool + args + result twice in a row)…
         run_once(&agent, &mut state, input.clone()).await;
         run_once(&agent, &mut state, input.clone()).await;
