@@ -1145,16 +1145,8 @@ impl LongHorizonRunner {
                         if repeated {
                             item.steps_without_progress += 1;
                         }
-                        item.last_result = Some(format!(
-                            "Done-condition NOT met: {}{}",
-                            verdict.detail,
-                            if repeated {
-                                " (you repeated the exact same tool calls as last step — \
-                                 change approach)"
-                            } else {
-                                ""
-                            }
-                        ));
+                        item.last_result =
+                            Some(failed_acceptance_result(check, &verdict, repeated));
                     }
                 }
                 None => {
@@ -1221,6 +1213,64 @@ impl LongHorizonRunner {
             interjected_items,
         }
     }
+}
+
+/// Feedback handed to the next step after a failed acceptance check —
+/// rendered verbatim into the `== LAST RESULT ==` block of the retry prompt.
+///
+/// Measured live (gemma4:12b, 2026-08-02 endurance evals): 320+ failed
+/// checks and ~130 steps per feature, because after a failure the model saw
+/// only "Done-condition NOT met: `FAIL(test_04)`: ..." — it was never shown
+/// WHAT command judges the task, nor told to read the test it must satisfy,
+/// so it retried by guessing. qwen3.5:9b infers the command from context;
+/// gemma4:12b does not. Naming the command and directing a read-first turns
+/// the guess loop into a feedback loop.
+///
+/// Bounds: `verdict.detail` embeds planner-authored strings (command,
+/// pattern, path) that carry no upstream byte cap — only the command-output
+/// tail inside it is bounded (400 chars) — so it is clamped here to
+/// [`STEP_RESULT_TAIL_MAX_BYTES`], the same one-screenful bound step notes
+/// use, with the cut announced (the full detail is already durably logged
+/// via the `acceptance_checked` entry before this runs). The command itself
+/// is included verbatim: the model must be able to run and read it exactly,
+/// truncating it would destroy the one thing this message exists to hand
+/// over, and the step prompt already embeds it verbatim ("RUN THAT CHECK
+/// YOURSELF"). Everything else is a fixed-size frame, so the whole message
+/// is O(one screenful).
+///
+/// The file the command runs is deliberately NOT inlined here: the
+/// directive names it via the command, and the model must exercise
+/// `read_file` itself — inlining would bloat every retry and the file can
+/// be large.
+fn failed_acceptance_result(
+    check: &AcceptanceCheck,
+    verdict: &AcceptanceVerdict,
+    repeated: bool,
+) -> String {
+    let detail = if verdict.detail.len() <= STEP_RESULT_TAIL_MAX_BYTES {
+        verdict.detail.clone()
+    } else {
+        format!(
+            "[showing last {STEP_RESULT_TAIL_MAX_BYTES} of {} bytes — full verdict is in the \
+             acceptance_checked run log] {}",
+            verdict.detail.len(),
+            text_tail(&verdict.detail, STEP_RESULT_TAIL_MAX_BYTES)
+        )
+    };
+    let mut result = format!("Done-condition NOT met: {detail}");
+    if repeated {
+        result.push_str(
+            " (you repeated the exact same tool calls as last step — change approach)",
+        );
+    }
+    if let Some(command) = check.self_check_command() {
+        result.push_str(&format!(
+            "\nThat verdict came from the harness running: `{command}`\n\
+             Before changing anything, read the file(s) this command runs (use read_file), \
+             understand every assertion, then make them pass. Do not guess."
+        ));
+    }
+    result
 }
 
 /// Last `max_bytes` of `text`, on a char boundary, trimmed.
@@ -1668,6 +1718,167 @@ mod tests {
         let emoji = "🌀".repeat(100);
         let tail = text_tail(&emoji, 10);
         assert!(tail.chars().all(|c| c == '🌀'));
+    }
+
+    // -----------------------------------------------------------------
+    // Failed-acceptance feedback
+    // -----------------------------------------------------------------
+
+    /// 2026-08-02 endurance evals (gemma4:12b): 320+ failed checks at ~130
+    /// steps/feature because the retry feedback never named the judging
+    /// command. The failure message must hand the model the command and
+    /// direct it to read the test before editing.
+    #[test]
+    fn failed_verdict_feedback_names_command_and_directs_read_first() {
+        let check = AcceptanceCheck::Command {
+            command: "sh tests/test_04.sh".to_string(),
+            timeout_secs: None,
+        };
+        let verdict = AcceptanceVerdict {
+            passed: false,
+            detail: "FAIL(test_04): exit code should be 1, got 0".to_string(),
+        };
+        let result = failed_acceptance_result(&check, &verdict, false);
+        assert!(
+            result.starts_with("Done-condition NOT met: FAIL(test_04)"),
+            "{result}"
+        );
+        assert!(
+            result.contains("running: `sh tests/test_04.sh`"),
+            "the exact acceptance command must be named: {result}"
+        );
+        assert!(
+            result.contains("read the file(s) this command runs (use read_file)"),
+            "{result}"
+        );
+        assert!(result.contains("Do not guess"), "{result}");
+        assert!(
+            !result.contains("repeated the exact same tool calls"),
+            "no repetition admonition without repetition: {result}"
+        );
+    }
+
+    #[test]
+    fn failed_verdict_feedback_keeps_the_repeated_steps_admonition() {
+        let check = AcceptanceCheck::Command {
+            command: "sh run_tests.sh".to_string(),
+            timeout_secs: None,
+        };
+        let verdict = AcceptanceVerdict {
+            passed: false,
+            detail: "`sh run_tests.sh` exited 1 — 3 failures".to_string(),
+        };
+        let result = failed_acceptance_result(&check, &verdict, true);
+        assert!(
+            result.contains("repeated the exact same tool calls as last step — change approach"),
+            "{result}"
+        );
+        // The admonition must not displace the read-first directive.
+        assert!(result.contains("Do not guess"), "{result}");
+    }
+
+    /// A pure file check has no command to read — the directive would name
+    /// nothing, so it is omitted (the condition is already stated in the
+    /// step prompt's "Done when" line).
+    #[test]
+    fn failed_file_check_feedback_omits_the_read_directive() {
+        let check = AcceptanceCheck::FileExists {
+            path: "out.txt".to_string(),
+        };
+        let verdict = AcceptanceVerdict {
+            passed: false,
+            detail: "file does not exist: out.txt".to_string(),
+        };
+        let result = failed_acceptance_result(&check, &verdict, false);
+        assert!(result.starts_with("Done-condition NOT met:"), "{result}");
+        assert!(
+            !result.contains("Before changing anything"),
+            "no command means no read-first directive: {result}"
+        );
+    }
+
+    /// The verdict detail embeds planner-authored strings with no upstream
+    /// byte cap; the feedback clamps it to `STEP_RESULT_TAIL_MAX_BYTES` —
+    /// the step-note bound — keeping the newest evidence and announcing the
+    /// cut, without displacing the command or the directive.
+    #[test]
+    fn failed_verdict_feedback_bounds_a_runaway_detail() {
+        let check = AcceptanceCheck::Command {
+            command: "sh tests/test_04.sh".to_string(),
+            timeout_secs: None,
+        };
+        let verdict = AcceptanceVerdict {
+            passed: false,
+            detail: format!("{}NEWEST-EVIDENCE", "x".repeat(STEP_RESULT_TAIL_MAX_BYTES * 10)),
+        };
+        let result = failed_acceptance_result(&check, &verdict, true);
+        assert!(
+            result.len() <= STEP_RESULT_TAIL_MAX_BYTES + 512,
+            "detail clamped to the step-note bound plus a fixed frame: {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("NEWEST-EVIDENCE"),
+            "tail truncation keeps the newest evidence"
+        );
+        assert!(
+            result.contains("[showing last"),
+            "the cut must announce itself: {result}"
+        );
+        assert!(result.contains("`sh tests/test_04.sh`"), "{result}");
+        assert!(result.contains("Do not guess"), "{result}");
+    }
+
+    /// A short detail passes through byte-identical — no truncation marker.
+    #[test]
+    fn failed_verdict_feedback_leaves_short_detail_untouched() {
+        let check = AcceptanceCheck::FileExists {
+            path: "a.txt".to_string(),
+        };
+        let verdict = AcceptanceVerdict {
+            passed: false,
+            detail: "file does not exist: a.txt".to_string(),
+        };
+        let result = failed_acceptance_result(&check, &verdict, false);
+        assert_eq!(result, "Done-condition NOT met: file does not exist: a.txt");
+    }
+
+    /// End-to-end: after a failed check, the NEXT step's prompt carries the
+    /// command and the read-first directive in its LAST RESULT block.
+    #[tokio::test]
+    async fn failed_acceptance_enriches_the_next_step_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "make the test pass",
+                Some(AcceptanceCheck::Command {
+                    // `exit 1` works under both sh and cmd.
+                    command: "exit 1".to_string(),
+                    timeout_secs: None,
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![Ok(outcome("try 1")), Ok(outcome("try 2"))]);
+        let _report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        let requests = runner.requests.lock().await;
+        assert!(requests.len() >= 2, "the item must get a retry step");
+        let retry = &requests[1].prompt;
+        assert!(retry.contains("== LAST RESULT =="), "{retry}");
+        assert!(retry.contains("Done-condition NOT met"), "{retry}");
+        assert!(
+            retry.contains("That verdict came from the harness running: `exit 1`"),
+            "{retry}"
+        );
+        assert!(
+            retry.contains("read the file(s) this command runs (use read_file)"),
+            "{retry}"
+        );
+        // First attempt has no verdict yet — the enrichment is failure-only.
+        assert!(!requests[0].prompt.contains("Done-condition NOT met"));
     }
 
     // -----------------------------------------------------------------
