@@ -295,7 +295,13 @@ pub fn build_task_services(
                         project: opt_string(&params, "project"),
                         title,
                         description: opt_string(&params, "description"),
-                        priority: get_i64(&params, "priority").unwrap_or(3),
+                        // Floored at 2: priority 1 is the user speaking (an
+                        // interjection jumps the queue at p1), and this
+                        // service is the MODEL's write surface — a
+                        // self-created todo must never outrank user-origin
+                        // work (observed live 2026-08-02: a self-created p1
+                        // side-task preempted the user's p2 request).
+                        priority: get_i64(&params, "priority").unwrap_or(3).max(2),
                         labels: string_vec(params.get("labels")),
                         tool_scope: string_vec(params.get("tools")),
                         due_at: opt_string(&params, "due_at"),
@@ -333,7 +339,9 @@ pub fn build_task_services(
                             .and_then(Value::as_str)
                             .map(|s| Some(s.to_string())),
                         status: opt_string(&params, "status"),
-                        priority: get_i64(&params, "priority"),
+                        // Same floor as tasks.add: the model cannot promote
+                        // its own work to p1 after the fact either.
+                        priority: get_i64(&params, "priority").map(|p| p.max(2)),
                         labels: params
                             .get("labels")
                             .filter(|v| v.is_array())
@@ -2104,11 +2112,18 @@ impl AgentPlanner {
 
 /// Seed a plan into the store, returning the created task ids in plan order.
 ///
-/// `jump_queue` is how an interjected message reaches the front: the store
-/// orders `next()` by `in_progress` first, then priority, then `sort_order`.
-/// A task inserted mid-run therefore has to (a) sort ahead on `sort_order`
-/// and (b) not be outranked by an item the harness already marked
-/// `in_progress` - see `SessionInterjector::yield_current_item`.
+/// Every seed sorts strictly below the scope's current minimum `sort_order`:
+/// the plan being seeded is the user's CURRENT request, and leftovers from
+/// earlier turns are information for the planner, not work that outranks it
+/// (observed live 2026-08-02: a fresh question seeded at sort 0 tied a
+/// cancelled turn's leftovers and lost on id, so the stale work ran first).
+///
+/// `jump_queue` is how an interjected message reaches the front of a LIVE
+/// run: the store orders `next()` by `in_progress` first, then priority,
+/// then `sort_order`, so an interjection additionally (a) takes priority 1 -
+/// the user speaking mid-run outranks anything already planned - and (b)
+/// must not be outranked by an item the harness already marked `in_progress`
+/// - see `SessionInterjector::yield_current_item`.
 pub async fn seed_plan(
     storage: &Arc<Storage>,
     scope: &str,
@@ -2117,18 +2132,15 @@ pub async fn seed_plan(
     jump_queue: bool,
 ) -> Result<Vec<i64>, String> {
     let repo = storage.tasks();
-    let base_sort = if jump_queue {
-        // Strictly below every existing item in the scope so the new work is
-        // selected next. Explicitly computed rather than hardcoded to 0 -
-        // 0 collides with the default and merely ties.
-        let existing = repo
-            .list(scope, scope_id, false)
-            .await
-            .map_err(|e| e.to_string())?;
-        existing.iter().map(|t| t.sort_order).min().unwrap_or(0) - plan.tasks.len() as i64 - 1
-    } else {
-        0
-    };
+    // Strictly below every existing item in the scope so this plan is
+    // selected ahead of leftovers. Explicitly computed rather than hardcoded
+    // to 0 - 0 collides with the default and merely ties.
+    let existing = repo
+        .list(scope, scope_id, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let base_sort =
+        existing.iter().map(|t| t.sort_order).min().unwrap_or(0) - plan.tasks.len() as i64 - 1;
 
     let mut ids = Vec::with_capacity(plan.tasks.len());
     for (index, task) in plan.tasks.iter().enumerate() {
@@ -2163,6 +2175,43 @@ pub async fn seed_plan(
         return Err("no planned task could be created".to_string());
     }
     Ok(ids)
+}
+
+/// Put every `in_progress` item in a scope back to `pending`.
+///
+/// Two callers, one invariant: `next()` sorts `in_progress` first ("resume
+/// what you started"), which is right only while the run that started the
+/// item is alive. An interjection yields the in-flight item so the user's
+/// message wins the next selection, and a cancelled chat run demotes its
+/// leftovers on exit so a stopped turn cannot auto-resume ahead of the
+/// user's next request — unfinished work is information for the model, not
+/// an instruction to the harness. Returns how many items were demoted.
+pub async fn demote_in_progress(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+    actor: &str,
+) -> Result<usize, String> {
+    let repo = storage.tasks();
+    let tasks = repo
+        .list(scope, scope_id, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut demoted = 0usize;
+    for task in tasks.iter().filter(|t| t.status == "in_progress") {
+        repo.update(
+            task.id,
+            TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            },
+            Some(actor),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        demoted += 1;
+    }
+    Ok(demoted)
 }
 
 // ---------------------------------------------------------------------------
@@ -2248,24 +2297,14 @@ impl SessionInterjector {
     /// counters are keyed by item id, so the original resumes exactly where
     /// it stood once the user's request is done.
     async fn yield_current_item(&self) -> Result<(), String> {
-        let repo = self.storage.tasks();
-        let tasks = repo
-            .list(&self.scope, self.scope_id.as_deref(), false)
-            .await
-            .map_err(|e| e.to_string())?;
-        for task in tasks.iter().filter(|t| t.status == "in_progress") {
-            repo.update(
-                task.id,
-                TaskPatch {
-                    status: Some("pending".to_string()),
-                    ..TaskPatch::default()
-                },
-                Some(&self.actor),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        demote_in_progress(
+            &self.storage,
+            &self.scope,
+            self.scope_id.as_deref(),
+            &self.actor,
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -2856,6 +2895,155 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next.title, "second ask");
+    }
+
+    /// REGRESSION (live 2026-08-02): turn 1 was cancelled with its item still
+    /// `in_progress`; turn 2 asked something unrelated, and `next()`'s
+    /// in_progress-first ordering ran the stale leftover ahead of the user's
+    /// new request. The cancel path demotes, the new seed sorts ahead.
+    #[tokio::test]
+    async fn a_cancelled_turns_leftover_does_not_preempt_the_next_turns_plan() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let turn1 = seed_plan(&storage, "session", Some("s1"), &plan_of(&["turn one"]), false)
+            .await
+            .expect("seeded")[0];
+        let repo = storage.tasks();
+        repo.update(
+            turn1,
+            TaskPatch {
+                status: Some("in_progress".to_string()),
+                ..TaskPatch::default()
+            },
+            Some("harness"),
+        )
+        .await
+        .expect("harness started it");
+
+        // Stop pressed: the chat run's exit path demotes its in-flight items.
+        let demoted = demote_in_progress(&storage, "session", Some("s1"), "chat")
+            .await
+            .expect("demote");
+        assert_eq!(demoted, 1);
+
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["turn two"]), false)
+            .await
+            .expect("seeded");
+
+        let next = repo.next("session", Some("s1")).await.unwrap().unwrap();
+        assert_eq!(
+            next.title, "turn two",
+            "the user's current turn outranks a cancelled turn's leftover"
+        );
+        assert_eq!(
+            repo.get(turn1).await.unwrap().status,
+            "pending",
+            "the leftover stays open as information for the planner"
+        );
+    }
+
+    /// Even without a cancel, a fresh turn's plan seeds ahead of pending
+    /// leftovers: each seed sorts strictly below the scope's current minimum.
+    #[tokio::test]
+    async fn a_fresh_turns_plan_outranks_pending_leftovers() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        seed_plan(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["leftover a", "leftover b"]),
+            false,
+        )
+        .await
+        .expect("seeded");
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["fresh ask"]), false)
+            .await
+            .expect("seeded");
+
+        let next = storage
+            .tasks()
+            .next("session", Some("s1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.title, "fresh ask", "each turn seeds ahead of prior leftovers");
+    }
+
+    /// REGRESSION (live 2026-08-02): the model self-created a p1 todo
+    /// ("Migrate Lucide icons") that outranked the user's p2 request — the
+    /// agent was about to start an unrequested repo-wide migration. The
+    /// tasks.* services floor model priority at 2 on add AND update.
+    #[tokio::test]
+    async fn a_tool_created_todo_never_outranks_the_turns_plan() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services = build_task_services(storage.clone(), workspace_id);
+
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["user request"]), false)
+            .await
+            .expect("seeded");
+
+        let created = add_task(
+            &services,
+            json!({
+                "title": "Migrate Lucide icons to @lucide/vue",
+                "scope": "session",
+                "session_id": "s1",
+                "priority": 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created["task"]["priority"],
+            json!(2),
+            "model-asked p1 floors at 2"
+        );
+
+        // Nor can the model promote its own item to p1 after the fact.
+        let id = created["task"]["id"].as_i64().expect("id");
+        let patched = services
+            .get("tasks.update")
+            .expect("tasks.update service")(json!({ "id": id, "priority": 1 }))
+        .await
+        .expect("update succeeds");
+        assert_eq!(patched["task"]["priority"], json!(2));
+
+        let next = storage
+            .tasks()
+            .next("session", Some("s1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.title, "user request",
+            "self-created side-work cannot jump the user's plan"
+        );
+    }
+
+    /// An interjection (the user speaking mid-run) still jumps everything:
+    /// leftovers, the current turn's plan, and any self-created todo.
+    #[tokio::test]
+    async fn an_interjection_still_jumps_leftovers_and_the_current_plan() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["leftover"]), false)
+            .await
+            .expect("seeded");
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["current turn"]), false)
+            .await
+            .expect("seeded");
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["interjection"]), true)
+            .await
+            .expect("interjected");
+
+        let next = storage
+            .tasks()
+            .next("session", Some("s1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.title, "interjection",
+            "the user speaking mid-run still goes first"
+        );
     }
 
     #[test]
