@@ -438,6 +438,15 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         .filter(|v| !v.is_undefined() && !v.is_null())
         .map(|v| v.to_boolean())
         .unwrap_or(false);
+    // Optional third arg: bounded query — collect at most this many entries
+    // (see NannaBridge::list_dir). Non-numeric / non-positive values mean
+    // "no bound", matching a caller that simply omitted the argument.
+    let max_entries = args.get(2)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .map(|v| v.to_number(context))
+        .transpose()?
+        .filter(|n| n.is_finite() && *n >= 1.0)
+        .map(|n| n as usize);
 
     let bridge = BRIDGE.with(|b| b.borrow().clone())
         .ok_or_else(|| {
@@ -449,7 +458,7 @@ fn nanna_list_dir(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
             .enable_all()
             .build()
             .expect("Failed to create runtime");
-        rt.block_on(bridge.list_dir(&path, recursive))
+        rt.block_on(bridge.list_dir(&path, recursive, max_entries))
     })
     .join()
     .map_err(|_| {

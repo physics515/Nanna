@@ -955,8 +955,23 @@ impl NannaBridge {
         self.logs.write().await.push(entry);
     }
 
-    /// List directory contents (if permitted)
-    pub async fn list_dir(&self, path: &str, recursive: bool) -> Result<Vec<DirEntry>> {
+    /// List directory contents (if permitted).
+    ///
+    /// `max_entries` makes this a bounded query: at most that many entries are
+    /// collected and the walk stops immediately once the bound is reached.
+    /// This is NOT silent truncation — the caller asked for a bound and is
+    /// responsible for announcing it (the convention is to request `budget + 1`
+    /// so an overflow-length return proves more entries exist). The bound
+    /// exists because every returned entry is marshalled into the script
+    /// engine one JS object at a time; unbounded listings of real workspaces
+    /// (hundreds of thousands of entries under node_modules/.git/target) blow
+    /// the 30s script deadline before the script runs a single line.
+    pub async fn list_dir(
+        &self,
+        path: &str,
+        recursive: bool,
+        max_entries: Option<usize>,
+    ) -> Result<Vec<DirEntry>> {
         let path = self.resolve_path(path);
 
         if !self.permissions.allows_read(&path) {
@@ -971,6 +986,7 @@ impl NannaBridge {
             "venv", "dist", "build", ".next", ".nuxt", ".cache",
         ];
 
+        let cap = max_entries.unwrap_or(usize::MAX);
         let mut entries = Vec::new();
 
         if recursive {
@@ -983,6 +999,9 @@ impl NannaBridge {
                         .map_or(true, |name| !IGNORE_DIRS.contains(&name))
                 })
             {
+                if entries.len() >= cap {
+                    break;
+                }
                 let entry = match result {
                     Ok(e) => e,
                     Err(_) => continue,
@@ -1005,6 +1024,9 @@ impl NannaBridge {
                 .await
                 .map_err(|e| ScriptError::Bridge(format!("Failed to read entry: {e}")))?
             {
+                if entries.len() >= cap {
+                    break;
+                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 let metadata = entry.metadata().await.ok();
                 let entry_type = metadata.as_ref().map_or("unknown", |m| {
@@ -1684,6 +1706,77 @@ mod tests {
             .expect("exec should not error");
         assert!(out.success, "command should succeed, got {out:?}");
         assert_eq!(out.stdout.trim(), "c", "stdout was {:?}", out.stdout);
+    }
+
+    // ---------------------------------------------------------------------
+    // list_dir bounded queries: max_entries makes listings safe to marshal
+    // into the script engine (unbounded workspace walks blew the 30s Boa
+    // deadline — explore tool, observed live 2026-08-02).
+    // ---------------------------------------------------------------------
+
+    /// Seed `count` files into `dir`, plus a `sub/` directory holding one file.
+    fn seed_tree(dir: &std::path::Path, count: usize) {
+        for i in 0..count {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").expect("seed file");
+        }
+        std::fs::create_dir(dir.join("sub")).expect("seed subdir");
+        std::fs::write(dir.join("sub").join("inner.txt"), "y").expect("seed inner");
+    }
+
+    fn read_bridge(dir: &std::path::Path) -> NannaBridge {
+        NannaBridge::new(ToolPermissions::none().with_read([dir]))
+    }
+
+    #[tokio::test]
+    async fn list_dir_unbounded_returns_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_tree(dir.path(), 5);
+        let bridge = read_bridge(dir.path());
+
+        let flat = bridge
+            .list_dir(&dir.path().to_string_lossy(), false, None)
+            .await
+            .expect("flat listing");
+        assert_eq!(flat.len(), 6, "5 files + sub/");
+
+        let deep = bridge
+            .list_dir(&dir.path().to_string_lossy(), true, None)
+            .await
+            .expect("recursive listing");
+        assert_eq!(deep.len(), 7, "5 files + sub/ + sub/inner.txt");
+    }
+
+    #[tokio::test]
+    async fn list_dir_max_entries_bounds_flat_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_tree(dir.path(), 10);
+        let bridge = read_bridge(dir.path());
+
+        let bounded = bridge
+            .list_dir(&dir.path().to_string_lossy(), false, Some(3))
+            .await
+            .expect("bounded flat listing");
+        assert_eq!(bounded.len(), 3, "must stop at the bound");
+
+        // budget + 1 convention: an overflow-length return proves more exist.
+        let probe = bridge
+            .list_dir(&dir.path().to_string_lossy(), false, Some(12))
+            .await
+            .expect("probe listing");
+        assert_eq!(probe.len(), 11, "10 files + sub/ fit under a 12-entry bound");
+    }
+
+    #[tokio::test]
+    async fn list_dir_max_entries_bounds_recursive_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_tree(dir.path(), 10);
+        let bridge = read_bridge(dir.path());
+
+        let bounded = bridge
+            .list_dir(&dir.path().to_string_lossy(), true, Some(4))
+            .await
+            .expect("bounded recursive listing");
+        assert_eq!(bounded.len(), 4, "recursive walk must stop at the bound");
     }
 }
 
