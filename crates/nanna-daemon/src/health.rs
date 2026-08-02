@@ -123,7 +123,7 @@ pub enum PidFileError {
 /// file (observed live: a GUI sidecar overwrote the standalone daemon's
 /// lock, then ran on as a storage-less zombie).
 #[cfg(windows)]
-fn is_process_running(pid: u32) -> bool {
+pub(crate) fn is_process_running(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 

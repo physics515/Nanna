@@ -29,5 +29,11 @@ nanna-memory = { path = "../nanna-memory" }
 nanna-workspace = { path = "../nanna-workspace" }
 nanna-mcp = { path = "../nanna-mcp", optional = true }
 
+# Process-group kill for acceptance-check timeouts (harness.rs
+# kill_process_tree): kill(-pgid, SIGKILL) reaps the shell AND its
+# descendants, which kill_on_drop alone cannot.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

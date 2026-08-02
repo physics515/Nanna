@@ -121,8 +121,13 @@ fn stop_daemon_process(pid_file: &std::path::Path) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         use std::process::Command;
+        // /T kills the daemon's whole tree, not just the daemon: without it,
+        // in-flight exec children (powershell.exe/bash.exe) survived every
+        // `nanna daemon stop`/`restart` and accumulated across dev cycles.
+        // A current daemon's kill-on-close Job Object reaps them anyway;
+        // /T is belt-and-braces for daemons where adoption failed.
         let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
+            .args(["/T", "/F", "/PID", &pid.to_string()])
             .status()?;
 
         if status.success() {

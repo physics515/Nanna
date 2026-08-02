@@ -22,6 +22,8 @@ pub mod dream_summarizer;
 pub mod embedding_router;
 pub mod health;
 pub mod ipc;
+#[cfg(windows)]
+pub mod job;
 pub mod llm_router;
 // `log_buffer` now lives in `nanna-core` so pure daemon clients (the GUI) can
 // capture their own lines without linking this crate. Re-exported here so

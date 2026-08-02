@@ -380,9 +380,10 @@ pub fn default_exec_timeout_secs(command: &str) -> u64 {
 /// On Windows this shells out to `taskkill /T /F`, which walks the tree from
 /// `pid` — necessary because killing only the shell we spawned would leave a
 /// grandchild (`cargo`, `git`) running and holding a workspace/build lock. On
-/// Unix we rely on `kill_on_drop` reaping the direct child (the common
-/// exec-optimized single command replaces the shell, so the direct child *is*
-/// the workload); a dedicated process-group kill is a possible future hardening.
+/// Unix the child is its own process-group leader (`process_group(0)` at
+/// spawn), so signalling the *negative* pid reaps the shell and every
+/// descendant in one call — `kill_on_drop` alone only reached the direct
+/// child and left grandchildren running.
 async fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
@@ -395,7 +396,16 @@ async fn kill_process_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = pid; // direct child is reaped by kill_on_drop when the future drops
+        // pid is a fresh process-group id from the kernel: it fits i32, and a
+        // failed signal (group already gone) is exactly the no-op we want.
+        #[allow(clippy::cast_possible_wrap)]
+        let pgid = -(pid as i32);
+        // SAFETY: kill(2) with a negative pgid signals a process group we
+        // created; `process_group(0)` at spawn put the child in its own
+        // group, so this can never reach our own.
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
     }
 }
 
@@ -1193,6 +1203,145 @@ fn strip_ansi_escapes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Tree-kill: the timeout path must reap the shell AND its grandchildren
+    // (the failure mode was a wedged workload holding a workspace/build lock
+    // across exec calls; on daemon death the leaked children accumulated —
+    // 89 powershell.exe counted 2026-08-01).
+    // ---------------------------------------------------------------------
+
+    /// Reap bound: SIGKILL / taskkill is near-instant; 5s is a generous
+    /// ceiling for a loaded CI machine, polled at 50ms.
+    #[allow(dead_code)] // used by the platform-specific test below
+    const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Grandchild-startup bound: powershell/sh must write its child's pid
+    /// file well within this; dominated by powershell cold-start on Windows.
+    #[allow(dead_code)]
+    const SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kill_process_tree_reaps_shell_and_grandchild() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+
+        // PowerShell parent spawns a detached ping sleeper (grandchild),
+        // records its Windows pid, then sleeps — same shape as an exec'd
+        // build command that forks a worker.
+        let script = format!(
+            "$p = Start-Process -WindowStyle Hidden -PassThru cmd.exe -ArgumentList '/C','ping -n 60 127.0.0.1 >nul'; \
+             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 60",
+            pid_file.display()
+        );
+        // Same isolation flag the exec path uses.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let mut cmd = tokio::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        let mut child = cmd.spawn().expect("spawn powershell parent");
+        let pid = child.id().expect("pid of live child");
+
+        let deadline = tokio::time::Instant::now() + SPAWN_DEADLINE;
+        let grandchild_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(gc) = text.trim().parse::<u32>()
+            {
+                break gc;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild never reported its pid"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+
+        kill_process_tree(pid).await;
+
+        let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
+        loop {
+            let shell_dead = child.try_wait().expect("try_wait").is_some();
+            let grandchild_dead = !windows_pid_alive(grandchild_pid).await;
+            if shell_dead && grandchild_dead {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tree survived kill_process_tree (shell_dead={shell_dead}, grandchild_dead={grandchild_dead})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Liveness via `tasklist` — fine for a test; the daemon's runtime checks
+    /// use Win32 directly (see nanna-daemon health.rs for why).
+    #[cfg(windows)]
+    async fn windows_pid_alive(pid: u32) -> bool {
+        tokio::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .await
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_tree_reaps_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 60 & echo $! > '{}'; sleep 60",
+            pid_file.display()
+        ));
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+        // Same isolation the exec path uses — and what gives us a pgid to kill.
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sh parent");
+        let pid = child.id().expect("pid of live child");
+
+        let deadline = tokio::time::Instant::now() + SPAWN_DEADLINE;
+        let grandchild_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(gc) = text.trim().parse::<i32>()
+            {
+                break gc;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild never reported its pid"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        kill_process_tree(pid).await;
+
+        // Reap the shell (a zombie would still answer kill(pid, 0)).
+        let status = child.wait().await.expect("wait");
+        assert!(!status.success(), "shell must have died by signal");
+
+        // The grandchild reparents to init and is reaped there; poll bounded.
+        let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
+        loop {
+            // SAFETY: signal 0 probes existence only.
+            let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild survived process-group kill"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Path resolution: absolute and relative must BOTH work, and a relative
