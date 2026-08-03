@@ -206,6 +206,10 @@ impl ControlPlane {
 
         let step_runner = AgentStepRunner {
             discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            // One ledger for the whole turn: the breakers' streaks must
+            // outlive the step boundary that discards every other RunState
+            // field, or their thresholds are unreachable.
+            repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
             router: router.clone(),
             tools: tools.clone(),
             agent_config: agent.agent_config().await,
@@ -237,8 +241,12 @@ impl ControlPlane {
             memory: None,
             workspace_id: None,
             // One run, one fault tally: a GPU fault seen while planning and
-            // one seen while stepping are the same repeat evidence.
+            // one seen while stepping are the same repeat evidence. The
+            // breaker ledger is shared for the same reason — planning calls
+            // no tools today, so this costs nothing and cannot drift if that
+            // ever changes.
             gpu_fault_count: step_runner.gpu_fault_count.clone(),
+            repeat_ledger: Arc::clone(&step_runner.repeat_ledger),
         };
         let planner = Arc::new(AgentPlanner::new(Arc::new(planner_runner)));
 

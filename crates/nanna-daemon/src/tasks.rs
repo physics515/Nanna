@@ -974,6 +974,15 @@ pub struct AgentStepRunner {
     /// than once per step — the runner is one object for the whole run, while
     /// each step gets a fresh `RunState`.
     pub discovered_tools: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// The sibling breakers' repeat-call ledger for THIS run.
+    ///
+    /// Shared across steps for exactly the reason `discovered_tools` above
+    /// is: the runner is one object for the whole run, while each step gets a
+    /// fresh `RunState`. A per-step ledger reset the streak counters 22 times
+    /// in the 20-minute wedged turn of 2026-08-02 (session 05775d1d), so the
+    /// K = 3 thresholds were never reachable — the model made 2-3 identical
+    /// calls per step, forever.
+    pub repeat_ledger: nanna_agent::SharedRepeatLedger,
     pub router: Arc<LlmRouter>,
     pub tools: Arc<nanna_tools::ToolRegistry>,
     pub agent_config: nanna_agent::AgentConfig,
@@ -2111,6 +2120,14 @@ impl AgentStepRunner {
             // reset. An empty title falls back (inside the loop) to the
             // step prompt's goal line rather than fabricating a header.
             task_anchor: Some(request.item_title.clone()).filter(|t| !t.trim().is_empty()),
+            // The RUN's breaker ledger, shared for the same structural reason
+            // `discovered_tools` is: this runner is one object for the whole
+            // run, while each step gets a fresh `RunState`. Per step, a model
+            // repeating itself 2-3 times never reached the breaker threshold
+            // and the counter reset at every boundary (observed live
+            // 2026-08-02, session 05775d1d: 22 steps, 79 identical
+            // `explore {}` calls, 3 short-circuits).
+            repeat_ledger: Some(Arc::clone(&self.repeat_ledger)),
             initial_active_tools: active,
             restrict_to_active_tools: restrict_to_active,
             is_sub_agent: true,

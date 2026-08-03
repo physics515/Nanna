@@ -386,6 +386,9 @@ impl ControlPlane {
                 );
                 let runner = AgentStepRunner {
                     discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+                    // One ledger for the whole background run — a long-horizon
+                    // run is exactly where a per-step reset hurts most.
+                    repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
                     router: router.clone(),
                     tools: tools.clone(),
                     agent_config: agent.agent_config().await,
