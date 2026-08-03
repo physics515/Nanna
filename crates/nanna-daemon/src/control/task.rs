@@ -9,6 +9,10 @@ use nanna_storage::{NewTask, TaskPatch};
 impl ControlPlane {
     /// Resolve `(scope, scope_id)` for a task action. Workspace scope binds
     /// to the active workspace; session scope requires an explicit id.
+    ///
+    /// Control-plane clients have no session of their own to fall back on
+    /// (unlike a tool call, where the bridge supplies the running session), so
+    /// the error names the field to send and the scopes that need no id.
     async fn resolve_task_scope(
         &self,
         scope: Option<&str>,
@@ -17,9 +21,12 @@ impl ControlPlane {
         let scope = scope.unwrap_or("session").to_lowercase();
         match scope.as_str() {
             "session" => {
-                let session_id = session_id
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "session scope requires session_id".to_string())?;
+                let session_id = session_id.filter(|s| !s.is_empty()).ok_or_else(|| {
+                    "session scope requires a session id — send \"session_id\": \"<id>\" with \
+                     this task action, or use \"scope\": \"workspace\" (the active workspace) \
+                     or \"scope\": \"global\""
+                        .to_string()
+                })?;
                 Ok(("session".to_string(), Some(session_id.to_string())))
             }
             "workspace" => {

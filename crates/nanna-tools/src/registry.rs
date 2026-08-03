@@ -15,6 +15,26 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "scripting")]
 use crate::skills::load_skill_with_services;
 
+tokio::task_local! {
+    /// The session the *currently executing run* belongs to.
+    ///
+    /// A `ToolRegistry` is process-wide and its `session_id` field is one slot:
+    /// last writer wins. That is survivable for interactive chat, where the
+    /// bound session is simply "the session the user is in", but it is the
+    /// wrong shape for runs that OVERLAP — and they do, by design. A chat turn
+    /// claims per-session (`run_chat_turn`) and rebinds the registry
+    /// immediately, so a chat can start while a scheduled run is mid-flight.
+    /// Anything that wrote the slot on entry and restored it on exit would then
+    /// hand the live chat's binding back to a scheduled session that has ended,
+    /// and the next session-scoped tool call would be attributed to the wrong
+    /// session.
+    ///
+    /// A task-local has no slot to fight over: the value rides with the run's
+    /// future, so each run reads its own and none can clobber another's. Set it
+    /// with [`ToolRegistry::with_run_session`].
+    static RUN_SESSION_ID: String;
+}
+
 /// Registry of available tools
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
@@ -68,7 +88,11 @@ impl ToolRegistry {
     /// Set the default working directory for tool execution.
     /// Called when the active workspace changes.
     pub async fn set_default_workdir(&self, workdir: Option<std::path::PathBuf>) {
-        // Also set for the current session if one is active
+        // Also set for the current session if one is active. Deliberately the
+        // SHARED binding, not `current_session_id()`: this is a control-plane
+        // call (workspace activation, chat setup) made from outside any run, so
+        // a run scope is never in effect here, and pinning a workspace root to
+        // a transient `scheduled-<id>` would leave an entry nothing clears.
         if let Some(ref sid) = *self.session_id.read().await {
             if let Some(ref wd) = workdir {
                 self.session_workdirs
@@ -83,8 +107,10 @@ impl ToolRegistry {
     /// Get the current default working directory.
     /// Returns the per-session workdir if available, otherwise the global default.
     pub async fn default_workdir(&self) -> Option<std::path::PathBuf> {
-        // Per-session workdir takes priority
-        if let Some(ref sid) = *self.session_id.read().await {
+        // Per-session workdir takes priority — keyed on the session THIS run is
+        // executing as, so a scheduled run does not inherit the workdir of
+        // whichever chat happens to own the shared binding.
+        if let Some(ref sid) = self.current_session_id().await {
             if let Some(wd) = self.session_workdirs.read().await.get(sid) {
                 return Some(wd.clone());
             }
@@ -107,13 +133,55 @@ impl ToolRegistry {
 
     /// Set the current session ID.
     /// Called when an agent session starts or changes.
+    ///
+    /// This is the *shared* binding — the session the daemon is interactively
+    /// in. A run that merely overlaps that session (a scheduled task, a
+    /// heartbeat) must NOT write here; it scopes itself with
+    /// [`Self::with_run_session`] instead.
     pub async fn set_session_id(&self, session_id: Option<String>) {
         *self.session_id.write().await = session_id;
     }
 
     /// Get the current session ID.
+    ///
+    /// A run-scoped binding from [`Self::with_run_session`] wins over the
+    /// shared one, so a scheduled run reads its own session even while a chat
+    /// turn owns the shared slot.
     pub async fn session_id(&self) -> Option<String> {
+        self.current_session_id().await
+    }
+
+    /// The session in effect for the caller: the run-scoped binding when the
+    /// caller is inside one, the shared binding otherwise.
+    async fn current_session_id(&self) -> Option<String> {
+        if let Ok(session_id) = RUN_SESSION_ID.try_with(Clone::clone) {
+            return Some(session_id);
+        }
         self.session_id.read().await.clone()
+    }
+
+    /// Run `future` with `session_id` as the session every tool call inside it
+    /// scopes to, leaving the shared binding untouched.
+    ///
+    /// Use this for a run that is not the session the daemon is bound to — a
+    /// scheduled task or a heartbeat, work that can overlap a live chat.
+    /// Session-scoped tools (`todo` above all) read their scope from
+    /// `Nanna.sessionId()`, which is this value; the scheduler used to call
+    /// `agent.chat(&session_id, ..)` without supplying it at all, so
+    /// `Nanna.sessionId()` was null and every session-scoped `todo` call died
+    /// on "session scope requires session_id" (35 logged failures 2026-07-28 ..
+    /// 07-31, all of them `scheduled-heartbeat-*`).
+    ///
+    /// The binding covers the whole future and nothing else: the agent loop
+    /// executes tool calls inline (it never `spawn`s one onto another task), so
+    /// [`Self::session_id`] resolves to `session_id` throughout the run, and a
+    /// concurrently polled chat future in the same task still reads the shared
+    /// binding.
+    pub async fn with_run_session<F>(session_id: String, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        RUN_SESSION_ID.scope(session_id, future).await
     }
 
     /// Register a tool
@@ -1240,5 +1308,98 @@ mod tests {
 
         reg.set_policy(ToolPolicy::deny_only(["exec"])).await;
         assert!(!reg.policy().await.permits("exec"));
+    }
+
+    // --- run-scoped session ---
+
+    #[tokio::test]
+    async fn a_run_scoped_session_wins_and_leaves_the_shared_binding_alone() {
+        let reg = ToolRegistry::new();
+        reg.set_session_id(Some("chat-a".to_string())).await;
+
+        let seen =
+            ToolRegistry::with_run_session("scheduled-run".to_string(), reg.session_id()).await;
+
+        assert_eq!(
+            seen.as_deref(),
+            Some("scheduled-run"),
+            "inside a run scope, tools must read the run's session"
+        );
+        assert_eq!(
+            reg.session_id().await.as_deref(),
+            Some("chat-a"),
+            "a run scope must leave the shared binding exactly as it found it"
+        );
+    }
+
+    /// With no run scope there is nothing to prefer, so the shared binding
+    /// still answers — chat and sub-agent paths are unchanged by this.
+    #[tokio::test]
+    async fn outside_a_run_scope_the_shared_binding_still_answers() {
+        let reg = ToolRegistry::new();
+        assert_eq!(reg.session_id().await, None);
+
+        reg.set_session_id(Some("chat-a".to_string())).await;
+        assert_eq!(reg.session_id().await.as_deref(), Some("chat-a"));
+    }
+
+    /// Two runs in flight at once — a heartbeat and a sub-agent — over a third
+    /// session that owns the shared binding. Each must read only its own, in
+    /// both directions, with no ordering assumption between them.
+    #[tokio::test]
+    async fn overlapping_runs_each_read_their_own_session() {
+        let reg = Arc::new(ToolRegistry::new());
+        reg.set_session_id(Some("chat-a".to_string())).await;
+
+        let both_started = Arc::new(tokio::sync::Barrier::new(2));
+
+        let one = {
+            let (reg, gate) = (reg.clone(), both_started.clone());
+            async move {
+                gate.wait().await;
+                reg.session_id().await
+            }
+        };
+        let two = {
+            let (reg, gate) = (reg.clone(), both_started.clone());
+            async move {
+                gate.wait().await;
+                reg.session_id().await
+            }
+        };
+
+        let (one_seen, two_seen) = tokio::join!(
+            ToolRegistry::with_run_session("scheduled-heartbeat".to_string(), one),
+            ToolRegistry::with_run_session("sub-agent".to_string(), two),
+        );
+
+        assert_eq!(one_seen.as_deref(), Some("scheduled-heartbeat"));
+        assert_eq!(two_seen.as_deref(), Some("sub-agent"));
+        assert_eq!(reg.session_id().await.as_deref(), Some("chat-a"));
+    }
+
+    /// The per-session workdir is keyed on the same answer, so a run must not
+    /// pick up the working directory of whichever chat owns the shared binding.
+    #[tokio::test]
+    async fn a_run_scope_does_not_inherit_the_bound_chats_workdir() {
+        let reg = ToolRegistry::new();
+        reg.set_session_id(Some("chat-a".to_string())).await;
+        reg.set_session_workdir("chat-a", std::path::PathBuf::from("/chat-a"))
+            .await;
+        *reg.default_workdir.write().await = Some(std::path::PathBuf::from("/default"));
+
+        assert_eq!(
+            reg.default_workdir().await,
+            Some(std::path::PathBuf::from("/chat-a"))
+        );
+
+        let seen =
+            ToolRegistry::with_run_session("scheduled-run".to_string(), reg.default_workdir()).await;
+        assert_eq!(
+            seen,
+            Some(std::path::PathBuf::from("/default")),
+            "a scheduled run has no workdir of its own and must fall back to the \
+             global default, not borrow an unrelated chat's"
+        );
     }
 }

@@ -50,6 +50,11 @@ const TASK_NEXT_SKIP_MAX: usize = 100;
 // ---------------------------------------------------------------------------
 
 /// Resolve `(scope, scope_id)` from service params + the active workspace.
+///
+/// A call from inside a session never reaches the missing-id error: the
+/// scripting bridge fills `session_id` from the session the tool is running
+/// in. Only a caller with no session context at all gets here, so the message
+/// names both ways out instead of just restating the requirement.
 async fn resolve_scope(
     params: &Value,
     workspace_id: &Arc<RwLock<Option<String>>>,
@@ -65,7 +70,12 @@ async fn resolve_scope(
                 .get("session_id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "session scope requires session_id".to_string())?;
+                .ok_or_else(|| {
+                    "session scope needs a session id and this caller has none — pass \
+                     session_id explicitly, or use scope 'workspace' (the active workspace) \
+                     or scope 'global'"
+                        .to_string()
+                })?;
             Ok(("session".to_string(), Some(session_id.to_string())))
         }
         "workspace" => {
@@ -144,17 +154,14 @@ fn opt_string(params: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Canonicalize an acceptance payload through the harness parser so a shape
-/// that would fail at run time is rejected at write time instead of wedging
-/// every future run in the scope.
+/// Canonicalize an acceptance payload through the shared entry point so a
+/// shape that would fail at run time is rejected at write time instead of
+/// wedging every future run in the scope — and so what is persisted is the
+/// canonical object, identical to what the planner admits and what `create`
+/// stores.
 fn canonical_acceptance(params: &Value) -> Result<Option<Value>, String> {
     match params.get("acceptance").filter(|v| !v.is_null()) {
-        Some(raw) => {
-            let check = AcceptanceCheck::from_json(raw)?;
-            serde_json::to_value(&check)
-                .map(Some)
-                .map_err(|e| e.to_string())
-        }
+        Some(raw) => AcceptanceCheck::canonicalize(raw).map(Some),
         None => Ok(None),
     }
 }
@@ -5079,6 +5086,224 @@ impl TaskRunManager {
                 resumes,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod acceptance_canonicalization_tests {
+    use super::{canonical_acceptance, seed_plan};
+    use nanna_agent::harness::AcceptanceCheck;
+    use nanna_agent::{Plan, PlanOrigin, parse_plan};
+    use nanna_storage::Storage;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// REGRESSION: an acceptance check handed over as a JSON *string* — the
+    /// dialect models actually emit — must reach the harness as a real check.
+    ///
+    /// Tolerating the string only in the READER admitted it at the planner and
+    /// then had `create` reject it (`value.get("kind")` is None for a string),
+    /// so the task was silently skipped; if every planned item was stringified
+    /// the whole turn died with "no planned task could be created". The write
+    /// boundary canonicalizes, so the store only ever holds the object.
+    #[tokio::test]
+    async fn a_stringified_acceptance_survives_planner_seed_store_and_harness_read() {
+        let raw = r#"[{"title":"make it build",
+                       "acceptance":"{\"kind\":\"command\",\"command\":\"cargo build\"}"}]"#;
+        let tasks = parse_plan(raw).expect("the plan parses");
+        assert_eq!(tasks.len(), 1);
+
+        // 1. Planner admission holds the canonical OBJECT, not the raw string.
+        let admitted = tasks[0]
+            .acceptance
+            .as_ref()
+            .expect("a stringified check must still be admitted");
+        assert!(
+            admitted.is_object(),
+            "the planner must admit the canonical object: {admitted}"
+        );
+
+        // 2. Seeding creates the task instead of dropping it.
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let plan = Plan {
+            tasks,
+            origin: PlanOrigin::Model,
+        };
+        let ids = seed_plan(&storage, "session", Some("sess-plan"), &plan, false)
+            .await
+            .expect("a stringified acceptance must not sink the plan");
+        assert_eq!(ids.len(), 1, "the planned task was created");
+
+        // 3. The STORED row is an object.
+        let stored = storage.tasks().get(ids[0]).await.expect("stored task");
+        let acceptance = stored.acceptance.expect("acceptance persisted");
+        assert!(
+            acceptance.is_object(),
+            "the store must hold an object: {acceptance}"
+        );
+        assert_eq!(acceptance["kind"], json!("command"));
+
+        // 4. The harness reads it back as a real check.
+        assert_eq!(
+            AcceptanceCheck::from_json(&acceptance).expect("harness read"),
+            AcceptanceCheck::Command {
+                command: "cargo build".to_string(),
+                timeout_secs: None,
+            }
+        );
+    }
+
+    /// The `tasks.add`/`tasks.update` script services canonicalize through the
+    /// same entry point, so a stringified check written by the todo tool is
+    /// stored identically to one written by the planner.
+    #[tokio::test]
+    async fn the_task_services_canonicalize_the_same_way() {
+        let canonical = canonical_acceptance(&json!({
+            "acceptance": "{kind: 'regex', pattern: '0 failed', command: 'cargo test'}"
+        }))
+        .expect("the JS-object-literal flavor is repaired")
+        .expect("an acceptance was present");
+        assert!(canonical.is_object(), "{canonical}");
+        assert_eq!(canonical["kind"], json!("regex"));
+
+        // And the store accepts exactly what was canonicalized.
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let mut new = nanna_storage::NewTask {
+            parent_id: None,
+            scope: "global".to_string(),
+            scope_id: None,
+            project: None,
+            title: "canonical".to_string(),
+            description: None,
+            priority: 2,
+            labels: Vec::new(),
+            tool_scope: Vec::new(),
+            due_at: None,
+            recurrence: None,
+            depends_on: Vec::new(),
+            acceptance: Some(canonical),
+            assignee: None,
+            sort_order: 0,
+        };
+        let created = storage.tasks().create(new.clone()).await.expect("create");
+        assert!(created.acceptance.expect("stored").is_object());
+
+        // The raw string form goes in too — canonicalized at the boundary.
+        new.title = "raw string".to_string();
+        new.acceptance = Some(json!("{\"kind\":\"file_exists\",\"path\":\"out.txt\"}"));
+        let created = storage.tasks().create(new).await.expect("create");
+        let stored = created.acceptance.expect("stored");
+        assert_eq!(stored, json!({"kind": "file_exists", "path": "out.txt"}));
+    }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::{build_task_services, TurnBaselines};
+    use nanna_storage::Storage;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    // -----------------------------------------------------------------
+    // Session scope, against the params the todo tool ACTUALLY emits
+    //
+    // `todo/tool.ts` calls `Nanna.sessionId()` and forwards the result on
+    // every scope-carrying call. That produces exactly two shapes, and both
+    // are exercised below:
+    //   bound run    -> {"scope":"session","session_id":"<id>", ...}
+    //   session-less -> `Nanna.sessionId()` is JS null, so `base` carries
+    //                   `"session_id": null` and `compact()` (which drops
+    //                   null) omits the key entirely on add/update.
+    // -----------------------------------------------------------------
+
+    fn services_over(storage: &Arc<Storage>) -> nanna_scripting::NannaBridge {
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(TurnBaselines::new()),
+        );
+        nanna_scripting::NannaBridge::new(nanna_scripting::ToolPermissions::default())
+            .with_services(services)
+    }
+
+    /// The shape a run WITH a bound session emits: scope and session_id both
+    /// present, straight from `Nanna.sessionId()`. It lands in that session.
+    #[tokio::test]
+    async fn the_todo_tools_bound_session_params_land_in_that_session() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let bridge = services_over(&storage);
+
+        let added = bridge
+            .call_service(
+                "tasks.add",
+                json!({
+                    "scope": "session",
+                    "session_id": "scheduled-heartbeat-1",
+                    "title": "write the parser"
+                }),
+            )
+            .await
+            .expect("the tool's own params shape must be accepted");
+        assert_eq!(added["task"]["scope"], json!("session"));
+
+        let listed = storage
+            .tasks()
+            .list("session", Some("scheduled-heartbeat-1"), true)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1, "the task landed in the calling session");
+        assert_eq!(listed[0].title, "write the parser");
+    }
+
+    /// The shape a SESSION-LESS run emits on `next`/`list`: `session_id` is
+    /// present but null, because `Nanna.sessionId()` returned null and `base`
+    /// is not compacted. It must fail with a message that names every way out
+    /// — restating "requires session_id" is precisely what the model could not
+    /// act on across 35 logged failures.
+    #[tokio::test]
+    async fn a_null_session_id_is_told_how_to_supply_a_scope() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let bridge = services_over(&storage);
+
+        let err = bridge
+            .call_service("tasks.next", json!({"scope": "session", "session_id": null}))
+            .await
+            .expect_err("no session anywhere: the caller must be told");
+        assert!(err.contains("session_id"), "{err}");
+        assert!(err.contains("workspace"), "names the id-free scopes: {err}");
+        assert!(err.contains("global"), "{err}");
+    }
+
+    /// The same session-less run on `add`, where `compact()` drops the null
+    /// and the key is absent altogether. Same teaching error.
+    #[tokio::test]
+    async fn an_absent_session_id_is_told_how_to_supply_a_scope() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let bridge = services_over(&storage);
+
+        let err = bridge
+            .call_service("tasks.add", json!({"scope": "session", "title": "x"}))
+            .await
+            .expect_err("compact() drops the null id, so the key is missing");
+        assert!(err.contains("session_id"), "{err}");
+        assert!(err.contains("workspace"), "{err}");
+        assert!(err.contains("global"), "{err}");
+    }
+
+    /// The id-free escapes the error names have to actually work, or the
+    /// message is teaching a dead end.
+    #[tokio::test]
+    async fn the_scopes_the_error_names_are_usable_without_an_id() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let bridge = services_over(&storage);
+
+        bridge
+            .call_service("tasks.add", json!({"scope": "global", "title": "global work"}))
+            .await
+            .expect("global scope needs no id");
+        let listed = storage.tasks().list("global", None, true).await.expect("list");
+        assert_eq!(listed.len(), 1);
     }
 }
 

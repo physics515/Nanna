@@ -58,3 +58,34 @@ fn every_default_skill_parameters_block_parses() {
     assert!(checked > 0, "no default skills were checked");
     eprintln!("checked {checked} skills, {with_params} with parameter schemas");
 }
+
+/// The todo skill's `acceptance` description must carry the object shapes all
+/// the way into the extracted schema. A description is the cheapest place to
+/// prevent a malformed call, and it prevents nothing if the manifest parser
+/// drops it: 121 logged todo failures passed the object as a string.
+#[test]
+fn todo_acceptance_description_shows_every_valid_shape() {
+    let tool_ts = skills_dir().join("todo").join("tool.ts");
+    if !tool_ts.is_file() {
+        eprintln!("skipping: {} not present", tool_ts.display());
+        return;
+    }
+    let source = std::fs::read_to_string(&tool_ts).expect("read todo/tool.ts");
+    let manifest = nanna_scripting::extract_manifest(&source).expect("todo manifest extracts");
+    let acceptance = manifest
+        .parameters
+        .as_ref()
+        .and_then(|p| p.get("properties"))
+        .and_then(|p| p.get("acceptance"))
+        .expect("acceptance parameter survives extraction");
+    assert_eq!(acceptance["type"], serde_json::json!("object"));
+    let description = acceptance["description"].as_str().expect("a description");
+    for shape in [
+        r#"{"kind":"command","command":"cargo test"}"#,
+        r#"{"kind":"file_exists","path":"docs/plan.md"}"#,
+        r#"{"kind":"regex","pattern":"0 failed","path":"build.log"}"#,
+        r#"{"kind":"regex","pattern":"0 failed","command":"cargo test"}"#,
+    ] {
+        assert!(description.contains(shape), "must show {shape}: {description}");
+    }
+}

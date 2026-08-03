@@ -1,6 +1,6 @@
 export default {
   name: "todo",
-  version: "0.2.0",
+  version: "0.2.1",
   description: "Agent-grade task store. Track and drive multi-step work: 'next' returns the ONE actionable task (unblocked, highest priority), 'add' creates tasks (with parent_id for subtasks, depends_on for ordering, acceptance for a machine-checkable done condition), 'done' completes a task (its acceptance check is verified by the harness first), 'note' saves findings for future steps, 'query' filters (e.g. 'p1 & !done', '@label', 'overdue'). Tasks persist across sessions via scope: session (default), workspace, or global.",
   output: "context",
   parameters: {
@@ -24,7 +24,14 @@ export default {
       depends_on: { type: "array", items: { type: "integer" }, description: "Task ids that must complete first. Blocked status is derived from this" },
       acceptance: {
         type: "object",
-        description: "Machine-checkable done condition, verified by the harness: {kind:'command', command:'...'} (exit 0), {kind:'file_exists', path:'...'}, or {kind:'regex', pattern:'...', path|command:'...'}"
+        description: 'Machine-checkable done condition, verified by the harness. Pass an OBJECT, never a string (a quoted "{...}" is rejected). Exactly one of: {"kind":"command","command":"cargo test"} (passes when it exits 0), {"kind":"file_exists","path":"docs/plan.md"}, {"kind":"regex","pattern":"0 failed","path":"build.log"}, or {"kind":"regex","pattern":"0 failed","command":"cargo test"} — regex always needs a path OR a command. Optional on command and regex: "timeout_secs": 120',
+        properties: {
+          kind: { type: "string", enum: ["command", "file_exists", "regex"] },
+          command: { type: "string" },
+          path: { type: "string" },
+          pattern: { type: "string" },
+          timeout_secs: { type: "integer" }
+        }
       },
       content: { type: "string", description: "Note content (for note action)" },
       filter: { type: "string", description: "Query filter: & | ! (), p1..p4, @label, #project, overdue, today, no date, due before: DATE, search: text, subtask, blocked, done, pending, in_progress" },

@@ -1687,7 +1687,23 @@ impl DaemonServer {
                             // vs the 5-min idle threshold, and memory pressure
                             // still overrides, so dreaming is not starved.
                             activity.record();
-                            match agent.chat(&session_id, &task.payload, None, &[]).await {
+                            // Session-scoped tools resolve their scope from the
+                            // registry, not from the prompt: without this every
+                            // `todo` call in a scheduled run failed with
+                            // "session scope requires session_id" (35 logged
+                            // failures, all of them heartbeats). The scope is
+                            // carried by the run's own future rather than
+                            // written into the shared binding — the idle gate
+                            // above stops a scheduled run STARTING during a
+                            // live run, but a chat can still start during THIS
+                            // one, and the two must not see each other's
+                            // session.
+                            let outcome = ToolRegistry::with_run_session(
+                                session_id.clone(),
+                                agent.chat(&session_id, &task.payload, None, &[]),
+                            )
+                            .await;
+                            match outcome {
                                 Ok(result) => {
                                     let heartbeat_ok = task.name == "heartbeat"
                                         && result.content.trim().contains("HEARTBEAT_OK");
@@ -3328,6 +3344,77 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION: a scheduled run must see its own session — every one of the
+    /// 35 logged "session scope requires session_id" `todo` failures came from
+    /// a `scheduled-heartbeat-*` run that had a session id all along, it just
+    /// never reached the registry `Nanna.sessionId()` reads.
+    ///
+    /// And it must see ONLY its own. The scheduler's idle gate
+    /// (`agent.any_run_active()`) stops a scheduled run from STARTING during a
+    /// live run; it does not stop a chat turn from starting during a scheduled
+    /// run, because a chat claims per-session and rebinds the registry at once.
+    /// This is the shape that arrangement produces: chat-a is bound, the
+    /// heartbeat starts, chat-b starts mid-heartbeat. Nothing here may leave
+    /// the heartbeat reading chat-b's session, chat-b reading the heartbeat's,
+    /// or — the failure mode of a save/restore binding — chat-b's binding
+    /// replaced by the dead chat-a when the heartbeat ends.
+    #[tokio::test]
+    async fn a_scheduled_run_and_a_concurrent_chat_keep_their_own_sessions() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.set_session_id(Some("chat-a".to_string())).await;
+
+        // Barriers pin the interleaving so this fails for the right reason
+        // rather than by timing luck: `chat_started` puts chat-b's rebind
+        // strictly inside the heartbeat, `both_read` holds the heartbeat open
+        // until chat-b has read.
+        let chat_started = Arc::new(tokio::sync::Barrier::new(2));
+        let both_read = Arc::new(tokio::sync::Barrier::new(2));
+
+        let heartbeat = {
+            let (tools, chat_started, both_read) =
+                (tools.clone(), chat_started.clone(), both_read.clone());
+            async move {
+                chat_started.wait().await;
+                let seen = tools.session_id().await;
+                both_read.wait().await;
+                seen
+            }
+        };
+
+        let chat = {
+            let (tools, chat_started, both_read) =
+                (tools.clone(), chat_started.clone(), both_read.clone());
+            async move {
+                tools.set_session_id(Some("chat-b".to_string())).await;
+                chat_started.wait().await;
+                let seen = tools.session_id().await;
+                both_read.wait().await;
+                seen
+            }
+        };
+
+        let (heartbeat_seen, chat_seen) = tokio::join!(
+            ToolRegistry::with_run_session("scheduled-heartbeat".to_string(), heartbeat),
+            chat,
+        );
+
+        assert_eq!(
+            heartbeat_seen.as_deref(),
+            Some("scheduled-heartbeat"),
+            "the scheduled run's tools must see the run's own session"
+        );
+        assert_eq!(
+            chat_seen.as_deref(),
+            Some("chat-b"),
+            "a chat starting mid-run must not be attributed to the scheduled run"
+        );
+        assert_eq!(
+            tools.session_id().await.as_deref(),
+            Some("chat-b"),
+            "the ended run must not hand the live chat's binding back to a dead session"
+        );
+    }
 
     #[test]
     fn channel_webhook_secrets_flow_into_webhook_config() {

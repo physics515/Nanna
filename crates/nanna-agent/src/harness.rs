@@ -85,10 +85,41 @@ pub struct AcceptanceVerdict {
     pub detail: String,
 }
 
+// Every canonical acceptance shape, quoted verbatim in every parse error.
+// Defined by the store — the write boundary owns what an acceptance check
+// looks like — and used here so the reader's errors and the writer's errors
+// can never drift apart.
+use nanna_storage::ACCEPTANCE_SHAPES;
+
 impl AcceptanceCheck {
+    /// Normalize an acceptance payload to the object the store holds, without
+    /// interpreting it as a typed check.
+    ///
+    /// This is the SAME normalization `create`/`update` apply, so anything
+    /// admitted here is admitted by the store: an admission that used a looser
+    /// rule than the write path silently dropped the task instead of running
+    /// it.
+    ///
+    /// # Errors
+    /// Returns a shape-carrying message when the payload cannot be normalized.
+    pub fn canonicalize(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let check = Self::from_json(value)?;
+        // Round-tripping through the typed check is what makes the result
+        // canonical rather than merely object-shaped: unknown keys are gone,
+        // absent options are absent, and `timeout_secs` is an integer.
+        serde_json::to_value(&check)
+            .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
+    }
+
     /// Parse the store's acceptance JSON (`{kind: ..., ...}`).
+    ///
+    /// Tolerates the one dialect models actually emit — the object handed over
+    /// as a JSON *string* — by deferring to the store's own normalization, so
+    /// the reader never accepts a shape the writer would reject.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
-        serde_json::from_value(value.clone()).map_err(|e| format!("invalid acceptance check: {e}"))
+        let canonical = nanna_storage::canonicalize_acceptance(value)?;
+        serde_json::from_value(canonical)
+            .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
     }
 
     /// Short human-readable description for the step prompt.
@@ -1722,6 +1753,91 @@ mod tests {
         .unwrap();
         assert!(matches!(re, AcceptanceCheck::Regex { .. }));
         assert!(AcceptanceCheck::from_json(&serde_json::json!({"kind": "vibes"})).is_err());
+    }
+
+    #[test]
+    fn acceptance_accepts_the_object_handed_over_as_a_string() {
+        // The dominant live failure: the model serializes the object itself.
+        let cmd = AcceptanceCheck::from_json(&serde_json::json!(
+            "{\"kind\": \"command\", \"command\": \"cargo check --all\"}"
+        ))
+        .expect("stringified command check");
+        assert_eq!(
+            cmd,
+            AcceptanceCheck::Command {
+                command: "cargo check --all".to_string(),
+                timeout_secs: None,
+            }
+        );
+
+        let file =
+            AcceptanceCheck::from_json(&serde_json::json!("{\"kind\":\"file_exists\",\"path\":\"out.txt\"}"))
+                .expect("stringified file_exists check");
+        assert_eq!(
+            file,
+            AcceptanceCheck::FileExists {
+                path: "out.txt".to_string(),
+            }
+        );
+
+        let re = AcceptanceCheck::from_json(&serde_json::json!(
+            "{\"kind\":\"regex\",\"pattern\":\"0 failed\",\"command\":\"cargo test\",\"timeout_secs\":30}"
+        ))
+        .expect("stringified regex check");
+        assert_eq!(
+            re,
+            AcceptanceCheck::Regex {
+                pattern: "0 failed".to_string(),
+                path: None,
+                command: Some("cargo test".to_string()),
+                timeout_secs: Some(30),
+            }
+        );
+    }
+
+    #[test]
+    fn acceptance_repairs_the_js_object_literal_flavor() {
+        let check = AcceptanceCheck::from_json(&serde_json::json!(
+            "{kind: 'command', command: 'cargo test -p nanna-agent', timeout_secs: 45}"
+        ))
+        .expect("unquoted keys + single-quoted values repair");
+        assert_eq!(
+            check,
+            AcceptanceCheck::Command {
+                command: "cargo test -p nanna-agent".to_string(),
+                timeout_secs: Some(45),
+            }
+        );
+
+        // Where a bare VALUE ends is a guess, so repair refuses and teaches
+        // instead of inventing a check the model never wrote.
+        let err = AcceptanceCheck::from_json(&serde_json::json!(
+            "{kind: command, command: cargo check --all}"
+        ))
+        .expect_err("bare values are not repairable");
+        assert!(err.contains(r#"{"kind":"command","command":"cargo test"}"#), "{err}");
+    }
+
+    #[test]
+    fn acceptance_errors_show_the_expected_shapes() {
+        // Double-encoded: one unwrap leaves a string, which is still not a check.
+        let err = AcceptanceCheck::from_json(&serde_json::json!(
+            "\"{\\\"kind\\\":\\\"command\\\",\\\"command\\\":\\\"cargo test\\\"}\""
+        ))
+        .expect_err("double-encoded acceptance must be rejected");
+        for shape in [
+            r#"{"kind":"command","command":"cargo test"}"#,
+            r#"{"kind":"file_exists","path":"docs/plan.md"}"#,
+            r#"{"kind":"regex","pattern":"0 failed","path":"build.log"}"#,
+            r#"{"kind":"regex","pattern":"0 failed","command":"cargo test"}"#,
+        ] {
+            assert!(err.contains(shape), "error must show {shape}: {err}");
+        }
+
+        // A genuine object with the wrong kind teaches the same way.
+        let err = AcceptanceCheck::from_json(&serde_json::json!({"kind": "vibes"}))
+            .expect_err("unknown kind must be rejected");
+        assert!(err.contains(r#"{"kind":"file_exists","path":"docs/plan.md"}"#), "{err}");
     }
 
     #[tokio::test]
