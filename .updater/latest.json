@@ -1,11 +1,11 @@
 {
-  "version": "0.3.0",
-  "notes": "Public Beta 4 \u2014 long-horizon hardening: context sizing, paged tool discovery, OpenRouter decode + rate-limit stack, workspace sync, Stop/bubbles/explore fixes",
-  "pub_date": "2026-07-31T21:22:49.000Z",
+  "version": "0.3.1",
+  "notes": "Public Beta 5 — long-horizon reliability: mission convergence on the environment, small-model stall control, adaptive context under VRAM pressure, abortive Stop, no orphaned processes, todo dialect tolerance",
+  "pub_date": "2026-08-03T22:02:59.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXNUK3I2U1dqQ0Q5dFlwZ1NsYTdSaFFsRU1QeEdGVUticWdmeXorVDJKMEYxczd2ZmJWZTlaOUgvbWMxaDJmYU9xaTlVSkFOcVFhbER3eUJEMkh5NFE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1NTMyMjk3CWZpbGU6TmFubmFfMC4zLjBfeDY0LXNldHVwLmV4ZQpBUS9yNUhTM1FkbGFzVEd4Z0ZBRFlLVEVtOERNWGtvcFZ6dlBKNUsyV1lSbHRDRlYyNnB6dVNlUjlhSFlOcWNmNlNxdHBCWnpuYythaTZqWWdoNmtCZz09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.0-beta.4/Nanna_0.3.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWp4QUtkMDVpSm51d0pDZkZHSjhXOEpXZDBaZi9WNEt3ZXBaL2RXbmRCbFF3THRPZXA3QnMrakJQaVh2UlVVTGVDRFFwYVJQNUMxcGlXbFBwVGNpU3dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1Nzk0NDk1CWZpbGU6TmFubmFfMC4zLjFfeDY0LXNldHVwLmV4ZQpHcktQN3FuTnptdlZQb2ZEUmtHdDNJd0VsZEtNUlgrdENuSHVMRHVtcit1Wi92OHJHb25IdVJJYUNjRVVIZmNZS1pHbGhUbXo0U1NVdHNlT01zSTFEUT09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.1-beta.5/Nanna_0.3.1_x64-setup.exe"
     }
   }
 }
