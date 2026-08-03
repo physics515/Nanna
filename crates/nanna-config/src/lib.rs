@@ -78,8 +78,10 @@ pub struct Config {
     pub channels: ChannelsConfig,
     /// Tool settings
     pub tools: ToolsConfig,
-    /// Memory settings  
+    /// Memory settings
     pub memory: MemoryConfig,
+    /// Background scheduler settings (heartbeat + cron runner)
+    pub scheduler: SchedulerConfig,
 }
 
 
@@ -390,6 +392,50 @@ impl Default for ToolsConfig {
             brave_api_key: None,
             use_script_tools: true,
             tools_dir: None,
+        }
+    }
+}
+
+/// Background scheduler settings.
+///
+/// Since P16 the daemon is the only mode, so the daemon's scheduler is *the*
+/// scheduler and this section is the only thing that configures it. These are
+/// the three knobs behind Settings → Scheduler in the GUI; the daemon applies
+/// them to the running loop on config reload, so no restart is needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulerConfig {
+    /// Master switch. `false` leaves cron jobs loaded and editable but fires
+    /// nothing: no heartbeat, no cron, no memory consolidation, no recurrence
+    /// sweep.
+    pub enabled: bool,
+
+    /// Whether the periodic heartbeat prompt runs.
+    ///
+    /// A heartbeat is a full agent turn against the *same* model chat uses.
+    /// With a single-slot local backend, a heartbeat firing mid-conversation
+    /// time-shares the slot, the in-flight generation is cancelled, and the
+    /// client sees a stream that ended without `done=true` — a fault the
+    /// harness then spends its retry budget healing. Turning this off is a
+    /// prerequisite for a clean local benchmark run.
+    pub heartbeat_enabled: bool,
+
+    /// Seconds between heartbeats. Clamped up to
+    /// `nanna_core::MIN_HEARTBEAT_INTERVAL_SECS` when applied — below the
+    /// scheduler's own 30s tick resolution the period cannot be honored.
+    pub heartbeat_interval_secs: u64,
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    1800
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            heartbeat_enabled: true,
+            heartbeat_interval_secs: default_heartbeat_interval_secs(),
         }
     }
 }

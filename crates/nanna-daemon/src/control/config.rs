@@ -3,6 +3,31 @@
 use super::*;
 
 impl ControlPlane {
+    /// Push `[scheduler]` settings onto the **running** scheduler loop.
+    ///
+    /// The scheduler captures its config when it starts, so a config write
+    /// alone would only take effect at the next daemon restart. That is the
+    /// wrong latency for the heartbeat switch in particular: the heartbeat runs
+    /// a full agent turn on the same model chat uses, so on a single-slot local
+    /// backend it cancels an in-flight generation, and "turn it off" has to mean
+    /// *now* — before the benchmark run, not after a restart.
+    ///
+    /// Takes a snapshot rather than reading `self.config`, so the caller can
+    /// release its config guard first: the scheduler lock is only ever taken
+    /// with no config lock held.
+    async fn apply_scheduler_settings(&self, config: &Config) {
+        let Some(scheduler) = self.scheduler.as_ref() else {
+            return;
+        };
+        scheduler.write().await.apply_settings(
+            config.scheduler.enabled,
+            config.scheduler.heartbeat_enabled,
+            std::time::Duration::from_secs(nanna_core::clamp_heartbeat_secs(
+                config.scheduler.heartbeat_interval_secs,
+            )),
+        );
+    }
+
     // =========================================================================
     // Config Handlers
     // =========================================================================
@@ -126,6 +151,7 @@ impl ControlPlane {
                         let snapshot = config.clone();
                         drop(config);
                         self.rebuild_llm_providers(&snapshot).await;
+                        self.apply_scheduler_settings(&snapshot).await;
 
                         json!({ "status": "updated", "path": path })
                     }
@@ -164,6 +190,7 @@ impl ControlPlane {
                     let snapshot = config.clone();
                     drop(config);
                     self.rebuild_llm_providers(&snapshot).await;
+                    self.apply_scheduler_settings(&snapshot).await;
 
                     json!({ "status": "reset" })
                 }
@@ -190,10 +217,14 @@ impl ControlPlane {
 
                         // This is the reload the GUI triggers after saving a
                         // credential — the step that makes a post-boot login
-                        // actually reach the router.
+                        // actually reach the router. The Scheduler tab rides the
+                        // same hop: it saves to the shared config file and then
+                        // asks for a reload, which is what gets those toggles to
+                        // the running scheduler loop.
                         let snapshot = config.clone();
                         drop(config);
                         self.rebuild_llm_providers(&snapshot).await;
+                        self.apply_scheduler_settings(&snapshot).await;
 
                         json!({ "status": "reloaded" })
                     }
@@ -230,6 +261,7 @@ impl ControlPlane {
                         let snapshot = config.clone();
                         drop(config);
                         self.rebuild_llm_providers(&snapshot).await;
+                        self.apply_scheduler_settings(&snapshot).await;
 
                         json!({ "status": "imported" })
                     }

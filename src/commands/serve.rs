@@ -175,6 +175,9 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
         memory_min_remaining_memories: config.memory.min_remaining_memories,
         dream_idle_threshold_secs: config.memory.dream_idle_threshold_secs,
         dream_memory_pressure_count: config.memory.dream_memory_pressure_count,
+        scheduler_enabled: config.scheduler.enabled,
+        heartbeat_enabled: config.scheduler.heartbeat_enabled,
+        heartbeat_interval_secs: config.scheduler.heartbeat_interval_secs,
     };
 
     info!("Initializing daemon server...");

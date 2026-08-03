@@ -216,12 +216,15 @@ pub async fn get_extended_settings(
         })
         .unwrap_or_default();
 
-    // Runtime memory/scheduler toggles have no daemon control action yet; the
-    // daemon-only setters are no-ops, so report the enabled defaults.
+    // Dreaming has no daemon control action yet; its setter is still a no-op, so
+    // report the enabled default.
     let dreaming_enabled = true;
-    let scheduler_enabled = true;
-    let heartbeat_enabled = true;
-    let heartbeat_interval_seconds = 1800;
+    // Scheduler toggles are real settings now — read them back from the config
+    // the daemon also reads, so the switches reflect what the daemon is doing
+    // instead of hardcoded `true`s that never moved.
+    let scheduler_enabled = state_guard.config.scheduler.enabled;
+    let heartbeat_enabled = state_guard.config.scheduler.heartbeat_enabled;
+    let heartbeat_interval_seconds = state_guard.config.scheduler.heartbeat_interval_secs;
 
     // Embedding settings come from the config cache (the daemon reads the same file).
     let embedding_provider = state_guard.config.memory.embedding_provider.clone();

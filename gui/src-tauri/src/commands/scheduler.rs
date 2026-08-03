@@ -1,47 +1,77 @@
 //! Scheduler and cron-job commands. The daemon runs heartbeat + cron and owns
-//! the job store; these forward to it. The whole-scheduler / heartbeat runtime
-//! toggles have no daemon control action yet, so they are no-ops.
+//! the job store; these forward to it.
+//!
+//! The three whole-scheduler toggles persist to `[scheduler]` in the shared
+//! `config.toml` and then ask the daemon to reload, which re-applies them to
+//! the running scheduler loop — no daemon restart. They were no-ops before,
+//! which left the daemon's heartbeat unconditional: a heartbeat is a full agent
+//! turn on the same local model chat uses, so it would steal the single Ollama
+//! slot mid-conversation and cancel the in-flight generation.
 
 #[allow(clippy::wildcard_imports)]
 use crate::*;
 
-/// Enable/disable the scheduler.
-///
-/// No-op: the daemon owns the scheduler and exposes no enable/disable action
-/// over IPC. Kept for UI compatibility.
+/// Persist the `[scheduler]` section and make the daemon adopt it live.
+async fn save_scheduler_config(state: &mut AppState) -> Result<(), String> {
+    state.config.save().map_err(|e| {
+        warn!("Failed to save scheduler settings to config: {e}");
+        format!("Failed to save scheduler settings: {e}")
+    })?;
+    // The daemon re-reads the file and pushes the section onto its live
+    // scheduler. A failure here means the setting is saved but not yet in
+    // effect, so surface it rather than reporting success.
+    state
+        .backend
+        .config_reload()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Saved, but the daemon did not pick it up: {e}"))
+}
+
+/// Enable/disable the whole scheduler (heartbeat, cron, consolidation, sweeps).
 #[tauri::command]
 pub async fn set_scheduler_enabled(
-    _state: State<'_, Arc<RwLock<AppState>>>,
+    state: State<'_, Arc<RwLock<AppState>>>,
     enabled: bool,
 ) -> Result<(), String> {
-    info!("set_scheduler_enabled({enabled}) is a no-op in daemon-only mode (the daemon owns the scheduler)");
+    let mut state_guard = state.write().await;
+    state_guard.config.scheduler.enabled = enabled;
+    save_scheduler_config(&mut state_guard).await?;
+    info!("Scheduler enabled: {enabled}");
     Ok(())
 }
 
-/// Enable/disable the heartbeat.
-///
-/// No-op: no daemon control action for the heartbeat toggle yet.
+/// Enable/disable the periodic heartbeat.
 #[tauri::command]
 pub async fn set_heartbeat_enabled(
-    _state: State<'_, Arc<RwLock<AppState>>>,
+    state: State<'_, Arc<RwLock<AppState>>>,
     enabled: bool,
 ) -> Result<(), String> {
-    info!("set_heartbeat_enabled({enabled}) is a no-op in daemon-only mode");
+    let mut state_guard = state.write().await;
+    state_guard.config.scheduler.heartbeat_enabled = enabled;
+    save_scheduler_config(&mut state_guard).await?;
+    info!("Heartbeat enabled: {enabled}");
     Ok(())
 }
 
-/// Set the heartbeat interval.
-///
-/// No-op: no daemon control action for the heartbeat interval yet.
+/// Set the heartbeat interval, in seconds.
 #[tauri::command]
 pub async fn set_heartbeat_interval(
-    _state: State<'_, Arc<RwLock<AppState>>>,
+    state: State<'_, Arc<RwLock<AppState>>>,
     seconds: u64,
 ) -> Result<(), String> {
-    if seconds < 30 {
-        return Err("Heartbeat interval must be at least 30 seconds".to_string());
+    // Same floor the scheduler itself clamps to — reject here so the user gets
+    // a message instead of a value that is silently raised.
+    if seconds < nanna_core::MIN_HEARTBEAT_INTERVAL_SECS {
+        return Err(format!(
+            "Heartbeat interval must be at least {} seconds",
+            nanna_core::MIN_HEARTBEAT_INTERVAL_SECS
+        ));
     }
-    info!("set_heartbeat_interval({seconds}) is a no-op in daemon-only mode");
+    let mut state_guard = state.write().await;
+    state_guard.config.scheduler.heartbeat_interval_secs = seconds;
+    save_scheduler_config(&mut state_guard).await?;
+    info!("Heartbeat interval: {seconds}s");
     Ok(())
 }
 
