@@ -27,3 +27,33 @@ for (const { path, hit } of PAGES) {
     expect(textLen).toBeGreaterThan(20)
   })
 }
+
+/**
+ * Same matrix, but reached the way a user reaches it: one page load, then
+ * client-side navigation through the rail. Each route is a lazily-imported
+ * chunk, so this is the only path that exercises loading a route into an
+ * already-running shell — a failure there blanks the whole window instead of
+ * rendering a page-level error. Workspaces regressed exactly this way when
+ * `@tauri-apps/plugin-dialog` reached Vite's dep optimizer mid-session.
+ */
+const RAIL_PRIMARY = new Set(['/memory', '/tools', '/channels', '/settings'])
+
+test('client-side nav: every rail route mounts without blanking the shell', async ({ page, mock }) => {
+  await mock.gotoWithMock('/')
+
+  for (const { path, hit } of PAGES) {
+    if (path === '/') continue
+
+    if (RAIL_PRIMARY.has(path)) {
+      await page.locator(`a[href="${path}"]`).first().click()
+    } else {
+      await page.getByRole('button', { name: 'More' }).click()
+      await page.locator(`.admin-flyout a[href="${path}"]`).click()
+    }
+
+    // The rail itself carries several of these words, so scope the content
+    // assertion to <main> and confirm the route actually committed.
+    await page.waitForURL((url) => url.pathname === path, { timeout: 25_000 })
+    await expect(page.locator('main').getByText(hit).first()).toBeVisible({ timeout: 25_000 })
+  }
+})
