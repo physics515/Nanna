@@ -595,7 +595,11 @@ async function loadWorkspaces() {
   try {
     workspaces.value = await invoke<WorkspaceInfo[]>('list_workspaces')
   } catch (e) {
+    // Without this the page shows "No workspaces open" after a failed call —
+    // indistinguishable from an empty registry, and it hides the real reason
+    // the user cannot open one.
     console.error('Failed to load workspaces:', e)
+    loadError.value = e instanceof Error ? e.message : String(e)
   } finally {
     isLoading.value = false
   }
