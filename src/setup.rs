@@ -30,8 +30,11 @@ pub fn create_scheduler(
     storage: Arc<Storage>,
 ) -> Scheduler {
     let scheduler_config = SchedulerConfig {
-        heartbeat_interval: std::time::Duration::from_mins(5), // 5 minutes
-        heartbeat_enabled: true,
+        enabled: config.scheduler.enabled,
+        heartbeat_interval: std::time::Duration::from_secs(
+            nanna_core::clamp_heartbeat_secs(config.scheduler.heartbeat_interval_secs),
+        ),
+        heartbeat_enabled: config.scheduler.heartbeat_enabled,
         heartbeat_prompt: "Heartbeat: check in and review state".to_string(),
         max_concurrent: 4,
         check_interval: std::time::Duration::from_secs(30),

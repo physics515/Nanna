@@ -966,6 +966,17 @@ pub struct DaemonConfig {
     /// Live memory count that forces a dream cycle regardless of idle time
     /// (mirrors `[memory] dream_memory_pressure_count`; `0` disables).
     pub dream_memory_pressure_count: usize,
+    /// Master switch for the daemon's scheduler (mirrors `[scheduler] enabled`).
+    /// `false` loads cron jobs but fires nothing.
+    pub scheduler_enabled: bool,
+    /// Whether the periodic heartbeat runs (mirrors
+    /// `[scheduler] heartbeat_enabled`). The heartbeat drives a full agent turn
+    /// against the chat model, so on a single-slot local backend it competes
+    /// with live conversation — hence a user-visible switch.
+    pub heartbeat_enabled: bool,
+    /// Seconds between heartbeats (mirrors `[scheduler] heartbeat_interval_secs`).
+    /// Clamped up to [`nanna_core::MIN_HEARTBEAT_INTERVAL_SECS`] when applied.
+    pub heartbeat_interval_secs: u64,
 }
 
 /// LLM provider configuration (multi-provider)
@@ -1090,6 +1101,10 @@ impl Default for DaemonConfig {
             // Mirror DreamingConfig::default() (== nanna-config defaults).
             dream_idle_threshold_secs: 300,
             dream_memory_pressure_count: 5000,
+            // Mirror nanna_config::SchedulerConfig::default().
+            scheduler_enabled: true,
+            heartbeat_enabled: true,
+            heartbeat_interval_secs: 1800,
         }
     }
 }
@@ -1452,9 +1467,16 @@ impl DaemonServer {
         // Loads persisted jobs and runs heartbeat + memory consolidation,
         // mirroring the GUI's embedded schedule.
         let scheduler = {
+            // These three come from `[scheduler]` in the user's config, not from
+            // literals: the GUI's Scheduler tab writes them there and a config
+            // reload re-applies them to this very loop (see the control plane's
+            // config handler), so the toggles work without a daemon restart.
             let scheduler_config = nanna_core::SchedulerConfig {
-                heartbeat_interval: std::time::Duration::from_secs(1800),
-                heartbeat_enabled: true,
+                enabled: self.config.scheduler_enabled,
+                heartbeat_interval: std::time::Duration::from_secs(
+                    nanna_core::clamp_heartbeat_secs(self.config.heartbeat_interval_secs),
+                ),
+                heartbeat_enabled: self.config.heartbeat_enabled,
                 heartbeat_prompt: DAEMON_HEARTBEAT_PROMPT.to_string(),
                 max_concurrent: 4,
                 check_interval: std::time::Duration::from_secs(30),
@@ -2960,6 +2982,14 @@ impl DaemonBuilder {
         builder.config.dream_idle_threshold_secs = config.memory.dream_idle_threshold_secs;
         builder.config.dream_memory_pressure_count = config.memory.dream_memory_pressure_count;
 
+        // Scheduler switches. The daemon owns the scheduler (P16), so without
+        // this the GUI's Scheduler tab is dead UI and the heartbeat is
+        // unconditional — which is how it kept stealing the local model's one
+        // slot mid-chat.
+        builder.config.scheduler_enabled = config.scheduler.enabled;
+        builder.config.heartbeat_enabled = config.scheduler.heartbeat_enabled;
+        builder.config.heartbeat_interval_secs = config.scheduler.heartbeat_interval_secs;
+
         // Wire webhook signature-verification secrets from the user's channel
         // config. Without this the inbound webhook server always ran with the
         // all-None default, so every provider's verification silently no-op'd —
@@ -3606,5 +3636,49 @@ mod tests {
             daemon.dream_memory_pressure_count, dream.memory_pressure_count,
             "daemon memory-pressure default must mirror DreamingConfig"
         );
+    }
+
+    #[test]
+    fn daemon_config_default_mirrors_scheduler_config_defaults() {
+        // A user who never opens Settings must get exactly the schedule the
+        // config file documents — the daemon's fallback cannot drift from it.
+        let daemon = DaemonConfig::default();
+        let scheduler = nanna_config::SchedulerConfig::default();
+        assert_eq!(daemon.scheduler_enabled, scheduler.enabled);
+        assert_eq!(daemon.heartbeat_enabled, scheduler.heartbeat_enabled);
+        assert_eq!(
+            daemon.heartbeat_interval_secs,
+            scheduler.heartbeat_interval_secs
+        );
+    }
+
+    #[test]
+    fn scheduler_settings_come_from_config_not_literals() {
+        // Regression: the daemon used to hardcode `heartbeat_enabled: true` and
+        // a 1800s interval, which made Settings → Scheduler dead UI and left the
+        // heartbeat competing with chat for the single local-model slot.
+        let mut builder = DaemonBuilder::new();
+        let user = nanna_config::SchedulerConfig {
+            enabled: false,
+            heartbeat_enabled: false,
+            heartbeat_interval_secs: 600,
+        };
+        builder.config.scheduler_enabled = user.enabled;
+        builder.config.heartbeat_enabled = user.heartbeat_enabled;
+        builder.config.heartbeat_interval_secs = user.heartbeat_interval_secs;
+
+        // Mirrors the construction in `init_services`.
+        let core = nanna_core::SchedulerConfig {
+            enabled: builder.config.scheduler_enabled,
+            heartbeat_interval: std::time::Duration::from_secs(nanna_core::clamp_heartbeat_secs(
+                builder.config.heartbeat_interval_secs,
+            )),
+            heartbeat_enabled: builder.config.heartbeat_enabled,
+            ..nanna_core::SchedulerConfig::default()
+        };
+
+        assert!(!core.enabled);
+        assert!(!core.heartbeat_enabled);
+        assert_eq!(core.heartbeat_interval, std::time::Duration::from_secs(600));
     }
 }

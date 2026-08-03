@@ -8,10 +8,23 @@ use chrono::{DateTime, Utc};
 use nanna_storage::{NewCronJob, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Instant};
+use tokio::time::{interval, interval_at, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Floor on the heartbeat interval.
+///
+/// Two independent constraints meet at the same number. The scheduler resolves
+/// *all* due work on its `check_interval` tick (30s), so a heartbeat period
+/// finer than that is finer than the scheduler's own resolution — it cannot be
+/// honored, only rounded. And a heartbeat is a full agent turn against the chat
+/// model, which takes far longer than 30s on a local backend, so a shorter
+/// period would queue heartbeats faster than they drain. `interval()` also
+/// panics outright on a zero period, which this floor rules out by
+/// construction.
+pub const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 /// Scheduled task types
 #[derive(Debug, Clone)]
@@ -83,9 +96,20 @@ pub type TaskExecutor = Arc<
 /// Scheduler configuration
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Heartbeat interval
+    /// Master switch. `false` keeps the scheduler loaded — jobs stay in the
+    /// store and remain listable/editable — but fires nothing: no heartbeat,
+    /// no cron, no consolidation, no recurrence sweep.
+    pub enabled: bool,
+    /// Heartbeat interval. Values below [`MIN_HEARTBEAT_INTERVAL_SECS`] are
+    /// clamped up when the running loop reads them.
     pub heartbeat_interval: Duration,
-    /// Whether heartbeats are enabled
+    /// Whether heartbeats are enabled.
+    ///
+    /// A heartbeat drives a full agent turn against the *same* model chat uses.
+    /// On a single-slot local backend a heartbeat firing mid-conversation
+    /// time-shares the slot and the in-flight generation gets cancelled, which
+    /// reaches the client as a stream that ended without `done=true`. Being
+    /// able to turn this off is a prerequisite for a clean local benchmark run.
     pub heartbeat_enabled: bool,
     /// Heartbeat prompt/payload
     pub heartbeat_prompt: String,
@@ -100,6 +124,7 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             heartbeat_interval: Duration::from_secs(1800), // 30 minutes
             heartbeat_enabled: true,
             // Do not command a `Read HEARTBEAT.md` here — that drove a read_file
@@ -114,6 +139,79 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// The scheduler settings a user may change while the loop is running.
+///
+/// [`Scheduler::start`] moves a *clone* of [`SchedulerConfig`] into its spawned
+/// task, so everything captured there is frozen for the life of the process.
+/// These three knobs are user-facing (Settings → Scheduler) and one of them —
+/// the heartbeat — actively interferes with chat on a single-slot local model,
+/// so flipping it has to take effect now, not at the next daemon restart. They
+/// therefore live behind atomics that the loop re-reads on every tick.
+///
+/// All accesses are `Relaxed`: each knob is read independently on its own tick
+/// and nothing is ordered against anything else, so the only guarantee needed
+/// is that a write eventually becomes visible.
+#[derive(Debug)]
+pub struct SchedulerRuntime {
+    enabled: AtomicBool,
+    heartbeat_enabled: AtomicBool,
+    heartbeat_interval_secs: AtomicU64,
+}
+
+impl SchedulerRuntime {
+    fn from_config(config: &SchedulerConfig) -> Self {
+        Self {
+            enabled: AtomicBool::new(config.enabled),
+            heartbeat_enabled: AtomicBool::new(config.heartbeat_enabled),
+            heartbeat_interval_secs: AtomicU64::new(clamp_heartbeat_secs(
+                config.heartbeat_interval.as_secs(),
+            )),
+        }
+    }
+
+    /// Whether the scheduler fires anything at all.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the periodic heartbeat prompt fires. Independent of
+    /// [`Self::enabled`]: both must be true for a heartbeat to run.
+    #[must_use]
+    pub fn heartbeat_enabled(&self) -> bool {
+        self.heartbeat_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_heartbeat_enabled(&self, enabled: bool) {
+        self.heartbeat_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The heartbeat period, never below [`MIN_HEARTBEAT_INTERVAL_SECS`].
+    #[must_use]
+    pub fn heartbeat_interval(&self) -> Duration {
+        Duration::from_secs(self.heartbeat_interval_secs.load(Ordering::Relaxed))
+    }
+
+    /// Set the heartbeat period, clamping up to [`MIN_HEARTBEAT_INTERVAL_SECS`].
+    /// Clamping at the setter (not the reader) means the stored value is always
+    /// the value the loop will actually use.
+    pub fn set_heartbeat_interval(&self, interval: Duration) {
+        self.heartbeat_interval_secs
+            .store(clamp_heartbeat_secs(interval.as_secs()), Ordering::Relaxed);
+    }
+}
+
+/// Raise a heartbeat period to the floor the scheduler can actually honor.
+/// See [`MIN_HEARTBEAT_INTERVAL_SECS`] for why the floor exists.
+#[must_use]
+pub fn clamp_heartbeat_secs(secs: u64) -> u64 {
+    secs.max(MIN_HEARTBEAT_INTERVAL_SECS)
+}
+
 /// The main scheduler
 pub struct Scheduler {
     config: SchedulerConfig,
@@ -123,11 +221,16 @@ pub struct Scheduler {
     storage: Option<Arc<Storage>>,
     /// Job run history (in-memory, last N runs per job)
     history: Arc<RwLock<HashMap<String, Vec<JobRun>>>>,
+    /// The knobs the running loop re-reads. Shared with the spawned task, so
+    /// this is the authority for the three live settings — `config` keeps the
+    /// boot-time values and is updated alongside by [`Self::apply_settings`].
+    runtime: Arc<SchedulerRuntime>,
 }
 
 impl Scheduler {
     #[must_use]
     pub fn new(config: SchedulerConfig) -> Self {
+        let runtime = Arc::new(SchedulerRuntime::from_config(&config));
         Self {
             config,
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -135,7 +238,42 @@ impl Scheduler {
             shutdown_tx: None,
             storage: None,
             history: Arc::new(RwLock::new(HashMap::new())),
+            runtime,
         }
+    }
+
+    /// Handle onto the live knobs. Cloneable and independent of any lock around
+    /// the scheduler itself.
+    #[must_use]
+    pub fn runtime(&self) -> Arc<SchedulerRuntime> {
+        self.runtime.clone()
+    }
+
+    /// Apply user-facing scheduler settings to the *running* loop.
+    ///
+    /// Takes effect within one `check_interval` tick — no restart. `config` is
+    /// updated in lock-step so the struct never disagrees with the atomics
+    /// about what the scheduler is doing.
+    pub fn apply_settings(
+        &mut self,
+        enabled: bool,
+        heartbeat_enabled: bool,
+        heartbeat_interval: Duration,
+    ) {
+        self.runtime.set_enabled(enabled);
+        self.runtime.set_heartbeat_enabled(heartbeat_enabled);
+        self.runtime.set_heartbeat_interval(heartbeat_interval);
+
+        self.config.enabled = enabled;
+        self.config.heartbeat_enabled = heartbeat_enabled;
+        // Mirror the *clamped* value, not the requested one.
+        self.config.heartbeat_interval = self.runtime.heartbeat_interval();
+
+        info!(
+            "Scheduler settings applied: enabled={enabled}, heartbeat_enabled={heartbeat_enabled}, \
+             heartbeat_interval={:?}",
+            self.config.heartbeat_interval
+        );
     }
 
     /// Set persistent storage for cron jobs.
@@ -533,15 +671,21 @@ impl Scheduler {
         let tasks = self.tasks.clone();
         let storage = self.storage.clone();
         let history = self.history.clone();
+        let runtime = self.runtime.clone();
 
         // Spawn the scheduler loop
         tokio::spawn(async move {
-            let mut heartbeat_interval = interval(config.heartbeat_interval);
+            // The heartbeat period is retunable at runtime, so track the value
+            // this timer was built from and rebuild when it changes.
+            let mut heartbeat_secs = runtime.heartbeat_interval().as_secs();
+            let mut heartbeat_interval = interval(Duration::from_secs(heartbeat_secs));
             let mut check_interval = interval(config.check_interval);
 
             info!(
-                "Scheduler started (heartbeat every {:?}, check every {:?})",
-                config.heartbeat_interval, config.check_interval
+                "Scheduler started (enabled: {}, heartbeat every {}s, check every {:?})",
+                runtime.enabled(),
+                heartbeat_secs,
+                config.check_interval
             );
 
             loop {
@@ -551,7 +695,7 @@ impl Scheduler {
                         break;
                     }
                     _ = heartbeat_interval.tick() => {
-                        if config.heartbeat_enabled {
+                        if runtime.enabled() && runtime.heartbeat_enabled() {
                             debug!("Heartbeat tick");
                             let task = heartbeat_task(&config.heartbeat_prompt);
                             let result = executor(task).await;
@@ -580,6 +724,24 @@ impl Scheduler {
                         }
                     }
                     _ = check_interval.tick() => {
+                        // Pick up a live heartbeat-interval change. Rebuilt only
+                        // when the value actually differs, so steady state never
+                        // resets the timer's phase; the replacement starts a full
+                        // period out so retuning the interval cannot itself fire a
+                        // heartbeat.
+                        let desired_secs = runtime.heartbeat_interval().as_secs();
+                        if desired_secs != heartbeat_secs {
+                            heartbeat_secs = desired_secs;
+                            let period = Duration::from_secs(heartbeat_secs);
+                            heartbeat_interval = interval_at(Instant::now() + period, period);
+                            info!("Heartbeat interval changed to {heartbeat_secs}s");
+                        }
+
+                        // Master switch: leave jobs loaded, fire nothing.
+                        if !runtime.enabled() {
+                            continue;
+                        }
+
                         // Check for due tasks
                         let now = Utc::now();
                         let tasks_snapshot = {
@@ -842,5 +1004,99 @@ mod tests {
         assert!(!p.contains("read heartbeat"), "must not command a file read: {p}");
         assert!(!p.contains(".md"), "must not reference a bespoke .md file: {p}");
         assert!(p.contains("heartbeat_ok"), "must keep the HEARTBEAT_OK sentinel: {p}");
+    }
+
+    #[test]
+    fn runtime_mirrors_the_config_it_was_built_from() {
+        let config = SchedulerConfig {
+            enabled: false,
+            heartbeat_enabled: false,
+            heartbeat_interval: Duration::from_mins(10),
+            ..SchedulerConfig::default()
+        };
+        let scheduler = Scheduler::new(config);
+        let runtime = scheduler.runtime();
+
+        assert!(!runtime.enabled());
+        assert!(!runtime.heartbeat_enabled());
+        assert_eq!(runtime.heartbeat_interval(), Duration::from_mins(10));
+    }
+
+    #[test]
+    fn heartbeat_interval_is_clamped_to_the_scheduler_tick() {
+        // Below the scheduler's own 30s resolution the period cannot be
+        // honored, and zero would panic `interval()` outright.
+        assert_eq!(clamp_heartbeat_secs(0), MIN_HEARTBEAT_INTERVAL_SECS);
+        assert_eq!(clamp_heartbeat_secs(1), MIN_HEARTBEAT_INTERVAL_SECS);
+        assert_eq!(
+            clamp_heartbeat_secs(MIN_HEARTBEAT_INTERVAL_SECS),
+            MIN_HEARTBEAT_INTERVAL_SECS
+        );
+        // At or above the floor the user's value is used verbatim.
+        assert_eq!(clamp_heartbeat_secs(1800), 1800);
+
+        // The clamp applies through every entry point, so a running loop can
+        // never read a zero period out of the atomics.
+        let scheduler = Scheduler::new(SchedulerConfig {
+            heartbeat_interval: Duration::ZERO,
+            ..SchedulerConfig::default()
+        });
+        assert_eq!(
+            scheduler.runtime().heartbeat_interval(),
+            Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS)
+        );
+        scheduler
+            .runtime()
+            .set_heartbeat_interval(Duration::from_secs(5));
+        assert_eq!(
+            scheduler.runtime().heartbeat_interval(),
+            Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn apply_settings_updates_both_the_runtime_and_the_config() {
+        // The struct must never disagree with the atomics about what the
+        // scheduler is doing — `config` is what a reader inspects, `runtime` is
+        // what the loop obeys.
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let runtime = scheduler.runtime();
+        assert!(runtime.enabled() && runtime.heartbeat_enabled());
+
+        scheduler.apply_settings(false, false, Duration::from_mins(15));
+
+        assert!(!runtime.enabled());
+        assert!(!runtime.heartbeat_enabled());
+        assert_eq!(runtime.heartbeat_interval(), Duration::from_mins(15));
+        assert!(!scheduler.config.enabled);
+        assert!(!scheduler.config.heartbeat_enabled);
+        assert_eq!(
+            scheduler.config.heartbeat_interval,
+            Duration::from_mins(15)
+        );
+    }
+
+    #[test]
+    fn apply_settings_mirrors_the_clamped_interval_not_the_requested_one() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        scheduler.apply_settings(true, true, Duration::from_secs(1));
+        assert_eq!(
+            scheduler.config.heartbeat_interval,
+            Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn a_handle_taken_before_a_change_observes_it() {
+        // The running loop clones the handle once at startup; a settings change
+        // that arrives later must be visible through that same clone, or the
+        // toggles would only take effect on a daemon restart.
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let handle_held_by_the_loop = scheduler.runtime();
+
+        scheduler.apply_settings(true, false, Duration::from_mins(30));
+
+        assert!(!handle_held_by_the_loop.heartbeat_enabled());
+        assert!(handle_held_by_the_loop.enabled());
     }
 }

@@ -17,8 +17,10 @@ pub use dreaming::{
     DreamingRuntime, DreamingRuntimeConfig, create_dreaming_executor,
 };
 pub use scheduler::{
-    Scheduler, SchedulerConfig, ScheduledTask, TaskType, TaskResult, TaskExecutor, JobRun,
+    Scheduler, SchedulerConfig, SchedulerRuntime, ScheduledTask, TaskType, TaskResult,
+    TaskExecutor, JobRun,
     heartbeat_task, recurring_task, delayed_task, consolidation_task,
+    clamp_heartbeat_secs, MIN_HEARTBEAT_INTERVAL_SECS,
     DREAMING_TASK_NAME, is_dreaming_task,
 };
 pub use workspace::{
