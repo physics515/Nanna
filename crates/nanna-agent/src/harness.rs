@@ -85,10 +85,40 @@ pub struct AcceptanceVerdict {
     pub detail: String,
 }
 
+/// Every canonical acceptance shape, quoted verbatim in every parse error.
+///
+/// serde names the Rust type it wanted ("expected internally tagged enum
+/// AcceptanceCheck") and never the shape, so a model has nothing to copy: the
+/// daemon logs hold 121 identical malformed acceptance calls. An error that
+/// carries the target shapes is the only version of this message that can end
+/// the loop on the next attempt.
+const ACCEPTANCE_SHAPES: &str = concat!(
+    "`acceptance` must be a JSON OBJECT (not a string), exactly one of:\n",
+    "  {\"kind\":\"command\",\"command\":\"cargo test\"}\n",
+    "  {\"kind\":\"file_exists\",\"path\":\"docs/plan.md\"}\n",
+    "  {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"path\":\"build.log\"}\n",
+    "  {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"command\":\"cargo test\"}\n",
+    "Optional on command and regex: \"timeout_secs\": <integer seconds>."
+);
+
 impl AcceptanceCheck {
     /// Parse the store's acceptance JSON (`{kind: ..., ...}`).
+    ///
+    /// Tolerates the one dialect models actually emit: the object handed over
+    /// as a JSON *string*. It is unwrapped ONCE — a value still stringy after
+    /// that is double-encoded noise, and peeling deeper would accept payloads
+    /// nobody wrote.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
-        serde_json::from_value(value.clone()).map_err(|e| format!("invalid acceptance check: {e}"))
+        let unwrapped;
+        let value = match value.as_str() {
+            Some(text) => {
+                unwrapped = parse_stringified_acceptance(text)?;
+                &unwrapped
+            }
+            None => value,
+        };
+        serde_json::from_value(value.clone())
+            .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
     }
 
     /// Short human-readable description for the step prompt.
@@ -222,6 +252,110 @@ impl AcceptanceCheck {
             }
         }
     }
+}
+
+/// Decode an acceptance object that arrived as a string: strict JSON first,
+/// then the JS-object-literal flavor via [`repair_js_object_literal`].
+fn parse_stringified_acceptance(text: &str) -> Result<serde_json::Value, String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return Ok(value);
+    }
+    repair_js_object_literal(text)
+        .and_then(|repaired| serde_json::from_str::<serde_json::Value>(&repaired).ok())
+        .ok_or_else(|| {
+            format!(
+                "invalid acceptance check: it arrived as a string, and the text inside is \
+                 not JSON. {ACCEPTANCE_SHAPES}"
+            )
+        })
+}
+
+/// Rewrite the JS-object-literal flavor — `{kind: 'command', command: 'cargo
+/// test'}` — into strict JSON, or `None` when that cannot be done without
+/// guessing.
+///
+/// Only two rewrites are unambiguous: an unquoted KEY (a bare identifier
+/// immediately followed by `:`) gains quotes, and a single-quoted string
+/// becomes double-quoted. A bare token in VALUE position (`command: cargo
+/// test --all`) is not repairable: where the value ends is a guess, and a
+/// wrong guess writes an acceptance check the model never asked for. Those
+/// fall through to the shape-carrying error, which is what teaches the fix.
+fn repair_js_object_literal(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            // Already-valid JSON string: copy through, escapes intact.
+            '"' => {
+                out.push('"');
+                i += 1;
+                loop {
+                    let c = *chars.get(i)?;
+                    i += 1;
+                    out.push(c);
+                    if c == '\\' {
+                        out.push(*chars.get(i)?);
+                        i += 1;
+                    } else if c == '"' {
+                        break;
+                    }
+                }
+            }
+            // Single-quoted string → double-quoted.
+            '\'' => {
+                out.push('"');
+                i += 1;
+                loop {
+                    let c = *chars.get(i)?;
+                    i += 1;
+                    match c {
+                        '\\' => {
+                            let escaped = *chars.get(i)?;
+                            i += 1;
+                            // \' is not a JSON escape; every other escape is
+                            // passed through unchanged.
+                            if escaped == '\'' {
+                                out.push('\'');
+                            } else {
+                                out.push('\\');
+                                out.push(escaped);
+                            }
+                        }
+                        '\'' => break,
+                        '"' => out.push_str("\\\""),
+                        other => out.push(other),
+                    }
+                }
+                out.push('"');
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let token: String = chars[start..i].iter().collect();
+                let colon_follows = chars[i..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|c| *c == ':');
+                if colon_follows {
+                    out.push('"');
+                    out.push_str(&token);
+                    out.push('"');
+                } else if matches!(token.as_str(), "true" | "false" | "null") {
+                    out.push_str(&token);
+                } else {
+                    return None;
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 fn resolve_in_workdir(workdir: &Path, path: &str) -> PathBuf {
@@ -1533,6 +1667,91 @@ mod tests {
         .unwrap();
         assert!(matches!(re, AcceptanceCheck::Regex { .. }));
         assert!(AcceptanceCheck::from_json(&serde_json::json!({"kind": "vibes"})).is_err());
+    }
+
+    #[test]
+    fn acceptance_accepts_the_object_handed_over_as_a_string() {
+        // The dominant live failure: the model serializes the object itself.
+        let cmd = AcceptanceCheck::from_json(&serde_json::json!(
+            "{\"kind\": \"command\", \"command\": \"cargo check --all\"}"
+        ))
+        .expect("stringified command check");
+        assert_eq!(
+            cmd,
+            AcceptanceCheck::Command {
+                command: "cargo check --all".to_string(),
+                timeout_secs: None,
+            }
+        );
+
+        let file =
+            AcceptanceCheck::from_json(&serde_json::json!("{\"kind\":\"file_exists\",\"path\":\"out.txt\"}"))
+                .expect("stringified file_exists check");
+        assert_eq!(
+            file,
+            AcceptanceCheck::FileExists {
+                path: "out.txt".to_string(),
+            }
+        );
+
+        let re = AcceptanceCheck::from_json(&serde_json::json!(
+            "{\"kind\":\"regex\",\"pattern\":\"0 failed\",\"command\":\"cargo test\",\"timeout_secs\":30}"
+        ))
+        .expect("stringified regex check");
+        assert_eq!(
+            re,
+            AcceptanceCheck::Regex {
+                pattern: "0 failed".to_string(),
+                path: None,
+                command: Some("cargo test".to_string()),
+                timeout_secs: Some(30),
+            }
+        );
+    }
+
+    #[test]
+    fn acceptance_repairs_the_js_object_literal_flavor() {
+        let check = AcceptanceCheck::from_json(&serde_json::json!(
+            "{kind: 'command', command: 'cargo test -p nanna-agent', timeout_secs: 45}"
+        ))
+        .expect("unquoted keys + single-quoted values repair");
+        assert_eq!(
+            check,
+            AcceptanceCheck::Command {
+                command: "cargo test -p nanna-agent".to_string(),
+                timeout_secs: Some(45),
+            }
+        );
+
+        // Where a bare VALUE ends is a guess, so repair refuses and teaches
+        // instead of inventing a check the model never wrote.
+        let err = AcceptanceCheck::from_json(&serde_json::json!(
+            "{kind: command, command: cargo check --all}"
+        ))
+        .expect_err("bare values are not repairable");
+        assert!(err.contains(r#"{"kind":"command","command":"cargo test"}"#), "{err}");
+    }
+
+    #[test]
+    fn acceptance_errors_show_the_expected_shapes() {
+        // Double-encoded: one unwrap leaves a string, which is still not a check.
+        let err = AcceptanceCheck::from_json(&serde_json::json!(
+            "\"{\\\"kind\\\":\\\"command\\\",\\\"command\\\":\\\"cargo test\\\"}\""
+        ))
+        .expect_err("double-encoded acceptance must be rejected");
+        for shape in [
+            r#"{"kind":"command","command":"cargo test"}"#,
+            r#"{"kind":"file_exists","path":"docs/plan.md"}"#,
+            r#"{"kind":"regex","pattern":"0 failed","path":"build.log"}"#,
+            r#"{"kind":"regex","pattern":"0 failed","command":"cargo test"}"#,
+        ] {
+            assert!(err.contains(shape), "error must show {shape}: {err}");
+        }
+
+        // A genuine object with the wrong kind teaches the same way.
+        let err = AcceptanceCheck::from_json(&serde_json::json!({"kind": "vibes"}))
+            .expect_err("unknown kind must be rejected");
+        assert!(err.contains(r#"{"kind":"file_exists","path":"docs/plan.md"}"#), "{err}");
     }
 
     #[tokio::test]

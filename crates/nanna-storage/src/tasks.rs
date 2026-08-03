@@ -1181,8 +1181,14 @@ fn validate_acceptance(value: &serde_json::Value) -> Result<(), StorageError> {
                     .and_then(serde_json::Value::as_str)
                     .is_none()
             {
+                // Both forms are spelled out: the bare "requires path or
+                // command" wording left the model to invent the rest, and it
+                // re-sent the same targetless check 11 times.
                 return Err(StorageError::Invalid(
-                    "acceptance kind 'regex' requires 'path' or 'command' to match against"
+                    "acceptance kind 'regex' needs something to match against — either a \
+                     file: {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"path\":\"build.log\"} \
+                     or a command's output: \
+                     {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"command\":\"cargo test\"}"
                         .to_string(),
                 ));
             }
@@ -1882,6 +1888,27 @@ mod tests {
             "kind": "command", "command": "cargo test -p nanna-storage"
         }));
         assert!(repo.create(nt).await.is_ok());
+    }
+
+    /// The rejection has to carry the fix: a regex check missing its target
+    /// was re-sent 11 times against the old "requires 'path' or 'command'"
+    /// wording, which named the fields but never the shape.
+    #[tokio::test]
+    async fn targetless_regex_acceptance_names_both_valid_forms() {
+        let (_s, repo) = repo().await;
+        let mut nt = new_task("regex needs target");
+        nt.acceptance = Some(serde_json::json!({"kind": "regex", "pattern": "0 failed"}));
+        let Err(StorageError::Invalid(message)) = repo.create(nt).await else {
+            panic!("a regex check with no target must be rejected");
+        };
+        assert!(
+            message.contains(r#"{"kind":"regex","pattern":"0 failed","path":"build.log"}"#),
+            "{message}"
+        );
+        assert!(
+            message.contains(r#"{"kind":"regex","pattern":"0 failed","command":"cargo test"}"#),
+            "{message}"
+        );
     }
 
     #[tokio::test]

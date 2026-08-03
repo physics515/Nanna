@@ -50,6 +50,11 @@ const TASK_NEXT_SKIP_MAX: usize = 100;
 // ---------------------------------------------------------------------------
 
 /// Resolve `(scope, scope_id)` from service params + the active workspace.
+///
+/// A call from inside a session never reaches the missing-id error: the
+/// scripting bridge fills `session_id` from the session the tool is running
+/// in. Only a caller with no session context at all gets here, so the message
+/// names both ways out instead of just restating the requirement.
 async fn resolve_scope(
     params: &Value,
     workspace_id: &Arc<RwLock<Option<String>>>,
@@ -65,7 +70,12 @@ async fn resolve_scope(
                 .get("session_id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "session scope requires session_id".to_string())?;
+                .ok_or_else(|| {
+                    "session scope needs a session id and this caller has none — pass \
+                     session_id explicitly, or use scope 'workspace' (the active workspace) \
+                     or scope 'global'"
+                        .to_string()
+                })?;
             Ok(("session".to_string(), Some(session_id.to_string())))
         }
         "workspace" => {
@@ -4760,6 +4770,73 @@ impl TaskRunManager {
                 resumes,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::{build_task_services, TurnBaselines};
+    use nanna_storage::Storage;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    // -----------------------------------------------------------------
+    // Session scope: context, not a question for the model
+    // -----------------------------------------------------------------
+
+    /// A todo call made inside a session lands in that session's scope even
+    /// though the model named neither `session_id` nor `scope` — the bridge
+    /// knows which session it is running in. (35 logged todo failures were
+    /// the store asking the model for the id it was already inside of.)
+    #[tokio::test]
+    async fn session_scope_resolves_from_the_calling_session() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(TurnBaselines::new()),
+        );
+        let bridge = nanna_scripting::NannaBridge::new(nanna_scripting::ToolPermissions::default())
+            .with_services(services)
+            .with_session_id("sess-live");
+
+        let added = bridge
+            .call_service("tasks.add", json!({"title": "write the parser"}))
+            .await
+            .expect("the session comes from the call site");
+        assert_eq!(added["task"]["scope"], json!("session"));
+
+        let listed = storage
+            .tasks()
+            .list("session", Some("sess-live"), true)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1, "the task landed in the calling session");
+        assert_eq!(listed[0].title, "write the parser");
+    }
+
+    /// A caller with no session at all still gets an error — and it names
+    /// every way out, since restating "requires session_id" is exactly what
+    /// the model could not act on.
+    #[tokio::test]
+    async fn a_context_free_caller_is_told_how_to_supply_a_scope() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let services = build_task_services(
+            storage,
+            Arc::new(RwLock::new(None)),
+            Arc::new(TurnBaselines::new()),
+        );
+        let bridge = nanna_scripting::NannaBridge::new(nanna_scripting::ToolPermissions::default())
+            .with_services(services);
+
+        let err = bridge
+            .call_service("tasks.next", json!({"scope": "session"}))
+            .await
+            .expect_err("no session anywhere: the caller must be told");
+        assert!(err.contains("session_id"), "{err}");
+        assert!(err.contains("workspace"), "names the id-free scopes: {err}");
+        assert!(err.contains("global"), "{err}");
     }
 }
 
