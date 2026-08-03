@@ -87,6 +87,37 @@ pub enum AgentError {
     ContextTooLong,
     #[error("Agent stopped")]
     Stopped,
+    /// The runner's effective context window was demoted below the smallest
+    /// prompt this run can possibly send. Compression shrinks HISTORY; it can
+    /// never shrink the system prompt, the tool definitions, the step frame,
+    /// or the output reserve — so below their sum, adaptation is impossible
+    /// and continuing would only produce silently-truncated prompts. The run
+    /// stops LOUDLY instead; the step/eval is resumable once the window is
+    /// restored (free GPU memory or restart the runner).
+    #[error(
+        "effective context window ({effective_window} tokens) is below the minimum viable \
+         window ({floor} tokens = system prompt {system_tokens} + tool definitions \
+         {tool_tokens} + step frame {frame_tokens} + output reserve {output_reserve}); \
+         the runner's num_ctx was demoted under GPU memory pressure and no amount of \
+         history compression can fit this step — failing loudly instead of running \
+         silently truncated; free GPU memory (or restart the runner) and resume"
+    )]
+    ContextBelowFloor {
+        /// The live window the runner will actually honour.
+        effective_window: usize,
+        /// Sum of the irreducible parts below — the derived minimum.
+        floor: usize,
+        /// Estimated tokens of the effective system prompt (workspace slice
+        /// already re-capped for the shrunken window).
+        system_tokens: usize,
+        /// Estimated tokens of the active tool definitions.
+        tool_tokens: usize,
+        /// Estimated tokens of the step frame (the first user message, which
+        /// truncation always preserves).
+        frame_tokens: usize,
+        /// Output tokens the request must reserve.
+        output_reserve: usize,
+    },
 }
 
 /// Message content types
