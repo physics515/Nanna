@@ -85,39 +85,40 @@ pub struct AcceptanceVerdict {
     pub detail: String,
 }
 
-/// Every canonical acceptance shape, quoted verbatim in every parse error.
-///
-/// serde names the Rust type it wanted ("expected internally tagged enum
-/// AcceptanceCheck") and never the shape, so a model has nothing to copy: the
-/// daemon logs hold 121 identical malformed acceptance calls. An error that
-/// carries the target shapes is the only version of this message that can end
-/// the loop on the next attempt.
-const ACCEPTANCE_SHAPES: &str = concat!(
-    "`acceptance` must be a JSON OBJECT (not a string), exactly one of:\n",
-    "  {\"kind\":\"command\",\"command\":\"cargo test\"}\n",
-    "  {\"kind\":\"file_exists\",\"path\":\"docs/plan.md\"}\n",
-    "  {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"path\":\"build.log\"}\n",
-    "  {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"command\":\"cargo test\"}\n",
-    "Optional on command and regex: \"timeout_secs\": <integer seconds>."
-);
+// Every canonical acceptance shape, quoted verbatim in every parse error.
+// Defined by the store — the write boundary owns what an acceptance check
+// looks like — and used here so the reader's errors and the writer's errors
+// can never drift apart.
+use nanna_storage::ACCEPTANCE_SHAPES;
 
 impl AcceptanceCheck {
+    /// Normalize an acceptance payload to the object the store holds, without
+    /// interpreting it as a typed check.
+    ///
+    /// This is the SAME normalization `create`/`update` apply, so anything
+    /// admitted here is admitted by the store: an admission that used a looser
+    /// rule than the write path silently dropped the task instead of running
+    /// it.
+    ///
+    /// # Errors
+    /// Returns a shape-carrying message when the payload cannot be normalized.
+    pub fn canonicalize(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let check = Self::from_json(value)?;
+        // Round-tripping through the typed check is what makes the result
+        // canonical rather than merely object-shaped: unknown keys are gone,
+        // absent options are absent, and `timeout_secs` is an integer.
+        serde_json::to_value(&check)
+            .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
+    }
+
     /// Parse the store's acceptance JSON (`{kind: ..., ...}`).
     ///
-    /// Tolerates the one dialect models actually emit: the object handed over
-    /// as a JSON *string*. It is unwrapped ONCE — a value still stringy after
-    /// that is double-encoded noise, and peeling deeper would accept payloads
-    /// nobody wrote.
+    /// Tolerates the one dialect models actually emit — the object handed over
+    /// as a JSON *string* — by deferring to the store's own normalization, so
+    /// the reader never accepts a shape the writer would reject.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
-        let unwrapped;
-        let value = match value.as_str() {
-            Some(text) => {
-                unwrapped = parse_stringified_acceptance(text)?;
-                &unwrapped
-            }
-            None => value,
-        };
-        serde_json::from_value(value.clone())
+        let canonical = nanna_storage::canonicalize_acceptance(value)?;
+        serde_json::from_value(canonical)
             .map_err(|e| format!("invalid acceptance check: {e}. {ACCEPTANCE_SHAPES}"))
     }
 
@@ -252,110 +253,6 @@ impl AcceptanceCheck {
             }
         }
     }
-}
-
-/// Decode an acceptance object that arrived as a string: strict JSON first,
-/// then the JS-object-literal flavor via [`repair_js_object_literal`].
-fn parse_stringified_acceptance(text: &str) -> Result<serde_json::Value, String> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return Ok(value);
-    }
-    repair_js_object_literal(text)
-        .and_then(|repaired| serde_json::from_str::<serde_json::Value>(&repaired).ok())
-        .ok_or_else(|| {
-            format!(
-                "invalid acceptance check: it arrived as a string, and the text inside is \
-                 not JSON. {ACCEPTANCE_SHAPES}"
-            )
-        })
-}
-
-/// Rewrite the JS-object-literal flavor — `{kind: 'command', command: 'cargo
-/// test'}` — into strict JSON, or `None` when that cannot be done without
-/// guessing.
-///
-/// Only two rewrites are unambiguous: an unquoted KEY (a bare identifier
-/// immediately followed by `:`) gains quotes, and a single-quoted string
-/// becomes double-quoted. A bare token in VALUE position (`command: cargo
-/// test --all`) is not repairable: where the value ends is a guess, and a
-/// wrong guess writes an acceptance check the model never asked for. Those
-/// fall through to the shape-carrying error, which is what teaches the fix.
-fn repair_js_object_literal(text: &str) -> Option<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() + text.len() / 4);
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            // Already-valid JSON string: copy through, escapes intact.
-            '"' => {
-                out.push('"');
-                i += 1;
-                loop {
-                    let c = *chars.get(i)?;
-                    i += 1;
-                    out.push(c);
-                    if c == '\\' {
-                        out.push(*chars.get(i)?);
-                        i += 1;
-                    } else if c == '"' {
-                        break;
-                    }
-                }
-            }
-            // Single-quoted string → double-quoted.
-            '\'' => {
-                out.push('"');
-                i += 1;
-                loop {
-                    let c = *chars.get(i)?;
-                    i += 1;
-                    match c {
-                        '\\' => {
-                            let escaped = *chars.get(i)?;
-                            i += 1;
-                            // \' is not a JSON escape; every other escape is
-                            // passed through unchanged.
-                            if escaped == '\'' {
-                                out.push('\'');
-                            } else {
-                                out.push('\\');
-                                out.push(escaped);
-                            }
-                        }
-                        '\'' => break,
-                        '"' => out.push_str("\\\""),
-                        other => out.push(other),
-                    }
-                }
-                out.push('"');
-            }
-            c if c.is_alphabetic() || c == '_' => {
-                let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                    i += 1;
-                }
-                let token: String = chars[start..i].iter().collect();
-                let colon_follows = chars[i..]
-                    .iter()
-                    .find(|c| !c.is_whitespace())
-                    .is_some_and(|c| *c == ':');
-                if colon_follows {
-                    out.push('"');
-                    out.push_str(&token);
-                    out.push('"');
-                } else if matches!(token.as_str(), "true" | "false" | "null") {
-                    out.push_str(&token);
-                } else {
-                    return None;
-                }
-            }
-            other => {
-                out.push(other);
-                i += 1;
-            }
-        }
-    }
-    Some(out)
 }
 
 fn resolve_in_workdir(workdir: &Path, path: &str) -> PathBuf {

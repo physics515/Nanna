@@ -80,7 +80,7 @@ impl TaskRepository {
     /// Create a task. Validates scope, title, priority, parent, and
     /// dependencies (existence + bounds); a new task cannot introduce a
     /// dependency cycle because nothing depends on it yet.
-    pub async fn create(&self, new: NewTask) -> Result<Task, StorageError> {
+    pub async fn create(&self, mut new: NewTask) -> Result<Task, StorageError> {
         validate_scope(&new.scope, new.scope_id.as_deref())?;
         validate_title(&new.title)?;
         validate_priority(new.priority)?;
@@ -90,8 +90,10 @@ impl TaskRepository {
                 new.depends_on.len()
             )));
         }
+        // Canonicalize BEFORE storing: the row must hold the object shape the
+        // harness reads back, whatever dialect the caller handed us.
         if let Some(acceptance) = &new.acceptance {
-            validate_acceptance(acceptance)?;
+            new.acceptance = Some(admit_acceptance(acceptance)?);
         }
 
         let scope_tasks = self.load_scope(&new.scope, new.scope_id.as_deref()).await?;
@@ -343,9 +345,12 @@ impl TaskRepository {
             task.recurrence = recurrence;
         }
         if let Some(acceptance) = patch.acceptance {
-            if let Some(check) = &acceptance {
-                validate_acceptance(check)?;
-            }
+            // Same write-boundary rule as `create`: canonicalize, then store
+            // the canonical object (never the caller's raw value).
+            let acceptance = match &acceptance {
+                Some(check) => Some(admit_acceptance(check)?),
+                None => None,
+            };
             changed.push("acceptance");
             task.acceptance = acceptance;
         }
@@ -1133,6 +1138,173 @@ fn validate_priority(priority: i64) -> Result<(), StorageError> {
     }
 }
 
+/// Every canonical acceptance shape, quoted verbatim in every parse error.
+///
+/// serde names the Rust type it wanted ("expected internally tagged enum
+/// AcceptanceCheck") and never the shape, so a model has nothing to copy: the
+/// daemon logs hold 121 identical malformed acceptance calls. An error that
+/// carries the target shapes is the only version of this message that can end
+/// the loop on the next attempt.
+pub const ACCEPTANCE_SHAPES: &str = concat!(
+    "`acceptance` must be a JSON OBJECT (not a string), exactly one of:\n",
+    "  {\"kind\":\"command\",\"command\":\"cargo test\"}\n",
+    "  {\"kind\":\"file_exists\",\"path\":\"docs/plan.md\"}\n",
+    "  {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"path\":\"build.log\"}\n",
+    "  {\"kind\":\"regex\",\"pattern\":\"0 failed\",\"command\":\"cargo test\"}\n",
+    "Optional on command and regex: \"timeout_secs\": <integer seconds>."
+);
+
+/// Normalize an acceptance payload to the ONE representation the store holds:
+/// a JSON object.
+///
+/// The store is the single source of truth for what an acceptance check looks
+/// like, so the tolerance for the dialect models actually emit lives here, at
+/// the write boundary — not only in the reader. A reader that accepted more
+/// than the writer stored is the exact disagreement that let a stringified
+/// check pass the planner's admission and then be rejected by `create`,
+/// silently dropping the task.
+///
+/// The one tolerated dialect is the object handed over as a JSON *string*. It
+/// is unwrapped ONCE: a value still stringy after that is double-encoded
+/// noise, and peeling deeper would accept payloads nobody wrote.
+///
+/// # Errors
+/// Returns a shape-carrying message when the payload is neither an object nor
+/// a string that decodes to one.
+pub fn canonicalize_acceptance(
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if value.is_object() {
+        return Ok(value.clone());
+    }
+    let Some(text) = value.as_str() else {
+        return Err(format!("invalid acceptance check: {ACCEPTANCE_SHAPES}"));
+    };
+    let decoded = parse_stringified_acceptance(text)?;
+    if !decoded.is_object() {
+        return Err(format!(
+            "invalid acceptance check: it arrived as a string, and the text inside is not an \
+             object. {ACCEPTANCE_SHAPES}"
+        ));
+    }
+    Ok(decoded)
+}
+
+/// Decode an acceptance object that arrived as a string: strict JSON first,
+/// then the JS-object-literal flavor via [`repair_js_object_literal`].
+fn parse_stringified_acceptance(text: &str) -> Result<serde_json::Value, String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return Ok(value);
+    }
+    repair_js_object_literal(text)
+        .and_then(|repaired| serde_json::from_str::<serde_json::Value>(&repaired).ok())
+        .ok_or_else(|| {
+            format!(
+                "invalid acceptance check: it arrived as a string, and the text inside is \
+                 not JSON. {ACCEPTANCE_SHAPES}"
+            )
+        })
+}
+
+/// Rewrite the JS-object-literal flavor — `{kind: 'command', command: 'cargo
+/// test'}` — into strict JSON, or `None` when that cannot be done without
+/// guessing.
+///
+/// Only two rewrites are unambiguous: an unquoted KEY (a bare identifier
+/// immediately followed by `:`) gains quotes, and a single-quoted string
+/// becomes double-quoted. A bare token in VALUE position (`command: cargo
+/// test --all`) is not repairable: where the value ends is a guess, and a
+/// wrong guess writes an acceptance check the model never asked for. Those
+/// fall through to the shape-carrying error, which is what teaches the fix.
+fn repair_js_object_literal(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            // Already-valid JSON string: copy through, escapes intact.
+            '"' => {
+                out.push('"');
+                i += 1;
+                loop {
+                    let c = *chars.get(i)?;
+                    i += 1;
+                    out.push(c);
+                    if c == '\\' {
+                        out.push(*chars.get(i)?);
+                        i += 1;
+                    } else if c == '"' {
+                        break;
+                    }
+                }
+            }
+            // Single-quoted string → double-quoted.
+            '\'' => {
+                out.push('"');
+                i += 1;
+                loop {
+                    let c = *chars.get(i)?;
+                    i += 1;
+                    match c {
+                        '\\' => {
+                            let escaped = *chars.get(i)?;
+                            i += 1;
+                            // \' is not a JSON escape; every other escape is
+                            // passed through unchanged.
+                            if escaped == '\'' {
+                                out.push('\'');
+                            } else {
+                                out.push('\\');
+                                out.push(escaped);
+                            }
+                        }
+                        '\'' => break,
+                        '"' => out.push_str("\\\""),
+                        other => out.push(other),
+                    }
+                }
+                out.push('"');
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let token: String = chars[start..i].iter().collect();
+                let colon_follows = chars[i..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|c| *c == ':');
+                if colon_follows {
+                    out.push('"');
+                    out.push_str(&token);
+                    out.push('"');
+                } else if matches!(token.as_str(), "true" | "false" | "null") {
+                    out.push_str(&token);
+                } else {
+                    return None;
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Canonicalize + validate an acceptance payload on its way into the store.
+///
+/// Every write path funnels through here, so what `create`/`update` persist
+/// is exactly what [`canonicalize_acceptance`] admits — never the raw value a
+/// caller happened to hold.
+fn admit_acceptance(value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
+    let canonical = canonicalize_acceptance(value).map_err(StorageError::Invalid)?;
+    validate_acceptance(&canonical)?;
+    Ok(canonical)
+}
+
 /// Validate the acceptance-check JSON shape at write time so the harness
 /// never meets a malformed check at run time.
 fn validate_acceptance(value: &serde_json::Value) -> Result<(), StorageError> {
@@ -1888,6 +2060,72 @@ mod tests {
             "kind": "command", "command": "cargo test -p nanna-storage"
         }));
         assert!(repo.create(nt).await.is_ok());
+    }
+
+    /// The write boundary is where the acceptance representation is decided:
+    /// whatever dialect a caller holds, the ROW holds an object. A store that
+    /// merely validated (and rejected) the stringified form dropped the task
+    /// entirely, because the reader had already admitted it upstream.
+    #[tokio::test]
+    async fn acceptance_is_canonicalized_to_an_object_at_write() {
+        let (_s, repo) = repo().await;
+
+        // The object handed over as a JSON string.
+        let mut nt = new_task("stringified");
+        nt.acceptance = Some(serde_json::json!(
+            "{\"kind\":\"command\",\"command\":\"cargo test\"}"
+        ));
+        let created = repo.create(nt).await.expect("a stringified check is admitted");
+        assert_eq!(
+            created.acceptance.expect("stored"),
+            serde_json::json!({"kind": "command", "command": "cargo test"}),
+            "the row must hold the object, never the string"
+        );
+
+        // The JS-object-literal flavor, same rule.
+        let mut nt = new_task("js literal");
+        nt.acceptance = Some(serde_json::json!("{kind: 'file_exists', path: 'out.txt'}"));
+        let created = repo.create(nt).await.expect("the literal flavor is repaired");
+        assert_eq!(
+            created.acceptance.expect("stored"),
+            serde_json::json!({"kind": "file_exists", "path": "out.txt"})
+        );
+
+        // `update` obeys the same boundary.
+        let updated = repo
+            .update(
+                created.id,
+                TaskPatch {
+                    acceptance: Some(Some(serde_json::json!(
+                        "{\"kind\":\"regex\",\"pattern\":\"0 failed\",\"path\":\"build.log\"}"
+                    ))),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("update canonicalizes too");
+        let stored = updated.acceptance.expect("stored");
+        assert!(stored.is_object(), "{stored}");
+        assert_eq!(stored["kind"], serde_json::json!("regex"));
+    }
+
+    /// One unwrap, no more: a double-encoded payload is noise nobody wrote,
+    /// and peeling deeper would accept it.
+    #[tokio::test]
+    async fn double_encoded_acceptance_is_still_rejected() {
+        let (_s, repo) = repo().await;
+        let mut nt = new_task("double encoded");
+        nt.acceptance = Some(serde_json::json!(
+            "\"{\\\"kind\\\":\\\"command\\\",\\\"command\\\":\\\"cargo test\\\"}\""
+        ));
+        let Err(StorageError::Invalid(message)) = repo.create(nt).await else {
+            panic!("double-encoded acceptance must be rejected");
+        };
+        assert!(
+            message.contains(r#"{"kind":"command","command":"cargo test"}"#),
+            "the rejection must carry the shapes: {message}"
+        );
     }
 
     /// The rejection has to carry the fix: a regex check missing its target

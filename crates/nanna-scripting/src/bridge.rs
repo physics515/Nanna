@@ -597,28 +597,10 @@ impl NannaBridge {
         self.tool_search.as_ref().map(|f| f(query, limit))
     }
 
-    /// Call a registered service by name.
-    ///
-    /// A missing (or null/empty) `session_id` param is filled from the
-    /// bridge's session: a tool running INSIDE a session must never make the
-    /// model hand back the session it is already in — that demand produced 35
-    /// "session scope requires session_id" todo failures, each one a burned
-    /// step. An explicit non-empty `session_id` always wins (the caller knows
-    /// something the bridge does not), and a bridge with no session leaves the
-    /// params untouched so genuinely context-free callers still get the
-    /// service's own error.
-    pub async fn call_service(&self, name: &str, mut params: Value) -> std::result::Result<Value, String> {
+    /// Call a registered service by name
+    pub async fn call_service(&self, name: &str, params: Value) -> std::result::Result<Value, String> {
         let service = self.services.get(name)
             .ok_or_else(|| format!("Service not found: {name}"))?;
-        if let (Some(session_id), Some(obj)) = (self.session_id.as_deref(), params.as_object_mut()) {
-            if obj
-                .get("session_id")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                obj.insert("session_id".to_string(), Value::String(session_id.to_string()));
-            }
-        }
         service(params).await
     }
 
@@ -1796,61 +1778,6 @@ mod tests {
             .expect("bounded recursive listing");
         assert_eq!(bounded.len(), 4, "recursive walk must stop at the bound");
     }
-
-    // ---------------------------------------------------------------------
-    // Session-scoped services: the session a tool runs in is context, never
-    // something the model has to type back.
-    // ---------------------------------------------------------------------
-
-    /// A service that echoes the params it was handed.
-    fn echo_service() -> HashMap<String, ServiceFn> {
-        let mut services: HashMap<String, ServiceFn> = HashMap::new();
-        let echo: ServiceFn = Arc::new(|params: Value| Box::pin(async move { Ok(params) }));
-        services.insert("tasks.next".to_string(), echo);
-        services
-    }
-
-    async fn call_echo(bridge: &NannaBridge, params: Value) -> Value {
-        bridge
-            .call_service("tasks.next", params)
-            .await
-            .expect("echo service")
-    }
-
-    #[tokio::test]
-    async fn service_call_inherits_the_bridge_session() {
-        let bridge = NannaBridge::new(ToolPermissions::default())
-            .with_services(echo_service())
-            .with_session_id("sess-live");
-
-        // Absent, null, and empty all mean "the session I am running in".
-        for params in [
-            serde_json::json!({"scope": "session"}),
-            serde_json::json!({"scope": "session", "session_id": Value::Null}),
-            serde_json::json!({"scope": "session", "session_id": ""}),
-        ] {
-            let seen = call_echo(&bridge, params).await;
-            assert_eq!(seen["session_id"], serde_json::json!("sess-live"));
-        }
-
-        // An explicit id wins: the caller knows what the bridge does not.
-        let seen = call_echo(
-            &bridge,
-            serde_json::json!({"scope": "session", "session_id": "sess-other"}),
-        )
-        .await;
-        assert_eq!(seen["session_id"], serde_json::json!("sess-other"));
-    }
-
-    #[tokio::test]
-    async fn service_call_without_a_session_is_left_alone() {
-        let bridge = NannaBridge::new(ToolPermissions::default()).with_services(echo_service());
-        let seen = call_echo(&bridge, serde_json::json!({"scope": "session"})).await;
-        assert!(
-            seen.get("session_id").is_none(),
-            "a context-free caller must reach the service's own error: {seen}"
-        );
-    }
 }
 
 #[cfg(all(test, windows))]
@@ -1906,5 +1833,4 @@ mod drive_path_tests {
             "cat /d/ws/a.txt | grep x > /d/ws/b.txt"
         );
     }
-
 }

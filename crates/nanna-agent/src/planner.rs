@@ -279,14 +279,16 @@ fn normalize_task(value: &serde_json::Value) -> Option<PlannedTask> {
         .filter(|d| !d.is_empty())
         .map(|d| clamp_bytes(d, PLAN_DESCRIPTION_MAX_BYTES));
 
-    // Acceptance is admitted only if it parses as a real check. A malformed
-    // one is dropped, not passed through — an unparseable check would fail
-    // every verdict and grind the item to abandonment.
+    // Acceptance is admitted only if it parses as a real check, and what is
+    // admitted is the CANONICAL object, never the raw value: a check the
+    // parser tolerates (e.g. the object handed over as a string) but the store
+    // rejects would make `create` drop the whole task. A malformed one is
+    // dropped, not passed through — an unparseable check would fail every
+    // verdict and grind the item to abandonment.
     let acceptance = map
         .get("acceptance")
         .filter(|v| !v.is_null())
-        .filter(|v| crate::harness::AcceptanceCheck::from_json(v).is_ok())
-        .cloned();
+        .and_then(|v| crate::harness::AcceptanceCheck::canonicalize(v).ok());
 
     let tool_scope = map
         .get("tool_scope")
