@@ -1001,9 +1001,9 @@ pub(super) fn strip_harness_markers(text: &str) -> String {
     out.join("\n")
 }
 
-/// Apply [`strip_harness_markers`] to the journal's text entries, dropping
-/// entries the strip empties out. Tool, thinking and fault entries pass
-/// through untouched — they are records, not prose.
+/// Apply [`strip_harness_markers`] to the journal's text entries and drop
+/// every prose entry left with nothing to show. Tool, fault and step entries
+/// pass through untouched — they are records and run mechanics, not prose.
 pub(super) fn sanitize_timeline(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
     items
         .into_iter()
@@ -1017,6 +1017,19 @@ pub(super) fn sanitize_timeline(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
                         content: stripped,
                         at,
                     })
+                }
+            }
+            // A burst that closed with nothing in it — a lone newline delta
+            // between two tool calls opens and closes its own segment —
+            // rendered as its own "💭 Thinking · 1 words" card (observed
+            // live 2026-08-03). Markers are NOT stripped from thinking: it
+            // is the model's own record, and emptiness is the only thing
+            // that makes the card meaningless.
+            TimelineItem::Thinking { content, at } => {
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some(TimelineItem::Thinking { content, at })
                 }
             }
             other => Some(other),
@@ -1354,5 +1367,49 @@ mod tests {
             TimelineItem::Text { content, .. } if content == "hello"
         ));
         assert!(matches!(&sanitized[1], TimelineItem::Tool { .. }));
+    }
+
+    #[test]
+    fn sanitize_timeline_drops_empty_thinking_and_keeps_records() {
+        let at = Utc::now().to_rfc3339();
+        let items = vec![
+            TimelineItem::Thinking {
+                content: "  \n\t\n".to_string(),
+                at: at.clone(),
+            },
+            TimelineItem::Thinking {
+                content: String::new(),
+                at: at.clone(),
+            },
+            TimelineItem::Thinking {
+                content: "  the file is missing a newline  ".to_string(),
+                at: at.clone(),
+            },
+            TimelineItem::Tool {
+                call_id: "c1".to_string(),
+                name: "read_file".to_string(),
+                input: None,
+                output: Some("ok".to_string()),
+                success: Some(true),
+                duration_ms: Some(3),
+                tokens: None,
+                total_tokens: None,
+                at: at.clone(),
+            },
+            TimelineItem::Fault {
+                message: "stream ended without done=true".to_string(),
+                at: at.clone(),
+            },
+        ];
+        let sanitized = sanitize_timeline(items);
+        assert_eq!(sanitized.len(), 3);
+        // Real thinking survives verbatim — no trimming, no marker strip.
+        assert!(matches!(
+            &sanitized[0],
+            TimelineItem::Thinking { content, .. }
+                if content == "  the file is missing a newline  "
+        ));
+        assert!(matches!(&sanitized[1], TimelineItem::Tool { .. }));
+        assert!(matches!(&sanitized[2], TimelineItem::Fault { .. }));
     }
 }
