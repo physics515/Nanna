@@ -13,7 +13,7 @@
 //! control loop is deterministically testable without a model.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::cancel::CancelToken;
 use std::time::{Duration, Instant};
@@ -595,6 +595,38 @@ pub struct LongHorizonConfig {
     /// Consecutive runner errors before the run stops (circuit breaker for a
     /// dead model endpoint).
     pub max_consecutive_errors: usize,
+    /// Item ids whose acceptance check may run BEFORE a step: when one of
+    /// these items' checks already passes with nothing run, complete it on
+    /// that verdict and take no step.
+    ///
+    /// This is the harness's own philosophy applied one moment earlier — the
+    /// check is the only judge of "done", so a check that already passes means
+    /// the work is already done, and running a step to discover that burns a
+    /// model round to learn what one command already said.
+    ///
+    /// **Empty by default, and the emptiness is the bound.** On the FIRST plan
+    /// of a turn nothing has run yet, so a done-condition that already passes
+    /// says the planner wrote a condition the world happened to satisfy — not
+    /// that the user's request is moot. Completing there would delete real
+    /// work. It is populated only for mission CONTINUATION rounds, where the
+    /// run has already acted on the world this turn and the question "is this
+    /// re-proposal already satisfied?" is exactly the mission's termination
+    /// question. See `chat_harness`'s continuation loop.
+    ///
+    /// **A SET OF IDS, not a flag, and that is the invariant.** The pre-check
+    /// exists to skip work the CONTINUATION PLANNER re-proposed that the
+    /// environment already satisfies; it must NEVER apply to work a user just
+    /// asked for. A flag scoped to the round would cover every item the round
+    /// happens to select, and the harness polls the [`Interjector`] at the top
+    /// of each iteration — so a message the user sent mid-round is planned
+    /// into a new item and selected under the same flag. If its planned
+    /// acceptance happened to pass already, that item would close with zero
+    /// steps run and the user would never be answered. Interjections are the
+    /// one thing that must never be skipped. Carrying the exact ids
+    /// `seed_continuation` returned makes the wrong item unreachable rather
+    /// than merely unlikely: leftovers, replan subtasks and interjected asks
+    /// are all outside the set and all run normally.
+    pub precheck_acceptance_items: HashSet<i64>,
     /// Actor name recorded in the activity log.
     pub actor: String,
 }
@@ -609,6 +641,7 @@ impl Default for LongHorizonConfig {
             step_iterations: 8,
             step_token_budget: None,
             max_consecutive_errors: 3,
+            precheck_acceptance_items: HashSet::new(),
             actor: "harness".to_string(),
         }
     }
@@ -647,10 +680,33 @@ pub struct LongHorizonReport {
     /// carry that: a 42-feature build whose planner emits one task and whose
     /// first step completes it looks numerically identical to "hi".
     pub tool_calls: usize,
+    /// The subset of `tool_calls` that CHANGED SOMETHING — the work-evidence
+    /// set the completion-claim rung accepts as proof (`is_work_evidence_tool`:
+    /// writes, edits, the shell). Reads and searches can run forever without
+    /// touching anything outside the context window, so `tool_calls > 0`
+    /// answers "did this run act?" while only this field answers "did this run
+    /// change the world?".
+    ///
+    /// The caller that needs the distinction is the chat harness's
+    /// mission-continuation loop: a round that changed nothing and closed
+    /// nothing is not progress, whatever its tasks were titled.
+    #[serde(default)]
+    pub side_effect_tool_calls: usize,
     pub items_completed: usize,
     /// Items completed on the model's claim alone (no acceptance check
     /// existed) — logged so unverified completions are visible.
     pub items_completed_unverified: usize,
+    /// The subset of `items_completed` closed by the acceptance PRE-CHECK:
+    /// their done-condition already passed before any step ran, so the run
+    /// completed them for free (see
+    /// `LongHorizonConfig::precheck_acceptance_items`).
+    ///
+    /// Counted apart because these completions are evidence the goal was
+    /// ALREADY met, not evidence this run advanced it. The chat harness's
+    /// mission loop needs that distinction: a continuation round whose every
+    /// item was already satisfied changed nothing, and must count dry.
+    #[serde(default)]
+    pub items_already_satisfied: usize,
     pub items_abandoned: usize,
     /// The most recent step-runner error seen during the run, kept so a
     /// caller can say WHY when the plan drained through abandonment rather
@@ -873,6 +929,15 @@ struct ItemProgress {
     last_result: Option<String>,
     last_tool_calls: Vec<StepToolCall>,
     runner_errors: usize,
+    /// Has the acceptance pre-check already run for this item in this run?
+    ///
+    /// The bound on the pre-check's cost: ONE extra acceptance execution per
+    /// item per run, taken at the item's first selection. Without it a
+    /// grinding item would re-run its check before every step as well as
+    /// after it, doubling the command executions of the slowest thing the
+    /// harness does — and re-asking a question the post-step verdict answered
+    /// moments earlier, from the same state.
+    acceptance_prechecked: bool,
 }
 
 /// The long-horizon control loop.
@@ -918,8 +983,10 @@ impl LongHorizonRunner {
         let started = Instant::now();
         let mut steps_taken = 0usize;
         let mut tool_calls_total = 0usize;
+        let mut side_effect_tool_calls = 0usize;
         let mut items_completed = 0usize;
         let mut items_completed_unverified = 0usize;
+        let mut items_already_satisfied = 0usize;
         let mut items_abandoned = 0usize;
         let mut replans = 0usize;
         let mut false_success_claims = 0usize;
@@ -965,14 +1032,24 @@ impl LongHorizonRunner {
                 Ok(None) => break StopReason::AllTasksDone,
                 Err(message) => break StopReason::SourceError { message },
             };
-            let item = progress.entry(step.id).or_default();
-            let is_replan = item.steps_without_progress >= cfg.max_steps_per_item;
+            // Scoped so the pre-check below (which may `progress.remove`) is
+            // not fighting a live borrow of the same map.
+            let (is_replan, fruitless_steps, item_replans, precheck_due) = {
+                let item = progress.entry(step.id).or_default();
+                let precheck_due = !item.acceptance_prechecked;
+                item.acceptance_prechecked = true;
+                (
+                    item.steps_without_progress >= cfg.max_steps_per_item,
+                    item.steps_without_progress,
+                    item.replans,
+                    precheck_due,
+                )
+            };
 
-            if is_replan && item.replans >= cfg.max_replans_per_item {
+            if is_replan && item_replans >= cfg.max_replans_per_item {
                 // Grinding AND replanning failed — close the item and move on.
                 let reason = format!(
-                    "abandoned after {} fruitless steps and {} replans",
-                    item.steps_without_progress, item.replans
+                    "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
                 );
                 if let Err(message) = source.abandon(step.id, &reason).await {
                     break StopReason::SourceError { message };
@@ -983,6 +1060,81 @@ impl LongHorizonRunner {
             }
 
             let _ = source.start(step.id).await;
+
+            // ACCEPTANCE PRE-CHECK. The environment is the judge of "done";
+            // ask it before spending a step, not only after. When the
+            // done-condition already passes with nothing run, the work is
+            // provably already there and a step could only rediscover that.
+            //
+            // Opt-in (`precheck_acceptance_items`) because on a first plan a
+            // pre-passing condition means the check is wrong, not the work
+            // done — see the field's docs. Scoped to the exact ids the caller
+            // named rather than to "every item this run selects": the
+            // interjection poll above can add a USER'S message to the plan
+            // mid-round, and skipping that on a pre-passing condition would
+            // leave the user unanswered. Bounded to one execution per item per
+            // run by `acceptance_prechecked`, and each execution reuses
+            // `AcceptanceCheck::run`, so it inherits the same workdir
+            // resolution and the same clamped timeout as every other
+            // acceptance run — no second execution path to keep in sync.
+            let precheck = if precheck_due && cfg.precheck_acceptance_items.contains(&step.id) {
+                step.acceptance.as_ref()
+            } else {
+                None
+            };
+            if let Some(check) = precheck {
+                let verdict = check.run(workdir).await;
+                if verdict.passed {
+                    let detail = serde_json::json!({
+                        "verified": true,
+                        "verdict": verdict.detail,
+                        "already_satisfied": true,
+                        "steps_run": 0,
+                        "tokens_spent": 0,
+                    });
+                    let _ = source
+                        .log(
+                            step.id,
+                            "acceptance_already_satisfied",
+                            serde_json::json!({
+                                "detail": verdict.detail,
+                                "check": check.describe(),
+                            }),
+                        )
+                        .await;
+                    match source.complete(step.id, detail).await {
+                        Ok(()) => {
+                            consecutive_errors = 0;
+                            items_completed += 1;
+                            items_already_satisfied += 1;
+                            progress.remove(&step.id);
+                            tracing::info!(
+                                item = step.id,
+                                title = %step.title,
+                                verdict = %verdict.detail,
+                                "acceptance already passed before any step — completing \
+                                 without running one"
+                            );
+                            continue;
+                        }
+                        Err(message) => {
+                            // Same containment as the post-step path: a
+                            // completion can legitimately fail (a concurrent
+                            // decomposition opened a child). Fall through and
+                            // run the step normally.
+                            let _ = source
+                                .log(
+                                    step.id,
+                                    "complete_failed",
+                                    serde_json::json!({ "error": message }),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            let item = progress.entry(step.id).or_default();
 
             let (prompt, step_kind) = if is_replan {
                 let stall_summary = format!(
@@ -1135,6 +1287,16 @@ impl LongHorizonRunner {
             let repeated = steps_repeat(&item.last_tool_calls, &outcome.tool_calls);
             item.last_tool_calls.clone_from(&outcome.tool_calls);
             tool_calls_total += outcome.tool_calls.len();
+            // Counted by NAME, not by outcome: a [`StepToolCall`] is a digest
+            // and carries no success flag. An attempted-but-failed `exec`
+            // therefore reads as "the step reached for the world", which errs
+            // toward letting a mission continue — the cheap mistake, since the
+            // opposite one ends a live mission a round early.
+            side_effect_tool_calls += outcome
+                .tool_calls
+                .iter()
+                .filter(|call| crate::loop_runner::is_work_evidence_tool(&call.name))
+                .count();
 
             // Verdict time. With a check, the environment is the only judge.
             match &step.acceptance {
@@ -1246,8 +1408,10 @@ impl LongHorizonRunner {
             stop,
             steps_taken,
             tool_calls: tool_calls_total,
+            side_effect_tool_calls,
             items_completed,
             items_completed_unverified,
+            items_already_satisfied,
             items_abandoned,
             last_runner_error,
             replans,
@@ -1453,6 +1617,31 @@ mod tests {
                     .or_insert(0) += self.per_replan;
             }
             self.inner.run_step(request).await
+        }
+    }
+
+    /// Creates a file on every step — the environment changing UNDER the
+    /// harness, which is the only thing an acceptance check exists to notice.
+    struct FileWritingRunner {
+        path: PathBuf,
+        steps: Mutex<usize>,
+    }
+
+    impl FileWritingRunner {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                steps: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StepRunner for FileWritingRunner {
+        async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+            *self.steps.lock().await += 1;
+            std::fs::write(&self.path, b"done").map_err(|e| e.to_string())?;
+            Ok(outcome("wrote the artifact"))
         }
     }
 
@@ -1970,6 +2159,300 @@ mod tests {
     // -----------------------------------------------------------------
     // Control loop
     // -----------------------------------------------------------------
+
+    /// The report must separate "called tools" from "changed something": the
+    /// chat harness's mission loop treats a round that only READ as making no
+    /// progress, and reads are most of a round's tool calls.
+    #[tokio::test]
+    async fn the_report_counts_side_effects_apart_from_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "look around",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+        let called = |names: &[&str]| {
+            Ok(StepOutcome {
+                text: "had a look".to_string(),
+                input_tokens: 1000,
+                output_tokens: 200,
+                tool_calls: names
+                    .iter()
+                    .map(|name| StepToolCall {
+                        name: (*name).to_string(),
+                        input_digest: (*name).to_string(),
+                        output_digest: String::new(),
+                    })
+                    .collect(),
+            })
+        };
+        let runner = ScriptedRunner::new(vec![
+            called(&["read_file", "code_search", "list_dir"]),
+            called(&["read_file", "exec"]),
+        ]);
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 0,
+            ..fast_config()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.tool_calls, 5, "every call counts here");
+        assert_eq!(
+            report.side_effect_tool_calls, 1,
+            "only the shell call changed anything: {report:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Acceptance pre-check: ask the environment before spending a step
+    // -----------------------------------------------------------------
+
+    /// The decisive convergence signal. A seeded item whose done-condition
+    /// ALREADY passes is finished work: complete it on that verdict, run no
+    /// step, and record it apart so the caller can tell "already met" from
+    /// "this run met it".
+    ///
+    /// The runner's script is EMPTY on purpose — any step at all fails the
+    /// test loudly instead of quietly costing a model round.
+    #[tokio::test]
+    async fn an_already_passing_acceptance_completes_without_running_a_step() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.txt"), b"already here").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "produce the artifact",
+                Some(AcceptanceCheck::FileExists {
+                    path: "artifact.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![]);
+        let config = LongHorizonConfig {
+            precheck_acceptance_items: HashSet::from([1]),
+            ..fast_config()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.steps_taken, 0, "no step: {report:?}");
+        assert!(
+            runner.requests.lock().await.is_empty(),
+            "the runner was never asked to do anything"
+        );
+        assert_eq!(report.items_completed, 1, "the item IS closed");
+        assert_eq!(
+            report.items_already_satisfied, 1,
+            "…and closed as already-satisfied, which is not progress"
+        );
+        assert_eq!(report.input_tokens + report.output_tokens, 0);
+
+        // The verdict says WHY it closed — a completion with no step behind it
+        // must announce itself, in the store the user can read.
+        let completions = source.completions.lock().await;
+        let (id, detail) = completions.first().expect("one completion");
+        assert_eq!(*id, 1);
+        assert_eq!(detail["already_satisfied"], serde_json::json!(true));
+        assert_eq!(detail["verified"], serde_json::json!(true));
+        assert_eq!(detail["steps_run"], serde_json::json!(0));
+        assert!(
+            source
+                .log_entries
+                .lock()
+                .await
+                .iter()
+                .any(|(_, action)| action == "acceptance_already_satisfied"),
+            "the activity log records the pre-check"
+        );
+    }
+
+    /// The other direction, and the larger half of the contract: a check that
+    /// does NOT already pass changes nothing about how the item runs. The step
+    /// happens, the post-step verdict closes it, and the completion is
+    /// ordinary — `items_already_satisfied` stays 0.
+    ///
+    /// This also pins the pre-check's bound: it runs at most ONCE per item per
+    /// run. The environment flips mid-run (the step writes the file), and the
+    /// item still closes through the post-step verdict rather than a second
+    /// pre-check.
+    #[tokio::test]
+    async fn a_failing_pre_check_runs_the_step_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("artifact.txt");
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "produce the artifact",
+                Some(AcceptanceCheck::FileExists {
+                    path: "artifact.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner = FileWritingRunner::new(artifact.clone());
+        let config = LongHorizonConfig {
+            precheck_acceptance_items: HashSet::from([1]),
+            ..fast_config()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.steps_taken, 1, "the step ran: {report:?}");
+        assert_eq!(*runner.steps.lock().await, 1);
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(
+            report.items_already_satisfied, 0,
+            "the work was done BY this run, not found already done"
+        );
+        assert!(artifact.exists());
+        let completions = source.completions.lock().await;
+        let (_, detail) = completions.first().expect("one completion");
+        assert!(
+            detail.get("already_satisfied").is_none(),
+            "an ordinary completion, unmarked: {detail}"
+        );
+    }
+
+    /// The pre-check is OPT-IN, and the default is the bound: on a first plan
+    /// nothing has run yet, so a condition that already passes means the
+    /// planner wrote a weak check — not that the user's request is moot.
+    /// Completing there would delete real work, so the default runs the step.
+    #[tokio::test]
+    async fn the_pre_check_is_off_unless_the_caller_asks_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.txt"), b"already here").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "produce the artifact",
+                Some(AcceptanceCheck::FileExists {
+                    path: "artifact.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![Ok(outcome("had a go"))]);
+        assert!(
+            LongHorizonConfig::default()
+                .precheck_acceptance_items
+                .is_empty(),
+            "off by default"
+        );
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.steps_taken, 1, "the step ran: {report:?}");
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(report.items_already_satisfied, 0);
+    }
+
+    /// THE PRE-CHECK MUST NEVER SWALLOW A LIVE USER MESSAGE.
+    ///
+    /// The pre-check is scoped to the ids the continuation planner seeded, and
+    /// this is the reason. The harness polls the interjector at the top of
+    /// every iteration, BEFORE `next()`, so a message the user sends during a
+    /// continuation round is planned into a fresh item and selected inside the
+    /// very round the pre-check is enabled for. A round-wide flag would cover
+    /// it, and an interjected ask whose planned acceptance happened to pass
+    /// already ("artifact.txt exists" — trivially true) would be completed
+    /// with ZERO steps run: the user asked a question and got silence.
+    ///
+    /// Driven through the interjector rather than by calling the pre-check
+    /// directly, because the path IS the bug: nothing about the item itself
+    /// says "a user just asked for this", only where it came from.
+    ///
+    /// Both halves of the contract in one run — the seeded item is skipped and
+    /// counted `already_satisfied` (so the caller's round still reads dry),
+    /// while the interjected item, whose acceptance is the same trivially-true
+    /// condition, runs its step.
+    #[tokio::test]
+    async fn an_interjected_item_runs_its_step_even_when_acceptance_already_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.txt"), b"already here").unwrap();
+        let passing = || {
+            Some(AcceptanceCheck::FileExists {
+                path: "artifact.txt".to_string(),
+            })
+        };
+        let source = Arc::new(MemorySource::default());
+        source
+            .push(step(1, "the continuation re-proposal", passing()))
+            .await;
+        // Nothing waiting when the seeded item is selected; the user's message
+        // lands on the next boundary, mid-round.
+        let interjector = ScriptedInterjector::new(
+            source.clone(),
+            vec![vec![], vec![step(2, "and what about the logs?", passing())]],
+        );
+        let runner = ScriptedRunner::new(vec![Ok(outcome("here are the logs\nTASK COMPLETE"))]);
+        let config = LongHorizonConfig {
+            // Only the continuation planner's seed is in scope.
+            precheck_acceptance_items: HashSet::from([1]),
+            ..fast_config()
+        };
+
+        let report = LongHorizonRunner::new(config)
+            .run_with_interjector(
+                "goal",
+                source.as_ref(),
+                &runner,
+                dir.path(),
+                None,
+                Some(&interjector),
+            )
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.interjected_items, 1);
+        assert_eq!(report.items_completed, 2, "both closed: {report:?}");
+        assert_eq!(
+            report.items_already_satisfied, 1,
+            "ONLY the seeded re-proposal was skipped for free: {report:?}"
+        );
+        assert_eq!(
+            report.steps_taken, 1,
+            "one step, and it belongs to the user's message: {report:?}"
+        );
+        let prompts: Vec<String> = runner
+            .requests
+            .lock()
+            .await
+            .iter()
+            .map(|r| r.prompt.clone())
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains("and what about the logs?"),
+            "the user's mid-round message must reach a step prompt: {prompts:?}"
+        );
+        let completions = source.completions.lock().await;
+        let seeded = completions
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .expect("the seeded item closed");
+        assert_eq!(seeded.1["already_satisfied"], serde_json::json!(true));
+        let interjected = completions
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .expect("the interjected item closed");
+        assert!(
+            interjected.1.get("already_satisfied").is_none(),
+            "the user's item closed by running, not by being skipped: {}",
+            interjected.1
+        );
+    }
 
     #[tokio::test]
     async fn empty_plan_stops_immediately_with_all_done() {

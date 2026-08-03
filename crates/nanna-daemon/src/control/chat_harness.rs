@@ -59,11 +59,12 @@ use tokio::sync::RwLock;
 /// rounds of real new work is a session the user should be steering anyway.
 const CONTINUATION_ROUNDS_MAX: usize = 60;
 
-/// Consecutive rounds that plan no new work before the mission is done.
+/// Consecutive rounds that make no progress before the mission is done.
 ///
 /// Bound justification: one dry round can be a planner hiccup; two in a row
 /// means re-planning from the current store state finds nothing left — the
-/// goal is as done as this planner can make it.
+/// goal is as done as this planner can make it. A round is dry when it plans
+/// no new work OR when it makes none ([`round_made_progress`]).
 const CONTINUATION_DRY_ROUNDS: usize = 2;
 
 /// Rounds a run may end in an ERROR stop and still be retried.
@@ -74,6 +75,45 @@ const CONTINUATION_DRY_ROUNDS: usize = 2;
 /// mission's termination criterion should be "no more work can be planned",
 /// not "the last step happened to exit by the happy path".
 const CONTINUATION_ERROR_ROUNDS: usize = 3;
+
+/// Did a continuation round actually PROGRESS the mission?
+///
+/// The duplicate-title filter (`tasks::same_title`) is a narrow safety net,
+/// not the terminator: it only refuses a title it can prove is the same
+/// string modulo case, punctuation and plurals, because a duplicate filter
+/// that guesses can DELETE work nobody will ever do. Rephrasing walks
+/// straight past it — observed live 2026-08-03 (goal "fix conflicts and merge
+/// all open prs"), the planner re-proposed finished work as "check the
+/// current PR state", then "enumerate the currently open PRs", then "check
+/// which PRs are still open", three different verbs for one job.
+///
+/// So convergence is decided by what a round DID, not by what it was called.
+/// Two signals, both title-blind:
+///
+/// - The **acceptance pre-check**
+///   (`LongHorizonConfig::precheck_acceptance_items`) is the decisive one, and
+///   the environment proves it: an item THIS ROUND SEEDED whose done-condition
+///   already passes is completed with no step run and counted in
+///   `items_already_satisfied`. That is what would have ended the live run,
+///   whose condition (`gh pr list --state open … | grep -qx 0`) passed on
+///   every round. Those completions are therefore NOT progress — they are
+///   proof the goal was already met. It is scoped to the round's seeded ids
+///   precisely so it can never swallow an interjected user message.
+/// - The **structural** one: a round that made no side-effectful tool call (no
+///   write, no edit, no shell — the same work-evidence set the
+///   completion-claim rung uses) and closed nothing left the world and the
+///   plan exactly as it found them.
+///
+/// The structural signal has a documented limit: `exec` is dual-use, so a
+/// read-only `gh pr list` through the shell counts as side-effectful and the
+/// round reads as progress. That is the case the pre-check above covers, and
+/// it is why the pre-check is the decisive rung rather than a second opinion.
+///
+/// Genuine multi-round missions are untouched: writing a file or closing an
+/// item the run actually did resets the counter exactly as before.
+fn round_made_progress(round: &nanna_agent::harness::LongHorizonReport) -> bool {
+    round.side_effect_tool_calls > 0 || round.items_completed > round.items_already_satisfied
+}
 
 /// Per-session interjection intake, shared between the chat handler (which
 /// pushes) and the live run's [`SessionInterjector`] (which drains).
@@ -450,7 +490,9 @@ impl ControlPlane {
                                 .await;
                             report.steps_taken += extra.steps_taken;
                             report.tool_calls += extra.tool_calls;
+                            report.side_effect_tool_calls += extra.side_effect_tool_calls;
                             report.items_completed += extra.items_completed;
+                            report.items_already_satisfied += extra.items_already_satisfied;
                             report.items_abandoned += extra.items_abandoned;
                             report.interjected_items += admitted + extra.interjected_items;
                             if extra.last_runner_error.is_some() {
@@ -610,26 +652,83 @@ impl ControlPlane {
                                 );
                                 continue;
                             }
-                            dry_rounds = 0;
                             tracing::info!(
                                 continuations,
                                 new_tasks = seeded.len(),
                                 "mission continues — the goal is not done yet"
                             );
-                            let more =
-                                nanna_agent::harness::LongHorizonRunner::new(config.clone())
-                                    .run_with_interjector(
-                                        &content_owned,
-                                        &source,
-                                        &step_runner,
-                                        &workdir,
-                                        Some(run_handle.cancel.clone()),
-                                        Some(&interjector),
-                                    )
-                                    .await;
+                            // Continuation rounds ask the ENVIRONMENT first, but
+                            // only about THIS ROUND'S SEEDED ITEMS. By this point
+                            // the turn has already run its plan and acted on the
+                            // world, so "this re-proposal's done-condition already
+                            // passes" means the work is done — not that the planner
+                            // wrote a weak condition before anything happened, which
+                            // is why the first round above runs without the
+                            // pre-check.
+                            //
+                            // Scoped to `seeded` rather than switched on for the
+                            // round, because the round is not the only source of
+                            // items: the harness polls the interjector before every
+                            // selection, so a message the USER sends mid-round is
+                            // planned into a new item and would be selected under a
+                            // round-wide flag. An interjected ask whose acceptance
+                            // happened to pass already would then close with zero
+                            // steps and the user would never be answered. Leftovers
+                            // and replan subtasks are outside the set for the same
+                            // reason: the pre-check may only skip what the
+                            // continuation planner just re-proposed.
+                            let round_config = LongHorizonConfig {
+                                precheck_acceptance_items: seeded.iter().copied().collect(),
+                                ..config.clone()
+                            };
+                            let runner = nanna_agent::harness::LongHorizonRunner::new(round_config);
+                            let more = runner
+                                .run_with_interjector(
+                                    &content_owned,
+                                    &source,
+                                    &step_runner,
+                                    &workdir,
+                                    Some(run_handle.cancel.clone()),
+                                    Some(&interjector),
+                                )
+                                .await;
+                            // The dry counter is decided by what the round DID,
+                            // not by what it was called — see
+                            // [`round_made_progress`]. Seeding a title the
+                            // duplicate filter let through is not yet progress:
+                            // the round has to change something, and items the
+                            // acceptance pre-check closed for free changed
+                            // nothing (they prove the goal was ALREADY met).
+                            //
+                            // A round that ended in a retryable ERROR is
+                            // accounted by `error_rounds` alone. It changed
+                            // nothing either, but feeding both counters would
+                            // silently cut the error-retry budget from
+                            // CONTINUATION_ERROR_ROUNDS to
+                            // CONTINUATION_DRY_ROUNDS: two bounds, two failure
+                            // modes, neither shortening the other.
+                            let errored = matches!(
+                                more.stop,
+                                nanna_agent::harness::StopReason::SourceError { .. }
+                                    | nanna_agent::harness::StopReason::RunnerErrors { .. }
+                            );
+                            if round_made_progress(&more) {
+                                dry_rounds = 0;
+                            } else if !errored {
+                                dry_rounds += 1;
+                                tracing::info!(
+                                    continuations,
+                                    dry_rounds,
+                                    steps = more.steps_taken,
+                                    already_satisfied = more.items_already_satisfied,
+                                    "mission continuation changed nothing and closed nothing"
+                                );
+                            }
                             report.steps_taken += more.steps_taken;
                             report.tool_calls += more.tool_calls;
+                            report.side_effect_tool_calls += more.side_effect_tool_calls;
                             report.items_completed += more.items_completed;
+                            report.items_already_satisfied += more.items_already_satisfied;
                             report.items_abandoned += more.items_abandoned;
                             report.interjected_items += more.interjected_items;
                             if more.last_runner_error.is_some() {
@@ -1068,8 +1167,10 @@ mod tests {
             stop,
             steps_taken: steps,
             tool_calls: 0,
+            side_effect_tool_calls: 0,
             items_completed: completed,
             items_completed_unverified: 0,
+            items_already_satisfied: 0,
             items_abandoned: abandoned,
             last_runner_error: last_err.map(String::from),
             replans: 0,
@@ -1233,6 +1334,158 @@ mod tests {
             "the goal was worked once, never treadmilled: {:?}",
             all.iter().map(|t| &t.title).collect::<Vec<_>>()
         );
+    }
+
+    /// One continuation round's report: `side_effects` work-evidence calls
+    /// and `completed` items closed. `tool_calls` is deliberately larger than
+    /// `side_effects` — a round that only READ still called tools, and that
+    /// is exactly the distinction the total counter cannot make.
+    fn round(side_effects: usize, completed: usize) -> LongHorizonReport {
+        LongHorizonReport {
+            tool_calls: side_effects + 4,
+            side_effect_tool_calls: side_effects,
+            ..report(StopReason::AllTasksDone, 1, completed, 0, None)
+        }
+    }
+
+    /// A round whose items were all closed by the acceptance PRE-CHECK: the
+    /// environment said the work was already there, so nothing ran.
+    fn already_satisfied_round(items: usize) -> LongHorizonReport {
+        LongHorizonReport {
+            tool_calls: 0,
+            side_effect_tool_calls: 0,
+            items_already_satisfied: items,
+            ..report(StopReason::AllTasksDone, 0, items, 0, None)
+        }
+    }
+
+    /// REGRESSION (live 2026-08-03, "fix conflicts and merge all open prs"):
+    /// the planner rephrased finished work every round, so the title filter
+    /// saw new work forever. Progress is judged by what a round CHANGED.
+    #[test]
+    fn a_round_that_changes_nothing_makes_no_progress() {
+        // Read-only inspection: tools were called, nothing moved.
+        assert!(!round_made_progress(&round(0, 0)));
+        // Writing/editing/shelling is progress…
+        assert!(round_made_progress(&round(1, 0)));
+        // …and so is closing an item the round actually worked.
+        assert!(round_made_progress(&round(0, 1)));
+    }
+
+    /// The decisive rung. The live mission's done-condition (`gh pr list
+    /// --state open … | grep -qx 0`) passed on EVERY continuation round, so
+    /// every re-proposal the planner made was already satisfied. Those
+    /// completions prove the goal was already met — they are not progress, and
+    /// two of them in a row end the mission.
+    #[test]
+    fn items_the_environment_had_already_satisfied_are_not_progress() {
+        assert!(!round_made_progress(&already_satisfied_round(1)));
+        assert!(!round_made_progress(&already_satisfied_round(3)));
+        // One genuinely worked item among pre-satisfied ones IS progress: the
+        // comparison is on the excess, not on the raw count.
+        let mixed = LongHorizonReport {
+            items_already_satisfied: 2,
+            ..round(0, 3)
+        };
+        assert!(round_made_progress(&mixed));
+    }
+
+    /// End to end over the counter the loop actually runs: a planner that
+    /// re-proposes finished work under NEW verbs every round — the exact live
+    /// transcript, which `same_title` can no longer match and must not — still
+    /// converges, because the pre-check closes each proposal for free and the
+    /// dry counter reaches its bound.
+    #[test]
+    fn a_rephrasing_planner_converges_on_the_pre_check() {
+        let mut dry_rounds = 0usize;
+        let mut continuations = 0usize;
+        while dry_rounds < CONTINUATION_DRY_ROUNDS && continuations < CONTINUATION_ROUNDS_MAX {
+            // Every round: one seeded task, pre-check passes, nothing run.
+            if round_made_progress(&already_satisfied_round(1)) {
+                dry_rounds = 0;
+            } else {
+                dry_rounds += 1;
+            }
+            continuations += 1;
+        }
+        assert_eq!(
+            continuations, CONTINUATION_DRY_ROUNDS,
+            "the mission ends two rounds after the environment says it is done"
+        );
+    }
+
+    /// The structural counter must work where the title filter cannot: rounds
+    /// with genuinely different titles that nonetheless change nothing end the
+    /// mission after `CONTINUATION_DRY_ROUNDS`, not at `ROUNDS_MAX`.
+    #[tokio::test]
+    async fn two_rounds_that_change_nothing_end_the_mission() {
+        use crate::tasks::{closed_task_ids, seed_continuation};
+        use nanna_agent::planner::Plan;
+
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let scope = "session";
+        let scope_id = Some("s1");
+        let closed_before_turn = closed_task_ids(&storage, scope, scope_id)
+            .await
+            .expect("baseline");
+
+        // Titles the duplicate filter has no grounds to refuse — different
+        // subjects every round.
+        let titles = [
+            "inventory the alpha module",
+            "inventory the beta module",
+            "inventory the gamma module",
+        ];
+        let mut dry_rounds = 0usize;
+        let mut continuations = 0usize;
+        while dry_rounds < CONTINUATION_DRY_ROUNDS && continuations < CONTINUATION_ROUNDS_MAX {
+            let seeded = seed_continuation(
+                &storage,
+                scope,
+                scope_id,
+                &Plan::single(titles[continuations % titles.len()]),
+                &closed_before_turn,
+            )
+            .await
+            .unwrap_or_default();
+            continuations += 1;
+            assert!(
+                !seeded.is_empty(),
+                "a genuinely new title seeds — only the structural signal can end this"
+            );
+            if round_made_progress(&round(0, 0)) {
+                dry_rounds = 0;
+            } else {
+                dry_rounds += 1;
+            }
+        }
+
+        assert_eq!(
+            continuations, CONTINUATION_DRY_ROUNDS,
+            "two rounds that changed nothing end the mission"
+        );
+    }
+
+    /// A genuine multi-round mission is untouched: a round that writes files
+    /// or closes items resets the counter exactly as before.
+    #[test]
+    fn a_productive_round_resets_the_dry_counter() {
+        // Observed shape of a real build: a quiet round, then work, then two
+        // quiet ones. The mission survives the first quiet round and ends on
+        // the SECOND consecutive one — four rounds, not two.
+        let script = [round(0, 0), round(3, 1), round(0, 0), round(0, 0)];
+        let mut dry_rounds = 0usize;
+        let mut continuations = 0usize;
+        while dry_rounds < CONTINUATION_DRY_ROUNDS && continuations < script.len() {
+            if round_made_progress(&script[continuations]) {
+                dry_rounds = 0;
+            } else {
+                dry_rounds += 1;
+            }
+            continuations += 1;
+        }
+        assert_eq!(continuations, 4, "the productive round bought more rounds");
+        assert_eq!(dry_rounds, CONTINUATION_DRY_ROUNDS);
     }
 
     #[test]

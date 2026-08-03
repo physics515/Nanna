@@ -2355,12 +2355,90 @@ pub async fn seed_plan(
     Ok(ids)
 }
 
-/// Whitespace- and ASCII-case-insensitive title identity — the same rule the
-/// `tasks.add` idempotent-reuse check applies, so "is this the same task?"
-/// has exactly one definition.
+/// Crude, deliberately SYMMETRIC plural fold: drop a trailing `s` from tokens
+/// of 3+ characters that do not already end in `ss`.
+///
+/// Not a stemmer and not trying to be — the only plural that matters here is a
+/// planner writing "PRs" one round and "PR" the next. Because the fold is
+/// applied to both sides, an over-fold ("status" → "statu", "tests" → "test")
+/// cannot make two DIFFERENT titles match unless they differ only in that
+/// trailing `s`, which is precisely the case being folded. The failure it can
+/// produce is collapsing a genuine singular/plural distinction ("close the
+/// issue" vs "close the issues"); that is accepted, because a planner does not
+/// use the plural `s` to name a different job.
+fn fold_plural(word: &str) -> &str {
+    if word.len() >= 3 && word.ends_with('s') && !word.ends_with("ss") {
+        &word[..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+/// A title's tokens in ORDER: lowercased, split on non-alphanumerics, plurals
+/// folded. Nothing is dropped — every word the planner wrote still has to be
+/// there, in the same place.
+fn title_tokens(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| fold_plural(&word.to_lowercase()).to_string())
+        .collect()
+}
+
+/// Title identity — the same rule the `tasks.add` idempotent-reuse check
+/// applies, so "is this the same task?" has exactly one definition.
+///
+/// **This predicate can DELETE WORK.** [`seed_continuation`] drops a proposed
+/// task when its title matches one already closed this turn, and `tasks.add`
+/// hands back an existing id instead of creating a new task. A missed
+/// duplicate costs one extra continuation round; a WRONG match silently
+/// discards a job nobody will ever do. The two errors are not comparable, so
+/// the rule is deliberately conservative: it normalizes only what cannot
+/// change meaning and matches nothing else.
+///
+/// Normalized away (none of it can name different work):
+/// - surrounding whitespace and internal punctuation/separator runs,
+/// - ASCII case,
+/// - trailing-`s` plurals ([`fold_plural`]) — "merge the PRs" and "merge the
+///   PR" are one job.
+///
+/// Everything else is load-bearing and compared verbatim, IN ORDER. Two titles
+/// are the same work only when their normalized token sequences are equal.
+/// Sequence rather than set because word order carries the subject: "merge
+/// master into the PR" and "merge the PR into master" are the same multiset
+/// and opposite jobs. A sequence comparison is strictly more conservative than
+/// a set comparison, and conservative is the safe direction here.
+///
+/// **Known consequence, accepted on purpose.** An earlier revision of this
+/// function dropped a filler list ("check", "verify", "list", "current",
+/// "state", …) and matched on subsets, to catch the live 2026-08-03 mission
+/// ("fix conflicts and merge all open prs") whose planner re-proposed finished
+/// work in a new spelling every round — "check the current PR state", then
+/// "enumerate the currently open PRs", then "check which PRs are still open".
+/// That rule reduced those titles to `{pr}` and `{pr, open}`, which are
+/// subsets of "merge the PRs" and "merge all open PRs": the filter would have
+/// dropped the planner's proposal to actually MERGE as a duplicate of a
+/// VERIFICATION task, and the mission would have converged reporting success
+/// with the merges never done. Strictly worse than the bug it fixed.
+///
+/// So those three titles no longer match each other — they use different verbs
+/// and name different work as far as any string rule can tell. Terminating
+/// that mission is not this function's job: the acceptance PRE-CHECK
+/// (`LongHorizonConfig::precheck_acceptance_items`) asks the environment
+/// instead, and the environment is the only judge that cannot be fooled by a
+/// synonym.
+/// This predicate is the narrow safety net underneath it, not the terminator.
 #[must_use]
 pub fn same_title(a: &str, b: &str) -> bool {
-    a.trim().eq_ignore_ascii_case(b.trim())
+    let left = title_tokens(a);
+    let right = title_tokens(b);
+    if left.is_empty() || right.is_empty() {
+        // A title with no alphanumerics at all ("???") normalizes to nothing,
+        // and "nothing == nothing" would match every such title with every
+        // other. Fall back to exact comparison rather than invent identity.
+        return a.trim().eq_ignore_ascii_case(b.trim());
+    }
+    left == right
 }
 
 /// Ids of every closed (`done` or `cancelled`) task in a scope.
@@ -3033,10 +3111,12 @@ pub(crate) async fn reset_ollama_runner_for(model: &str) {
 fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     let mut folded = segments.last().cloned().unwrap_or(LongHorizonReport {
         tool_calls: 0,
+        side_effect_tool_calls: 0,
         stop: StopReason::AllTasksDone,
         steps_taken: 0,
         items_completed: 0,
         items_completed_unverified: 0,
+        items_already_satisfied: 0,
         items_abandoned: 0,
         last_runner_error: None,
         replans: 0,
@@ -3049,9 +3129,11 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     });
     folded.steps_taken = segments.iter().map(|r| r.steps_taken).sum();
     folded.tool_calls = segments.iter().map(|r| r.tool_calls).sum();
+    folded.side_effect_tool_calls = segments.iter().map(|r| r.side_effect_tool_calls).sum();
     folded.items_completed = segments.iter().map(|r| r.items_completed).sum();
     folded.items_completed_unverified =
         segments.iter().map(|r| r.items_completed_unverified).sum();
+    folded.items_already_satisfied = segments.iter().map(|r| r.items_already_satisfied).sum();
     folded.items_abandoned = segments.iter().map(|r| r.items_abandoned).sum();
     folded.replans = segments.iter().map(|r| r.replans).sum();
     folded.false_success_claims = segments.iter().map(|r| r.false_success_claims).sum();
@@ -3539,10 +3621,12 @@ mod tests {
     ) -> LongHorizonReport {
         LongHorizonReport {
             tool_calls: 0,
+            side_effect_tool_calls: 0,
             stop,
             steps_taken: steps,
             items_completed: completed,
             items_completed_unverified: 0,
+            items_already_satisfied: 0,
             items_abandoned: 0,
             last_runner_error: None,
             replans: 0,
@@ -4180,6 +4264,241 @@ mod tests {
             .expect("the same request on a later turn seeds again");
         assert_eq!(second.len(), 1);
         assert_ne!(second[0], first[0], "a fresh task, not the closed one");
+    }
+
+    // -----------------------------------------------------------------
+    // Title identity: normalization only, because a match DELETES work
+    // -----------------------------------------------------------------
+
+    /// What the rule is allowed to normalize away — case, surrounding
+    /// whitespace, punctuation, and trailing-`s` plurals. None of it can name
+    /// different work.
+    #[test]
+    fn normalization_only_ignores_what_cannot_change_the_work() {
+        assert!(same_title("Write data file", "  write DATA file  "));
+        assert!(same_title("merge the open PRs", "Merge the open PR!"));
+        assert!(same_title("fix conflicts", "fix   conflicts."));
+        assert!(same_title("run tests: nanna-daemon", "run tests nanna daemon"));
+        assert!(same_title("merge PR 163", "  MERGE pr 163 "));
+    }
+
+    /// THE correctness bar, and the reason this rule stays this narrow.
+    ///
+    /// A `same_title` match DELETES work: [`seed_continuation`] drops the
+    /// matched proposal and `tasks.add` returns an existing id instead of
+    /// creating a task. An earlier revision dropped an inspection-verb filler
+    /// list ("check", "enumerate", "verify", "list", "state", "current", …)
+    /// and matched token SUBSETS, which reduced "check the current PR state"
+    /// to `{pr}` and "check which PRs are still open" to `{pr, open}` — both
+    /// subsets of the ACTION titles below, at a share the majority rule
+    /// accepted. The filter would then have dropped the planner's proposal to
+    /// actually MERGE as a duplicate of a finished VERIFICATION task, and the
+    /// mission would have converged reporting success with the merges never
+    /// done.
+    ///
+    /// Every pair here is subset-shaped — the exact region the removed rule
+    /// decided — and every one of them must refuse.
+    #[test]
+    fn a_verification_title_never_swallows_the_action_it_verifies() {
+        // Inspection vs action: the live 2026-08-03 titles against the work
+        // the mission actually existed to do.
+        assert!(!same_title(
+            "check which PRs are still open",
+            "merge all open PRs"
+        ));
+        assert!(!same_title("check the current PR state", "merge the PRs"));
+        // Compound work: the added half is REAL work, not a qualifier.
+        assert!(!same_title(
+            "run the tests",
+            "run the tests and fix the failures"
+        ));
+        assert!(!same_title("fix conflicts", "fix conflicts in nanna-daemon"));
+        assert!(!same_title(
+            "merge the PRs",
+            "merge the PRs after resolving the nanna-daemon conflicts"
+        ));
+        // A qualifier that narrows the target is still a different target.
+        assert!(!same_title("merge PR", "merge PR 163"));
+        assert!(!same_title("run the tests", "run the tests again"));
+    }
+
+    /// Different targets, different work — the identifier bar the earlier
+    /// revision handled with a dedicated numeric rule and sequence equality
+    /// gets for free.
+    #[test]
+    fn titles_naming_different_targets_are_not_duplicates() {
+        assert!(!same_title("merge PR 163", "merge PR 161"));
+        assert!(!same_title("step 1", "step 2"));
+        assert!(!same_title(
+            "fix conflicts in nanna-daemon",
+            "fix conflicts in nanna-gui"
+        ));
+        assert!(!same_title("merge PR 163", "close PR 163"));
+        assert!(!same_title("feature A", "feature B"));
+        // Same words, opposite jobs: why identity is a SEQUENCE, not a set.
+        assert!(!same_title(
+            "merge master into the PR",
+            "merge the PR into master"
+        ));
+    }
+
+    /// ACCEPTED CONSEQUENCE, asserted so it cannot be lost by accident: the
+    /// live transcript's rephrasings used DIFFERENT VERBS, and no honest
+    /// string rule can call them the same work. Title matching therefore does
+    /// NOT converge that mission — the acceptance pre-check does (see
+    /// `LongHorizonConfig::precheck_acceptance_items`). The safe failure
+    /// direction is one extra round, never deleted work.
+    #[test]
+    fn rephrasing_with_a_different_verb_is_not_matched_by_title() {
+        let live = [
+            "check the current PR state",
+            "enumerate the currently open PRs",
+            "check which PRs are still open",
+        ];
+        for (i, a) in live.iter().enumerate() {
+            for b in &live[i + 1..] {
+                assert!(
+                    !same_title(a, b),
+                    "{a:?} and {b:?} differ in words that could name real work — \
+                     convergence is the acceptance pre-check's job, not this rule's"
+                );
+            }
+        }
+    }
+
+    /// A title with no alphanumerics normalizes to nothing, and "nothing ==
+    /// nothing" would match every such title with every other. Fall back to
+    /// exact identity instead.
+    #[test]
+    fn a_contentless_title_falls_back_to_exact_identity() {
+        assert!(same_title("???", " ??? "));
+        assert!(!same_title("???", "!!!"));
+        assert!(!same_title("???", "merge PR 163"));
+    }
+
+    /// End to end through the seeding path: a re-proposal that differs only
+    /// in the ways normalization ignores seeds NOTHING once the original is
+    /// closed — a dry round, which is what the mission loop needs.
+    #[tokio::test]
+    async fn continuation_filters_the_renormalized_duplicates() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+
+        let ids = seed_plan(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["merge the open PRs"]),
+            false,
+        )
+        .await
+        .expect("initial seed");
+        storage
+            .tasks()
+            .complete(ids[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        let seeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["Merge the open PR.", "merge   the OPEN prs"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert!(
+            seeded.is_empty(),
+            "the same sentence respelled is not new work"
+        );
+    }
+
+    /// …and the filter never eats the mission's actual job: the ACTION title
+    /// seeds even though a VERIFICATION title about the same subject already
+    /// closed this turn. This is the case the blocked revision got wrong.
+    #[tokio::test]
+    async fn continuation_seeds_the_action_after_a_verification_closed() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+
+        let ids = seed_plan(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["check which PRs are still open"]),
+            false,
+        )
+        .await
+        .expect("initial seed");
+        storage
+            .tasks()
+            .complete(ids[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        let seeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["merge all open PRs"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert_eq!(seeded.len(), 1, "merging is the work; it must survive");
+        let open = storage
+            .tasks()
+            .list("session", Some("s1"), false)
+            .await
+            .expect("list");
+        assert_eq!(open[0].title, "merge all open PRs");
+    }
+
+    /// …and the mission still moves: a different PR number is different work
+    /// and seeds, even though every other word matches a closed title.
+    #[tokio::test]
+    async fn continuation_seeds_a_different_identifier() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+
+        let ids = seed_plan(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["merge PR 161"]),
+            false,
+        )
+        .await
+        .expect("initial seed");
+        storage
+            .tasks()
+            .complete(ids[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        let seeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["merge PR 163"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert_eq!(seeded.len(), 1, "the next PR is real work");
+        let open = storage
+            .tasks()
+            .list("session", Some("s1"), false)
+            .await
+            .expect("list");
+        assert_eq!(open[0].title, "merge PR 163");
     }
 
     /// REGRESSION (lfm2.5 smoke, 2026-07-25): the model deleted a SEEDED
