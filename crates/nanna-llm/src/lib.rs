@@ -1420,7 +1420,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// so it would have had no effect on the thing it was written to fix.)
     ///
     /// Source order: what the caller explicitly asked for, then the live
-    /// measurement, then the env override, then a safe constant.
+    /// latch, then min(env pin, probed/nominal size) at latch initialization.
     fn resolve_num_ctx(request: &AnthropicRequest) -> u32 {
         if let Some(explicit) = request.context_limit {
             return explicit;
@@ -1428,23 +1428,45 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         if let Some(latched) = Self::latched_num_ctx(&request.model) {
             return latched;
         }
-        // Explicit beats computed. `NANNA_OLLAMA_NUM_CTX` is set by someone who
-        // measured THIS machine with THIS model; `fit_context_to_free_vram` has
-        // only inferred a size from free bytes. Having the heuristic win was a
+        // Explicit beats computed — downward. `NANNA_OLLAMA_NUM_CTX` is set by
+        // someone who measured THIS machine with THIS model;
+        // `fit_context_to_free_vram` has only inferred a size from free bytes.
+        // Letting the heuristic promote past the operator's number was a
         // silent override of a deliberate setting, and it was expensive: the
         // same model on the same mission scored 31/42 at the operator's 16384
         // and 8/42 once the heuristic promoted it to 32768. Fitting in VRAM is
         // necessary, not sufficient — a 9B model given twice the window does
         // not use it well, it loses the thread and rewrites work it had passing.
         //
-        // Nothing here makes an oversized model unrunnable: a value that really
-        // is too large still fails once and gets walked down by
-        // `demote_context`, which is the mechanism that belongs on this.
-        let sized = Self::env_num_ctx()
-            .or_else(|| Self::fit_context_to_free_vram(&request.model))
-            .unwrap_or(16_384);
-        Self::latch_num_ctx(&request.model, sized);
-        sized
+        // So the pin is a ceiling on the STARTING latch, not a disable of the
+        // machinery around it: the start is min(env, sized), which lets the
+        // env shrink the start (a probed 16384 that faults under sustained
+        // mission KV load starts stable at a pinned 8192) but never grow it
+        // past what the probe — or the nominal fallback when the card cannot
+        // be measured — says this machine supports. And a pin that is still
+        // too large fails once and gets walked down by `demote_context`, the
+        // mechanism that belongs on real GPU faults: demotion below the pin
+        // keeps working because the latch, not the env, is consulted once it
+        // exists.
+        let sized = Self::fit_context_to_free_vram(&request.model).unwrap_or(16_384);
+        let start = match Self::env_num_ctx() {
+            Some(pinned) => {
+                let start = pinned.min(sized);
+                tracing::info!(
+                    model = %request.model,
+                    pinned = start,
+                    requested = pinned,
+                    sized,
+                    source = "env",
+                    "NANNA_OLLAMA_NUM_CTX pins the starting num_ctx latch; \
+                     demote_context can still walk it lower on GPU faults"
+                );
+                start
+            }
+            None => sized,
+        };
+        Self::latch_num_ctx(&request.model, start);
+        start
     }
 
     /// The operator's explicit context size, if they set one.
@@ -5537,10 +5559,11 @@ mod tests {
     /// The regression this guards: the VRAM heuristic used to run FIRST and the
     /// env var was only consulted when measuring failed, so an operator's
     /// deliberate 16384 was silently promoted to a computed 32768. Same model,
-    /// same mission, 31/42 became 8/42.
+    /// same mission, 31/42 became 8/42. (The override is a ceiling — it beats
+    /// any LARGER measurement; min semantics are covered separately below.)
     ///
-    /// Serialised against `an_absent_or_junk_override_falls_through_to_sizing`
-    /// because the environment is process-global.
+    /// Serialised against the other env-touching tests via `env_lock` because
+    /// the environment is process-global.
     #[test]
     fn an_explicit_override_beats_the_vram_heuristic() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -5580,9 +5603,169 @@ mod tests {
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
 
+    /// The pin is min(env, sized) in BOTH directions. Fake model names are
+    /// absent from Ollama's tags, so the VRAM probe abstains and sizing lands
+    /// on the nominal 16384 deterministically on any machine — which makes
+    /// both sides of the min observable without mocking the card.
+    #[test]
+    fn the_env_pin_is_a_ceiling_on_the_starting_latch_in_both_directions() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut request = request_with_tool_history(serde_json::json!({}));
+        request.context_limit = None;
+
+        // Shrink: a pin below what sizing would pick IS the starting latch.
+        // SAFETY: edition 2024 requires this; env_lock serialises the
+        // env-touching tests, and nothing else reads this key.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
+        request.model = "test-env-pin-shrinks:1b".to_string();
+        assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
+        assert_eq!(
+            LlmClient::latched_num_ctx("test-env-pin-shrinks:1b"),
+            Some(8_192),
+            "the pin must be LATCHED as the start, not re-derived per request"
+        );
+
+        // Never grow: a pin above what sizing supports starts at the sized
+        // value — the env cannot inflate the window past the machine.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "32768") };
+        request.model = "test-env-pin-cannot-grow:1b".to_string();
+        assert_eq!(LlmClient::resolve_num_ctx(&request), 16_384);
+
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+    }
+
+    /// The pin is a ceiling, not a disable: a real GPU fault still walks the
+    /// latch below the pinned start, the walked-down value survives later
+    /// requests (the latch, not the env, is consulted once it exists), and an
+    /// explicit per-request `context_limit` keeps outranking both.
+    #[test]
+    fn demotion_still_walks_below_the_env_pin() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: see above.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
+
+        let mut request = request_with_tool_history(serde_json::json!({}));
+        request.model = "test-env-pin-demotes:1b".to_string();
+        request.context_limit = None;
+        assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
+
+        assert_eq!(
+            LlmClient::demote_context("test-env-pin-demotes:1b"),
+            Some(4_096)
+        );
+        assert_eq!(
+            LlmClient::resolve_num_ctx(&request),
+            4_096,
+            "a demotion below the pin must stick — the pin must not re-inflate it"
+        );
+
+        request.context_limit = Some(2_048);
+        assert_eq!(
+            LlmClient::resolve_num_ctx(&request),
+            2_048,
+            "an explicit request limit keeps its precedence over pin and latch"
+        );
+
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+    }
+
+    /// A pin that changes the starting latch must say so at INFO — model,
+    /// pinned value, and source — so an operator reading the logs knows the
+    /// window was deliberate, not measured.
+    #[test]
+    fn the_env_pin_announces_itself_at_info() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: see above.
+        unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
+
+        let mut request = request_with_tool_history(serde_json::json!({}));
+        request.model = "test-env-pin-announces:1b".to_string();
+        request.context_limit = None;
+
+        let out = capture_info_logs(|| {
+            assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
+        });
+        assert!(
+            out.contains("NANNA_OLLAMA_NUM_CTX pins"),
+            "the pin must announce itself, got: {out}"
+        );
+        assert!(
+            out.contains("test-env-pin-announces:1b"),
+            "the announcement must name the model, got: {out}"
+        );
+        assert!(
+            out.contains("8192"),
+            "the announcement must carry the pinned value, got: {out}"
+        );
+        assert!(
+            out.contains("env"),
+            "the announcement must name its source, got: {out}"
+        );
+
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+    }
+
+    /// With the variable unset the sizing path is today's behavior exactly:
+    /// the sized start, and no pin announcement to mislead an operator into
+    /// hunting for a setting nobody made.
+    #[test]
+    fn an_unset_env_neither_pins_nor_announces() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
+
+        let mut request = request_with_tool_history(serde_json::json!({}));
+        request.model = "test-env-pin-unset:1b".to_string();
+        request.context_limit = None;
+
+        let out = capture_info_logs(|| {
+            assert_eq!(LlmClient::resolve_num_ctx(&request), 16_384);
+        });
+        assert!(
+            !out.contains("NANNA_OLLAMA_NUM_CTX pins"),
+            "no pin means no pin announcement, got: {out}"
+        );
+    }
+
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(Default::default)
+    }
+
+    /// Run `f` with a thread-local INFO subscriber and return everything it
+    /// logged. Thread-local (`with_default`, not the global default) so
+    /// parallel tests on other threads neither pollute nor race this capture.
+    fn capture_info_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.0.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// A big co-resident model is real pressure and must actually shrink the

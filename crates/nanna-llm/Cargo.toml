@@ -31,3 +31,6 @@ tiktoken-rs = { version = "0.12", optional = true }
 # `start_paused` virtual-time tests for the OpenRouter request-spacing gate —
 # real 3s sleeps in tests would be the slow alternative.
 tokio = { workspace = true, features = ["test-util"] }
+# Captures the num_ctx pin announcement in tests — the log line is part of
+# the contract (silent pins are how operators chase phantom sizing bugs).
+tracing-subscriber.workspace = true
