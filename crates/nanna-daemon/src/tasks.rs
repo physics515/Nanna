@@ -2424,8 +2424,9 @@ fn title_tokens(title: &str) -> Vec<String> {
 /// So those three titles no longer match each other — they use different verbs
 /// and name different work as far as any string rule can tell. Terminating
 /// that mission is not this function's job: the acceptance PRE-CHECK
-/// (`LongHorizonConfig::precheck_acceptance`) asks the environment instead,
-/// and the environment is the only judge that cannot be fooled by a synonym.
+/// (`LongHorizonConfig::precheck_acceptance_items`) asks the environment
+/// instead, and the environment is the only judge that cannot be fooled by a
+/// synonym.
 /// This predicate is the narrow safety net underneath it, not the terminator.
 #[must_use]
 pub fn same_title(a: &str, b: &str) -> bool {
@@ -4345,8 +4346,8 @@ mod tests {
     /// live transcript's rephrasings used DIFFERENT VERBS, and no honest
     /// string rule can call them the same work. Title matching therefore does
     /// NOT converge that mission — the acceptance pre-check does (see
-    /// `LongHorizonConfig::precheck_acceptance`). The safe failure direction
-    /// is one extra round, never deleted work.
+    /// `LongHorizonConfig::precheck_acceptance_items`). The safe failure
+    /// direction is one extra round, never deleted work.
     #[test]
     fn rephrasing_with_a_different_verb_is_not_matched_by_title() {
         let live = [

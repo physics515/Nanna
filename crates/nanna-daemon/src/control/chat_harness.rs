@@ -90,13 +90,15 @@ const CONTINUATION_ERROR_ROUNDS: usize = 3;
 /// So convergence is decided by what a round DID, not by what it was called.
 /// Two signals, both title-blind:
 ///
-/// - The **acceptance pre-check** (`LongHorizonConfig::precheck_acceptance`)
-///   is the decisive one, and the environment proves it: a seeded item whose
-///   done-condition already passes is completed with no step run and counted
-///   in `items_already_satisfied`. That is what would have ended the live run,
+/// - The **acceptance pre-check**
+///   (`LongHorizonConfig::precheck_acceptance_items`) is the decisive one, and
+///   the environment proves it: an item THIS ROUND SEEDED whose done-condition
+///   already passes is completed with no step run and counted in
+///   `items_already_satisfied`. That is what would have ended the live run,
 ///   whose condition (`gh pr list --state open … | grep -qx 0`) passed on
 ///   every round. Those completions are therefore NOT progress — they are
-///   proof the goal was already met.
+///   proof the goal was already met. It is scoped to the round's seeded ids
+///   precisely so it can never swallow an interjected user message.
 /// - The **structural** one: a round that made no side-effectful tool call (no
 ///   write, no edit, no shell — the same work-evidence set the
 ///   completion-claim rung uses) and closed nothing left the world and the
@@ -561,17 +563,6 @@ impl ControlPlane {
 
                         let is_mission =
                             ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
-                        // Continuation rounds ask the ENVIRONMENT first. By
-                        // this point the turn has already run its plan and
-                        // acted on the world, so "this re-proposal's
-                        // done-condition already passes" means the work is
-                        // done — not that the planner wrote a weak condition
-                        // before anything happened, which is why the first
-                        // round above runs without the pre-check.
-                        let continuation_config = LongHorizonConfig {
-                            precheck_acceptance: true,
-                            ..config.clone()
-                        };
                         let mut error_rounds = 0usize;
                         let mut dry_rounds = 0usize;
                         let mut continuations = 0usize;
@@ -666,9 +657,31 @@ impl ControlPlane {
                                 new_tasks = seeded.len(),
                                 "mission continues — the goal is not done yet"
                             );
-                            let runner = nanna_agent::harness::LongHorizonRunner::new(
-                                continuation_config.clone(),
-                            );
+                            // Continuation rounds ask the ENVIRONMENT first, but
+                            // only about THIS ROUND'S SEEDED ITEMS. By this point
+                            // the turn has already run its plan and acted on the
+                            // world, so "this re-proposal's done-condition already
+                            // passes" means the work is done — not that the planner
+                            // wrote a weak condition before anything happened, which
+                            // is why the first round above runs without the
+                            // pre-check.
+                            //
+                            // Scoped to `seeded` rather than switched on for the
+                            // round, because the round is not the only source of
+                            // items: the harness polls the interjector before every
+                            // selection, so a message the USER sends mid-round is
+                            // planned into a new item and would be selected under a
+                            // round-wide flag. An interjected ask whose acceptance
+                            // happened to pass already would then close with zero
+                            // steps and the user would never be answered. Leftovers
+                            // and replan subtasks are outside the set for the same
+                            // reason: the pre-check may only skip what the
+                            // continuation planner just re-proposed.
+                            let round_config = LongHorizonConfig {
+                                precheck_acceptance_items: seeded.iter().copied().collect(),
+                                ..config.clone()
+                            };
+                            let runner = nanna_agent::harness::LongHorizonRunner::new(round_config);
                             let more = runner
                                 .run_with_interjector(
                                     &content_owned,

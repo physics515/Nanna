@@ -13,7 +13,7 @@
 //! control loop is deterministically testable without a model.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::cancel::CancelToken;
 use std::time::{Duration, Instant};
@@ -595,24 +595,38 @@ pub struct LongHorizonConfig {
     /// Consecutive runner errors before the run stops (circuit breaker for a
     /// dead model endpoint).
     pub max_consecutive_errors: usize,
-    /// Ask the environment BEFORE spending a step: when an item's acceptance
-    /// check already passes with nothing run, complete it on that verdict and
-    /// take no step.
+    /// Item ids whose acceptance check may run BEFORE a step: when one of
+    /// these items' checks already passes with nothing run, complete it on
+    /// that verdict and take no step.
     ///
     /// This is the harness's own philosophy applied one moment earlier — the
     /// check is the only judge of "done", so a check that already passes means
     /// the work is already done, and running a step to discover that burns a
     /// model round to learn what one command already said.
     ///
-    /// **Off by default, and the default is the bound.** On the FIRST plan of
-    /// a turn nothing has run yet, so a done-condition that already passes
+    /// **Empty by default, and the emptiness is the bound.** On the FIRST plan
+    /// of a turn nothing has run yet, so a done-condition that already passes
     /// says the planner wrote a condition the world happened to satisfy — not
     /// that the user's request is moot. Completing there would delete real
-    /// work. It is switched ON only for mission CONTINUATION rounds, where the
+    /// work. It is populated only for mission CONTINUATION rounds, where the
     /// run has already acted on the world this turn and the question "is this
     /// re-proposal already satisfied?" is exactly the mission's termination
     /// question. See `chat_harness`'s continuation loop.
-    pub precheck_acceptance: bool,
+    ///
+    /// **A SET OF IDS, not a flag, and that is the invariant.** The pre-check
+    /// exists to skip work the CONTINUATION PLANNER re-proposed that the
+    /// environment already satisfies; it must NEVER apply to work a user just
+    /// asked for. A flag scoped to the round would cover every item the round
+    /// happens to select, and the harness polls the [`Interjector`] at the top
+    /// of each iteration — so a message the user sent mid-round is planned
+    /// into a new item and selected under the same flag. If its planned
+    /// acceptance happened to pass already, that item would close with zero
+    /// steps run and the user would never be answered. Interjections are the
+    /// one thing that must never be skipped. Carrying the exact ids
+    /// `seed_continuation` returned makes the wrong item unreachable rather
+    /// than merely unlikely: leftovers, replan subtasks and interjected asks
+    /// are all outside the set and all run normally.
+    pub precheck_acceptance_items: HashSet<i64>,
     /// Actor name recorded in the activity log.
     pub actor: String,
 }
@@ -627,7 +641,7 @@ impl Default for LongHorizonConfig {
             step_iterations: 8,
             step_token_budget: None,
             max_consecutive_errors: 3,
-            precheck_acceptance: false,
+            precheck_acceptance_items: HashSet::new(),
             actor: "harness".to_string(),
         }
     }
@@ -684,7 +698,8 @@ pub struct LongHorizonReport {
     pub items_completed_unverified: usize,
     /// The subset of `items_completed` closed by the acceptance PRE-CHECK:
     /// their done-condition already passed before any step ran, so the run
-    /// completed them for free (see `LongHorizonConfig::precheck_acceptance`).
+    /// completed them for free (see
+    /// `LongHorizonConfig::precheck_acceptance_items`).
     ///
     /// Counted apart because these completions are evidence the goal was
     /// ALREADY met, not evidence this run advanced it. The chat harness's
@@ -1051,14 +1066,18 @@ impl LongHorizonRunner {
             // done-condition already passes with nothing run, the work is
             // provably already there and a step could only rediscover that.
             //
-            // Opt-in (`precheck_acceptance`) because on a first plan a
+            // Opt-in (`precheck_acceptance_items`) because on a first plan a
             // pre-passing condition means the check is wrong, not the work
-            // done — see the field's docs. Bounded to one execution per item
-            // per run by `acceptance_prechecked`, and each execution reuses
+            // done — see the field's docs. Scoped to the exact ids the caller
+            // named rather than to "every item this run selects": the
+            // interjection poll above can add a USER'S message to the plan
+            // mid-round, and skipping that on a pre-passing condition would
+            // leave the user unanswered. Bounded to one execution per item per
+            // run by `acceptance_prechecked`, and each execution reuses
             // `AcceptanceCheck::run`, so it inherits the same workdir
             // resolution and the same clamped timeout as every other
             // acceptance run — no second execution path to keep in sync.
-            let precheck = if cfg.precheck_acceptance && precheck_due {
+            let precheck = if precheck_due && cfg.precheck_acceptance_items.contains(&step.id) {
                 step.acceptance.as_ref()
             } else {
                 None
@@ -2218,7 +2237,7 @@ mod tests {
             .await;
         let runner = ScriptedRunner::new(vec![]);
         let config = LongHorizonConfig {
-            precheck_acceptance: true,
+            precheck_acceptance_items: HashSet::from([1]),
             ..fast_config()
         };
         let report = LongHorizonRunner::new(config)
@@ -2282,7 +2301,7 @@ mod tests {
             .await;
         let runner = FileWritingRunner::new(artifact.clone());
         let config = LongHorizonConfig {
-            precheck_acceptance: true,
+            precheck_acceptance_items: HashSet::from([1]),
             ..fast_config()
         };
         let report = LongHorizonRunner::new(config)
@@ -2326,7 +2345,9 @@ mod tests {
             .await;
         let runner = ScriptedRunner::new(vec![Ok(outcome("had a go"))]);
         assert!(
-            !LongHorizonConfig::default().precheck_acceptance,
+            LongHorizonConfig::default()
+                .precheck_acceptance_items
+                .is_empty(),
             "off by default"
         );
         let report = LongHorizonRunner::new(fast_config())
@@ -2335,6 +2356,102 @@ mod tests {
         assert_eq!(report.steps_taken, 1, "the step ran: {report:?}");
         assert_eq!(report.items_completed, 1);
         assert_eq!(report.items_already_satisfied, 0);
+    }
+
+    /// THE PRE-CHECK MUST NEVER SWALLOW A LIVE USER MESSAGE.
+    ///
+    /// The pre-check is scoped to the ids the continuation planner seeded, and
+    /// this is the reason. The harness polls the interjector at the top of
+    /// every iteration, BEFORE `next()`, so a message the user sends during a
+    /// continuation round is planned into a fresh item and selected inside the
+    /// very round the pre-check is enabled for. A round-wide flag would cover
+    /// it, and an interjected ask whose planned acceptance happened to pass
+    /// already ("artifact.txt exists" — trivially true) would be completed
+    /// with ZERO steps run: the user asked a question and got silence.
+    ///
+    /// Driven through the interjector rather than by calling the pre-check
+    /// directly, because the path IS the bug: nothing about the item itself
+    /// says "a user just asked for this", only where it came from.
+    ///
+    /// Both halves of the contract in one run — the seeded item is skipped and
+    /// counted `already_satisfied` (so the caller's round still reads dry),
+    /// while the interjected item, whose acceptance is the same trivially-true
+    /// condition, runs its step.
+    #[tokio::test]
+    async fn an_interjected_item_runs_its_step_even_when_acceptance_already_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.txt"), b"already here").unwrap();
+        let passing = || {
+            Some(AcceptanceCheck::FileExists {
+                path: "artifact.txt".to_string(),
+            })
+        };
+        let source = Arc::new(MemorySource::default());
+        source
+            .push(step(1, "the continuation re-proposal", passing()))
+            .await;
+        // Nothing waiting when the seeded item is selected; the user's message
+        // lands on the next boundary, mid-round.
+        let interjector = ScriptedInterjector::new(
+            source.clone(),
+            vec![vec![], vec![step(2, "and what about the logs?", passing())]],
+        );
+        let runner = ScriptedRunner::new(vec![Ok(outcome("here are the logs\nTASK COMPLETE"))]);
+        let config = LongHorizonConfig {
+            // Only the continuation planner's seed is in scope.
+            precheck_acceptance_items: HashSet::from([1]),
+            ..fast_config()
+        };
+
+        let report = LongHorizonRunner::new(config)
+            .run_with_interjector(
+                "goal",
+                source.as_ref(),
+                &runner,
+                dir.path(),
+                None,
+                Some(&interjector),
+            )
+            .await;
+
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.interjected_items, 1);
+        assert_eq!(report.items_completed, 2, "both closed: {report:?}");
+        assert_eq!(
+            report.items_already_satisfied, 1,
+            "ONLY the seeded re-proposal was skipped for free: {report:?}"
+        );
+        assert_eq!(
+            report.steps_taken, 1,
+            "one step, and it belongs to the user's message: {report:?}"
+        );
+        let prompts: Vec<String> = runner
+            .requests
+            .lock()
+            .await
+            .iter()
+            .map(|r| r.prompt.clone())
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains("and what about the logs?"),
+            "the user's mid-round message must reach a step prompt: {prompts:?}"
+        );
+        let completions = source.completions.lock().await;
+        let seeded = completions
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .expect("the seeded item closed");
+        assert_eq!(seeded.1["already_satisfied"], serde_json::json!(true));
+        let interjected = completions
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .expect("the interjected item closed");
+        assert!(
+            interjected.1.get("already_satisfied").is_none(),
+            "the user's item closed by running, not by being skipped: {}",
+            interjected.1
+        );
     }
 
     #[tokio::test]
