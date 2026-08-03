@@ -40,8 +40,9 @@ pub use registry::{
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
     EmotionalContext, ExtractedMemory, MemoryCallback,
-    MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions,
-    STEERING_CONTINUATION, StepKind, StreamCallback, TASK_ANCHOR_MAX_BYTES, TaskComplexity,
+    MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RepeatLedger,
+    RunOptions, STEERING_CONTINUATION, SharedRepeatLedger, StepKind, StreamCallback,
+    TASK_ANCHOR_MAX_BYTES, TaskComplexity,
     ThinkingCallback, ThinkingMode, ToolCallRecord,
     budget_warning_message, claim_nudge_message, min_viable_num_ctx, narration_nudge_message,
     repetition_nudge_message, thinking_spiral_nudge_message, tool_loop_nudge_message,

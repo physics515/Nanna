@@ -169,6 +169,7 @@ fn canonical_acceptance(params: &Value) -> Result<Option<Value>, String> {
 pub fn build_task_services(
     storage: Arc<Storage>,
     workspace_id: Arc<RwLock<Option<String>>>,
+    turn_baselines: Arc<TurnBaselines>,
 ) -> HashMap<String, ServiceFn> {
     let mut services: HashMap<String, ServiceFn> = HashMap::new();
 
@@ -215,11 +216,13 @@ pub fn build_task_services(
     {
         let storage = storage.clone();
         let workspace_id = workspace_id.clone();
+        let turn_baselines = turn_baselines.clone();
         services.insert(
             "tasks.add".to_string(),
             Arc::new(move |params: Value| {
                 let storage = storage.clone();
                 let workspace_id = workspace_id.clone();
+                let turn_baselines = turn_baselines.clone();
                 Box::pin(async move {
                     // A subtask always lives in its parent's scope — replan
                     // steps only know the parent id, not the run's scope.
@@ -265,6 +268,49 @@ pub fn build_task_services(
                             ),
                         }));
                     }
+
+                    // Closed-since-turn-start guard. The open-title reuse
+                    // above deliberately lets a CLOSED title be added again —
+                    // a recurring chore must stay addable tomorrow — but
+                    // "tomorrow" is the point: within ONE turn, a title the
+                    // run already finished or abandoned is settled work, and
+                    // re-creating it is how a turn spins. Observed live
+                    // 2026-08-02 (session 05775d1d): the harness's replan step
+                    // drives this very service through the todo tool, and
+                    // task #2059 (abandoned) came straight back as #2060 with
+                    // the identical title, immediately re-seeded.
+                    //
+                    // The baseline is the same one `seed_continuation` uses
+                    // and the comparison is the same `same_title` rule, so
+                    // both doors now answer "is this the same task?"
+                    // identically. No live turn → no baseline → unchanged
+                    // behavior for adds from outside a run.
+                    if let Some(baseline) =
+                        turn_baselines.baseline(&scope, scope_id.as_deref()).await
+                    {
+                        let closed =
+                            tasks_closed_since(&storage, &scope, scope_id.as_deref(), &baseline)
+                                .await?
+                                .into_iter()
+                                .find(|t| same_title(&t.title, &title));
+                        if let Some(closed) = closed {
+                            tracing::info!(
+                                task_id = closed.id,
+                                status = %closed.status,
+                                title = %title,
+                                "refusing to re-create a title this turn already closed"
+                            );
+                            // A returned notice, never an error: the model
+                            // reads it as a normal result and moves on.
+                            return Ok(json!({
+                                "task": task_to_json(&closed),
+                                "created": false,
+                                "closed_this_turn": true,
+                                "note": closed_this_turn_notice(&closed.title, &closed.status),
+                            }));
+                        }
+                    }
+
                     // Ordering: a subtask inherits its parent's ladder
                     // position; a new root task appends AFTER everything
                     // (defaulting to 0 would jump the whole queue — observed
@@ -899,6 +945,24 @@ impl TaskSource for TursoTaskSource {
         self.emit(id, "abandoned", json!({ "reason": reason }));
         Ok(())
     }
+
+    /// Open children of `id` in this scope — the runner's evidence that a
+    /// replan step actually decomposed something. Counted from the scope's
+    /// open list rather than a dedicated query because that is the same view
+    /// `next()` selects from: work that exists but can never be surfaced is
+    /// not work the replan produced.
+    async fn open_subtasks(&self, id: i64) -> Result<Option<usize>, String> {
+        Ok(Some(
+            self.storage
+                .tasks()
+                .list(&self.scope, self.scope_id.as_deref(), false)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|t| t.parent_id == Some(id))
+                .count(),
+        ))
+    }
 }
 
 /// Runs one harness step as a fresh `Agent` with an isolated context — the
@@ -910,6 +974,15 @@ pub struct AgentStepRunner {
     /// than once per step — the runner is one object for the whole run, while
     /// each step gets a fresh `RunState`.
     pub discovered_tools: Arc<tokio::sync::RwLock<std::collections::HashSet<String>>>,
+    /// The sibling breakers' repeat-call ledger for THIS run.
+    ///
+    /// Shared across steps for exactly the reason `discovered_tools` above
+    /// is: the runner is one object for the whole run, while each step gets a
+    /// fresh `RunState`. A per-step ledger reset the streak counters 22 times
+    /// in the 20-minute wedged turn of 2026-08-02 (session 05775d1d), so the
+    /// K = 3 thresholds were never reachable — the model made 2-3 identical
+    /// calls per step, forever.
+    pub repeat_ledger: nanna_agent::SharedRepeatLedger,
     pub router: Arc<LlmRouter>,
     pub tools: Arc<nanna_tools::ToolRegistry>,
     pub agent_config: nanna_agent::AgentConfig,
@@ -2047,6 +2120,14 @@ impl AgentStepRunner {
             // reset. An empty title falls back (inside the loop) to the
             // step prompt's goal line rather than fabricating a header.
             task_anchor: Some(request.item_title.clone()).filter(|t| !t.trim().is_empty()),
+            // The RUN's breaker ledger, shared for the same structural reason
+            // `discovered_tools` is: this runner is one object for the whole
+            // run, while each step gets a fresh `RunState`. Per step, a model
+            // repeating itself 2-3 times never reached the breaker threshold
+            // and the counter reset at every boundary (observed live
+            // 2026-08-02, session 05775d1d: 22 steps, 79 identical
+            // `explore {}` calls, 3 short-circuits).
+            repeat_ledger: Some(Arc::clone(&self.repeat_ledger)),
             initial_active_tools: active,
             restrict_to_active_tools: restrict_to_active,
             is_sub_agent: true,
@@ -2305,6 +2386,138 @@ pub async fn closed_task_ids(
         .collect())
 }
 
+/// Tasks closed in a scope SINCE `baseline` was captured — the work this turn
+/// has already finished or given up on.
+///
+/// The one definition of "this turn already worked that", shared by every
+/// in-run item-creation path: the continuation planner
+/// ([`seed_continuation`]) and the model's own write surface (`tasks.add`,
+/// which the harness's replan step drives through the todo tool). They used
+/// to disagree, and that disagreement WAS the hole — see [`TurnBaselines`].
+///
+/// Returns whole tasks rather than titles so the one caller that must NAME
+/// what it refused (`tasks.add`, whose notice cites the settled task's id and
+/// verdict) does not need a second query with a second chance to drift.
+pub async fn tasks_closed_since(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+    baseline: &HashSet<i64>,
+) -> Result<Vec<Task>, String> {
+    Ok(storage
+        .tasks()
+        .list(scope, scope_id, true)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|t| (t.status == "done" || t.status == "cancelled") && !baseline.contains(&t.id))
+        .collect())
+}
+
+/// Scope identity for [`TurnBaselines`]. The unit separator (U+001F) cannot
+/// appear in a scope name, so no (scope, scope_id) pair collides with a
+/// differently-split one — the same idiom the loop runner's repeat key uses.
+fn scope_key(scope: &str, scope_id: Option<&str>) -> String {
+    format!("{scope}\u{1f}{}", scope_id.unwrap_or(""))
+}
+
+/// Turn-start closed-task baselines, keyed by scope — the shared boundary
+/// that makes "closed since this turn started" answerable from anywhere.
+///
+/// Why it exists (observed live 2026-08-02, ollama/gemma4:12b, session
+/// 05775d1d): [`seed_continuation`] filters continuation-planner titles that
+/// closed this turn, but it is not the only path that creates items mid-run.
+/// The harness's replan step tells the MODEL to decompose a stalled item into
+/// subtasks through the todo tool, which lands in `tasks.add` — and that
+/// dedups only against OPEN titles, exactly so a genuinely recurring chore
+/// stays addable tomorrow. So a title the run had just ABANDONED was created
+/// again, unfiltered, and immediately re-seeded: task #2059 (abandoned) →
+/// #2060 (identical title). One guard covered one door.
+///
+/// The baseline is registered by the chat harness for the life of a turn and
+/// removed on the same exit path that releases the run claim, so at most one
+/// entry exists per session with a live run. Absent entry = no live turn =
+/// no filtering: a scope with no registered baseline behaves exactly as
+/// before, which is what a plain `tasks.add` from outside a run should do.
+///
+/// **What is guarded, and what deliberately is not.** The guard covers the
+/// paths where the RUN proposes its own next work: the continuation planner
+/// ([`seed_continuation`]) and the model's own writes (`tasks.add`, which the
+/// replan step drives). It does NOT cover interjections — a mid-run user
+/// message plans through [`seed_plan`] — because the user re-asking for
+/// something the run just finished is new intent, not a run spinning on
+/// itself, and silently dropping it would be the worse failure.
+///
+/// **The trade.** Matching is scope-wide, exactly as [`seed_continuation`]
+/// matches, rather than parent-scoped like the OPEN-title reuse above. Two
+/// genuinely different subtasks under different parents sharing one generic
+/// title ("run the tests"), where one closed this turn, are refused — the
+/// notice tells the model to retitle, which costs one call. The alternative
+/// leaves the resurrection door open for exactly the shape that wedged the
+/// run, since a replan re-parents freely.
+#[derive(Debug, Default)]
+pub struct TurnBaselines {
+    inner: RwLock<HashMap<String, HashSet<i64>>>,
+}
+
+impl TurnBaselines {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the turn-start baseline for a scope, replacing any stale entry
+    /// (a previous turn in the same scope that never got to close cleanly).
+    pub async fn open_turn(&self, scope: &str, scope_id: Option<&str>, closed: HashSet<i64>) {
+        self.inner
+            .write()
+            .await
+            .insert(scope_key(scope, scope_id), closed);
+    }
+
+    /// Drop a scope's baseline at turn end. Called from the same exit tail
+    /// that releases the run claim, so a leaked entry would need the whole
+    /// tail to be skipped — and the next turn's `open_turn` replaces it.
+    pub async fn close_turn(&self, scope: &str, scope_id: Option<&str>) {
+        self.inner.write().await.remove(&scope_key(scope, scope_id));
+    }
+
+    /// The turn-start baseline for a scope, or `None` when no turn is live.
+    pub async fn baseline(&self, scope: &str, scope_id: Option<&str>) -> Option<HashSet<i64>> {
+        self.inner
+            .read()
+            .await
+            .get(&scope_key(scope, scope_id))
+            .cloned()
+    }
+}
+
+/// The notice `tasks.add` returns when a title closed earlier THIS TURN is
+/// proposed again.
+///
+/// A returned notice, never an error (the repo rule: tool failures are
+/// returned, not thrown), and it announces itself: WHAT happened (nothing was
+/// created), WHY (this exact title was already finished or abandoned in this
+/// same turn), and WHAT TO DO instead (move on, or add genuinely different
+/// work). Naming the prior task id makes the claim checkable rather than
+/// something the model has to take on faith.
+#[must_use]
+pub fn closed_this_turn_notice(title: &str, status: &str) -> String {
+    let verdict = if status == "cancelled" {
+        "abandoned"
+    } else {
+        "completed"
+    };
+    format!(
+        "NOT created: \"{title}\" was already {verdict} earlier in this same turn. \
+         Re-creating it would restart work this run has already settled, which is how a \
+         turn spins instead of finishing. Nothing was written and nothing was lost — the \
+         earlier task's outcome stands. Move on to the next piece of the goal, or add a \
+         task whose title describes genuinely different work. If the earlier attempt was \
+         wrong, say so in your answer rather than silently redoing it."
+    )
+}
+
 /// Seed a CONTINUATION round's plan, dropping tasks this turn already closed.
 ///
 /// A continuation round re-plans the same goal, and a small planner routinely
@@ -2330,24 +2543,14 @@ pub async fn seed_continuation(
     plan: &Plan,
     closed_before_turn: &HashSet<i64>,
 ) -> Result<Vec<i64>, String> {
-    let closed_this_turn: Vec<String> = storage
-        .tasks()
-        .list(scope, scope_id, true)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|t| {
-            (t.status == "done" || t.status == "cancelled") && !closed_before_turn.contains(&t.id)
-        })
-        .map(|t| t.title)
-        .collect();
+    let closed_this_turn = tasks_closed_since(storage, scope, scope_id, closed_before_turn).await?;
     let fresh: Vec<_> = plan
         .tasks
         .iter()
         .filter(|task| {
             !closed_this_turn
                 .iter()
-                .any(|closed| same_title(closed, &task.title))
+                .any(|closed| same_title(&closed.title, &task.title))
         })
         .cloned()
         .collect();
@@ -3210,7 +3413,8 @@ mod tests {
     async fn a_tool_created_todo_never_outranks_the_turns_plan() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         seed_plan(&storage, "session", Some("s1"), &plan_of(&["user request"]), false)
             .await
@@ -3410,7 +3614,8 @@ mod tests {
     async fn re_adding_an_open_title_reuses_the_existing_task() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         let first = add_task(
             &services,
@@ -3442,7 +3647,8 @@ mod tests {
     async fn the_same_title_is_addable_again_once_the_previous_one_is_closed() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         let first = add_task(
             &services,
@@ -3474,7 +3680,8 @@ mod tests {
     async fn the_same_title_under_a_different_parent_is_not_a_duplicate() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         let a = add_task(
             &services,
@@ -3500,6 +3707,322 @@ mod tests {
         assert_ne!(
             sub_a["task"]["id"], sub_b["task"]["id"],
             "same title under different parents is different work"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Closed-since-turn-start guard on the model's own write surface.
+    //
+    // REGRESSION (live 2026-08-02, ollama/gemma4:12b, session 05775d1d):
+    // `seed_continuation` filtered continuation-planner titles closed this
+    // turn, but the HARNESS replan path creates items by telling the model to
+    // add subtasks through the todo tool — landing in `tasks.add`, which
+    // dedups only against OPEN titles. Task #2059 was abandoned and came
+    // straight back as #2060 with the identical title, immediately re-seeded.
+    // -----------------------------------------------------------------
+
+    /// Mark a task abandoned exactly as `TursoTaskSource::abandon` does.
+    async fn abandon(storage: &Arc<Storage>, id: i64) {
+        storage
+            .tasks()
+            .update(
+                id,
+                TaskPatch {
+                    status: Some("cancelled".to_string()),
+                    ..TaskPatch::default()
+                },
+                Some("test"),
+            )
+            .await
+            .expect("abandon");
+    }
+
+    #[tokio::test]
+    async fn a_title_abandoned_this_turn_is_not_re_created() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+
+        // The turn opens with nothing closed yet — the harness's snapshot.
+        baselines
+            .open_turn(
+                "session",
+                Some("s1"),
+                closed_task_ids(&storage, "session", Some("s1"))
+                    .await
+                    .expect("baseline"),
+            )
+            .await;
+
+        let doomed = add_task(
+            &services,
+            json!({"title": "Implement the parser", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let doomed_id = doomed["task"]["id"].as_i64().expect("id");
+        abandon(&storage, doomed_id).await;
+
+        // The replan re-proposes the very title the run just gave up on.
+        let again = add_task(
+            &services,
+            json!({"title": "  implement THE parser ", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+
+        assert_eq!(again["created"], json!(false), "nothing was created");
+        assert_eq!(again["closed_this_turn"], json!(true));
+        assert_eq!(
+            again["task"]["id"].as_i64(),
+            Some(doomed_id),
+            "the notice points at the settled task, so the claim is checkable"
+        );
+        let note = again["note"].as_str().expect("a note explains the refusal");
+        assert!(note.contains("NOT created"), "{note}");
+        assert!(note.contains("abandoned"), "names the verdict: {note}");
+        assert!(note.contains("Nothing was written"), "{note}");
+
+        let all = storage
+            .tasks()
+            .list("session", Some("s1"), true)
+            .await
+            .expect("list");
+        assert_eq!(all.len(), 1, "no #2060 clone exists");
+    }
+
+    #[tokio::test]
+    async fn a_completed_title_is_refused_the_same_way_within_the_turn() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+        baselines
+            .open_turn("session", Some("s1"), HashSet::new())
+            .await;
+
+        let done = add_task(
+            &services,
+            json!({"title": "answer the question", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        storage
+            .tasks()
+            .complete(done["task"]["id"].as_i64().expect("id"), Some("test"), None)
+            .await
+            .expect("complete");
+
+        let again = add_task(
+            &services,
+            json!({"title": "answer the question", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_eq!(again["created"], json!(false));
+        assert!(
+            again["note"].as_str().expect("note").contains("completed"),
+            "a finished title names the finished verdict"
+        );
+    }
+
+    /// The trade the OPEN-title dedupe was deliberately built around must
+    /// survive: a chore closed BEFORE this turn is legitimate work to schedule
+    /// again. Only titles closed since the turn's own snapshot are refused.
+    #[tokio::test]
+    async fn a_title_closed_before_the_turn_started_is_still_addable() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+
+        // Yesterday's chore, closed before the turn opens.
+        let yesterday = add_task(
+            &services,
+            json!({"title": "run the tests", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let yesterday_id = yesterday["task"]["id"].as_i64().expect("id");
+        storage
+            .tasks()
+            .complete(yesterday_id, Some("test"), None)
+            .await
+            .expect("complete");
+
+        // NOW the turn starts — the snapshot includes yesterday's chore.
+        baselines
+            .open_turn(
+                "session",
+                Some("s1"),
+                closed_task_ids(&storage, "session", Some("s1"))
+                    .await
+                    .expect("baseline"),
+            )
+            .await;
+
+        let today = add_task(
+            &services,
+            json!({"title": "run the tests", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_ne!(
+            today["task"]["id"].as_i64(),
+            Some(yesterday_id),
+            "a recurring chore closed in HISTORY is still schedulable"
+        );
+        assert!(today["closed_this_turn"].is_null());
+    }
+
+    /// Ordering: an OPEN title still reuses its item rather than tripping the
+    /// closed guard — reuse points the model at live work, which is strictly
+    /// more useful than a refusal.
+    #[tokio::test]
+    async fn an_open_title_still_reuses_while_a_turn_is_live() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+        baselines
+            .open_turn("session", Some("s1"), HashSet::new())
+            .await;
+
+        let first = add_task(
+            &services,
+            json!({"title": "build the thing", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let again = add_task(
+            &services,
+            json!({"title": "build the thing", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_eq!(again["deduplicated"], json!(true));
+        assert_eq!(first["task"]["id"], again["task"]["id"]);
+    }
+
+    /// The guard is scoped to the TURN, not to history: once the turn's exit
+    /// tail drops the baseline, the title is addable again.
+    #[tokio::test]
+    async fn the_guard_lifts_when_the_turn_closes() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+        baselines
+            .open_turn("session", Some("s1"), HashSet::new())
+            .await;
+
+        let done = add_task(
+            &services,
+            json!({"title": "summarize the log", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        storage
+            .tasks()
+            .complete(done["task"]["id"].as_i64().expect("id"), Some("test"), None)
+            .await
+            .expect("complete");
+        assert_eq!(
+            add_task(
+                &services,
+                json!({"title": "summarize the log", "scope": "session", "session_id": "s1"}),
+            )
+            .await["created"],
+            json!(false)
+        );
+
+        // Turn over — the user may legitimately ask for it again.
+        baselines.close_turn("session", Some("s1")).await;
+        let next_turn = add_task(
+            &services,
+            json!({"title": "summarize the log", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert!(
+            next_turn["closed_this_turn"].is_null(),
+            "a new turn may re-ask: {next_turn}"
+        );
+    }
+
+    /// Both in-run creation doors answer "did this turn already settle that?"
+    /// with the SAME rule — that disagreement was the hole.
+    #[tokio::test]
+    async fn the_planner_door_and_the_model_door_share_one_rule() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let baselines = Arc::new(TurnBaselines::new());
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            baselines.clone(),
+        );
+        let baseline = closed_task_ids(&storage, "session", Some("s1"))
+            .await
+            .expect("baseline");
+        baselines
+            .open_turn("session", Some("s1"), baseline.clone())
+            .await;
+
+        let ids = seed_plan(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["explain mutexes"]),
+            false,
+        )
+        .await
+        .expect("seeded");
+        storage
+            .tasks()
+            .complete(ids[0], Some("test"), None)
+            .await
+            .expect("complete");
+
+        // Door 1: the continuation planner re-proposes it — filtered.
+        let reseeded = seed_continuation(
+            &storage,
+            "session",
+            Some("s1"),
+            &plan_of(&["explain mutexes"]),
+            &baseline,
+        )
+        .await
+        .expect("continuation");
+        assert!(reseeded.is_empty(), "the planner door filters it");
+
+        // Door 2: the model re-adds it through the todo tool — refused, and
+        // by the same `titles_closed_since` view.
+        let re_added = add_task(
+            &services,
+            json!({"title": "explain mutexes", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert_eq!(
+            re_added["created"],
+            json!(false),
+            "the model door refuses it too"
+        );
+        let settled: Vec<String> = tasks_closed_since(&storage, "session", Some("s1"), &baseline)
+            .await
+            .expect("settled")
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(
+            settled,
+            vec!["explain mutexes".to_string()],
+            "one shared view of what this turn settled"
         );
     }
 
@@ -3667,7 +4190,8 @@ mod tests {
     async fn a_task_with_an_acceptance_contract_cannot_be_deleted() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         let seeded = storage
             .tasks()
@@ -3707,7 +4231,8 @@ mod tests {
     async fn clear_keeps_every_task_carrying_a_contract() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         let seeded = |title: &str| NewTask {
             scope: "session".to_string(),
@@ -3770,7 +4295,8 @@ mod tests {
     async fn a_scratch_task_without_acceptance_is_still_removable() {
         let storage = Arc::new(Storage::in_memory().await.expect("storage"));
         let workspace_id = Arc::new(RwLock::new(None));
-        let services = build_task_services(storage.clone(), workspace_id);
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
 
         let scratch = add_task(
             &services,

@@ -92,6 +92,13 @@ function serviceExecute(action, input, sessionId, scope) {
         project: input.project, assignee: input.assignee
       });
       var res = Nanna.service("tasks.add", params);
+      // A reuse or a refusal is NOT an add. Reporting "Added task #2060"
+      // for either tells the model it created work it did not create, and
+      // it plans the next step around a task that does not exist. The
+      // service explains itself in `note`; pass that through verbatim.
+      if (res.note) {
+        return res.note + "\n\n" + listSummary(base);
+      }
       return "Added task #" + res.task.id + ": " + res.task.title + "\n\n" + listSummary(base);
     }
 
@@ -184,12 +191,22 @@ function serviceExecute(action, input, sessionId, scope) {
         return "Error: 'items' (JSON array) or 'title' required for create";
       }
       Nanna.service("tasks.clear", { scope: scope, session_id: sessionId, closed_only: false });
+      var created = 0;
       for (var i = 0; i < itemsList.length; i++) {
-        Nanna.service("tasks.add", {
+        var addRes = Nanna.service("tasks.add", {
           scope: scope, session_id: sessionId, title: "" + itemsList[i]
         });
+        // Count what the store actually created, not what was asked for: a
+        // title reused or refused is not a new task, and an inflated count
+        // is a summary that lies about the plan the model is about to work.
+        if (!addRes.note) { created++; }
       }
-      return "Created " + itemsList.length + " tasks.\n\n" + listSummary(base);
+      var skipped = itemsList.length - created;
+      var suffix = skipped > 0
+        ? " (" + skipped + " of " + itemsList.length + " already existed or were already"
+          + " settled this turn and were not re-created)"
+        : "";
+      return "Created " + created + " tasks." + suffix + "\n\n" + listSummary(base);
     }
 
     case "clear": {

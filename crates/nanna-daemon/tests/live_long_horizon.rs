@@ -101,7 +101,14 @@ async fn build_env(workdir: &Path) -> EvalEnv {
     let tools_dir = nanna_tools::skills::defaults::resolve_tools_dir(None)
         .expect("DEV_TOOLS_DIR must resolve in debug builds");
     let workspace_id = Arc::new(tokio::sync::RwLock::new(None));
-    let services = build_task_services(storage.clone(), workspace_id);
+    // No turn baseline registered: this eval drives the harness directly, with
+    // no chat turn to bound. The closed-since-turn-start guard therefore never
+    // engages here, which is the intended "outside a run" behavior.
+    let services = build_task_services(
+        storage.clone(),
+        workspace_id,
+        Arc::new(nanna_daemon::tasks::TurnBaselines::new()),
+    );
     let loaded = tools.load_skills_with_services(&tools_dir, &services).await;
     assert!(loaded > 0, "no skills loaded from {tools_dir:?}");
 
@@ -111,6 +118,8 @@ async fn build_env(workdir: &Path) -> EvalEnv {
     }
     let router = Arc::new(router);
     let runner = AgentStepRunner {
+        // One ledger for the whole eval run, matching production.
+        repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
         // Fresh per run: discovery is paid once per tool, then carried across
         // this run's steps.
         discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
