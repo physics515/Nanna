@@ -2815,6 +2815,87 @@ lfm2.5 2/42.** What the series surfaced and fixed:
 
 ---
 
+### P21 — TAO / Bittensor integration 🌱 (new — 2026-08-03, owner request)
+
+Bittensor is a live, TAO-incentivized market for *exactly* the two resources Nanna spends: **inference**
+and **GPU time**. The North Star does not change — local-first, offline-capable, private by default — so
+Bittensor enters as **optional escalation and optional income**, never a dependency and never on the
+default path. Three separable tracks; **decide the reading before building** (they share almost no code):
+
+- [ ] **Decide the direction (owner call, blocks nothing else in the phase).** (A) *Consume* — Bittensor
+      as a cheap cloud tier the local model can escalate to. (B) *Contribute* — sell the idle GPU on a
+      subnet for TAO. (C) *Know* — TAO/subnet state as first-class agent knowledge (balances, emissions,
+      prices) so Nanna can reason about the network it lives on. A is cheapest and on-thesis; B conflicts
+      with "the GPU is Nanna's brain"; C is small and unblocks the other two's telemetry.
+
+**A. Consume — Bittensor-backed inference as a router tier (`nanna-llm`)**
+- [ ] **Route through the existing OpenRouter path first — zero new provider code.** Chutes (SN64) is
+      already one of OpenRouter's upstream providers, and we ship a working, rate-limit-aware OpenRouter
+      client (P20/PR #130–#133). Add provider-preference plumbing to the OpenRouter request so a model can
+      be pinned to a Bittensor-backed upstream, and measure price/latency/failure-rate against the direct
+      path *before* writing a second client. Cheapest possible experiment; strictly a config + request-field
+      change.
+- [ ] **Then, only if it buys something measurable, a direct `Provider::Chutes` (OpenAI-compatible).**
+      The transport is our existing OpenAI-compat code path — the work is a named provider entry, keyring
+      credential (`SecureStore`, never `config.toml` — P1 doctrine), model discovery, and **pacing priors
+      re-taught from `x-ratelimit-*` headers** exactly like the OpenRouter/GitHub spacings. Confirm the
+      live base URL and auth header at wire-up (published surface has moved; do not hardcode from memory)
+      and record it in the provider entry with a dated source link. Justification bar: a real win on
+      cost/model-availability over routing through OpenRouter, or it does not land.
+- [ ] **Complexity-router placement (P10).** Local (`nanna-infer`) stays tier 0 / zero-cost. A
+      Bittensor-backed tier sits *below* the frontier APIs on the escalation ladder: it is where "bigger
+      than local, cheaper than Anthropic" requests go. Needs an honest capability note per model — a subnet
+      endpoint is a fleet of independent miners, so **tool-calling fidelity and determinism vary by model
+      and by hour** in a way a single vendor's API does not. Gate it behind the model-capability matrix
+      (backlog item) rather than assuming Anthropic-grade tool use, and expect it to be a poor fit for the
+      harness's strict tool dialect until proven (P20 lesson: dialect quirks, not intelligence, gate weak
+      backends).
+- [ ] **Privacy stance is stated, not implied.** Prompts sent to a subnet are served by *anonymous third
+      parties*, which is a weaker trust position than a named vendor under contract. Any Bittensor tier must
+      be opt-in per the same rules as the other cloud providers, must be documented in `PRIVACY.md`, and must
+      never be selectable while a run is marked local-only.
+
+**B. Contribute — sell the idle GPU (research-first, explicit go/no-go)**
+- [ ] **Feasibility read before any code.** Registration costs TAO (recycle/burn), miner stacks are
+      subnet-specific Python, and the top inference subnets are contested by datacenter fleets — a single
+      consumer card (this bench machine: 4070 Ti SUPER, and the desktop already eats ~5–6 GB of it) is
+      unlikely to clear its own registration cost. Produce a one-page verdict with real numbers (current
+      registration cost, emission share per subnet, VRAM floor) and a **kill decision** if it doesn't pay.
+- [ ] **If it proceeds: it must never contend with the agent.** Nanna's whole thesis is that the GPU is
+      her brain; a miner sharing the card is the same VRAM-pressure spiral that already produced CUDA OOM
+      "illegal memory access" faults and a `num_ctx` demotion that invalidated a 4-hour bench. Non-negotiable
+      shape: mine only while genuinely idle (reuse the dreaming `ActivityClock`), yield instantly and
+      completely on any agent request, and sweep orphaned server processes (the known
+      `llama-server`-holds-VRAM-invisibly failure mode).
+- [ ] **Compute-rental subnets are the likelier fit than an inference subnet** if B proceeds at all —
+      renting the whole card out for a window is a cleaner boundary than time-slicing it against the agent.
+
+**C. Know — TAO/subnet state as agent knowledge (small, self-contained)**
+- [ ] **Read-only chain/market tools first** — TAO price, wallet/coldkey balance and stake, subnet
+      emissions/alpha price, one subnet's neuron table. Ships as filesystem JS/TS skills over an HTTP data
+      source (taostats-class API + keyring'd key), consistent with "all tools are JS/TS skills" — **no new
+      Rust crate for the read path**, and no chain client until a read-only HTTP source proves insufficient.
+- [ ] **If a native client becomes necessary:** `subxt`-based, in a **feature-flagged** `nanna-tao*` crate
+      (prior art: [`rusttensor`](https://github.com/womboai/rusttensor), [`bittensor-rs`](https://lib.rs/crates/bittensor-rs)).
+      Weigh the dependency mass honestly — `subxt` pulls a large Substrate tree, and the dep doctrine is
+      pure-Rust, no-C, off by default (same treatment as arti/onyums in P9).
+- [ ] **Signing is out of scope, and the guard is custody — not an approval flow.** Nanna holds no
+      coldkey and constructs no extrinsics: transfers, staking, and subnet registration are the owner's
+      hands. This is not a permission gate (there are none — owner doctrine); it is that the private key
+      simply is not in the daemon's reach. A hotkey, if B ever needs one, is separate and never the coldkey.
+      Revisit only on an explicit owner directive.
+
+**Open questions to settle when the phase activates:** which reading (A/B/C) leads; whether a Bittensor
+tier is allowed to serve *dreaming/summarization* traffic (high volume, low sensitivity — arguably the
+best fit) or only user-facing escalation; and whether subnet-endpoint variance can be absorbed by the
+existing failover ladder or needs its own health tracking.
+
+Sources: [Chutes / SN64 overview](https://simplytao.ai/blog/subnet-64-chutes-your-simple-guide) ·
+[dTAO + alpha tokens](https://www.coingecko.com/learn/top-bittensor-subnets-dtao) ·
+[Bittensor SDK docs](https://docs.learnbittensor.org/python-api/html/autoapi/bittensor/core/subtensor/)
+
+---
+
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
 
 These are aspirational per-subsystem enhancements distilled from the old planning docs. Grouped to
@@ -2828,7 +2909,9 @@ keep the phases readable; promote individual items into a phase when they become
   dupes within an extraction batch, order-preserving; deliberately NO length threshold so short facts
   survive — cross-batch dedup stays with `smart_ingest` similarity bands)**; background consolidation with
   progress events; memory categories/tags.
-- **LLM providers:** add Google Gemini, Mistral, Grok (xAI); custom OpenAI-compatible endpoints; model
+- **LLM providers:** add Google Gemini, Mistral, Grok (xAI); custom OpenAI-compatible endpoints;
+  *(Bittensor/Chutes-backed inference is **not** a backlog provider bump — it carries privacy, incentive,
+  and endpoint-variance questions of its own; see **P21**)*; model
   capability matrix (skip incompatible models in fallback); model-discovery cache (5-min TTL); typed
   errors instead of string matching; respect `retry-after` headers; OAuth refresh retry; provider
   health dashboard; investigate GitHub Copilot API masking.
