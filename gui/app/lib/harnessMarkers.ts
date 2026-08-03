@@ -15,3 +15,15 @@ export function stripHarnessMarkers(text: string): string {
     .filter(line => line.trim().toLowerCase() !== 'task complete')
     .join('\n')
 }
+
+/**
+ * Does this segment have anything to SHOW once the plumbing is out?
+ *
+ * The single predicate every card gate uses — assistant bubbles, streaming
+ * bubble, thinking cards. A segment that is only whitespace or only harness
+ * markers draws no card at all: an empty card reads as the model failing to
+ * answer when in fact it was working.
+ */
+export function hasRenderableText(text: string | null | undefined): boolean {
+  return stripHarnessMarkers(text ?? '').trim().length > 0
+}

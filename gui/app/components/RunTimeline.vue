@@ -1,9 +1,12 @@
 <template>
   <div class="space-y-1">
     <template v-for="(item, idx) in items" :key="timelineKey(item, idx)">
-      <!-- Thinking burst: its own block, inline where it happened -->
+      <!-- Thinking burst: its own block, inline where it happened. Gated
+           exactly like the text branch below — a burst that closed empty
+           (a lone newline delta between two tool calls) otherwise drew its
+           own "💭 Thinking · 1 words" card. -->
       <ThinkingCard
-        v-if="item.kind === 'thinking'"
+        v-if="item.kind === 'thinking' && hasRenderableText(item.content)"
         :content="item.content ?? ''"
         :is-active="isLive && idx === items.length - 1"
       />
@@ -55,7 +58,10 @@
 
 <script setup lang="ts">
 import type { TimelineEntry } from '~/composables/useSessionState'
-import { stripHarnessMarkers } from '~/lib/harnessMarkers'
+// A card renders only if it has visible content once the harness plumbing is
+// stripped — the same invariant the page applies to its historical and
+// streaming bubbles.
+import { hasRenderableText, stripHarnessMarkers } from '~/lib/harnessMarkers'
 
 const props = defineProps<{
   items: TimelineEntry[]
@@ -63,13 +69,6 @@ const props = defineProps<{
    *  bubble instead, and the trailing thinking segment shows as active. */
   isLive?: boolean
 }>()
-
-// An assistant bubble renders only if it has visible text once the harness
-// plumbing is stripped — the same invariant the page applies to its
-// historical and streaming bubbles.
-function hasRenderableText(content: string | null | undefined): boolean {
-  return stripHarnessMarkers(content ?? '').trim().length > 0
-}
 
 // Index-based keys: the journal is append-only (items never reorder or
 // vanish), and call_ids are NOT unique — Ollama synthesizes them per

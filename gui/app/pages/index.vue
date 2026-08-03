@@ -130,10 +130,12 @@
 
         <!-- Legacy layout for messages without a journal -->
         <template v-else>
-          <!-- Thinking block rendered as its own card (before tools and response) -->
-          <div v-if="msg.role === 'assistant' && msg.reasoning" class="max-w-[1800px] mx-auto">
+          <!-- Thinking block rendered as its own card (before tools and
+               response). Gated like every other card: a burst that is only
+               whitespace has nothing to show. -->
+          <div v-if="msg.role === 'assistant' && hasRenderableText(msg.reasoning)" class="max-w-[1800px] mx-auto">
             <div class="mx-4 sm:mx-12 my-2">
-              <ThinkingCard :content="msg.reasoning" />
+              <ThinkingCard :content="msg.reasoning ?? ''" />
             </div>
           </div>
 
@@ -199,7 +201,7 @@
            predating the timeline) -->
       <template v-else>
         <!-- Live thinking card during streaming -->
-        <div v-if="streamingThinking" class="max-w-[1800px] mx-auto">
+        <div v-if="hasLiveThinking" class="max-w-[1800px] mx-auto">
           <div class="mx-4 sm:mx-12 my-2">
             <ThinkingCard :content="streamingThinking" :is-active="isStreaming" />
           </div>
@@ -235,7 +237,7 @@
                 <MarkdownContent :content="stripHarnessMarkers(liveBubbleContent)" />
                 <span class="cursor-blink inline-block ml-0.5">▋</span>
               </div>
-              <div v-else-if="!streamingThinking && !liveTimeline.length" class="text-nanna-text-muted flex items-center gap-2">
+              <div v-else-if="!hasLiveThinking && !liveTimeline.length" class="text-nanna-text-muted flex items-center gap-2">
                 <span class="animate-pulse">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.2s">●</span>
                 <span class="animate-pulse" style="animation-delay: 0.4s">●</span>
@@ -313,7 +315,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, emit as tauriEmit, type UnlistenFn } from '@tauri-apps/api/event'
 import { useSessionState, type TimelineEntry } from '~/composables/useSessionState'
 import { useBackend } from '~/composables/useBackend'
-import { stripHarnessMarkers } from '~/lib/harnessMarkers'
+import { hasRenderableText, stripHarnessMarkers } from '~/lib/harnessMarkers'
 
 const { isOnline, status: backendStatus, refresh: refreshBackend, init: initBackend } = useBackend()
 const offlineDetail = computed(() => {
@@ -475,9 +477,12 @@ const liveBubbleContent = computed(() => {
 // The streaming bubble renders only when the open segment has something to
 // SHOW — a tail of harness markers or bare whitespace would otherwise draw
 // an empty card with just a cursor.
-const liveBubbleHasText = computed(() =>
-  stripHarnessMarkers(liveBubbleContent.value).trim().length > 0
-)
+const liveBubbleHasText = computed(() => hasRenderableText(liveBubbleContent.value))
+
+// Same gate for the legacy live thinking card, and for the "…" placeholder
+// that stands in for it: a whitespace-only burst must suppress the card
+// WITHOUT suppressing the placeholder, or a streaming turn shows nothing.
+const hasLiveThinking = computed(() => hasRenderableText(streamingThinking.value))
 
 function timelineHasText(items: TimelineEntry[] | undefined): boolean {
   return !!items?.some(item => item.kind === 'text' && hasSpokenText(item.content))
@@ -496,7 +501,7 @@ function timelineHasText(items: TimelineEntry[] | undefined): boolean {
 // harness bookkeeping renders blank once the markers come out — the marker is
 // exactly the case that looked like an empty reply.
 function hasSpokenText(content: string | undefined | null): boolean {
-  return stripHarnessMarkers(content ?? '').trim().length > 0
+  return hasRenderableText(content)
 }
 
 // Benchmark line under a completed run: tokens spent + time taken, so

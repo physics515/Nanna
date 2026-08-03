@@ -30,6 +30,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useSplatter } from '~/composables/useSplatter'
+import { stripHarnessMarkers } from '~/lib/harnessMarkers'
 
 const props = defineProps<{
   content: string
@@ -38,9 +39,12 @@ const props = defineProps<{
 
 const expanded = ref(false)
 
+// Counted over the same text the timeline gates the card on, so the count
+// and the gate never disagree. Splitting an empty string yields [''] — that
+// is what labelled whitespace-only bursts "1 words" before they were gated.
 const wordCount = computed(() => {
-  if (!props.content) return 0
-  return props.content.trim().split(/\s+/).length
+  const visible = stripHarnessMarkers(props.content ?? '').trim()
+  return visible ? visible.split(/\s+/).length : 0
 })
 
 const statusColors = computed<[string, string, string]>(() => {
