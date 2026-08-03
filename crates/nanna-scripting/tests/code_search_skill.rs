@@ -11,6 +11,9 @@
 //!   descends into the noise dirs (node_modules, .git, target, ...);
 //! - a whole-file regex prefilter keeps non-matching files out of the per-line
 //!   pass, which measured ~99% of the cost, without dropping anchored matches;
+//! - the files that DO reach that pass are split in bounded ~4 KiB slices, so
+//!   the walk costs lines x slice instead of lines x file length — a byte cap
+//!   alone cannot bound a `split("\n")`, and can be preempted between slices;
 //! - wall-clock against the real script deadline is the primary bound, with
 //!   derived caps on entries, file size, rendered file size and result chars —
 //!   and every one announces itself in the output when it trips;
@@ -354,22 +357,144 @@ async fn oversized_matches_are_reported_without_context() {
     assert!(content.contains("search_file"), "got: {content}");
 }
 
+/// The deadline bug the byte cap could not catch. `RENDER_MAX_CHARS` is a
+/// BYTE cap, but `split("\n")` costs the PRODUCT of line count and string
+/// length (~1e-8 x lines x chars), so a file can sit right at the cap and
+/// still be catastrophically expensive: 128 KiB of one-character lines —
+/// minified JS, a CSV, a log, a base64 blob wrapped narrow — is 65,536 lines,
+/// and one `split` over it measured ~84s. That is past the 30s script
+/// deadline, and the budget check happens BEFORE each file, so the clock
+/// cannot preempt a split once entered: the whole call returns NOTHING.
+///
+/// Splitting in bounded ~4 KiB slices turns O(lines x length) into
+/// O(lines x slice), which is what makes the byte cap true — the same file
+/// walks in ~2.7s. The needle sits on the LAST line so the whole file must be
+/// walked; nothing here can pass by exiting early.
+#[tokio::test]
+async fn dense_short_lines_at_the_render_cap_finish_inside_the_deadline() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // Exactly at RENDER_MAX_CHARS (128 KiB = 131,072), not over it: at one
+    // byte more the file would be skipped as un-rendered and this would prove
+    // nothing. 65,532 one-char lines + "needle\n" = 131,071 bytes.
+    let mut dense = String::with_capacity(131_072);
+    for _ in 0..65_532 {
+        dense.push_str("x\n");
+    }
+    dense.push_str("needle\n");
+    assert!(
+        dense.len() <= 128 * 1024,
+        "seed must stay under the render cap"
+    );
+    seed(dir.path(), "dense.js", &dense);
+
+    let started = std::time::Instant::now();
+    let content = run_search_ok(
+        json!({ "pattern": "needle", "path": dir.path().to_string_lossy() }),
+        dir.path(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    // The whole point: before the sliced walk this call returned nothing at
+    // all, because one split over this file outruns the script deadline.
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "must return inside the 30s script deadline, took {elapsed:?}"
+    );
+    assert!(
+        content.contains("1 match(es) in 1 file(s)"),
+        "got: {content}"
+    );
+    // Walked, not skipped: the line context is really there, and the line
+    // number is only right if every slice contributed exactly its own lines.
+    assert!(
+        content.contains(">65533: needle"),
+        "got tail: {}",
+        tail(&content)
+    );
+    assert!(
+        !content.contains("larger than"),
+        "the file is at the render cap, not over it — it must be walked, \
+         not reported as un-rendered: {content}"
+    );
+    assert!(
+        !content.contains("STOPPED"),
+        "a file at the render cap must finish well inside the work budget: {}",
+        tail(&content)
+    );
+}
+
+/// The sliced walk must produce exactly the array one `split("\n")` would.
+/// Line lengths here (37 bytes) divide the 4 KiB slice unevenly, so slice
+/// boundaries land mid-line constantly — if the walk cut a line in half, or
+/// dropped/doubled the empty segment a slice ending on "\n" leaves behind,
+/// the reported line number would drift from the true one.
+#[tokio::test]
+async fn sliced_walk_numbers_lines_exactly_like_one_split() {
+    if skill_missing() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = String::new();
+    for i in 1..=3_000 {
+        if i == 2_345 {
+            body.push_str("needle\n");
+        } else {
+            body.push_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        }
+    }
+    seed(dir.path(), "wide.rs", &body);
+
+    let content = run_search_ok(
+        json!({ "pattern": "needle", "path": dir.path().to_string_lossy() }),
+        dir.path(),
+    )
+    .await;
+
+    assert!(
+        content.contains("1 match(es) in 1 file(s)"),
+        "got: {content}"
+    );
+    assert!(
+        content.contains(">2345: needle"),
+        "line number must survive ~27 slice boundaries: {}",
+        tail(&content)
+    );
+}
+
 /// The primary bound: wall-clock against the real script deadline. Every one
-/// of these files matches, so every one pays the expensive per-line render
-/// (~0.5s each measured) — the budget must cut the search off and hand back a
-/// partial result rather than let the whole call hit the 30s deadline and
-/// return nothing.
+/// of these files matches, so every one pays the per-line walk — the budget
+/// must cut the search off and hand back a partial result rather than let the
+/// whole call hit the 30s deadline and return nothing.
+///
+/// The corpus is sized against the SLICED walk. It used to be 80 x 58 KB of
+/// ordinary source, which cost ~45s when each file was one `split("\n")`;
+/// slicing dropped that to ~4s, so the budget stopped tripping and the test
+/// stopped testing anything. The bound did not change — what it takes to
+/// reach it did. So each file here is now the worst shape the render cap
+/// admits: 128 KiB of one-character lines, ~2.7s to walk in slices, with the
+/// needle on the LAST line so no file can exit early. 24 of them is ~65s of
+/// walk work against a 20s budget; the run stops around the seventh, and the
+/// surplus files cost nothing because they are never reached.
 #[tokio::test]
 async fn time_budget_trips_and_announces_itself() {
     if skill_missing() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut body = String::from("the needle is here\n");
-    while body.len() < 58_000 {
-        body.push_str("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+    let mut body = String::with_capacity(131_072);
+    for _ in 0..65_526 {
+        body.push_str("x\n");
     }
-    for i in 0..80 {
+    body.push_str("the needle is here\n");
+    assert!(
+        body.len() <= 128 * 1024,
+        "each file must stay under the render cap"
+    );
+    for i in 0..24 {
         seed(dir.path(), &format!("f{i}.rs"), &body);
     }
 
