@@ -1,6 +1,6 @@
 export default {
   name: "code_search",
-  version: "0.2.0",
+  version: "0.3.0",
   output: "memory",
   description: "Search for a pattern across files in a directory tree. Returns matching lines with context. Supports regex patterns, a filename glob filter, and a depth bound.",
   parameters: {
@@ -62,8 +62,8 @@ export default {
       // pattern like "^fn main" would match line 40 in the per-line pass but
       // be rejected by the prefilter — a silent false negative. With "m" the
       // prefilter is a strict superset of "some line matches": it may let a
-      // non-matching file through (costing one split) but can never drop a
-      // matching one.
+      // non-matching file through (costing one line walk) but can never drop
+      // a matching one.
       prefilter = new RegExp(searchPattern, "im");
     } catch (e) {
       return {
@@ -89,13 +89,18 @@ export default {
     // file varies by ~75x with shape alone (11.6 MB read in 1.5s; the same
     // 11.6 MB split into lines, 112s).
     //
-    // The reserve is the OVERSHOOT, not a round fraction. The budget is
-    // checked before each file, so the most that can be spent after the last
-    // check is one file: a read bounded by MAX_FILE_BYTES (~0.15s at the
-    // measured 7.7 MB/s) plus one context render bounded by
-    // RENDER_MAX_CHARS (~2s), ≈ 2.2s. Triple that so a machine three times
-    // slower than the one measured still lands inside the deadline
-    // (30000 - 3 x 2200 = 23,400) and round down for slack.
+    // The reserve is the OVERSHOOT, not a round fraction — the cost of the
+    // longest stretch that runs AFTER a budget check and cannot itself be
+    // interrupted. With the per-file walk sliced (SPLIT_SLICE_CHARS below)
+    // that stretch is no longer the render: it is one directory listing
+    // bounded by MAX_ENTRIES (12,000 entries at the measured 8,800/s ≈ 1.4s),
+    // then, for the first file under it, a read bounded by MAX_FILE_BYTES
+    // (~0.13s at the measured 7.7 MB/s) plus a whole-string prefilter over
+    // the same bytes (~0.11s) plus the one slice in flight when the clock
+    // trips (~0.08s, derived below) ≈ 1.7s. Triple that so a machine three
+    // times slower than the one measured still lands inside the deadline
+    // (30000 - 3 x 1700 = 24,900); 20,000 keeps the slack the earlier,
+    // un-sliced reserve was sized for and costs nothing to hold.
     var SCRIPT_DEADLINE_MS = 30000;
     var WORK_BUDGET_MS = 20000;
 
@@ -112,13 +117,46 @@ export default {
     // largest file worth reading whole is ~1.15 MB, rounded down to 1 MiB.
     var MAX_FILE_BYTES = 1024 * 1024;
 
-    // RENDER — splitting a file into lines to extract match context is the
-    // expensive step, and it grows SUPER-linearly in line count: a
-    // 58KB/1100-line file measured 0.56s, and ten times the lines cost
-    // ~45x, not 10x. At that growth a 128 KiB file costs ~2s, an eighth of
-    // the work budget — the most one file may take. Larger files are still
-    // searched (the whole-string prefilter below is cheap); only their line
-    // context is skipped, and the skip announces itself.
+    // SLICE — the width of one split. Splitting a file into lines is the
+    // expensive step, and the measurement that pins it down is that
+    // `content.split("\n")` costs the PRODUCT of line count and string
+    // length, ~1e-8 x lines x chars seconds. At a FIXED 128 KiB:
+    //
+    //     653 lines  0.91s     2,428 lines  3.41s     7,711 lines 10.29s
+    //  26,215 lines 32.86s    65,536 lines 83.96s
+    //
+    // So a byte cap cannot bound this: 128 KiB of one-char lines (minified
+    // JS, a CSV, a log, a wrapped base64 blob) passes any byte cap and then
+    // spends ~84s inside ONE uninterruptible split — past the 30s deadline,
+    // which means the whole call returns nothing. Isolating the stages showed
+    // the split ITSELF is the entire cost, so no cheaper per-line loop helps
+    // (32,768 one-char lines: split alone 21.3s, split+regex 23.2s, an empty
+    // JS loop of the same count 70ms).
+    //
+    // Splitting in bounded slices breaks the product, turning
+    // O(lines x length) into O(lines x slice):
+    //
+    //   1 MiB / 19,419 lines:  one split 184.06s  ->  4 KiB slices 3.05s (60x)
+    //   128 KiB / 65,536 lines: one split 82.53s  ->  4 KiB slices 2.68s (31x)
+    //   128 KiB /  2,428 lines: one split  2.26s  ->  4 KiB slices 0.13s (17x)
+    //
+    // 4 KiB is also what makes the walk preemptible at all: a slice holds at
+    // most SPLIT_SLICE_CHARS/2 lines (every line "x\n"), so one slice costs at
+    // most ~1e-8 x 2,048 x 4,096 ≈ 0.08s, and the work budget can be checked
+    // between slices instead of only between files.
+    var SPLIT_SLICE_CHARS = 4096;
+
+    // RENDER — the file size worth doing line work on at all. Once the walk
+    // is sliced its cost is ~1e-8 x lines x SPLIT_SLICE_CHARS, and BYTES NOW
+    // BOUND LINES: the densest a file can be packed is one line per two chars
+    // ("x\n"), so 128 KiB holds at most 65,536 lines and its walk costs at
+    // most ~1e-8 x 65,536 x 4,096 ≈ 2.7s — an eighth of the work budget, the
+    // most one file may take. That is the same 128 KiB and the same "eighth
+    // of the budget" this cap already carried, but it is only TRUE with the
+    // slicing above: measured against one split, that same worst-case file
+    // costs 84s. Larger files are still searched (the whole-string prefilter
+    // below is cheap); only their line context is skipped, and the skip
+    // announces itself.
     var RENDER_MAX_CHARS = 128 * 1024;
 
     // OUTPUT — this tool declares output:"memory", so its result is not cut
@@ -163,6 +201,10 @@ export default {
     // Detect it here so the other bounds carry the load and the note below
     // tells the truth about which bound applied.
     var clockOk = isFinite(startedAt);
+    // Absolute cutoff, so the sliced walk below can be preempted without
+    // having to carry `startedAt` and the budget separately. Null means the
+    // clock is unusable and the walk falls back to the size bounds alone.
+    var deadlineAt = clockOk ? startedAt + WORK_BUDGET_MS : null;
 
     var visited = 0;
     var entriesCapped = false;
@@ -280,10 +322,12 @@ export default {
 
         // Whole-string prefilter. Testing the regex against the entire file
         // is effectively free (11.6 MB measured at 1.3s, the same cost as
-        // reading it), while splitting that text into lines costs 112s. A
-        // file with no match must therefore never reach the split — and in a
-        // real search almost no file does. This one line is the difference
-        // between a search that finishes and one that eats the deadline.
+        // reading it), while walking that text line by line is everything
+        // else — 112s for the same bytes as one split per file, and still the
+        // dominant per-file cost once sliced. A file with no match must
+        // therefore never reach the walk, and in a real search almost none
+        // does. This one line is the difference between a search that
+        // finishes and one that eats the deadline.
         if (!prefilter.test(content)) {
           continue;
         }
@@ -293,17 +337,15 @@ export default {
           continue;
         }
 
-        var lines = content.split("\n");
-        var matches = [];
-        for (var li = 0; li < lines.length; li++) {
-          if (regex.test(lines[li])) {
-            matches.push(li);
-            totalMatches++;
-            if (totalMatches >= maxResults) {
-              break;
-            }
-          }
-        }
+        // Split and scan in bounded slices rather than one `split("\n")`.
+        // Same lines, same matches, but the cost stops being the product of
+        // the file's line count and its length, and the work budget can
+        // preempt the walk part-way instead of only between files.
+        var walk = walkLines(content, regex, maxResults - totalMatches, ctx,
+          SPLIT_SLICE_CHARS, deadlineAt);
+        var lines = walk.lines;
+        var matches = walk.matches;
+        totalMatches += matches.length;
 
         if (matches.length > 0) {
           var section = formatFileMatches(childPath, lines, matches, ctx);
@@ -313,6 +355,15 @@ export default {
             break;
           }
           results.push(section);
+        }
+
+        // Rendered first, then stop: a walk cut off by the clock still found
+        // real matches in the lines it reached, and dropping them would make
+        // the budget cost more than it saves.
+        if (walk.timeCapped) {
+          timeCapped = true;
+          stop = true;
+          break;
         }
 
         if (totalMatches >= maxResults) {
@@ -350,8 +401,9 @@ export default {
     }
     if (notRendered > 0) {
       notes.push(notRendered + " file(s) CONTAIN the pattern but are larger than " +
-        formatSize(RENDER_MAX_CHARS) + ", so their line context was not rendered (extracting " +
-        "context from a file that size would spend the whole deadline). They are counted in " +
+        formatSize(RENDER_MAX_CHARS) + ", so their line context was not rendered (walking a " +
+        "file line by line costs its line count, and above that size one file could take more " +
+        "than the eighth of the work budget any single file is allowed). They are counted in " +
         "the file total above. Use search_file on one of them, or narrow the pattern.");
     }
     if (entriesCapped) {
@@ -361,11 +413,12 @@ export default {
         "path/depth/file_pattern, or use exec `rg` for a whole-repo sweep.");
     }
     if (timeCapped) {
-      notes.push("STOPPED: spent the " + WORK_BUDGET_MS + "ms work budget (half the " +
-        SCRIPT_DEADLINE_MS + "ms script deadline, so the result comes back instead of the " +
+      notes.push("STOPPED: spent the " + WORK_BUDGET_MS + "ms work budget (kept under the " +
+        SCRIPT_DEADLINE_MS + "ms script deadline so the result comes back instead of the " +
         "whole call timing out) after " + filesScanned + " file(s), " + formatSize(bytesRead) +
-        " read. The search SUCCEEDED over what it reached and unscanned files remain — " +
-        "narrow with path/depth/file_pattern, or use exec `rg` for a whole-repo sweep.");
+        " read; the last file may have been only partly walked. The search SUCCEEDED over " +
+        "what it reached and unscanned files remain — narrow with path/depth/file_pattern, " +
+        "or use exec `rg` for a whole-repo sweep.");
     }
     if (outputCapped) {
       notes.push("STOPPED: the next match section would pass the " + MAX_OUTPUT_CHARS +
@@ -415,6 +468,84 @@ export default {
     }
     return { content: body, success: true };
   }
+}
+
+// Split `content` into lines and collect the indices of matching ones, in
+// bounded slices. Produces exactly the array `content.split("\n")` would —
+// but in interruptible steps, and it scans each slice as it lands, so a match
+// near the top of a big file costs only the lines above it.
+//
+// `deadlineAt` is an absolute Date.now() cutoff, or null when the engine
+// serves no usable clock (then the caller's size bounds are the only limit).
+// Returns { lines, matches, timeCapped }; `lines` holds only what was walked.
+function walkLines(content, regex, maxMatches, ctx, sliceChars, deadlineAt) {
+  var lines = [];
+  var matches = [];
+  var scanned = 0;
+  var pos = 0;
+  var timeCapped = false;
+
+  while (pos < content.length) {
+    if (deadlineAt !== null && Date.now() > deadlineAt) {
+      timeCapped = true;
+      break;
+    }
+
+    // Extend the slice to the end of the line it lands in, so a line is never
+    // cut in half across two splits.
+    var end = pos + sliceChars;
+    if (end < content.length) {
+      var nl = content.indexOf("\n", end);
+      end = nl < 0 ? content.length : nl + 1;
+    } else {
+      end = content.length;
+    }
+    var part = content.slice(pos, end);
+    pos = end;
+
+    var got = part.split("\n");
+    // A slice that ended on a newline leaves a trailing "" that is not a line
+    // — it is the start of the next slice's first line. At EOF it IS a line
+    // (the empty segment after a trailing newline), matching split.
+    if (pos < content.length && got.length > 0 && got[got.length - 1] === "") {
+      got.pop();
+    }
+    for (var g = 0; g < got.length; g++) {
+      lines.push(got[g]);
+    }
+
+    // Scan what just landed. The per-line loop is free next to the split.
+    while (scanned < lines.length && matches.length < maxMatches) {
+      if (regex.test(lines[scanned])) {
+        matches.push(scanned);
+      }
+      scanned++;
+    }
+
+    // Once we have every match we were asked for AND enough trailing lines to
+    // render their context, the rest of the file cannot change the answer —
+    // stop reading it.
+    if (matches.length >= maxMatches &&
+        lines.length > matches[matches.length - 1] + ctx) {
+      break;
+    }
+  }
+  // `"".split("\n")` is [""], but the loop above never runs for an empty file.
+  // Keep the two equivalent.
+  if (content.length === 0) {
+    lines.push("");
+  }
+  // Scan anything appended but not reached — only the empty-file line above,
+  // since the loop scans each slice as it lands. A no-op otherwise, and it
+  // keeps "what was walked" and "what was scanned" equal on every path.
+  while (scanned < lines.length && matches.length < maxMatches) {
+    if (regex.test(lines[scanned])) {
+      matches.push(scanned);
+    }
+    scanned++;
+  }
+
+  return { lines: lines, matches: matches, timeCapped: timeCapped };
 }
 
 // Running total of the rendered sections, including the "\n\n" that joins
