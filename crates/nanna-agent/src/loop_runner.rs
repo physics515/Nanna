@@ -6023,7 +6023,12 @@ fn is_write_tool(name: &str) -> bool {
 /// precisely because both change the world). Read/search/list calls can
 /// succeed forever without changing anything outside the context window,
 /// so they are never claim evidence.
-fn is_work_evidence_tool(name: &str) -> bool {
+///
+/// Crate-visible because the harness asks the same question one rung up: a
+/// continuation round that made no work-evidence call changed nothing in the
+/// world, which is the structural half of the mission's convergence signal.
+/// One classification, two rungs — a second list would drift.
+pub(crate) fn is_work_evidence_tool(name: &str) -> bool {
     is_write_tool(name)
         || matches!(
             name,
