@@ -69,6 +69,12 @@ pub struct ControlPlane {
     storage: Option<Arc<Storage>>,
     /// Shared workspace ID for script services (updated before each agent run)
     services_workspace_id: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
+    /// Turn-start closed-task baselines, shared with the `tasks.*` script
+    /// services so the model's own `tasks.add` (which the harness's replan
+    /// step drives through the todo tool) answers "already closed this turn?"
+    /// with the same baseline the continuation planner uses. `None` in
+    /// minimal test constructions — the guard then simply never engages.
+    turn_baselines: Option<Arc<crate::tasks::TurnBaselines>>,
     /// Event broadcaster for pushing events to subscribed clients
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
     /// Monotonic clock start, for reporting daemon uptime in `SystemAction::Status`.
@@ -128,6 +134,7 @@ impl ControlPlane {
             storage: None,
             event_tx: None,
             services_workspace_id: None,
+            turn_baselines: None,
             started_at: std::time::Instant::now(),
             status_manager: None,
             task_runs: None,
@@ -185,6 +192,7 @@ impl ControlPlane {
             storage: None,
             event_tx: None,
             services_workspace_id: None,
+            turn_baselines: None,
             started_at: std::time::Instant::now(),
             status_manager: None,
             task_runs: None,
@@ -244,6 +252,7 @@ impl ControlPlane {
             storage: None,
             event_tx: None,
             services_workspace_id: None,
+            turn_baselines: None,
             started_at: std::time::Instant::now(),
             status_manager: None,
             task_runs: None,
@@ -313,6 +322,17 @@ impl ControlPlane {
     /// Set the shared workspace ID for script services
     pub fn with_workspace_id(mut self, ws_id: Arc<tokio::sync::RwLock<Option<String>>>) -> Self {
         self.services_workspace_id = Some(ws_id);
+        self
+    }
+
+    /// Share the turn-start closed-task baselines with the control plane.
+    ///
+    /// Must be the SAME handle `build_task_services` was given: the chat
+    /// harness registers a turn here and `tasks.add` reads it, so two
+    /// separate registries would silently mean no guard at all.
+    #[must_use]
+    pub fn with_turn_baselines(mut self, baselines: Arc<crate::tasks::TurnBaselines>) -> Self {
+        self.turn_baselines = Some(baselines);
         self
     }
 

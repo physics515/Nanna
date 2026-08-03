@@ -439,6 +439,7 @@ fn build_script_services(
     session_history: SharedSessionHistory,
     workspace_id: Arc<tokio::sync::RwLock<Option<String>>>,
     storage: Option<Arc<nanna_storage::Storage>>,
+    turn_baselines: Arc<crate::tasks::TurnBaselines>,
     summarizer: Option<(Arc<crate::llm_router::LlmRouter>, Vec<String>)>,
 ) -> HashMap<String, ServiceFn> {
     use serde_json::{Value, json};
@@ -451,6 +452,7 @@ fn build_script_services(
         services.extend(crate::tasks::build_task_services(
             storage,
             workspace_id.clone(),
+            turn_baselines,
         ));
     }
 
@@ -1307,8 +1309,16 @@ impl DaemonServer {
         }
 
         // Initialize services
-        let (tools, memory, agent, router, tools_dir, workspace_id_for_services, model_stats) =
-            self.init_services().await?;
+        let (
+            tools,
+            memory,
+            agent,
+            router,
+            tools_dir,
+            workspace_id_for_services,
+            turn_baselines,
+            model_stats,
+        ) = self.init_services().await?;
 
         // Recover any orphaned checkpoints from the database.
         if let Some(ref storage) = self.storage {
@@ -1714,6 +1724,7 @@ impl DaemonServer {
         .with_tools_dir(tools_dir)
         .with_event_tx(self.ipc.event_sender())
         .with_workspace_id(workspace_id_for_services)
+        .with_turn_baselines(turn_baselines)
         .with_scheduler(scheduler)
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
@@ -2168,6 +2179,7 @@ impl DaemonServer {
             Arc<LlmRouter>,
             Option<PathBuf>,                          // tools_dir
             Arc<tokio::sync::RwLock<Option<String>>>, // workspace_id for script services
+            Arc<crate::tasks::TurnBaselines>,         // turn-start closed-task baselines
             nanna_agent::ModelStatsTracker,           // shared model-stats tracker
         ),
         crate::DaemonError,
@@ -2653,6 +2665,10 @@ impl DaemonServer {
         // Build script services and load all tools from disk
         let workspace_id_for_services: Arc<tokio::sync::RwLock<Option<String>>> =
             Arc::new(tokio::sync::RwLock::new(None));
+        // ONE registry, shared by the chat harness (which registers a turn's
+        // baseline) and the `tasks.*` services (whose `tasks.add` reads it).
+        // Two registries would compile and silently guard nothing.
+        let turn_baselines = Arc::new(crate::tasks::TurnBaselines::new());
         {
             let spawner_arc: Option<Arc<dyn AgentSpawner + Send + Sync>> = if !router
                 .available_providers()
@@ -2715,6 +2731,7 @@ impl DaemonServer {
                 session_history.clone(),
                 workspace_id_for_services.clone(),
                 self.storage.clone(),
+                turn_baselines.clone(),
                 Some((router.clone(), summarizer_models)),
             );
 
@@ -2816,6 +2833,7 @@ impl DaemonServer {
             router,
             tools_dir,
             workspace_id_for_services,
+            turn_baselines,
             model_stats,
         ))
     }

@@ -248,6 +248,9 @@ impl ControlPlane {
         let memory = self.memory.clone();
 
         let sessions = self.sessions.clone();
+        // The SAME registry `build_task_services` was given, so the baseline
+        // this turn publishes is the one `tasks.add` reads.
+        let turn_baselines = self.turn_baselines.clone();
         let session_id_owned = session_id.to_string();
         let content_owned = content.to_string();
         let message_id_for_run = message_id.clone();
@@ -306,6 +309,20 @@ impl ControlPlane {
                 let closed_before_turn = closed_task_ids(&storage, &scope, scope_id.as_deref())
                     .await
                     .unwrap_or_default();
+
+                // Publish the boundary so EVERY in-run item-creation path
+                // shares it, not just the continuation planner below. The
+                // harness's replan step decomposes a stalled item by telling
+                // the model to add subtasks through the todo tool, which
+                // lands in `tasks.add` — a path this snapshot used not to
+                // reach, so an abandoned title came straight back (#2059 →
+                // #2060, observed live 2026-08-02). Dropped again on the exit
+                // tail that releases the run claim.
+                if let Some(ref baselines) = turn_baselines {
+                    baselines
+                        .open_turn(&scope, scope_id.as_deref(), closed_before_turn.clone())
+                        .await;
+                }
 
                 let plan = planner
                     .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
@@ -726,10 +743,15 @@ impl ControlPlane {
                 content,
             });
 
-            // Every exit path releases both registrations — a leaked entry
-            // would make the session look busy forever.
+            // Every exit path releases all three registrations — a leaked
+            // entry would make the session look busy forever, and a leaked
+            // turn baseline would keep filtering titles into the next turn,
+            // where re-asking is legitimate.
             agent.unregister_external_run(&session_id_owned).await;
             registry.release(&session_id_owned).await;
+            if let Some(ref baselines) = turn_baselines {
+                baselines.close_turn(&scope, scope_id.as_deref()).await;
+            }
         });
 
         Ok(Some(message_id))

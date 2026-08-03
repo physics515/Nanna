@@ -525,14 +525,37 @@ struct LlmResult {
     error_tool_results: Vec<ContentBlock>,
 }
 
-/// Detect a literal tool-call loop: the two most recent tool calls used the
-/// same tool with the same arguments and got the same result (P14).
+/// Detect a literal tool-call loop: the newest tool call repeated an earlier
+/// call with the same tool, the same arguments, and the same result (P14).
 ///
 /// Identical result twice means the environment did not change — repeating
 /// the call cannot make progress. Text-level detectors miss this because the
 /// surrounding narration usually varies.
+///
+/// **Per-key, not per-adjacency.** This used to compare only the two most
+/// recent records, which any interleaving defeated: an A-B-A-B alternation
+/// never puts two identical records side by side, so the nudge — the FIRST
+/// rung of the escalation ladder every breaker threshold is derived from —
+/// never fired at all. Observed live 2026-08-02 (ollama/gemma4:12b, session
+/// 05775d1d): a 20-minute wedged turn alternating `explore` with `write_file`
+/// rewriting one file, with no loop nudge in the entire turn. The streak that
+/// matters is per call shape, so the lookback is per call shape too: find the
+/// most recent EARLIER record with the same (name, input) key and compare its
+/// output — exactly the rule the sibling breakers already use, and the same
+/// shape as the discovery-pause streak, which likewise ignores whatever
+/// ordinary calls ran in between.
+///
+/// The NEWEST record must itself be the repeat: an identical pair buried
+/// earlier in the run never fires retroactively, because the lookback is
+/// anchored on `last`. A different outcome for that same key clears it — the
+/// intervening call is what resets the streak, never a different tool.
+///
+/// The scan is exact rather than windowed (a lookback window would be a magic
+/// cap that an A-B-C-…-A pattern could dodge). It costs O(records) once per
+/// iteration, and `records` is the run's working set, already bounded by the
+/// run's iteration budget.
 fn detect_tool_call_loop(records: &[ToolCallRecord]) -> bool {
-    let [.., prev, last] = records else {
+    let Some((last, earlier)) = records.split_last() else {
         return false;
     };
     // Write-tool inputs are size-stubbed in the records ("[N bytes written]"),
@@ -543,7 +566,11 @@ fn detect_tool_call_loop(records: &[ToolCallRecord]) -> bool {
     ) {
         return false;
     }
-    last.name == prev.name && last.input == prev.input && last.output == prev.output
+    earlier
+        .iter()
+        .rev()
+        .find(|prev| prev.name == last.name && prev.input == last.input)
+        .is_some_and(|prev| prev.output == last.output)
 }
 
 /// Consecutive identical failures of one exact call shape (tool name +
@@ -688,6 +715,13 @@ fn resolve_task_anchor(explicit: Option<&str>, message: &str) -> Option<String> 
 /// [`repeat_call_key`]: a success resets the failure streak and a failure
 /// resets the success-identity streak, so their state lives adjacent in one
 /// struct per call shape.
+///
+/// **Interleaving cannot dilute a streak.** The state is keyed by call shape
+/// and touched only when THAT shape runs, so an A-B-A-B alternation extends
+/// A's streak on every A exactly as a contiguous A-A-A run would; whatever
+/// ran in between is irrelevant. Only a DIFFERENT outcome for the SAME key
+/// resets — which is the alternation that genuinely means progress
+/// (fail→ok→fail on one shape), not the alternation between two tools.
 #[derive(Debug, Clone, Default)]
 struct RepeatCallState {
     /// Consecutive failures of this exact call shape (cleared by any success).
@@ -4021,11 +4055,14 @@ impl Agent {
 
             // Sibling-breaker bookkeeping. A short-circuited call never ran,
             // so it neither extends nor clears anything — only real executions
-            // count. A different input is a different key and is untouched.
+            // count. A different input is a different key and is untouched,
+            // which is also why interleaving cannot dilute a streak: calls to
+            // other shapes land in other entries, so A-B-A-B extends A's
+            // streak exactly as A-A-A would.
             // The two streaks reset each other: a success wipes the failure
-            // streak, a failure wipes the success-identity streak — an
-            // ALTERNATING call is making some kind of progress and trips
-            // neither breaker.
+            // streak, a failure wipes the success-identity streak — a shape
+            // whose OWN outcome alternates is making some kind of progress and
+            // trips neither breaker.
             if !short_circuited {
                 let key = repeat_call_key(&name, &input);
                 let entry = state.repeat_calls.entry(key).or_default();
@@ -6191,14 +6228,60 @@ mod tests {
     }
 
     #[test]
-    fn tool_loop_only_compares_the_last_two() {
-        // An identical pair earlier in the run must not fire retroactively.
+    fn tool_loop_needs_the_newest_call_to_be_the_repeat() {
+        // An identical pair earlier in the run must not fire retroactively:
+        // the lookback is anchored on the NEWEST record, and `exec` here has
+        // no earlier twin of its own.
         let records = vec![
             record("read_file", serde_json::json!({"path": "a.rs"}), "x"),
             record("read_file", serde_json::json!({"path": "a.rs"}), "x"),
             record("exec", serde_json::json!({"command": "ls"}), "files"),
         ];
         assert!(!detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_fires_through_an_interleaved_call() {
+        // The live wedge (session 05775d1d): A-B-A alternation. Adjacency
+        // comparison saw `write_file` then `explore` and never fired; the
+        // per-key lookback sees `explore` repeat its own earlier outcome.
+        let records = vec![
+            record("explore", serde_json::json!({}), "nothing found"),
+            record("write_file", serde_json::json!({"path": "x.rs"}), "ok"),
+            record("explore", serde_json::json!({}), "nothing found"),
+        ];
+        assert!(detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_fires_through_many_interleaved_calls() {
+        // Interleaving depth is irrelevant — the streak is per call shape, so
+        // a lookback window an A-B-C-D-A pattern could dodge would be wrong.
+        let records = vec![
+            record("explore", serde_json::json!({}), "nothing found"),
+            record("exec", serde_json::json!({"command": "ls"}), "files"),
+            record("read_file", serde_json::json!({"path": "a.rs"}), "src"),
+            record("exec", serde_json::json!({"command": "pwd"}), "/tmp"),
+            record("explore", serde_json::json!({}), "nothing found"),
+        ];
+        assert!(detect_tool_call_loop(&records));
+    }
+
+    #[test]
+    fn tool_loop_resets_on_a_different_outcome_for_the_same_key() {
+        // Only a DIFFERENT outcome for that same key clears the streak — an
+        // intervening call to another tool never does. Here the most recent
+        // earlier `explore` returned something else, so the environment moved.
+        let records = vec![
+            record("explore", serde_json::json!({}), "nothing found"),
+            record("explore", serde_json::json!({}), "found src/main.rs"),
+            record("exec", serde_json::json!({"command": "ls"}), "files"),
+            record("explore", serde_json::json!({}), "nothing found"),
+        ];
+        assert!(
+            !detect_tool_call_loop(&records),
+            "the newest explore differs from the most recent earlier one"
+        );
     }
 
     #[test]
@@ -7476,6 +7559,240 @@ mod zero_info_breaker_tests {
         // Only the 4th is short-circuited.
         run_once(&agent, &mut state, input).await;
         assert_eq!(executions.load(Ordering::SeqCst), 3);
+    }
+}
+
+/// Interleave evasion: the live wedge (2026-08-02, ollama/gemma4:12b, session
+/// 05775d1d) was an A-B-A-B alternation — `explore` ×100 alternating with
+/// `write_file` ×33 rewriting one file — that ran for 20 minutes.
+///
+/// These tests pin the invariant the whole escalation ladder rests on: a
+/// streak belongs to a call SHAPE, so whatever runs in between is irrelevant.
+/// Every rung must reach its threshold under alternation exactly as it does
+/// under a contiguous run.
+#[cfg(test)]
+mod interleave_breaker_tests {
+    use super::*;
+    use nanna_tools::{Tool, ToolDefinition, ToolError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Always fails, identically. `executions` counts REAL dispatches — the
+    /// breaker assertion is that this counter stops moving.
+    struct SinkingTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SinkingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "sinker".to_string(),
+                description: "test tool that always fails identically".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            // Structured failure, RETURNED not thrown — the repo rule.
+            Ok(ToolResult::error("boom: the disk is on fire"))
+        }
+    }
+
+    /// Always succeeds, identically — the zero-information shape.
+    struct EchoTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for EchoTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "echo".to_string(),
+                description: "test tool that always succeeds identically".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success("state: idle"))
+        }
+    }
+
+    /// Succeeds with a DIFFERENT result every call, so its own streaks never
+    /// build: the honest interleave partner, still dispatchable after the
+    /// tool it alternates with has been cut off.
+    struct TickingTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for TickingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "ticker".to_string(),
+                description: "test tool that succeeds with a fresh result each call".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            let n = self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success(format!("tick {n}")))
+        }
+    }
+
+    async fn interleave_agent(
+        sinks: Arc<AtomicUsize>,
+        echoes: Arc<AtomicUsize>,
+        ticks: Arc<AtomicUsize>,
+    ) -> Agent {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(SinkingTool { executions: sinks }).await;
+        tools.register(EchoTool { executions: echoes }).await;
+        tools.register(TickingTool { executions: ticks }).await;
+        // Never contacted: `execute_tools` is driven directly and the mock
+        // results are small enough to bypass all summarization paths.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(AgentConfig::default(), llm, tools)
+    }
+
+    async fn call(agent: &Agent, state: &mut RunState, name: &str) -> String {
+        let uses = vec![(
+            Uuid::new_v4().to_string(),
+            name.to_string(),
+            serde_json::json!({}),
+        )];
+        let mut blocks = agent
+            .execute_tools(&uses, state, &RunOptions::default(), None)
+            .await;
+        assert_eq!(blocks.len(), 1);
+        match blocks.remove(0) {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected a tool_result block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_call_short_circuits_at_its_own_third_outcome_despite_interleaving() {
+        let sinks = Arc::new(AtomicUsize::new(0));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let agent =
+            interleave_agent(Arc::clone(&sinks), Arc::new(AtomicUsize::new(0)), Arc::clone(&ticks))
+                .await;
+        let mut state = RunState::new();
+
+        // A-fail, B-ok, A-fail, B-ok, … — never two identical records in a row.
+        for i in 1..=REPEAT_FAILURE_BREAKER_AFTER {
+            call(&agent, &mut state, "sinker").await;
+            assert_eq!(sinks.load(Ordering::SeqCst), i, "sinker call {i} executes");
+            call(&agent, &mut state, "ticker").await;
+            assert_eq!(ticks.load(Ordering::SeqCst), i, "ticker call {i} executes");
+        }
+
+        // The interleaved partner never diluted the streak: sinker's K+1th
+        // call short-circuits exactly as a contiguous run would.
+        let content = call(&agent, &mut state, "sinker").await;
+        assert_eq!(
+            sinks.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER,
+            "interleaving must not buy the broken shape extra executions"
+        );
+        assert!(content.contains("REPEAT-FAILURE BREAKER"), "got: {content}");
+
+        // …and only that shape is disabled — the partner still runs.
+        call(&agent, &mut state, "ticker").await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER + 1,
+            "the interleaved tool is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_sibling_breakers_reach_threshold_while_alternating_with_each_other() {
+        let sinks = Arc::new(AtomicUsize::new(0));
+        let echoes = Arc::new(AtomicUsize::new(0));
+        let agent =
+            interleave_agent(Arc::clone(&sinks), Arc::clone(&echoes), Arc::new(AtomicUsize::new(0)))
+                .await;
+        let mut state = RunState::new();
+
+        // The adversarial case: the two shapes alternate with EACH OTHER, so
+        // the record stream never repeats itself adjacently at all.
+        for _ in 0..REPEAT_FAILURE_BREAKER_AFTER {
+            call(&agent, &mut state, "echo").await;
+            call(&agent, &mut state, "sinker").await;
+        }
+        assert_eq!(echoes.load(Ordering::SeqCst), ZERO_INFO_BREAKER_AFTER);
+        assert_eq!(sinks.load(Ordering::SeqCst), REPEAT_FAILURE_BREAKER_AFTER);
+
+        // Each shape trips its OWN sibling at its OWN threshold.
+        let echo_notice = call(&agent, &mut state, "echo").await;
+        assert!(
+            echo_notice.contains("ZERO-INFORMATION BREAKER"),
+            "got: {echo_notice}"
+        );
+        let sink_notice = call(&agent, &mut state, "sinker").await;
+        assert!(
+            sink_notice.contains("REPEAT-FAILURE BREAKER"),
+            "got: {sink_notice}"
+        );
+        assert_eq!(echoes.load(Ordering::SeqCst), ZERO_INFO_BREAKER_AFTER);
+        assert_eq!(sinks.load(Ordering::SeqCst), REPEAT_FAILURE_BREAKER_AFTER);
+    }
+
+    #[tokio::test]
+    async fn the_soft_nudge_rung_still_fires_first_under_interleaving() {
+        // The rung the breaker thresholds are DERIVED from. Adjacency
+        // comparison never fired here — the whole ladder started at its hard
+        // rung, and in the live wedge it never started at all.
+        let sinks = Arc::new(AtomicUsize::new(0));
+        let agent = interleave_agent(
+            Arc::clone(&sinks),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let mut state = RunState::new();
+
+        call(&agent, &mut state, "sinker").await;
+        call(&agent, &mut state, "ticker").await;
+        assert!(
+            !detect_tool_call_loop(&state.tool_records),
+            "one sinker call is not yet a repeat"
+        );
+
+        call(&agent, &mut state, "sinker").await;
+        assert!(
+            detect_tool_call_loop(&state.tool_records),
+            "the second identical sinker outcome is a loop, interleaved or not"
+        );
+
+        // The soft rung fired while the hard rung is still one call away: the
+        // 2 + 1 derivation holds under interleaving too.
+        call(&agent, &mut state, "ticker").await;
+        call(&agent, &mut state, "sinker").await;
+        assert_eq!(
+            sinks.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER,
+            "the post-nudge attempt still executes"
+        );
+        call(&agent, &mut state, "sinker").await;
+        assert_eq!(sinks.load(Ordering::SeqCst), REPEAT_FAILURE_BREAKER_AFTER);
     }
 }
 

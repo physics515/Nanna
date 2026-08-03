@@ -469,6 +469,18 @@ pub trait TaskSource: Send + Sync {
     /// Give up on an item after repeated failed replans — close it so the run
     /// can move on instead of grinding.
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String>;
+
+    /// How many OPEN children an item has, or `None` when this source cannot
+    /// report it.
+    ///
+    /// A replan step decomposes a stalled item by adding subtasks through the
+    /// store, so this is how the runner tells a replan that produced work
+    /// from one that produced nothing. `None` means "unknown", and the runner
+    /// then treats every replan as productive — the pre-existing behavior, so
+    /// a source that does not implement this is unaffected.
+    async fn open_subtasks(&self, _id: i64) -> Result<Option<usize>, String> {
+        Ok(None)
+    }
 }
 
 /// Request for one step: everything the runner needs to build a fresh-context
@@ -996,6 +1008,16 @@ impl LongHorizonRunner {
                 )
             };
 
+            // Open-children count BEFORE a replan runs, so "did this replan
+            // actually decompose anything?" is answerable afterwards. Only
+            // taken for replan steps — an execute step has no such contract,
+            // and this is a store round-trip.
+            let subtasks_before = if is_replan {
+                source.open_subtasks(step.id).await.unwrap_or(None)
+            } else {
+                None
+            };
+
             let remaining_wall = cfg.max_wall_clock.saturating_sub(started.elapsed());
             let request = StepRequest {
                 item_id: step.id,
@@ -1050,18 +1072,46 @@ impl LongHorizonRunner {
 
             if is_replan {
                 // The replan step adds subtasks through the store; the next
-                // next() will surface them. Reset the grind counter so the
-                // new decomposition gets a fresh allowance.
+                // next() will surface them. A replan that actually decomposed
+                // resets the grind counter so the new work gets a fresh
+                // allowance — but a DRY replan must not buy one.
+                //
+                // Observed live 2026-08-02 (session 05775d1d): a replan
+                // re-proposed the title the run had just abandoned, the store
+                // refused to resurrect it, and the reset handed the item
+                // another full allowance of fruitless steps — the item span
+                // grew by `max_steps_per_item` per empty replan instead of
+                // converging. With the reset withheld the item is still at
+                // its grind threshold, so the next iteration replans again
+                // and the existing `max_replans_per_item` rung reaches
+                // abandonment directly. A source that cannot report its
+                // children (`None`) is treated as productive, exactly as
+                // before.
+                let produced_work = match (subtasks_before, source.open_subtasks(step.id).await) {
+                    (Some(before), Ok(Some(after))) => after > before,
+                    _ => true,
+                };
                 item.replans += 1;
-                item.steps_without_progress = 0;
-                item.last_result = None;
-                item.last_tool_calls.clear();
+                if produced_work {
+                    item.steps_without_progress = 0;
+                    item.last_result = None;
+                    item.last_tool_calls.clear();
+                } else {
+                    tracing::info!(
+                        item = step.id,
+                        replans = item.replans,
+                        "replan added no subtasks — not resetting the grind counter"
+                    );
+                }
                 replans += 1;
                 let _ = source
                     .log(
                         step.id,
                         "replanned",
-                        serde_json::json!({ "replans": item.replans }),
+                        serde_json::json!({
+                            "replans": item.replans,
+                            "produced_work": produced_work,
+                        }),
                     )
                     .await;
                 continue;
@@ -1311,6 +1361,10 @@ mod tests {
         notes: Mutex<Vec<(i64, String)>>,
         log_entries: Mutex<Vec<(i64, String)>>,
         fail_next: Mutex<bool>,
+        /// Open-children ledger. `None` (the default) means "this source
+        /// cannot report", which is the pre-existing path every other test
+        /// exercises: the runner then treats every replan as productive.
+        subtasks: Option<Arc<Mutex<HashMap<i64, usize>>>>,
     }
 
     impl MemorySource {
@@ -1367,6 +1421,38 @@ mod tests {
                 item.abandoned = true;
             }
             Ok(())
+        }
+        async fn open_subtasks(&self, id: i64) -> Result<Option<usize>, String> {
+            match &self.subtasks {
+                Some(ledger) => Ok(Some(ledger.lock().await.get(&id).copied().unwrap_or(0))),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Replays a script and, on every Plan step, adds `per_replan` open
+    /// children to the shared ledger — what a replan step does when it
+    /// actually decomposes something. At 0 it is the DRY replan: the step
+    /// ran, and the store holds nothing new (every title it proposed was
+    /// already closed this turn, so `tasks.add` refused to resurrect it).
+    struct ReplanningRunner {
+        inner: ScriptedRunner,
+        subtasks: Arc<Mutex<HashMap<i64, usize>>>,
+        per_replan: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl StepRunner for ReplanningRunner {
+        async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
+            if request.step_kind == StepKind::Plan && self.per_replan > 0 {
+                *self
+                    .subtasks
+                    .lock()
+                    .await
+                    .entry(request.item_id)
+                    .or_insert(0) += self.per_replan;
+            }
+            self.inner.run_step(request).await
         }
     }
 
@@ -2055,6 +2141,114 @@ mod tests {
             .unwrap();
         assert_eq!(exec.tool_scope, vec!["exec".to_string()]);
         assert_eq!(exec.max_iterations, Some(fast_config().step_iterations));
+    }
+
+    /// Build a stalled item whose acceptance can never pass, with an
+    /// open-children ledger the runner can report from.
+    fn replan_fixture(per_replan: usize) -> (MemorySource, ReplanningRunner) {
+        let ledger = Arc::new(Mutex::new(HashMap::new()));
+        let source = MemorySource {
+            subtasks: Some(ledger.clone()),
+            ..MemorySource::default()
+        };
+        let runner = ReplanningRunner {
+            // Long enough that the script never runs dry first — the
+            // assertions are about how many steps the LADDER takes, not
+            // about the script running out.
+            inner: ScriptedRunner::new((0..10).map(|i| Ok(outcome(&format!("try {i}")))).collect()),
+            subtasks: ledger,
+            per_replan,
+        };
+        (source, runner)
+    }
+
+    /// REGRESSION (live 2026-08-02, session 05775d1d): a replan re-proposed
+    /// the title the run had just abandoned, the store refused to resurrect
+    /// it, and the unconditional grind-counter reset handed the item another
+    /// full allowance of fruitless steps anyway. A replan that decomposed
+    /// NOTHING has produced no new work, so it earns no fresh allowance —
+    /// the item stays at its grind threshold and the existing
+    /// `max_replans_per_item` rung reaches abandonment directly.
+    #[tokio::test]
+    async fn a_dry_replan_does_not_buy_a_fresh_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, runner) = replan_fixture(0);
+        source
+            .push(step(
+                1,
+                "stubborn item",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // 2 execute steps reach the grind threshold, 1 replan produces
+        // nothing, and the next iteration abandons — no second allowance.
+        assert_eq!(report.replans, 1);
+        assert_eq!(report.items_abandoned, 1);
+        assert_eq!(
+            report.steps_taken, 3,
+            "a dry replan must not restart the grind allowance: {report:?}"
+        );
+    }
+
+    /// The other half of the contract: a replan that DID decompose still
+    /// resets the counter, so real new work gets its full allowance.
+    #[tokio::test]
+    async fn a_productive_replan_still_resets_the_grind_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, runner) = replan_fixture(2);
+        source
+            .push(step(
+                1,
+                "stubborn item",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // 2 execute + 1 replan + 2 more execute, then abandonment.
+        assert_eq!(report.replans, 1);
+        assert_eq!(report.items_abandoned, 1);
+        assert_eq!(
+            report.steps_taken, 5,
+            "a replan that added subtasks keeps its fresh allowance: {report:?}"
+        );
+    }
+
+    /// A source that cannot report its children is unchanged: `None` means
+    /// unknown, and unknown is treated as productive rather than starving a
+    /// legitimate decomposition.
+    #[tokio::test]
+    async fn a_source_that_cannot_report_children_keeps_the_old_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "stubborn item",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner =
+            ScriptedRunner::new((0..10).map(|i| Ok(outcome(&format!("try {i}")))).collect());
+
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.steps_taken, 5, "unreported children ⇒ productive");
     }
 
     #[tokio::test]
