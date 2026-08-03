@@ -944,6 +944,15 @@ pub struct AgentStepRunner {
     /// session's chat transcript ("show your work as you go"). None for
     /// background runs that have no transcript to show.
     pub chat_sink: Option<ChatSink>,
+    /// GPU-memory faults observed in THIS harness run, across all its steps.
+    ///
+    /// Drives the blip-tolerant demotion ladder ([`gpu_fault_action`]): the
+    /// FIRST fault of a run gets a runner reset alone (reload at the same
+    /// size), the SECOND and every later one demote the context as well.
+    /// Runners serving the same run (the chat harness's planner and step
+    /// runners) share one counter, so the two faults that prove a repeat do
+    /// not have to land on the same runner object.
+    pub gpu_fault_count: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
@@ -1570,6 +1579,36 @@ fn gpu_memory_error(message: &str) -> bool {
         || m.contains("failed to allocate")
 }
 
+/// What to do about the `fault_ordinal`-th GPU-memory fault of a run (1-based).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuFaultAction {
+    /// Unload the runner (`keep_alive: 0`) and retry at the SAME size.
+    ResetOnly,
+    /// Reset AND walk the num_ctx latch down a rung (floor-clamped).
+    ResetAndDemote,
+}
+
+/// Blip tolerance for the demotion ladder.
+///
+/// Every fault gets the runner reset — reloading at the same size IS the
+/// blip fix. Shrinking is the repeat fix, so demotion engages only from the
+/// SECOND fault of a run. The old code demoted on the first: three runs had
+/// died to the fault repeating until the run ended, but that evidence
+/// predates the starting pin (PR #158, `NANNA_OLLAMA_NUM_CTX`). With a sane
+/// pinned start a single fault is usually a transient load blip, and demoting
+/// on it destroys a viable window — observed live 2026-08-03: exactly ONE
+/// fault all run, 8192 halved to 4096 under a ~4.2k pressure-tier floor,
+/// 38 below-floor stops, 8 resume cycles, run dead in 8 minutes. The second
+/// fault of a run is the evidence the first one lacked, so it (and every
+/// later one) acts immediately.
+const fn gpu_fault_action(fault_ordinal: u32) -> GpuFaultAction {
+    if fault_ordinal <= 1 {
+        GpuFaultAction::ResetOnly
+    } else {
+        GpuFaultAction::ResetAndDemote
+    }
+}
+
 #[async_trait::async_trait]
 impl StepRunner for AgentStepRunner {
     async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
@@ -1627,18 +1666,61 @@ impl StepRunner for AgentStepRunner {
                     );
                     self.reset_ollama_runner().await;
                 }
-                // Out of VRAM is the one fault where repeating the request
-                // unchanged is guaranteed to fail again: the context we asked
-                // for does not fit. Shrink it and unload, so the retry brings
-                // the model back at a size that does.
-                //
-                // Acted on from the FIRST retry, unlike the wedge above. A
-                // wedge might be a blip worth one free retry; this cannot be —
-                // and the evidence for waiting is bad, since three runs died to
-                // exactly this fault repeating until the run ended.
-                if gpu_memory_error(&last_err)
-                    && nanna_llm::LlmClient::demote_context(&self.agent_config.model).is_some()
-                {
+                // Out of VRAM: reset on EVERY fault (reloading at the same
+                // size is the blip fix), demote only once the fault REPEATS
+                // within the run (shrinking is the repeat fix) — see
+                // `gpu_fault_action` for why the first fault gets tolerance
+                // the old code denied it. The demotion is clamped to the
+                // run's measured minimum viable window, so a fault can never
+                // be "healed" into a size the floor check refuses.
+                if gpu_memory_error(&last_err) {
+                    let fault = self
+                        .gpu_fault_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    match gpu_fault_action(fault) {
+                        GpuFaultAction::ResetOnly => {
+                            tracing::warn!(
+                                gpu_faults = fault,
+                                "first GPU memory fault of this run — resetting \
+                                 the runner at the SAME size; a single fault at \
+                                 a sane starting pin is a load blip until a \
+                                 second fault proves otherwise"
+                            );
+                        }
+                        GpuFaultAction::ResetAndDemote => {
+                            // The clamp: the smallest window THIS run's steps
+                            // stay viable in (pressure-tier floor solved for
+                            // the window).
+                            let floor = nanna_agent::min_viable_num_ctx(
+                                &self.tools,
+                                &self.system_prompt,
+                                self.workspace_context.as_deref(),
+                                self.workspace_root.as_deref(),
+                                &request.prompt,
+                                self.agent_config.max_tokens as usize,
+                            )
+                            .await;
+                            // demote_context announces old → new and
+                            // clamped-or-not; `None` means the latch already
+                            // sits at the floor — the retry then reloads at
+                            // the same size and, if the fault persists, the
+                            // existing loud below-floor/fault failure
+                            // surfaces (resumable) instead of a manufactured
+                            // unusable window.
+                            let demoted = nanna_llm::LlmClient::demote_context(
+                                &self.agent_config.model,
+                                Some(floor),
+                            );
+                            tracing::warn!(
+                                gpu_faults = fault,
+                                min_viable_ctx = floor,
+                                demoted_to = ?demoted,
+                                "repeat GPU memory fault — demotion ladder engaged"
+                            );
+                        }
+                    }
+                    // The reset rides along on every fault, demoted or not.
                     self.reset_ollama_runner().await;
                 }
             }
@@ -2809,6 +2891,41 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // GPU-fault recovery ladder: blip tolerance before demotion
+    // -----------------------------------------------------------------
+
+    /// The first fault of a run is a blip until proven otherwise: reset the
+    /// runner at the SAME size, never shrink a viable window on one data
+    /// point (the 2026-08-03 run died to exactly that). The second and every
+    /// later fault is the proof — demote as well.
+    #[test]
+    fn the_first_gpu_fault_resets_only_and_the_second_demotes() {
+        assert_eq!(gpu_fault_action(1), GpuFaultAction::ResetOnly);
+        assert_eq!(gpu_fault_action(2), GpuFaultAction::ResetAndDemote);
+        assert_eq!(gpu_fault_action(3), GpuFaultAction::ResetAndDemote);
+        assert_eq!(gpu_fault_action(u32::MAX), GpuFaultAction::ResetAndDemote);
+    }
+
+    /// The run-scoped counter drives the ladder: two faults recorded through
+    /// the shared tally cross the demotion threshold exactly once, at the
+    /// second fault — regardless of which runner clone observed each fault.
+    #[test]
+    fn the_shared_fault_tally_crosses_into_demotion_at_the_second_fault() {
+        let tally = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let record = |t: &Arc<std::sync::atomic::AtomicU32>| {
+            t.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+        };
+        assert_eq!(gpu_fault_action(record(&tally)), GpuFaultAction::ResetOnly);
+        // A second runner sharing the same run shares the tally.
+        let other_runner_view = tally.clone();
+        assert_eq!(
+            gpu_fault_action(record(&other_runner_view)),
+            GpuFaultAction::ResetAndDemote
+        );
+        assert_eq!(gpu_fault_action(record(&tally)), GpuFaultAction::ResetAndDemote);
     }
 
     #[test]

@@ -420,6 +420,38 @@ pub fn clamp_model_info_to_effective_window(model: &str, mut info: ModelInfo) ->
     info
 }
 
+/// The quantum every demoted `num_ctx` snaps to.
+///
+/// Derived from the runner, not chosen: llama.cpp (Ollama's backend) prefills
+/// prompts in physical batches of 512 tokens (`n_batch`/`n_ubatch` default),
+/// so a context is consumed and its KV cache allocated in 512-token slices —
+/// a finer step changes the footprint by less than one prefill batch and buys
+/// nothing, while a coarser one (the old power-of-two buckets) throws away
+/// windows that would have fit.
+pub const NUM_CTX_QUANTUM: u32 = 512;
+
+/// The top of the demotion ladder — the largest window the VRAM sizing path
+/// can grant (its buckets are `[4096, 8192, 16384, 32768]`), so an unlatched
+/// model demoting for the first time walks down from the most it could ever
+/// have been given, exactly as the old bucket ladder did.
+pub const NUM_CTX_CEILING: u32 = 32_768;
+
+/// Fallback minimum viable window for [`LlmClient::demote_context`] when the
+/// caller cannot supply the live agent floor.
+///
+/// Derived from the pressure-tier `ContextFloor` the agent measures (system
+/// prompt slice + core-plus-work-evidence tool definitions + step frame +
+/// window-scaled output reserve): observed live 2026-08-03 at ~4.2k tokens,
+/// rounded UP to the next [`NUM_CTX_QUANTUM`]. The old ladder's 4096 terminal
+/// bucket sat BELOW that floor, and landing there produced 38 below-floor
+/// stops and 8 burned resume cycles in 8 minutes — a default any lower than
+/// the measured floor manufactures a window the agent will loudly refuse.
+///
+/// Callers with the run at hand should pass the measured floor instead
+/// (`nanna_agent`'s min-viable-window derivation); this constant only covers
+/// call sites that have no agent state to measure.
+pub const DEFAULT_MIN_VIABLE_NUM_CTX: u32 = 4_608;
+
 /// Conservative model info when the provider has not (yet) told us limits.
 ///
 /// Supports tools optimistically — capability misses are softer than overrunning
@@ -1444,10 +1476,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // mission KV load starts stable at a pinned 8192) but never grow it
         // past what the probe — or the nominal fallback when the card cannot
         // be measured — says this machine supports. And a pin that is still
-        // too large fails once and gets walked down by `demote_context`, the
-        // mechanism that belongs on real GPU faults: demotion below the pin
-        // keeps working because the latch, not the env, is consulted once it
-        // exists.
+        // too large faults under load and gets walked down by
+        // `demote_context` (the caller demotes on the second fault of a run —
+        // one fault at a sane pin is usually a transient blip, healed by a
+        // runner reset alone): demotion below the pin keeps working because
+        // the latch, not the env, is consulted once it exists.
         let sized = Self::fit_context_to_free_vram(&request.model).unwrap_or(16_384);
         let start = match Self::env_num_ctx() {
             Some(pinned) => {
@@ -1522,9 +1555,12 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Self::latched_num_ctx(model)
     }
 
-    /// Drop `model` to the next smaller context bucket after the runner failed
+    /// Drop `model` to the next smaller context rung after the runner failed
     /// in a way that means it ran out of GPU memory. Returns the new size, or
-    /// `None` if it is already at the floor.
+    /// `None` when the latch already sits at (or below) the minimum viable
+    /// window — demoting past the floor manufactures a window the agent will
+    /// loudly refuse, so the fault is surfaced instead of "healed" into an
+    /// unusable size.
     ///
     /// This is the half of the sizing loop that measurement cannot supply.
     /// Sizing happens on the FIRST request, which is structurally the most
@@ -1535,20 +1571,56 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// `num_ctx`, which makes Ollama evict and reload the model, which frees
     /// the memory that justified the change. The only signal that is both late
     /// enough to be honest and unambiguous is the failure itself.
-    pub fn demote_context(model: &str) -> Option<u32> {
-        const BUCKETS: [u32; 4] = [32_768, 16_384, 8_192, 4_096];
+    ///
+    /// The rung is **3/4 of the current latch**, rounded DOWN to
+    /// [`NUM_CTX_QUANTUM`], never below `min_viable_ctx` (rounded UP to the
+    /// same quantum; `None` falls back to [`DEFAULT_MIN_VIABLE_NUM_CTX`]).
+    /// Derivation of the step: the KV cache scales linearly with `num_ctx`,
+    /// so a 25% cut frees ~25% of the KV allocation — comfortably more than
+    /// one retry's worth of KV growth, which is what the step must outpace —
+    /// while halving (the old ladder) overshoots: it assumed faults repeat
+    /// deterministically, but with a sane starting pin a single fault is
+    /// usually a transient load blip, and 8192 → 4096 destroyed a viable
+    /// window by landing below the agent's ~4.2k pressure-tier floor
+    /// (observed live 2026-08-03: 38 below-floor stops, 8 resume cycles,
+    /// run dead in 8 minutes). 3/4 is geometric, so it still reaches any
+    /// floor in bounded rungs — ⌈log₄∕₃(start/floor)⌉, 7 from 32768 to 4608
+    /// — and its 25% cuts can never skip PAST a viable window the way a 50%
+    /// cut can.
+    pub fn demote_context(model: &str, min_viable_ctx: Option<u32>) -> Option<u32> {
+        let clamp = min_viable_ctx
+            .unwrap_or(DEFAULT_MIN_VIABLE_NUM_CTX)
+            .div_ceil(NUM_CTX_QUANTUM)
+            .saturating_mul(NUM_CTX_QUANTUM);
         let key = Self::ctx_latch_key(model);
         let mut guard = Self::ctx_latch().lock().ok()?;
-        let current = guard.get(&key).copied().unwrap_or(BUCKETS[0]);
-        let next = BUCKETS.iter().copied().find(|b| *b < current)?;
+        let current = guard.get(&key).copied().unwrap_or(NUM_CTX_CEILING);
+        if current <= clamp {
+            tracing::warn!(
+                model,
+                current,
+                floor = clamp,
+                "GPU memory failure at the context floor — NOT demoting further; \
+                 a smaller window would be below the minimum viable request, so \
+                 the fault stays loud (below-floor/fault failures are resumable) \
+                 instead of being healed into an unusable window"
+            );
+            return None;
+        }
+        let stepped = (current / 4 * 3) / NUM_CTX_QUANTUM * NUM_CTX_QUANTUM;
+        let clamped = stepped < clamp;
+        let next = if clamped { clamp } else { stepped };
         guard.insert(key, next);
         tracing::warn!(
             model,
             from = current,
             to = next,
-            "GPU memory failure — dropping context a bucket and retrying; \
-             the effective window shrank and downstream budgets re-derive from \
-             it (readable via effective_num_ctx / effective_context_window)"
+            floor = clamp,
+            clamped,
+            "GPU memory failure — demoting context to 3/4 (quantized to 512, \
+             clamped at the minimum viable window) and retrying; the effective \
+             window shrank and downstream budgets re-derive from it (readable \
+             via effective_num_ctx / effective_context_window)"
         );
         Some(next)
     }
@@ -5469,13 +5541,116 @@ mod tests {
         LlmClient::latch_num_ctx(model, 32_768);
         assert_eq!(LlmClient::latched_num_ctx(model), Some(32_768));
 
-        // Demotion steps one bucket at a time...
-        assert_eq!(LlmClient::demote_context(model), Some(16_384));
-        assert_eq!(LlmClient::demote_context(model), Some(8_192));
-        assert_eq!(LlmClient::demote_context(model), Some(4_096));
-        // ...and stops at the floor rather than shrinking to nothing.
-        assert_eq!(LlmClient::demote_context(model), None);
-        assert_eq!(LlmClient::latched_num_ctx(model), Some(4_096));
+        // Demotion steps 3/4 at a time on the 512 quantum — the full default
+        // ladder, documented end to end: geometric (bounded rungs) but never
+        // the 50% cliff that skips past viable windows.
+        for expected in [24_576, 18_432, 13_824, 10_240, 7_680, 5_632] {
+            assert_eq!(LlmClient::demote_context(model, None), Some(expected));
+        }
+        // The last rung clamps AT the default minimum viable window (4608 —
+        // the quantized pressure-tier floor), not below it...
+        assert_eq!(LlmClient::demote_context(model, None), Some(4_608));
+        // ...and once there, a repeat fault does NOT demote further: the
+        // loud fault path stands rather than a manufactured unusable window.
+        assert_eq!(LlmClient::demote_context(model, None), None);
+        assert_eq!(LlmClient::latched_num_ctx(model), Some(4_608));
+    }
+
+    /// The rung arithmetic itself: 3/4 of the current latch, rounded DOWN to
+    /// the 512 quantum, strictly decreasing on every step.
+    #[test]
+    fn demotion_steps_to_three_quarters_on_the_quantum() {
+        let model = "test-three-quarter-step:1b";
+        LlmClient::latch_num_ctx(model, 8_192);
+        // Floor far below: pure stepping is visible. 8192·¾ = 6144 (on the
+        // quantum), 6144·¾ = 4608 (on the quantum), 4608·¾ = 3456 → 3072
+        // (rounded DOWN to the quantum), 3072·¾ = 2304 → 2048.
+        let floor = Some(2_048);
+        assert_eq!(LlmClient::demote_context(model, floor), Some(6_144));
+        assert_eq!(LlmClient::demote_context(model, floor), Some(4_608));
+        assert_eq!(LlmClient::demote_context(model, floor), Some(3_072));
+        assert_eq!(LlmClient::demote_context(model, floor), Some(2_048));
+        assert_eq!(LlmClient::demote_context(model, floor), None);
+        for size in [6_144u32, 4_608, 3_072, 2_048] {
+            assert_eq!(size % NUM_CTX_QUANTUM, 0, "every rung sits on the quantum");
+        }
+    }
+
+    /// The live 2026-08-03 failure, fixed: ONE fault at a pinned 8192 must
+    /// not land below the agent's floor. With the floor supplied, the rung
+    /// that would undershoot clamps TO the floor's quantum instead.
+    #[test]
+    fn demotion_clamps_to_the_floor_quantum_instead_of_skipping_past_it() {
+        let model = "test-floor-clamp:1b";
+        LlmClient::latch_num_ctx(model, 8_192);
+        // An agent floor of 4300 tokens (≈ the live pressure-tier floor)
+        // quantizes UP to 4608. 8192·¾ = 6144 clears it...
+        assert_eq!(LlmClient::demote_context(model, Some(4_300)), Some(6_144));
+        // ...but 6144·¾ = 4608 lands exactly on it, and the next rung
+        // (4608·¾ = 3456) would undershoot — so it clamps and then stops.
+        assert_eq!(LlmClient::demote_context(model, Some(4_300)), Some(4_608));
+        assert_eq!(LlmClient::demote_context(model, Some(4_300)), None);
+        assert_eq!(LlmClient::latched_num_ctx(model), Some(4_608));
+
+        // A rung strictly between two quanta clamps UP, never down: from
+        // 8192 with a 5000-token floor (quantum 5120), ¾ gives 6144, then
+        // 4608 < 5120 → the demotion lands AT 5120.
+        let model2 = "test-floor-clamp-up:1b";
+        LlmClient::latch_num_ctx(model2, 8_192);
+        assert_eq!(LlmClient::demote_context(model2, Some(5_000)), Some(6_144));
+        assert_eq!(LlmClient::demote_context(model2, Some(5_000)), Some(5_120));
+        assert_eq!(LlmClient::demote_context(model2, Some(5_000)), None);
+    }
+
+    /// No demotion may EVER produce a window below the supplied floor — even
+    /// when the latch already sits under it (a floor that grew mid-run, e.g.
+    /// a fatter step frame). The latch is left alone and the fault surfaces.
+    #[test]
+    fn no_demotion_ever_lands_below_the_floor() {
+        let model = "test-never-below-floor:1b";
+        LlmClient::latch_num_ctx(model, 4_096);
+        assert_eq!(
+            LlmClient::demote_context(model, Some(8_192)),
+            None,
+            "a latch already below the floor must not be walked further"
+        );
+        assert_eq!(
+            LlmClient::latched_num_ctx(model),
+            Some(4_096),
+            "refusing to demote must not touch the latch"
+        );
+        // And with no floor supplied, the conservative default holds the line.
+        LlmClient::latch_num_ctx(model, DEFAULT_MIN_VIABLE_NUM_CTX);
+        assert_eq!(LlmClient::demote_context(model, None), None);
+        assert_eq!(
+            LlmClient::latched_num_ctx(model),
+            Some(DEFAULT_MIN_VIABLE_NUM_CTX)
+        );
+    }
+
+    /// Every demotion decision announces itself — old → new, the floor it
+    /// respected, and whether it clamped — and the refusal at the floor is
+    /// just as loud, so an operator can read the ladder off the logs.
+    #[test]
+    fn a_demotion_announces_old_new_floor_and_clamp() {
+        let model = "test-demotion-announces:1b";
+        LlmClient::latch_num_ctx(model, 6_144);
+        let out = capture_info_logs(|| {
+            assert_eq!(LlmClient::demote_context(model, Some(5_000)), Some(5_120));
+        });
+        assert!(out.contains("demoting context"), "the decision: {out}");
+        assert!(out.contains("test-demotion-announces:1b"), "the model: {out}");
+        assert!(out.contains("6144"), "old size: {out}");
+        assert!(out.contains("5120"), "new size AND the floor quantum: {out}");
+        assert!(out.contains("clamped=true"), "clamped-or-not: {out}");
+
+        let refused = capture_info_logs(|| {
+            assert_eq!(LlmClient::demote_context(model, Some(5_000)), None);
+        });
+        assert!(
+            refused.contains("NOT demoting further"),
+            "the refusal at the floor must be announced too: {refused}"
+        );
     }
 
     /// The routed name and the request name are different spellings of one
@@ -5489,10 +5664,10 @@ mod tests {
             "demotion keyed on the routed name must reach the request path"
         );
         assert_eq!(
-            LlmClient::demote_context("ollama/test-prefix-model:1b"),
-            Some(8_192)
+            LlmClient::demote_context("ollama/test-prefix-model:1b", None),
+            Some(12_288)
         );
-        assert_eq!(LlmClient::latched_num_ctx("test-prefix-model:1b"), Some(8_192));
+        assert_eq!(LlmClient::latched_num_ctx("test-prefix-model:1b"), Some(12_288));
     }
 
     /// The demotion must be OBSERVABLE, not just latched: a model that was
@@ -5511,9 +5686,9 @@ mod tests {
         // latch, and a claim SMALLER than the latch is never inflated.
         LlmClient::latch_num_ctx(model, 16_384);
         assert_eq!(effective_context_window(model, 32_000), 16_384);
-        assert_eq!(LlmClient::demote_context(model), Some(8_192));
-        assert_eq!(LlmClient::effective_num_ctx(model), Some(8_192));
-        assert_eq!(effective_context_window(model, 32_000), 8_192);
+        assert_eq!(LlmClient::demote_context(model, None), Some(12_288));
+        assert_eq!(LlmClient::effective_num_ctx(model), Some(12_288));
+        assert_eq!(effective_context_window(model, 32_000), 12_288);
         assert_eq!(
             effective_context_window(model, 4_000),
             4_000,
@@ -5650,12 +5825,12 @@ mod tests {
         assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
 
         assert_eq!(
-            LlmClient::demote_context("test-env-pin-demotes:1b"),
-            Some(4_096)
+            LlmClient::demote_context("test-env-pin-demotes:1b", None),
+            Some(6_144)
         );
         assert_eq!(
             LlmClient::resolve_num_ctx(&request),
-            4_096,
+            6_144,
             "a demotion below the pin must stick — the pin must not re-inflate it"
         );
 

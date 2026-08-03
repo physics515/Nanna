@@ -135,6 +135,7 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         // The eval drives the harness directly, with no chat session to
         // stream into — step output is judged by acceptance checks, not read.
         chat_sink: None,
+        gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     };
     EvalEnv { storage, runner }
 }
