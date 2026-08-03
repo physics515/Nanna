@@ -48,6 +48,88 @@ fn tool_names_for_request(active_tools: &HashSet<String>, restrict: bool) -> Has
     names
 }
 
+/// The work-evidence tools kept in the request under context pressure — the
+/// mission's working set: every unit of real work the harness can credit
+/// flows through reading, writing, editing, or executing.
+///
+/// This is the PRESSURE tier of the two-tier tool system. A run accumulates
+/// discovered tools step over step (activation persists for the run), and at
+/// full window that entire set rides on every request. When a VRAM demotion
+/// shrinks the effective window below the [`ContextFloor`] of that full set,
+/// the request degrades to the core baseline plus THIS set instead of failing
+/// the step outright — and the floor is then measured against the reduced
+/// set, because it is the smallest request the step could actually send.
+///
+/// It is a starting set, never a cage: [`DISCOVERY_TOOL_NAME`] still ships on
+/// every request, so anything dropped is one `discover_tools` call away
+/// (owner directive: never gate tools), and tools the model activates after
+/// the squeeze re-enter the active set through the normal activation path.
+const PRESSURE_TIER_WORK_TOOLS: &[&str] = &["read_file", "write_file", "edit_file", "exec"];
+
+/// The pressure-tier ACTIVE set: the work-evidence tools alone.
+///
+/// The core baseline (discovery-only in restricted mode, the memory quartet
+/// otherwise) is contributed by [`tool_names_for_request`] exactly as for the
+/// full tier — so the pressure tier differs from the full tier only in which
+/// activated tools it carries: the working set instead of everything the run
+/// has discovered so far. Names with no registered definition cost nothing
+/// (the registry simply serves no definition for them).
+fn pressure_tier_active_tools() -> HashSet<String> {
+    PRESSURE_TIER_WORK_TOOLS.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The smallest output reserve (in tokens) a step can do real work in — the
+/// floor of [`window_scaled_output_reserve`].
+///
+/// Derived from the step's minimum useful emission, not chosen. A harness
+/// step's smallest complete unit of output is ONE full tool call plus the
+/// one-line claim naming its evidence:
+/// - **arguments**: the largest routine single-call payload is one file
+///   chunk through `write_file`/`edit_file` —
+///   [`nanna_memory::MEMORY_CHUNK_MAX_CHARS`] (3200 chars), the same bound
+///   the episodic writer chunks results against, at the conservative ~3.2
+///   chars/token code ratio the budget estimators use → 1000 tokens;
+/// - **call framing** (tool name, JSON braces/keys/quoting): the same fixed
+///   50-token per-call overhead [`estimate_tool_definition_tokens`] and the
+///   context estimator charge for a tool block;
+/// - **the claim line**: one sentence naming the work evidence, bounded like
+///   the task anchor it echoes ([`TASK_ANCHOR_MAX_BYTES`] = 200 bytes) →
+///   ~62 tokens at the same ratio.
+const MIN_OUTPUT_RESERVE_TOKENS: usize = (nanna_memory::MEMORY_CHUNK_MAX_CHARS * 10) / 32 // 1000
+    + 50
+    + (TASK_ANCHOR_MAX_BYTES * 10) / 32; // 62 → 1112 total
+
+/// Window-proportional output reserve: `clamp(window/4, derived-min, requested)`.
+///
+/// A fixed half-window reserve is honest at 16k+ (output can genuinely run
+/// long) but starves input under demotion: at an 8192 window it claimed 4096
+/// tokens — half the window — for output a harness step never emits, and that
+/// claim alone pushed the [`ContextFloor`] past the window (observed live
+/// 2026-08-03: floor 9875 > window 8192, 8 burned resume cycles). The reserve
+/// is therefore DERIVED from the live window:
+/// - **window/4**: the same input-protecting proportion
+///   [`nanna_llm::ModelInfo::hard_input_limit`] uses for its static reserve —
+///   output scales down with the window instead of eating a fixed half;
+/// - **floored** at [`MIN_OUTPUT_RESERVE_TOKENS`] — below one complete tool
+///   call the reserve is useless, and if THAT does not fit the floor check
+///   fails the step loudly rather than shipping a mute request;
+/// - **capped** at the caller's `requested_max_tokens` — the reserve never
+///   grows past what the request would actually claim, so large-window /
+///   cloud behavior is unchanged (window/4 ≥ requested there).
+///
+/// Callers feed the result through
+/// [`nanna_llm::ModelInfo::effective_output_budget`], which additionally caps
+/// at the provider's `max_output_tokens` and half the window.
+fn window_scaled_output_reserve(window: usize, requested_max_tokens: usize) -> usize {
+    // lo ≤ hi holds by construction: min(MIN, requested) ≤ requested. A
+    // caller asking for less than the derived minimum gets what it asked for
+    // — the floor protects steps from a starved reserve, not from themselves.
+    (window / 4).clamp(
+        MIN_OUTPUT_RESERVE_TOKENS.min(requested_max_tokens),
+        requested_max_tokens,
+    )
+}
+
 /// Thinking mode for extended reasoning
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkingMode {
@@ -1521,6 +1603,31 @@ pub fn window_shrink_notice(
     )
 }
 
+/// Render the transcript notice injected when the tool set degrades to the
+/// pressure tier: the effective window cannot carry every activated tool
+/// definition above the [`ContextFloor`], so the request keeps only the core
+/// baseline plus [`PRESSURE_TIER_WORK_TOOLS`].
+///
+/// Every degradation must announce itself — WHAT was reduced, WHY, and the
+/// way back (`discover_tools` re-activates anything on demand, so this is a
+/// context trim, never a capability loss). Task-anchored like every injected
+/// steering text (the injected-notice reset bug): opens with the
+/// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+#[must_use]
+pub fn tool_pressure_notice(window: usize, dropped: &[String], task_anchor: Option<&str>) -> String {
+    format!(
+        "{}[TOOL SET REDUCED: the context window ({window} tokens) is too small to carry \
+         every activated tool definition, so this step ships only the core working set \
+         (read_file, write_file, edit_file, exec, plus discovery). Dropped from the \
+         request: {}. This is expected adaptation, NOT a capability loss: call \
+         `discover_tools` the moment you need one of them and it comes right back. All \
+         work so far SUCCEEDED and files on disk are the source of truth.] \
+         {STEERING_CONTINUATION}",
+        anchor_header(task_anchor),
+        dropped.join(", ")
+    )
+}
+
 /// The irreducible parts of a request — what history compression can NEVER
 /// shrink — and therefore the derived minimum context window this run can
 /// operate in. Each term is measured from the live run, not configured:
@@ -1906,9 +2013,16 @@ impl Agent {
         } else {
             0
         };
+        // The output reserve is window-scaled (window/4, floored at the
+        // derived per-step minimum, capped at the configured max_tokens): a
+        // half-window reserve at a demoted 8k window starved input past the
+        // context floor. See `window_scaled_output_reserve`.
         self.context.write().await.configure_for_model_with_output(
             &model_info,
-            self.config.max_tokens as usize + thinking_reserve_tokens,
+            window_scaled_output_reserve(
+                model_info.context_window,
+                self.config.max_tokens as usize,
+            ) + thinking_reserve_tokens,
         );
         // The window the budgets above were derived from. `get_model_info` is
         // already clamped to the LIVE effective runner window (the Ollama
@@ -2079,9 +2193,17 @@ impl Agent {
                     model_info.clone(),
                 );
                 let mut ctx = self.context.write().await;
+                // Same window-scaled reserve derivation as run start — the
+                // PR #156 re-derivation path recomputes it from the LIVE
+                // window, so a demotion shrinks the output reserve
+                // proportionally instead of letting a stale half-window
+                // claim starve the input side.
                 ctx.configure_for_model_with_output(
                     &live_info,
-                    self.config.max_tokens as usize + thinking_reserve_tokens,
+                    window_scaled_output_reserve(
+                        live_info.context_window,
+                        self.config.max_tokens as usize,
+                    ) + thinking_reserve_tokens,
                 );
                 warn!(
                     model = %self.config.model,
@@ -2111,15 +2233,58 @@ impl Agent {
             // cloud models keep their provider-error path) and checked on the
             // first iteration (a fresh step may start already-demoted) and
             // again on every further shrink.
+            let mut tool_pressure_note: Option<String> = None;
             if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
                 && (state.iterations == 1 || window_shrink_note.is_some())
             {
-                let floor = self
-                    .context_floor(
-                        &state.active_tools,
-                        options.restrict_to_active_tools && !options.all_tools_active,
-                    )
-                    .await;
+                let restrict = options.restrict_to_active_tools && !options.all_tools_active;
+                let mut floor = self.context_floor(&state.active_tools, restrict).await;
+                if configured_window < floor.total() {
+                    // Before giving up, try the PRESSURE tier: the floor's
+                    // tool term counts every definition the run has
+                    // accumulated, but the smallest request this step could
+                    // send carries only the core baseline + the work-evidence
+                    // set (everything else stays one discover_tools call
+                    // away). Only a strict improvement engages — when the
+                    // reduced set measures no smaller (e.g. nothing beyond
+                    // the working set was active), the full floor stands.
+                    let pressure_active = pressure_tier_active_tools();
+                    let pressure_floor = self.context_floor(&pressure_active, restrict).await;
+                    if pressure_floor.total() < floor.total() {
+                        if configured_window >= pressure_floor.total() {
+                            let full_names =
+                                tool_names_for_request(&state.active_tools, restrict);
+                            let reduced_names =
+                                tool_names_for_request(&pressure_active, restrict);
+                            let mut dropped: Vec<String> =
+                                full_names.difference(&reduced_names).cloned().collect();
+                            dropped.sort();
+                            warn!(
+                                model = %self.config.model,
+                                effective_window = configured_window,
+                                full_floor = floor.total(),
+                                pressure_floor = pressure_floor.total(),
+                                full_tool_tokens = floor.tool_tokens,
+                                pressure_tool_tokens = pressure_floor.tool_tokens,
+                                dropped = %dropped.join(", "),
+                                "Window cannot fit the full tool catalog above \
+                                 the context floor — degrading to the pressure \
+                                 tier (core + work-evidence tools; the rest \
+                                 stay reachable via discover_tools)"
+                            );
+                            tool_pressure_note = Some(tool_pressure_notice(
+                                configured_window,
+                                &dropped,
+                                state.task_anchor.as_deref(),
+                            ));
+                            state.active_tools = pressure_active;
+                        }
+                        // Either way the honest minimum for the loud-failure
+                        // check below is the PRESSURE-tier floor — the
+                        // smallest request this step could possibly send.
+                        floor = pressure_floor;
+                    }
+                }
                 if configured_window < floor.total() {
                     warn!(
                         model = %self.config.model,
@@ -2281,8 +2446,16 @@ impl Agent {
             // The shrink notice goes in AFTER the ladder ran so compression
             // cannot drop its own announcement: the model must see WHAT
             // happened and WHY, or the suddenly-shorter history reads as
-            // corruption (the restart-spiral failure class).
+            // corruption (the restart-spiral failure class). Same for the
+            // tool-pressure notice — a tool set that silently thins between
+            // turns reads exactly like the deleted-definitions failure class
+            // (observed live: an unbounded workspace injection ate qwen's
+            // tool defs and the run spiraled).
             if let Some(note) = window_shrink_note.take() {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(AnthropicMessage::user_text(&note));
+            }
+            if let Some(note) = tool_pressure_note.take() {
                 let mut ctx = self.context.write().await;
                 ctx.messages.push(AnthropicMessage::user_text(&note));
             }
@@ -4719,8 +4892,14 @@ impl Agent {
             // Same latch-clamped source and same derivation the request
             // builder uses for max_tokens — the floor counts the reserve the
             // next request will genuinely claim, not the provider's claim.
-            let reserve = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "")
-                .effective_output_budget(self.config.max_tokens as usize);
+            // Window-scaled: a demoted window shrinks the reserve with it
+            // (window/4, floored at the derived per-step minimum) instead of
+            // letting a half-window claim dominate the floor.
+            let info = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "");
+            let reserve = info.effective_output_budget(window_scaled_output_reserve(
+                info.context_window,
+                self.config.max_tokens as usize,
+            ));
             (
                 nanna_llm::estimate_tokens(&ctx.effective_system_prompt()),
                 ctx.step_frame_tokens(),
@@ -4807,11 +4986,16 @@ impl Agent {
         // Paired with configure_for_model_with_output at run start: the
         // context's hard input limit reserved this budget (plus the Claude
         // thinking budget), so input + output can't over-commit THIS model's
-        // window. Routed cheaper tiers with smaller windows remain the
-        // pre-existing escalate-on-reject path.
-        let max_tokens = u32::try_from(
-            model_info.effective_output_budget(self.config.max_tokens as usize),
-        )
+        // window. Window-scaled (window/4, floored at the derived per-step
+        // minimum, capped at the configured max_tokens) so the request claims
+        // the same reserve the floor counted. Routed cheaper tiers with
+        // smaller windows remain the pre-existing escalate-on-reject path.
+        let max_tokens = u32::try_from(model_info.effective_output_budget(
+            window_scaled_output_reserve(
+                model_info.context_window,
+                self.config.max_tokens as usize,
+            ),
+        ))
         .unwrap_or(u32::MAX);
 
         AnthropicRequest {
@@ -6439,6 +6623,261 @@ mod repeat_failure_breaker_tests {
         );
     }
 
+    /// Mock tool with a caller-chosen name and description — the knob the
+    /// pressure-tier tests turn to make definitions arbitrarily fat.
+    struct BigDefTool {
+        name: String,
+        description: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BigDefTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: self.description.clone(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::success("ok"))
+        }
+    }
+
+    /// Register six fat discovered tools (the run's accumulated catalog —
+    /// each definition estimates well over 1500 tokens) plus a small
+    /// `write_file` (the work-evidence tool the pressure tier keeps).
+    /// Returns the fat tool names.
+    async fn fat_catalog(tools: &ToolRegistry) -> Vec<String> {
+        let mut fat_names = Vec::new();
+        for i in 0..6 {
+            let name = format!("fat_tool_{i}");
+            tools
+                .register(BigDefTool {
+                    name: name.clone(),
+                    description: "verbose tool documentation ".repeat(250),
+                })
+                .await;
+            fat_names.push(name);
+        }
+        tools
+            .register(BigDefTool {
+                name: "write_file".to_string(),
+                description: "write a file to disk".to_string(),
+            })
+            .await;
+        fat_names
+    }
+
+    /// The output reserve is DERIVED from the live window — window/4, floored
+    /// at the per-step minimum (one complete tool call + the claim line),
+    /// capped at the caller's request — instead of a fixed half-window claim
+    /// that starves input under demotion.
+    #[test]
+    fn output_reserve_scales_with_the_window_and_never_starves_a_step() {
+        // Full windows keep today's behavior: window/4 ≥ requested there, so
+        // the caller's max_tokens stands.
+        assert_eq!(window_scaled_output_reserve(200_000, 8_192), 8_192);
+        assert_eq!(window_scaled_output_reserve(32_768, 8_192), 8_192);
+        // Demoted windows scale proportionally.
+        assert_eq!(window_scaled_output_reserve(16_384, 8_192), 4_096);
+        assert_eq!(window_scaled_output_reserve(8_192, 8_192), 2_048);
+        // ...but never below the derived minimum a step needs to emit one
+        // complete tool call plus its claim line.
+        assert_eq!(
+            window_scaled_output_reserve(4_096, 8_192),
+            MIN_OUTPUT_RESERVE_TOKENS
+        );
+        assert_eq!(
+            window_scaled_output_reserve(2_048, 8_192),
+            MIN_OUTPUT_RESERVE_TOKENS
+        );
+        // ...and never above what the caller asked for.
+        assert_eq!(window_scaled_output_reserve(16_384, 2_000), 2_000);
+        // A caller asking for less than the derived minimum gets what it
+        // asked for — the floor protects against starvation, not intent.
+        assert_eq!(window_scaled_output_reserve(8_192, 512), 512);
+        // The minimum is the documented derivation, term by term: one full
+        // write/edit chunk + fixed call framing + the bounded claim line.
+        assert_eq!(
+            MIN_OUTPUT_RESERVE_TOKENS,
+            (nanna_memory::MEMORY_CHUNK_MAX_CHARS * 10) / 32
+                + 50
+                + (TASK_ANCHOR_MAX_BYTES * 10) / 32
+        );
+        assert!(
+            MIN_OUTPUT_RESERVE_TOKENS <= 4_096 / 2,
+            "the minimum must fit even the smallest demotion bucket's \
+             half-window output cap"
+        );
+    }
+
+    /// The pressure-tier degradation must announce itself — WHAT was dropped,
+    /// WHY, and the way back — task-anchored like every injected steering
+    /// text.
+    #[test]
+    fn the_tool_pressure_notice_announces_what_why_and_the_way_back() {
+        let dropped = vec!["code_search".to_string(), "web_fetch".to_string()];
+        let note = tool_pressure_notice(8_192, &dropped, Some("Build CSV export"));
+        assert!(note.contains("TOOL SET REDUCED"), "{note}");
+        assert!(note.contains("8192 tokens"), "the WHY names the window: {note}");
+        assert!(
+            note.contains("code_search, web_fetch"),
+            "the WHAT lists every dropped tool: {note}"
+        );
+        assert!(note.contains("discover_tools"), "the way back: {note}");
+        assert!(note.contains("NOT a capability loss"), "{note}");
+        assert!(note.contains("SUCCEEDED"), "{note}");
+        // Task-anchored like every injected steering text, and it continues
+        // the run rather than inviting a reset.
+        assert!(note.contains("Build CSV export"), "{note}");
+        assert!(note.contains("Do not greet"), "{note}");
+    }
+
+    /// The live 2026-08-03 failure shape, fixed: at a demoted 8192 window the
+    /// run's accumulated tool catalog (~11k tokens of definitions) pushed the
+    /// floor past the window and every step died. Under pressure the step now
+    /// degrades to the work-evidence tier, ANNOUNCES the reduction in the
+    /// transcript, and proceeds — the floor error must NOT fire.
+    #[tokio::test]
+    async fn a_pressure_tier_step_fits_an_8192_window_where_the_full_catalog_did_not() {
+        let model = "test-pressure-tier-model:9b";
+        // Walk the latch to 8192 exactly as two VRAM demotions would.
+        assert_eq!(nanna_llm::LlmClient::demote_context(model), Some(16_384));
+        assert_eq!(nanna_llm::LlmClient::demote_context(model), Some(8_192));
+
+        let tools = Arc::new(ToolRegistry::new());
+        let fat_names = fat_catalog(&tools).await;
+        // Connection refused instantly — the run must get PAST the floor
+        // check and die at the LLM, proving the step was allowed to proceed.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let config = AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(config, llm, tools);
+        agent.context.write().await.system_prompt = "You are the test agent.".to_string();
+
+        // The harness-step shape: the accumulated catalog pre-activated,
+        // restricted to the active set (tasks.rs try_run_step).
+        let mut initial = fat_names.clone();
+        initial.push("write_file".to_string());
+        let err = agent
+            .run(
+                "do the step",
+                RunOptions {
+                    initial_active_tools: initial,
+                    restrict_to_active_tools: true,
+                    max_iterations: Some(1),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .err()
+            .expect("the LLM at port 9 must refuse the connection");
+        assert!(
+            !matches!(err, AgentError::ContextBelowFloor { .. }),
+            "the pressure tier must fit 8192 — the floor must not fire: {err}"
+        );
+
+        // The degradation announced itself in the transcript...
+        let ctx = agent.context.read().await;
+        let note = ctx
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::Text { text } if text.contains("TOOL SET REDUCED") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("the reduction must announce itself in the transcript");
+        // ...naming every dropped tool, keeping the work-evidence set.
+        let dropped_part = note
+            .split("Dropped from the request: ")
+            .nth(1)
+            .expect("the notice must carry the dropped list");
+        for name in &fat_names {
+            assert!(dropped_part.contains(name), "{name} must be listed: {note}");
+        }
+        assert!(
+            !dropped_part.contains("write_file"),
+            "the work-evidence tool is KEPT, never dropped: {note}"
+        );
+    }
+
+    /// Full-window behavior is unchanged: a model the latch does not govern
+    /// (no demotion ever ran) ships its full activated catalog and injects no
+    /// pressure notice.
+    #[tokio::test]
+    async fn a_full_window_keeps_the_full_catalog_and_stays_silent() {
+        let model = "test-full-window-catalog-model:9b";
+        assert!(
+            nanna_llm::LlmClient::effective_num_ctx(model).is_none(),
+            "this model must be unlatched — the floor path is scoped to \
+             latch-governed models"
+        );
+
+        let tools = Arc::new(ToolRegistry::new());
+        let fat_names = fat_catalog(&tools).await;
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let config = AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(config, llm, tools);
+        agent.context.write().await.system_prompt = "You are the test agent.".to_string();
+
+        let mut initial = fat_names.clone();
+        initial.push("write_file".to_string());
+        let active: HashSet<String> = initial.iter().cloned().collect();
+        let err = agent
+            .run(
+                "do the step",
+                RunOptions {
+                    initial_active_tools: initial,
+                    restrict_to_active_tools: true,
+                    max_iterations: Some(1),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .err()
+            .expect("the LLM at port 9 must refuse the connection");
+        assert!(!matches!(err, AgentError::ContextBelowFloor { .. }), "{err}");
+
+        let ctx = agent.context.read().await;
+        assert!(
+            !ctx.messages.iter().flat_map(|m| &m.content).any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("TOOL SET REDUCED")
+            )),
+            "no pressure notice at full window"
+        );
+        drop(ctx);
+
+        // The request the step builds still carries every fat definition.
+        let request = agent.build_request_with_thinking(None, &active, true).await;
+        let tool_names: Vec<String> = request
+            .tools
+            .unwrap_or_default()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        for name in &fat_names {
+            assert!(
+                tool_names.contains(name),
+                "full window ships the full catalog; missing {name}: {tool_names:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_breaker_notice_announces_itself() {
         let notice = repeat_failure_breaker_notice(None, "explore", 3, "timeout after 30s");
@@ -7536,6 +7975,18 @@ mod anchored_steering_tests {
             (
                 "discovery_pause",
                 discovery_pause_notice(anchor, "discover_tools", 3, &available),
+            ),
+            (
+                "window_shrink",
+                window_shrink_notice(16_384, 8_192, anchor),
+            ),
+            (
+                "tool_pressure",
+                tool_pressure_notice(
+                    8_192,
+                    &["code_search".to_string(), "web_fetch".to_string()],
+                    anchor,
+                ),
             ),
         ]
     }
