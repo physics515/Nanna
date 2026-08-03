@@ -360,14 +360,64 @@ pub fn model_context_window(model: &str) -> usize {
 ///
 /// Used by sync paths that cannot await a provider fetch (e.g. consolidation
 /// sizing). Prefer [`LlmClient::get_model_info`] whenever a client is available.
+///
+/// The result is clamped to the LIVE effective runner window
+/// ([`clamp_model_info_to_effective_window`]): a cached provider claim is a
+/// static fact, but a mid-run `num_ctx` demotion is live state, and budgets
+/// derived from the stale claim overflow every subsequent prompt.
 #[must_use]
 pub fn model_info_from_cache_or_unknown(model: &str, provider: &str) -> ModelInfo {
     if let Some(cache) = ModelInfoCache::default_location() {
         if let Some(info) = cache.get(model) {
-            return info;
+            return clamp_model_info_to_effective_window(model, info);
         }
     }
-    unknown_model_info(model, provider)
+    clamp_model_info_to_effective_window(model, unknown_model_info(model, provider))
+}
+
+/// The context window the local runner will actually honour for `model` right
+/// now: `reported` (provider metadata / cache / config) clamped by the live
+/// Ollama `num_ctx` latch. Models that were never sized by the Ollama path
+/// (cloud providers, unlatched local models) pass `reported` through unchanged.
+///
+/// This is the read side of [`LlmClient::demote_context`]. A mid-run VRAM
+/// demotion rewrites the latch, and every downstream budget (compression
+/// threshold, hard input limit, workspace cap) must be derived from THIS
+/// number, not from the provider's static claim. Observed live 2026-08-02: a
+/// silent 16384→4096 demotion left the agent budgeting for 16k while Ollama
+/// truncated every prompt to 4k model-side — the model lost its task and a
+/// 4-hour eval scored 1/42 against 4/42-per-hour at full context.
+#[must_use]
+pub fn effective_context_window(model: &str, reported: usize) -> usize {
+    match LlmClient::effective_num_ctx(model) {
+        Some(latched) => reported.min(latched as usize),
+        None => reported,
+    }
+}
+
+/// `info` with its window clamped to the live effective runner window for
+/// `model` (see [`effective_context_window`]).
+///
+/// `max_output_tokens` is re-bounded to half the clamped window, mirroring how
+/// the Ollama fetch derives it from the full window — so every budget the
+/// [`ModelInfo`] helpers derive (`hard_input_limit_for`,
+/// `effective_output_budget`, `compression_threshold_for`) stays consistent
+/// with the window the runner will actually honour. No-op when no latch exists
+/// or the latch is at/above the reported window.
+#[must_use]
+pub fn clamp_model_info_to_effective_window(model: &str, mut info: ModelInfo) -> ModelInfo {
+    let effective = effective_context_window(model, info.context_window);
+    if effective < info.context_window {
+        tracing::debug!(
+            model,
+            reported_window = info.context_window,
+            effective_window = effective,
+            "model info clamped to live effective num_ctx (runner was demoted below the provider claim)"
+        );
+        info.context_window = effective;
+        info.max_output_tokens = info.max_output_tokens.min((effective / 2).max(1));
+    }
+    info
 }
 
 /// Conservative model info when the provider has not (yet) told us limits.
@@ -1435,6 +1485,21 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         }
     }
 
+    /// The LIVE effective `num_ctx` for `model`, if the Ollama sizing path has
+    /// latched one. `None` means the model was never sized here (cloud models,
+    /// or a local model before its first request) and the provider-reported
+    /// window stands.
+    ///
+    /// This is deliberately a poll-getter rather than a change notification:
+    /// the latch is process-global state keyed by model name, and the agent
+    /// loop already has a natural per-iteration point to re-read it. Callers
+    /// budgeting prompts MUST treat the value as live — [`Self::demote_context`]
+    /// rewrites it mid-run under VRAM pressure.
+    #[must_use]
+    pub fn effective_num_ctx(model: &str) -> Option<u32> {
+        Self::latched_num_ctx(model)
+    }
+
     /// Drop `model` to the next smaller context bucket after the runner failed
     /// in a way that means it ran out of GPU memory. Returns the new size, or
     /// `None` if it is already at the floor.
@@ -1459,7 +1524,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             model,
             from = current,
             to = next,
-            "GPU memory failure — dropping context a bucket and retrying"
+            "GPU memory failure — dropping context a bucket and retrying; \
+             the effective window shrank and downstream budgets re-derive from \
+             it (readable via effective_num_ctx / effective_context_window)"
         );
         Some(next)
     }
@@ -1878,7 +1945,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // Check cache first
         if let Some(cache) = cache {
             if let Some(info) = cache.get(model) {
-                return info;
+                return clamp_model_info_to_effective_window(model, info);
             }
         }
 
@@ -1891,14 +1958,17 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             }
         };
 
-        // Cache the result
+        // Cache the result — the UNCLAMPED provider claim. The cache stores
+        // static facts about the model; the effective-window clamp below is
+        // live per-process state (the Ollama num_ctx latch) and must never be
+        // persisted as if the model itself shrank.
         if let Some(cache) = cache {
             if let Err(e) = cache.set(&info) {
                 warn!(model = %model, error = %e, "Failed to cache model info");
             }
         }
 
-        info
+        clamp_model_info_to_effective_window(model, info)
     }
 
     /// Force refresh model info from API (bypasses cache).
@@ -5401,6 +5471,67 @@ mod tests {
             Some(8_192)
         );
         assert_eq!(LlmClient::latched_num_ctx("test-prefix-model:1b"), Some(8_192));
+    }
+
+    /// The demotion must be OBSERVABLE, not just latched: a model that was
+    /// never sized passes the provider claim through, and after a demotion
+    /// the effective window is the latch, not the claim. This getter is what
+    /// the agent loop polls to re-derive its budgets mid-run — the 2026-08-02
+    /// failure was exactly this value existing but being unreadable.
+    #[test]
+    fn a_demotion_is_visible_through_the_effective_window() {
+        let model = "test-effective-window-model:9b";
+        // Never sized: the provider claim stands, for local and cloud alike.
+        assert_eq!(LlmClient::effective_num_ctx(model), None);
+        assert_eq!(effective_context_window(model, 32_000), 32_000);
+
+        // Sized at 16384, then demoted: the effective window follows the
+        // latch, and a claim SMALLER than the latch is never inflated.
+        LlmClient::latch_num_ctx(model, 16_384);
+        assert_eq!(effective_context_window(model, 32_000), 16_384);
+        assert_eq!(LlmClient::demote_context(model), Some(8_192));
+        assert_eq!(LlmClient::effective_num_ctx(model), Some(8_192));
+        assert_eq!(effective_context_window(model, 32_000), 8_192);
+        assert_eq!(
+            effective_context_window(model, 4_000),
+            4_000,
+            "the latch is a ceiling, not a floor"
+        );
+    }
+
+    /// Model info served to budget derivation must carry the LIVE window:
+    /// context clamps to the latch and max_output re-bounds to half of it, so
+    /// hard_input_limit_for / effective_output_budget stay consistent with
+    /// what the runner will actually honour.
+    #[test]
+    fn model_info_clamps_to_the_demoted_window() {
+        let model = "test-clamped-info-model:9b";
+        let claim = ModelInfo {
+            id: model.to_string(),
+            context_window: 16_384,
+            max_output_tokens: 8_192,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: current_timestamp(),
+            provider: "ollama".to_string(),
+        };
+
+        // Unlatched: the claim passes through untouched.
+        let untouched = clamp_model_info_to_effective_window(model, claim.clone());
+        assert_eq!(untouched.context_window, 16_384);
+        assert_eq!(untouched.max_output_tokens, 8_192);
+
+        LlmClient::latch_num_ctx(model, 4_096);
+        let clamped = clamp_model_info_to_effective_window(model, claim);
+        assert_eq!(clamped.context_window, 4_096);
+        assert_eq!(
+            clamped.max_output_tokens, 2_048,
+            "output cap mirrors the Ollama half-window derivation"
+        );
+        // The derived budgets never over-commit the demoted window.
+        let reserve = clamped.effective_output_budget(4_096);
+        assert!(clamped.hard_input_limit_for(reserve) + reserve <= 4_096);
     }
 
     /// The regression this guards: the VRAM heuristic used to run FIRST and the

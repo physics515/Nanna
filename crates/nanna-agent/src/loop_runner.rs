@@ -1496,6 +1496,72 @@ pub fn budget_warning_message(cumulative: u64, budget: u64, task_anchor: Option<
     )
 }
 
+/// Render the transcript notice injected after a mid-run window demotion has
+/// been adapted to.
+///
+/// Every truncation/compression artifact must announce itself — WHAT happened,
+/// WHY, and that the work SUCCEEDED with disk as truth. Without this, the
+/// model meets a suddenly-shorter history and reads it as corruption or a
+/// conversation reset (the false-memory-loop failure class). Task-anchored
+/// like every injected steering text.
+#[must_use]
+pub fn window_shrink_notice(
+    old_window: usize,
+    new_window: usize,
+    task_anchor: Option<&str>,
+) -> String {
+    format!(
+        "{}[CONTEXT WINDOW REDUCED mid-run: {old_window} → {new_window} tokens — GPU \
+         memory pressure demoted the local model's context size. Older conversation \
+         history has been compressed or dropped to fit the smaller window. This is \
+         expected adaptation, NOT corruption: all work so far SUCCEEDED and files on \
+         disk are the source of truth — re-read them with your tools if context seems \
+         missing. Keep your responses concise from here on.] {STEERING_CONTINUATION}",
+        anchor_header(task_anchor)
+    )
+}
+
+/// The irreducible parts of a request — what history compression can NEVER
+/// shrink — and therefore the derived minimum context window this run can
+/// operate in. Each term is measured from the live run, not configured:
+/// the effective system prompt (workspace slice already re-capped for the
+/// current window), the active tool definitions, the step frame (the first
+/// user message, which [`AgentContext::truncate_to_limit`] always preserves),
+/// and the output tokens the request must reserve.
+#[derive(Debug, Clone, Copy)]
+struct ContextFloor {
+    system_tokens: usize,
+    tool_tokens: usize,
+    frame_tokens: usize,
+    output_reserve: usize,
+}
+
+impl ContextFloor {
+    /// The minimum viable window: input floor + output reserve. Because the
+    /// output reserve is capped at half the window by
+    /// [`nanna_llm::ModelInfo::effective_output_budget`], `window < total()`
+    /// is exactly "the irreducible input exceeds the hard input limit" — no
+    /// request this loop could send would fit, regardless of compression.
+    fn total(self) -> usize {
+        self.system_tokens + self.tool_tokens + self.frame_tokens + self.output_reserve
+    }
+}
+
+/// Estimate the token cost of a set of tool definitions as they go out on the
+/// wire (name + description + JSON schema, code-family tokenization), plus a
+/// small fixed per-tool framing overhead matching the estimator used for
+/// tool-use blocks in [`AgentContext::estimate_tokens`].
+fn estimate_tool_definition_tokens(defs: &[nanna_tools::ToolDefinition]) -> usize {
+    defs.iter()
+        .map(|d| {
+            nanna_llm::estimate_tokens_for_family(
+                &d.to_anthropic_format().to_string(),
+                nanna_llm::TokenContentFamily::Code,
+            ) + 50
+        })
+        .sum()
+}
+
 /// Detect repetitive text by checking if the same line appears multiple times.
 /// Returns `true` if significant repetition is found.
 fn detect_repetition(text: &str) -> bool {
@@ -1844,6 +1910,12 @@ impl Agent {
             &model_info,
             self.config.max_tokens as usize + thinking_reserve_tokens,
         );
+        // The window the budgets above were derived from. `get_model_info` is
+        // already clamped to the LIVE effective runner window (the Ollama
+        // num_ctx latch), so a step starting AFTER a demotion budgets small
+        // from its first token. The loop below re-reads the latch every
+        // iteration and re-derives when it shrinks mid-run.
+        let mut configured_window = model_info.context_window;
 
         // Mission mode: put the completion contract in the system prompt UP
         // FRONT — the model must know from turn one that it works until
@@ -1987,6 +2059,90 @@ impl Agent {
                 "Agent iteration"
             );
 
+            // Adaptive window rebind: a VRAM-pressure demotion (nanna-llm
+            // demote_context) rewrites the runner's effective num_ctx while
+            // this loop is mid-flight. Budgets derived from the old window
+            // would overflow every subsequent prompt — Ollama truncates
+            // model-side, SILENTLY, and the model loses its own task
+            // (observed 2026-08-02: a silent 16384→4096 demotion turned a
+            // 4-hour eval into 1/42). A smaller window means MORE
+            // compression, announced, with the run continuing: re-derive all
+            // budgets from the live window here, and the tiered compression
+            // ladder directly below shrinks history down to the new
+            // thresholds in this same iteration.
+            let live_window =
+                nanna_llm::effective_context_window(&self.config.model, configured_window);
+            let mut window_shrink_note: Option<String> = None;
+            if live_window != configured_window {
+                let live_info = nanna_llm::clamp_model_info_to_effective_window(
+                    &self.config.model,
+                    model_info.clone(),
+                );
+                let mut ctx = self.context.write().await;
+                ctx.configure_for_model_with_output(
+                    &live_info,
+                    self.config.max_tokens as usize + thinking_reserve_tokens,
+                );
+                warn!(
+                    model = %self.config.model,
+                    old_window = configured_window,
+                    new_window = live_window,
+                    compression_threshold = ctx.compression_threshold,
+                    hard_limit = ctx.hard_limit,
+                    workspace_cap_chars = ctx.workspace_context_cap_chars(),
+                    "Effective context window changed mid-run — budgets re-derived; \
+                     compression ladder will shrink history to fit"
+                );
+                window_shrink_note = Some(window_shrink_notice(
+                    configured_window,
+                    live_window,
+                    state.task_anchor.as_deref(),
+                ));
+                configured_window = live_window;
+            }
+
+            // Floor: below the irreducible prompt, adaptation is impossible.
+            // Compression shrinks history, never the system prompt, tool
+            // definitions, step frame, or output reserve — so when the window
+            // drops under their sum the ONLY honest move is a loud stop (the
+            // step/eval is resumable); anything else is a silently truncated
+            // prompt. Scoped to models the runner latch actually governs (a
+            // latch exists only once the Ollama sizing/demotion path has run;
+            // cloud models keep their provider-error path) and checked on the
+            // first iteration (a fresh step may start already-demoted) and
+            // again on every further shrink.
+            if nanna_llm::LlmClient::effective_num_ctx(&self.config.model).is_some()
+                && (state.iterations == 1 || window_shrink_note.is_some())
+            {
+                let floor = self
+                    .context_floor(
+                        &state.active_tools,
+                        options.restrict_to_active_tools && !options.all_tools_active,
+                    )
+                    .await;
+                if configured_window < floor.total() {
+                    warn!(
+                        model = %self.config.model,
+                        effective_window = configured_window,
+                        floor = floor.total(),
+                        system_tokens = floor.system_tokens,
+                        tool_tokens = floor.tool_tokens,
+                        frame_tokens = floor.frame_tokens,
+                        output_reserve = floor.output_reserve,
+                        "Effective window below the minimum viable window — \
+                         stopping loudly (no compression can fit this step)"
+                    );
+                    return Err(AgentError::ContextBelowFloor {
+                        effective_window: configured_window,
+                        floor: floor.total(),
+                        system_tokens: floor.system_tokens,
+                        tool_tokens: floor.tool_tokens,
+                        frame_tokens: floor.frame_tokens,
+                        output_reserve: floor.output_reserve,
+                    });
+                }
+            }
+
             // Tiered context compression before API call
             {
                 let mut ctx = self.context.write().await;
@@ -2120,6 +2276,15 @@ impl Agent {
                         ctx.truncate_to_limit();
                     }
                 }
+            }
+
+            // The shrink notice goes in AFTER the ladder ran so compression
+            // cannot drop its own announcement: the model must see WHAT
+            // happened and WHY, or the suddenly-shorter history reads as
+            // corruption (the restart-spiral failure class).
+            if let Some(note) = window_shrink_note.take() {
+                let mut ctx = self.context.write().await;
+                ctx.messages.push(AnthropicMessage::user_text(&note));
             }
 
             // Model routing: classify complexity and pick cheapest capable model
@@ -2289,6 +2454,13 @@ impl Agent {
                     cache_creation_tokens: result.cache_creation_tokens,
                     input_tokens: result.input_tokens,
                     output_tokens: result.output_tokens,
+                    // The live latch, not `configured_window`: an escalated or
+                    // routed request may run a different model than the one
+                    // the loop budgets for.
+                    effective_context_window: nanna_llm::LlmClient::effective_num_ctx(
+                        &actual_model,
+                    )
+                    .map(|n| n as usize),
                 });
 
             if let Some(ref tracker) = self.stats {
@@ -4529,6 +4701,42 @@ impl Agent {
         ctx.messages.push(AnthropicMessage::user(tool_results));
     }
 
+    /// Measure the run's [`ContextFloor`] — the irreducible request parts that
+    /// no history compression can shrink. Every term is derived from live
+    /// state, not configured: the effective system prompt is read AFTER the
+    /// budgets were rebound, so its workspace slice is already re-capped for
+    /// the current (possibly demoted) window; the tool definitions are the
+    /// ones the next request will actually carry; the step frame is the first
+    /// user message (preserved by every truncation path); and the output
+    /// reserve is what the request builder will actually claim.
+    async fn context_floor(
+        &self,
+        active_tools: &HashSet<String>,
+        restrict_to_active: bool,
+    ) -> ContextFloor {
+        let (system_tokens, frame_tokens, output_reserve) = {
+            let ctx = self.context.read().await;
+            // Same latch-clamped source and same derivation the request
+            // builder uses for max_tokens — the floor counts the reserve the
+            // next request will genuinely claim, not the provider's claim.
+            let reserve = nanna_llm::model_info_from_cache_or_unknown(&self.config.model, "")
+                .effective_output_budget(self.config.max_tokens as usize);
+            (
+                nanna_llm::estimate_tokens(&ctx.effective_system_prompt()),
+                ctx.step_frame_tokens(),
+                reserve,
+            )
+        };
+        let names = tool_names_for_request(active_tools, restrict_to_active);
+        let defs = self.tools.definitions_for_names(&names).await;
+        ContextFloor {
+            system_tokens,
+            tool_tokens: estimate_tool_definition_tokens(&defs),
+            frame_tokens,
+            output_reserve,
+        }
+    }
+
     async fn build_request_with_thinking(
         &self,
         thinking_override: Option<ThinkingMode>,
@@ -6069,6 +6277,165 @@ mod repeat_failure_breaker_tests {
             repeat_call_key("explore", &serde_json::json!({"path": "a"})),
             repeat_call_key("explore", &serde_json::json!({"path": "b"})),
             "different arguments are different keys"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Adaptive context on mid-run window demotion
+    // -----------------------------------------------------------------
+
+    /// The transcript notice injected after a demotion is adapted to must
+    /// carry WHAT happened, WHY, and that the work SUCCEEDED with disk as
+    /// truth — an unannounced shrink reads as corruption and spirals small
+    /// models into restarts.
+    #[test]
+    fn the_window_shrink_notice_announces_what_why_and_disk_truth() {
+        let note = window_shrink_notice(16_384, 4_096, Some("Build CSV export"));
+        assert!(note.contains("16384 → 4096"), "old→new numbers: {note}");
+        assert!(note.contains("GPU memory pressure"), "the WHY: {note}");
+        assert!(note.contains("compressed or dropped"), "the WHAT: {note}");
+        assert!(note.contains("NOT corruption"));
+        assert!(note.contains("SUCCEEDED"));
+        assert!(note.contains("disk are the source of truth"));
+        // Task-anchored like every injected steering text, and it continues
+        // the run rather than inviting a reset.
+        assert!(note.contains("Build CSV export"));
+        assert!(note.contains("Do not greet"));
+    }
+
+    /// Below the derived floor the step fails LOUDLY, with a stop reason that
+    /// names every irreducible term — never a silently truncated prompt. This
+    /// drives the real `run()` loop: the latch (the mock window source) is
+    /// walked to its 4096 floor exactly as VRAM pressure would, the system
+    /// prompt alone outweighs the window, and the loop must return the typed
+    /// error before any LLM call is attempted.
+    #[tokio::test]
+    async fn a_below_floor_demotion_fails_the_step_loudly() {
+        let model = "test-below-floor-model:9b";
+        while nanna_llm::LlmClient::demote_context(model).is_some() {}
+        assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(4_096));
+
+        let tools = Arc::new(ToolRegistry::new());
+        // Never contacted: the floor check fires before the first request.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let config = AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(config, llm, tools);
+        {
+            // An irreducible prompt no compression can shrink: the system
+            // prompt alone estimates far past the demoted 4096 window.
+            let mut ctx = agent.context.write().await;
+            ctx.system_prompt = "system directive ".repeat(4_000);
+        }
+
+        let err = agent
+            .run("do the thing", RunOptions::default())
+            .await
+            .err()
+            .expect("a below-floor window must fail the step, not run truncated");
+
+        // Loud: the stop reason names the numbers and the way back.
+        let msg = err.to_string();
+        assert!(msg.contains("minimum viable"), "{msg}");
+        assert!(msg.contains("4096"), "{msg}");
+        assert!(msg.contains("resume"), "{msg}");
+        let AgentError::ContextBelowFloor {
+            effective_window,
+            floor,
+            system_tokens,
+            output_reserve,
+            ..
+        } = err
+        else {
+            panic!("expected ContextBelowFloor, got: {err}");
+        };
+        assert_eq!(effective_window, 4_096);
+        assert!(floor > effective_window);
+        assert!(system_tokens > 4_096, "the system prompt is what broke the floor");
+        assert!(
+            output_reserve <= 4_096 / 2,
+            "the reserve is derived from the live window, never more than half"
+        );
+    }
+
+    /// After a demotion to 4096, a step prompt assembled by the REAL request
+    /// builder fits the new window: input estimate under the re-derived hard
+    /// limit, and the request's max_tokens claims only the remainder. The
+    /// budgets come from `model_info_from_cache_or_unknown`, which is clamped
+    /// by the live latch — the same source a fresh harness step reads.
+    #[tokio::test]
+    async fn a_step_prompt_assembled_after_demotion_fits_the_new_window() {
+        let model = "test-post-demotion-fit-model:9b";
+        while nanna_llm::LlmClient::demote_context(model).is_some() {}
+
+        let tools = Arc::new(ToolRegistry::new());
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let config = AgentConfig {
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(config, llm, tools);
+        {
+            let mut ctx = agent.context.write().await;
+            ctx.system_prompt = "You are the test agent.".to_string();
+            ctx.messages.push(AnthropicMessage::user_text("the step frame"));
+            for i in 0..40 {
+                ctx.messages.push(AnthropicMessage::assistant_text(format!(
+                    "turn {i}: {}",
+                    "x".repeat(800)
+                )));
+            }
+
+            // The fresh-step path: budgets configured from the latch-clamped
+            // info, then the no-LLM ladder tail brings history under them.
+            let live_info = nanna_llm::model_info_from_cache_or_unknown(model, "");
+            assert_eq!(
+                live_info.context_window, 4_096,
+                "model info must serve the demoted window, not the provider claim"
+            );
+            ctx.configure_for_model_with_output(&live_info, agent.config.max_tokens as usize);
+            assert!(ctx.exceeds_hard_limit(), "the 16k-era transcript must overflow");
+            ctx.drop_oldest(8);
+            ctx.truncate_to_limit();
+        }
+
+        let request = agent
+            .build_request_with_thinking(None, &HashSet::new(), false)
+            .await;
+        let ctx = agent.context.read().await;
+        assert!(
+            ctx.estimate_request_tokens() <= ctx.hard_limit,
+            "assembled input {} must fit the re-derived hard limit {}",
+            ctx.estimate_request_tokens(),
+            ctx.hard_limit
+        );
+        assert!(
+            request.max_tokens as usize + ctx.hard_limit <= 4_096,
+            "input budget + output claim ({} + {}) must never over-commit the demoted window",
+            ctx.hard_limit,
+            request.max_tokens
+        );
+        // The step frame survived the ladder into the actual request, and the
+        // compression announces itself ahead of it (the dropped history rides
+        // in as a framed <previous_context> summary, never a silent gap).
+        let texts: Vec<&str> = request
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("COMPRESSED SUMMARY")),
+            "dropped history must announce itself in the request"
+        );
+        assert!(
+            texts.iter().any(|t| *t == "the step frame"),
+            "the pinned step frame must survive into the request"
         );
     }
 

@@ -33,6 +33,24 @@ fn chunk_and_hash(content: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Estimate one message's token cost — the per-block heuristic shared by
+/// [`AgentContext::estimate_tokens`] (whole transcript) and
+/// [`AgentContext::step_frame_tokens`] (the irreducible first message).
+fn estimate_message_tokens(msg: &AnthropicMessage) -> usize {
+    msg.content
+        .iter()
+        .map(|c| match c {
+            ContentBlock::Text { text } => estimate_tokens(text),
+            ContentBlock::ToolUse { input, .. } => {
+                estimate_tokens_for_family(&input.to_string(), TokenContentFamily::Code) + 50
+            }
+            ContentBlock::ToolResult { content, .. } => estimate_tokens(content) + 20,
+            ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
+            ContentBlock::Thinking { thinking, .. } => estimate_tokens(thinking),
+        })
+        .sum()
+}
+
 /// Whether a model-produced summary is plausible enough to stand in for the
 /// original content. Small models sometimes return degenerate output — empty
 /// text, "...", or a bare title — which, if accepted, silently REPLACES real
@@ -725,29 +743,18 @@ impl AgentContext {
         // Family-aware heuristic from nanna-llm (ASCII English/code + CJK density).
         let system_tokens = estimate_tokens(&self.system_prompt);
         let summary_tokens: usize = self.summaries.iter().map(|s| estimate_tokens(&s.summary)).sum();
-        let message_tokens: usize = self
-            .messages
-            .iter()
-            .map(|m| {
-                m.content
-                    .iter()
-                    .map(|c| match c {
-                        ContentBlock::Text { text } => estimate_tokens(text),
-                        ContentBlock::ToolUse { input, .. } => {
-                            estimate_tokens_for_family(
-                                &input.to_string(),
-                                TokenContentFamily::Code,
-                            ) + 50
-                        }
-                        ContentBlock::ToolResult { content, .. } => estimate_tokens(content) + 20,
-                        ContentBlock::Image { .. } => 1000, // Images are ~1k tokens
-                        ContentBlock::Thinking { thinking, .. } => estimate_tokens(thinking),
-                    })
-                    .sum::<usize>()
-            })
-            .sum();
+        let message_tokens: usize = self.messages.iter().map(estimate_message_tokens).sum();
 
         system_tokens + summary_tokens + message_tokens
+    }
+
+    /// Estimated tokens of the step frame: the FIRST user message (the
+    /// original request / harness step prompt). [`Self::truncate_to_limit`]
+    /// always preserves it, so it is an irreducible part of every request this
+    /// context will ever produce — the context-floor derivation counts it.
+    #[must_use]
+    pub fn step_frame_tokens(&self) -> usize {
+        self.messages.first().map_or(0, estimate_message_tokens)
     }
 
     /// Check if compression is needed based on token count
@@ -1721,5 +1728,83 @@ mod tests {
         // A degenerate budget can never claim more than half the window.
         ctx.configure_for_model_with_output(&info, 30_000);
         assert_eq!(ctx.hard_limit, 16_000);
+    }
+
+    /// The 2026-08-02 failure, replayed at the context level: a mid-run
+    /// num_ctx demotion (16384 → 4096) must rebind EVERY window-derived
+    /// budget — compression threshold, hard limit, workspace cap — and the
+    /// existing no-LLM ladder must then shrink a transcript budgeted for the
+    /// old window down to the new one. The mock window source is the real
+    /// nanna-llm latch, driven by demote_context on a test-unique model.
+    #[test]
+    fn a_mid_run_demotion_rebinds_budgets_and_the_ladder_fits_the_new_window() {
+        let model = "test-ctx-demotion-model:9b";
+        let claim = ModelInfo {
+            id: model.into(),
+            context_window: 16_384,
+            max_output_tokens: 8_192,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "ollama".into(),
+        };
+
+        // Budgeted for the full window, with a transcript sized to fit it.
+        let mut ctx = AgentContext::new("s");
+        ctx.configure_for_model_with_output(&claim, 2_048);
+        let (old_threshold, old_hard, old_cap) = (
+            ctx.compression_threshold,
+            ctx.hard_limit,
+            ctx.workspace_context_cap_chars(),
+        );
+        ctx.messages.push(AnthropicMessage::user_text("the step frame"));
+        for i in 0..40 {
+            ctx.messages
+                .push(AnthropicMessage::assistant_text(format!("turn {i}: {}", "x".repeat(800))));
+        }
+        assert!(
+            !ctx.exceeds_hard_limit(),
+            "the transcript must fit the ORIGINAL window for the replay to mean anything"
+        );
+
+        // The demotion, exactly as VRAM pressure produces it: demote_context
+        // walks the latch down bucket by bucket, and the effective window
+        // follows. (An unlatched model starts from the top bucket.)
+        assert_eq!(LlmClient::demote_context(model), Some(16_384));
+        assert_eq!(LlmClient::demote_context(model), Some(8_192));
+        assert_eq!(LlmClient::demote_context(model), Some(4_096));
+        let live = nanna_llm::effective_context_window(model, claim.context_window);
+        assert_eq!(live, 4_096, "the latch is the live window source");
+
+        // The rebind the agent loop performs: every budget re-derives.
+        let live_info = nanna_llm::clamp_model_info_to_effective_window(model, claim);
+        ctx.configure_for_model_with_output(&live_info, 2_048);
+        assert!(ctx.hard_limit < old_hard, "hard limit must shrink with the window");
+        assert!(ctx.compression_threshold < old_threshold);
+        assert!(ctx.compression_threshold <= ctx.hard_limit);
+        assert!(
+            ctx.workspace_context_cap_chars() < old_cap,
+            "the workspace cap re-derives from the live hard limit"
+        );
+        assert!(ctx.hard_limit + 2_048 <= 4_096, "input + output never over-commit");
+
+        // A transcript budgeted for 16k now overflows 4k — and the existing
+        // ladder (drop_oldest → truncate_to_limit, the no-LLM tail every
+        // tier falls back to) brings it under the NEW hard limit.
+        assert!(ctx.exceeds_hard_limit(), "the old transcript must overflow the demoted window");
+        ctx.drop_oldest(8);
+        ctx.truncate_to_limit();
+        assert!(
+            !ctx.exceeds_hard_limit(),
+            "after the ladder the request fits the demoted window (est {} <= hard {})",
+            ctx.estimate_request_tokens(),
+            ctx.hard_limit
+        );
+        // The step frame survives every truncation path.
+        assert!(matches!(
+            &ctx.messages.first().expect("frame kept").content[0],
+            ContentBlock::Text { text } if text == "the step frame"
+        ));
     }
 }
