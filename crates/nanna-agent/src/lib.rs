@@ -43,7 +43,7 @@ pub use loop_runner::{
     MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RunOptions,
     STEERING_CONTINUATION, StepKind, StreamCallback, TASK_ANCHOR_MAX_BYTES, TaskComplexity,
     ThinkingCallback, ThinkingMode, ToolCallRecord,
-    budget_warning_message, claim_nudge_message, narration_nudge_message,
+    budget_warning_message, claim_nudge_message, min_viable_num_ctx, narration_nudge_message,
     repetition_nudge_message, thinking_spiral_nudge_message, tool_loop_nudge_message,
     wrapup_nudge_due, wrapup_nudge_message,
 };

@@ -1669,6 +1669,85 @@ fn estimate_tool_definition_tokens(defs: &[nanna_tools::ToolDefinition]) -> usiz
         .sum()
 }
 
+/// The smallest `num_ctx` a harness step shaped like THIS run can still
+/// viably execute in — the PRESSURE-tier [`ContextFloor`] solved for the
+/// window it is measured against.
+///
+/// Two of the floor's terms scale WITH the window (the workspace-context cap
+/// follows the hard input limit, and the output reserve is window/4 above its
+/// derived minimum), so "floor fits window" is a fixed-point condition, not a
+/// constant. Both terms are non-decreasing in the window, so the smallest
+/// fixed point is found by walking candidate windows upward one
+/// [`nanna_llm::NUM_CTX_QUANTUM`] at a time — bounded by
+/// [`nanna_llm::NUM_CTX_CEILING`]/quantum iterations of pure token
+/// estimation, no I/O.
+///
+/// This is the clamp a VRAM demotion must respect:
+/// [`nanna_llm::LlmClient::demote_context`] takes it as `min_viable_ctx`, so
+/// a GPU fault can never be "healed" into a window the floor check would
+/// immediately refuse (observed live 2026-08-03: 8192 halved to 4096 under a
+/// ~4.2k pressure-tier floor — 38 below-floor stops, 8 burned resume cycles,
+/// run dead in 8 minutes). Callers with no run state at hand fall back to
+/// [`nanna_llm::DEFAULT_MIN_VIABLE_NUM_CTX`] instead.
+pub async fn min_viable_num_ctx(
+    tools: &ToolRegistry,
+    system_prompt: &str,
+    workspace_context: Option<&str>,
+    workspace_root: Option<&std::path::Path>,
+    step_prompt: &str,
+    requested_max_tokens: usize,
+) -> u32 {
+    // The tool term is the PRESSURE tier — the smallest request a step could
+    // send (core baseline + work-evidence set) — and does not vary with the
+    // candidate window.
+    let names = tool_names_for_request(&pressure_tier_active_tools(), true);
+    let defs = tools.definitions_for_names(&names).await;
+    let tool_tokens = estimate_tool_definition_tokens(&defs);
+
+    // A probe context carrying exactly what the daemon step runner hands a
+    // fresh step: the base system prompt, the workspace slice (whose cap the
+    // scan re-derives per candidate window), and the step prompt as the
+    // irreducible first message.
+    let mut probe = AgentContext::new("min-viable-window-probe".to_string())
+        .with_system_prompt(system_prompt);
+    probe.workspace_root = workspace_root.map(std::path::Path::to_path_buf);
+    probe.workspace_context = workspace_context
+        .map(str::to_string)
+        .filter(|w| !w.is_empty());
+    probe.messages.push(AnthropicMessage::user_text(step_prompt));
+    let frame_tokens = probe.step_frame_tokens();
+
+    let quantum = nanna_llm::NUM_CTX_QUANTUM as usize;
+    // Below 2048 nothing is a window: the operator env pin refuses smaller
+    // values outright, and the derived per-step output reserve alone
+    // ([`MIN_OUTPUT_RESERVE_TOKENS`]) claims over half of anything smaller.
+    let mut candidate = 2_048_usize;
+    while candidate <= nanna_llm::NUM_CTX_CEILING as usize {
+        // Mirror the mid-run rebind exactly: max_output re-bounds to half the
+        // candidate window (`clamp_model_info_to_effective_window`), the
+        // reserve is the window-scaled claim the request builder derives, and
+        // the workspace cap follows the resulting hard input limit.
+        let reserve = window_scaled_output_reserve(candidate, requested_max_tokens)
+            .min((candidate / 2).max(1));
+        probe.hard_limit = candidate.saturating_sub(reserve).max(candidate / 2);
+        let floor = ContextFloor {
+            system_tokens: nanna_llm::estimate_tokens(&probe.effective_system_prompt()),
+            tool_tokens,
+            frame_tokens,
+            output_reserve: reserve,
+        };
+        if floor.total() <= candidate {
+            return u32::try_from(candidate).unwrap_or(nanna_llm::NUM_CTX_CEILING);
+        }
+        candidate += quantum;
+    }
+    // Even the ceiling cannot fit the irreducible parts. Return it: the
+    // demotion path then refuses every rung and the existing loud
+    // below-floor failure surfaces — the honest outcome, never a silently
+    // truncated prompt.
+    nanna_llm::NUM_CTX_CEILING
+}
+
 /// Detect repetitive text by checking if the same line appears multiple times.
 /// Returns `true` if significant repetition is found.
 fn detect_repetition(text: &str) -> bool {
@@ -6496,7 +6575,9 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_below_floor_demotion_fails_the_step_loudly() {
         let model = "test-below-floor-model:9b";
-        while nanna_llm::LlmClient::demote_context(model).is_some() {}
+        // Walk the latch to a 4096 floor exactly as VRAM pressure with that
+        // caller-supplied clamp would.
+        while nanna_llm::LlmClient::demote_context(model, Some(4_096)).is_some() {}
         assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(4_096));
 
         let tools = Arc::new(ToolRegistry::new());
@@ -6552,7 +6633,7 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_step_prompt_assembled_after_demotion_fits_the_new_window() {
         let model = "test-post-demotion-fit-model:9b";
-        while nanna_llm::LlmClient::demote_context(model).is_some() {}
+        while nanna_llm::LlmClient::demote_context(model, Some(4_096)).is_some() {}
 
         let tools = Arc::new(ToolRegistry::new());
         let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
@@ -6717,6 +6798,70 @@ mod repeat_failure_breaker_tests {
         );
     }
 
+    /// The min-viable-window derivation ([`min_viable_num_ctx`]): the value a
+    /// VRAM demotion is clamped to. It must sit on the demotion quantum, never
+    /// fall below the smallest window the machinery accepts, and grow with
+    /// every irreducible term — because a clamp SMALLER than the real floor
+    /// re-creates the 2026-08-03 failure (demotion lands in a window the
+    /// floor check refuses, 38 below-floor stops in 8 minutes).
+    #[tokio::test]
+    async fn the_min_viable_window_sits_on_the_quantum_and_tracks_the_prompt() {
+        let tools = ToolRegistry::new();
+
+        // A tiny irreducible prompt: the derived per-step output reserve
+        // dominates, and the smallest acceptable window (2048 — the operator
+        // pin's own lower bound) already fits it.
+        let small = min_viable_num_ctx(
+            &tools,
+            "You are the test agent.",
+            None,
+            None,
+            "do the thing",
+            8_192,
+        )
+        .await;
+        assert_eq!(small, 2_048, "a tiny prompt needs only the smallest window");
+
+        // A fat system prompt pushes the floor up: the window must cover the
+        // prompt AND the window-scaled reserve (W/4), so it lands well above
+        // the old halving ladder's 8192 → 4096 cliff.
+        let fat_prompt = "system directive ".repeat(2_000); // ~34k chars
+        let fat = min_viable_num_ctx(&tools, &fat_prompt, None, None, "do the thing", 8_192).await;
+        assert_eq!(fat % nanna_llm::NUM_CTX_QUANTUM, 0, "every answer sits on the quantum");
+        assert!(
+            fat > 8_192,
+            "an ~8.5k-token irreducible prompt plus its W/4 reserve cannot fit \
+             even the pinned 8192 start — the clamp must sit ABOVE the window \
+             the old halving ladder would have manufactured, got {fat}"
+        );
+
+        // The workspace slice counts too — but only up to its CAP (the slice
+        // is bounded by the window-derived workspace cap, which is the
+        // fixed-point the scan solves), so a huge workspace raises the floor
+        // by its capped slice, never its full 112k chars.
+        let base = "x".repeat(3_200); // ~800 tokens of base system prompt
+        let no_ws = min_viable_num_ctx(&tools, &base, None, None, "do the thing", 8_192).await;
+        let with_ws = min_viable_num_ctx(
+            &tools,
+            &base,
+            Some(&"workspace reference material\n".repeat(4_000)),
+            None,
+            "do the thing",
+            8_192,
+        )
+        .await;
+        assert!(
+            with_ws > no_ws,
+            "the capped workspace slice is an irreducible term and must raise \
+             the floor ({with_ws} vs {no_ws})"
+        );
+        assert!(
+            with_ws <= nanna_llm::NUM_CTX_CEILING,
+            "the scan is bounded by the ladder ceiling even for a 112k-char \
+             workspace, because the slice cap scales with the candidate window"
+        );
+    }
+
     /// The pressure-tier degradation must announce itself — WHAT was dropped,
     /// WHY, and the way back — task-anchored like every injected steering
     /// text.
@@ -6747,9 +6892,10 @@ mod repeat_failure_breaker_tests {
     #[tokio::test]
     async fn a_pressure_tier_step_fits_an_8192_window_where_the_full_catalog_did_not() {
         let model = "test-pressure-tier-model:9b";
-        // Walk the latch to 8192 exactly as two VRAM demotions would.
-        assert_eq!(nanna_llm::LlmClient::demote_context(model), Some(16_384));
-        assert_eq!(nanna_llm::LlmClient::demote_context(model), Some(8_192));
+        // Walk the latch to 8192 exactly as repeated VRAM demotions clamped
+        // at an 8192 floor would land it.
+        while nanna_llm::LlmClient::demote_context(model, Some(8_192)).is_some() {}
+        assert_eq!(nanna_llm::LlmClient::effective_num_ctx(model), Some(8_192));
 
         let tools = Arc::new(ToolRegistry::new());
         let fat_names = fat_catalog(&tools).await;

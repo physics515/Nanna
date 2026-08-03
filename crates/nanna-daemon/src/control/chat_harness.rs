@@ -217,6 +217,7 @@ impl ControlPlane {
             // Tool results go to memory, a stub goes to context.
             memory: self.memory.clone(),
             workspace_id: active_workspace_id,
+            gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         // The planner shares the step runner's provider handling but must not
         // stream its JSON into the transcript — planning is not work to show.
@@ -235,6 +236,9 @@ impl ControlPlane {
             // Planning calls no tools, so it has nothing to remember.
             memory: None,
             workspace_id: None,
+            // One run, one fault tally: a GPU fault seen while planning and
+            // one seen while stepping are the same repeat evidence.
+            gpu_fault_count: step_runner.gpu_fault_count.clone(),
         };
         let planner = Arc::new(AgentPlanner::new(Arc::new(planner_runner)));
 

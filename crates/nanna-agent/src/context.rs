@@ -1769,11 +1769,10 @@ mod tests {
         );
 
         // The demotion, exactly as VRAM pressure produces it: demote_context
-        // walks the latch down bucket by bucket, and the effective window
-        // follows. (An unlatched model starts from the top bucket.)
-        assert_eq!(LlmClient::demote_context(model), Some(16_384));
-        assert_eq!(LlmClient::demote_context(model), Some(8_192));
-        assert_eq!(LlmClient::demote_context(model), Some(4_096));
+        // walks the latch down rung by rung (3/4 on the 512 quantum, clamped
+        // at the caller's floor), and the effective window follows. (An
+        // unlatched model starts from the ladder ceiling.)
+        while LlmClient::demote_context(model, Some(4_096)).is_some() {}
         let live = nanna_llm::effective_context_window(model, claim.context_window);
         assert_eq!(live, 4_096, "the latch is the live window source");
 
