@@ -94,6 +94,12 @@ pub enum AgentError {
     /// and continuing would only produce silently-truncated prompts. The run
     /// stops LOUDLY instead; the step/eval is resumable once the window is
     /// restored (free GPU memory or restart the runner).
+    ///
+    /// Every term is already at its minimum when this fires: the tool term
+    /// counts the PRESSURE-tier definitions (core baseline + the
+    /// work-evidence set — the loop degrades to that tier and announces it
+    /// before ever failing), and the output reserve is window-scaled with a
+    /// derived per-step floor, not a fixed half-window claim.
     #[error(
         "effective context window ({effective_window} tokens) is below the minimum viable \
          window ({floor} tokens = system prompt {system_tokens} + tool definitions \
@@ -110,7 +116,9 @@ pub enum AgentError {
         /// Estimated tokens of the effective system prompt (workspace slice
         /// already re-capped for the shrunken window).
         system_tokens: usize,
-        /// Estimated tokens of the active tool definitions.
+        /// Estimated tokens of the smallest tool set the step could ship —
+        /// the pressure tier (core baseline + work-evidence tools), which
+        /// the loop already degraded to before failing.
         tool_tokens: usize,
         /// Estimated tokens of the step frame (the first user message, which
         /// truncation always preserves).

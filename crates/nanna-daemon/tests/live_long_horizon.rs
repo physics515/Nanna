@@ -840,6 +840,75 @@ async fn restart_ollama_server() -> bool {
     healed
 }
 
+/// Stop resuming after this many CONSECUTIVE segments died with the
+/// byte-identical runner error.
+///
+/// Derivation: one repeat distinguishes nothing (a transient can strike
+/// twice); by the third identical text the failure has survived a heal + an
+/// escalated pause, which is the definition of deterministic here — more
+/// resumes only replay it (observed live 2026-08-03: 8 identical
+/// below-floor failures, 20s apart, burned the whole resume budget in
+/// 23 minutes).
+const IDENTICAL_FAILURE_STOP_AFTER: usize = 3;
+
+/// Consecutive identical-failure accounting for the endurance resume loop:
+/// tracks the last failure text and how many segments in a row ended with
+/// exactly it. Byte-equality is the right bar — a deterministic failure
+/// (e.g. `AgentError::ContextBelowFloor`, whose message carries the same
+/// derived numbers every time) reproduces its text exactly, while genuine
+/// provider weather (timeouts, changing HTTP bodies) varies.
+#[derive(Default)]
+struct IdenticalFailureStreak {
+    last: Option<String>,
+    count: usize,
+}
+
+impl IdenticalFailureStreak {
+    /// Record a failed segment's error text; returns the current streak.
+    fn observe(&mut self, message: &str) -> usize {
+        if self.last.as_deref() == Some(message) {
+            self.count += 1;
+        } else {
+            self.last = Some(message.to_string());
+            self.count = 1;
+        }
+        self.count
+    }
+
+    /// A non-failure segment breaks any streak; returns 0.
+    fn reset(&mut self) -> usize {
+        self.last = None;
+        self.count = 0;
+        0
+    }
+}
+
+/// Not `#[ignore]`d: the breaker's accounting must hold without an Ollama.
+#[test]
+fn identical_failure_streak_counts_only_consecutive_identical_errors() {
+    let mut streak = IdenticalFailureStreak::default();
+    let below_floor = "step error: effective context window (8192 tokens) is below the \
+                       minimum viable window (9875 tokens = ...)";
+    assert_eq!(streak.observe(below_floor), 1);
+    assert_eq!(streak.observe(below_floor), 2);
+    assert_eq!(
+        streak.observe(below_floor),
+        3,
+        "the third identical failure reaches the stop bound"
+    );
+    assert!(3 >= IDENTICAL_FAILURE_STOP_AFTER);
+
+    // A DIFFERENT error is new weather: the streak restarts at 1...
+    assert_eq!(streak.observe("step error: 502 stream ended without done"), 1);
+    // ...and flapping between two errors never accumulates either.
+    assert_eq!(streak.observe(below_floor), 1);
+    assert_eq!(streak.observe(below_floor), 2);
+
+    // A successful segment clears everything.
+    assert_eq!(streak.reset(), 0);
+    assert_eq!(streak.observe(below_floor), 1, "after a success the count restarts");
+}
+
 /// The endurance run: 42 dependency-chained fail-to-pass features. Progress
 /// prints every 2 minutes so a multi-hour run is observable from the log.
 #[tokio::test(flavor = "multi_thread")]
@@ -934,6 +1003,7 @@ async fn live_endurance() {
     const ENDURANCE_RESUMES_MAX: usize = 8;
     let cap = Duration::from_secs_f64(hours * 3600.0);
     let mut resumes = 0usize;
+    let mut identical_failures = IdenticalFailureStreak::default();
     let mut segment_reports: Vec<LongHorizonReport> = Vec::new();
     let report = loop {
         let remaining = cap.saturating_sub(started.elapsed());
@@ -948,6 +1018,27 @@ async fn live_endurance() {
             .await;
         let provider_died = matches!(report.stop, StopReason::RunnerErrors { .. });
         segment_reports.push(report.clone());
+        // Identical-failure breaker: a resume heals TRANSIENT incidents (a
+        // wedged runner, a dropped stream). A segment that dies with the
+        // byte-identical error every time is deterministic — observed live
+        // 2026-08-03: a below-floor context window (AgentError::
+        // ContextBelowFloor) failed 8 segments identically, 20s apart, and
+        // the loop burned every resume treating physics as weather. Stop
+        // with a clear message instead of thrashing.
+        let streak = match &report.stop {
+            StopReason::RunnerErrors { message } => identical_failures.observe(message),
+            _ => identical_failures.reset(),
+        };
+        if streak >= IDENTICAL_FAILURE_STOP_AFTER {
+            println!(
+                "[stop] the same failure ended {streak} consecutive segments — this is \
+                 deterministic (e.g. a context window below the step floor), not a \
+                 transient provider incident; stopping instead of thrashing resumes. \
+                 Last error: {}",
+                report.last_runner_error.as_deref().unwrap_or("<none recorded>")
+            );
+            break report;
+        }
         if !provider_died || resumes >= ENDURANCE_RESUMES_MAX || started.elapsed() >= cap {
             break report;
         }
@@ -962,7 +1053,11 @@ async fn live_endurance() {
         if eval_model_is_ollama() && !restart_ollama_server().await {
             env.runner.reset_ollama_runner().await;
         }
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // A repeated identical failure doubles the pause — if it is about to
+        // become deterministic, give the machine (VRAM, the server) real time
+        // to change state before the last attempt.
+        tokio::time::sleep(Duration::from_secs(15 * (1 << streak.saturating_sub(1)).max(1)))
+            .await;
     };
     progress.abort();
 
