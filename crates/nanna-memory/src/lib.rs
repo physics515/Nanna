@@ -7,6 +7,7 @@
 //! Implements FSRS-6 for cognitive memory decay and the "dreaming" consolidation model.
 
 mod activity;
+pub mod chunk_rank;
 pub mod chunking;
 mod consolidation;
 mod dreaming;
@@ -16,6 +17,7 @@ mod service;
 
 pub use activity::ActivityClock;
 
+pub use chunk_rank::{collapse_chunk_hits, ChunkHit};
 pub use chunking::{chunk_text, derive_chunk_params, Chunk, ChunkParams, CHUNKER_VERSION};
 
 pub use consolidation::{
@@ -177,6 +179,21 @@ pub trait MemoryPersistence: Send + Sync {
         _model: &str,
     ) -> Result<(), MemoryError> {
         Ok(())
+    }
+
+    /// Chunk-level nearest neighbours, as `(memory_id, ordinal, similarity)`.
+    ///
+    /// Similarity, not distance — the caller compares it against the same
+    /// calibrated cosine threshold every other score is compared against, and
+    /// a path that returned distance here would silently invert every
+    /// comparison downstream.
+    async fn search_chunks(
+        &self,
+        _query: &[f32],
+        _limit: usize,
+        _workspace_id: Option<&str>,
+    ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
+        Ok(Vec::new())
     }
 
     /// Memory ids that have no chunk rows at all, at most `limit`.
@@ -1255,6 +1272,36 @@ impl VectorStore {
     /// write-lock, beside `set_dimension`.
     pub fn set_chunk_params(&self, params: crate::chunking::ChunkParams) {
         self.config.set_chunk_max_chars(params.max_chars);
+    }
+
+    /// Chunk-level nearest neighbours for `query`, collapsed to one entry per
+    /// parent memory.
+    ///
+    /// Over-fetches deliberately: `limit` is the number of MEMORIES wanted, but
+    /// several of the top chunks routinely belong to the same memory, so asking
+    /// the index for exactly `limit` chunks would return fewer memories than
+    /// asked for whenever a memory matched more than once — and would do it
+    /// most often for exactly the memories that matched best.
+    pub async fn search_chunks(
+        &self,
+        query: &[f32],
+        limit: usize,
+        workspace_id: Option<&str>,
+        min_score: f32,
+    ) -> HashMap<String, crate::chunk_rank::ChunkHit> {
+        let Some(ref db) = self.db else { return HashMap::new() };
+        if query.is_empty() || limit == 0 {
+            return HashMap::new();
+        }
+        /// Chunks fetched per memory wanted. Four is the point past which the
+        /// over-fetch stops changing which memories come back in practice,
+        /// while keeping the SQL scan bounded.
+        const CHUNK_OVERFETCH: usize = 4;
+        let hits = db
+            .search_chunks(query, limit.saturating_mul(CHUNK_OVERFETCH), workspace_id)
+            .await
+            .unwrap_or_default();
+        crate::chunk_rank::collapse_chunk_hits(&hits, min_score)
     }
 
     /// Chunks awaiting a vector under `model`, as `(chunk_id, content)`.

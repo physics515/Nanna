@@ -1031,25 +1031,72 @@ impl MemoryService {
         // Scoped search
         let results = self.store.search_scoped(&query_embedding, self.config.max_results * 2, workspace_id).await;
         let min_score = self.get_min_score();
-        
+
+        // Chunk-level hits, collapsed to one per parent. A long memory whose
+        // whole-row vector is a centroid of everything it contains can score
+        // poorly on a query that one of its paragraphs answers exactly — that
+        // is the failure chunking exists to fix, so the two signals are merged
+        // rather than one replacing the other, and each memory keeps whichever
+        // evidence is stronger.
+        let chunk_hits = self
+            .store
+            .search_chunks(
+                &query_embedding,
+                self.config.max_results * 2,
+                workspace_id,
+                min_score,
+            )
+            .await;
+
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
-        
+        let mut scored: Vec<(MemoryEntry, f32, f32)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for (entry, score) in results {
-            if score < min_score {
+            let hit = chunk_hits.get(&entry.id);
+            // Admitted on the better of the two TRUE similarities. Neither is
+            // inflated for the test: `rank` carries the corroboration bonus and
+            // is used only for ordering, so the threshold keeps the exact
+            // meaning it was calibrated with.
+            let best = hit.map_or(score, |h| h.best.max(score));
+            if best < min_score {
                 continue;
             }
-            
+            let rank = hit.map_or(score, |h| h.rank().max(score));
+            seen.insert(entry.id.clone());
+            scored.push((entry, best, rank));
+        }
+
+        // Memories whose chunks matched but whose whole-row vector did not
+        // clear the top-k cut. These are the ones chunking is FOR: without
+        // this pass, splitting a memory would improve nothing, because the
+        // row-level search would still be the only way in.
+        for (id, hit) in &chunk_hits {
+            if seen.contains(id) {
+                continue;
+            }
+            if let Some(entry) = self.store.get(id).await {
+                if workspace_id.is_some() && entry.workspace_id.as_deref() != workspace_id {
+                    continue;
+                }
+                scored.push((entry, hit.best, hit.rank()));
+            }
+        }
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (entry, score, _rank) in scored {
             let weight = entry.fsrs.weight(&self.config.fsrs);
             let state = entry.fsrs.state(&self.config.fsrs);
-            
+
             if weight < self.config.min_weight {
                 continue;
             }
-            
+
             updates.push((entry.id.clone(), Rating::Good));
-            
+
             filtered.push(RecallResult {
                 id: entry.id,
                 content: entry.content,
@@ -1059,7 +1106,7 @@ impl MemoryService {
                 metadata: entry.metadata,
                 workspace_id: entry.workspace_id,
             });
-            
+
             if filtered.len() >= self.config.max_results {
                 break;
             }
@@ -2825,6 +2872,121 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Returns fixed chunk hits so recall's merge can be driven without an
+    /// embedding index.
+    struct StubChunkSearch {
+        hits: Vec<(String, i64, f32)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::MemoryPersistence for StubChunkSearch {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &crate::FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+        async fn search_chunks(
+            &self,
+            _query: &[f32],
+            _limit: usize,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    /// The whole justification for chunking. A long memory's row vector is a
+    /// centroid of everything it contains, so a query answered exactly by one
+    /// paragraph can score below the recall threshold at row level. If chunk
+    /// hits could only re-rank memories the row search already returned,
+    /// splitting a memory would improve nothing — the row vector would still
+    /// be the only way in.
+    #[tokio::test]
+    async fn a_chunk_hit_surfaces_a_memory_the_row_vector_missed() {
+        // Orthogonal to the query, so the row-level search cannot reach it.
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) })
+        });
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+
+        let buried = MemoryEntry {
+            id: "buried".to_string(),
+            content: "a long memory whose centroid says nothing about the query".to_string(),
+            embeddings: HashMap::new(),
+            embedding_model: Some("prov:a".to_string()),
+            embedding: vec![0.0, 1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: crate::FsrsState::default(),
+            workspace_id: None,
+        };
+        service.store.add(buried).await.expect("add");
+
+        // Row search alone finds nothing: the vectors are orthogonal.
+        assert!(
+            service.recall_scoped("the query", None).await.unwrap().is_empty(),
+            "precondition — the row vector must not reach this memory"
+        );
+
+        // Now the same store, with a chunk of that memory matching strongly.
+        let service = service.with_persistence(Arc::new(StubChunkSearch {
+            hits: vec![("buried".to_string(), 7, 0.88)],
+        }));
+        let found = service.recall_scoped("the query", None).await.unwrap();
+        assert_eq!(found.len(), 1, "the chunk hit must surface its parent");
+        assert_eq!(found[0].id, "buried");
+        assert!(
+            (found[0].score - 0.88).abs() < 1e-6,
+            "the reported score is the chunk's true similarity, not a synthetic rank: {}",
+            found[0].score
+        );
+    }
+
+    /// Corroboration reorders; it never admits. A memory whose every chunk is
+    /// just below the bar must stay out however many chunks it has, or the
+    /// threshold would mean something weaker for long memories than short ones.
+    #[tokio::test]
+    async fn many_near_miss_chunks_do_not_add_up_to_a_recall() {
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) })
+        });
+        let hits: Vec<(String, i64, f32)> =
+            (0..30).map(|i| ("long".to_string(), i, 0.39)).collect();
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed)
+        .with_persistence(Arc::new(StubChunkSearch { hits }));
+
+        service
+            .store
+            .add(MemoryEntry {
+                id: "long".to_string(),
+                content: "thirty paragraphs that each nearly match".to_string(),
+                embeddings: HashMap::new(),
+                embedding_model: Some("prov:a".to_string()),
+                embedding: vec![0.0, 1.0, 0.0, 0.0],
+                metadata: HashMap::new(),
+                timestamp: 0,
+                fsrs: crate::FsrsState::default(),
+                workspace_id: None,
+            })
+            .await
+            .expect("add");
+
+        assert!(
+            service.recall_scoped("the query", None).await.unwrap().is_empty(),
+            "thirty near-misses must not clear a threshold none of them clears"
+        );
     }
 
     /// A chunk whose vector came from another model is exactly as unsearchable

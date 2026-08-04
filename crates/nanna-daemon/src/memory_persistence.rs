@@ -247,6 +247,32 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
+    async fn search_chunks(
+        &self,
+        query: &[f32],
+        limit: usize,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.repo
+            .search_chunks_by_embedding_sql(query, limit, workspace_id)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    // `vector_distance_cos` returns a DISTANCE; every threshold
+                    // downstream is stated as a similarity. Converting here,
+                    // once, at the boundary, is the only place that cannot be
+                    // forgotten by a later caller.
+                    .map(|(memory_id, ordinal, distance)| {
+                        (memory_id, ordinal, 1.0 - distance as f32)
+                    })
+                    .collect()
+            })
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
     async fn parents_without_chunks(&self, limit: usize) -> Result<Vec<String>, MemoryError> {
         self.repo
             .parents_without_chunks(limit)
