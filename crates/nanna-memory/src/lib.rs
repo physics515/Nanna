@@ -183,6 +183,11 @@ pub trait MemoryPersistence: Send + Sync {
 
     /// Chunk-level nearest neighbours, as `(memory_id, ordinal, similarity)`.
     ///
+    /// Restricted to chunks embedded by `model`. Comparing across models is
+    /// meaningless — equal width is not equal vector space — and it fails
+    /// silently rather than loudly, so the model is a required argument here
+    /// instead of an optional filter.
+    ///
     /// Similarity, not distance — the caller compares it against the same
     /// calibrated cosine threshold every other score is compared against, and
     /// a path that returned distance here would silently invert every
@@ -190,6 +195,7 @@ pub trait MemoryPersistence: Send + Sync {
     async fn search_chunks(
         &self,
         _query: &[f32],
+        _model: &str,
         _limit: usize,
         _workspace_id: Option<&str>,
     ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
@@ -1285,12 +1291,17 @@ impl VectorStore {
     pub async fn search_chunks(
         &self,
         query: &[f32],
+        model: &str,
         limit: usize,
         workspace_id: Option<&str>,
         min_score: f32,
     ) -> HashMap<String, crate::chunk_rank::ChunkHit> {
         let Some(ref db) = self.db else { return HashMap::new() };
-        if query.is_empty() || limit == 0 {
+        // No bound model means no way to say which vector space the query
+        // lives in, and chunk vectors carry the model that made them. Refusing
+        // to search is the only honest answer; guessing would compare across
+        // spaces.
+        if query.is_empty() || model.is_empty() || limit == 0 {
             return HashMap::new();
         }
         /// Chunks fetched per memory wanted. Four is the point past which the
@@ -1298,7 +1309,7 @@ impl VectorStore {
         /// while keeping the SQL scan bounded.
         const CHUNK_OVERFETCH: usize = 4;
         let hits = db
-            .search_chunks(query, limit.saturating_mul(CHUNK_OVERFETCH), workspace_id)
+            .search_chunks(query, model, limit.saturating_mul(CHUNK_OVERFETCH), workspace_id)
             .await
             .unwrap_or_default();
         crate::chunk_rank::collapse_chunk_hits(&hits, min_score)
