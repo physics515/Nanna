@@ -2621,6 +2621,26 @@ skill.
       `think` by model detection; the OpenAI-compat conversion drops it. NOTE: a config file that
       explicitly saved `thinking_enabled = false` (any install that touched Settings before this)
       keeps false — flip it in Settings → Agent.
+      **SUPERSEDED 2026-08-04 (below): the flag and its switch are gone.**
+- [x] **Thinking always on, one knob (2026-08-04, owner)** — "thinking should be on by default and
+      remove the option in settings to turn it off." The two disconnected knobs collapsed into one:
+      `ThinkingMode` now `#[default]`s to `Medium` and `[agent] thinking_enabled` is **deleted** —
+      along with the Settings → Agent switch, the `set_thinking_enabled` command and its
+      `generate_handler!` registration, and the field in `useSettingsPage`/the e2e mock. Legacy
+      `config.toml` files still carrying `thinking_enabled = true` load unchanged (no
+      `deny_unknown_fields` anywhere in the chain; test:
+      `legacy_thinking_enabled_key_still_loads`).
+      `Medium` is derived, not chosen: the sent budget must leave the visible answer
+      `MIN_OUTPUT_RESERVE_TOKENS` (1112) of room inside the shipped `max_tokens: 8192`, so the
+      largest enum step that survives the standard budget unclamped is 4096.
+      The budget is then clamped per request against the LIVE effective output budget
+      (`thinking_budget_for_output`): `min(configured, max_output − 1112)`, and **no** `thinking`
+      field at all when that leaves less than the API's 1024 minimum — the demoted-window path
+      (reserve as low as 1112) would otherwise emit `budget_tokens >= max_tokens`, an invalid
+      request. Provider gate unchanged in effect: only `Provider::Anthropic` requests carry the
+      field (the OpenAI-compat conversion drops it, Ollama enables `think` by model detection), and
+      the existing `temperature: None` pairing rides with it, so Ollama's temperature is untouched.
+      `RunOptions::thinking_mode` stays as the internal per-run escape hatch.
 
 **Live GUI drive (2026-07-24, gemma4:12b):** planner does NOT over-decompose — "what is 2+2?" planned
 as 1 task (origin=Model); an 817-char project brief hit the 30s planner timeout while the model was

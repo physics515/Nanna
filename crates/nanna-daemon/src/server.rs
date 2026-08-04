@@ -15,7 +15,6 @@ use crate::protocol::Response;
 use crate::session::SessionManager;
 use crate::webhook::{DEFAULT_WEBHOOK_PORT, WebhookConfig, WebhookServer};
 use async_trait::async_trait;
-use nanna_agent::ThinkingMode;
 use nanna_channels::{
     ChannelId, IncomingMessage, MessageContent, MessageRouter as ChannelMessageRouter,
     Sender as ChannelSender, TelegramChannel,
@@ -3043,10 +3042,10 @@ impl DaemonBuilder {
         builder.config.agent.openrouter_api_key = config.llm.openrouter_api_key.clone();
         builder.config.agent.openai_api_key = config.llm.openai_api_key.clone();
 
-        // Set thinking mode from config
-        if config.agent.thinking_enabled {
-            builder.config.agent.thinking_mode = ThinkingMode::Medium;
-        }
+        // Thinking mode is NOT read from config: it is always on (owner
+        // directive 2026-08-04). `AgentServiceConfig::default` already carries
+        // `ThinkingMode::default()`, and the `agent.thinking_enabled` flag that
+        // used to gate it here is gone.
 
         // Agent-loop iteration policy: unbounded by default (long-horizon worker),
         // with late escalating soft nudges. All three are user-configurable.

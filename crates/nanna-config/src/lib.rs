@@ -237,8 +237,14 @@ pub struct AgentConfig {
     /// Injected into every session independent of workspace.
     #[serde(default)]
     pub user_profile: Option<String>,
-    /// Enable thinking/reasoning mode
-    pub thinking_enabled: bool,
+    // NOTE: `thinking_enabled` was removed 2026-08-04 (owner directive:
+    // "thinking should be on by default and remove the option in settings to
+    // turn it off"). It was a second, disconnected knob beside
+    // `nanna_agent::ThinkingMode`, which now defaults to a real budget.
+    // Existing config.toml files still carrying `thinking_enabled = true`
+    // load unchanged: nothing in this file uses
+    // `#[serde(deny_unknown_fields)]`, so serde ignores the stale key.
+    // Covered by `legacy_thinking_enabled_key_still_loads`.
     /// Enable streaming responses
     pub streaming_enabled: bool,
     /// Absolute cap on agent-loop iterations (tool-call rounds). `None` = unlimited
@@ -273,10 +279,6 @@ impl Default for AgentConfig {
             personality_mode: "balanced".to_string(),
             persona: None,
             user_profile: None,
-            // On by default: models that support thinking should show it
-            // (the request layer only sends thinking where the provider
-            // supports it — Ollama detects by model, OpenAI-compat drops it).
-            thinking_enabled: true,
             streaming_enabled: true,
             max_iterations: None,
             nudge_after_iterations: default_nudge_after(),
@@ -981,6 +983,32 @@ mod tests {
         let parsed: MemoryConfig =
             toml::from_str("auto_remember_messages = false").unwrap();
         assert!(!parsed.auto_remember_messages);
+    }
+
+    #[test]
+    fn legacy_thinking_enabled_key_still_loads() {
+        // `thinking_enabled` was removed 2026-08-04 (thinking is always on).
+        // Every install that ever touched Settings → Agent has the key on
+        // disk, and a config that refuses to parse is a dead app — so the
+        // stale key must be ignored, not rejected. This is only true while
+        // nothing in the chain uses `#[serde(deny_unknown_fields)]`.
+        let legacy = r#"
+[agent]
+name = "Nanna"
+personality_mode = "balanced"
+thinking_enabled = true
+streaming_enabled = true
+"#;
+        let config: Config = toml::from_str(legacy).expect("legacy config must still parse");
+        assert_eq!(config.agent.name, "Nanna");
+        assert!(config.agent.streaming_enabled);
+
+        // The opposite disk state (an install that turned thinking OFF) must
+        // parse too — and cannot turn anything off any more, by construction:
+        // there is no field left for it to land in.
+        let legacy_off = "[agent]\nthinking_enabled = false\n";
+        let off: Config = toml::from_str(legacy_off).expect("legacy off-state must still parse");
+        assert_eq!(off.agent.name, AgentConfig::default().name);
     }
 
     #[test]

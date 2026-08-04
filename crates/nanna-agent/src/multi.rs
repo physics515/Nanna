@@ -379,7 +379,10 @@ impl Default for SwarmConfig {
             aggregation_prompt: None,
             context_isolation: crate::context::ContextIsolation::SystemOnly,
             calculate_critical_path: true,
-            thinking_mode: ThinkingMode::Instant,
+            // Sub-agents think by default too — same one truth as the main
+            // loop (owner directive 2026-08-04). A caller that genuinely
+            // wants a mute sub-agent still sets this field explicitly.
+            thinking_mode: ThinkingMode::default(),
             context_budget: None,
         }
     }
@@ -576,7 +579,7 @@ impl AgentCoordinator {
                 aggregation_prompt: None,
                 context_isolation: crate::context::ContextIsolation::SystemOnly,
                 calculate_critical_path: false,
-                thinking_mode: ThinkingMode::Instant,
+                thinking_mode: ThinkingMode::default(),
                 context_budget: None,
             },
         ).await?;

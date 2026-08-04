@@ -130,19 +130,46 @@ fn window_scaled_output_reserve(window: usize, requested_max_tokens: usize) -> u
     )
 }
 
-/// Thinking mode for extended reasoning
+/// The smallest `thinking.budget_tokens` the Anthropic API accepts.
+///
+/// Not a preference — the API rejects anything below it, and it is exactly
+/// [`ThinkingMode::Low`]'s budget. Used as the "is there room to think at
+/// all?" test in [`thinking_budget_for_output`]: below this the only valid
+/// request is one with **no** `thinking` field.
+pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
+
+/// Thinking mode for extended reasoning.
+///
+/// Thinking is ON by default (owner directive 2026-08-04). There is no
+/// user-facing way to turn it off: the config flag and the Settings switch
+/// that used to gate it were deleted, and every `AgentConfig`-shaped default
+/// in the workspace now starts from [`ThinkingMode::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkingMode {
-    /// No explicit thinking - fast responses
-    #[default]
+    /// No explicit thinking — fast responses.
+    ///
+    /// INTERNAL ONLY. No config, IPC command, or UI control selects this;
+    /// it exists so an internal caller (planner, sub-agent, swarm) can pass
+    /// it through the per-run `RunOptions::thinking_mode` escape hatch when
+    /// a step genuinely wants no reasoning budget.
     Instant,
-    /// Low thinking budget (1024 tokens)
+    /// Low thinking budget (1024 tokens) — the API minimum.
     Low,
-    /// Medium thinking budget (4096 tokens)
+    /// Medium thinking budget (4096 tokens). **The default.**
+    ///
+    /// Derived from the request contract, not taste. The shipped output
+    /// budget is `max_tokens: 8192`, and the sent budget must leave the
+    /// visible answer at least [`MIN_OUTPUT_RESERVE_TOKENS`] (1112) of room
+    /// — so the largest step that fits is the largest `budget < 8192 - 1112
+    /// = 7080`. `High` (8192) and `Maximum` (16384) both exceed the whole
+    /// output budget and would be clamped on every single request, i.e. the
+    /// enum value would be a lie. `Medium` is the largest step that survives
+    /// the standard budget unclamped.
+    #[default]
     Medium,
-    /// High thinking budget (8192 tokens)
+    /// High thinking budget (8192 tokens).
     High,
-    /// Maximum thinking budget (16384 tokens)
+    /// Maximum thinking budget (16384 tokens).
     Maximum,
 }
 
@@ -152,7 +179,7 @@ impl ThinkingMode {
     pub const fn budget_tokens(&self) -> Option<u32> {
         match self {
             Self::Instant => None,
-            Self::Low => Some(1024),
+            Self::Low => Some(MIN_THINKING_BUDGET_TOKENS),
             Self::Medium => Some(4096),
             Self::High => Some(8192),
             Self::Maximum => Some(16384),
@@ -164,6 +191,52 @@ impl ThinkingMode {
     pub const fn is_enabled(&self) -> bool {
         !matches!(self, Self::Instant)
     }
+}
+
+/// The thinking budget to actually send, given the request's live effective
+/// output budget. `None` means "send no `thinking` field at all".
+///
+/// The Anthropic API requires `thinking.budget_tokens` to be **strictly less
+/// than** the request's `max_tokens`, and `max_tokens` is not a constant here:
+/// since the per-window output reserve landed it is
+/// `effective_output_budget(window_scaled_output_reserve(window, configured))`,
+/// which on a demoted local window bottoms out at [`MIN_OUTPUT_RESERVE_TOKENS`]
+/// (1112) — smaller than every non-`Low` budget. Sending the configured budget
+/// unclamped would therefore emit an invalid request on exactly the small-window
+/// path the reserve exists to support.
+///
+/// The derivation, both bounds taken from constraints already proven elsewhere
+/// in this file rather than picked:
+/// - **room** = `max_output - MIN_OUTPUT_RESERVE_TOKENS`. Thinking may not eat
+///   the answer: whatever is left after the budget must still hold the
+///   smallest complete unit of visible output a step can emit — one full tool
+///   call plus its claim line, which is precisely what
+///   [`MIN_OUTPUT_RESERVE_TOKENS`] is derived as.
+/// - **floor** = [`MIN_THINKING_BUDGET_TOKENS`]. Below the API minimum there is
+///   no valid budget to send, so the honest request is one with no `thinking`
+///   field — a degraded-but-valid request instead of a guaranteed 400.
+///
+/// The strict-inequality invariant falls out: the returned budget is at most
+/// `max_output - 1112`, and `1112 > 0`, so it is always `< max_output`.
+#[must_use]
+fn thinking_budget_for_output(configured: Option<u32>, max_output: u32) -> Option<u32> {
+    let configured = configured?;
+    let room = max_output.saturating_sub(
+        u32::try_from(MIN_OUTPUT_RESERVE_TOKENS).unwrap_or(u32::MAX),
+    );
+    if room < MIN_THINKING_BUDGET_TOKENS {
+        // Not enough output budget for a legal thinking block AND a visible
+        // answer. Announce the degradation rather than shipping a 400.
+        tracing::debug!(
+            max_output,
+            configured,
+            min_budget = MIN_THINKING_BUDGET_TOKENS,
+            answer_floor = MIN_OUTPUT_RESERVE_TOKENS,
+            "output budget too small for a thinking block; sending no thinking field"
+        );
+        return None;
+    }
+    Some(configured.min(room))
 }
 
 /// Agent configuration
@@ -275,7 +348,10 @@ impl Default for AgentConfig {
             max_iterations: None,
             nudge_after_iterations: 500,
             nudge_interval_iterations: 100,
-            thinking_mode: ThinkingMode::Instant,
+            // Thinking is on by default and has no off switch (owner
+            // directive 2026-08-04). See `ThinkingMode::Medium` for why this
+            // budget and not another.
+            thinking_mode: ThinkingMode::default(),
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
             openrouter_api_key: None,
@@ -5159,12 +5235,6 @@ impl Agent {
             })
             .collect();
 
-        // Determine thinking mode (override takes precedence)
-        let thinking_mode = thinking_override.unwrap_or(self.config.thinking_mode);
-        let thinking = thinking_mode
-            .budget_tokens()
-            .map(nanna_llm::ThinkingConfig::new);
-
         // Get effective system prompt (includes workspace context if set)
         let system_prompt = ctx.effective_system_prompt();
 
@@ -5215,6 +5285,27 @@ impl Agent {
             ),
         ))
         .unwrap_or(u32::MAX);
+
+        // Thinking mode (per-run override takes precedence over config), then
+        // two gates before it reaches the wire:
+        //
+        // 1. PROVIDER. `thinking` is an Anthropic-shaped field and only the
+        //    native Anthropic path serializes it — `anthropic_to_wire_request`
+        //    (OpenAI-compat) drops it, and the Ollama path enables reasoning by
+        //    model detection (`think: true`) instead. Gating here keeps the
+        //    field off providers that would reject it AND keeps the paired
+        //    `temperature: None` below from silently retuning Ollama, which
+        //    substitutes its own 0.6 when temperature is absent.
+        // 2. BUDGET. See `thinking_budget_for_output`: the budget must stay
+        //    strictly under this request's `max_tokens`, which is derived
+        //    per-window and can be as small as the per-step output floor.
+        let thinking_mode = thinking_override.unwrap_or(self.config.thinking_mode);
+        let thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic {
+            thinking_budget_for_output(thinking_mode.budget_tokens(), max_tokens)
+                .map(nanna_llm::ThinkingConfig::new)
+        } else {
+            None
+        };
 
         AnthropicRequest {
             context_limit: None,
@@ -8866,5 +8957,194 @@ mod anchored_steering_tests {
         // Nothing to anchor on → None, and the header is omitted.
         assert_eq!(resolve_task_anchor(None, "   \n  "), None);
         assert_eq!(resolve_task_anchor(Some(""), ""), None);
+    }
+}
+
+#[cfg(test)]
+mod thinking_always_on_tests {
+    use super::*;
+
+    /// A model name nothing else in the suite touches, so the Ollama `num_ctx`
+    /// latch (a process-global keyed by model) cannot make these assertions
+    /// depend on test order, and the on-disk model-info cache cannot serve a
+    /// real entry for it. `model_info_from_cache_or_unknown` therefore returns
+    /// the documented unknown floor: 32000 window / 4096 max output.
+    const MODEL: &str = "claude-thinking-default-probe";
+
+    fn anthropic_agent(config: AgentConfig) -> Agent {
+        // Never contacted — only `build_request_with_thinking` is driven, and
+        // the provider is what the thinking gate reads.
+        let llm = Arc::new(LlmClient::anthropic("test-key-not-used"));
+        Agent::new(config, llm, Arc::new(ToolRegistry::new()))
+    }
+
+    #[test]
+    fn the_default_thinks() {
+        // The directive in one assertion: a config nobody configured still
+        // carries a real reasoning budget.
+        let budget = AgentConfig::default().thinking_mode.budget_tokens();
+        assert_eq!(budget, Some(4096), "default must be a real budget, not None");
+        assert_eq!(ThinkingMode::default(), ThinkingMode::Medium);
+        assert!(ThinkingMode::default().is_enabled());
+    }
+
+    #[test]
+    fn the_default_budget_fits_the_shipped_output_budget_unclamped() {
+        // Why Medium and not High/Maximum: the default must survive the
+        // STANDARD request (max_tokens 8192) without being clamped, or the
+        // enum value would be a lie on every call.
+        let configured = ThinkingMode::default().budget_tokens();
+        let shipped_max_tokens = AgentConfig::default().max_tokens;
+        assert_eq!(
+            thinking_budget_for_output(configured, shipped_max_tokens),
+            configured,
+            "the default budget must not be clamped at the shipped max_tokens"
+        );
+        // ...and the next step up would be.
+        assert_ne!(
+            thinking_budget_for_output(ThinkingMode::High.budget_tokens(), shipped_max_tokens),
+            ThinkingMode::High.budget_tokens(),
+            "High only fits by being clamped — that is why it is not the default"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_output_budget_clamps_then_drops_the_thinking_field() {
+        let configured = Some(4096u32);
+        let floor = u32::try_from(MIN_OUTPUT_RESERVE_TOKENS).unwrap();
+
+        // Roomy: the configured budget is sent verbatim.
+        assert_eq!(thinking_budget_for_output(configured, 8192), Some(4096));
+
+        // Tight: clamped down to whatever is left after the visible answer.
+        assert_eq!(
+            thinking_budget_for_output(configured, 4096),
+            Some(4096 - floor)
+        );
+
+        // Exactly enough for the API minimum plus the answer floor: still sent.
+        assert_eq!(
+            thinking_budget_for_output(configured, MIN_THINKING_BUDGET_TOKENS + floor),
+            Some(MIN_THINKING_BUDGET_TOKENS)
+        );
+
+        // One token short of that: NO thinking field, rather than an invalid
+        // one. This is the demoted-small-window path.
+        assert_eq!(
+            thinking_budget_for_output(configured, MIN_THINKING_BUDGET_TOKENS + floor - 1),
+            None
+        );
+        // The floor of `window_scaled_output_reserve` itself — the smallest
+        // output budget a step can be given — leaves no room to think.
+        assert_eq!(thinking_budget_for_output(configured, floor), None);
+        assert_eq!(thinking_budget_for_output(configured, 1), None);
+
+        // Instant (internal escape hatch) still means no thinking at any size.
+        assert_eq!(thinking_budget_for_output(None, 200_000), None);
+    }
+
+    #[test]
+    fn the_clamp_never_emits_a_budget_at_or_above_max_tokens() {
+        // The API contract, swept across every mode and a wide range of live
+        // output budgets: `budget_tokens` must be STRICTLY less than
+        // `max_tokens`, and never below the API minimum.
+        let modes = [
+            ThinkingMode::Instant,
+            ThinkingMode::Low,
+            ThinkingMode::Medium,
+            ThinkingMode::High,
+            ThinkingMode::Maximum,
+        ];
+        for mode in modes {
+            for max_output in [1u32, 512, 1112, 2135, 2136, 4096, 8192, 16384, 64_000] {
+                if let Some(budget) = thinking_budget_for_output(mode.budget_tokens(), max_output) {
+                    assert!(
+                        budget < max_output,
+                        "{mode:?} at max_output {max_output} produced budget {budget}"
+                    );
+                    assert!(
+                        budget >= MIN_THINKING_BUDGET_TOKENS,
+                        "{mode:?} at max_output {max_output} produced sub-minimum budget {budget}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_request_carries_thinking_and_drops_temperature() {
+        let agent = anthropic_agent(AgentConfig {
+            model: MODEL.to_string(),
+            ..Default::default()
+        });
+        let request = agent
+            .build_request_with_thinking(None, &HashSet::new(), false)
+            .await;
+
+        let thinking = request
+            .thinking
+            .as_ref()
+            .expect("an Anthropic request must carry a thinking budget by default");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert!(
+            thinking.budget_tokens < request.max_tokens,
+            "budget {} must be strictly under max_tokens {}",
+            thinking.budget_tokens,
+            request.max_tokens
+        );
+        // Anthropic rejects an explicit temperature alongside thinking; the
+        // pairing must survive thinking becoming the default.
+        assert!(
+            request.temperature.is_none(),
+            "temperature must be omitted whenever thinking is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_anthropic_request_sends_no_thinking_field_and_keeps_temperature() {
+        // Provider awareness: the Anthropic-shaped field must not reach a
+        // provider whose conversion drops it (OpenAI-compat) or which enables
+        // reasoning by model detection (Ollama) — and because temperature is
+        // paired to thinking, Ollama would otherwise silently lose the
+        // configured temperature and fall back to its own default.
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        let agent = Agent::new(
+            AgentConfig {
+                model: "qwen3.5:9b-thinking-probe".to_string(),
+                temperature: 0.7,
+                ..Default::default()
+            },
+            llm,
+            Arc::new(ToolRegistry::new()),
+        );
+        let request = agent
+            .build_request_with_thinking(None, &HashSet::new(), false)
+            .await;
+        assert!(request.thinking.is_none());
+        assert_eq!(request.temperature, Some(0.7));
+    }
+
+    #[tokio::test]
+    async fn the_internal_per_run_override_still_wins() {
+        // Requirement: the directive removes the USER-facing off switch, not
+        // internal control. Planner/sub-agent callers keep both directions.
+        let agent = anthropic_agent(AgentConfig {
+            model: MODEL.to_string(),
+            ..Default::default()
+        });
+
+        let muted = agent
+            .build_request_with_thinking(Some(ThinkingMode::Instant), &HashSet::new(), false)
+            .await;
+        assert!(muted.thinking.is_none(), "Instant override must mute thinking");
+        assert_eq!(muted.temperature, Some(AgentConfig::default().temperature));
+
+        let raised = agent
+            .build_request_with_thinking(Some(ThinkingMode::Low), &HashSet::new(), false)
+            .await;
+        assert_eq!(
+            raised.thinking.as_ref().map(|t| t.budget_tokens),
+            Some(MIN_THINKING_BUDGET_TOKENS)
+        );
     }
 }

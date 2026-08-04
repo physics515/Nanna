@@ -1509,19 +1509,11 @@ pub async fn set_personality_mode(
     Ok(())
 }
 
-/// Set thinking mode enabled
-#[tauri::command]
-pub async fn set_thinking_enabled(
-    state: State<'_, Arc<RwLock<AppState>>>,
-    enabled: bool,
-) -> Result<(), String> {
-    let mut state_guard = state.write().await;
-    state_guard.config.agent.thinking_enabled = enabled;
-    state_guard.config.save()
-        .map_err(|e| format!("Failed to save config: {}", e))?;
-    info!("Thinking mode: {}", if enabled { "enabled" } else { "disabled" });
-    Ok(())
-}
+// NOTE: `set_thinking_enabled` was removed 2026-08-04 (owner directive:
+// thinking is always on, and the Settings switch that turned it off is gone).
+// Thinking mode is now `nanna_agent::ThinkingMode::default()` everywhere, with
+// the only remaining control the internal per-run `RunOptions::thinking_mode`
+// override.
 
 /// Set streaming enabled
 #[tauri::command]
