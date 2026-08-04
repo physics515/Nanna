@@ -475,6 +475,28 @@ fn default_model_info(model: &str, provider: &str) -> ModelInfo {
     unknown_model_info(model, provider)
 }
 
+/// One model object from `GET /v1/models/{id}`.
+///
+/// The field names are load-bearing and were wrong: the Models API returns
+/// **`max_input_tokens`** (the context window) and **`max_tokens`** (the output
+/// cap), and there is no `context_window` field at all. Reading for the wrong
+/// names is silent — both `Option`s deserialize to `None`, both fall back to
+/// the unknown-model floor, and that floor gets written to the on-disk cache
+/// with a fresh timestamp. Every Anthropic model resolved to 32k context / 4k
+/// output as a result, no matter what it actually was.
+///
+/// The aliases keep the older spellings working if a proxy or gateway answers
+/// with them. Deliberately at module scope rather than inside the fetch so the
+/// mapping is testable without a network round trip.
+#[derive(Deserialize)]
+struct AnthropicModelResponse {
+    id: String,
+    #[serde(default, alias = "context_window")]
+    max_input_tokens: Option<usize>,
+    #[serde(default, alias = "max_output_tokens")]
+    max_tokens: Option<usize>,
+}
+
 /// File-based cache for model information
 #[derive(Clone)]
 pub struct ModelInfoCache {
@@ -482,6 +504,13 @@ pub struct ModelInfoCache {
 }
 
 impl ModelInfoCache {
+    /// Bumped whenever a fix changes what a *correct* cached entry contains,
+    /// so previously-written entries are orphaned rather than served.
+    ///
+    /// v2: the Anthropic Models API response was being read with the wrong
+    /// field names, so every Anthropic model cached the unknown-model floor.
+    const SCHEMA_GENERATION: u32 = 2;
+
     /// Create a new cache with the specified directory
     pub fn new(cache_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -544,7 +573,14 @@ impl ModelInfoCache {
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
-        self.cache_dir.join(format!("{safe_name}.json"))
+        // The suffix is a schema generation, not decoration. Entries written
+        // before the Anthropic field names were corrected hold the
+        // unknown-model floor (32k window / 4k output) for models that are
+        // nothing like it, with a fresh timestamp — so the week-long TTL would
+        // keep serving them. Bumping the generation orphans those files
+        // instead of trusting them; the next lookup refetches.
+        self.cache_dir
+            .join(format!("{safe_name}.v{}.json", Self::SCHEMA_GENERATION))
     }
 }
 
@@ -2454,24 +2490,23 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             return Err(LlmError::Api { status, message });
         }
 
-        // Parse response - Anthropic may or may not include context_window
-        #[derive(Deserialize)]
-        struct AnthropicModelResponse {
-            id: String,
-            #[serde(default)]
-            context_window: Option<usize>,
-            #[serde(default)]
-            max_output_tokens: Option<usize>,
-        }
-
+        // The Models API spells these `max_input_tokens` (the context window)
+        // and `max_tokens` (the output cap). There is no `context_window`
+        // field — asking for one deserializes to `None`, silently falls back
+        // to the unknown-model floor, and caches THAT, so every Anthropic
+        // model resolved to 32k context / 4k output no matter what it really
+        // was. The aliases keep the old spellings working if a proxy or
+        // gateway answers with them.
         let api_response: AnthropicModelResponse = response.json().await?;
 
         // Use API values if available, otherwise use defaults
         let defaults = default_model_info(model, "anthropic");
         Ok(ModelInfo {
             id: api_response.id,
-            context_window: api_response.context_window.unwrap_or(defaults.context_window),
-            max_output_tokens: api_response.max_output_tokens.unwrap_or(defaults.max_output_tokens),
+            context_window: api_response
+                .max_input_tokens
+                .unwrap_or(defaults.context_window),
+            max_output_tokens: api_response.max_tokens.unwrap_or(defaults.max_output_tokens),
             supports_tools: defaults.supports_tools,
             supports_vision: defaults.supports_vision,
             embedding_dimension: None, // Anthropic doesn't provide embedding models via this API
@@ -6996,6 +7031,44 @@ mod anthropic_model_contract_tests {
             conformed.thinking, None,
             "Fable rejects an explicit disable; omission is the only legal form"
         );
+    }
+
+    /// The Models API payload, spelled the way the API actually spells it.
+    /// Reading the wrong field names is silent — it defaults to the
+    /// unknown-model floor and caches that — so this pins the mapping.
+    #[test]
+    fn the_models_api_payload_is_read_with_the_right_field_names() {
+        let payload = serde_json::json!({
+            "id": "claude-opus-5",
+            "type": "model",
+            "display_name": "Claude Opus 5",
+            "created_at": "2026-01-01T00:00:00Z",
+            "max_input_tokens": 1_000_000,
+            "max_tokens": 128_000,
+        });
+        let parsed: super::AnthropicModelResponse =
+            serde_json::from_value(payload).expect("deserializes");
+        assert_eq!(parsed.id, "claude-opus-5");
+        assert_eq!(
+            parsed.max_input_tokens,
+            Some(1_000_000),
+            "context window must come from max_input_tokens; there is no \
+             context_window field on the Models API"
+        );
+        assert_eq!(parsed.max_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn the_older_field_spellings_still_parse() {
+        let payload = serde_json::json!({
+            "id": "claude-opus-5",
+            "context_window": 200_000,
+            "max_output_tokens": 64_000,
+        });
+        let parsed: super::AnthropicModelResponse =
+            serde_json::from_value(payload).expect("deserializes");
+        assert_eq!(parsed.max_input_tokens, Some(200_000));
+        assert_eq!(parsed.max_tokens, Some(64_000));
     }
 
     #[test]

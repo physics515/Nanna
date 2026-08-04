@@ -172,9 +172,10 @@ pub enum ThinkingMode {
     /// the standard budget unclamped.
     ///
     /// The budget reaches the wire only on the pre-4.6 contract; on adaptive
-    /// models the model chooses its own depth and this figure survives solely
-    /// as the *context* reserve (thinking generates on top of `max_tokens`
-    /// either way). See [`thinking_for_model`].
+    /// models the model chooses its own depth, and this figure survives as the
+    /// reasoning room reserved in the context budget and added to the request
+    /// ceiling (`max_tokens` covers thinking and the answer together — see
+    /// [`request_output_budget`]). See also [`thinking_for_model`].
     #[default]
     Medium,
     /// High thinking budget (8192 tokens).
@@ -249,6 +250,45 @@ fn thinking_budget_for_output(configured: Option<u32>, max_output: u32) -> Optio
     Some(configured.min(room))
 }
 
+/// The request's output ceiling for `model`.
+///
+/// `max_tokens` caps thinking AND the visible answer together — one shared
+/// ceiling, not a cap on the answer with reasoning billed on top. So a request
+/// that will think has to ask for both, or the answer is what gets truncated:
+/// the model spends the budget reasoning and the turn ends
+/// `stop_reason: "max_tokens"` with short or empty text. The legacy shape
+/// enforces the same relationship explicitly by requiring
+/// `budget_tokens < max_tokens`; adaptive models have no budget field to check,
+/// so the room is added here instead.
+///
+/// The added amount is the mode's nominal budget — the same figure the context
+/// reserve at run start sets aside for reasoning — so the answer keeps the full
+/// configured budget it was sized for. `effective_output_budget` then clamps
+/// the total to what the model will actually accept.
+///
+/// Shared by the initial build and by the post-routing rebuild: `route_model`
+/// replaces the model after the fact, and a ceiling derived from the
+/// configured model's contract does not transfer to a routed one.
+#[must_use]
+fn request_output_budget(
+    model: &str,
+    model_info: &nanna_llm::ModelInfo,
+    answer_budget: usize,
+    mode: ThinkingMode,
+    is_anthropic: bool,
+) -> u32 {
+    let headroom = if is_anthropic
+        && mode.is_enabled()
+        && nanna_llm::anthropic_model_contract(model).adaptive_thinking
+    {
+        mode.budget_tokens().unwrap_or(0) as usize
+    } else {
+        0
+    };
+    u32::try_from(model_info.effective_output_budget(answer_budget.saturating_add(headroom)))
+        .unwrap_or(u32::MAX)
+}
+
 /// The `thinking` field to send for this model, or `None` for no field at all.
 ///
 /// The shape is not ours to choose — it is the model's request contract, and
@@ -256,9 +296,10 @@ fn thinking_budget_for_output(configured: Option<u32>, max_output: u32) -> Optio
 /// from [`nanna_llm::anthropic_model_contract`]:
 ///
 /// - **Adaptive (4.6 and newer).** No token budget exists; the model decides
-///   depth per request. `ThinkingMode`'s budget still shapes the *context*
-///   reserve — thinking generates on top of `max_tokens` either way — but it
-///   has no wire representation here.
+///   depth per request. `ThinkingMode`'s budget has no wire representation
+///   here — it survives as the reasoning room reserved in the context budget
+///   and added to the request ceiling, since `max_tokens` covers thinking and
+///   the answer together (see [`request_output_budget`]).
 /// - **Legacy (pre-4.6).** `{"type":"enabled","budget_tokens":N}`, clamped by
 ///   [`thinking_budget_for_output`] so the budget stays strictly under this
 ///   request's `max_tokens`.
@@ -2851,6 +2892,24 @@ impl Agent {
                 // record against the routed model rather than an visible error.
                 let routed_contract = nanna_llm::anthropic_model_contract(&request.model);
                 let routed_mode = options.thinking_mode.unwrap_or(self.config.thinking_mode);
+                let routed_info =
+                    nanna_llm::model_info_from_cache_or_unknown(&request.model, "");
+                // The ceiling first, because the thinking shape is derived
+                // against it. It has to be rebuilt too: the original was sized
+                // from the configured model's window, output cap AND thinking
+                // contract, none of which transfer — a legacy-configured agent
+                // contributes no reasoning headroom, so routing to an adaptive
+                // model would hand it a ceiling with no room to think in.
+                request.max_tokens = request_output_budget(
+                    &request.model,
+                    &routed_info,
+                    window_scaled_output_reserve(
+                        routed_info.context_window,
+                        self.config.max_tokens as usize,
+                    ),
+                    routed_mode,
+                    self.llm.provider() == nanna_llm::Provider::Anthropic,
+                );
                 request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic {
                     thinking_for_model(routed_contract, routed_mode, request.max_tokens)
                 } else {
@@ -3354,6 +3413,14 @@ impl Agent {
                 // marks a pending completion claim as verified-in-progress.
                 state.mission_stall_rounds = 0;
                 state.mission_verified_since_claim = true;
+            } else {
+                // A round that called no tool still ends a reasoning block.
+                // Without this the buffer carries across continuation rounds
+                // (mission stall, narration, repetition), and the spiral
+                // detector — which measures it as "this block" — trips on the
+                // concatenated volume of several unrelated rounds rather than
+                // on any one of them going in circles.
+                state.finalize_reasoning_block(None);
             }
 
             // Execute tools and continue loop
@@ -5427,24 +5494,13 @@ impl Agent {
         // the answer keeps the full configured `max_tokens` it was sized for.
         // `effective_output_budget` then clamps the total to what the model
         // will actually accept.
-        let thinking_headroom = if nanna_llm::anthropic_model_contract(&self.config.model)
-            .adaptive_thinking
-            && thinking_override
-                .unwrap_or(self.config.thinking_mode)
-                .is_enabled()
-            && self.llm.provider() == nanna_llm::Provider::Anthropic
-        {
-            thinking_override
-                .unwrap_or(self.config.thinking_mode)
-                .budget_tokens()
-                .unwrap_or(0) as usize
-        } else {
-            0
-        };
-        let max_tokens = u32::try_from(
-            model_info.effective_output_budget(answer_budget.saturating_add(thinking_headroom)),
-        )
-        .unwrap_or(u32::MAX);
+        let max_tokens = request_output_budget(
+            &self.config.model,
+            &model_info,
+            answer_budget,
+            thinking_override.unwrap_or(self.config.thinking_mode),
+            self.llm.provider() == nanna_llm::Provider::Anthropic,
+        );
 
         // Thinking mode (per-run override takes precedence over config), then
         // two gates before it reaches the wire:
@@ -9321,35 +9377,86 @@ mod thinking_always_on_tests {
 
     /// `max_tokens` caps thinking AND the answer together. If the request asks
     /// only for the answer budget, a thinking model spends it reasoning and the
-    /// turn ends `stop_reason: "max_tokens"` with the answer truncated — the
-    /// failure this widening exists to prevent.
-    #[tokio::test]
-    async fn a_thinking_request_asks_for_more_than_the_answer_budget() {
-        // A configured answer budget below the model's output cap, so the cap
-        // is not what decides the comparison.
-        let thinking = anthropic_agent(AgentConfig {
-            model: "claude-opus-5".to_string(),
-            max_tokens: 2048,
-            ..Default::default()
-        })
-        .build_request_with_thinking(None, &HashSet::new(), false)
-        .await;
+    /// turn ends `stop_reason: "max_tokens"` with the answer truncated.
+    ///
+    /// Exercised against `request_output_budget` directly with real limits:
+    /// the end-to-end path resolves model info through the process-global disk
+    /// cache, which a unit test cannot seed without writing to the user's real
+    /// cache directory. An earlier end-to-end version of this test passed while
+    /// the widening was a no-op at the shipped default, because both arms
+    /// clamped to the same unknown-model output cap.
+    #[test]
+    fn a_thinking_request_asks_for_more_than_the_answer_budget() {
+        let opus5 = nanna_llm::ModelInfo {
+            id: "claude-opus-5".to_string(),
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            supports_tools: true,
+            supports_vision: true,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "anthropic".to_string(),
+        };
+        let configured = AgentConfig::default().max_tokens as usize;
+        let answer = window_scaled_output_reserve(opus5.context_window, configured);
 
-        let muted = anthropic_agent(AgentConfig {
-            model: "claude-opus-5".to_string(),
-            max_tokens: 2048,
-            thinking_mode: ThinkingMode::Instant,
-            ..Default::default()
-        })
-        .build_request_with_thinking(None, &HashSet::new(), false)
-        .await;
+        let thinking = request_output_budget(
+            "claude-opus-5",
+            &opus5,
+            answer,
+            ThinkingMode::Medium,
+            true,
+        );
+        let muted = request_output_budget(
+            "claude-opus-5",
+            &opus5,
+            answer,
+            ThinkingMode::Instant,
+            true,
+        );
 
-        assert!(
-            thinking.max_tokens > muted.max_tokens,
-            "a thinking request must reserve room beyond the answer budget \
-             ({} vs {})",
-            thinking.max_tokens,
-            muted.max_tokens
+        assert_eq!(
+            muted, configured as u32,
+            "a non-thinking request asks for exactly the answer budget"
+        );
+        assert_eq!(
+            thinking,
+            configured as u32 + ThinkingMode::Medium.budget_tokens().unwrap(),
+            "a thinking request adds the reasoning budget on top, so the              answer keeps the full budget it was sized for"
+        );
+    }
+
+    #[test]
+    fn only_adaptive_anthropic_requests_widen_the_ceiling() {
+        let info = nanna_llm::ModelInfo {
+            id: "probe".to_string(),
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            supports_tools: true,
+            supports_vision: false,
+            embedding_dimension: None,
+            cached_at: 0,
+            provider: "anthropic".to_string(),
+        };
+        let configured = AgentConfig::default().max_tokens as usize;
+        let answer = window_scaled_output_reserve(info.context_window, configured);
+
+        // Legacy models bound reasoning with `budget_tokens` instead, and that
+        // clamp already reserves the answer floor inside the ceiling.
+        assert_eq!(
+            request_output_budget(
+                "claude-sonnet-4-20250514",
+                &info,
+                answer,
+                ThinkingMode::Medium,
+                true
+            ),
+            configured as u32
+        );
+        // Ollama bounds thinking inside num_predict; nothing to add.
+        assert_eq!(
+            request_output_budget("qwen3.5:9b", &info, answer, ThinkingMode::Medium, false),
+            configured as u32
         );
     }
 
