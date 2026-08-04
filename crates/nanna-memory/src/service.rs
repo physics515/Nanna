@@ -1772,20 +1772,65 @@ fn truncate(s: &str, max_len: usize) -> String {
 ///
 /// Exported so the producer chunks against the same number the consumer bounds
 /// against. Them drifting apart IS the bug this documents.
-pub const MEMORY_OBSERVATION_MAX_CHARS: usize = MEMORY_CHUNK_MAX_CHARS + 192;
+pub const MEMORY_OBSERVATION_MAX_CHARS: usize = MEMORY_CHUNK_MAX_CHARS + MEMORY_OBSERVATION_HEADER_CHARS;
 
-/// Chunk size the episodic writer splits large tool results into.
-pub const MEMORY_CHUNK_MAX_CHARS: usize = 3200;
+/// The `[tool → target — outcome] ` header the episodic writer prepends. The
+/// target is itself capped at 120 chars, so this covers the header whole.
+pub const MEMORY_OBSERVATION_HEADER_CHARS: usize = 192;
 
-/// Maximum byte length of merged memory content — bounds accretion across repeated merges.
+/// Retrieval-granularity target for one embedded chunk, in chars.
 ///
-/// Derived, not picked: a merged entry must hold four maximum-size observations,
-/// doubled so multi-byte UTF-8 cannot shrink that to three. The old value was a
-/// flat 4096 — *below a single observation* once any of it was non-ASCII — so a
-/// row saturated after roughly one merge and then silently refused every fold
-/// after it. Twelve rows in the 2026-07-27 run sat at 3895-4076 bytes; the
-/// `sh ./minidb help` family alone lost ~349 folds to that ceiling.
-const MEMORY_MERGE_MAX_BYTES: usize = MEMORY_OBSERVATION_MAX_CHARS * 4 * 2;
+/// This is the SOFT bound — what size makes a good retrieval unit, independent
+/// of any model. A chunk far larger than a few paragraphs embeds to a centroid
+/// of everything it contains: it matches most queries weakly and locates
+/// nothing precisely, so recall degrades as chunks grow even when the model
+/// could accept them. Use [`chunk_max_chars_for_window`] to combine this with
+/// the hard bound.
+pub const MEMORY_CHUNK_TARGET_CHARS: usize = 3200;
+
+/// Conservative chars-per-token, matching the ratio the budget estimators use
+/// for code (which tokenizes worse than prose). Under-estimating chars per
+/// token makes the derived chunk SMALLER, which is the safe direction.
+const CHARS_PER_TOKEN: usize = 3;
+
+/// The chunk budget for an embedding model whose input window is
+/// `embedding_window_tokens`.
+///
+/// Two independent bounds, smaller wins:
+///
+/// - **Hard — the model's window.** A chunk larger than the embedder accepts is
+///   truncated by the embedder, and the resulting vector describes only a
+///   prefix while claiming to describe the whole chunk. Nothing errors; recall
+///   just quietly degrades. A 512-token embedding model (~1.5k chars) handed
+///   the 3200-char target was losing half of every chunk this way.
+/// - **Soft — [`MEMORY_CHUNK_TARGET_CHARS`].** Retrieval granularity, above.
+///   A 32k-token embedder would otherwise permit ~100k-char chunks, which fit
+///   fine and retrieve badly.
+///
+/// Room is left for the `[tool → target — outcome] ` header the writer prepends
+/// (see [`MEMORY_OBSERVATION_MAX_CHARS`]), because the header is embedded too.
+///
+/// `0` (window unknown) yields the target: no information about the model is a
+/// reason to keep the previous behaviour, not to guess a bigger number.
+#[must_use]
+pub fn chunk_max_chars_for_window(embedding_window_tokens: usize) -> usize {
+    if embedding_window_tokens == 0 {
+        return MEMORY_CHUNK_TARGET_CHARS;
+    }
+    let window_chars = embedding_window_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let usable = window_chars.saturating_sub(MEMORY_OBSERVATION_HEADER_CHARS);
+    // Never zero: a pathologically small window still has to chunk into
+    // something, and one char at a time is the floor that keeps progress.
+    usable.min(MEMORY_CHUNK_TARGET_CHARS).max(1)
+}
+
+/// Kept for callers that want the compile-time target rather than a
+/// model-derived budget — notably the output-reserve derivation, which is
+/// about the largest routine `write_file` payload and only ever coincided with
+/// the embedding chunk size.
+pub const MEMORY_CHUNK_MAX_CHARS: usize = MEMORY_CHUNK_TARGET_CHARS;
+
+
 
 /// Merge `incoming` content into `existing`, deduplicating and bounding length.
 ///
@@ -1891,11 +1936,13 @@ fn merge_memory_content(existing: &str, incoming: &str) -> String {
         return incoming.to_string();
     }
 
-    // Bounded append.
-    let merged_len_bytes = existing.len() + SEPARATOR.len() + incoming.len();
-    if merged_len_bytes > MEMORY_MERGE_MAX_BYTES {
-        return existing.to_string();
-    }
+    // Unbounded append. There was a byte cap here, and it did not merely bound
+    // growth: past the ceiling it returned `existing` and DISCARDED the
+    // incoming observation — a silent write failure reported as a successful
+    // merge. Storage has no size limit now, and the constraint the cap was
+    // standing in for (an embedding model's finite input window) is handled
+    // where it actually applies, by chunking the content for embedding rather
+    // than by refusing to remember it.
     format!("{existing}{SEPARATOR}{incoming}")
 }
 
@@ -1995,14 +2042,21 @@ mod tests {
         );
     }
 
+    /// Storage is unbounded. The byte cap this replaces did not bound growth so
+    /// much as drop writes: past the ceiling it returned the existing content
+    /// and discarded the incoming observation, reporting success. A merge must
+    /// never lose the thing being merged in.
     #[test]
-    fn test_merge_memory_content_bounded() {
-        // Appending past the byte cap keeps the existing content (no unbounded growth).
-        let existing = "a".repeat(MEMORY_MERGE_MAX_BYTES - 1);
-        let incoming = "b".repeat(MEMORY_MERGE_MAX_BYTES);
+    fn test_merge_memory_content_is_unbounded() {
+        let existing = "a".repeat(64_000);
+        let incoming = "b".repeat(64_000);
         let merged = merge_memory_content(&existing, &incoming);
-        assert_eq!(merged, existing);
-        assert!(merged.len() <= MEMORY_MERGE_MAX_BYTES);
+        assert!(
+            merged.contains(&incoming),
+            "the incoming observation must survive the merge at any size"
+        );
+        assert!(merged.starts_with(&existing), "and so must the existing one");
+        assert_eq!(merged.len(), existing.len() + 2 + incoming.len());
     }
 
     #[tokio::test]
