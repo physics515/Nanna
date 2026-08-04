@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use nanna_memory::{FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence};
 use nanna_storage::{MemoryRepository, NewMemory};
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Implements `MemoryPersistence` using the `MemoryRepository` from `nanna-storage`.
 pub struct TursoMemoryPersistence {
@@ -60,9 +60,23 @@ fn entry_to_new_memory(entry: &MemoryEntry) -> NewMemory {
 
 /// Convert a `nanna_storage::Memory` back to a `MemoryEntry`.
 ///
-/// Returns `None` if the stored entry has no embedding (can't be searched).
-pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
-    let embedding = mem.embedding?;
+/// A row with no vector converts like any other, carrying an empty embedding.
+/// That is the documented meaning of an empty `MemoryEntry::embedding` — "not
+/// embedded by the active model yet, which is a backfill job, not an error" —
+/// and the store is built for it: `add` skips the width check on an empty
+/// vector, `search` drops to the SIMD path rather than misaligning the GPU
+/// batch, and `entries_missing_model` treats exactly these rows as the backfill
+/// queue.
+///
+/// This used to `return None`, and the caller counted it as a benign skip. It
+/// was not benign. A memory written while the embedding provider was down
+/// persisted its content fine and then vanished on the next restart: never
+/// loaded, so never searchable, and — because the backfill queue is built from
+/// loaded entries — never backfilled either. The row stayed in the database
+/// forever, invisible. The log line said "skipped", which reads as "nothing to
+/// see", not "this memory is now unreachable for good".
+pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
+    let embedding = mem.embedding.unwrap_or_default();
 
     // Rebuild metadata HashMap from JSON
     let mut metadata: HashMap<String, String> = mem.metadata
@@ -96,16 +110,22 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
         generation: mem.fsrs_generation as u32,
     };
 
-    Some(MemoryEntry {
+    MemoryEntry {
         id: mem.memory_id,
         content: mem.content,
         // The DB keeps one vector per row plus the model that made it. Retained
         // buckets live in RAM for the life of the daemon, so a provider that
         // flaps mid-session costs nothing; across a restart only the persisted
         // one survives and the rest are backfilled lazily.
+        //
+        // An empty vector gets NO bucket: a bucket keyed by the model name
+        // asserts "this model has embedded this entry", and an empty vector
+        // asserts the opposite. Recording one would lift the row straight out
+        // of the backfill queue it belongs in.
         embeddings: mem
             .embedding_model
             .clone()
+            .filter(|_| !embedding.is_empty())
             .map(|model| HashMap::from([(model, embedding.clone())]))
             .unwrap_or_default(),
         embedding_model: mem.embedding_model.clone(),
@@ -114,7 +134,7 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> Option<MemoryEntry> {
         timestamp,
         fsrs,
         workspace_id: mem.workspace_id,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,20 +239,12 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .await
             .map_err(|e| MemoryError::Persistence(e.to_string()))?;
 
-        let mut entries = Vec::with_capacity(db_memories.len());
-        let mut skipped = 0usize;
-
-        for mem in db_memories {
-            match db_memory_to_entry(mem) {
-                Some(entry) => entries.push(entry),
-                None => {
-                    skipped += 1;
-                }
-            }
-        }
-
-        if skipped > 0 {
-            warn!("Skipped {} memories with no embedding during bulk load", skipped);
+        let (entries, awaiting_embedding) = Self::convert_rows(db_memories);
+        if awaiting_embedding > 0 {
+            info!(
+                "Loaded {awaiting_embedding} memories with no vector yet; they are queued for \
+                 backfill and unsearchable until it runs — their content is intact"
+            );
         }
 
         Ok(entries)
@@ -250,9 +262,12 @@ impl MemoryPersistence for TursoMemoryPersistence {
         match self.repo.bulk_load().await {
             Ok(db_memories) => {
                 let expected = db_memories.len();
-                let (entries, no_embedding) = Self::convert_rows(db_memories);
-                if no_embedding > 0 {
-                    warn!("Skipped {} memories with no embedding during bulk load", no_embedding);
+                let (entries, awaiting_embedding) = Self::convert_rows(db_memories);
+                if awaiting_embedding > 0 {
+                    info!(
+                        "Loaded {awaiting_embedding} memories with no vector yet; they are queued \
+                         for backfill and unsearchable until it runs — their content is intact"
+                    );
                 }
                 Ok(LoadReport { entries, corrupt_rows: 0, expected })
             }
@@ -265,9 +280,12 @@ impl MemoryPersistence for TursoMemoryPersistence {
                     .map_err(|se| MemoryError::Persistence(se.to_string()))?;
                 let expected = report.expected;
                 let corrupt_rows = report.corrupt_ids.len();
-                let (entries, no_embedding) = Self::convert_rows(report.memories);
-                if no_embedding > 0 {
-                    warn!("Skipped {} memories with no embedding during salvage load", no_embedding);
+                let (entries, awaiting_embedding) = Self::convert_rows(report.memories);
+                if awaiting_embedding > 0 {
+                    info!(
+                        "Salvaged {awaiting_embedding} memories with no vector yet; they are \
+                         queued for backfill, not lost"
+                    );
                 }
                 warn!(
                     "Salvage load recovered {} of {} rows; {} corrupt rows skipped",
@@ -283,17 +301,102 @@ impl MemoryPersistence for TursoMemoryPersistence {
 }
 
 impl TursoMemoryPersistence {
-    /// Convert stored `Memory` rows to `MemoryEntry`, returning the converted
-    /// entries and the count skipped for having no embedding (unsearchable).
+    /// Convert stored `Memory` rows to `MemoryEntry`.
+    ///
+    /// Returns every row — none are dropped — plus a count of how many arrived
+    /// without a vector, so the caller can say so. Those are backfill work, not
+    /// losses, and the distinction is the whole point: the previous version
+    /// discarded them and reported the discard as a skip.
     fn convert_rows(rows: Vec<nanna_storage::Memory>) -> (Vec<MemoryEntry>, usize) {
         let mut entries = Vec::with_capacity(rows.len());
-        let mut no_embedding = 0usize;
+        let mut awaiting_embedding = 0usize;
         for mem in rows {
-            match db_memory_to_entry(mem) {
-                Some(entry) => entries.push(entry),
-                None => no_embedding += 1,
+            let entry = db_memory_to_entry(mem);
+            if entry.embedding.is_empty() {
+                awaiting_embedding += 1;
             }
+            entries.push(entry);
         }
-        (entries, no_embedding)
+        (entries, awaiting_embedding)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_row(memory_id: &str, embedding: Option<Vec<f32>>, model: Option<&str>) -> nanna_storage::Memory {
+        nanna_storage::Memory {
+            id: 1,
+            memory_id: memory_id.to_string(),
+            content: "the harbor light was green".to_string(),
+            embedding,
+            embedding_model: model.map(str::to_string),
+            session_id: None,
+            created_at: "2026-08-04 00:00:00".to_string(),
+            updated_at: "2026-08-04 00:00:00".to_string(),
+            metadata: None,
+            tags: Vec::new(),
+            workspace_id: None,
+            fsrs_stability: 1.0,
+            fsrs_difficulty: 5.0,
+            fsrs_last_access: 0,
+            fsrs_access_count: 0,
+            fsrs_importance: 3.0,
+            fsrs_storage_strength: 1.0,
+            fsrs_generation: 0,
+        }
+    }
+
+    /// A memory written while the embedding provider was down persists its
+    /// content fine, and used to vanish on the next restart: the loader
+    /// returned `None` for it, so it was never in the store, never searchable,
+    /// and never backfilled — because the backfill queue is built from loaded
+    /// entries. The row stayed in the database, unreachable, forever.
+    #[test]
+    fn a_row_awaiting_its_vector_survives_the_load() {
+        let entry = db_memory_to_entry(stored_row("m1", None, None));
+        assert_eq!(entry.id, "m1");
+        assert_eq!(entry.content, "the harbor light was green");
+        assert!(entry.embedding.is_empty(), "no vector yet, by definition");
+        assert!(
+            entry.embeddings.is_empty(),
+            "an empty vector must not be bucketed under any model — that would \
+             claim the model had embedded it and drop it out of the queue"
+        );
+    }
+
+    /// The `None` case must not be reachable by writing an empty vector either:
+    /// a row can carry `Some(vec![])` from an older write path, and bucketing
+    /// that under its recorded model name would be the same lie.
+    #[test]
+    fn an_empty_stored_vector_is_not_bucketed_under_its_model() {
+        let entry = db_memory_to_entry(stored_row("m2", Some(Vec::new()), Some("ollama:nomic")));
+        assert!(entry.embedding.is_empty());
+        assert!(
+            entry.embeddings.is_empty(),
+            "an empty vector claims no model, whatever the column says"
+        );
+    }
+
+    #[test]
+    fn a_row_with_a_vector_round_trips_into_its_model_bucket() {
+        let entry = db_memory_to_entry(stored_row("m3", Some(vec![0.1, 0.2]), Some("ollama:nomic")));
+        assert_eq!(entry.embedding, vec![0.1, 0.2]);
+        assert_eq!(entry.embeddings.get("ollama:nomic"), Some(&vec![0.1, 0.2]));
+    }
+
+    /// The count exists so the load can SAY what it deferred. Silence is what
+    /// made the old behaviour survive: "skipped N" read as housekeeping.
+    #[test]
+    fn conversion_reports_how_many_await_a_vector_and_drops_none() {
+        let rows = vec![
+            stored_row("a", Some(vec![0.1, 0.2]), Some("ollama:nomic")),
+            stored_row("b", None, None),
+            stored_row("c", None, None),
+        ];
+        let (entries, awaiting) = TursoMemoryPersistence::convert_rows(rows);
+        assert_eq!(entries.len(), 3, "every row must survive the conversion");
+        assert_eq!(awaiting, 2);
     }
 }
