@@ -1759,9 +1759,24 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// Build HTTP client with sensible timeouts
+    /// Remote-provider HTTP client.
+    ///
+    /// No TOTAL request deadline, for the same reason the Ollama client below
+    /// has none: `reqwest`'s `.timeout()` covers the response BODY, so it
+    /// aborts a healthy stream that is still delivering tokens, purely for
+    /// taking too long overall. A 120-second cap did that to any turn longer
+    /// than two minutes — and long turns are now the normal case, with
+    /// thinking on by default, real context windows in place of the phantom
+    /// 32k floor, and a ceiling that covers reasoning as well as the answer.
+    /// The failure surfaced as a stream error after the full input cost had
+    /// already been paid, and read as a model fault rather than a client one.
+    ///
+    /// A genuine stall is still caught, by silence BETWEEN chunks
+    /// (`read_timeout`), which a live stream never hits. Anthropic's own SDKs
+    /// default to a 10-minute total for the same reason.
     fn build_http_client() -> Client {
         Client::builder()
-            .timeout(std::time::Duration::from_secs(120))  // 2 min total timeout
+            .read_timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new())
@@ -1826,11 +1841,11 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     ///
     /// Source order: what the caller explicitly asked for, then the live
     /// latch, then min(env pin, probed/nominal size) at latch initialization.
-    fn resolve_num_ctx(request: &AnthropicRequest) -> u32 {
-        if let Some(explicit) = request.context_limit {
+    fn resolve_num_ctx(model: &str, explicit: Option<u32>) -> u32 {
+        if let Some(explicit) = explicit {
             return explicit;
         }
-        if let Some(latched) = Self::latched_num_ctx(&request.model) {
+        if let Some(latched) = Self::latched_num_ctx(model) {
             return latched;
         }
         // Explicit beats computed — downward. `NANNA_OLLAMA_NUM_CTX` is set by
@@ -1854,12 +1869,12 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // one fault at a sane pin is usually a transient blip, healed by a
         // runner reset alone): demotion below the pin keeps working because
         // the latch, not the env, is consulted once it exists.
-        let sized = Self::fit_context_to_free_vram(&request.model).unwrap_or(16_384);
+        let sized = Self::fit_context_to_free_vram(model).unwrap_or(16_384);
         let start = match Self::env_num_ctx() {
             Some(pinned) => {
                 let start = pinned.min(sized);
                 tracing::info!(
-                    model = %request.model,
+                    model = %model,
                     pinned = start,
                     requested = pinned,
                     sized,
@@ -1871,7 +1886,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             }
             None => sized,
         };
-        Self::latch_num_ctx(&request.model, start);
+        Self::latch_num_ctx(model, start);
         start
     }
 
@@ -2944,7 +2959,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // `CUDA error: an illegal memory access was encountered` rather than a
         // clean allocation failure. So the budget reserves a fraction of free
         // VRAM for it instead of spending everything on cache.
-        let num_ctx = Self::resolve_num_ctx(request);
+        let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
         tracing::info!(
             model = %request.model,
             num_ctx,
@@ -3246,15 +3261,19 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             })
             .collect();
 
-        let options = if request.temperature.is_some() || request.max_tokens.is_some() || request.context_limit.is_some() {
-            Some(OllamaOptions {
-                temperature: request.temperature,
-                num_predict: request.max_tokens,
-                num_ctx: request.context_limit,
-            })
-        } else {
-            None
-        };
+        // Size the window the same way the Anthropic-shaped path does. Left
+        // unset, Ollama used the Modelfile default — commonly 2k-8k — and
+        // silently truncated the prompt server-side, which is every secondary
+        // caller on this path: dream summaries, multi-agent decomposition and
+        // aggregation, and context compression. They were built and budgeted
+        // against the model's real window and then quietly cut down to a
+        // fraction of it.
+        let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
+        let options = Some(OllamaOptions {
+            temperature: request.temperature,
+            num_predict: request.max_tokens,
+            num_ctx: Some(num_ctx),
+        });
 
         let body = OllamaRequest {
             model: &request.model,
@@ -4630,7 +4649,7 @@ impl LlmClient {
             // sharing with the desktop, and it failed as
             // `CUDA error: an illegal memory access was encountered` rather
             // than as a clean allocation failure.
-            let num_ctx = Self::resolve_num_ctx(&request);
+            let num_ctx = Self::resolve_num_ctx(&request.model, request.context_limit);
             tracing::info!(
                 model = %request.model,
                 num_ctx,
@@ -6181,7 +6200,7 @@ mod tests {
         request.context_limit = None;
 
         assert_eq!(
-            LlmClient::resolve_num_ctx(&request),
+            LlmClient::resolve_num_ctx(&request.model, request.context_limit),
             16_384,
             "an explicit override must win over whatever the card measures"
         );
@@ -6223,7 +6242,7 @@ mod tests {
         // env-touching tests, and nothing else reads this key.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
         request.model = "test-env-pin-shrinks:1b".to_string();
-        assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
+        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 8_192);
         assert_eq!(
             LlmClient::latched_num_ctx("test-env-pin-shrinks:1b"),
             Some(8_192),
@@ -6234,7 +6253,7 @@ mod tests {
         // value — the env cannot inflate the window past the machine.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "32768") };
         request.model = "test-env-pin-cannot-grow:1b".to_string();
-        assert_eq!(LlmClient::resolve_num_ctx(&request), 16_384);
+        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 16_384);
 
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
@@ -6252,21 +6271,21 @@ mod tests {
         let mut request = request_with_tool_history(serde_json::json!({}));
         request.model = "test-env-pin-demotes:1b".to_string();
         request.context_limit = None;
-        assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
+        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 8_192);
 
         assert_eq!(
             LlmClient::demote_context("test-env-pin-demotes:1b", None),
             Some(6_144)
         );
         assert_eq!(
-            LlmClient::resolve_num_ctx(&request),
+            LlmClient::resolve_num_ctx(&request.model, request.context_limit),
             6_144,
             "a demotion below the pin must stick — the pin must not re-inflate it"
         );
 
         request.context_limit = Some(2_048);
         assert_eq!(
-            LlmClient::resolve_num_ctx(&request),
+            LlmClient::resolve_num_ctx(&request.model, request.context_limit),
             2_048,
             "an explicit request limit keeps its precedence over pin and latch"
         );
@@ -6288,7 +6307,7 @@ mod tests {
         request.context_limit = None;
 
         let out = capture_info_logs(|| {
-            assert_eq!(LlmClient::resolve_num_ctx(&request), 8_192);
+            assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 8_192);
         });
         assert!(
             out.contains("NANNA_OLLAMA_NUM_CTX pins"),
@@ -6324,7 +6343,7 @@ mod tests {
         request.context_limit = None;
 
         let out = capture_info_logs(|| {
-            assert_eq!(LlmClient::resolve_num_ctx(&request), 16_384);
+            assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 16_384);
         });
         assert!(
             !out.contains("NANNA_OLLAMA_NUM_CTX pins"),

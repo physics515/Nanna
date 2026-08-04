@@ -820,9 +820,11 @@ impl AgentService {
                 // agent's actual output budget — the reserve tracks
                 // max_tokens instead of the provider's max_output claim, so
                 // small-output agents keep most of the window for input.
-                // Claude interleaved thinking generates ON TOP of max_tokens;
-                // its budget joins the reserve (Ollama bounds thinking inside
-                // num_predict and needs no extra).
+                // Claude's max_tokens is ONE ceiling over thinking and the
+                // visible answer together, so a thinking run needs the reserve
+                // widened by the reasoning budget or the answer is what gets
+                // squeezed out (Ollama bounds thinking inside num_predict and
+                // needs no extra).
                 let thinking_reserve_tokens = if agent_config.model.starts_with("claude") {
                     agent_config
                         .thinking_mode

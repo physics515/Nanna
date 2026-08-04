@@ -2200,8 +2200,19 @@ pub struct Agent {
 /// callbacks or IO — so it is unit-testable against synthetic event sequences.
 #[derive(Default)]
 struct StreamBlockAssembler {
-    /// Accumulated text (index-0 / text blocks). Also the returned `LlmResult.text`.
+    /// Every text delta of the turn, concatenated. This is the returned
+    /// `LlmResult.text` — the user-visible reply — so it must NOT be reset
+    /// per block.
     text: String,
+    /// Text of the block currently open, reset each time one closes.
+    ///
+    /// Separate from `text` because the two want opposite lifetimes: the reply
+    /// is the whole turn, a stored `ContentBlock::Text` is one block. Pushing
+    /// `text` per block made every block after the first contain all the text
+    /// before it, so a `text -> tool -> text -> tool` turn stored
+    /// `[Text(A), Tool, Text(A+B), Tool]` and replayed the model's own
+    /// commentary back to it, duplicated, on every later round.
+    block_text: String,
     /// Current thinking block content.
     thinking_text: String,
     /// Current thinking block signature.
@@ -2218,6 +2229,7 @@ struct StreamBlockAssembler {
 impl StreamBlockAssembler {
     fn on_text(&mut self, t: &str) {
         self.text.push_str(t);
+        self.block_text.push_str(t);
     }
     fn on_thinking(&mut self, t: &str) {
         self.thinking_text.push_str(t);
@@ -2270,8 +2282,10 @@ impl StreamBlockAssembler {
             self.current_block_type.clear();
             return true;
         }
-        if !self.text.is_empty() {
-            self.content_blocks.push(ContentBlock::Text { text: self.text.clone() });
+        if !self.block_text.is_empty() {
+            self.content_blocks.push(ContentBlock::Text {
+                text: std::mem::take(&mut self.block_text),
+            });
         }
         self.current_block_type.clear();
         false
@@ -3010,12 +3024,55 @@ impl Agent {
                             })
                             .await;
                     }
-                    // Rebuild request with primary model
+                    // Rebuild request with primary model. Everything the
+                    // routing swap re-derived has to be re-derived back:
+                    // `max_tokens`, `thinking` and `temperature` were all
+                    // rebuilt against the ROUTED tier's window, output cap and
+                    // contract, none of which describe the primary. Restoring
+                    // only the name left the rescue turn running on the cheap
+                    // tier's ceiling — and if that tier's model info was a
+                    // cache miss it was the 4096 unknown floor, so the retry
+                    // that exists to save the turn truncated it instead.
                     request.model = self.config.model.clone();
                     request.cache_control = if request.model.starts_with("claude") {
                         Some(CacheControl::ephemeral())
                     } else {
                         None
+                    };
+                    let primary_contract =
+                        nanna_llm::anthropic_model_contract(&request.model);
+                    let primary_mode =
+                        options.thinking_mode.unwrap_or(self.config.thinking_mode);
+                    let primary_info = nanna_llm::model_info_from_cache_or_unknown(
+                        &request.model,
+                        "",
+                    );
+                    request.max_tokens = request_output_budget(
+                        &request.model,
+                        &primary_info,
+                        window_scaled_output_reserve(
+                            primary_info.context_window,
+                            self.config.max_tokens as usize,
+                        ),
+                        primary_mode,
+                        self.llm.provider() == nanna_llm::Provider::Anthropic,
+                    );
+                    request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic
+                    {
+                        thinking_for_model(primary_contract, primary_mode, request.max_tokens)
+                    } else {
+                        None
+                    };
+                    let primary_thinks = request
+                        .thinking
+                        .as_ref()
+                        .is_some_and(nanna_llm::ThinkingConfig::is_thinking);
+                    request.temperature = if nanna_llm::is_claude_model(&request.model)
+                        && (primary_contract.sampling_removed || primary_thinks)
+                    {
+                        None
+                    } else {
+                        Some(self.config.temperature)
                     };
                     let escalation_start = std::time::Instant::now();
                     result = self.call_llm(&request, &options, &mut state).await;
@@ -3922,6 +3979,7 @@ impl Agent {
                         // re-measures the same text and trips again immediately.
                         state.current_reasoning.clear();
                         asm.text.clear();
+                        asm.block_text.clear();
                         break;
                     }
                 }
@@ -6960,6 +7018,40 @@ mod tests {
         assert!(matches!(asm.content_blocks[0], ContentBlock::Text { .. }));
         assert!(matches!(asm.content_blocks[1], ContentBlock::ToolUse { .. }));
         assert_eq!(asm.text, "hello world");
+    }
+
+    /// One text block never showed the bug — the second one carried the
+    /// first's text too, because the stored block cloned the whole-turn
+    /// buffer instead of the block's own. The model then saw its own
+    /// commentary replayed, duplicated, on every later round.
+    #[test]
+    fn a_second_text_block_does_not_repeat_the_first() {
+        let mut asm = StreamBlockAssembler::default();
+        asm.on_block_start(0, "text".into(), None, None);
+        asm.on_text("first. ");
+        asm.on_block_stop(0);
+        asm.on_block_start(1, "tool_use".into(), Some("c1".into()), Some("read_file".into()));
+        asm.on_tool_delta(1, "{}");
+        asm.on_block_stop(1);
+        asm.on_block_start(2, "text".into(), None, None);
+        asm.on_text("second.");
+        asm.on_block_stop(2);
+
+        let texts: Vec<&str> = asm
+            .content_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["first. ", "second."],
+            "each stored block holds only its own text"
+        );
+        // The reply the user sees is still the whole turn.
+        assert_eq!(asm.text, "first. second.");
     }
 }
 

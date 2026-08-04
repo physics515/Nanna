@@ -961,7 +961,8 @@ impl AgentContext {
             );
 
             // Find content to summarize (oldest messages first, keeping most recent)
-            let content_to_summarize = self.extract_content_for_summarization(max_chars_per_chunk);
+            let (content_to_summarize, covered_ends) =
+                self.extract_content_for_summarization(max_chars_per_chunk);
 
             if content_to_summarize.is_empty() {
                 warn!("No content available to summarize, truncating remaining");
@@ -970,21 +971,49 @@ impl AgentContext {
             }
 
             // Try to summarize with fallback
-            match Self::summarize_content_with_fallback(&content_to_summarize, config).await
+            match Self::summarize_content_with_fallback(
+                &content_to_summarize,
+                &covered_ends,
+                config,
+            )
+            .await
             {
-                Ok(summary) => {
+                Ok((summary, consumed)) => {
+                    // Only messages the summarizer actually READ may be
+                    // dropped. It truncates the blob to its own window, which
+                    // on a small local summarizer is a fraction of a large
+                    // chat window — replacing the whole extraction on the
+                    // strength of that summary silently discarded the rest.
+                    let covered_messages =
+                        covered_ends.iter().take_while(|&&end| end <= consumed).count();
+
+                    if covered_messages == 0 {
+                        // Not even one whole message fit. Dropping anything
+                        // here would delete more than was summarized, and
+                        // looping would spin on the same content forever.
+                        warn!(
+                            consumed,
+                            first_message_ends_at = covered_ends.first().copied().unwrap_or(0),
+                            "summarizer window too small for a single message; truncating instead"
+                        );
+                        self.truncate_to_limit();
+                        break;
+                    }
+
                     info!(
-                        original_len = content_to_summarize.len(),
+                        extracted_len = content_to_summarize.len(),
+                        summarized_len = consumed,
+                        covered_messages,
                         summary_len = summary.len(),
                         compression = format!(
                             "{:.1}x",
-                            content_to_summarize.len() as f64 / summary.len().max(1) as f64
+                            consumed as f64 / summary.len().max(1) as f64
                         ),
                         "Content summarized successfully"
                     );
 
                     // Replace the summarized content with the summary
-                    self.replace_with_summary(&content_to_summarize, &summary);
+                    self.replace_with_summary(covered_messages, &summary);
                 }
                 Err(e) => {
                     warn!(error = %e, "All summarization models failed, truncating");
@@ -1006,15 +1035,24 @@ impl AgentContext {
     }
 
     /// Extract content from oldest messages for summarization
-    fn extract_content_for_summarization(&self, max_chars: usize) -> String {
+    /// Gather the oldest messages into one blob, plus the running length of
+    /// that blob after each message it FULLY covered.
+    ///
+    /// Those offsets are what make the replacement safe. Extraction stops at
+    /// `max_chars`, and the summarizer truncates again to its own window, so
+    /// what actually got summarized is a PREFIX of this content — not all of
+    /// it, and not a whole number of messages unless someone checks. Knowing
+    /// where each message ended lets the caller drop exactly the covered ones.
+    fn extract_content_for_summarization(&self, max_chars: usize) -> (String, Vec<usize>) {
         let mut content = String::new();
         let mut chars_collected = 0;
+        let mut covered_ends: Vec<usize> = Vec::new();
 
         // Keep at least the last 2 messages (user query + assistant response in progress)
         let messages_to_consider = if self.messages.len() > 2 {
             &self.messages[..self.messages.len() - 2]
         } else {
-            return String::new(); // Not enough messages to summarize
+            return (String::new(), covered_ends); // Not enough messages to summarize
         };
 
         for msg in messages_to_consider {
@@ -1038,58 +1076,203 @@ impl AgentContext {
                         let end = block_text.floor_char_boundary(max_chars.min(block_text.len()));
                         content.push_str(&block_text[..end]);
                     }
-                    return content;
+                    return (content, covered_ends);
                 }
 
                 content.push_str(&format!("[{}]: {}\n", msg.role, block_text));
                 chars_collected += block_text.len();
             }
+            // Recorded only once every block of the message fit: a partially
+            // captured message must never be dropped on the strength of a
+            // summary that saw only part of it.
+            covered_ends.push(content.len());
         }
 
-        content
+        (content, covered_ends)
     }
 
-    /// Try to summarize content using models in priority order
+    /// Split `content` into pieces that each fit `budget_chars`, cutting only
+    /// at the message boundaries in `covered_ends`.
+    ///
+    /// Returns `(chunk_text, end_offset_in_content)` per piece. Cutting only at
+    /// boundaries is what lets the caller say which whole messages a set of
+    /// summaries covers; a chunk ending mid-message could not be counted.
+    ///
+    /// A single message larger than the budget gets its own chunk. The
+    /// summarizer truncates it internally and the caller decides whether that
+    /// partial reading may retire it — splitting mid-message is lossy either
+    /// way, and at least this keeps every other message whole.
+    fn chunk_at_message_boundaries(
+        content: &str,
+        covered_ends: &[usize],
+        budget_chars: usize,
+    ) -> Vec<(String, usize)> {
+        let budget = budget_chars.max(1);
+        let mut chunks: Vec<(String, usize)> = Vec::new();
+        let mut start = 0usize;
+        let mut last_end = 0usize;
+
+        for &end in covered_ends {
+            if end <= start {
+                continue;
+            }
+            if end - start > budget {
+                // Flush the whole messages that fit before this one.
+                if last_end > start {
+                    chunks.push((content[start..last_end].to_string(), last_end));
+                    start = last_end;
+                }
+                // Still over? Then this message alone exceeds the budget.
+                if end - start > budget {
+                    chunks.push((content[start..end].to_string(), end));
+                    start = end;
+                }
+            }
+            last_end = end;
+        }
+        if last_end > start {
+            chunks.push((content[start..last_end].to_string(), last_end));
+        }
+        chunks
+    }
+
+    /// Join per-chunk summaries into one document.
+    ///
+    /// Numbered because the chunks are sequential slices of one conversation:
+    /// without the order a reader cannot tell whether two statements are a
+    /// contradiction or a change over time.
+    fn splice_summaries(parts: &[String]) -> String {
+        if parts.len() == 1 {
+            return parts[0].clone();
+        }
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("[Part {} of {}]\n{}", i + 1, parts.len(), p.trim()))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Summarize the whole blob by chunking it to the summarizer's own window,
+    /// summarizing each chunk in order, and splicing the results.
+    ///
+    /// Returns `(spliced_summary, chars_of_content_actually_read)`.
+    ///
+    /// Handing the whole blob over and letting the model truncate silently
+    /// threw away everything past its window — and a secondary model's context
+    /// is routinely a fraction of the chat model's, so a 32k local summarizer
+    /// asked to compress a 1M-token conversation read the first few percent
+    /// and reported success. Chunking reads all of it.
+    ///
+    /// A model that fails partway is abandoned for the next candidate rather
+    /// than half-trusted: its summaries describe only a prefix, and splicing
+    /// two models' voices mid-document is a worse artifact than letting the
+    /// next candidate do the whole job.
     async fn summarize_content_with_fallback(
         content: &str,
+        covered_ends: &[usize],
         config: &ContextSummarizationConfig,
-    ) -> Result<String, String> {
+    ) -> Result<(String, usize), String> {
         for model_spec in &config.model_priority {
             debug!(model = %model_spec, "Attempting summarization");
 
-            match Self::try_summarize_with_model(model_spec, content, config).await {
-                Ok(summary) => {
-                    info!(model = %model_spec, "Summarization succeeded");
-                    return Ok(summary);
-                }
-                Err(e) => {
-                    warn!(model = %model_spec, error = %e, "Summarization failed, trying next");
+            let (client, model_name, budget) =
+                match Self::resolve_summarizer(model_spec, config).await {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        warn!(model = %model_spec, error = %e, "Summarizer unavailable, trying next");
+                        continue;
+                    }
+                };
+
+            let chunks = Self::chunk_at_message_boundaries(content, covered_ends, budget);
+            if chunks.is_empty() {
+                warn!(model = %model_spec, "Nothing to summarize after chunking");
+                continue;
+            }
+
+            let mut parts: Vec<String> = Vec::with_capacity(chunks.len());
+            let mut consumed = 0usize;
+            let mut failed = false;
+
+            for (i, (chunk, end)) in chunks.iter().enumerate() {
+                match Self::summarize_chunk(&client, &model_name, chunk).await {
+                    Ok(summary) => {
+                        parts.push(summary);
+                        consumed = *end;
+                    }
+                    Err(e) => {
+                        warn!(
+                            model = %model_spec,
+                            chunk = i + 1,
+                            of = chunks.len(),
+                            error = %e,
+                            "Chunk summarization failed"
+                        );
+                        failed = true;
+                        break;
+                    }
                 }
             }
+
+            if failed {
+                continue;
+            }
+
+            info!(
+                model = %model_spec,
+                chunks = chunks.len(),
+                read_chars = consumed,
+                "Summarization succeeded"
+            );
+            return Ok((Self::splice_summaries(&parts), consumed));
         }
 
         Err("All summarization models failed".to_string())
     }
 
     /// Try to summarize with a specific model via direct LLM call
-    async fn try_summarize_with_model(
+    /// Resolve a summarizer candidate to `(client, model, input budget in chars)`.
+    ///
+    /// Separated from the call so the budget can be known BEFORE the content is
+    /// split: chunking to this number is what lets every chunk be read whole
+    /// instead of the tail being silently truncated away. Summarizers in one
+    /// priority list can have radically different windows, so this is resolved
+    /// per candidate, not once for the list.
+    async fn resolve_summarizer(
         model_spec: &str,
-        content: &str,
         config: &ContextSummarizationConfig,
-    ) -> Result<String, String> {
+    ) -> Result<(nanna_llm::LlmClient, String, usize), String> {
         let (client, model_name) = Self::create_client_for_model(model_spec, config)?;
-
-        // Fetch this fallback model's own limits; summarizers may have radically
-        // different windows even when they are in the same priority list.
         let cache = nanna_llm::ModelInfoCache::default_location();
         let model_info = client.get_model_info(&model_name, cache.as_ref()).await;
         // Reserve output capacity and prompt framing before filling the input.
+        let budget = model_info
+            .hard_input_limit()
+            .saturating_sub(512)
+            .saturating_mul(4);
+        Ok((client, model_name, budget.max(1)))
+    }
+
+    /// Summarize one chunk that is already sized to fit `model_name`.
+    ///
+    /// The truncation here is a backstop, not the sizing mechanism — chunks
+    /// arrive pre-fitted. It only bites when a single message exceeds the whole
+    /// window, which the caller accounts for separately.
+    async fn summarize_chunk(
+        client: &nanna_llm::LlmClient,
+        model_name: &str,
+        content: &str,
+    ) -> Result<String, String> {
+        let cache = nanna_llm::ModelInfoCache::default_location();
+        let model_info = client.get_model_info(model_name, cache.as_ref()).await;
         let max_chars = model_info.hard_input_limit().saturating_sub(512).saturating_mul(4);
         let truncated = if content.len() > max_chars {
             &content[..content.floor_char_boundary(max_chars)]
         } else {
             content
         };
+        let model_name = model_name.to_string();
 
         let prompt = format!(
             "Summarize the following conversation history concisely. Preserve key facts, decisions, \
@@ -1185,10 +1368,23 @@ impl AgentContext {
     /// Uses content-defined chunking (CDC) for deduplication - this creates
     /// deterministic chunk boundaries based on content, allowing detection of
     /// duplicate content even when split differently.
-    fn replace_with_summary(&mut self, _original_content: &str, summary: &str) {
-        // Remove old messages that were summarized (keep last 2)
+    /// Replace the first `covered_messages` messages with `summary`.
+    ///
+    /// The count is the caller's, not this function's, and that is the whole
+    /// point. This used to take the extracted content, ignore it, and remove
+    /// everything but the last two messages — correct only if the summarizer
+    /// had read everything extracted. It had not: extraction stops at the
+    /// chat model's budget and the summarizer truncates again to its own, so
+    /// on a large chat window with a small local summarizer the great majority
+    /// of the removed history was never summarized at all. It vanished, and
+    /// the compression ratio logged against the pre-truncation length made it
+    /// look like a triumph.
+    fn replace_with_summary(&mut self, covered_messages: usize, summary: &str) {
+        // Never take the last 2 (live user query + in-flight response), and
+        // never take more than the summarizer actually read.
         let keep_count = 2.min(self.messages.len());
-        let remove_count = self.messages.len().saturating_sub(keep_count);
+        let removable = self.messages.len().saturating_sub(keep_count);
+        let remove_count = covered_messages.min(removable);
 
         if remove_count > 0 {
             // Use CDC to hash content blocks from messages being removed
@@ -1597,6 +1793,114 @@ fn chrono_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The data-loss bug: extraction can gather far more than the summarizer
+    /// will read, so the replacement must be keyed to what was actually
+    /// summarized. Previously it removed everything but the last two messages
+    /// regardless, which on a large chat window with a small local summarizer
+    /// discarded the great majority of the history unsummarized.
+    #[test]
+    fn only_messages_the_summarizer_read_are_replaced() {
+        let mut ctx = AgentContext::new("s1");
+        for i in 0..10 {
+            ctx.messages.push(AnthropicMessage::user_text(format!("message {i}")));
+        }
+
+        // Everything except the reserved last two is offered up...
+        let (content, covered_ends) = ctx.extract_content_for_summarization(usize::MAX);
+        assert_eq!(covered_ends.len(), 8, "10 messages, last 2 always reserved");
+        assert!(!content.is_empty());
+
+        // ...but suppose the summarizer's window only reached message 3.
+        let consumed = covered_ends[2];
+        let covered = covered_ends.iter().take_while(|&&e| e <= consumed).count();
+        assert_eq!(covered, 3);
+
+        ctx.replace_with_summary(covered, "summary of the first three");
+        assert_eq!(
+            ctx.messages.len(),
+            7,
+            "only the 3 summarized messages are gone; the other 7 survive"
+        );
+        assert!(
+            ctx.messages.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("message 3")
+            ))),
+            "an unsummarized message must not be deleted"
+        );
+    }
+
+    /// A partially-captured message is not counted as covered, so it cannot be
+    /// deleted on the strength of a summary that saw only part of it.
+    #[test]
+    fn a_partially_captured_message_is_never_counted_as_covered() {
+        let mut ctx = AgentContext::new("s1");
+        for i in 0..5 {
+            ctx.messages.push(AnthropicMessage::user_text(format!(
+                "{i}: {}",
+                "padding ".repeat(50)
+            )));
+        }
+        // Room for roughly one message, so the second is cut mid-way.
+        let (_, covered_ends) = ctx.extract_content_for_summarization(600);
+        assert!(
+            covered_ends.len() <= 1,
+            "a truncated message is not reported as covered (got {})",
+            covered_ends.len()
+        );
+    }
+
+    /// Chunks must cut only at message boundaries, cover the whole input, and
+    /// never exceed the summarizer's budget — that is what lets every chunk be
+    /// read whole instead of the tail being truncated away.
+    #[test]
+    fn chunking_covers_everything_and_cuts_only_at_message_boundaries() {
+        // Four messages ending at 100/200/300/400.
+        let content: String = "x".repeat(400);
+        let ends = vec![100usize, 200, 300, 400];
+
+        let chunks = AgentContext::chunk_at_message_boundaries(&content, &ends, 250);
+        assert!(chunks.len() >= 2, "400 chars into a 250 budget needs splitting");
+        for (text, _) in &chunks {
+            assert!(text.len() <= 250, "no chunk may exceed the budget");
+        }
+        // Every cut lands on a message boundary, and the last covers the end.
+        for (_, end) in &chunks {
+            assert!(ends.contains(end), "cut at {end} is not a message boundary");
+        }
+        assert_eq!(chunks.last().unwrap().1, 400, "all content is covered");
+        let rebuilt: String = chunks.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(rebuilt, content, "chunks concatenate back to the input");
+    }
+
+    #[test]
+    fn a_message_larger_than_the_budget_gets_its_own_chunk() {
+        let content: String = "y".repeat(500);
+        // Second message alone is 380 chars, over a 200 budget.
+        let ends = vec![100usize, 480, 500];
+        let chunks = AgentContext::chunk_at_message_boundaries(&content, &ends, 200);
+        assert_eq!(chunks.last().unwrap().1, 500, "still covers everything");
+        let rebuilt: String = chunks.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(rebuilt, content);
+        assert!(
+            chunks.iter().any(|(t, _)| t.len() > 200),
+            "the oversized message is isolated rather than split mid-message"
+        );
+    }
+
+    #[test]
+    fn spliced_summaries_keep_their_order() {
+        assert_eq!(AgentContext::splice_summaries(&["only".to_string()]), "only");
+        let joined =
+            AgentContext::splice_summaries(&["first".to_string(), "second".to_string()]);
+        assert!(joined.contains("[Part 1 of 2]"));
+        assert!(joined.contains("[Part 2 of 2]"));
+        assert!(
+            joined.find("first").unwrap() < joined.find("second").unwrap(),
+            "order carries the difference between contradiction and change over time"
+        );
+    }
 
     #[test]
     fn implausible_summaries_are_rejected() {
