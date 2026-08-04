@@ -119,7 +119,6 @@ pub async fn run_cli(
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: Some(10),
-        thinking_mode: nanna_agent::ThinkingMode::Instant,
         summarization_priority: config.llm.summarization_priority.clone(),
         summarization_ollama_url: config.llm.ollama_url.clone(),
         ..Default::default()
@@ -265,7 +264,6 @@ pub async fn run_once(config: &Config, prompt: &str, model: Option<String>) -> a
         max_tokens: config.llm.max_tokens,
         temperature: config.llm.temperature,
         max_iterations: Some(10),
-        thinking_mode: nanna_agent::ThinkingMode::Instant,
         summarization_priority: config.llm.summarization_priority.clone(),
         summarization_ollama_url: config.llm.ollama_url.clone(),
         ..Default::default()

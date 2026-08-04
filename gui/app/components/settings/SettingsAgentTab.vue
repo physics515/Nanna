@@ -128,16 +128,13 @@
     </SettingsSection>
 
     <!-- Response Preferences -->
-    <SettingsSection title="Response Preferences" description="Streaming, thinking, length, and long-run loop controls.">
+    <!--
+      No thinking switch here by design (owner directive 2026-08-04): thinking
+      is always on. The switch it replaced was also dead UI — the settings
+      payload never carried `thinking_enabled`, so it always rendered off.
+    -->
+    <SettingsSection title="Response Preferences" description="Streaming, length, and long-run loop controls.">
       <div class="space-y-4">
-        <div class="flex items-center justify-between">
-          <div>
-            <div class="text-sm font-medium text-nanna-text">Thinking Mode</div>
-            <div class="text-xs text-nanna-text-dim">Show reasoning process</div>
-          </div>
-          <UiSwitch :model-value="settings?.thinking_enabled" label="Thinking enabled" @update:model-value="setThinkingEnabled" />
-        </div>
-
         <div class="flex items-center justify-between">
           <div>
             <div class="text-sm font-medium text-nanna-text">Streaming</div>
@@ -357,15 +354,6 @@ async function savePersonalityMode() {
   try {
     await invoke('set_personality_mode', { mode: personalityMode.value })
     showToast('Personality mode saved', 'success')
-  } catch (e: any) {
-    showToast(`Couldn't save: ${e.message || e}`, 'error')
-  }
-}
-
-async function setThinkingEnabled(enabled: boolean) {
-  try {
-    await invoke('set_thinking_enabled', { enabled })
-    await loadSettings()
   } catch (e: any) {
     showToast(`Couldn't save: ${e.message || e}`, 'error')
   }

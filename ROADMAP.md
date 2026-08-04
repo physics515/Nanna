@@ -2621,6 +2621,61 @@ skill.
       `think` by model detection; the OpenAI-compat conversion drops it. NOTE: a config file that
       explicitly saved `thinking_enabled = false` (any install that touched Settings before this)
       keeps false — flip it in Settings → Agent.
+      **SUPERSEDED 2026-08-04 (below): the flag and its switch are gone.**
+- [x] **Thinking always on, one knob (2026-08-04, owner)** — "thinking should be on by default and
+      remove the option in settings to turn it off." The two disconnected knobs collapsed into one:
+      `ThinkingMode` now `#[default]`s to `Medium` and `[agent] thinking_enabled` is **deleted** —
+      along with the Settings → Agent switch, the `set_thinking_enabled` command and its
+      `generate_handler!` registration, and the field in `useSettingsPage`/the e2e mock. Legacy
+      `config.toml` files still carrying `thinking_enabled = true` load unchanged (no
+      `deny_unknown_fields` anywhere in the chain; test:
+      `legacy_thinking_enabled_key_still_loads`).
+      **The wire shape is the model's to dictate, not ours** (`anthropic_model_contract`,
+      nanna-llm). `budget_tokens` was REMOVED on Opus 5 / 4.8 / 4.7, Sonnet 5, and Fable 5 — the
+      first cut of this change sent `{"type":"enabled","budget_tokens":4096}` on every native
+      Anthropic request, which is a hard 400 on the model the owner actually runs. Three families:
+      adaptive (`{"type":"adaptive"}`, 4.6 and newer), legacy budgets (pre-4.6, clamped as below),
+      and always-on (Fable/Mythos, where an explicit `disabled` is itself rejected so muting
+      degrades to sending no field). An unrecognized `claude-*` name is assumed **current**, since
+      every generation since 4.6 has removed parameters rather than added them.
+      **`display` is why a correct adaptive request can still look broken:** on Opus 5 / 4.8 / 4.7,
+      Sonnet 5 and Fable 5 it defaults to `"omitted"`, which streams thinking blocks with *empty
+      text* — the actual reason no thinking rendered, and the reason we send
+      `display: "summarized"` there. The 4.6 family already defaults to summarized, so the field is
+      left off rather than sent speculatively.
+      Legacy budgets keep the derivation: `Medium` (4096) is the largest enum step that leaves the
+      visible answer `MIN_OUTPUT_RESERVE_TOKENS` (1112) of room inside the shipped
+      `max_tokens: 8192`, then clamped per request against the LIVE effective output budget
+      (`thinking_budget_for_output`): `min(configured, max_output − 1112)`, and **no** `thinking`
+      field at all when that leaves less than the API's 1024 minimum — the demoted-window path
+      (reserve as low as 1112) would otherwise emit `budget_tokens >= max_tokens`.
+      **`temperature` is dropped by model family, not by `thinking.is_some()`** — it was removed on
+      the same five models and 400s on its own. That fixed a live latent break beyond the main
+      loop: the summarizer, distiller, compressor, memory extractor and vision tool each hard-coded
+      a temperature and resolve their model dynamically (falling back to the main model), so all
+      five failed outright against Opus 5 before this. `sampling_temperature_for_model` gates on
+      `is_claude_model` first so a local `qwen3.5:9b` is not mistaken for an unrecognized Claude.
+      **The gate belongs at the wire boundary, not the call site** (`conform_to_anthropic_contract`,
+      run on the `complete_anthropic` / `stream_anthropic` dispatchers). Fixing the six
+      `AnthropicRequest` literals still missed the whole `CompletionRequest` family:
+      `CompletionRequest::default()` carries `temperature: Some(0.7)` and
+      `complete_anthropic_simple` converted it ungated, so sub-agent questions, multi-agent
+      decomposition/aggregation, dream summaries and `AgentContext::compress` all 400'd against
+      Opus 5. (The streaming arm's `if request.thinking.is_some()` rule never fired at all —
+      `with_thinking` has zero callers.) The dispatcher covers every caller at once, including the
+      OpenRouter/proxy paths that route Claude through the OpenAI-compat conversion.
+      The boundary also **translates `thinking: None` into an explicit `disabled`** where the model
+      accepts one. Omission used to mean "no thinking" everywhere — which is what every
+      `thinking: None` in this codebase was written to mean — but on Opus 5 / Sonnet 5 / Fable it
+      now means *adaptive*, so those auxiliary requests would reason inside a `max_tokens` sized for
+      no reasoning (512 for the distiller) and return `stop_reason: "max_tokens"` with empty text.
+      A silent truncation is worse than the 400 it replaced. Always-on models keep `None`.
+      **`claude-mythos-preview` is LEGACY, not Mythos 5** — it is the model those were migrated away
+      from (its published "before" example configures `budget_tokens`, and its prompt-cache minimum
+      groups with Opus 4.7), so the `mythos` substring must not sweep it into the always-on row.
+      Provider gate unchanged in effect: only `Provider::Anthropic` requests carry the field (the
+      OpenAI-compat conversion drops it, Ollama enables `think` by model detection).
+      `RunOptions::thinking_mode` stays as the internal per-run escape hatch.
 
 **Live GUI drive (2026-07-24, gemma4:12b):** planner does NOT over-decompose — "what is 2+2?" planned
 as 1 task (origin=Model); an 817-char project brief hit the 30s planner timeout while the model was

@@ -80,7 +80,6 @@ function installInPage(options = {}) {
       available_models: ['mock-model', 'local-tiny'],
       provider: 'local',
       streaming_enabled: true,
-      thinking_enabled: false,
       agent_name: 'Nanna',
       max_tokens: 4096,
       anthropic_api_key: apiKeySet ? 'sk-ant-e2e-mock' : '',
@@ -388,9 +387,6 @@ function installInPage(options = {}) {
       case 'set_streaming_enabled':
         state.config.streaming_enabled = !!(pick(args, 'enabled') ?? true);
         return true;
-      case 'set_thinking_enabled':
-        state.config.thinking_enabled = !!(pick(args, 'enabled') ?? false);
-        return true;
       case 'set_agent_name':
         state.config.agent_name = pick(args, 'name') || state.config.agent_name;
         return true;
@@ -416,7 +412,6 @@ function installInPage(options = {}) {
           available_providers: ['anthropic', 'openai', 'openrouter', 'ollama', 'local'],
           model: state.config.model,
           streaming_enabled: state.config.streaming_enabled,
-          thinking_enabled: state.config.thinking_enabled,
           agent_name: state.config.agent_name,
           max_tokens: state.config.max_tokens,
           api_key_set: state.config.api_key_set,

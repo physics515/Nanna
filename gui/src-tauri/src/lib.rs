@@ -285,7 +285,6 @@ pub fn run() {
             commands::settings::set_system_prompt,
             commands::settings::set_agent_name,
             commands::settings::set_personality_mode,
-            commands::settings::set_thinking_enabled,
             commands::settings::set_streaming_enabled,
             commands::settings::set_max_tokens,
             commands::settings::set_agent_iteration_policy,

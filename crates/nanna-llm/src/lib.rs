@@ -475,6 +475,28 @@ fn default_model_info(model: &str, provider: &str) -> ModelInfo {
     unknown_model_info(model, provider)
 }
 
+/// One model object from `GET /v1/models/{id}`.
+///
+/// The field names are load-bearing and were wrong: the Models API returns
+/// **`max_input_tokens`** (the context window) and **`max_tokens`** (the output
+/// cap), and there is no `context_window` field at all. Reading for the wrong
+/// names is silent — both `Option`s deserialize to `None`, both fall back to
+/// the unknown-model floor, and that floor gets written to the on-disk cache
+/// with a fresh timestamp. Every Anthropic model resolved to 32k context / 4k
+/// output as a result, no matter what it actually was.
+///
+/// The aliases keep the older spellings working if a proxy or gateway answers
+/// with them. Deliberately at module scope rather than inside the fetch so the
+/// mapping is testable without a network round trip.
+#[derive(Deserialize)]
+struct AnthropicModelResponse {
+    id: String,
+    #[serde(default, alias = "context_window")]
+    max_input_tokens: Option<usize>,
+    #[serde(default, alias = "max_output_tokens")]
+    max_tokens: Option<usize>,
+}
+
 /// File-based cache for model information
 #[derive(Clone)]
 pub struct ModelInfoCache {
@@ -482,6 +504,13 @@ pub struct ModelInfoCache {
 }
 
 impl ModelInfoCache {
+    /// Bumped whenever a fix changes what a *correct* cached entry contains,
+    /// so previously-written entries are orphaned rather than served.
+    ///
+    /// v2: the Anthropic Models API response was being read with the wrong
+    /// field names, so every Anthropic model cached the unknown-model floor.
+    const SCHEMA_GENERATION: u32 = 2;
+
     /// Create a new cache with the specified directory
     pub fn new(cache_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -544,7 +573,14 @@ impl ModelInfoCache {
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
-        self.cache_dir.join(format!("{safe_name}.json"))
+        // The suffix is a schema generation, not decoration. Entries written
+        // before the Anthropic field names were corrected hold the
+        // unknown-model floor (32k window / 4k output) for models that are
+        // nothing like it, with a fresh timestamp — so the week-long TTL would
+        // keep serving them. Bumping the generation orphans those files
+        // instead of trusting them; the next lookup refetches.
+        self.cache_dir
+            .join(format!("{safe_name}.v{}.json", Self::SCHEMA_GENERATION))
     }
 }
 
@@ -1106,25 +1142,362 @@ impl CompletionRequest {
     }
 }
 
-/// Extended thinking configuration
-#[derive(Debug, Clone, Serialize)]
-pub struct ThinkingConfig {
-    /// Type of thinking (always "enabled" when present)
-    #[serde(rename = "type")]
-    pub thinking_type: String,
-    /// Budget in tokens for thinking
-    pub budget_tokens: u32,
+/// How the model should surface its reasoning.
+///
+/// `Summarized` returns readable summary text in the thinking blocks;
+/// `Omitted` still emits thinking blocks but leaves their text empty. The raw
+/// chain of thought is never returned under either setting, and both are
+/// billed the same — this controls visibility only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    /// Readable summary of the reasoning.
+    Summarized,
+    /// Thinking blocks arrive with empty text.
+    Omitted,
+}
+
+/// Extended thinking configuration.
+///
+/// Three wire shapes, and which ones a model accepts is part of that model's
+/// request contract — see [`AnthropicModelContract`]. Sending the wrong shape
+/// is a 400, not a degraded response:
+///
+/// - `{"type":"adaptive"}` — Claude 4.6 and newer. The model decides depth per
+///   request; there is no token budget to set.
+/// - `{"type":"enabled","budget_tokens":N}` — pre-4.6 models **only**.
+///   `budget_tokens` was removed on Opus 5, Opus 4.8, Opus 4.7, Sonnet 5, and
+///   Fable 5; sending it to any of them fails the request.
+/// - `{"type":"disabled"}` — explicit opt-out, where the model accepts one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ThinkingConfig {
+    /// Model-chosen thinking depth (Claude 4.6+).
+    Adaptive {
+        /// Omitted from the wire when `None`, which takes the model's default.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
+    /// Fixed thinking budget — pre-4.6 models only.
+    Enabled {
+        /// Budget in tokens. Must be strictly less than the request's
+        /// `max_tokens`, minimum 1024.
+        budget_tokens: u32,
+    },
+    /// Explicit opt-out.
+    Disabled,
 }
 
 impl ThinkingConfig {
-    /// Create a new thinking config with the given budget
+    /// A fixed-budget config, for pre-4.6 models.
     #[must_use]
-    pub fn new(budget_tokens: u32) -> Self {
-        Self {
-            thinking_type: "enabled".to_string(),
-            budget_tokens,
+    pub const fn enabled(budget_tokens: u32) -> Self {
+        Self::Enabled { budget_tokens }
+    }
+
+    /// An adaptive config that asks for readable reasoning summaries.
+    #[must_use]
+    pub const fn adaptive_summarized() -> Self {
+        Self::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
         }
     }
+
+    /// An adaptive config that takes the model's own `display` default.
+    #[must_use]
+    pub const fn adaptive() -> Self {
+        Self::Adaptive { display: None }
+    }
+
+    /// The fixed budget, if this is a budgeted config.
+    #[must_use]
+    pub const fn budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Enabled { budget_tokens } => Some(*budget_tokens),
+            _ => None,
+        }
+    }
+
+    /// Whether this config asks the model to reason.
+    #[must_use]
+    pub const fn is_thinking(&self) -> bool {
+        matches!(self, Self::Adaptive { .. } | Self::Enabled { .. })
+    }
+}
+
+/// The parts of a Claude model's request contract that differ by model family
+/// and fail closed — send the wrong shape and the API returns 400 rather than
+/// ignoring the field.
+///
+/// Derived from the published per-model table; the two axes that bite are the
+/// `thinking` shape and whether sampling parameters still exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Four independent capability facts about one model, not a state machine:
+// every combination below is a real published contract, and they are read
+// individually at different points in the request build.
+#[allow(clippy::struct_excessive_bools)]
+pub struct AnthropicModelContract {
+    /// Takes `{"type":"adaptive"}`; `budget_tokens` is rejected.
+    pub adaptive_thinking: bool,
+    /// `thinking.display` defaults to `"omitted"`, so reasoning text only
+    /// arrives if `"summarized"` is asked for explicitly. On the 4.6 family
+    /// the default is already `"summarized"`.
+    pub display_defaults_omitted: bool,
+    /// `temperature`, `top_p`, and `top_k` were removed; sending one is a 400.
+    pub sampling_removed: bool,
+    /// Thinking cannot be turned off — `{"type":"disabled"}` is rejected, so
+    /// the only legal request is one with no `thinking` field.
+    pub thinking_always_on: bool,
+}
+
+impl AnthropicModelContract {
+    /// The pre-4.6 contract: fixed thinking budgets, sampling parameters live.
+    const LEGACY: Self = Self {
+        adaptive_thinking: false,
+        display_defaults_omitted: false,
+        sampling_removed: false,
+        thinking_always_on: false,
+    };
+}
+
+/// Classify a Claude model into its request contract.
+///
+/// Matching is by family substring rather than an exact allow-list so dated
+/// snapshots (`claude-sonnet-4-5-20250929`) and the Bedrock `anthropic.`
+/// prefix land in the right family. The patterns cannot collide across
+/// generations: `"sonnet-5"` does not occur inside `"sonnet-4-5"`, because the
+/// character after `sonnet` differs.
+///
+/// Unknown `claude-*` models get the **current-generation** contract, not the
+/// legacy one. Every model released since 4.6 has removed `budget_tokens` and
+/// the sampling parameters, so an unrecognized name is far more likely to be
+/// newer than the table than older than it — and guessing legacy for a new
+/// model produces a hard 400 on the very first request.
+#[must_use]
+pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
+    // Strip the provider prefix BEFORE folding dots, or the Bedrock
+    // `anthropic.` form has already lost its separator and never matches.
+    let lowered = model.to_ascii_lowercase();
+    let unprefixed = lowered
+        .strip_prefix("anthropic.")
+        .or_else(|| lowered.strip_prefix("anthropic/"))
+        .unwrap_or(&lowered);
+    // Fold dotted aliases (`claude-opus-4.6`) onto the hyphenated ids the
+    // patterns below are written against.
+    let name = unprefixed.replace('.', "-");
+    let name = name.as_str();
+
+    // Mythos Preview is a migration SOURCE, not a member of the Mythos 5
+    // contract: the published "before" example for the Fable 5 migration is
+    // `claude-mythos-preview` with `{"type":"enabled","budget_tokens":N}`,
+    // i.e. removing budgets is a break *relative to* it, and its prompt-cache
+    // minimum is grouped with Opus 4.7 rather than with Fable/Mythos 5. It
+    // must not inherit the always-on row below.
+    if name.contains("mythos-preview") {
+        return AnthropicModelContract::LEGACY;
+    }
+
+    // Thinking is always on and cannot be disabled.
+    if name.contains("fable-5") || name.contains("mythos") {
+        return AnthropicModelContract {
+            adaptive_thinking: true,
+            display_defaults_omitted: true,
+            sampling_removed: true,
+            thinking_always_on: true,
+        };
+    }
+
+    // Adaptive-only, sampling removed, reasoning hidden unless asked for.
+    if name.contains("opus-5")
+        || name.contains("sonnet-5")
+        || name.contains("opus-4-8")
+        || name.contains("opus-4-7")
+    {
+        return AnthropicModelContract {
+            adaptive_thinking: true,
+            display_defaults_omitted: true,
+            sampling_removed: true,
+            thinking_always_on: false,
+        };
+    }
+
+    // The 4.6 family: adaptive, but sampling still works and reasoning
+    // summaries are already the default.
+    if name.contains("opus-4-6") || name.contains("sonnet-4-6") {
+        return AnthropicModelContract {
+            adaptive_thinking: true,
+            display_defaults_omitted: false,
+            sampling_removed: false,
+            thinking_always_on: false,
+        };
+    }
+
+    // Pre-4.6 generations keep fixed budgets and sampling. The `-4-20…` arms
+    // catch dated Claude 4.0 snapshots (`claude-sonnet-4-20250514`), whose
+    // family digit is followed straight by the date.
+    if name.contains("opus-4-5")
+        || name.contains("opus-4-1")
+        || name.contains("opus-4-0")
+        || name.contains("opus-4-20")
+        || name.contains("sonnet-4-5")
+        || name.contains("sonnet-4-0")
+        || name.contains("sonnet-4-20")
+        || name.contains("haiku-4-5")
+        || name.contains("haiku-4-20")
+        || name.contains("claude-3")
+        || name.contains("claude-2")
+    {
+        return AnthropicModelContract::LEGACY;
+    }
+
+    // Unknown: assume current generation. See the doc comment.
+    AnthropicModelContract {
+        adaptive_thinking: true,
+        display_defaults_omitted: true,
+        sampling_removed: true,
+        thinking_always_on: false,
+    }
+}
+
+/// Whether `model` names a Claude model, as opposed to an Ollama tag, an
+/// `OpenRouter` slug for someone else's model, or an `OpenAI` id.
+///
+/// [`anthropic_model_contract`] answers "which Claude contract"; it assumes
+/// the answer here is already yes. Callers that resolve a model dynamically —
+/// the summarizer and distiller pick one from `summarization_priority` and
+/// fall back to the main model — have to ask this first, or a local
+/// `qwen3.5:9b` would be classified as an unrecognized Claude model and lose
+/// its sampling parameters.
+///
+/// `OpenRouter`'s `anthropic/claude-*` slugs count: that path proxies to the
+/// same API and rejects the same removed parameters.
+#[must_use]
+pub fn is_claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
+/// Conform a request to its model's contract, at the boundary where it is
+/// about to be sent.
+///
+/// Per-call-site fixes do not hold this invariant: a request reaches the API
+/// from many constructors (`AnthropicRequest` literals, and every
+/// `CompletionRequest` that `complete_anthropic_simple` converts), and each
+/// new one is another chance to send a parameter the model removed. This runs
+/// on the dispatch path so every caller is covered at once, including ones
+/// added later.
+///
+/// Two corrections, both faithful translations of what the calling code
+/// already meant rather than new policy:
+///
+/// 1. **`temperature` is dropped** where the model removed sampling, and
+///    alongside any active thinking config. `CompletionRequest::default()`
+///    carries `Some(0.7)`, so sub-agent questions, multi-agent decomposition
+///    and aggregation, dream summaries and `AgentContext::compress` all
+///    inherit a temperature nobody chose — a 400 on the current generation.
+/// 2. **`thinking: None` becomes an explicit `disabled`** where the model
+///    accepts one. Omitting the field used to mean "no thinking" everywhere,
+///    which is what every `thinking: None` in this codebase was written to
+///    mean; on Opus 5, Sonnet 5 and Fable it now means *adaptive*. Left as-is
+///    the model reasons inside a `max_tokens` sized for no reasoning (512 for
+///    the distiller, 1024 for the tool-output summarizer) and returns
+///    `stop_reason: "max_tokens"` with empty text — a silent truncation that
+///    is harder to spot than the 400 it replaced. Always-on models keep
+///    `None`, since they reject an explicit disable.
+///
+/// Borrowed unchanged when the request already conforms.
+#[must_use]
+pub fn conform_to_anthropic_contract(
+    request: &AnthropicRequest,
+) -> std::borrow::Cow<'_, AnthropicRequest> {
+    /// How `thinking` must change for the target model.
+    enum Fix {
+        Leave,
+        Set(ThinkingConfig),
+        Clear,
+    }
+
+    if !is_claude_model(&request.model) {
+        return std::borrow::Cow::Borrowed(request);
+    }
+    let contract = anthropic_model_contract(&request.model);
+
+    // How `thinking` must change for THIS model.
+    //
+    // The shape is rewritten, not merely filled in, because the model on a
+    // request is not fixed once it is built: `route_model` replaces it after
+    // the fact, so a shape derived from the configured model can arrive here
+    // attached to a different generation. Filling in only the `None` case
+    // would let a `budget_tokens` body reach a model that rejects it.
+    let fix = match &request.thinking {
+        // Omission used to mean "no thinking" everywhere; on adaptive models it
+        // now means adaptive. Make that original intent explicit where the
+        // model accepts an explicit off.
+        None if contract.adaptive_thinking && !contract.thinking_always_on => {
+            Fix::Set(ThinkingConfig::Disabled)
+        }
+        // A fixed budget on a model that removed `budget_tokens`.
+        Some(ThinkingConfig::Enabled { .. }) if contract.adaptive_thinking => {
+            Fix::Set(if contract.display_defaults_omitted {
+                ThinkingConfig::adaptive_summarized()
+            } else {
+                ThinkingConfig::adaptive()
+            })
+        }
+        // An adaptive request on a model that predates adaptive. This layer
+        // knows the wire contract but not the step's output reserve, so it
+        // cannot synthesize an honest `budget_tokens`; dropping the field is
+        // the valid degradation, since omission means no thinking on these
+        // models. Reaching this means a caller skipped its own derivation.
+        Some(ThinkingConfig::Adaptive { .. }) if !contract.adaptive_thinking => {
+            tracing::debug!(
+                model = %request.model,
+                "adaptive thinking requested on a pre-4.6 model; sending no thinking field"
+            );
+            Fix::Clear
+        }
+        // An explicit off on a model that rejects one.
+        Some(ThinkingConfig::Disabled) if contract.thinking_always_on => Fix::Clear,
+        _ => Fix::Leave,
+    };
+
+    let effective_thinking = match &fix {
+        Fix::Set(c) => Some(c),
+        Fix::Clear => None,
+        Fix::Leave => request.thinking.as_ref(),
+    };
+    let thinking_active = effective_thinking.is_some_and(ThinkingConfig::is_thinking);
+    let drop_temperature =
+        request.temperature.is_some() && (contract.sampling_removed || thinking_active);
+
+    if !drop_temperature && matches!(fix, Fix::Leave) {
+        return std::borrow::Cow::Borrowed(request);
+    }
+
+    let mut conformed = request.clone();
+    if drop_temperature {
+        conformed.temperature = None;
+    }
+    match fix {
+        Fix::Set(c) => conformed.thinking = Some(c),
+        Fix::Clear => conformed.thinking = None,
+        Fix::Leave => {}
+    }
+    std::borrow::Cow::Owned(conformed)
+}
+
+/// The `temperature` to actually send for `model`, given what the caller
+/// wanted. `None` means the field must be omitted entirely.
+///
+/// `temperature` was removed on Opus 5 / 4.8 / 4.7, Sonnet 5, and Fable 5 —
+/// sending one is a 400, so a hard-coded temperature on an auxiliary request
+/// (summarize, distill, score, extract) fails that request outright once the
+/// model it resolves to is current-generation.
+#[must_use]
+pub fn sampling_temperature_for_model(model: &str, requested: f32) -> Option<f32> {
+    if is_claude_model(model) && anthropic_model_contract(model).sampling_removed {
+        return None;
+    }
+    Some(requested)
 }
 
 /// Full Anthropic request with tools
@@ -2117,24 +2490,23 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             return Err(LlmError::Api { status, message });
         }
 
-        // Parse response - Anthropic may or may not include context_window
-        #[derive(Deserialize)]
-        struct AnthropicModelResponse {
-            id: String,
-            #[serde(default)]
-            context_window: Option<usize>,
-            #[serde(default)]
-            max_output_tokens: Option<usize>,
-        }
-
+        // The Models API spells these `max_input_tokens` (the context window)
+        // and `max_tokens` (the output cap). There is no `context_window`
+        // field — asking for one deserializes to `None`, silently falls back
+        // to the unknown-model floor, and caches THAT, so every Anthropic
+        // model resolved to 32k context / 4k output no matter what it really
+        // was. The aliases keep the old spellings working if a proxy or
+        // gateway answers with them.
         let api_response: AnthropicModelResponse = response.json().await?;
 
         // Use API values if available, otherwise use defaults
         let defaults = default_model_info(model, "anthropic");
         Ok(ModelInfo {
             id: api_response.id,
-            context_window: api_response.context_window.unwrap_or(defaults.context_window),
-            max_output_tokens: api_response.max_output_tokens.unwrap_or(defaults.max_output_tokens),
+            context_window: api_response
+                .max_input_tokens
+                .unwrap_or(defaults.context_window),
+            max_output_tokens: api_response.max_tokens.unwrap_or(defaults.max_output_tokens),
             supports_tools: defaults.supports_tools,
             supports_vision: defaults.supports_vision,
             embedding_dimension: None, // Anthropic doesn't provide embedding models via this API
@@ -2322,6 +2694,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// Returns `LlmError::Api` if the API returns an error.
     /// Returns `LlmError::Network` if the request fails.
     pub async fn complete_anthropic(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        // Last stop before the wire: correct anything the caller's model
+        // no longer accepts. See `conform_to_anthropic_contract`.
+        let request = &*conform_to_anthropic_contract(request);
         match self.provider {
             Provider::Anthropic => self.complete_anthropic_native(request).await,
             Provider::OpenAI | Provider::OpenRouter | Provider::GitHubModels | Provider::ClaudeProxy =>
@@ -3736,7 +4111,9 @@ impl LlmClient {
         request: &AnthropicRequest,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
         let provider = self.provider;
-        let request = request.clone();
+        // Same boundary correction as the non-streaming path — a streamed
+        // request carries the identical body and 400s the same way.
+        let request = conform_to_anthropic_contract(request).into_owned();
 
         stream! {
             // One gate for every streamed request regardless of which backend
@@ -4911,7 +5288,10 @@ impl LlmClient {
                         model: request.model.clone(),
                         messages: all_messages,
                         max_tokens: request.max_tokens.unwrap_or(4096),
-                        temperature: if request.thinking.is_some() { None } else { request.temperature },
+                        // Model-family correction happens at the dispatcher
+                        // (`conform_to_anthropic_contract`), which sees the
+                        // resolved model; pass the caller's value through.
+                        temperature: request.temperature,
                         system: system_msg,
                         tools,
                         stream: Some(true),
@@ -5910,7 +6290,19 @@ mod tests {
     /// Run `f` with a thread-local INFO subscriber and return everything it
     /// logged. Thread-local (`with_default`, not the global default) so
     /// parallel tests on other threads neither pollute nor race this capture.
+    /// Serializes the log-capture tests.
+    ///
+    /// `with_default` installs a subscriber per thread, but tracing keeps a
+    /// PROCESS-wide max-level hint recomputed as subscribers come and go, and a
+    /// callsite evaluated during another thread's install/uninstall window can
+    /// be cached as disabled. The capture then comes back empty and the test
+    /// fails on its first `contains` assertion — intermittently, and only when
+    /// something else in the crate happens to be running alongside it.
+    static LOG_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn capture_info_logs(f: impl FnOnce()) -> String {
+        let _serialized = LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+
         #[derive(Clone, Default)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -6422,6 +6814,301 @@ mod tests {
             tiny.conversation_history_budget(10_000, 10_000, 5_000),
             tiny.hard_input_limit()
         );
+    }
+}
+
+#[cfg(test)]
+mod anthropic_model_contract_tests {
+    use super::{
+        anthropic_model_contract, conform_to_anthropic_contract, AnthropicRequest, ThinkingConfig,
+        ThinkingDisplay,
+    };
+
+    #[test]
+    fn the_current_generation_dropped_budgets_and_sampling() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        ] {
+            let c = anthropic_model_contract(model);
+            assert!(c.adaptive_thinking, "{model} takes adaptive thinking");
+            assert!(c.sampling_removed, "{model} rejects temperature");
+            assert!(
+                c.display_defaults_omitted,
+                "{model} hides reasoning text unless display is asked for"
+            );
+            assert!(!c.thinking_always_on, "{model} accepts an explicit disable");
+        }
+    }
+
+    #[test]
+    fn fable_and_mythos_cannot_be_told_not_to_think() {
+        for model in ["claude-fable-5", "claude-mythos-5"] {
+            let c = anthropic_model_contract(model);
+            assert!(c.thinking_always_on, "{model} rejects an explicit disable");
+            assert!(c.adaptive_thinking);
+            assert!(c.sampling_removed);
+        }
+    }
+
+    /// Mythos *Preview* is the model those two were migrated away FROM — the
+    /// published "before" example configures it with `budget_tokens`, so it
+    /// must not be swept into the always-on row by the `mythos` substring.
+    #[test]
+    fn mythos_preview_is_a_migration_source_not_a_mythos_five() {
+        let c = anthropic_model_contract("claude-mythos-preview");
+        assert!(!c.adaptive_thinking, "it still takes budget_tokens");
+        assert!(!c.thinking_always_on, "nothing documents a rejected disable");
+        assert!(!c.sampling_removed, "it still takes temperature");
+    }
+
+    #[test]
+    fn the_four_six_family_is_adaptive_but_kept_sampling() {
+        for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+            let c = anthropic_model_contract(model);
+            assert!(c.adaptive_thinking, "{model} takes adaptive thinking");
+            assert!(!c.sampling_removed, "{model} kept temperature");
+            assert!(
+                !c.display_defaults_omitted,
+                "{model} already defaults to summarized reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_four_six_models_keep_budgets_and_sampling() {
+        for model in [
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+        ] {
+            let c = anthropic_model_contract(model);
+            assert!(!c.adaptive_thinking, "{model} still takes budget_tokens");
+            assert!(!c.sampling_removed, "{model} still takes temperature");
+        }
+    }
+
+    /// The family patterns are substrings, so the generations they must not
+    /// confuse are worth pinning: `sonnet-5` does not occur inside
+    /// `sonnet-4-5`, and `opus-5` does not occur inside `opus-4-5`. Getting
+    /// this wrong sends `budget_tokens` to a model that 400s on it, or strips
+    /// `temperature` from one that wanted it.
+    #[test]
+    fn adjacent_generations_do_not_collide() {
+        assert!(anthropic_model_contract("claude-sonnet-5").adaptive_thinking);
+        assert!(!anthropic_model_contract("claude-sonnet-4-5").adaptive_thinking);
+        assert!(anthropic_model_contract("claude-opus-5").adaptive_thinking);
+        assert!(!anthropic_model_contract("claude-opus-4-5").adaptive_thinking);
+    }
+
+    #[test]
+    fn provider_prefixes_and_dotted_aliases_still_classify() {
+        // Bedrock prefixes the first-party id; some configs write `4.6`.
+        assert!(anthropic_model_contract("anthropic.claude-opus-5").sampling_removed);
+        assert!(anthropic_model_contract("anthropic/claude-opus-4-6").adaptive_thinking);
+        assert!(!anthropic_model_contract("claude-opus-4.6").sampling_removed);
+        assert!(anthropic_model_contract("CLAUDE-OPUS-5").adaptive_thinking);
+    }
+
+    /// An unrecognized name is assumed to be newer than this table, not older:
+    /// every generation since 4.6 removed `budget_tokens`, so guessing legacy
+    /// would 400 on the first request against a model we simply had not heard
+    /// of yet.
+    #[test]
+    fn unknown_models_get_the_current_contract() {
+        let c = anthropic_model_contract("claude-something-unreleased");
+        assert!(c.adaptive_thinking);
+        assert!(c.sampling_removed);
+        assert!(c.display_defaults_omitted);
+    }
+
+    fn probe_request(model: &str) -> AnthropicRequest {
+        AnthropicRequest {
+            context_limit: None,
+            model: model.to_string(),
+            messages: vec![],
+            max_tokens: 512,
+            temperature: Some(0.7),
+            system: None,
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        }
+    }
+
+    /// The defect the boundary check exists for: `CompletionRequest::default()`
+    /// carries `temperature: Some(0.7)`, so sub-agent questions, multi-agent
+    /// decomposition, dream summaries and `AgentContext::compress` all inherit
+    /// a temperature nobody chose — a 400 on the current generation.
+    #[test]
+    fn the_boundary_strips_an_inherited_temperature() {
+        let req = probe_request("claude-opus-5");
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(conformed.temperature, None);
+    }
+
+    /// Omitting `thinking` used to mean "no thinking" everywhere, which is
+    /// what every `thinking: None` in this codebase was written to mean. On
+    /// Opus 5 it now means adaptive, so a 512-token auxiliary request would
+    /// spend its whole budget reasoning and return empty text.
+    #[test]
+    fn the_boundary_makes_an_implied_mute_explicit() {
+        let req = probe_request("claude-opus-5");
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(conformed.thinking, Some(ThinkingConfig::Disabled));
+    }
+
+    #[test]
+    fn the_boundary_leaves_always_on_models_muted_by_omission() {
+        // Fable rejects an explicit disable, so `None` has to stay `None`.
+        let req = probe_request("claude-fable-5");
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(conformed.thinking, None);
+        assert_eq!(conformed.temperature, None);
+    }
+
+    #[test]
+    fn the_boundary_leaves_legacy_and_non_claude_requests_alone() {
+        // Legacy: omission already means off, and sampling still exists.
+        let legacy_req = probe_request("claude-sonnet-4-20250514");
+        let legacy = conform_to_anthropic_contract(&legacy_req);
+        assert_eq!(legacy.thinking, None);
+        assert_eq!(legacy.temperature, Some(0.7));
+        assert!(
+            matches!(legacy, std::borrow::Cow::Borrowed(_)),
+            "a conforming request must not be cloned"
+        );
+
+        // A local model must keep its temperature — Ollama substitutes its
+        // own default when the field is absent.
+        let ollama_req = probe_request("qwen3.5:9b");
+        let ollama = conform_to_anthropic_contract(&ollama_req);
+        assert_eq!(ollama.temperature, Some(0.7));
+        assert_eq!(ollama.thinking, None);
+        assert!(matches!(ollama, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn the_boundary_does_not_disturb_a_request_that_already_thinks() {
+        let mut req = probe_request("claude-opus-5");
+        req.thinking = Some(ThinkingConfig::adaptive_summarized());
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(
+            conformed.thinking,
+            Some(ThinkingConfig::adaptive_summarized())
+        );
+        assert_eq!(conformed.temperature, None);
+    }
+
+    /// The routing case: a request is built against the configured model, then
+    /// `route_model` replaces `request.model` with a different generation. The
+    /// boundary must rewrite a now-illegal shape, not just fill in a missing
+    /// one, or a `budget_tokens` body reaches a model that rejects it.
+    #[test]
+    fn the_boundary_rewrites_a_shape_left_over_from_another_model() {
+        let mut legacy_shape_on_current = probe_request("claude-opus-5");
+        legacy_shape_on_current.thinking = Some(ThinkingConfig::enabled(4096));
+        let conformed = conform_to_anthropic_contract(&legacy_shape_on_current);
+        assert_eq!(
+            conformed.thinking,
+            Some(ThinkingConfig::adaptive_summarized()),
+            "budget_tokens is a 400 on Opus 5 — the shape must be replaced"
+        );
+        assert_eq!(conformed.temperature, None);
+
+        // And the mirror direction: adaptive left over on a pre-4.6 model.
+        // This layer cannot invent an honest budget, so it drops the field —
+        // valid, since omission means no thinking there.
+        let mut current_shape_on_legacy = probe_request("claude-sonnet-4-20250514");
+        current_shape_on_legacy.thinking = Some(ThinkingConfig::adaptive_summarized());
+        let conformed = conform_to_anthropic_contract(&current_shape_on_legacy);
+        assert_eq!(conformed.thinking, None);
+    }
+
+    #[test]
+    fn the_boundary_drops_an_explicit_disable_that_the_model_rejects() {
+        let mut req = probe_request("claude-fable-5");
+        req.thinking = Some(ThinkingConfig::Disabled);
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(
+            conformed.thinking, None,
+            "Fable rejects an explicit disable; omission is the only legal form"
+        );
+    }
+
+    /// The Models API payload, spelled the way the API actually spells it.
+    /// Reading the wrong field names is silent — it defaults to the
+    /// unknown-model floor and caches that — so this pins the mapping.
+    #[test]
+    fn the_models_api_payload_is_read_with_the_right_field_names() {
+        let payload = serde_json::json!({
+            "id": "claude-opus-5",
+            "type": "model",
+            "display_name": "Claude Opus 5",
+            "created_at": "2026-01-01T00:00:00Z",
+            "max_input_tokens": 1_000_000,
+            "max_tokens": 128_000,
+        });
+        let parsed: super::AnthropicModelResponse =
+            serde_json::from_value(payload).expect("deserializes");
+        assert_eq!(parsed.id, "claude-opus-5");
+        assert_eq!(
+            parsed.max_input_tokens,
+            Some(1_000_000),
+            "context window must come from max_input_tokens; there is no \
+             context_window field on the Models API"
+        );
+        assert_eq!(parsed.max_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn the_older_field_spellings_still_parse() {
+        let payload = serde_json::json!({
+            "id": "claude-opus-5",
+            "context_window": 200_000,
+            "max_output_tokens": 64_000,
+        });
+        let parsed: super::AnthropicModelResponse =
+            serde_json::from_value(payload).expect("deserializes");
+        assert_eq!(parsed.max_input_tokens, Some(200_000));
+        assert_eq!(parsed.max_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn the_wire_shapes_serialize_as_the_api_spells_them() {
+        let adaptive = serde_json::to_value(ThinkingConfig::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
+        })
+        .expect("serializes");
+        assert_eq!(
+            adaptive,
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+
+        let bare = serde_json::to_value(ThinkingConfig::adaptive()).expect("serializes");
+        assert_eq!(
+            bare,
+            serde_json::json!({"type": "adaptive"}),
+            "an unset display must be absent, not null"
+        );
+
+        let budgeted = serde_json::to_value(ThinkingConfig::enabled(4096)).expect("serializes");
+        assert_eq!(
+            budgeted,
+            serde_json::json!({"type": "enabled", "budget_tokens": 4096})
+        );
+
+        let off = serde_json::to_value(ThinkingConfig::Disabled).expect("serializes");
+        assert_eq!(off, serde_json::json!({"type": "disabled"}));
     }
 }
 

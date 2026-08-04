@@ -45,7 +45,8 @@ export interface ExtendedSettings {
   scheduler_enabled: boolean
   heartbeat_enabled: boolean
   heartbeat_interval_seconds: number
-  thinking_enabled?: boolean
+  // No `thinking_enabled`: thinking is always on (owner directive 2026-08-04)
+  // and the backend has no such field or command any more.
   streaming_enabled?: boolean
   max_tokens?: number
   agent_name?: string

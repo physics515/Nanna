@@ -69,6 +69,24 @@ pub fn plausible_summary(summary: &str, source_len: usize) -> bool {
     len >= 64 && len.saturating_mul(1_000) >= source_len
 }
 
+/// How far [`AgentContext::enforce_limits_with_summarization`] should summarize.
+///
+/// The loop used to test `exceeds_hard_limit()` unconditionally, which made it
+/// a no-op for its own tier-2 caller: that tier is entered on
+/// `needs_compression() && !exceeds_hard_limit()`, so the predicate was false
+/// on entry, zero iterations ran, and `Ok(0)` returned after the log line had
+/// already announced that summarization was happening. The band between the
+/// compression threshold and the hard limit was therefore never summarized —
+/// harmless when a model reported a 32k window and the band was a couple of
+/// thousand tokens, and decidedly not once models report their real windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummarizationTarget {
+    /// Summarize until back under the proactive compression threshold (tier 2).
+    CompressionThreshold,
+    /// Summarize until back under the hard input limit (tier 3).
+    HardLimit,
+}
+
 /// Configuration for context summarization
 #[derive(Debug, Clone, Default)]
 pub struct ContextSummarizationConfig {
@@ -909,6 +927,7 @@ impl AgentContext {
     pub async fn enforce_limits_with_summarization(
         &mut self,
         config: &ContextSummarizationConfig,
+        target: SummarizationTarget,
     ) -> Result<usize, String> {
         if config.model_priority.is_empty() {
             // No summarization configured, fall back to truncation
@@ -924,7 +943,13 @@ impl AgentContext {
         // This only bounds extraction to the context already held by this agent.
         let max_chars_per_chunk = self.hard_limit.saturating_mul(4);
 
-        while self.exceeds_hard_limit() && iterations < config.max_iterations {
+        // The caller's tier decides how far down to summarize; testing the
+        // hard limit here regardless is what made the tier-2 call a no-op.
+        let over_target = |ctx: &Self| match target {
+            SummarizationTarget::CompressionThreshold => ctx.needs_compression(),
+            SummarizationTarget::HardLimit => ctx.exceeds_hard_limit(),
+        };
+        while over_target(self) && iterations < config.max_iterations {
             iterations += 1;
 
             let current_tokens = self.estimate_tokens();
@@ -1075,10 +1100,10 @@ impl AgentContext {
 
         let request = AnthropicRequest {
             context_limit: None,
-            model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: u32::try_from(model_info.max_output_tokens.min(2_048)).unwrap_or(u32::MAX),
-            temperature: Some(0.3),
+            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.3),
+            model: model_name,
             system: Some("You are a conversation summarizer. Output only the summary, no preamble.".to_string()),
             tools: None,
             stream: None,

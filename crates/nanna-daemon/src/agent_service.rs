@@ -107,7 +107,10 @@ impl Default for AgentServiceConfig {
             max_iterations: None, // Unlimited — model stops when done
             nudge_after_iterations: 500,
             nudge_interval_iterations: 100,
-            thinking_mode: ThinkingMode::Instant,
+            // Thinking is on by default with no off switch (owner directive
+            // 2026-08-04) — this default IS the truth now that the
+            // `agent.thinking_enabled` config flag is gone.
+            thinking_mode: ThinkingMode::default(),
             summarization_priority: vec![],
             summarization_ollama_url: Some("http://localhost:11434".to_string()),
             model_routing: vec![],

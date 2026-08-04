@@ -103,7 +103,7 @@ pub async fn compress_text_with_config(
         model: model.to_string(),
         messages: vec![AnthropicMessage::user_text(prompt)],
         max_tokens,
-        temperature: Some(0.1),
+        temperature: nanna_llm::sampling_temperature_for_model(model, 0.1),
         system: Some(
             "You are an information density scorer. Output ONLY one number (1-10) per line, nothing else."
                 .to_string(),
