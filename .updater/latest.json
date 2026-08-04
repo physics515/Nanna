@@ -1,11 +1,11 @@
 {
   "version": "0.3.1",
-  "notes": "Public Beta 5 — long-horizon reliability: mission convergence on the environment, small-model stall control, adaptive context under VRAM pressure, abortive Stop, no orphaned processes, todo dialect tolerance",
-  "pub_date": "2026-08-03T22:02:59.000Z",
+  "notes": "Public Beta 6 — same application code as Beta 5; ships the NSIS installer only (the unused MSI target and its Windows Installer warning 1946 are gone)",
+  "pub_date": "2026-08-04T04:20:12.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWp4QUtkMDVpSm51d0pDZkZHSjhXOEpXZDBaZi9WNEt3ZXBaL2RXbmRCbFF3THRPZXA3QnMrakJQaVh2UlVVTGVDRFFwYVJQNUMxcGlXbFBwVGNpU3dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1Nzk0NDk1CWZpbGU6TmFubmFfMC4zLjFfeDY0LXNldHVwLmV4ZQpHcktQN3FuTnptdlZQb2ZEUmtHdDNJd0VsZEtNUlgrdENuSHVMRHVtcit1Wi92OHJHb25IdVJJYUNjRVVIZmNZS1pHbGhUbXo0U1NVdHNlT01zSTFEUT09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.1-beta.5/Nanna_0.3.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFRYjVFN0prb0lZS1Z1dFBaK2wwdXFVVU1ZaEFnVmZadFRvNkdCZFNHbGFCUnF6dW5uY282cHhhL0Mrb0hucExRNEpYdEM2eXhJR0gyRDRSamwydkFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1ODE3MTY4CWZpbGU6TmFubmFfMC4zLjFfeDY0LXNldHVwLmV4ZQoydXJURW1WMlkwVVViOXl2bDlNdlhsZy9ZVk5WOS9Kc2NYUGZscURJN0J1UHFYSDdCU3FTRDVMRjZiaUdKMEtuZkNoeXUwMmFiWk5Ib2ZLeXRrMzFDUT09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.1-beta.6/Nanna_0.3.1_x64-setup.exe"
     }
   }
 }
