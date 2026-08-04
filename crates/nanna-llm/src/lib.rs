@@ -497,6 +497,53 @@ struct AnthropicModelResponse {
     max_tokens: Option<usize>,
 }
 
+/// The `model_info` block of an Ollama `POST /api/show` response.
+///
+/// Kept as a raw map because the keys are not fixed: GGUF namespaces its
+/// metadata by *architecture*, so the window arrives as `llama.context_length`,
+/// `qwen3.context_length`, `bert.context_length`, `nomic-bert.context_length`,
+/// and so on. See [`gguf_metadata_usize`].
+#[derive(Deserialize, Default)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    model_info: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Read a GGUF metadata integer by its *suffix*, across any architecture.
+///
+/// GGUF keys everything by architecture and there is no reliable
+/// `general.*` mirror. `nomic-embed-text` publishes only
+/// `nomic-bert.context_length` and `nomic-bert.embedding_length`; nothing under
+/// `general.`. Reading the fixed key `general.context_length` therefore
+/// returned `None` for essentially every local model, the caller fell back to
+/// the unknown-model floor, and that invented 32k window was cached with a
+/// fresh timestamp and used to size every budget downstream — in silence. The
+/// same miss left `embedding_dimension` at `None` for every Ollama embedder.
+///
+/// `general.` still wins when present, since a model that does publish it is
+/// stating its own answer. Among architecture-namespaced matches the
+/// **smallest** wins: these bound what we may send, and the only safe reading
+/// of an ambiguous bound is the one that cannot overrun.
+fn gguf_metadata_usize(
+    model_info: &serde_json::Map<String, serde_json::Value>,
+    suffix: &str,
+) -> Option<usize> {
+    let dotted = format!(".{suffix}");
+    if let Some(v) = model_info
+        .get(&format!("general.{suffix}"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        return usize::try_from(v).ok();
+    }
+    model_info
+        .iter()
+        .filter(|(k, _)| k.ends_with(&dotted))
+        .filter_map(|(_, v)| v.as_u64())
+        .filter_map(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .min()
+}
+
 /// File-based cache for model information
 #[derive(Clone)]
 pub struct ModelInfoCache {
@@ -509,7 +556,11 @@ impl ModelInfoCache {
     ///
     /// v2: the Anthropic Models API response was being read with the wrong
     /// field names, so every Anthropic model cached the unknown-model floor.
-    const SCHEMA_GENERATION: u32 = 2;
+    ///
+    /// v3: Ollama GGUF metadata was read at the fixed key `general.*`, which
+    /// almost no model publishes — so every local model cached the invented
+    /// 32k floor and every embedder cached a `None` dimension.
+    const SCHEMA_GENERATION: u32 = 3;
 
     /// Create a new cache with the specified directory
     pub fn new(cache_dir: impl Into<std::path::PathBuf>) -> Self {
@@ -2631,34 +2682,15 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             return Err(LlmError::Api { status, message });
         }
 
-        // Ollama returns model info including context length and embedding dimension
-        #[derive(Deserialize)]
-        struct OllamaShowResponse {
-            #[serde(default)]
-            model_info: Option<OllamaModelInfo>,
-        }
-
-        #[derive(Deserialize)]
-        struct OllamaModelInfo {
-            #[serde(rename = "general.context_length", default)]
-            context_length: Option<usize>,
-            /// Embedding dimension (for embedding models)
-            #[serde(rename = "general.embedding_length", default)]
-            embedding_length: Option<usize>,
-        }
-
         let api_response: OllamaShowResponse = response.json().await?;
+        let model_info = api_response.model_info.unwrap_or_default();
 
         // Use the model metadata verbatim. In particular, do not silently raise
         // a local model's configured context window above what Ollama reports.
         let defaults = default_model_info(model, "ollama");
-        let (context_window, embedding_dimension) = match api_response.model_info {
-            Some(info) => (
-                info.context_length.unwrap_or(defaults.context_window),
-                info.embedding_length,
-            ),
-            None => (defaults.context_window, None),
-        };
+        let context_window =
+            gguf_metadata_usize(&model_info, "context_length").unwrap_or(defaults.context_window);
+        let embedding_dimension = gguf_metadata_usize(&model_info, "embedding_length");
 
         Ok(ModelInfo {
             id: model.to_string(),
@@ -3962,6 +3994,42 @@ impl EmbeddingClient {
             status: 500,
             message: "No embedding returned".to_string(),
         })
+    }
+
+    /// The maximum sequence length this embedding model accepts, in tokens.
+    ///
+    /// `None` means "not discoverable", which is different from "unbounded" —
+    /// the caller must treat it as *no ceiling learned* and fall back to its own
+    /// default, never as permission to send arbitrarily long text.
+    ///
+    /// This bound matters because exceeding it does not fail: every embedding
+    /// backend silently truncates to the sequence limit and returns a
+    /// well-formed vector for the prefix. The tail is not embedded, is not
+    /// retrievable, and nothing reports it.
+    pub async fn context_window(&self) -> Option<usize> {
+        match self.provider {
+            EmbeddingProvider::Ollama => self.ollama_context_window().await,
+            // No OpenAI-compatible embeddings endpoint publishes a sequence
+            // limit, and `/v1/models` carries no field for one. Guessing from
+            // the model name would bake a table that silently rots as models
+            // are added; an honest `None` sends the caller to its own default.
+            EmbeddingProvider::OpenAI => None,
+        }
+    }
+
+    async fn ollama_context_window(&self) -> Option<usize> {
+        let response = self
+            .http
+            .post(format!("{}/api/show", self.base_url))
+            .json(&serde_json::json!({ "name": self.model }))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let show: OllamaShowResponse = response.json().await.ok()?;
+        gguf_metadata_usize(&show.model_info?, "context_length")
     }
 }
 
@@ -5903,6 +5971,63 @@ fn parse_sse_event(event: &str) -> Option<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+
+    // -----------------------------------------------------------------
+    // GGUF metadata, which is namespaced by architecture
+    // -----------------------------------------------------------------
+
+    fn gguf(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(json).expect("test fixture is valid JSON")
+    }
+
+    /// Verbatim from a live `POST /api/show` for `nomic-embed-text`, which is
+    /// the default embedding model. There is no `general.*` key at all — this
+    /// is the shape that made every local model resolve to the unknown floor.
+    #[test]
+    fn an_embedding_model_publishes_its_window_under_its_architecture() {
+        let info = gguf(
+            r#"{"nomic-bert.context_length": 2048, "nomic-bert.embedding_length": 768}"#,
+        );
+        assert_eq!(super::gguf_metadata_usize(&info, "context_length"), Some(2048));
+        assert_eq!(super::gguf_metadata_usize(&info, "embedding_length"), Some(768));
+    }
+
+    #[test]
+    fn a_general_key_wins_over_an_architecture_key() {
+        let info = gguf(r#"{"general.context_length": 8192, "llama.context_length": 4096}"#);
+        assert_eq!(super::gguf_metadata_usize(&info, "context_length"), Some(8192));
+    }
+
+    /// Two architectures both claiming a window is ambiguous, and this value
+    /// bounds what we are allowed to send. The smaller claim is the only one
+    /// that cannot overrun.
+    #[test]
+    fn ambiguous_architecture_keys_resolve_to_the_bound_that_cannot_overrun() {
+        let info = gguf(r#"{"bert.context_length": 512, "llama.context_length": 32768}"#);
+        assert_eq!(super::gguf_metadata_usize(&info, "context_length"), Some(512));
+    }
+
+    /// A suffix must not match a key that merely contains it, or
+    /// `rope.scaling.original_context_length` would answer for the real window.
+    #[test]
+    fn a_suffix_matches_only_on_a_dotted_boundary() {
+        let info = gguf(
+            r#"{"llama.rope.scaling.original_context_length": 8192, "llama.context_length": 4096}"#,
+        );
+        assert_eq!(super::gguf_metadata_usize(&info, "context_length"), Some(4096));
+    }
+
+    /// Absent, zero, and non-numeric all mean "we learned nothing". Zero in
+    /// particular must not pass through as a bound, or it would clamp every
+    /// chunk to nothing.
+    #[test]
+    fn an_unlearnable_window_is_none_not_zero() {
+        assert_eq!(super::gguf_metadata_usize(&gguf("{}"), "context_length"), None);
+        let zeroed = gguf(r#"{"bert.context_length": 0}"#);
+        assert_eq!(super::gguf_metadata_usize(&zeroed, "context_length"), None);
+        let textual = gguf(r#"{"bert.context_length": "2048"}"#);
+        assert_eq!(super::gguf_metadata_usize(&textual, "context_length"), None);
+    }
 
     // -----------------------------------------------------------------
     // Context sizing
