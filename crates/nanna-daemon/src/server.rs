@@ -2499,6 +2499,14 @@ impl DaemonServer {
                                 && let Some(mem) = mem_cell.get()
                             {
                                 let model = provider.to_string();
+                                // The new provider's input window, memoized by
+                                // the router — one `/api/show` per provider per
+                                // process, and it travels WITH the model and
+                                // width for the same reason those two do. A
+                                // chunk sized for the old window is not
+                                // rejected by the new embedder, it is silently
+                                // truncated.
+                                let window = router.context_window_for(&provider).await;
                                 tracing::info!(
                                     "Embedding provider changed — rebinding the store to \
                                      '{}' ({} dims)",
@@ -2511,7 +2519,7 @@ impl DaemonServer {
                                 // model used earlier is free because its bucket
                                 // was retained.
                                 let (_, missing) =
-                                    mem.rebind_embeddings(&model, embedding.len()).await;
+                                    mem.rebind_embeddings(&model, embedding.len(), window).await;
 
                                 // Whatever this model has never embedded gets
                                 // filled in lazily, in bounded passes, while
@@ -2687,14 +2695,21 @@ impl DaemonServer {
                         // entries of a session get bucketed under `None` — they
                         // would be re-embedded on the next switch instead of
                         // being reusable, which is the whole point of buckets.
-                        let bind_model = embed_router.active_provider().await.to_string();
+                        let bind_provider = embed_router.active_provider().await;
+                        let bind_model = bind_provider.to_string();
                         let memory_for_bind = memory_arc.clone();
+                        let router_for_bind = embed_router.clone();
                         tokio::spawn(async move {
-                            // The probed (or seeded) dimension travels WITH the
-                            // model — the binding is one pair, never two
-                            // independently-updated latches.
-                            let (_, missing) =
-                                memory_for_bind.rebind_embeddings(&bind_model, dimension).await;
+                            // The probed (or seeded) dimension and the model's
+                            // input window travel WITH the model — the binding
+                            // is one triple, never three independently-updated
+                            // latches. Resolved inside the spawn because it
+                            // costs a request, and startup must not block on it.
+                            let window =
+                                router_for_bind.context_window_for(&bind_provider).await;
+                            let (_, missing) = memory_for_bind
+                                .rebind_embeddings(&bind_model, dimension, window)
+                                .await;
                             if missing > 0 {
                                 drain_backfill(&memory_for_bind, &bind_model).await;
                             }

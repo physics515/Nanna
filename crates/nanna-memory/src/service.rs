@@ -8,6 +8,7 @@ use crate::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
     MemoryCluster, cluster_memories, create_consolidated_entry,
 };
+use crate::chunking::{derive_chunk_params, ChunkParams};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -69,7 +70,35 @@ pub struct MemoryService {
     /// and rebound the model, but the width latch stayed at 2048 — every write
     /// for the next several minutes failed `DimensionMismatch` while the log
     /// said the store had been rebound.
-    active_embedding_model: RwLock<Option<String>>,
+    binding: RwLock<EmbeddingBinding>,
+}
+
+/// Everything about the active embedding model that a write has to agree on.
+///
+/// Model identity and chunk size live in one struct behind one lock for the
+/// same reason the width latch is only touched while that lock is held: a
+/// reader that sees the new model but the old chunk size writes chunks the new
+/// embedder will silently truncate, and a reader that sees the new chunk size
+/// but the old model stamps those chunks with the wrong provenance and they
+/// never get backfilled. Both are the 2026-08-02 split-brain wearing a
+/// different hat, so there is nowhere for the pair to come apart.
+#[derive(Clone, Debug)]
+struct EmbeddingBinding {
+    /// `provider:model` of the embedder currently in use, once the daemon says.
+    model: Option<String>,
+    /// Chunk geometry derived from that model's input window.
+    chunk_params: ChunkParams,
+}
+
+impl Default for EmbeddingBinding {
+    fn default() -> Self {
+        Self {
+            model: None,
+            // No model bound yet means no window learned yet, which resolves to
+            // the retrieval-granularity target rather than to "unbounded".
+            chunk_params: derive_chunk_params(None),
+        }
+    }
 }
 
 impl MemoryService {
@@ -86,7 +115,7 @@ impl MemoryService {
             embed_fn: None,
             pending_updates: RwLock::new(Vec::new()),
             min_score_override: RwLock::new(None),
-            active_embedding_model: RwLock::new(None),
+            binding: RwLock::new(EmbeddingBinding::default()),
         }
     }
 
@@ -164,7 +193,7 @@ impl MemoryService {
         // Take the binding lock AFTER the embed call returns (never across the
         // await — the daemon's embed_fn rebinds on a provider switch and would
         // deadlock), so the width correction cannot tear a rebind in half.
-        let binding = self.active_embedding_model.write().await;
+        let binding = self.binding.write().await;
         let expected_dim = self.store.dimension();
         if actual_dim == expected_dim {
             info!("Embedding dimension confirmed: {}", actual_dim);
@@ -218,26 +247,58 @@ impl MemoryService {
     /// re-embedding the whole store in each direction made a flap cost two full
     /// passes over every memory. Buckets make the return trip free.
     ///
-    /// Model and dimension move as ONE binding, under one lock. The 2026-08-02
-    /// failover left them split: the model rebound 2048→768 but the width latch
-    /// did not, so every subsequent write failed `DimensionMismatch` until a
-    /// restart. `dimension` is the width of the vector the new provider just
-    /// produced — the caller always has one in hand, because a switch is only
-    /// ever observed on a successful embed.
-    pub async fn rebind_embeddings(&self, model: &str, dimension: usize) -> (usize, usize) {
+    /// Model, dimension, and chunk geometry move as ONE binding, under one
+    /// lock. The 2026-08-02 failover left the first two split: the model
+    /// rebound 2048→768 but the width latch did not, so every subsequent write
+    /// failed `DimensionMismatch` until a restart. Chunk geometry joins them
+    /// because it fails the same way and more quietly — chunks sized for the
+    /// old model's window are not rejected by the new one, they are truncated
+    /// by it, and the resulting vector describes a prefix while claiming to
+    /// describe the whole chunk.
+    ///
+    /// `dimension` is the width of the vector the new provider just produced —
+    /// the caller always has one in hand, because a switch is only ever
+    /// observed on a successful embed. `window_tokens` is that model's input
+    /// limit, or `None` when the provider does not publish one.
+    pub async fn rebind_embeddings(
+        &self,
+        model: &str,
+        dimension: usize,
+        window_tokens: Option<usize>,
+    ) -> (usize, usize) {
         assert!(dimension > 0, "a provider that produced a vector has a positive width");
-        let mut binding = self.active_embedding_model.write().await;
-        *binding = Some(model.to_string());
+        let params = derive_chunk_params(window_tokens);
+        let mut binding = self.binding.write().await;
+        let previous = binding.chunk_params;
+        binding.model = Some(model.to_string());
+        binding.chunk_params = params;
         self.store.set_dimension(dimension);
         let (rebound, missing) = self.store.rebind_to_model(model).await;
         drop(binding);
         if missing > 0 {
             info!(
-                "Rebound {rebound} memories to '{model}' ({dimension} dims); {missing} awaiting \
-                 backfill (they are unsearchable until then, not lost)"
+                "Rebound {rebound} memories to '{model}' ({dimension} dims, {} char chunks); \
+                 {missing} awaiting backfill (they are unsearchable until then, not lost)",
+                params.max_chars
             );
         } else {
-            info!("Rebound {rebound} memories to '{model}' ({dimension} dims) — nothing to backfill");
+            info!(
+                "Rebound {rebound} memories to '{model}' ({dimension} dims, {} char chunks) — \
+                 nothing to backfill",
+                params.max_chars
+            );
+        }
+        // A changed chunk size invalidates every chunk already written, and
+        // silently: the rows stay, the vectors stay, and they now describe
+        // pieces of a size this model was never asked about. Say so — an
+        // unannounced re-chunk is indistinguishable from corruption to whoever
+        // reads the store next.
+        if params.supersedes(&previous) {
+            info!(
+                "Chunk geometry changed {} → {} chars (chunker v{}); existing chunks will be \
+                 rewritten as their parents are backfilled",
+                previous.max_chars, params.max_chars, params.version
+            );
         }
         (rebound, missing)
     }
@@ -310,7 +371,16 @@ impl MemoryService {
 
     /// Identity of the embedding model currently in use, if the daemon has said.
     pub async fn active_embedding_model(&self) -> Option<String> {
-        self.active_embedding_model.read().await.clone()
+        self.binding.read().await.model.clone()
+    }
+
+    /// Chunk geometry for the active embedding model.
+    ///
+    /// Read this immediately before splitting content, never cached across an
+    /// await — a provider switch mid-write would otherwise chunk to the old
+    /// model's window and hand the new embedder text it silently truncates.
+    pub async fn chunk_params(&self) -> ChunkParams {
+        self.binding.read().await.chunk_params
     }
 
     /// The current binding as one consistent `(model, dimension)` pair.
@@ -320,8 +390,8 @@ impl MemoryService {
     /// width) state — which is precisely the split-brain this exists to
     /// prevent.
     pub async fn active_binding(&self) -> (Option<String>, usize) {
-        let model = self.active_embedding_model.read().await;
-        (model.clone(), self.store.dimension())
+        let binding = self.binding.read().await;
+        (binding.model.clone(), self.store.dimension())
     }
 
     /// Get the minimum similarity score threshold for recall
@@ -2617,6 +2687,75 @@ mod tests {
         })
     }
 
+    /// Chunk geometry is the third leg of the binding, and it fails more
+    /// quietly than the width: an over-long chunk is not rejected by the new
+    /// embedder, it is truncated by it, and the vector then describes a prefix
+    /// while claiming to describe the whole chunk. So a switch onto a
+    /// narrower model must shrink the chunk size in the same breath it moves
+    /// the model and the width — never one request later.
+    #[tokio::test]
+    async fn chunk_geometry_follows_a_provider_switch() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        // A roomy embedder: the retrieval-granularity target binds, not the
+        // window.
+        service.rebind_embeddings("prov:a", 4, Some(32_768)).await;
+        assert_eq!(
+            service.chunk_params().await.max_chars,
+            MEMORY_CHUNK_TARGET_CHARS,
+            "a wide window must not inflate chunks past the retrieval target"
+        );
+
+        // Failover onto a 512-token embedder. Its window is now the binding
+        // constraint, and the chunk size has to have already moved.
+        width.store(8, Ordering::SeqCst);
+        service.rebind_embeddings("prov:b", 8, Some(512)).await;
+
+        let (model, dimension) = service.active_binding().await;
+        let params = service.chunk_params().await;
+        assert_eq!(model.as_deref(), Some("prov:b"), "model moved");
+        assert_eq!(dimension, 8, "width moved");
+        assert!(
+            params.max_chars < MEMORY_CHUNK_TARGET_CHARS,
+            "chunk size did not move: {} chars still assumes the old window",
+            params.max_chars
+        );
+        assert!(
+            params.max_chars <= 512 * 3,
+            "chunk of {} chars cannot fit a 512-token window",
+            params.max_chars
+        );
+    }
+
+    /// An undiscoverable window is not permission to send unbounded text — it
+    /// means no ceiling was learned, so the retrieval target stands. Every
+    /// OpenAI-compatible embeddings endpoint lands here.
+    #[tokio::test]
+    async fn an_unknown_window_falls_back_rather_than_unbounding() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        service.rebind_embeddings("prov:a", 4, Some(512)).await;
+        let narrow = service.chunk_params().await.max_chars;
+        service.rebind_embeddings("prov:a", 4, None).await;
+        let unknown = service.chunk_params().await.max_chars;
+
+        assert!(unknown > narrow, "an unknown window should relax the 512-token clamp");
+        assert_eq!(
+            unknown, MEMORY_CHUNK_TARGET_CHARS,
+            "…but only as far as the retrieval target, never to unbounded"
+        );
+    }
+
     /// The 2026-08-02 incident: the router failed over 2048→768 and rebound
     /// the model, but the width latch stayed at 2048 — every write after the
     /// switch failed "Embedding dimension mismatch" for minutes. The binding
@@ -2631,7 +2770,7 @@ mod tests {
         };
         let service = MemoryService::new(config).with_embed_fn(switchable_width_embed(&width));
 
-        service.rebind_embeddings("prov:a", 4).await;
+        service.rebind_embeddings("prov:a", 4, None).await;
         let (first_id, _) = service
             .remember_with_importance("the harbor light was green", HashMap::new(), 3.0)
             .await
@@ -2639,7 +2778,7 @@ mod tests {
 
         // Failover: the fallback provider embeds at width 8.
         width.store(8, Ordering::SeqCst);
-        service.rebind_embeddings("prov:b", 8).await;
+        service.rebind_embeddings("prov:b", 8, None).await;
         assert_eq!(service.dimension(), 8, "the width latch moved with the model");
 
         let (second_id, _) = service
@@ -2687,7 +2826,7 @@ mod tests {
                     // daemon's embed_fn rebinding before it returns — every
                     // LATER embed comes from the new provider at width 8…
                     let service = cell.get().expect("service registered").clone();
-                    service.rebind_embeddings("prov:b", 8).await;
+                    service.rebind_embeddings("prov:b", 8, None).await;
                     width.store(8, Ordering::SeqCst);
                     // …but THIS call's vector was produced at the old width.
                     return Ok(vec![0.5_f32; 4]);
@@ -2701,7 +2840,7 @@ mod tests {
         };
         let service = Arc::new(MemoryService::new(config).with_embed_fn(embed));
         assert!(cell.set(service.clone()).is_ok(), "first set");
-        service.rebind_embeddings("prov:a", 4).await;
+        service.rebind_embeddings("prov:a", 4, None).await;
 
         flip.store(true, Ordering::SeqCst);
         let (id, action) = service
@@ -2743,11 +2882,11 @@ mod tests {
             .remember_with_importance("the anchor chain rattled", HashMap::new(), 3.0)
             .await
             .expect("write");
-        service.rebind_embeddings("prov:a", 4).await;
+        service.rebind_embeddings("prov:a", 4, None).await;
 
         // Provider fails over before the drain for prov:a gets there.
         width.store(8, Ordering::SeqCst);
-        service.rebind_embeddings("prov:b", 8).await;
+        service.rebind_embeddings("prov:b", 8, None).await;
 
         let filled = service
             .backfill_embeddings("prov:a", 16)

@@ -7,6 +7,7 @@
 //! Implements FSRS-6 for cognitive memory decay and the "dreaming" consolidation model.
 
 mod activity;
+pub mod chunking;
 mod consolidation;
 mod dreaming;
 mod fsrs;
@@ -14,6 +15,8 @@ pub mod retention;
 mod service;
 
 pub use activity::ActivityClock;
+
+pub use chunking::{chunk_text, derive_chunk_params, Chunk, ChunkParams, CHUNKER_VERSION};
 
 pub use consolidation::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
@@ -36,6 +39,7 @@ pub use service::{
     // path caps against. Those two numbers drifting apart is precisely how a
     // 4096-byte ceiling ended up silently rejecting 3200-char chunks.
     MEMORY_CHUNK_MAX_CHARS, MEMORY_OBSERVATION_MAX_CHARS,
+    MEMORY_CHUNK_TARGET_CHARS, chunk_max_chars_for_window,
 };
 pub use retention::{
     measure_gated_recall, measure_recall, run_retention_cycle, CorpusParams,
