@@ -2873,13 +2873,20 @@ pub async fn seed_continuation(
 
 /// Put every `in_progress` item in a scope back to `pending`.
 ///
-/// Two callers, one invariant: `next()` sorts `in_progress` first ("resume
-/// what you started"), which is right only while the run that started the
-/// item is alive. An interjection yields the in-flight item so the user's
-/// message wins the next selection, and a cancelled chat run demotes its
-/// leftovers on exit so a stopped turn cannot auto-resume ahead of the
-/// user's next request — unfinished work is information for the model, not
-/// an instruction to the harness. Returns how many items were demoted.
+/// One invariant behind every caller: `next()` sorts `in_progress` first
+/// ("resume what you started"), which is right only while the run that started
+/// the item is alive. An interjection yields the in-flight item so the user's
+/// message wins the next selection, and **every** chat turn releases its
+/// leftovers on exit — cancelled or not — so a finished turn cannot
+/// auto-resume ahead of the user's next request. Unfinished work is
+/// information for the model, not an instruction to the harness.
+///
+/// Releasing only on cancellation left normally-finished turns holding their
+/// items forever, which both hijacked the next message and accumulated: 191
+/// items were found stuck `in_progress` on a live database, the oldest chats
+/// carrying over a hundred each.
+///
+/// Returns how many items were demoted.
 pub async fn demote_in_progress(
     storage: &Arc<Storage>,
     scope: &str,
@@ -3519,6 +3526,61 @@ mod tests {
         let repo = storage.tasks();
         let next = repo.next("session", Some("s1")).await.unwrap().unwrap();
         assert_eq!(next.title, "a", "plan order decides what runs first");
+    }
+
+    /// The leak this release rule closes: an item left `in_progress` by a
+    /// finished turn outranks whatever the user says next, because `next()`
+    /// sorts `in_progress` first. Releasing on cancellation alone left every
+    /// normally-finished turn holding its items — 191 were found stuck on a
+    /// live database, the busiest chat carrying 155 open.
+    #[tokio::test]
+    async fn a_released_item_stops_outranking_the_users_next_message() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["stale work"]), false)
+            .await
+            .expect("seeded");
+        let repo = storage.tasks();
+
+        // The turn picks it up and ends without finishing it.
+        let started = repo.next("session", Some("s1")).await.unwrap().unwrap();
+        repo.update(
+            started.id,
+            TaskPatch {
+                status: Some("in_progress".to_string()),
+                ..TaskPatch::default()
+            },
+            Some("harness"),
+        )
+        .await
+        .expect("started");
+
+        // The user asks for something else.
+        seed_plan(&storage, "session", Some("s1"), &plan_of(&["the new question"]), true)
+            .await
+            .expect("interjected");
+        assert_eq!(
+            repo.next("session", Some("s1")).await.unwrap().unwrap().title,
+            "stale work",
+            "an unreleased item wins — this is the hijack"
+        );
+
+        // Turn end releases it.
+        let demoted = demote_in_progress(&storage, "session", Some("s1"), "chat")
+            .await
+            .expect("released");
+        assert_eq!(demoted, 1);
+        assert_eq!(
+            repo.next("session", Some("s1")).await.unwrap().unwrap().title,
+            "the new question",
+            "after release the user's message goes first"
+        );
+
+        // Released, not closed: it is still open work the planner can see.
+        let open = repo.list("session", Some("s1"), false).await.unwrap();
+        assert!(
+            open.iter().any(|t| t.title == "stale work" && t.status == "pending"),
+            "release must return the item to pending, not close it"
+        );
     }
 
     #[tokio::test]
