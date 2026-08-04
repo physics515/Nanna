@@ -433,6 +433,77 @@ async fn resolve_memory_handle(
         })
 }
 
+// ---------------------------------------------------------------------------
+// Param dialect readers for the `memory.*` script services
+// ---------------------------------------------------------------------------
+//
+// Same contract as the task services (see `crate::tasks`): read what can be
+// read losslessly, and answer what cannot with an error naming what ARRIVED.
+// "id is required" said to a caller who supplied an id in the wrong shape is
+// a false statement, and a model that reads it re-sends the identical call.
+
+/// Coerce a scalar to the text a memory service wants.
+///
+/// A memory id and a memory body are both genuinely text, so there is nothing
+/// to invent here: the only non-string shapes accepted are the scalars whose
+/// rendering is exactly the characters the caller meant — a handle typed
+/// without its quotes (`{"id": 12}`), a number, a boolean. An array or object
+/// is not text under any reading and is refused.
+fn as_text_lenient(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Read a required text param, keeping MISSING and UNINTERPRETABLE apart.
+fn req_text(params: &serde_json::Value, key: &str) -> Result<String, String> {
+    let Some(value) = params.get(key).filter(|v| !v.is_null()) else {
+        return Err(format!("{key} is required"));
+    };
+    let text = as_text_lenient(value).ok_or_else(|| {
+        format!(
+            "{key} must be text (got {}).",
+            crate::tasks::describe_value(value)
+        )
+    })?;
+    if text.trim().is_empty() {
+        return Err(format!("{key} is required — it arrived empty."));
+    }
+    Ok(text)
+}
+
+/// Read an optional text param. Absent or null yields `None`; a present value
+/// that is not text errors instead of falling through to a default — a
+/// silently defaulted `new` on `memory.replace` would delete the match.
+fn opt_text(params: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match params.get(key).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(value) => as_text_lenient(value).map(Some).ok_or_else(|| {
+            format!(
+                "{key} must be text (got {}).",
+                crate::tasks::describe_value(value)
+            )
+        }),
+    }
+}
+
+/// Read an optional count param (`limit`, `offset`).
+///
+/// Integers follow the same dialect rules as the task services — a stringified
+/// `"50"` is read rather than dropped onto the default. A negative count is
+/// refused rather than clamped: clamping answers a question nobody asked.
+fn opt_count(params: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(n) = crate::tasks::opt_i64(params, key)? else {
+        return Ok(None);
+    };
+    usize::try_from(n)
+        .map(Some)
+        .map_err(|_| format!("{key} must be zero or a positive whole number (got {n})."))
+}
+
 fn build_script_services(
     memory: &Option<Arc<MemoryService>>,
     spawner: Option<Arc<dyn AgentSpawner + Send + Sync>>,
@@ -602,7 +673,7 @@ fn build_script_services(
             Arc::new(move |params: Value| {
                 let mem = mem_list.clone();
                 Box::pin(async move {
-                    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                    let limit = opt_count(&params, "limit")?.unwrap_or(20);
                     let all = mem.list_all().await;
                     let items: Vec<Value> = all
                         .into_iter()
@@ -630,19 +701,11 @@ fn build_script_services(
             Arc::new(move |params: Value| {
                 let mem = mem_get.clone();
                 Box::pin(async move {
-                    let id = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "id is required".to_string())?
-                        .to_string();
-                    let offset =
-                        params.get("offset").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+                    let id = req_text(&params, "id")?;
+                    let offset = opt_count(&params, "offset")?.unwrap_or(0);
                     // Default cap keeps a huge tool result from re-flooding
                     // the context the stub existed to protect.
-                    let limit = params
-                        .get("limit")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(4_000) as usize;
+                    let limit = opt_count(&params, "limit")?.unwrap_or(4_000);
 
                     let entry = resolve_memory_handle(&mem, &id).await?;
                     let content = assemble_handle_content(&mem, &entry).await;
@@ -699,16 +762,8 @@ fn build_script_services(
             Arc::new(move |params: Value| {
                 let mem = mem_append.clone();
                 Box::pin(async move {
-                    let handle = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "id is required".to_string())?
-                        .to_string();
-                    let addition = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "content is required".to_string())?
-                        .to_string();
+                    let handle = req_text(&params, "id")?;
+                    let addition = req_text(&params, "content")?;
                     let entry = resolve_memory_handle(&mem, &handle).await?;
                     let combined = format!("{}\n{addition}", entry.content);
                     mem.update_content(&entry.id, &combined)
@@ -725,21 +780,9 @@ fn build_script_services(
             Arc::new(move |params: Value| {
                 let mem = mem_replace.clone();
                 Box::pin(async move {
-                    let handle = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "id is required".to_string())?
-                        .to_string();
-                    let old = params
-                        .get("old")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "old is required".to_string())?
-                        .to_string();
-                    let new = params
-                        .get("new")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let handle = req_text(&params, "id")?;
+                    let old = req_text(&params, "old")?;
+                    let new = opt_text(&params, "new")?.unwrap_or_default();
                     let entry = resolve_memory_handle(&mem, &handle).await?;
                     let hits = entry.content.matches(&old).count();
                     if hits == 0 {
