@@ -265,6 +265,7 @@ impl MemoryService {
         let mut binding = self.binding.write().await;
         let previous = self.store.chunk_params();
         binding.model = Some(model.to_string());
+        self.store.set_active_model(model).await;
         self.store.set_chunk_params(params);
         self.store.set_dimension(dimension);
         let (rebound, missing) = self.store.rebind_to_model(model).await;
@@ -2933,6 +2934,7 @@ mod tests {
             &self,
             memory_id: &str,
             _workspace_id: Option<&str>,
+            _model: Option<&str>,
             chunks: &[crate::ChunkWrite],
         ) -> Result<(), MemoryError> {
             self.unchunked.lock().unwrap().retain(|id| id != memory_id);

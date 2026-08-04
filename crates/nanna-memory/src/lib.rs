@@ -145,10 +145,14 @@ pub trait MemoryPersistence: Send + Sync {
     ///
     /// The default is a no-op, which is correct for a store with no durable
     /// backing: chunks are derived data, reproducible from content at any time.
+    /// `model` is the binding these chunks were produced under, and is what
+    /// unembedded chunks get queued against. Without it the queue could not
+    /// name which bucket the work belongs to.
     async fn replace_chunks(
         &self,
         _memory_id: &str,
         _workspace_id: Option<&str>,
+        _model: Option<&str>,
         _chunks: &[ChunkWrite],
     ) -> Result<(), MemoryError> {
         Ok(())
@@ -199,6 +203,27 @@ pub trait MemoryPersistence: Send + Sync {
         _limit: usize,
         _workspace_id: Option<&str>,
     ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Record a failed embedding attempt against queued work, with its reason.
+    ///
+    /// The reason is what separates a queue that is stuck from one that is
+    /// merely slow — a 402 with nothing attached reads as silence.
+    async fn record_embedding_failure(
+        &self,
+        _memory_id: &str,
+        _ordinal: i64,
+        _model: &str,
+        _error: &str,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Queue depth per model with the most recent error for each.
+    async fn embedding_queue_health(
+        &self,
+    ) -> Result<Vec<(String, usize, Option<String>)>, MemoryError> {
         Ok(Vec::new())
     }
 
@@ -384,6 +409,13 @@ pub struct VectorStore {
     /// Durable-store health from the last `load_from_db` (degraded if any row was
     /// unreadable). Surfaced so a corrupt store isn't a silent empty one.
     store_health: RwLock<MemoryStoreHealth>,
+    /// `provider:model` of the embedder currently bound.
+    ///
+    /// Lives HERE, with the width and chunk-geometry latches, rather than
+    /// beside them in `MemoryService` — one copy, moved under one lock, so
+    /// there is no second value that can go stale. Every write path needs it to
+    /// stamp which bucket its work belongs to.
+    active_model: RwLock<Option<String>>,
 }
 
 impl VectorStore {
@@ -396,6 +428,7 @@ impl VectorStore {
             gpu_pipeline: None,
             db: None,
             store_health: RwLock::new(MemoryStoreHealth::default()),
+            active_model: RwLock::new(None),
         }
     }
 
@@ -416,6 +449,7 @@ impl VectorStore {
                             gpu_pipeline: Some(pipeline),
                             db: None,
                             store_health: RwLock::new(MemoryStoreHealth::default()),
+                            active_model: RwLock::new(None),
                         }
                     }
                     Err(e) => {
@@ -1265,6 +1299,17 @@ impl VectorStore {
         self.config.set_dimension(new_dim);
     }
 
+    /// The bound embedding model, if the daemon has named one.
+    pub async fn active_model(&self) -> Option<String> {
+        self.active_model.read().await.clone()
+    }
+
+    /// Bind `model`. Only called under `MemoryService`'s binding write-lock,
+    /// beside `set_dimension` and `set_chunk_params`.
+    pub async fn set_active_model(&self, model: &str) {
+        *self.active_model.write().await = Some(model.to_string());
+    }
+
     /// Chunk geometry for the currently bound embedding model.
     #[must_use]
     pub fn chunk_params(&self) -> crate::chunking::ChunkParams {
@@ -1429,7 +1474,11 @@ impl VectorStore {
             })
             .collect();
 
-        if let Err(e) = db.replace_chunks(id, workspace_id, &writes).await {
+        let model = self.active_model().await;
+        if let Err(e) = db
+            .replace_chunks(id, workspace_id, model.as_deref(), &writes)
+            .await
+        {
             warn!("Failed to write chunks for memory {}: {} (retrieval for this memory falls back to its whole-row vector until the backfill rebuilds them)", id, e);
         }
     }
@@ -1609,6 +1658,7 @@ mod tests {
             &self,
             memory_id: &str,
             _workspace_id: Option<&str>,
+            _model: Option<&str>,
             chunks: &[ChunkWrite],
         ) -> Result<(), MemoryError> {
             self.calls.lock().unwrap().push((memory_id.to_string(), chunks.to_vec()));
