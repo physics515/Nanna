@@ -368,6 +368,7 @@ pub fn run() {
             commands::tools::test_skill,
             // Backend mode
             commands::system::get_backend_status,
+            commands::system::get_daemon_version,
             commands::system::init_backend,
             commands::sessions::get_session_run_state,
             // Cancellation & Logs

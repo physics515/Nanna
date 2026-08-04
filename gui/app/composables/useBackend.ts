@@ -14,6 +14,14 @@ export interface BackendStatus extends BackendStatusLike {
 const status = ref<BackendStatus | null>(null)
 const initialized = ref(false)
 const initializing = ref(false)
+/**
+ * The version the connected daemon reports about ITSELF.
+ *
+ * `status.version` is the GUI binary's own compile-time version — it describes
+ * the process asking, not the one answering, so it agrees with the daemon only
+ * when both came from the same build. Null means nothing is connected to ask.
+ */
+const daemonVersion = ref<string | null>(null)
 let pollHandle: ReturnType<typeof setInterval> | null = null
 let subscribers = 0
 
@@ -22,6 +30,17 @@ const POLL_MS = 2000
 async function refresh(): Promise<BackendStatus | null> {
   try {
     status.value = await invoke<BackendStatus>('get_backend_status')
+    // Fetched once per connection rather than on every 2s poll: the version of
+    // a running process cannot change under it. Cleared on disconnect so a
+    // reconnect re-asks — the daemon that comes back may be a different build,
+    // which is the whole reason for showing this.
+    if (status.value?.connected) {
+      if (daemonVersion.value === null) {
+        daemonVersion.value = await invoke<string | null>('get_daemon_version').catch(() => null)
+      }
+    } else {
+      daemonVersion.value = null
+    }
     return status.value
   } catch (e) {
     console.error('Failed to get backend status:', e)
@@ -74,6 +93,7 @@ export function useBackend() {
         daemon_state: 'not_started',
         version: 'unknown',
       }
+      daemonVersion.value = null
       initialized.value = true
       return 'disconnected'
     } finally {
@@ -104,6 +124,7 @@ export function useBackend() {
 
   return {
     status: readonly(status),
+    daemonVersion: readonly(daemonVersion),
     initialized: readonly(initialized),
     initializing: readonly(initializing),
     isDaemon,
