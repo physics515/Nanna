@@ -2425,6 +2425,24 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             }
         };
 
+        // Announce a model that ended up on the unknown floor instead of real
+        // provider limits. This is the failure mode that hid the Anthropic
+        // field-name bug: every Claude model silently resolved to 32k/4k, was
+        // cached with a fresh timestamp, and nothing anywhere said so. A model
+        // running on guessed limits is worth one line per cache TTL.
+        if info.context_window == UNKNOWN_CONTEXT_WINDOW
+            && info.max_output_tokens == UNKNOWN_MAX_OUTPUT_TOKENS
+        {
+            warn!(
+                model = %model,
+                provider = ?self.provider,
+                context_window = info.context_window,
+                max_output_tokens = info.max_output_tokens,
+                "model limits unavailable from the provider; using the unknown-model floor \
+                 — budgets will be sized for a far smaller model than this may be"
+            );
+        }
+
         // Cache the result — the UNCLAMPED provider claim. The cache stores
         // static facts about the model; the effective-window clamp below is
         // live per-process state (the Ollama num_ctx latch) and must never be
@@ -2460,8 +2478,27 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             Provider::OpenAI => self.fetch_openai_model_info(model).await,
             Provider::Ollama => self.fetch_ollama_model_info(model).await,
             Provider::OpenRouter => self.fetch_openrouter_model_info(model).await,
-            // For proxies and GitHub Models, use defaults
-            Provider::ClaudeProxy | Provider::GitHubModels => {
+            // A Claude proxy serves Claude models, so ask the way Anthropic
+            // answers. A proxy that does not implement the models endpoint
+            // 404s or fails to deserialize, and `get_model_info` falls back to
+            // defaults exactly as before — trying costs a request that is made
+            // once per model per cache TTL.
+            Provider::ClaudeProxy => match self.fetch_anthropic_model_info(model).await {
+                Ok(info) => Ok(ModelInfo {
+                    provider: "claude_proxy".to_string(),
+                    ..info
+                }),
+                Err(e) => {
+                    debug!(
+                        model = %model,
+                        error = %e,
+                        "proxy did not answer the models endpoint; using defaults"
+                    );
+                    Ok(default_model_info(model, "claude_proxy"))
+                }
+            },
+            // GitHub Models publishes no per-model limit endpoint.
+            Provider::GitHubModels => {
                 Ok(default_model_info(model, &format!("{:?}", self.provider)))
             }
         }
