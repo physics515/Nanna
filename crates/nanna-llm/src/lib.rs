@@ -6290,7 +6290,19 @@ mod tests {
     /// Run `f` with a thread-local INFO subscriber and return everything it
     /// logged. Thread-local (`with_default`, not the global default) so
     /// parallel tests on other threads neither pollute nor race this capture.
+    /// Serializes the log-capture tests.
+    ///
+    /// `with_default` installs a subscriber per thread, but tracing keeps a
+    /// PROCESS-wide max-level hint recomputed as subscribers come and go, and a
+    /// callsite evaluated during another thread's install/uninstall window can
+    /// be cached as disabled. The capture then comes back empty and the test
+    /// fails on its first `contains` assertion — intermittently, and only when
+    /// something else in the crate happens to be running alongside it.
+    static LOG_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn capture_info_logs(f: impl FnOnce()) -> String {
+        let _serialized = LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+
         #[derive(Clone, Default)]
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {

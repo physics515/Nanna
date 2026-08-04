@@ -2765,7 +2765,10 @@ impl Agent {
                             "Tier 2: standard summarization triggered"
                         );
                         match ctx
-                            .enforce_limits_with_summarization(&summarization_config)
+                            .enforce_limits_with_summarization(
+                                &summarization_config,
+                                crate::context::SummarizationTarget::CompressionThreshold,
+                            )
                             .await
                         {
                             Ok(iterations) if iterations > 0 => {
@@ -2811,7 +2814,10 @@ impl Agent {
                             "Tier 3: hard limit exceeded, aggressive summarization"
                         );
                         match ctx
-                            .enforce_limits_with_summarization(&summarization_config)
+                            .enforce_limits_with_summarization(
+                                &summarization_config,
+                                crate::context::SummarizationTarget::HardLimit,
+                            )
                             .await
                         {
                             Ok(iterations) if iterations > 0 => {
@@ -2892,8 +2898,18 @@ impl Agent {
                 // record against the routed model rather than an visible error.
                 let routed_contract = nanna_llm::anthropic_model_contract(&request.model);
                 let routed_mode = options.thinking_mode.unwrap_or(self.config.thinking_mode);
-                let routed_info =
-                    nanna_llm::model_info_from_cache_or_unknown(&request.model, "");
+                // Fetched, not read from cache. Nothing ever fetches info for a
+                // routing tier — every `get_model_info` call site passes the
+                // configured model — so a tier that has never been the active
+                // model is a guaranteed cache MISS, and a miss returns the
+                // unknown-model floor (32k window / 4k output). Sizing the
+                // ceiling from that would hand a routed step ~1k tokens of
+                // visible answer after reasoning, permanently, on every install.
+                let routed_cache = nanna_llm::ModelInfoCache::default_location();
+                let routed_info = self
+                    .llm
+                    .get_model_info(&request.model, routed_cache.as_ref())
+                    .await;
                 // The ceiling first, because the thinking shape is derived
                 // against it. It has to be rebuilt too: the original was sized
                 // from the configured model's window, output cap AND thinking
@@ -3105,10 +3121,10 @@ impl Agent {
             if !state.thinking_spiral_nudged
                 && result.tool_uses.is_empty()
                 && result.text.is_empty()
-                && detect_thinking_spiral(&state.reasoning_content)
+                && detect_thinking_spiral(&state.current_reasoning)
             {
                 warn!(
-                    reasoning_len = state.reasoning_content.len(),
+                    reasoning_len = state.current_reasoning.len(),
                     reasoning_tokens = state.reasoning_tokens,
                     "🌀 Post-hoc thinking spiral detected (sync path) — injecting action nudge"
                 );
@@ -3174,6 +3190,13 @@ impl Agent {
 
             // If no tool calls, check for narration loop before exiting
             if result.tool_uses.is_empty() {
+                // This round is over regardless of which path below it takes —
+                // normal exit, or one of the continuation `continue`s (mission
+                // stall, narration, repetition). Close its reasoning block here
+                // or the buffer carries into the next round and the spiral
+                // detector, which measures it as "this block", trips on the
+                // concatenated volume of several unrelated rounds.
+                state.finalize_reasoning_block(None);
                 // Detect narration loop: model talked about using tools but never called them
                 let has_tool_history = !state.tool_records.is_empty();
                 if detect_narration_loop(&state.final_text, has_tool_history)
@@ -3413,14 +3436,6 @@ impl Agent {
                 // marks a pending completion claim as verified-in-progress.
                 state.mission_stall_rounds = 0;
                 state.mission_verified_since_claim = true;
-            } else {
-                // A round that called no tool still ends a reasoning block.
-                // Without this the buffer carries across continuation rounds
-                // (mission stall, narration, repetition), and the spiral
-                // detector — which measures it as "this block" — trips on the
-                // concatenated volume of several unrelated rounds rather than
-                // on any one of them going in circles.
-                state.finalize_reasoning_block(None);
             }
 
             // Execute tools and continue loop
@@ -6189,7 +6204,14 @@ impl RunState {
         }
     }
 
-    fn into_response(self, truncated: bool) -> AgentResponse {
+    fn into_response(mut self, truncated: bool) -> AgentResponse {
+        // Close the last block on the way out. Reasoning blocks are otherwise
+        // only finalized when a round calls a tool, so on any run whose final
+        // round did not, the reasoning behind the final answer — the block most
+        // worth keeping — was dropped here. The daemon reads
+        // `reasoning.content` only when `blocks` is empty, so it did not
+        // recover it either. Idempotent: a no-op when the buffer is empty.
+        self.finalize_reasoning_block(None);
         let reasoning = if self.reasoning_content.is_empty() && self.reasoning_blocks.is_empty() {
             None
         } else {
