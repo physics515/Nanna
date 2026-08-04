@@ -299,6 +299,38 @@ pub async fn get_backend_status(
     Ok(state.backend.status().await)
 }
 
+/// The version the RUNNING daemon reports about itself.
+///
+/// Deliberately not `BackendStatus::version`, which is this GUI binary's own
+/// `CARGO_PKG_VERSION` — it describes the process asking, not the process
+/// answering. The two agree only when both were built from the same tree, and
+/// the moment they diverge is exactly when the daemon's version is worth
+/// showing: a packaged GUI talking to a separately-built daemon reports the
+/// GUI's number for both and looks consistent while being wrong.
+///
+/// `None` means no daemon is connected to ask — a distinct state from "asked
+/// and it did not say", which surfaces as an error.
+#[tauri::command]
+pub async fn get_daemon_version(
+    state: State<'_, Arc<RwLock<AppState>>>,
+) -> Result<Option<String>, String> {
+    let state = state.read().await;
+    let backend = &state.backend;
+    if !backend.status().await.connected {
+        return Ok(None);
+    }
+    let response = backend
+        .daemon_request(serde_json::json!({
+            "type": "system",
+            "action": "version"
+        }))
+        .await?;
+    Ok(response
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
 /// Initialize the backend - starts the daemon sidecar and connects.
 #[tauri::command]
 pub async fn init_backend(

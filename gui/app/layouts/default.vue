@@ -142,7 +142,7 @@
       <!-- ═══ Bottom Status Bar (full width except activity bar) ═══ -->
       <div class="status-bar">
         <div class="status-left">
-          <span class="status-version">{{ appVersion ? 'v' + appVersion : '' }}</span>
+          <span class="status-version" :title="versionTooltip">{{ versionLabel }}</span>
           <button
             :class="['status-update', updateVersion ? 'status-update-available' : '']"
             :disabled="updating || checking"
@@ -358,8 +358,32 @@ provide('closeWorkspaceTab', closeWorkspaceTab)
 provide('showWorkspacePicker', showWorkspacePicker)
 
 const { checkPermission } = useNotifications()
-const { init: initBackend, status: backendStatus, isDaemon, label: backendLabel } = useBackend()
+const { init: initBackend, status: backendStatus, daemonVersion, isDaemon, label: backendLabel } = useBackend()
 const statusBar = computed(() => statusBarLabel(backendStatus.value, apiKeySet.value))
+
+// App and daemon versions are two different things and only look like one.
+// `appVersion` is this window's build; `daemonVersion` is what the process on
+// the other end of the socket reports about itself. Showing a single number
+// when they disagree is how a stale daemon hides — so when they differ, both
+// are named. When they match, one number says it.
+const versionLabel = computed(() => {
+  if (!appVersion.value) return ''
+  const daemon = daemonVersion.value
+  if (!daemon || daemon === appVersion.value) return `v${appVersion.value}`
+  return `v${appVersion.value} · daemon v${daemon}`
+})
+const versionTooltip = computed(() => {
+  const app = appVersion.value ? `App v${appVersion.value}` : 'App version unknown'
+  if (!daemonVersion.value) {
+    return backendStatus.value?.connected
+      ? `${app}\nDaemon version unavailable`
+      : `${app}\nNo daemon connected`
+  }
+  const daemon = `Daemon v${daemonVersion.value}`
+  return daemonVersion.value === appVersion.value
+    ? `${app}\n${daemon} (same build)`
+    : `${app}\n${daemon}\nVersions differ — the daemon is a different build than this window.`
+})
 const { bind: bindShortcut } = useShortcuts()
 const { open: paletteOpen, toggle: togglePalette, hide: hidePalette } = useCommandPalette()
 const { info: toastInfo } = useToast()
