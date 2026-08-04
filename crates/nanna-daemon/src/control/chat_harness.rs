@@ -785,23 +785,34 @@ impl ControlPlane {
                 }
             }
 
-            // A cancelled run's in-flight items must not auto-resume:
-            // `next()` sorts `in_progress` first, so a leftover from a
-            // stopped turn would silently outrank the user's next message
-            // (observed live 2026-08-02: a cancelled turn's continuation task
-            // ran before the fresh question). Demote them to pending — still
-            // open, still shown to the planner as unfinished work per the
-            // owner directive above, just no longer at the head of the queue.
-            if run_handle.cancel.is_cancelled() {
-                match demote_in_progress(&storage, &scope, scope_id.as_deref(), "chat").await {
-                    Ok(0) => {}
-                    Ok(demoted) => tracing::info!(
-                        demoted,
-                        "cancelled turn — in-flight items returned to pending"
-                    ),
-                    Err(message) => {
-                        tracing::warn!(%message, "could not demote the cancelled turn's items");
-                    }
+            // The turn is over and the chat is back to waiting on input, so it
+            // no longer holds anything: every in-flight item returns to
+            // pending. `in_progress` means "a running turn is working this
+            // right now" — nothing is running now.
+            //
+            // This ran only for CANCELLED turns before, which left a turn that
+            // ended normally holding its items forever. `next()` sorts
+            // `in_progress` first ("resume what you were doing"), so those
+            // leftovers outranked the user's next message and the chat resumed
+            // stale work instead of answering it — the same hijack observed on
+            // 2026-08-02 after a cancel, just reached by the ordinary path.
+            // Left to accumulate it reads as tasks that follow you around and
+            // never die, which is what a long-lived chat per workspace looks
+            // like from outside.
+            //
+            // Demotion is not closure: the items stay open and the planner is
+            // still shown them as unfinished work per the owner directive
+            // above. They simply stop being at the head of the queue, so the
+            // next message decides what happens to them.
+            match demote_in_progress(&storage, &scope, scope_id.as_deref(), "chat").await {
+                Ok(0) => {}
+                Ok(demoted) => tracing::info!(
+                    demoted,
+                    cancelled = run_handle.cancel.is_cancelled(),
+                    "turn ended — in-flight items returned to pending"
+                ),
+                Err(message) => {
+                    tracing::warn!(%message, "could not release the turn's in-flight items");
                 }
             }
 
