@@ -112,38 +112,256 @@ fn task_to_json(task: &Task) -> Value {
     })
 }
 
-fn string_vec(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+// ---------------------------------------------------------------------------
+// Param dialect readers
+// ---------------------------------------------------------------------------
+//
+// Every param here arrives as JSON written by a model and carried across the
+// Boa bridge. Models routinely stringify scalars and nested JSON — `"2109"`
+// for an id, `"[2108]"` for a dependency list — which is the same dialect
+// PR #174 taught `acceptance` to read. Two rules hold for every reader below:
+//
+// 1. A value that can be read LOSSLESSLY is read, whatever shape it wore.
+//    Anything lossy or ambiguous is refused rather than guessed at: guessing
+//    writes a row nobody asked for.
+// 2. A value that cannot be read is an ERROR that names what arrived. It is
+//    never dropped. Silently discarding `depends_on` (observed live
+//    2026-08-04: `"[2108]"` vanished, and `"2109"` was answered with "id is
+//    required") left the model believing it had declared a dependency the
+//    store never recorded — the failure mode that makes a dialect bug
+//    invisible.
+//
+// Absent and JSON null both mean "not supplied": the Boa bridge serializes
+// `undefined` object members as null, so null must keep meaning "not
+// mentioned" or every partial update would wipe the fields it omitted.
+
+/// How much of an offending value an error message quotes back.
+///
+/// Bound justification: the message exists to identify WHICH value was
+/// rejected, not to reproduce it — a tool result is read back into the
+/// model's context, so echoing an arbitrarily large payload into an error
+/// would make the error the thing that floods the window. 48 chars quotes any
+/// plausible id, label, status, or short filter in full.
+const PARAM_PREVIEW_CHARS: usize = 48;
+
+/// Largest magnitude an `f64` represents with integer precision (2^53).
+///
+/// Bound justification: this is a property of the representation, not a
+/// policy. At or below 2^53 every integer has a distinct `f64`; above it,
+/// adjacent integers share a bit pattern, so "the fraction is zero" stops
+/// proving the value is the integer the caller meant.
+const F64_EXACT_INT_MAX: f64 = 9_007_199_254_740_992.0;
+
+/// Name the type (and, for scalars, the value) that actually arrived.
+///
+/// Shared with the `memory.*` services in `server.rs` so both script-service
+/// surfaces answer a mistyped param in one vocabulary.
+pub(crate) fn describe_value(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => format!("boolean {b}"),
+        Value::Number(n) => format!("number {n}"),
+        Value::String(s) => {
+            let truncated = s.chars().count() > PARAM_PREVIEW_CHARS;
+            let mut preview: String = s.chars().take(PARAM_PREVIEW_CHARS).collect();
+            if truncated {
+                preview.push('…');
+            }
+            format!("string \"{preview}\"")
+        }
+        Value::Array(items) => format!("an array of {} item(s)", items.len()),
+        Value::Object(_) => "an object".to_string(),
+    }
 }
 
-/// Read an i64 that may arrive as a JS float (Boa numbers cross the bridge
-/// as f64 once arithmetic touches them).
+/// Convert a whole `f64` to `i64`, or `None` when the conversion would be a
+/// guess. See [`F64_EXACT_INT_MAX`] for why the magnitude is bounded.
+// The cast is exact by construction: fract() == 0.0 and |f| <= 2^53 put the
+// value well inside i64.
+#[allow(clippy::cast_possible_truncation)]
+fn whole_f64_to_i64(f: f64) -> Option<i64> {
+    (f.fract() == 0.0 && f.abs() <= F64_EXACT_INT_MAX).then_some(f as i64)
+}
+
+/// Read an i64 from the dialects that actually reach this service.
+///
+/// Accepted, each because it is unambiguous:
+/// - a JSON integer — the canonical shape;
+/// - a JSON number with no fractional part, within [`F64_EXACT_INT_MAX`] —
+///   Boa numbers cross the bridge as `f64` once arithmetic touches them, so
+///   `3` can arrive as `3.0`;
+/// - a JSON string whose TRIMMED text parses as an integer — models stringify
+///   scalars constantly (`"2109"`). Parsed as `i64` first so the full i64
+///   range survives without an `f64` round trip; `"2109.0"` then falls back to
+///   the whole-number rule above.
+///
+/// Refused (`None`) because reading them would be a guess, not a coercion:
+/// empty or whitespace-only text, non-numeric text, any fractional value
+/// (`1.5`, `"1.5"`), a magnitude no longer exactly representable, and
+/// booleans — JS `true` is not 1 on this surface.
 fn as_i64_lenient(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| {
-        value
-            .as_f64()
-            .filter(|f| f.fract() == 0.0)
-            .map(|f| f as i64)
-    })
+    match value {
+        Value::Number(_) => value
+            .as_i64()
+            .or_else(|| value.as_f64().and_then(whole_f64_to_i64)),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            text.parse::<i64>()
+                .ok()
+                .or_else(|| text.parse::<f64>().ok().and_then(whole_f64_to_i64))
+        }
+        _ => None,
+    }
 }
 
-fn get_i64(params: &Value, key: &str) -> Option<i64> {
-    params.get(key).and_then(as_i64_lenient)
+/// Read a bool from the dialects that actually reach this service: the JSON
+/// literal, or the literal spelled out as text (`"true"`, `" False "`).
+///
+/// `1`/`0`/`"yes"`/`""` are refused on purpose — mapping them is a guess about
+/// intent, and this surface would rather say what it saw than pick a side.
+fn as_bool_lenient(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
-fn i64_vec(value: Option<&Value>) -> Vec<i64> {
-    value
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(as_i64_lenient).collect())
-        .unwrap_or_default()
+/// Unwrap a list that may have arrived as a JSON array or as a STRING holding
+/// one (`"[2108]"`).
+///
+/// Exactly ONE unwrap, mirroring PR #174's rule for stringified acceptance: a
+/// doubly-encoded payload (`"\"[1]\""`) is a bug worth surfacing, not one to
+/// peel until something array-shaped falls out. Coercing the ELEMENTS is a
+/// separate step — that is what turns `["2108"]` into `[2108]`.
+fn unwrap_array(value: &Value) -> Option<Vec<Value>> {
+    match value {
+        Value::Array(items) => Some(items.clone()),
+        Value::String(text) => match serde_json::from_str::<Value>(text.trim()) {
+            Ok(Value::Array(items)) => Some(items),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `Ok(None)` = not supplied (absent or null). `Ok(Some(_))` = read.
+/// `Err(_)` = supplied in a shape this service cannot read.
+type ParamResult<T> = Result<Option<T>, String>;
+
+/// Read an optional integer param, keeping MISSING and UNINTERPRETABLE apart.
+pub(crate) fn opt_i64(params: &Value, key: &str) -> ParamResult<i64> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => as_i64_lenient(value).map(Some).ok_or_else(|| {
+            format!(
+                "{key} must be an integer (got {}). Pass a number, e.g. {{\"{key}\": 42}} — the \
+                 digits as a string (\"42\") are accepted too.",
+                describe_value(value)
+            )
+        }),
+    }
+}
+
+/// Read a required integer param.
+///
+/// Missing and uninterpretable get DIFFERENT answers on purpose: replying
+/// "id is required" to a supplied `"2109"` is a false statement, and the model
+/// that read it re-sent the same call three times before giving up (observed
+/// live 2026-08-04). `id` of `0` is supplied, not missing.
+fn req_i64(params: &Value, key: &str) -> Result<i64, String> {
+    opt_i64(params, key)?.ok_or_else(|| format!("{key} is required"))
+}
+
+/// Read an optional bool param, keeping MISSING and UNINTERPRETABLE apart.
+///
+/// An unreadable value is an error rather than a fall-through to the default:
+/// a default silently substituted for `"include_done": "maybe"` answers a
+/// question the caller did not ask.
+fn opt_bool(params: &Value, key: &str) -> ParamResult<bool> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => as_bool_lenient(value).map(Some).ok_or_else(|| {
+            format!(
+                "{key} must be true or false (got {}).",
+                describe_value(value)
+            )
+        }),
+    }
+}
+
+/// Read an optional list-of-ids param (`depends_on`).
+///
+/// An unreadable list ERRORS instead of resolving to an empty vec: an empty
+/// `depends_on` is a real, meaningful value ("nothing blocks this"), so
+/// quietly substituting it for a list the caller did state is how a declared
+/// dependency disappears without a trace.
+fn opt_i64_vec(params: &Value, key: &str) -> ParamResult<Vec<i64>> {
+    let Some(value) = params.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let items = unwrap_array(value).ok_or_else(|| {
+        format!(
+            "{key} must be a list of task ids (got {}). Pass an array, e.g. \
+             {{\"{key}\": [12, 34]}} — the array as a JSON string (\"[12, 34]\") is accepted too.",
+            describe_value(value)
+        )
+    })?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            as_i64_lenient(item).ok_or_else(|| {
+                format!(
+                    "{key}[{index}] must be a task id (got {}). Every entry has to be an \
+                     integer, e.g. {{\"{key}\": [12, 34]}}.",
+                    describe_value(item)
+                )
+            })
+        })
+        .collect::<Result<Vec<i64>, String>>()
+        .map(Some)
+}
+
+/// Read an optional list-of-strings param (`labels`, `tools`).
+///
+/// Scalar elements are rendered as their text (`123` -> `"123"`) because that
+/// is lossless; a nested array or object is not a label by any reading and
+/// errors. Same no-silent-empty rule as [`opt_i64_vec`].
+fn opt_string_vec(params: &Value, key: &str) -> ParamResult<Vec<String>> {
+    let Some(value) = params.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let items = unwrap_array(value).ok_or_else(|| {
+        format!(
+            "{key} must be a list of strings (got {}). Pass an array, e.g. \
+             {{\"{key}\": [\"one\", \"two\"]}} — the array as a JSON string \
+             (\"[\\\"one\\\"]\") is accepted too.",
+            describe_value(value)
+        )
+    })?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match item {
+            Value::String(s) => Ok(s.clone()),
+            Value::Number(n) => Ok(n.to_string()),
+            Value::Bool(b) => Ok(b.to_string()),
+            other => Err(format!(
+                "{key}[{index}] must be text (got {}). Every entry has to be a string, e.g. \
+                 {{\"{key}\": [\"one\", \"two\"]}}.",
+                describe_value(other)
+            )),
+        })
+        .collect::<Result<Vec<String>, String>>()
+        .map(Some)
 }
 
 fn opt_string(params: &Value, key: &str) -> Option<String> {
@@ -233,7 +451,7 @@ pub fn build_task_services(
                 Box::pin(async move {
                     // A subtask always lives in its parent's scope — replan
                     // steps only know the parent id, not the run's scope.
-                    let parent_id = get_i64(&params, "parent_id");
+                    let parent_id = opt_i64(&params, "parent_id")?;
                     let (scope, scope_id, parent_sort) = if let Some(parent_id) = parent_id {
                         let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
                         (parent.scope, parent.scope_id, Some(parent.sort_order))
@@ -322,7 +540,7 @@ pub fn build_task_services(
                     // position; a new root task appends AFTER everything
                     // (defaulting to 0 would jump the whole queue — observed
                     // live as a task explosion drowning the seeded plan).
-                    let sort_order = match get_i64(&params, "sort_order") {
+                    let sort_order = match opt_i64(&params, "sort_order")? {
                         Some(explicit) => explicit,
                         None => match parent_sort {
                             Some(parent_sort) => parent_sort,
@@ -351,12 +569,12 @@ pub fn build_task_services(
                         // self-created todo must never outrank user-origin
                         // work (observed live 2026-08-02: a self-created p1
                         // side-task preempted the user's p2 request).
-                        priority: get_i64(&params, "priority").unwrap_or(3).max(2),
-                        labels: string_vec(params.get("labels")),
-                        tool_scope: string_vec(params.get("tools")),
+                        priority: opt_i64(&params, "priority")?.unwrap_or(3).max(2),
+                        labels: opt_string_vec(&params, "labels")?.unwrap_or_default(),
+                        tool_scope: opt_string_vec(&params, "tools")?.unwrap_or_default(),
                         due_at: opt_string(&params, "due_at"),
                         recurrence: opt_string(&params, "recurrence"),
-                        depends_on: i64_vec(params.get("depends_on")),
+                        depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
                         acceptance: canonical_acceptance(&params)?,
                         assignee: opt_string(&params, "assignee"),
                         sort_order,
@@ -376,12 +594,16 @@ pub fn build_task_services(
             Arc::new(move |params: Value| {
                 let storage = storage.clone();
                 Box::pin(async move {
-                    let id = get_i64(&params, "id").ok_or_else(|| "id is required".to_string())?;
-                    // Null/absent/mistyped values SKIP a field, never wipe it:
-                    // the Boa bridge serializes `undefined` object members as
-                    // null, so a partial update from the tool must not clear
-                    // every field it did not mention. (Clearing a field is a
-                    // deliberate op this service intentionally does not expose.)
+                    let id = req_i64(&params, "id")?;
+                    // Null/absent values SKIP a field, never wipe it: the Boa
+                    // bridge serializes `undefined` object members as null, so
+                    // a partial update from the tool must not clear every
+                    // field it did not mention. (Clearing a field is a
+                    // deliberate op this service intentionally does not
+                    // expose.) A value that is PRESENT but unreadable is a
+                    // different thing entirely and errors — skipping it left
+                    // the model believing it had set a field the store never
+                    // saw.
                     let patch = TaskPatch {
                         title: opt_string(&params, "title").or_else(|| opt_string(&params, "text")),
                         description: params
@@ -391,15 +613,9 @@ pub fn build_task_services(
                         status: opt_string(&params, "status"),
                         // Same floor as tasks.add: the model cannot promote
                         // its own work to p1 after the fact either.
-                        priority: get_i64(&params, "priority").map(|p| p.max(2)),
-                        labels: params
-                            .get("labels")
-                            .filter(|v| v.is_array())
-                            .map(|v| string_vec(Some(v))),
-                        tool_scope: params
-                            .get("tools")
-                            .filter(|v| v.is_array())
-                            .map(|v| string_vec(Some(v))),
+                        priority: opt_i64(&params, "priority")?.map(|p| p.max(2)),
+                        labels: opt_string_vec(&params, "labels")?,
+                        tool_scope: opt_string_vec(&params, "tools")?,
                         due_at: params
                             .get("due_at")
                             .and_then(Value::as_str)
@@ -408,21 +624,18 @@ pub fn build_task_services(
                             .get("recurrence")
                             .and_then(Value::as_str)
                             .map(|s| Some(s.to_string())),
-                        depends_on: params
-                            .get("depends_on")
-                            .filter(|v| v.is_array())
-                            .map(|v| i64_vec(Some(v))),
+                        depends_on: opt_i64_vec(&params, "depends_on")?,
                         acceptance: canonical_acceptance(&params)?.map(Some),
                         assignee: params
                             .get("assignee")
                             .and_then(Value::as_str)
                             .map(|s| Some(s.to_string())),
-                        parent_id: get_i64(&params, "parent_id").map(Some),
+                        parent_id: opt_i64(&params, "parent_id")?.map(Some),
                         project: params
                             .get("project")
                             .and_then(Value::as_str)
                             .map(|s| Some(s.to_string())),
-                        sort_order: get_i64(&params, "sort_order"),
+                        sort_order: opt_i64(&params, "sort_order")?,
                     };
                     let actor = opt_string(&params, "actor");
                     let task = storage
@@ -445,7 +658,7 @@ pub fn build_task_services(
             Arc::new(move |params: Value| {
                 let storage = storage.clone();
                 Box::pin(async move {
-                    let id = get_i64(&params, "id").ok_or_else(|| "id is required".to_string())?;
+                    let id = req_i64(&params, "id")?;
                     let actor = opt_string(&params, "actor");
                     let task = storage.tasks().get(id).await.map_err(err_str)?;
 
@@ -514,10 +727,7 @@ pub fn build_task_services(
                 let workspace_id = workspace_id.clone();
                 Box::pin(async move {
                     let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let include_done = params
-                        .get("include_done")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
+                    let include_done = opt_bool(&params, "include_done")?.unwrap_or(true);
                     let tasks = storage
                         .tasks()
                         .list(&scope, scope_id.as_deref(), include_done)
@@ -561,7 +771,7 @@ pub fn build_task_services(
             Arc::new(move |params: Value| {
                 let storage = storage.clone();
                 Box::pin(async move {
-                    let id = get_i64(&params, "id").ok_or_else(|| "id is required".to_string())?;
+                    let id = req_i64(&params, "id")?;
                     let content = opt_string(&params, "content")
                         .or_else(|| opt_string(&params, "text"))
                         .ok_or_else(|| "content is required".to_string())?;
@@ -585,7 +795,7 @@ pub fn build_task_services(
             Arc::new(move |params: Value| {
                 let storage = storage.clone();
                 Box::pin(async move {
-                    let id = get_i64(&params, "id").ok_or_else(|| "id is required".to_string())?;
+                    let id = req_i64(&params, "id")?;
                     let actor = opt_string(&params, "actor");
 
                     // A task carrying a machine-checkable acceptance check is
@@ -638,10 +848,7 @@ pub fn build_task_services(
                 let workspace_id = workspace_id.clone();
                 Box::pin(async move {
                     let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                    let closed_only = params
-                        .get("closed_only")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
+                    let closed_only = opt_bool(&params, "closed_only")?.unwrap_or(true);
 
                     // Same contract rule as tasks.remove, applied in bulk —
                     // and this is the path that actually bites. Observed live
@@ -5559,6 +5766,279 @@ mod workspace_reference_tests {
         assert!(
             goal_at > reference_at,
             "the user's message must come after the reference material"
+        );
+    }
+}
+
+/// What the `tasks.*` services accept from a model, and what they refuse.
+///
+/// The dialect is the contract: every param here is JSON a model wrote, so a
+/// reader that only admits the canonical shape is a reader that fails on real
+/// traffic — and one that drops what it cannot read fails invisibly.
+#[cfg(test)]
+mod param_dialect_tests {
+    use super::*;
+
+    async fn add_task(services: &HashMap<String, ServiceFn>, params: Value) -> Value {
+        services
+            .get("tasks.add")
+            .expect("tasks.add service")(params)
+        .await
+        .expect("add succeeds")
+    }
+
+    /// REGRESSION (live 2026-08-04, claude-opus-5 driving `todo`): the model
+    /// sent `{"action":"update","id":"2109"}` three times running and was told
+    /// "id is required" each time. The id was right there — only quoted.
+    #[test]
+    fn a_stringified_id_is_an_id() {
+        assert_eq!(req_i64(&json!({ "id": "2109" }), "id"), Ok(2109));
+        assert_eq!(req_i64(&json!({ "id": 2109 }), "id"), Ok(2109));
+        // Boa hands whole numbers back as floats once arithmetic touches them.
+        assert_eq!(req_i64(&json!({ "id": 2109.0 }), "id"), Ok(2109));
+        assert_eq!(req_i64(&json!({ "id": "2109.0" }), "id"), Ok(2109));
+        assert_eq!(req_i64(&json!({ "id": " 2109 " }), "id"), Ok(2109));
+        assert_eq!(req_i64(&json!({ "id": "-7" }), "id"), Ok(-7));
+    }
+
+    /// Zero is a value, not an absence — the JS `!input.id` guard this fix
+    /// also tightened made exactly that mistake.
+    #[test]
+    fn an_id_of_zero_is_supplied() {
+        assert_eq!(req_i64(&json!({ "id": 0 }), "id"), Ok(0));
+        assert_eq!(req_i64(&json!({ "id": "0" }), "id"), Ok(0));
+        assert_eq!(opt_i64(&json!({ "id": 0 }), "id"), Ok(Some(0)));
+    }
+
+    /// MISSING and UNINTERPRETABLE are different failures and must read
+    /// differently: "id is required" said about a supplied id is a false
+    /// statement, and a model that believes it loops on the same call.
+    #[test]
+    fn a_missing_id_and_an_unreadable_id_say_different_things() {
+        assert_eq!(req_i64(&json!({}), "id"), Err("id is required".to_string()));
+        // The bridge writes `undefined` members as null — still "not supplied".
+        assert_eq!(
+            req_i64(&json!({ "id": Value::Null }), "id"),
+            Err("id is required".to_string())
+        );
+
+        let unreadable = req_i64(&json!({ "id": "abc" }), "id").expect_err("not an integer");
+        assert!(
+            unreadable.contains("id must be an integer"),
+            "must name the requirement, got: {unreadable}"
+        );
+        assert!(
+            unreadable.contains("got string \"abc\""),
+            "must name what ARRIVED, got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("is required"),
+            "an id WAS supplied — saying otherwise is what caused the loop"
+        );
+    }
+
+    /// Lossy or ambiguous readings are refused rather than guessed at: a wrong
+    /// guess writes a row nobody asked for.
+    #[test]
+    fn a_lossy_or_ambiguous_id_is_refused() {
+        for bad in [
+            json!(1.5),
+            json!("1.5"),
+            json!(""),
+            json!("   "),
+            json!(true),
+            json!([1]),
+            json!({ "id": 1 }),
+            // Past 2^53 an f64 cannot tell adjacent integers apart, so
+            // "the fraction is zero" stops proving anything.
+            json!(9_007_199_254_740_994.0_f64),
+        ] {
+            assert!(
+                as_i64_lenient(&bad).is_none(),
+                "{bad} must not be read as an integer"
+            );
+        }
+        // A string, though, is parsed as i64 directly — no f64 round trip, so
+        // the full i64 range survives.
+        assert_eq!(
+            as_i64_lenient(&json!("9007199254740993")),
+            Some(9_007_199_254_740_993)
+        );
+    }
+
+    /// The silent half of the same bug: `depends_on: "[2108]"` hit
+    /// `Value::as_array`, returned None, and was dropped with no error at all.
+    /// The model believed it had declared a dependency the store never saw.
+    #[test]
+    fn a_stringified_dependency_list_survives() {
+        assert_eq!(
+            opt_i64_vec(&json!({ "depends_on": "[2108]" }), "depends_on"),
+            Ok(Some(vec![2108]))
+        );
+        assert_eq!(
+            opt_i64_vec(&json!({ "depends_on": ["2108"] }), "depends_on"),
+            Ok(Some(vec![2108]))
+        );
+        assert_eq!(
+            opt_i64_vec(&json!({ "depends_on": [2108, "2109"] }), "depends_on"),
+            Ok(Some(vec![2108, 2109]))
+        );
+        assert_eq!(
+            opt_i64_vec(&json!({ "depends_on": [] }), "depends_on"),
+            Ok(Some(vec![]))
+        );
+        assert_eq!(opt_i64_vec(&json!({}), "depends_on"), Ok(None));
+    }
+
+    /// One unwrap only, mirroring PR #174: a doubly-encoded list is a bug to
+    /// surface, not one to peel.
+    #[test]
+    fn a_dependency_list_is_unwrapped_exactly_once() {
+        assert!(
+            opt_i64_vec(&json!({ "depends_on": "\"[2108]\"" }), "depends_on").is_err(),
+            "a doubly-encoded list must be reported, not peeled twice"
+        );
+    }
+
+    /// An unreadable list must never resolve to an empty vec: empty is a real,
+    /// meaningful value ("nothing blocks this"), so substituting it silently
+    /// erases a dependency the caller did state.
+    #[test]
+    fn an_unreadable_dependency_list_errors_instead_of_emptying() {
+        let err = opt_i64_vec(&json!({ "depends_on": "not json" }), "depends_on")
+            .expect_err("must not silently empty");
+        assert!(err.contains("depends_on must be a list of task ids"), "{err}");
+        assert!(err.contains("got string \"not json\""), "{err}");
+
+        let element = opt_i64_vec(&json!({ "depends_on": ["abc"] }), "depends_on")
+            .expect_err("an unreadable element must not vanish either");
+        assert!(element.contains("depends_on[0]"), "{element}");
+        assert!(element.contains("got string \"abc\""), "{element}");
+    }
+
+    /// Same rule for the string lists. A scalar element renders losslessly;
+    /// a nested array is not a label under any reading.
+    #[test]
+    fn label_lists_read_the_same_dialects() {
+        assert_eq!(
+            opt_string_vec(&json!({ "labels": "[\"a\",\"b\"]" }), "labels"),
+            Ok(Some(vec!["a".to_string(), "b".to_string()]))
+        );
+        assert_eq!(
+            opt_string_vec(&json!({ "labels": [1, true] }), "labels"),
+            Ok(Some(vec!["1".to_string(), "true".to_string()]))
+        );
+        assert!(opt_string_vec(&json!({ "labels": "urgent" }), "labels").is_err());
+        assert!(opt_string_vec(&json!({ "labels": [["a"]] }), "labels").is_err());
+    }
+
+    /// Booleans arrive spelled out too. Only the two literals are read —
+    /// `1`/`"yes"` would be a guess about intent, and a default quietly
+    /// substituted for an unreadable flag answers a question nobody asked.
+    #[test]
+    fn booleans_read_the_literal_spelled_out_and_nothing_else() {
+        assert_eq!(opt_bool(&json!({ "b": "true" }), "b"), Ok(Some(true)));
+        assert_eq!(opt_bool(&json!({ "b": " False " }), "b"), Ok(Some(false)));
+        assert_eq!(opt_bool(&json!({ "b": false }), "b"), Ok(Some(false)));
+        assert_eq!(opt_bool(&json!({}), "b"), Ok(None));
+        assert!(opt_bool(&json!({ "b": 1 }), "b").is_err());
+        assert!(opt_bool(&json!({ "b": "yes" }), "b").is_err());
+    }
+
+    /// End to end through the live services: the exact three calls from the
+    /// 2026-08-04 transcript now land.
+    #[tokio::test]
+    async fn the_service_surface_accepts_the_dialect_the_model_sends() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
+
+        let blocker = add_task(
+            &services,
+            json!({ "title": "blocker", "scope": "session", "session_id": "s1" }),
+        )
+        .await;
+        let blocker_id = blocker["task"]["id"].as_i64().expect("id");
+        let target = add_task(
+            &services,
+            json!({ "title": "target", "scope": "session", "session_id": "s1" }),
+        )
+        .await;
+        let target_id = target["task"]["id"].as_i64().expect("id");
+
+        // The failing call, verbatim in shape: id and depends_on both quoted.
+        let updated = services.get("tasks.update").expect("tasks.update")(json!({
+            "id": target_id.to_string(),
+            "depends_on": format!("[{blocker_id}]"),
+            "title": "Move the four dialect readers",
+        }))
+        .await
+        .expect("a quoted id is an id");
+        assert_eq!(updated["task"]["id"], json!(target_id));
+        assert_eq!(
+            updated["task"]["depends_on"],
+            json!([blocker_id]),
+            "the dependency must be RECORDED, not silently dropped"
+        );
+        assert_eq!(updated["task"]["title"], json!("Move the four dialect readers"));
+
+        // A note and a completion against the same quoted id.
+        services.get("tasks.note").expect("tasks.note")(
+            json!({ "id": target_id.to_string(), "content": "found it" }),
+        )
+        .await
+        .expect("a quoted id notes");
+        services.get("tasks.done").expect("tasks.done")(
+            json!({ "id": blocker_id.to_string() }),
+        )
+        .await
+        .expect("a quoted id completes");
+
+        // And the remove that closed the transcript.
+        let removed = services.get("tasks.remove").expect("tasks.remove")(
+            json!({ "id": target_id.to_string() }),
+        )
+        .await
+        .expect("a quoted id removes");
+        assert_eq!(removed["removed"], json!(1));
+
+        // A genuinely unreadable id still fails — loudly, and about itself.
+        let err = services.get("tasks.update").expect("tasks.update")(
+            json!({ "id": "abc" }),
+        )
+        .await
+        .expect_err("garbage is still garbage");
+        assert!(err.contains("got string \"abc\""), "{err}");
+    }
+
+    /// A dependency the store cannot read stops the write instead of landing a
+    /// task whose plan is quietly missing an edge.
+    #[tokio::test]
+    async fn an_unreadable_dependency_refuses_the_add() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let workspace_id = Arc::new(RwLock::new(None));
+        let services =
+            build_task_services(storage.clone(), workspace_id, Arc::new(TurnBaselines::new()));
+
+        let err = services.get("tasks.add").expect("tasks.add")(json!({
+            "title": "depends on something",
+            "scope": "session",
+            "session_id": "s1",
+            "depends_on": "not json",
+        }))
+        .await
+        .expect_err("a dropped dependency must not pass silently");
+        assert!(err.contains("depends_on must be a list of task ids"), "{err}");
+
+        let open = storage
+            .tasks()
+            .list("session", Some("s1"), true)
+            .await
+            .expect("list");
+        assert!(
+            open.is_empty(),
+            "the refused add must not have written a half-formed task"
         );
     }
 }

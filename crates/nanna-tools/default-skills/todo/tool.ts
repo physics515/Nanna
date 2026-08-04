@@ -1,6 +1,6 @@
 export default {
   name: "todo",
-  version: "0.2.1",
+  version: "0.2.2",
   description: "Agent-grade task store. Track and drive multi-step work: 'next' returns the ONE actionable task (unblocked, highest priority), 'add' creates tasks (with parent_id for subtasks, depends_on for ordering, acceptance for a machine-checkable done condition), 'done' completes a task (its acceptance check is verified by the harness first), 'note' saves findings for future steps, 'query' filters (e.g. 'p1 & !done', '@label', 'overdue'). Tasks persist across sessions via scope: session (default), workspace, or global.",
   output: "context",
   parameters: {
@@ -110,7 +110,7 @@ function serviceExecute(action, input, sessionId, scope) {
     }
 
     case "update": {
-      if (!input.id) { return "Error: 'id' is required for update"; }
+      if (!hasId(input)) { return "Error: 'id' is required for update"; }
       var params = compact({
         id: input.id, title: input.title, text: input.text,
         description: input.description, status: input.status,
@@ -125,7 +125,7 @@ function serviceExecute(action, input, sessionId, scope) {
     }
 
     case "done": {
-      if (!input.id) { return "Error: 'id' is required for done"; }
+      if (!hasId(input)) { return "Error: 'id' is required for done"; }
       var res = Nanna.service("tasks.done", {
         id: input.id, workdir: Nanna.workdir(), actor: "todo-tool"
       });
@@ -149,8 +149,8 @@ function serviceExecute(action, input, sessionId, scope) {
       // (observed live 2026-07-26: 11 of 28 todo calls failed this way).
       // There is exactly ONE actionable task by design, so "the current
       // task" is unambiguous.
-      var noteId = input.id;
-      if (!noteId) {
+      var noteId = hasId(input) ? input.id : null;
+      if (noteId === null) {
         var open = Nanna.service("tasks.list", {
           scope: scope, session_id: sessionId, include_done: false
         });
@@ -158,9 +158,9 @@ function serviceExecute(action, input, sessionId, scope) {
         for (var ni = 0; ni < candidates.length; ni++) {
           if (candidates[ni].status === "in_progress") { noteId = candidates[ni].id; break; }
         }
-        if (!noteId && candidates.length > 0) { noteId = candidates[0].id; }
+        if (noteId === null && candidates.length > 0) { noteId = candidates[0].id; }
       }
-      if (!noteId) {
+      if (noteId === null || noteId === undefined) {
         return "No task to note against: the note was NOT saved because there are no open tasks. " +
                "Add a task first (action 'add'), or pass an explicit id. Nothing else went wrong.";
       }
@@ -178,7 +178,7 @@ function serviceExecute(action, input, sessionId, scope) {
     }
 
     case "remove": {
-      if (!input.id) { return "Error: 'id' is required for remove"; }
+      if (!hasId(input)) { return "Error: 'id' is required for remove"; }
       var res = Nanna.service("tasks.remove", { id: input.id });
       return "Removed " + res.removed + " task(s).\n\n" + listSummary(base);
     }
@@ -246,6 +246,16 @@ function serviceExecute(action, input, sessionId, scope) {
 function listSummary(base) {
   var counts = Nanna.service("tasks.counts", base);
   return "Progress: " + counts.closed + " done, " + counts.open + " open.";
+}
+
+// Was an id SUPPLIED? Presence is the only thing this layer can honestly
+// check — the service owns the type work, and it reads the dialects models
+// actually emit (a stringified "2109" resolves to 2109). `!input.id` got both
+// halves wrong: it called a legitimate id of 0 missing, and it waved every
+// other shape through to a service that answered "id is required" about an id
+// that was right there in the call (observed live 2026-08-04).
+function hasId(input) {
+  return input.id !== undefined && input.id !== null && input.id !== "";
 }
 
 // Drop undefined/null members: the bridge serializes `undefined` as null,
