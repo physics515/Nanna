@@ -1209,6 +1209,11 @@ pub struct DaemonServer {
     /// Set when storage init quarantined + rebuilt a corrupt database file;
     /// surfaced on /status and broadcast as `Event::MemoryStoreRebuilt`.
     memory_recovery: Option<Arc<nanna_storage::RecoveryReport>>,
+    /// Set when storage failed to open at all — memory is in-process only and
+    /// will be lost on exit. Distinct from `memory_recovery`, which means the
+    /// store WAS repaired and does persist. Surfaced on status so the state is
+    /// observable rather than inferred from a log line at boot.
+    storage_error: Option<String>,
 }
 
 impl DaemonServer {
@@ -1268,6 +1273,7 @@ impl DaemonServer {
             log_buffer: None,
             storage: None,
             memory_recovery: None,
+            storage_error: None,
         }
     }
 
@@ -1946,12 +1952,23 @@ impl DaemonServer {
         let _health_state = if self.config.enable_health_server {
             // Seed durable-memory-store health (load already ran in init_services),
             // so a corrupt/degraded store shows on /status, not just a boot log.
+            //
+            // A store that never opened is degraded too, and more severely than
+            // one with corrupt rows: there is no durable store at all, so the
+            // per-store health probe cannot report on it. Fold that in here or
+            // the most complete failure is the one /status calls healthy.
             let (mem_degraded, mem_corrupt) = if let Some(ref m) = memory {
                 let h = m.store_health().await;
-                (h.degraded, h.corrupt_rows)
+                (h.degraded || self.storage_error.is_some(), h.corrupt_rows)
             } else {
-                (false, 0)
+                (self.storage_error.is_some(), 0)
             };
+            if let Some(ref err) = self.storage_error {
+                error!(
+                    error = %err,
+                    "reporting degraded health: memory has no durable store this session"
+                );
+            }
             let mut state = HealthState::new(
                 memory.is_some(),
                 true, // agent is available
@@ -3290,10 +3307,24 @@ impl DaemonBuilder {
                 server.set_storage(Arc::new(storage));
             }
             Err(e) => {
-                warn!(
-                    "Failed to initialize storage: {}. Model stats will not persist.",
-                    e
+                // Storage is where MEMORY lives, not just model stats. Without
+                // it the daemon still runs and memory still "works" — in RAM,
+                // for this session, discarded on exit — so the failure reads as
+                // a good session until someone notices nothing was remembered.
+                //
+                // The old wording named model stats, the quietest thing lost,
+                // at warn level. That is the wrong end of the blast radius and
+                // the wrong severity: this is also the only signal a bad
+                // migration produces, since a migration that fails leaves the
+                // name unrecorded and gets retried on every boot forever.
+                error!(
+                    error = %e,
+                    db_path = ?db_path,
+                    "STORAGE UNAVAILABLE — memory is in-process only and will be LOST on exit; \
+                     model stats, tasks and checkpoints will not persist. Most likely a failed \
+                     migration or an unwritable database path."
                 );
+                server.storage_error = Some(e.to_string());
             }
         }
 

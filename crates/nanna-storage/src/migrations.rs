@@ -13,6 +13,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("009_memory_fsrs", MIGRATION_009),
     ("010_checkpoints", MIGRATION_010),
     ("011_tasks", MIGRATION_011),
+    ("012_memory_chunks", MIGRATION_012),
 ];
 
 const MIGRATION_001: &str = r"
@@ -351,4 +352,60 @@ CREATE TABLE IF NOT EXISTS task_activity (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_activity_task ON task_activity(task_id);
+";
+
+/// Per-chunk vectors, with the memory row as parent.
+///
+/// A memory's content is unbounded, but an embedding model's input window is
+/// not. Embedding a row whole meant everything past the window was truncated
+/// away and the resulting vector described only a prefix while claiming to
+/// describe the row. Chunks are sized to the model's window and embedded
+/// individually, so the whole content is represented.
+///
+/// Additive only. `memories` is untouched on purpose: the corruption-recovery
+/// salvage path reads a fixed column list positionally out of a quarantined
+/// file, so widening that table would break rebuilds of databases written
+/// before the change. Existing rows simply have no chunks and keep matching on
+/// `memories.embedding` until the backfill reaches them.
+///
+/// No ALTER, and no semicolon inside a comment -- migrations are split on
+/// `;` with no comment awareness, run outside a transaction, and are recorded
+/// only after every statement succeeds, so a statement that cannot apply is
+/// retried on every boot forever.
+const MIGRATION_012: &str = r"
+CREATE TABLE IF NOT EXISTS memory_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    char_start INTEGER NOT NULL,
+    char_end INTEGER NOT NULL,
+    embedding BLOB,
+    embedding_model TEXT,
+    chunk_max_chars INTEGER NOT NULL,
+    chunker_version INTEGER NOT NULL,
+    workspace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One row per (parent, ordinal). Rewrites replace the whole set for a parent.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_chunks_parent
+    ON memory_chunks(memory_id, ordinal);
+
+-- Scoped search filters inline rather than joining, so the workspace is
+-- denormalized onto the chunk.
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_workspace
+    ON memory_chunks(workspace_id);
+
+-- Finds chunks whose vector came from a model that is no longer active, which
+-- is what makes an embedding-model switch a resumable backfill instead of a
+-- full rebuild.
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_model
+    ON memory_chunks(embedding_model);
+
+-- Drives the backfill queue: chunks whose text exists but whose vector does
+-- not yet.
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_pending
+    ON memory_chunks(embedding_model, id);
 ";
