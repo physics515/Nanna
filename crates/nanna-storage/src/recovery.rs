@@ -52,6 +52,7 @@ const SALVAGE_TABLES: &[&str] = &[
     "sessions",
     "messages",
     "memories",
+    "memory_chunks",
     "memory_tags",
     "config",
     "cron_jobs",

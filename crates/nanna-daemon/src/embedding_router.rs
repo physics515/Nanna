@@ -70,6 +70,14 @@ pub struct EmbeddingRouter {
     /// Per-provider bench deadline; `Some(t)` means "do not call before `t`".
     /// Same length as `providers`. See [`DEMOTION_SECS`].
     demoted_until: RwLock<Vec<Option<Instant>>>,
+    /// Per-provider input window, memoized. Same length as `providers`.
+    ///
+    /// Three states, and the difference between the last two matters: `None` is
+    /// "never asked", `Some(None)` is "asked, the provider publishes no limit",
+    /// `Some(Some(n))` is a real limit. Collapsing the middle case into the
+    /// first would re-probe a provider that will never answer, once per
+    /// embedding call.
+    windows: RwLock<Vec<Option<Option<usize>>>>,
 }
 
 impl EmbeddingRouter {
@@ -80,6 +88,7 @@ impl EmbeddingRouter {
             active_index: RwLock::new(0),
             generation: AtomicU64::new(0),
             demoted_until: RwLock::new(vec![None]),
+            windows: RwLock::new(vec![None]),
         }
     }
 
@@ -88,6 +97,7 @@ impl EmbeddingRouter {
     pub fn with_fallback(mut self, info: EmbeddingProviderInfo, client: Arc<EmbeddingClient>) -> Self {
         self.providers.push(EmbeddingProviderEntry { info, client });
         self.demoted_until.get_mut().push(None);
+        self.windows.get_mut().push(None);
         self
     }
 
@@ -95,6 +105,35 @@ impl EmbeddingRouter {
     /// Consumers should store this and compare on subsequent calls.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    /// The input window of `info`'s model, in tokens, or `None` when the
+    /// provider publishes no limit.
+    ///
+    /// Memoized per provider: this costs one `POST /api/show` the first time a
+    /// provider is asked about and nothing thereafter. It is deliberately NOT
+    /// called on the embedding path — a provider switch is the only event that
+    /// can change the answer, and switches are rare.
+    ///
+    /// An unknown provider (not in this router) answers `None` rather than
+    /// panicking on a missing index; the caller then falls back to its own
+    /// default, which is the same thing it does for a provider that publishes
+    /// nothing.
+    pub async fn context_window_for(&self, info: &EmbeddingProviderInfo) -> Option<usize> {
+        let idx = self.providers.iter().position(|e| &e.info == info)?;
+        if let Some(memoized) = self.windows.read().await[idx] {
+            return memoized;
+        }
+        let probed = self.providers[idx].client.context_window().await;
+        self.windows.write().await[idx] = Some(probed);
+        match probed {
+            Some(window) => debug!("Embedding provider {info} accepts {window} tokens per input"),
+            None => debug!(
+                "Embedding provider {info} publishes no input limit; chunking falls back to the \
+                 retrieval-granularity default"
+            ),
+        }
+        probed
     }
 
     /// Get info about the currently active provider.

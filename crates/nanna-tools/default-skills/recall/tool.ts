@@ -9,7 +9,8 @@ export default {
     properties: {
       query: { type: "string", description: "A handle from a [memory:xxxxxxxx] stub, or search terms" },
       limit: { type: "integer", description: "Search: max results (default 5). Handle: max characters to return (default 4000)" },
-      offset: { type: "integer", description: "Handle mode only: start reading at this character offset" }
+      offset: { type: "integer", description: "Start reading at this character offset. Works in BOTH modes — search results are paged too, because memories have no size limit" },
+      page_chars: { type: "integer", description: "Search mode: how many characters of each memory to return per page" }
     },
     required: ["query"]
   },
@@ -46,7 +47,9 @@ export default {
     try {
       results = Nanna.service("memory.search", {
         query: query,
-        limit: input.limit || 5
+        limit: input.limit || 5,
+        offset: input.offset || 0,
+        page_chars: input.page_chars
       });
     } catch (e) {
       // Embedding model not configured — return gracefully instead of erroring
@@ -61,7 +64,18 @@ export default {
     for (var i = 0; i < results.length; i++) {
       var r = results[i];
       var score = r.score !== undefined ? " (relevance: " + r.score.toFixed(2) + ")" : "";
-      lines.push((i + 1) + ". [" + r.id + "]" + score + "\n   " + r.content);
+      // Memories have no size limit, so a search result is a PAGE of one. Say
+      // so whenever it is: an unannounced page reads as the whole memory, and
+      // a reader that believes it has the whole thing stops looking. The
+      // operation SUCCEEDED either way — this is a window, not a failure.
+      var more = "";
+      if (r.truncated) {
+        var next = (r.offset || 0) + r.returned;
+        more = "\n   [showing chars " + (r.offset || 0) + "-" + next + " of " + r.total +
+               ". The memory is stored WHOLE; read on with recall({query: \"" + r.id +
+               "\", offset: " + next + "})]";
+      }
+      lines.push((i + 1) + ". [" + r.id + "]" + score + "\n   " + r.content + more);
     }
 
     return "Found " + results.length + " memories:\n\n" + lines.join("\n\n");

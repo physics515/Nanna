@@ -1,6 +1,6 @@
 //! Repository implementations using Turso
 
-use crate::{CronJob, JobRun, Memory, Message, NewCronJob, NewJobRun, NewMemory, NewMessage, Session, StorageError, WorkspaceRecord};
+use crate::{CronJob, JobRun, Memory, MemoryChunk, Message, NewCronJob, NewJobRun, NewMemory, NewMemoryChunk, NewMessage, Session, StorageError, WorkspaceRecord};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use turso::Connection;
@@ -347,7 +347,344 @@ pub fn is_corruption_error(err: &StorageError) -> bool {
         || s.contains("invalid page")
 }
 
+
+const CHUNK_SELECT_BY_PARENT: &str = "SELECT id, memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id, created_at, updated_at FROM memory_chunks WHERE memory_id = ?1 ORDER BY ordinal ASC";
+
+const CHUNK_SELECT_PAGE: &str = "SELECT id, memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id, created_at, updated_at FROM memory_chunks WHERE memory_id = ?1 ORDER BY ordinal ASC LIMIT ?2 OFFSET ?3";
+
+const CHUNK_SELECT_STALE: &str = "SELECT id, memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id, created_at, updated_at FROM memory_chunks WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?1 ORDER BY id ASC LIMIT ?2";
+
+const CHUNK_KNN_SCOPED: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND octet_length(embedding) = ?2 AND (workspace_id = ?3 OR workspace_id IS NULL) ORDER BY dist ASC LIMIT ?4";
+
+const CHUNK_KNN_GLOBAL: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND octet_length(embedding) = ?2 ORDER BY dist ASC LIMIT ?3";
+
 impl MemoryRepository {
+    // ---------------------------------------------------------------
+    // Per-chunk vectors
+    //
+    // A memory's content is unbounded; an embedding model's window is not.
+    // These write and read the slices that make a long memory searchable by
+    // any part of itself rather than only by its first window's worth.
+    // ---------------------------------------------------------------
+
+    /// Replace a parent's entire chunk set.
+    ///
+    /// Delete-then-insert rather than upsert: re-chunking under a different
+    /// budget produces a different NUMBER of chunks, so leaving old ordinals
+    /// behind would mix two chunkings of the same text and double-count it in
+    /// search. Both statements run under one `conn.lock()` guard, which is the
+    /// de-facto transaction here — nothing in this crate issues BEGIN/COMMIT.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if any statement fails.
+    ///
+    /// # Panics
+    /// Panics if `memory_id` is empty, or if a chunk names a different parent.
+    pub async fn replace_chunks(
+        &self,
+        memory_id: &str,
+        chunks: &[NewMemoryChunk],
+    ) -> Result<usize, StorageError> {
+        assert!(!memory_id.is_empty(), "memory_id must not be empty");
+        assert!(
+            chunks.iter().all(|c| c.memory_id == memory_id),
+            "every chunk must name the parent it is written under"
+        );
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM memory_chunks WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        for c in chunks {
+            let blob: Option<Vec<u8>> = c
+                .embedding
+                .as_ref()
+                .map(|v| v.iter().flat_map(|f| f.to_le_bytes()).collect());
+            conn.execute(
+                "INSERT INTO memory_chunks (memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                turso::params![
+                    c.memory_id.clone(),
+                    c.ordinal,
+                    c.content.clone(),
+                    c.char_start,
+                    c.char_end,
+                    blob,
+                    c.embedding_model.clone(),
+                    c.chunk_max_chars,
+                    c.chunker_version,
+                    c.workspace_id.clone(),
+                ],
+            )
+            .await?;
+        }
+        Ok(chunks.len())
+    }
+
+    /// Every chunk of one parent, in ordinal order.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn chunks_for(&self, memory_id: &str) -> Result<Vec<MemoryChunk>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(CHUNK_SELECT_BY_PARENT, turso::params![memory_id])
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::decode_chunk_row(&row)?);
+        }
+        drop(rows);
+        debug_assert!(
+            out.windows(2).all(|w| w[0].ordinal < w[1].ordinal),
+            "ordinals must be strictly increasing (unique index + ORDER BY)"
+        );
+        Ok(out)
+    }
+
+    /// How many chunks a parent has, without loading their content.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn chunk_count(&self, memory_id: &str) -> Result<usize, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memory_chunks WHERE memory_id = ?1",
+                turso::params![memory_id],
+            )
+            .await?;
+        let n = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
+        drop(rows);
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// One page of a parent's chunks, for paginated recall.
+    ///
+    /// `page` is 1-based. Paging by ordinal rather than byte offset is what
+    /// lets a cursor survive a re-embed: ordinals are stable, byte offsets move
+    /// the moment the text is re-chunked.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if `page` or `per_page` is 0 — both are caller errors.
+    pub async fn chunk_page(
+        &self,
+        memory_id: &str,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Vec<MemoryChunk>, StorageError> {
+        assert!(page > 0, "pages are 1-based");
+        assert!(per_page > 0, "per_page must be positive");
+        let offset = i64::try_from((page - 1) * per_page).unwrap_or(i64::MAX);
+        let limit = i64::try_from(per_page).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                CHUNK_SELECT_PAGE,
+                turso::params![memory_id, limit, offset],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::decode_chunk_row(&row)?);
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    /// Attach a vector to a chunk that was written without one.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the update fails.
+    ///
+    /// # Panics
+    /// Panics if `embedding` is empty.
+    pub async fn set_chunk_embedding(
+        &self,
+        chunk_id: i64,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<bool, StorageError> {
+        assert!(!embedding.is_empty(), "embedding must not be empty");
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE memory_chunks SET embedding = ?1, embedding_model = ?2, updated_at = datetime('now') WHERE id = ?3",
+                turso::params![blob, model.to_string(), chunk_id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Chunks whose vector is missing, or came from a different model.
+    ///
+    /// This is why a model switch is a resumable backfill rather than a
+    /// rebuild: the text is already stored and chunked, so only the vectors
+    /// need recomputing — incrementally, and restartably after a crash.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn chunks_needing_embedding(
+        &self,
+        active_model: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryChunk>, StorageError> {
+        assert!(limit > 0, "limit must be positive");
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                CHUNK_SELECT_STALE,
+                turso::params![active_model.to_string(), limit_i64],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(Self::decode_chunk_row(&row)?);
+        }
+        drop(rows);
+        debug_assert!(out.len() <= limit, "returned more than the limit");
+        Ok(out)
+    }
+
+    /// Parents with no chunks yet — the eager backfill queue.
+    ///
+    /// Every memory written before this table existed starts here, and stays
+    /// searchable on its parent vector until the backfill reaches it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if `limit` is 0.
+    pub async fn parents_without_chunks(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        assert!(limit > 0, "limit must be positive");
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT m.memory_id FROM memories m WHERE NOT EXISTS (SELECT 1 FROM memory_chunks c WHERE c.memory_id = m.memory_id) ORDER BY m.id ASC LIMIT ?1",
+                turso::params![limit_i64],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    /// k-NN over CHUNK vectors, returning `(parent memory_id, ordinal, distance)`.
+    ///
+    /// Twin of [`Self::search_by_embedding_sql`], including the
+    /// `octet_length(embedding) = ?` guard that keeps foreign-dimension vectors
+    /// out of the comparison, and the explicit `drop(rows)` — an unfinished
+    /// cursor on the shared connection silently swallows later writes.
+    ///
+    /// `limit` counts CHUNKS, not parents: several chunks of one memory can
+    /// occupy consecutive positions, so a caller wanting k parents over-fetches.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if the query embedding is empty or `limit` is 0.
+    pub async fn search_chunks_by_embedding_sql(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<(String, i64, f64)>, StorageError> {
+        assert!(
+            !query_embedding.is_empty(),
+            "query embedding must not be empty"
+        );
+        assert!(limit > 0, "limit must be positive");
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let query_bytes = i64::try_from(query_blob.len()).unwrap_or(i64::MAX);
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock().await;
+        let mut rows = match workspace_id {
+            Some(ws) => {
+                conn.query(
+                    CHUNK_KNN_SCOPED,
+                    turso::params![query_blob, query_bytes, ws, limit_i64],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    CHUNK_KNN_GLOBAL,
+                    turso::params![query_blob, query_bytes, limit_i64],
+                )
+                .await?
+            }
+        };
+
+        let mut out: Vec<(String, i64, f64)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        }
+        drop(rows);
+
+        debug_assert!(out.len() <= limit, "returned more neighbours than the limit");
+        debug_assert!(
+            out.windows(2).all(|w| w[0].2 <= w[1].2),
+            "distances must be non-decreasing (ORDER BY dist ASC)"
+        );
+        Ok(out)
+    }
+
+    fn decode_chunk_row(row: &turso::Row) -> Result<MemoryChunk, StorageError> {
+        let embedding = match row.get_value(6)? {
+            turso::Value::Blob(b) => Some(
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            ),
+            _ => None,
+        };
+        let embedding_model = match row.get_value(7)? {
+            turso::Value::Text(t) => Some(t),
+            _ => None,
+        };
+        let workspace_id = match row.get_value(10)? {
+            turso::Value::Text(t) => Some(t),
+            _ => None,
+        };
+        Ok(MemoryChunk {
+            id: row.get(0)?,
+            memory_id: row.get(1)?,
+            ordinal: row.get(2)?,
+            content: row.get(3)?,
+            char_start: row.get(4)?,
+            char_end: row.get(5)?,
+            embedding,
+            embedding_model,
+            chunk_max_chars: row.get(8)?,
+            chunker_version: row.get(9)?,
+            workspace_id,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
+    }
+
     pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
@@ -777,6 +1114,11 @@ impl MemoryRepository {
                 turso::params![*id],
             )
             .await?;
+            conn.execute(
+                "DELETE FROM memory_chunks WHERE memory_id = ?1",
+                turso::params![*id],
+            )
+            .await?;
             let n = conn
                 .execute(
                     "DELETE FROM memories WHERE memory_id = ?1",
@@ -809,6 +1151,19 @@ impl MemoryRepository {
                  embedding = zeroblob(COALESCE(octet_length(embedding), 0)), \
                  content = zeroblob(octet_length(content)), \
                  metadata = zeroblob(COALESCE(octet_length(metadata), 0)) \
+             WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        // The chunk rows hold the SAME secrets, split up: each carries a slice
+        // of the content and its own embedding, and an embedding is invertible
+        // back to its source text. Zeroing only the parent would leave the whole
+        // memory reconstructible from its chunks — the Ghost-Vectors hole
+        // reopened through a second table.
+        conn.execute(
+            "UPDATE memory_chunks SET \
+                 embedding = zeroblob(COALESCE(octet_length(embedding), 0)), \
+                 content = zeroblob(octet_length(content)) \
              WHERE memory_id = ?1",
             turso::params![memory_id],
         )
@@ -861,6 +1216,16 @@ impl MemoryRepository {
         // Delete tags first
         conn.execute(
             "DELETE FROM memory_tags WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+
+        // Chunks are children by convention only: nothing in this crate sets
+        // `PRAGMA foreign_keys = ON`, so the REFERENCES clause enforces nothing
+        // and the cascade is ours to write. Without it a deleted memory keeps
+        // matching queries through its orphaned chunk vectors.
+        conn.execute(
+            "DELETE FROM memory_chunks WHERE memory_id = ?1",
             turso::params![memory_id],
         )
         .await?;

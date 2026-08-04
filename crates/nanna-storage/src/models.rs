@@ -257,3 +257,55 @@ pub struct TaskActivityEntry {
     pub detail: Option<serde_json::Value>,
     pub created_at: String,
 }
+
+/// One embedded slice of a memory's content.
+///
+/// A memory's content is unbounded; an embedding model's input window is not.
+/// Embedding a long row whole meant everything past the window was truncated
+/// and the vector described only a prefix — silently, since nothing errors.
+/// Chunks are cut to the model's window and embedded individually, so the whole
+/// content is represented and a long memory is still findable by its tail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryChunk {
+    pub id: i64,
+    /// Parent `memories.memory_id`.
+    pub memory_id: String,
+    /// Position within the parent, 0-based. Stable across re-embeds so a
+    /// pagination cursor survives one.
+    pub ordinal: i64,
+    pub content: String,
+    /// Char range within the parent's content — lets a page be addressed
+    /// without re-chunking.
+    pub char_start: i64,
+    pub char_end: i64,
+    /// `None` while queued for backfill: the text exists, the vector does not.
+    pub embedding: Option<Vec<f32>>,
+    /// Which model produced `embedding`. Vectors from different models are not
+    /// comparable, so this is what makes a model switch a resumable backfill
+    /// rather than a full rebuild.
+    pub embedding_model: Option<String>,
+    /// The budget this chunk was cut to, and the chunker that cut it. Together
+    /// they make re-chunking detectable: a parent whose chunks were cut under
+    /// different parameters can be redone rather than left as a mixed set.
+    pub chunk_max_chars: i64,
+    pub chunker_version: i64,
+    pub workspace_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A chunk to write. `embedding` may be `None` — the row is then queued for the
+/// backfill pass rather than being wrong.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMemoryChunk {
+    pub memory_id: String,
+    pub ordinal: i64,
+    pub content: String,
+    pub char_start: i64,
+    pub char_end: i64,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub chunk_max_chars: i64,
+    pub chunker_version: i64,
+    pub workspace_id: Option<String>,
+}

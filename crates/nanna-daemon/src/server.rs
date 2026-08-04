@@ -580,15 +580,47 @@ fn build_script_services(
                         .unwrap_or("")
                         .to_string();
                     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                    // Per-result page budget. Storage is unbounded now, so a
+                    // recall that returned whole memories would put an
+                    // arbitrarily large payload into a fixed context window —
+                    // `limit` times over. The default is one embedding chunk's
+                    // worth of text: the same unit the memory was indexed in,
+                    // so a page corresponds to something the retrieval actually
+                    // reasoned about rather than to a round number of bytes.
+                    let page_chars = params
+                        .get("page_chars")
+                        .and_then(|v| v.as_u64())
+                        .map_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS, |v| v as usize);
+                    let offset = params
+                        .get("offset")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
                     let workspace = ws.read().await;
                     match mem.recall_scoped(&query, workspace.as_deref()).await {
                         Ok(results) => {
                             let items: Vec<Value> = results
                                 .into_iter()
                                 .take(limit)
-                                .map(
-                                    |r| json!({"id": r.id, "content": r.content, "score": r.score}),
-                                )
+                                .map(|r| {
+                                    let (content, start, total) = r.excerpt(offset, page_chars);
+                                    let returned = content.chars().count();
+                                    json!({
+                                        "id": r.id,
+                                        "content": content,
+                                        "score": r.score,
+                                        // Always present, never inferred from
+                                        // whether `content` "looks" cut off. A
+                                        // page that does not announce itself is
+                                        // indistinguishable from a whole
+                                        // memory, and a reader that believes it
+                                        // has the whole thing stops looking.
+                                        "offset": start,
+                                        "returned": returned,
+                                        "total": total,
+                                        "truncated": start + returned < total,
+                                        "best_chunk": r.best_chunk,
+                                    })
+                                })
                                 .collect();
                             Ok(Value::Array(items))
                         }
@@ -1187,6 +1219,25 @@ async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
             }
         }
     }
+
+    // Chunk vectors drain in the same pass, after the whole-row ones.
+    //
+    // Row vectors first because they are what search falls back to: until a
+    // memory has one, it is invisible to recall entirely, whereas a memory
+    // with a row vector but no chunk vectors is merely coarser to retrieve.
+    // Draining eagerly rather than on demand is deliberate — a lazy chunk
+    // backfill would put the embed latency of a whole memory inside the first
+    // recall that happened to touch it.
+    loop {
+        match mem.backfill_chunks(model, BATCH).await {
+            Ok((0, 0)) => break,
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Chunk backfill for '{model}' halted: {e}");
+                break;
+            }
+        }
+    }
 }
 
 /// The main daemon server
@@ -1209,6 +1260,11 @@ pub struct DaemonServer {
     /// Set when storage init quarantined + rebuilt a corrupt database file;
     /// surfaced on /status and broadcast as `Event::MemoryStoreRebuilt`.
     memory_recovery: Option<Arc<nanna_storage::RecoveryReport>>,
+    /// Set when storage failed to open at all — memory is in-process only and
+    /// will be lost on exit. Distinct from `memory_recovery`, which means the
+    /// store WAS repaired and does persist. Surfaced on status so the state is
+    /// observable rather than inferred from a log line at boot.
+    storage_error: Option<String>,
 }
 
 impl DaemonServer {
@@ -1268,6 +1324,7 @@ impl DaemonServer {
             log_buffer: None,
             storage: None,
             memory_recovery: None,
+            storage_error: None,
         }
     }
 
@@ -1946,12 +2003,23 @@ impl DaemonServer {
         let _health_state = if self.config.enable_health_server {
             // Seed durable-memory-store health (load already ran in init_services),
             // so a corrupt/degraded store shows on /status, not just a boot log.
+            //
+            // A store that never opened is degraded too, and more severely than
+            // one with corrupt rows: there is no durable store at all, so the
+            // per-store health probe cannot report on it. Fold that in here or
+            // the most complete failure is the one /status calls healthy.
             let (mem_degraded, mem_corrupt) = if let Some(ref m) = memory {
                 let h = m.store_health().await;
-                (h.degraded, h.corrupt_rows)
+                (h.degraded || self.storage_error.is_some(), h.corrupt_rows)
             } else {
-                (false, 0)
+                (self.storage_error.is_some(), 0)
             };
+            if let Some(ref err) = self.storage_error {
+                error!(
+                    error = %err,
+                    "reporting degraded health: memory has no durable store this session"
+                );
+            }
             let mut state = HealthState::new(
                 memory.is_some(),
                 true, // agent is available
@@ -2482,6 +2550,14 @@ impl DaemonServer {
                                 && let Some(mem) = mem_cell.get()
                             {
                                 let model = provider.to_string();
+                                // The new provider's input window, memoized by
+                                // the router — one `/api/show` per provider per
+                                // process, and it travels WITH the model and
+                                // width for the same reason those two do. A
+                                // chunk sized for the old window is not
+                                // rejected by the new embedder, it is silently
+                                // truncated.
+                                let window = router.context_window_for(&provider).await;
                                 tracing::info!(
                                     "Embedding provider changed — rebinding the store to \
                                      '{}' ({} dims)",
@@ -2494,7 +2570,7 @@ impl DaemonServer {
                                 // model used earlier is free because its bucket
                                 // was retained.
                                 let (_, missing) =
-                                    mem.rebind_embeddings(&model, embedding.len()).await;
+                                    mem.rebind_embeddings(&model, embedding.len(), window).await;
 
                                 // Whatever this model has never embedded gets
                                 // filled in lazily, in bounded passes, while
@@ -2502,12 +2578,20 @@ impl DaemonServer {
                                 // inline: the store can hold thousands of
                                 // entries and the provider we just failed over
                                 // to may be the rate-limited one.
-                                if missing > 0 {
-                                    let mem = mem.clone();
-                                    tokio::spawn(async move {
-                                        drain_backfill(&mem, &model).await;
-                                    });
-                                }
+                                //
+                                // Unconditional for the same reason as the
+                                // startup bind: `missing` counts ROW vectors,
+                                // and the chunk queue is independent of it. A
+                                // flap back to a model whose row buckets were
+                                // all retained reports zero missing while its
+                                // chunk vectors are still stamped with the
+                                // other provider, and a drain interrupted
+                                // partway leaves exactly that state.
+                                let _ = missing;
+                                let mem = mem.clone();
+                                tokio::spawn(async move {
+                                    drain_backfill(&mem, &model).await;
+                                });
                             }
 
                             Ok(embedding)
@@ -2670,17 +2754,31 @@ impl DaemonServer {
                         // entries of a session get bucketed under `None` — they
                         // would be re-embedded on the next switch instead of
                         // being reusable, which is the whole point of buckets.
-                        let bind_model = embed_router.active_provider().await.to_string();
+                        let bind_provider = embed_router.active_provider().await;
+                        let bind_model = bind_provider.to_string();
                         let memory_for_bind = memory_arc.clone();
+                        let router_for_bind = embed_router.clone();
                         tokio::spawn(async move {
-                            // The probed (or seeded) dimension travels WITH the
-                            // model — the binding is one pair, never two
-                            // independently-updated latches.
-                            let (_, missing) =
-                                memory_for_bind.rebind_embeddings(&bind_model, dimension).await;
-                            if missing > 0 {
-                                drain_backfill(&memory_for_bind, &bind_model).await;
-                            }
+                            // The probed (or seeded) dimension and the model's
+                            // input window travel WITH the model — the binding
+                            // is one triple, never three independently-updated
+                            // latches. Resolved inside the spawn because it
+                            // costs a request, and startup must not block on it.
+                            let window =
+                                router_for_bind.context_window_for(&bind_provider).await;
+                            let (_, _missing) = memory_for_bind
+                                .rebind_embeddings(&bind_model, dimension, window)
+                                .await;
+                            // Unconditional, NOT gated on missing row vectors.
+                            // The two queues are independent: after the chunk
+                            // migration every existing memory has a row vector
+                            // and no chunks at all, so `missing == 0` while the
+                            // entire store is unchunked. Gating on the row
+                            // count would leave it that way forever. Both
+                            // drains no-op immediately when their queue is
+                            // empty, so the unconditional call costs one query
+                            // each on a store that is already complete.
+                            drain_backfill(&memory_for_bind, &bind_model).await;
                         });
                         tokio::spawn(async move {
                             match memory_for_probe.probe_and_align_dimension().await {
@@ -3290,10 +3388,24 @@ impl DaemonBuilder {
                 server.set_storage(Arc::new(storage));
             }
             Err(e) => {
-                warn!(
-                    "Failed to initialize storage: {}. Model stats will not persist.",
-                    e
+                // Storage is where MEMORY lives, not just model stats. Without
+                // it the daemon still runs and memory still "works" — in RAM,
+                // for this session, discarded on exit — so the failure reads as
+                // a good session until someone notices nothing was remembered.
+                //
+                // The old wording named model stats, the quietest thing lost,
+                // at warn level. That is the wrong end of the blast radius and
+                // the wrong severity: this is also the only signal a bad
+                // migration produces, since a migration that fails leaves the
+                // name unrecorded and gets retried on every boot forever.
+                error!(
+                    error = %e,
+                    db_path = ?db_path,
+                    "STORAGE UNAVAILABLE — memory is in-process only and will be LOST on exit; \
+                     model stats, tasks and checkpoints will not persist. Most likely a failed \
+                     migration or an unwritable database path."
                 );
+                server.storage_error = Some(e.to_string());
             }
         }
 

@@ -8,6 +8,7 @@ use crate::{
     ConsolidationConfig, ConsolidationResult, CompressionLevel,
     MemoryCluster, cluster_memories, create_consolidated_entry,
 };
+use crate::chunking::{derive_chunk_params, ChunkParams};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -69,7 +70,25 @@ pub struct MemoryService {
     /// and rebound the model, but the width latch stayed at 2048 — every write
     /// for the next several minutes failed `DimensionMismatch` while the log
     /// said the store had been rebound.
-    active_embedding_model: RwLock<Option<String>>,
+    binding: RwLock<EmbeddingBinding>,
+    /// Consecutive writes whose vector width disagreed with the binding, and
+    /// the width they all reported. See [`MemoryService::note_width_mismatch`].
+    width_mismatch_streak: RwLock<(usize, usize)>,
+}
+
+/// The identity half of the embedding binding.
+///
+/// The other two halves — vector width and chunk geometry — are latches on the
+/// store, moved ONLY while this lock's write half is held. That is not an
+/// accident of layout: a reader that sees the new model with the old width gets
+/// `DimensionMismatch` on every write (the 2026-08-02 incident), and a reader
+/// that sees the new model with the old chunk size writes chunks the new
+/// embedder silently truncates — same split-brain, quieter symptom. Holding the
+/// read half is what makes all three consistent.
+#[derive(Clone, Debug, Default)]
+struct EmbeddingBinding {
+    /// `provider:model` of the embedder currently in use, once the daemon says.
+    model: Option<String>,
 }
 
 impl MemoryService {
@@ -78,6 +97,9 @@ impl MemoryService {
     pub fn new(config: MemoryServiceConfig) -> Self {
         let store_config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(config.dimension),
+            // Unbound until the daemon names an embedding model; reads resolve
+            // to the retrieval-granularity default meanwhile.
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: true,
         };
         Self {
@@ -86,7 +108,8 @@ impl MemoryService {
             embed_fn: None,
             pending_updates: RwLock::new(Vec::new()),
             min_score_override: RwLock::new(None),
-            active_embedding_model: RwLock::new(None),
+            binding: RwLock::new(EmbeddingBinding::default()),
+            width_mismatch_streak: RwLock::new((0, 0)),
         }
     }
 
@@ -164,7 +187,7 @@ impl MemoryService {
         // Take the binding lock AFTER the embed call returns (never across the
         // await — the daemon's embed_fn rebinds on a provider switch and would
         // deadlock), so the width correction cannot tear a rebind in half.
-        let binding = self.active_embedding_model.write().await;
+        let binding = self.binding.write().await;
         let expected_dim = self.store.dimension();
         if actual_dim == expected_dim {
             info!("Embedding dimension confirmed: {}", actual_dim);
@@ -218,26 +241,58 @@ impl MemoryService {
     /// re-embedding the whole store in each direction made a flap cost two full
     /// passes over every memory. Buckets make the return trip free.
     ///
-    /// Model and dimension move as ONE binding, under one lock. The 2026-08-02
-    /// failover left them split: the model rebound 2048→768 but the width latch
-    /// did not, so every subsequent write failed `DimensionMismatch` until a
-    /// restart. `dimension` is the width of the vector the new provider just
-    /// produced — the caller always has one in hand, because a switch is only
-    /// ever observed on a successful embed.
-    pub async fn rebind_embeddings(&self, model: &str, dimension: usize) -> (usize, usize) {
+    /// Model, dimension, and chunk geometry move as ONE binding, under one
+    /// lock. The 2026-08-02 failover left the first two split: the model
+    /// rebound 2048→768 but the width latch did not, so every subsequent write
+    /// failed `DimensionMismatch` until a restart. Chunk geometry joins them
+    /// because it fails the same way and more quietly — chunks sized for the
+    /// old model's window are not rejected by the new one, they are truncated
+    /// by it, and the resulting vector describes a prefix while claiming to
+    /// describe the whole chunk.
+    ///
+    /// `dimension` is the width of the vector the new provider just produced —
+    /// the caller always has one in hand, because a switch is only ever
+    /// observed on a successful embed. `window_tokens` is that model's input
+    /// limit, or `None` when the provider does not publish one.
+    pub async fn rebind_embeddings(
+        &self,
+        model: &str,
+        dimension: usize,
+        window_tokens: Option<usize>,
+    ) -> (usize, usize) {
         assert!(dimension > 0, "a provider that produced a vector has a positive width");
-        let mut binding = self.active_embedding_model.write().await;
-        *binding = Some(model.to_string());
+        let params = derive_chunk_params(window_tokens);
+        let mut binding = self.binding.write().await;
+        let previous = self.store.chunk_params();
+        binding.model = Some(model.to_string());
+        self.store.set_chunk_params(params);
         self.store.set_dimension(dimension);
         let (rebound, missing) = self.store.rebind_to_model(model).await;
         drop(binding);
         if missing > 0 {
             info!(
-                "Rebound {rebound} memories to '{model}' ({dimension} dims); {missing} awaiting \
-                 backfill (they are unsearchable until then, not lost)"
+                "Rebound {rebound} memories to '{model}' ({dimension} dims, {} char chunks); \
+                 {missing} awaiting backfill (they are unsearchable until then, not lost)",
+                params.max_chars
             );
         } else {
-            info!("Rebound {rebound} memories to '{model}' ({dimension} dims) — nothing to backfill");
+            info!(
+                "Rebound {rebound} memories to '{model}' ({dimension} dims, {} char chunks) — \
+                 nothing to backfill",
+                params.max_chars
+            );
+        }
+        // A changed chunk size invalidates every chunk already written, and
+        // silently: the rows stay, the vectors stay, and they now describe
+        // pieces of a size this model was never asked about. Say so — an
+        // unannounced re-chunk is indistinguishable from corruption to whoever
+        // reads the store next.
+        if params.supersedes(&previous) {
+            info!(
+                "Chunk geometry changed {} → {} chars (chunker v{}); existing chunks will be \
+                 rewritten as their parents are backfilled",
+                previous.max_chars, params.max_chars, params.version
+            );
         }
         (rebound, missing)
     }
@@ -308,9 +363,166 @@ impl MemoryService {
         Ok(filled)
     }
 
+    /// Embed up to `batch` chunks that have no vector for `model` yet, and
+    /// chunk up to `batch` memories that have no chunks at all.
+    ///
+    /// The chunk analogue of [`Self::backfill_embeddings`], with the same
+    /// discipline and for the same reasons: the binding is re-checked AFTER
+    /// every embed call, because the daemon's `embed_fn` rebinds mid-call on a
+    /// provider switch and the vector then in hand belongs to the new provider,
+    /// not to `model`. Writing it under `model` would poison that bucket with
+    /// another model's vectors — wrong space, usually wrong width — and nothing
+    /// downstream could tell.
+    ///
+    /// Returns `(chunks_embedded, parents_chunked)`. Both zero means the store
+    /// is complete for this model.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding provider is configured.
+    pub async fn backfill_chunks(
+        &self,
+        model: &str,
+        batch: usize,
+    ) -> Result<(usize, usize), MemoryError> {
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
+
+        if self.active_embedding_model().await.as_deref() != Some(model) {
+            debug!("Chunk backfill for '{model}' skipped — it is not the active binding");
+            return Ok((0, 0));
+        }
+
+        // Chunk the unchunked FIRST. Those memories have no chunk rows at all,
+        // so they contribute nothing to the embedding queue until they do —
+        // running the queue first would report "complete" while whole memories
+        // sat outside the index.
+        let mut chunked = 0usize;
+        for id in self.store.parents_without_chunks(batch).await {
+            match self.store.rechunk(&id).await {
+                Ok(()) => chunked += 1,
+                // A memory in the database but not in the RAM cache is not an
+                // error worth stopping for: the cache is authoritative on
+                // content, so chunking it from a stale row would write chunks
+                // that disagree with the memory.
+                Err(e) => debug!("Could not chunk memory {id} yet: {e}"),
+            }
+        }
+
+        let mut embedded = 0usize;
+        for (chunk_id, content) in self.store.chunks_needing_embedding(model, batch).await {
+            match (embed_fn)(&content).await {
+                Ok(embedding) => {
+                    if self.active_embedding_model().await.as_deref() != Some(model) {
+                        debug!("Chunk backfill for '{model}' abandoned — provider changed underneath it");
+                        break;
+                    }
+                    if embedding.is_empty() {
+                        debug!("Chunk {chunk_id} embedded to an empty vector; leaving it queued");
+                        continue;
+                    }
+                    if let Err(e) = self.store.set_chunk_embedding(chunk_id, &embedding, model).await {
+                        debug!("Chunk backfill could not store embedding for {chunk_id}: {e}");
+                    } else {
+                        embedded += 1;
+                    }
+                }
+                Err(e) => {
+                    // The router already waited out congestion before erroring,
+                    // so this provider is genuinely unavailable. Leave the rest.
+                    warn!("Chunk backfill for '{model}' stopped after {embedded}: {e}");
+                    break;
+                }
+            }
+        }
+
+        if embedded > 0 || chunked > 0 {
+            info!("Chunk backfill for '{model}': {embedded} chunks embedded, {chunked} memories chunked");
+        }
+        Ok((embedded, chunked))
+    }
+
+    /// How many consecutive width mismatches make a wrong binding rather than a
+    /// race.
+    ///
+    /// A provider switch corrects itself on the very call that observes it —
+    /// the router hands back `switched_to` and the store rebinds before the
+    /// write lands — so a mismatch is normally a one-shot: writes already in
+    /// flight when the switch happened, carrying the previous provider's width.
+    /// Concurrency bounds how many of those there can be. Nothing bounds how
+    /// long a genuinely wrong binding persists, which is the difference this
+    /// number is drawing. Eight is comfortably above plausible in-flight
+    /// concurrency and far below "all day".
+    const WIDTH_MISMATCH_ESCALATION: usize = 8;
+
+    /// Record that a write arrived with `observed` width against the current
+    /// binding, and re-probe the provider when that stops looking like a race.
+    ///
+    /// The 2026-08-04 incident this exists for: the store was latched at 1536
+    /// (a paid embedder returning 402) while the live provider produced 768.
+    /// Every write for an entire day queued for backfill — 2167 of them — and
+    /// the backfill could not drain them either, because activating a
+    /// backfilled vector runs the same width gate that rejected them. Nothing
+    /// escalated, because queueing a write is *correct* behaviour for the race
+    /// it was written for, and a correct-looking line repeated 2167 times still
+    /// reads as correct.
+    ///
+    /// The re-probe is authoritative rather than a guess: it asks the live
+    /// provider for a vector and takes its width. Inferring the width from the
+    /// rejected vector instead would be wrong in exactly the race case, where
+    /// that vector is the OLD provider's and the binding is already right.
+    async fn note_width_mismatch(&self, observed: usize) {
+        let escalate = {
+            let mut streak = self.width_mismatch_streak.write().await;
+            if streak.1 == observed {
+                streak.0 += 1;
+            } else {
+                *streak = (1, observed);
+            }
+            streak.0 == Self::WIDTH_MISMATCH_ESCALATION
+        };
+        if !escalate {
+            return;
+        }
+        warn!(
+            "{} consecutive writes queued at {observed} dims against a {} dim binding — that is \
+             no longer a provider switch in flight, it is a stale binding. Re-probing the live \
+             embedding provider.",
+            Self::WIDTH_MISMATCH_ESCALATION,
+            self.dimension()
+        );
+        match self.probe_and_align_dimension().await {
+            Ok(actual) => {
+                info!("Re-probe settled the binding at {actual} dims; queued writes can now backfill");
+                *self.width_mismatch_streak.write().await = (0, 0);
+            }
+            // Leave the streak intact: the next write re-escalates, which is
+            // the behaviour we want while the provider is still unreachable.
+            Err(e) => warn!("Re-probe could not reach the embedding provider: {e}"),
+        }
+    }
+
+    /// Reset the mismatch streak — a write whose width agreed with the binding
+    /// is direct evidence the binding is fine.
+    async fn note_width_agreement(&self) {
+        let mut streak = self.width_mismatch_streak.write().await;
+        if streak.0 != 0 {
+            *streak = (0, 0);
+        }
+    }
+
     /// Identity of the embedding model currently in use, if the daemon has said.
     pub async fn active_embedding_model(&self) -> Option<String> {
-        self.active_embedding_model.read().await.clone()
+        self.binding.read().await.model.clone()
+    }
+
+    /// Chunk geometry for the active embedding model.
+    ///
+    /// Read this immediately before splitting content, never cached across an
+    /// await — a provider switch mid-write would otherwise chunk to the old
+    /// model's window and hand the new embedder text it silently truncates.
+    pub async fn chunk_params(&self) -> ChunkParams {
+        let _binding = self.binding.read().await;
+        self.store.chunk_params()
     }
 
     /// The current binding as one consistent `(model, dimension)` pair.
@@ -320,8 +532,8 @@ impl MemoryService {
     /// width) state — which is precisely the split-brain this exists to
     /// prevent.
     pub async fn active_binding(&self) -> (Option<String>, usize) {
-        let model = self.active_embedding_model.read().await;
-        (model.clone(), self.store.dimension())
+        let binding = self.binding.read().await;
+        (binding.model.clone(), self.store.dimension())
     }
 
     /// Get the minimum similarity score threshold for recall
@@ -409,6 +621,11 @@ impl MemoryService {
         // Create new memory
         let id = uuid::Uuid::new_v4().to_string();
         let (active_model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.note_width_agreement().await;
+        } else {
+            self.note_width_mismatch(embedding.len()).await;
+        }
         let (embedding_model, embedding, embeddings) =
             resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
@@ -626,6 +843,11 @@ impl MemoryService {
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
         
         let (active_model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.note_width_agreement().await;
+        } else {
+            self.note_width_mismatch(embedding.len()).await;
+        }
         let (embedding_model, embedding, embeddings) =
             resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
@@ -765,6 +987,11 @@ impl MemoryService {
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
 
         let (active_model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.note_width_agreement().await;
+        } else {
+            self.note_width_mismatch(embedding.len()).await;
+        }
         let (embedding_model, embedding, embeddings) =
             resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
@@ -792,75 +1019,15 @@ impl MemoryService {
     ///
     /// Returns `MemoryError` if no embedding function is configured.
     pub async fn recall(&self, query: &str) -> Result<Vec<RecallResult>, MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
-
-        let store_count = self.store.len().await;
-        info!("Recall: generating embedding for query (store has {} entries)", store_count);
-
-        // Generate query embedding
-        let query_embedding = (embed_fn)(query)
-            .await
-            .map_err(|e| {
-                warn!("Recall: embedding generation failed: {}", e);
-                MemoryError::Io(std::io::Error::other(e))
-            })?;
-        
-        info!("Recall: embedding generated ({} dims), searching...", query_embedding.len());
-
-        // Search
-        let results = self.store.search(&query_embedding, self.config.max_results * 2).await;
-        let min_score = self.get_min_score();
-        info!("Recall: raw search returned {} results (min_score: {:.2}, min_weight: {:.2})", 
-               results.len(), min_score, self.config.min_weight);
-        
-        // Log top results before filtering
-        for (i, (entry, score)) in results.iter().take(3).enumerate() {
-            info!("  [{}] score={:.3}: {}", i, score, truncate(&entry.content, 50));
-        }
-
-        // Filter by min score and weight, apply testing effect
-        let mut filtered = Vec::new();
-        let mut updates = Vec::new();
-        
-        for (entry, score) in results {
-            if score < min_score {
-                continue;
-            }
-            
-            let weight = entry.fsrs.weight(&self.config.fsrs);
-            let state = entry.fsrs.state(&self.config.fsrs);
-            
-            // Skip effectively forgotten memories
-            if weight < self.config.min_weight {
-                debug!("Skipping forgotten memory: {} (weight: {:.3})", entry.id, weight);
-                continue;
-            }
-            
-            // Queue testing effect update
-            updates.push((entry.id.clone(), Rating::Good));
-            
-            filtered.push(RecallResult {
-                id: entry.id,
-                content: entry.content,
-                score,
-                weight,
-                state,
-                metadata: entry.metadata,
-                workspace_id: entry.workspace_id,
-            });
-            
-            if filtered.len() >= self.config.max_results {
-                break;
-            }
-        }
-
-        // Queue FSRS updates (testing effect)
-        if !updates.is_empty() {
-            self.pending_updates.write().await.extend(updates);
-        }
-
-        debug!("Recall '{}' found {} results", truncate(query, 30), filtered.len());
-        Ok(filtered)
+        // Delegates rather than duplicating. This used to be a second,
+        // near-identical search loop, and it drifted the moment chunk-level
+        // recall was added: the scoped path gained it, this one silently did
+        // not, so whether a memory could be found at all depended on which
+        // entry point the caller happened to use. `search_scoped(.., None)` is
+        // the unscoped search exactly — it takes the same `top_k` off the same
+        // ranking with no workspace filter — so there is nothing here for a
+        // separate implementation to be more correct about.
+        self.recall_scoped(query, None).await
     }
 
     /// Recall memories with workspace scope filtering.
@@ -868,6 +1035,10 @@ impl MemoryService {
     /// Scope rules:
     /// - `workspace_id = Some(id)`: returns global + that workspace's memories
     /// - `workspace_id = None` (global): returns all memories
+    ///
+    /// Searches row vectors and chunk vectors together, keeping the stronger
+    /// evidence per memory — see [`crate::chunk_rank`] for why the two are
+    /// merged rather than one replacing the other.
     ///
     /// # Errors
     ///
@@ -892,35 +1063,86 @@ impl MemoryService {
         // Scoped search
         let results = self.store.search_scoped(&query_embedding, self.config.max_results * 2, workspace_id).await;
         let min_score = self.get_min_score();
-        
+
+        // Chunk-level hits, collapsed to one per parent. A long memory whose
+        // whole-row vector is a centroid of everything it contains can score
+        // poorly on a query that one of its paragraphs answers exactly — that
+        // is the failure chunking exists to fix, so the two signals are merged
+        // rather than one replacing the other, and each memory keeps whichever
+        // evidence is stronger.
+        let chunk_hits = self
+            .store
+            .search_chunks(
+                &query_embedding,
+                self.config.max_results * 2,
+                workspace_id,
+                min_score,
+            )
+            .await;
+
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
-        
+        let mut scored: Vec<(MemoryEntry, f32, f32, Option<i64>)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for (entry, score) in results {
-            if score < min_score {
+            let hit = chunk_hits.get(&entry.id);
+            // Admitted on the better of the two TRUE similarities. Neither is
+            // inflated for the test: `rank` carries the corroboration bonus and
+            // is used only for ordering, so the threshold keeps the exact
+            // meaning it was calibrated with.
+            let best = hit.map_or(score, |h| h.best.max(score));
+            if best < min_score {
                 continue;
             }
-            
+            let rank = hit.map_or(score, |h| h.rank().max(score));
+            // Only name a chunk when the chunk is what actually won; a row-level
+            // hit has no "part that matched" to point at.
+            let best_chunk = hit.filter(|h| h.best >= score).map(|h| h.best_ordinal);
+            seen.insert(entry.id.clone());
+            scored.push((entry, best, rank, best_chunk));
+        }
+
+        // Memories whose chunks matched but whose whole-row vector did not
+        // clear the top-k cut. These are the ones chunking is FOR: without
+        // this pass, splitting a memory would improve nothing, because the
+        // row-level search would still be the only way in.
+        for (id, hit) in &chunk_hits {
+            if seen.contains(id) {
+                continue;
+            }
+            if let Some(entry) = self.store.get(id).await {
+                if workspace_id.is_some() && entry.workspace_id.as_deref() != workspace_id {
+                    continue;
+                }
+                scored.push((entry, hit.best, hit.rank(), Some(hit.best_ordinal)));
+            }
+        }
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (entry, score, _rank, best_chunk) in scored {
             let weight = entry.fsrs.weight(&self.config.fsrs);
             let state = entry.fsrs.state(&self.config.fsrs);
-            
+
             if weight < self.config.min_weight {
                 continue;
             }
-            
+
             updates.push((entry.id.clone(), Rating::Good));
-            
+
             filtered.push(RecallResult {
                 id: entry.id,
                 content: entry.content,
+                best_chunk,
                 score,
                 weight,
                 state,
                 metadata: entry.metadata,
                 workspace_id: entry.workspace_id,
             });
-            
+
             if filtered.len() >= self.config.max_results {
                 break;
             }
@@ -1735,7 +1957,17 @@ pub struct ConsolidationBands {
 #[derive(Debug, Clone)]
 pub struct RecallResult {
     pub id: String,
+    /// The memory's full content.
+    ///
+    /// Full, because a `RecallResult` is a value, not a rendering — the caller
+    /// that puts this in front of a model is the one that must page it (see
+    /// [`Self::excerpt`]), and a caller that needs the whole thing (dreaming,
+    /// consolidation, export) must not be silently handed a prefix.
     pub content: String,
+    /// Ordinal of the chunk that produced [`Self::score`], when the hit came
+    /// from chunk search. Lets a paged read open at the part that matched
+    /// rather than at the beginning of a long memory.
+    pub best_chunk: Option<i64>,
     /// Similarity score from vector search
     pub score: f32,
     /// FSRS weight (retrievability × importance)
@@ -1745,6 +1977,29 @@ pub struct RecallResult {
     pub metadata: HashMap<String, String>,
     /// Workspace ID if scoped (None = global)
     pub workspace_id: Option<String>,
+}
+
+impl RecallResult {
+    /// A bounded window of [`Self::content`], as `(text, start, total)` in
+    /// characters.
+    ///
+    /// Storage is unbounded by design, so a recall that returned whole
+    /// memories would put an arbitrarily large payload into a fixed context
+    /// window — and would do it `limit` times over. Paging is therefore a
+    /// property of *reading*, not of storing.
+    ///
+    /// The window opens at `start`, clamped so it never begins past the end,
+    /// and is cut on a character boundary. It reports `total` so the caller can
+    /// say what fraction is shown and compute the next offset; a window that
+    /// silently showed a prefix would read as the whole memory, which is the
+    /// unannounced-truncation failure this codebase keeps paying for.
+    #[must_use]
+    pub fn excerpt(&self, start: usize, budget: usize) -> (String, usize, usize) {
+        let total = self.content.chars().count();
+        let start = start.min(total);
+        let text: String = self.content.chars().skip(start).take(budget.max(1)).collect();
+        (text, start, total)
+    }
 }
 
 fn chrono_timestamp() -> i64 {
@@ -1772,20 +2027,65 @@ fn truncate(s: &str, max_len: usize) -> String {
 ///
 /// Exported so the producer chunks against the same number the consumer bounds
 /// against. Them drifting apart IS the bug this documents.
-pub const MEMORY_OBSERVATION_MAX_CHARS: usize = MEMORY_CHUNK_MAX_CHARS + 192;
+pub const MEMORY_OBSERVATION_MAX_CHARS: usize = MEMORY_CHUNK_MAX_CHARS + MEMORY_OBSERVATION_HEADER_CHARS;
 
-/// Chunk size the episodic writer splits large tool results into.
-pub const MEMORY_CHUNK_MAX_CHARS: usize = 3200;
+/// The `[tool → target — outcome] ` header the episodic writer prepends. The
+/// target is itself capped at 120 chars, so this covers the header whole.
+pub const MEMORY_OBSERVATION_HEADER_CHARS: usize = 192;
 
-/// Maximum byte length of merged memory content — bounds accretion across repeated merges.
+/// Retrieval-granularity target for one embedded chunk, in chars.
 ///
-/// Derived, not picked: a merged entry must hold four maximum-size observations,
-/// doubled so multi-byte UTF-8 cannot shrink that to three. The old value was a
-/// flat 4096 — *below a single observation* once any of it was non-ASCII — so a
-/// row saturated after roughly one merge and then silently refused every fold
-/// after it. Twelve rows in the 2026-07-27 run sat at 3895-4076 bytes; the
-/// `sh ./minidb help` family alone lost ~349 folds to that ceiling.
-const MEMORY_MERGE_MAX_BYTES: usize = MEMORY_OBSERVATION_MAX_CHARS * 4 * 2;
+/// This is the SOFT bound — what size makes a good retrieval unit, independent
+/// of any model. A chunk far larger than a few paragraphs embeds to a centroid
+/// of everything it contains: it matches most queries weakly and locates
+/// nothing precisely, so recall degrades as chunks grow even when the model
+/// could accept them. Use [`chunk_max_chars_for_window`] to combine this with
+/// the hard bound.
+pub const MEMORY_CHUNK_TARGET_CHARS: usize = 3200;
+
+/// Conservative chars-per-token, matching the ratio the budget estimators use
+/// for code (which tokenizes worse than prose). Under-estimating chars per
+/// token makes the derived chunk SMALLER, which is the safe direction.
+const CHARS_PER_TOKEN: usize = 3;
+
+/// The chunk budget for an embedding model whose input window is
+/// `embedding_window_tokens`.
+///
+/// Two independent bounds, smaller wins:
+///
+/// - **Hard — the model's window.** A chunk larger than the embedder accepts is
+///   truncated by the embedder, and the resulting vector describes only a
+///   prefix while claiming to describe the whole chunk. Nothing errors; recall
+///   just quietly degrades. A 512-token embedding model (~1.5k chars) handed
+///   the 3200-char target was losing half of every chunk this way.
+/// - **Soft — [`MEMORY_CHUNK_TARGET_CHARS`].** Retrieval granularity, above.
+///   A 32k-token embedder would otherwise permit ~100k-char chunks, which fit
+///   fine and retrieve badly.
+///
+/// Room is left for the `[tool → target — outcome] ` header the writer prepends
+/// (see [`MEMORY_OBSERVATION_MAX_CHARS`]), because the header is embedded too.
+///
+/// `0` (window unknown) yields the target: no information about the model is a
+/// reason to keep the previous behaviour, not to guess a bigger number.
+#[must_use]
+pub fn chunk_max_chars_for_window(embedding_window_tokens: usize) -> usize {
+    if embedding_window_tokens == 0 {
+        return MEMORY_CHUNK_TARGET_CHARS;
+    }
+    let window_chars = embedding_window_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let usable = window_chars.saturating_sub(MEMORY_OBSERVATION_HEADER_CHARS);
+    // Never zero: a pathologically small window still has to chunk into
+    // something, and one char at a time is the floor that keeps progress.
+    usable.min(MEMORY_CHUNK_TARGET_CHARS).max(1)
+}
+
+/// Kept for callers that want the compile-time target rather than a
+/// model-derived budget — notably the output-reserve derivation, which is
+/// about the largest routine `write_file` payload and only ever coincided with
+/// the embedding chunk size.
+pub const MEMORY_CHUNK_MAX_CHARS: usize = MEMORY_CHUNK_TARGET_CHARS;
+
+
 
 /// Merge `incoming` content into `existing`, deduplicating and bounding length.
 ///
@@ -1891,11 +2191,13 @@ fn merge_memory_content(existing: &str, incoming: &str) -> String {
         return incoming.to_string();
     }
 
-    // Bounded append.
-    let merged_len_bytes = existing.len() + SEPARATOR.len() + incoming.len();
-    if merged_len_bytes > MEMORY_MERGE_MAX_BYTES {
-        return existing.to_string();
-    }
+    // Unbounded append. There was a byte cap here, and it did not merely bound
+    // growth: past the ceiling it returned `existing` and DISCARDED the
+    // incoming observation — a silent write failure reported as a successful
+    // merge. Storage has no size limit now, and the constraint the cap was
+    // standing in for (an embedding model's finite input window) is handled
+    // where it actually applies, by chunking the content for embedding rather
+    // than by refusing to remember it.
     format!("{existing}{SEPARATOR}{incoming}")
 }
 
@@ -1995,14 +2297,21 @@ mod tests {
         );
     }
 
+    /// Storage is unbounded. The byte cap this replaces did not bound growth so
+    /// much as drop writes: past the ceiling it returned the existing content
+    /// and discarded the incoming observation, reporting success. A merge must
+    /// never lose the thing being merged in.
     #[test]
-    fn test_merge_memory_content_bounded() {
-        // Appending past the byte cap keeps the existing content (no unbounded growth).
-        let existing = "a".repeat(MEMORY_MERGE_MAX_BYTES - 1);
-        let incoming = "b".repeat(MEMORY_MERGE_MAX_BYTES);
+    fn test_merge_memory_content_is_unbounded() {
+        let existing = "a".repeat(64_000);
+        let incoming = "b".repeat(64_000);
         let merged = merge_memory_content(&existing, &incoming);
-        assert_eq!(merged, existing);
-        assert!(merged.len() <= MEMORY_MERGE_MAX_BYTES);
+        assert!(
+            merged.contains(&incoming),
+            "the incoming observation must survive the merge at any size"
+        );
+        assert!(merged.starts_with(&existing), "and so must the existing one");
+        assert_eq!(merged.len(), existing.len() + 2 + incoming.len());
     }
 
     #[tokio::test]
@@ -2563,6 +2872,492 @@ mod tests {
         })
     }
 
+    /// A store that records chunk state so the backfill can be driven without
+    /// a database.
+    #[derive(Default)]
+    struct ChunkBackfillDb {
+        /// (chunk_id, content, embedded_by)
+        chunks: std::sync::Mutex<Vec<(i64, String, Option<String>)>>,
+        unchunked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::MemoryPersistence for ChunkBackfillDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &crate::FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+
+        async fn chunks_needing_embedding(
+            &self,
+            model: &str,
+            limit: usize,
+        ) -> Result<Vec<(i64, String)>, MemoryError> {
+            Ok(self
+                .chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, by)| by.as_deref() != Some(model))
+                .take(limit)
+                .map(|(id, content, _)| (*id, content.clone()))
+                .collect())
+        }
+
+        async fn set_chunk_embedding(
+            &self,
+            chunk_id: i64,
+            _embedding: &[f32],
+            model: &str,
+        ) -> Result<(), MemoryError> {
+            for (id, _, by) in self.chunks.lock().unwrap().iter_mut() {
+                if *id == chunk_id {
+                    *by = Some(model.to_string());
+                }
+            }
+            Ok(())
+        }
+
+        async fn parents_without_chunks(&self, limit: usize) -> Result<Vec<String>, MemoryError> {
+            Ok(self.unchunked.lock().unwrap().iter().take(limit).cloned().collect())
+        }
+
+        async fn replace_chunks(
+            &self,
+            memory_id: &str,
+            _workspace_id: Option<&str>,
+            chunks: &[crate::ChunkWrite],
+        ) -> Result<(), MemoryError> {
+            self.unchunked.lock().unwrap().retain(|id| id != memory_id);
+            let mut store = self.chunks.lock().unwrap();
+            let next = store.iter().map(|(id, _, _)| *id).max().unwrap_or(0) + 1;
+            for (i, c) in chunks.iter().enumerate() {
+                store.push((
+                    next + i as i64,
+                    c.content.clone(),
+                    c.embedding_model.clone().filter(|_| c.embedding.is_some()),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// The 2026-08-04 incident: the store latched at 1536 (a paid embedder
+    /// answering 402) while the live provider produced 768. Every write for a
+    /// day queued for backfill — 2167 of them — and the backfill could not
+    /// drain them either, because activating a backfilled vector runs the same
+    /// width gate. Queueing is CORRECT for the race it was written for, which
+    /// is why nothing escalated: a correct-looking line repeated 2167 times
+    /// still reads as correct.
+    #[tokio::test]
+    async fn a_persistent_width_mismatch_re_probes_the_binding() {
+        // Binding says 1536; the live provider produces 768, consistently.
+        let width = Arc::new(AtomicUsize::new(768));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 1536,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        assert_eq!(service.dimension(), 1536, "precondition — a stale binding");
+
+        for i in 0..MemoryService::WIDTH_MISMATCH_ESCALATION {
+            service
+                .remember_with_importance(&format!("observation {i}"), HashMap::new(), 3.0)
+                .await
+                .expect("the write must always land, vector or not");
+        }
+
+        assert_eq!(
+            service.dimension(),
+            768,
+            "a mismatch that repeats is a stale binding, and must re-probe rather than queue              writes forever"
+        );
+    }
+
+    /// A handful of mismatches IS the race the queue policy was written for —
+    /// writes already in flight when a switch landed, carrying the previous
+    /// provider's width. Re-probing on those would flap the latch.
+    #[tokio::test]
+    async fn a_brief_width_mismatch_does_not_disturb_the_binding() {
+        let width = Arc::new(AtomicUsize::new(768));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 1536,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        for i in 0..(MemoryService::WIDTH_MISMATCH_ESCALATION - 1) {
+            service
+                .remember_with_importance(&format!("in flight {i}"), HashMap::new(), 3.0)
+                .await
+                .expect("write");
+        }
+        assert_eq!(service.dimension(), 1536, "a short streak must not rebind");
+    }
+
+    /// A width that agrees clears the streak, so mismatches have to be
+    /// genuinely consecutive — otherwise a slow drip of races across an
+    /// otherwise healthy day would eventually escalate on its own.
+    #[tokio::test]
+    async fn an_agreeing_write_clears_the_streak() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        for _ in 0..(MemoryService::WIDTH_MISMATCH_ESCALATION - 1) {
+            width.store(9, Ordering::SeqCst);
+            service.remember_with_importance("mismatch", HashMap::new(), 3.0).await.expect("write");
+            width.store(4, Ordering::SeqCst);
+            service.remember_with_importance("agreement", HashMap::new(), 3.0).await.expect("write");
+        }
+        assert_eq!(service.dimension(), 4, "interleaved agreement must reset the streak");
+    }
+
+    fn recall_of(content: &str) -> RecallResult {
+        RecallResult {
+            id: "m".to_string(),
+            content: content.to_string(),
+            best_chunk: None,
+            score: 0.9,
+            weight: 1.0,
+            state: MemoryState::Active,
+            metadata: HashMap::new(),
+            workspace_id: None,
+        }
+    }
+
+    /// Storage is unbounded, so reading has to be paged — and every page has
+    /// to report the whole size, or a prefix is indistinguishable from the
+    /// complete memory and the reader stops early.
+    #[test]
+    fn an_excerpt_reports_the_true_total_not_the_page_size() {
+        let long = "x".repeat(10_000);
+        let (text, start, total) = recall_of(&long).excerpt(0, 100);
+        assert_eq!(text.chars().count(), 100);
+        assert_eq!(start, 0);
+        assert_eq!(total, 10_000, "the page must not hide how much there is");
+    }
+
+    /// Paging must terminate: the last page is short, the page after the end
+    /// is empty, and neither panics. Offsets past the end are what a naive
+    /// continuation loop produces.
+    #[test]
+    fn paging_terminates_at_the_end_instead_of_panicking() {
+        let content = "abcdefghij";
+        let r = recall_of(content);
+
+        let (last, start, total) = r.excerpt(8, 100);
+        assert_eq!(last, "ij");
+        assert_eq!((start, total), (8, 10));
+
+        let (past, start, total) = r.excerpt(10, 100);
+        assert!(past.is_empty(), "a page at the end is empty, not an error");
+        assert_eq!((start, total), (10, 10));
+
+        let (way_past, start, _) = r.excerpt(9_999, 100);
+        assert!(way_past.is_empty());
+        assert_eq!(start, 10, "the offset is clamped to the end, not echoed back");
+    }
+
+    /// Walking the pages must reproduce the memory exactly — the same
+    /// losslessness the chunker guarantees, on the read side.
+    #[test]
+    fn walking_the_pages_rebuilds_the_memory() {
+        let content = "héllo wörld, 日本語もある. ".repeat(200);
+        let r = recall_of(&content);
+        let mut rebuilt = String::new();
+        let mut offset = 0usize;
+        loop {
+            let (page, start, total) = r.excerpt(offset, 37);
+            if page.is_empty() {
+                assert_eq!(start, total);
+                break;
+            }
+            offset = start + page.chars().count();
+            rebuilt.push_str(&page);
+        }
+        assert_eq!(rebuilt, content, "paging must not drop or duplicate characters");
+    }
+
+    /// A zero budget would otherwise make no progress and hang any
+    /// continuation loop built on the returned offset.
+    #[test]
+    fn a_zero_page_budget_still_advances() {
+        let (page, _, _) = recall_of("abc").excerpt(0, 0);
+        assert_eq!(page.chars().count(), 1, "a page must contain at least one character");
+    }
+
+    /// Returns fixed chunk hits so recall's merge can be driven without an
+    /// embedding index.
+    struct StubChunkSearch {
+        hits: Vec<(String, i64, f32)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::MemoryPersistence for StubChunkSearch {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &crate::FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+        async fn search_chunks(
+            &self,
+            _query: &[f32],
+            _limit: usize,
+            _workspace_id: Option<&str>,
+        ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    /// The whole justification for chunking. A long memory's row vector is a
+    /// centroid of everything it contains, so a query answered exactly by one
+    /// paragraph can score below the recall threshold at row level. If chunk
+    /// hits could only re-rank memories the row search already returned,
+    /// splitting a memory would improve nothing — the row vector would still
+    /// be the only way in.
+    #[tokio::test]
+    async fn a_chunk_hit_surfaces_a_memory_the_row_vector_missed() {
+        // Orthogonal to the query, so the row-level search cannot reach it.
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) })
+        });
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed);
+
+        let buried = MemoryEntry {
+            id: "buried".to_string(),
+            content: "a long memory whose centroid says nothing about the query".to_string(),
+            embeddings: HashMap::new(),
+            embedding_model: Some("prov:a".to_string()),
+            embedding: vec![0.0, 1.0, 0.0, 0.0],
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: crate::FsrsState::default(),
+            workspace_id: None,
+        };
+        service.store.add(buried).await.expect("add");
+
+        // Row search alone finds nothing: the vectors are orthogonal.
+        assert!(
+            service.recall_scoped("the query", None).await.unwrap().is_empty(),
+            "precondition — the row vector must not reach this memory"
+        );
+
+        // Now the same store, with a chunk of that memory matching strongly.
+        let service = service.with_persistence(Arc::new(StubChunkSearch {
+            hits: vec![("buried".to_string(), 7, 0.88)],
+        }));
+        let found = service.recall_scoped("the query", None).await.unwrap();
+        assert_eq!(found.len(), 1, "the chunk hit must surface its parent");
+        assert_eq!(found[0].id, "buried");
+        assert!(
+            (found[0].score - 0.88).abs() < 1e-6,
+            "the reported score is the chunk's true similarity, not a synthetic rank: {}",
+            found[0].score
+        );
+    }
+
+    /// Corroboration reorders; it never admits. A memory whose every chunk is
+    /// just below the bar must stay out however many chunks it has, or the
+    /// threshold would mean something weaker for long memories than short ones.
+    #[tokio::test]
+    async fn many_near_miss_chunks_do_not_add_up_to_a_recall() {
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) })
+        });
+        let hits: Vec<(String, i64, f32)> =
+            (0..30).map(|i| ("long".to_string(), i, 0.39)).collect();
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed)
+        .with_persistence(Arc::new(StubChunkSearch { hits }));
+
+        service
+            .store
+            .add(MemoryEntry {
+                id: "long".to_string(),
+                content: "thirty paragraphs that each nearly match".to_string(),
+                embeddings: HashMap::new(),
+                embedding_model: Some("prov:a".to_string()),
+                embedding: vec![0.0, 1.0, 0.0, 0.0],
+                metadata: HashMap::new(),
+                timestamp: 0,
+                fsrs: crate::FsrsState::default(),
+                workspace_id: None,
+            })
+            .await
+            .expect("add");
+
+        assert!(
+            service.recall_scoped("the query", None).await.unwrap().is_empty(),
+            "thirty near-misses must not clear a threshold none of them clears"
+        );
+    }
+
+    /// A chunk whose vector came from another model is exactly as unsearchable
+    /// as a chunk with no vector, so both are one queue — which is what makes
+    /// an embedding-model switch a resumable incremental backfill rather than a
+    /// full rebuild.
+    #[tokio::test]
+    async fn a_model_switch_requeues_chunks_without_rebuilding_them() {
+        let db = Arc::new(ChunkBackfillDb::default());
+        *db.chunks.lock().unwrap() = vec![
+            (1, "alpha".into(), Some("prov:a".into())),
+            (2, "beta".into(), None),
+            (3, "gamma".into(), Some("prov:b".into())),
+        ];
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig { dimension: 4, ..Default::default() })
+            .with_embed_fn(switchable_width_embed(&width))
+            .with_persistence(db.clone());
+
+        service.rebind_embeddings("prov:a", 4, None).await;
+        let (embedded, _) = service.backfill_chunks("prov:a", 64).await.unwrap();
+        assert_eq!(embedded, 2, "the unembedded one and the other model's one");
+        assert!(
+            db.chunks.lock().unwrap().iter().all(|(_, _, by)| by.as_deref() == Some("prov:a")),
+            "every chunk now carries the active model's vector"
+        );
+
+        // Nothing left to do: a completed queue must report zero, or the
+        // daemon's drain loop never terminates.
+        assert_eq!(service.backfill_chunks("prov:a", 64).await.unwrap(), (0, 0));
+    }
+
+    /// Memories that predate chunking have no chunk rows, so they contribute
+    /// nothing to the embedding queue until they are split. Running the
+    /// embedding queue first would report the store complete while whole
+    /// memories sat outside the index entirely.
+    #[tokio::test]
+    async fn unchunked_memories_are_split_before_the_queue_is_measured() {
+        let db = Arc::new(ChunkBackfillDb::default());
+        *db.unchunked.lock().unwrap() = vec!["old-1".into()];
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig { dimension: 4, ..Default::default() })
+            .with_embed_fn(switchable_width_embed(&width))
+            .with_persistence(db.clone());
+        service.rebind_embeddings("prov:a", 4, None).await;
+
+        // The memory has to be in the RAM cache — it is the authority on
+        // content, and chunking from a stale row would disagree with it.
+        service
+            .remember_with_importance("a memory written before chunking existed", HashMap::new(), 3.0)
+            .await
+            .expect("write");
+        let id = service.store.all_entries().await[0].id.clone();
+        *db.unchunked.lock().unwrap() = vec![id];
+        db.chunks.lock().unwrap().clear();
+
+        let (_, chunked) = service.backfill_chunks("prov:a", 64).await.unwrap();
+        assert_eq!(chunked, 1, "the unchunked memory was split");
+        assert!(
+            !db.chunks.lock().unwrap().is_empty(),
+            "splitting it must have produced chunk rows"
+        );
+    }
+
+    /// Backfilling a bucket that is no longer the active binding poisons it
+    /// with another model's vectors — wrong space, usually wrong width, and
+    /// nothing downstream can tell. The guard is a skip, not an error.
+    #[tokio::test]
+    async fn a_chunk_backfill_for_an_inactive_binding_does_nothing() {
+        let db = Arc::new(ChunkBackfillDb::default());
+        *db.chunks.lock().unwrap() = vec![(1, "alpha".into(), None)];
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig { dimension: 4, ..Default::default() })
+            .with_embed_fn(switchable_width_embed(&width))
+            .with_persistence(db.clone());
+
+        service.rebind_embeddings("prov:a", 4, None).await;
+        assert_eq!(service.backfill_chunks("prov:b", 64).await.unwrap(), (0, 0));
+        assert_eq!(
+            db.chunks.lock().unwrap()[0].2, None,
+            "the inactive model must not have written a vector"
+        );
+    }
+
+    /// Chunk geometry is the third leg of the binding, and it fails more
+    /// quietly than the width: an over-long chunk is not rejected by the new
+    /// embedder, it is truncated by it, and the vector then describes a prefix
+    /// while claiming to describe the whole chunk. So a switch onto a
+    /// narrower model must shrink the chunk size in the same breath it moves
+    /// the model and the width — never one request later.
+    #[tokio::test]
+    async fn chunk_geometry_follows_a_provider_switch() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        // A roomy embedder: the retrieval-granularity target binds, not the
+        // window.
+        service.rebind_embeddings("prov:a", 4, Some(32_768)).await;
+        assert_eq!(
+            service.chunk_params().await.max_chars,
+            MEMORY_CHUNK_TARGET_CHARS,
+            "a wide window must not inflate chunks past the retrieval target"
+        );
+
+        // Failover onto a 512-token embedder. Its window is now the binding
+        // constraint, and the chunk size has to have already moved.
+        width.store(8, Ordering::SeqCst);
+        service.rebind_embeddings("prov:b", 8, Some(512)).await;
+
+        let (model, dimension) = service.active_binding().await;
+        let params = service.chunk_params().await;
+        assert_eq!(model.as_deref(), Some("prov:b"), "model moved");
+        assert_eq!(dimension, 8, "width moved");
+        assert!(
+            params.max_chars < MEMORY_CHUNK_TARGET_CHARS,
+            "chunk size did not move: {} chars still assumes the old window",
+            params.max_chars
+        );
+        assert!(
+            params.max_chars <= 512 * 3,
+            "chunk of {} chars cannot fit a 512-token window",
+            params.max_chars
+        );
+    }
+
+    /// An undiscoverable window is not permission to send unbounded text — it
+    /// means no ceiling was learned, so the retrieval target stands. Every
+    /// OpenAI-compatible embeddings endpoint lands here.
+    #[tokio::test]
+    async fn an_unknown_window_falls_back_rather_than_unbounding() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        service.rebind_embeddings("prov:a", 4, Some(512)).await;
+        let narrow = service.chunk_params().await.max_chars;
+        service.rebind_embeddings("prov:a", 4, None).await;
+        let unknown = service.chunk_params().await.max_chars;
+
+        assert!(unknown > narrow, "an unknown window should relax the 512-token clamp");
+        assert_eq!(
+            unknown, MEMORY_CHUNK_TARGET_CHARS,
+            "…but only as far as the retrieval target, never to unbounded"
+        );
+    }
+
     /// The 2026-08-02 incident: the router failed over 2048→768 and rebound
     /// the model, but the width latch stayed at 2048 — every write after the
     /// switch failed "Embedding dimension mismatch" for minutes. The binding
@@ -2577,7 +3372,7 @@ mod tests {
         };
         let service = MemoryService::new(config).with_embed_fn(switchable_width_embed(&width));
 
-        service.rebind_embeddings("prov:a", 4).await;
+        service.rebind_embeddings("prov:a", 4, None).await;
         let (first_id, _) = service
             .remember_with_importance("the harbor light was green", HashMap::new(), 3.0)
             .await
@@ -2585,7 +3380,7 @@ mod tests {
 
         // Failover: the fallback provider embeds at width 8.
         width.store(8, Ordering::SeqCst);
-        service.rebind_embeddings("prov:b", 8).await;
+        service.rebind_embeddings("prov:b", 8, None).await;
         assert_eq!(service.dimension(), 8, "the width latch moved with the model");
 
         let (second_id, _) = service
@@ -2633,7 +3428,7 @@ mod tests {
                     // daemon's embed_fn rebinding before it returns — every
                     // LATER embed comes from the new provider at width 8…
                     let service = cell.get().expect("service registered").clone();
-                    service.rebind_embeddings("prov:b", 8).await;
+                    service.rebind_embeddings("prov:b", 8, None).await;
                     width.store(8, Ordering::SeqCst);
                     // …but THIS call's vector was produced at the old width.
                     return Ok(vec![0.5_f32; 4]);
@@ -2647,7 +3442,7 @@ mod tests {
         };
         let service = Arc::new(MemoryService::new(config).with_embed_fn(embed));
         assert!(cell.set(service.clone()).is_ok(), "first set");
-        service.rebind_embeddings("prov:a", 4).await;
+        service.rebind_embeddings("prov:a", 4, None).await;
 
         flip.store(true, Ordering::SeqCst);
         let (id, action) = service
@@ -2689,11 +3484,11 @@ mod tests {
             .remember_with_importance("the anchor chain rattled", HashMap::new(), 3.0)
             .await
             .expect("write");
-        service.rebind_embeddings("prov:a", 4).await;
+        service.rebind_embeddings("prov:a", 4, None).await;
 
         // Provider fails over before the drain for prov:a gets there.
         width.store(8, Ordering::SeqCst);
-        service.rebind_embeddings("prov:b", 8).await;
+        service.rebind_embeddings("prov:b", 8, None).await;
 
         let filled = service
             .backfill_embeddings("prov:a", 16)
