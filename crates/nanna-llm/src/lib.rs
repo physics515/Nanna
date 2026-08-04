@@ -1239,11 +1239,27 @@ impl AnthropicModelContract {
 /// model produces a hard 400 on the very first request.
 #[must_use]
 pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
-    let lowered = model.to_ascii_lowercase().replace('.', "-");
-    let name = lowered
+    // Strip the provider prefix BEFORE folding dots, or the Bedrock
+    // `anthropic.` form has already lost its separator and never matches.
+    let lowered = model.to_ascii_lowercase();
+    let unprefixed = lowered
         .strip_prefix("anthropic.")
         .or_else(|| lowered.strip_prefix("anthropic/"))
         .unwrap_or(&lowered);
+    // Fold dotted aliases (`claude-opus-4.6`) onto the hyphenated ids the
+    // patterns below are written against.
+    let name = unprefixed.replace('.', "-");
+    let name = name.as_str();
+
+    // Mythos Preview is a migration SOURCE, not a member of the Mythos 5
+    // contract: the published "before" example for the Fable 5 migration is
+    // `claude-mythos-preview` with `{"type":"enabled","budget_tokens":N}`,
+    // i.e. removing budgets is a break *relative to* it, and its prompt-cache
+    // minimum is grouped with Opus 4.7 rather than with Fable/Mythos 5. It
+    // must not inherit the always-on row below.
+    if name.contains("mythos-preview") {
+        return AnthropicModelContract::LEGACY;
+    }
 
     // Thinking is always on and cannot be disabled.
     if name.contains("fable-5") || name.contains("mythos") {
@@ -1322,6 +1338,70 @@ pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
 #[must_use]
 pub fn is_claude_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("claude")
+}
+
+/// Conform a request to its model's contract, at the boundary where it is
+/// about to be sent.
+///
+/// Per-call-site fixes do not hold this invariant: a request reaches the API
+/// from many constructors (`AnthropicRequest` literals, and every
+/// `CompletionRequest` that `complete_anthropic_simple` converts), and each
+/// new one is another chance to send a parameter the model removed. This runs
+/// on the dispatch path so every caller is covered at once, including ones
+/// added later.
+///
+/// Two corrections, both faithful translations of what the calling code
+/// already meant rather than new policy:
+///
+/// 1. **`temperature` is dropped** where the model removed sampling, and
+///    alongside any active thinking config. `CompletionRequest::default()`
+///    carries `Some(0.7)`, so sub-agent questions, multi-agent decomposition
+///    and aggregation, dream summaries and `AgentContext::compress` all
+///    inherit a temperature nobody chose — a 400 on the current generation.
+/// 2. **`thinking: None` becomes an explicit `disabled`** where the model
+///    accepts one. Omitting the field used to mean "no thinking" everywhere,
+///    which is what every `thinking: None` in this codebase was written to
+///    mean; on Opus 5, Sonnet 5 and Fable it now means *adaptive*. Left as-is
+///    the model reasons inside a `max_tokens` sized for no reasoning (512 for
+///    the distiller, 1024 for the tool-output summarizer) and returns
+///    `stop_reason: "max_tokens"` with empty text — a silent truncation that
+///    is harder to spot than the 400 it replaced. Always-on models keep
+///    `None`, since they reject an explicit disable.
+///
+/// Borrowed unchanged when the request already conforms.
+#[must_use]
+pub fn conform_to_anthropic_contract(
+    request: &AnthropicRequest,
+) -> std::borrow::Cow<'_, AnthropicRequest> {
+    if !is_claude_model(&request.model) {
+        return std::borrow::Cow::Borrowed(request);
+    }
+    let contract = anthropic_model_contract(&request.model);
+
+    let thinking_active = request
+        .thinking
+        .as_ref()
+        .is_some_and(ThinkingConfig::is_thinking);
+    let drop_temperature =
+        request.temperature.is_some() && (contract.sampling_removed || thinking_active);
+    // Only where an explicit off is accepted: legacy models already mean "off"
+    // by omission, and Fable/Mythos reject `disabled` outright.
+    let mute_explicitly = request.thinking.is_none()
+        && contract.adaptive_thinking
+        && !contract.thinking_always_on;
+
+    if !drop_temperature && !mute_explicitly {
+        return std::borrow::Cow::Borrowed(request);
+    }
+
+    let mut conformed = request.clone();
+    if drop_temperature {
+        conformed.temperature = None;
+    }
+    if mute_explicitly {
+        conformed.thinking = Some(ThinkingConfig::Disabled);
+    }
+    std::borrow::Cow::Owned(conformed)
 }
 
 /// The `temperature` to actually send for `model`, given what the caller
@@ -2534,6 +2614,9 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// Returns `LlmError::Api` if the API returns an error.
     /// Returns `LlmError::Network` if the request fails.
     pub async fn complete_anthropic(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        // Last stop before the wire: correct anything the caller's model
+        // no longer accepts. See `conform_to_anthropic_contract`.
+        let request = &*conform_to_anthropic_contract(request);
         match self.provider {
             Provider::Anthropic => self.complete_anthropic_native(request).await,
             Provider::OpenAI | Provider::OpenRouter | Provider::GitHubModels | Provider::ClaudeProxy =>
@@ -3948,7 +4031,9 @@ impl LlmClient {
         request: &AnthropicRequest,
     ) -> impl Stream<Item = Result<StreamEvent, LlmError>> + '_ {
         let provider = self.provider;
-        let request = request.clone();
+        // Same boundary correction as the non-streaming path — a streamed
+        // request carries the identical body and 400s the same way.
+        let request = conform_to_anthropic_contract(request).into_owned();
 
         stream! {
             // One gate for every streamed request regardless of which backend
@@ -5123,7 +5208,10 @@ impl LlmClient {
                         model: request.model.clone(),
                         messages: all_messages,
                         max_tokens: request.max_tokens.unwrap_or(4096),
-                        temperature: if request.thinking.is_some() { None } else { request.temperature },
+                        // Model-family correction happens at the dispatcher
+                        // (`conform_to_anthropic_contract`), which sees the
+                        // resolved model; pass the caller's value through.
+                        temperature: request.temperature,
                         system: system_msg,
                         tools,
                         stream: Some(true),
@@ -6639,7 +6727,10 @@ mod tests {
 
 #[cfg(test)]
 mod anthropic_model_contract_tests {
-    use super::{anthropic_model_contract, ThinkingConfig, ThinkingDisplay};
+    use super::{
+        anthropic_model_contract, conform_to_anthropic_contract, AnthropicRequest, ThinkingConfig,
+        ThinkingDisplay,
+    };
 
     #[test]
     fn the_current_generation_dropped_budgets_and_sampling() {
@@ -6662,12 +6753,23 @@ mod anthropic_model_contract_tests {
 
     #[test]
     fn fable_and_mythos_cannot_be_told_not_to_think() {
-        for model in ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"] {
+        for model in ["claude-fable-5", "claude-mythos-5"] {
             let c = anthropic_model_contract(model);
             assert!(c.thinking_always_on, "{model} rejects an explicit disable");
             assert!(c.adaptive_thinking);
             assert!(c.sampling_removed);
         }
+    }
+
+    /// Mythos *Preview* is the model those two were migrated away FROM — the
+    /// published "before" example configures it with `budget_tokens`, so it
+    /// must not be swept into the always-on row by the `mythos` substring.
+    #[test]
+    fn mythos_preview_is_a_migration_source_not_a_mythos_five() {
+        let c = anthropic_model_contract("claude-mythos-preview");
+        assert!(!c.adaptive_thinking, "it still takes budget_tokens");
+        assert!(!c.thinking_always_on, "nothing documents a rejected disable");
+        assert!(!c.sampling_removed, "it still takes temperature");
     }
 
     #[test]
@@ -6734,6 +6836,85 @@ mod anthropic_model_contract_tests {
         assert!(c.adaptive_thinking);
         assert!(c.sampling_removed);
         assert!(c.display_defaults_omitted);
+    }
+
+    fn probe_request(model: &str) -> AnthropicRequest {
+        AnthropicRequest {
+            context_limit: None,
+            model: model.to_string(),
+            messages: vec![],
+            max_tokens: 512,
+            temperature: Some(0.7),
+            system: None,
+            tools: None,
+            stream: None,
+            thinking: None,
+            cache_control: None,
+        }
+    }
+
+    /// The defect the boundary check exists for: `CompletionRequest::default()`
+    /// carries `temperature: Some(0.7)`, so sub-agent questions, multi-agent
+    /// decomposition, dream summaries and `AgentContext::compress` all inherit
+    /// a temperature nobody chose — a 400 on the current generation.
+    #[test]
+    fn the_boundary_strips_an_inherited_temperature() {
+        let req = probe_request("claude-opus-5");
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(conformed.temperature, None);
+    }
+
+    /// Omitting `thinking` used to mean "no thinking" everywhere, which is
+    /// what every `thinking: None` in this codebase was written to mean. On
+    /// Opus 5 it now means adaptive, so a 512-token auxiliary request would
+    /// spend its whole budget reasoning and return empty text.
+    #[test]
+    fn the_boundary_makes_an_implied_mute_explicit() {
+        let req = probe_request("claude-opus-5");
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(conformed.thinking, Some(ThinkingConfig::Disabled));
+    }
+
+    #[test]
+    fn the_boundary_leaves_always_on_models_muted_by_omission() {
+        // Fable rejects an explicit disable, so `None` has to stay `None`.
+        let req = probe_request("claude-fable-5");
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(conformed.thinking, None);
+        assert_eq!(conformed.temperature, None);
+    }
+
+    #[test]
+    fn the_boundary_leaves_legacy_and_non_claude_requests_alone() {
+        // Legacy: omission already means off, and sampling still exists.
+        let legacy_req = probe_request("claude-sonnet-4-20250514");
+        let legacy = conform_to_anthropic_contract(&legacy_req);
+        assert_eq!(legacy.thinking, None);
+        assert_eq!(legacy.temperature, Some(0.7));
+        assert!(
+            matches!(legacy, std::borrow::Cow::Borrowed(_)),
+            "a conforming request must not be cloned"
+        );
+
+        // A local model must keep its temperature — Ollama substitutes its
+        // own default when the field is absent.
+        let ollama_req = probe_request("qwen3.5:9b");
+        let ollama = conform_to_anthropic_contract(&ollama_req);
+        assert_eq!(ollama.temperature, Some(0.7));
+        assert_eq!(ollama.thinking, None);
+        assert!(matches!(ollama, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn the_boundary_does_not_disturb_a_request_that_already_thinks() {
+        let mut req = probe_request("claude-opus-5");
+        req.thinking = Some(ThinkingConfig::adaptive_summarized());
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(
+            conformed.thinking,
+            Some(ThinkingConfig::adaptive_summarized())
+        );
+        assert_eq!(conformed.temperature, None);
     }
 
     #[test]
