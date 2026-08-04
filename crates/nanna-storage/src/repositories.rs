@@ -358,7 +358,302 @@ const CHUNK_KNN_SCOPED: &str = "SELECT memory_id, ordinal, vector_distance_cos(e
 
 const CHUNK_KNN_GLOBAL: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND embedding_model = ?2 AND octet_length(embedding) = ?3 ORDER BY dist ASC LIMIT ?4";
 
+
+/// Ordinal used for a whole-row (parent) vector in the shared embedding queue.
+///
+/// Negative so it can never collide with a real chunk ordinal, which counts
+/// from zero. One queue serves rows and chunks alike; a separate `kind` column
+/// would be a second source of truth that could disagree with the key.
+pub const ROW_ORDINAL: i64 = -1;
+
+/// Longest error text kept per queue item.
+///
+/// A provider error is diagnostic, not a log: one line of it identifies the
+/// cause (402, 404, connection refused), and a full HTML error page would put
+/// kilobytes per row into a table that is read on every health check.
+const QUEUE_ERROR_MAX_CHARS: usize = 500;
+
+/// Trim a provider error to something a queue row can hold, marking the cut.
+fn truncate_queue_error(error: &str) -> String {
+    if error.chars().count() <= QUEUE_ERROR_MAX_CHARS {
+        return error.to_string();
+    }
+    let head: String = error.chars().take(QUEUE_ERROR_MAX_CHARS).collect();
+    format!("{head} [truncated]")
+}
+
+const PUT_MEMORY_VECTOR: &str = "INSERT INTO memory_vectors (memory_id, embedding_model, embedding, dim) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(memory_id, embedding_model) DO UPDATE SET embedding = excluded.embedding, dim = excluded.dim, updated_at = datetime('now')";
+
+const PUT_CHUNK_VECTOR: &str = "INSERT INTO memory_chunk_vectors (memory_id, ordinal, embedding_model, embedding, dim) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(memory_id, ordinal, embedding_model) DO UPDATE SET embedding = excluded.embedding, dim = excluded.dim, updated_at = datetime('now')";
+
+const BUCKET_CENSUS: &str = "SELECT embedding_model, COUNT(*) AS n FROM memory_vectors GROUP BY embedding_model ORDER BY n DESC";
+
+const ENQUEUE_EMBEDDING: &str = "INSERT INTO embedding_queue (memory_id, ordinal, embedding_model) VALUES (?1, ?2, ?3) ON CONFLICT(memory_id, ordinal, embedding_model) DO NOTHING";
+
+const PENDING_EMBEDDINGS: &str = "SELECT memory_id, ordinal FROM embedding_queue WHERE embedding_model = ?1 ORDER BY attempts ASC, enqueued_at ASC LIMIT ?2";
+
+const RECORD_EMBEDDING_FAILURE: &str = "UPDATE embedding_queue SET attempts = attempts + 1, last_error = ?4, last_attempt_at = datetime('now') WHERE memory_id = ?1 AND ordinal = ?2 AND embedding_model = ?3";
+
+const EMBEDDING_QUEUE_HEALTH: &str = "SELECT embedding_model, COUNT(*) AS n, MAX(last_error) FROM embedding_queue GROUP BY embedding_model ORDER BY n DESC";
+
 impl MemoryRepository {
+    // ------------------------------------------------------------------
+    // Embedding buckets: one vector per (row | chunk, model)
+    // ------------------------------------------------------------------
+
+    /// Store `embedding` as `model`'s vector for `memory_id`, replacing only
+    /// that model's bucket.
+    ///
+    /// Other models' vectors are untouched. That is the whole point: a provider
+    /// that flaps away and back used to cost two full re-embeds of the store,
+    /// because a single vector column meant adopting a new model destroyed the
+    /// previous one's work.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the write fails.
+    ///
+    /// # Panics
+    /// Panics if `embedding` or `model` is empty — both would store a bucket
+    /// that nothing can ever match.
+    pub async fn put_memory_vector(
+        &self,
+        memory_id: &str,
+        model: &str,
+        embedding: &[f32],
+    ) -> Result<(), StorageError> {
+        assert!(!embedding.is_empty(), "an empty vector is not a bucket");
+        assert!(!model.is_empty(), "a bucket must name the model that filled it");
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let dim = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        conn.execute(PUT_MEMORY_VECTOR, turso::params![memory_id.to_string(), model.to_string(), blob, dim])
+            .await?;
+        Ok(())
+    }
+
+    /// Every stored bucket for `memory_id`, as `(model, vector)`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn memory_vectors(&self, memory_id: &str) -> Result<Vec<(String, Vec<f32>)>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT embedding_model, embedding FROM memory_vectors WHERE memory_id = ?1",
+                turso::params![memory_id.to_string()],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let model: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            out.push((model, decode_embedding(Some(blob)).unwrap_or_default()));
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    /// Every bucket for every memory, as `(memory_id, model, vector)`.
+    ///
+    /// One scan: the loader needs all buckets for all rows, and N+1 point
+    /// lookups over a few thousand memories is a startup stall.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn all_memory_vectors(&self) -> Result<Vec<(String, String, Vec<f32>)>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT memory_id, embedding_model, embedding FROM memory_vectors", ())
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            let model: String = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            out.push((id, model, decode_embedding(Some(blob)).unwrap_or_default()));
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    /// How many vectors each model holds — the bucket census, largest first.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn bucket_counts(&self) -> Result<Vec<(String, usize)>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(BUCKET_CENSUS, ()).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let model: String = row.get(0)?;
+            let n: i64 = row.get(1)?;
+            out.push((model, usize::try_from(n).unwrap_or(0)));
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    /// Store a chunk's vector under `model`, leaving other models' alone.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the write fails.
+    ///
+    /// # Panics
+    /// Panics if `embedding` or `model` is empty.
+    pub async fn put_chunk_vector(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+        embedding: &[f32],
+    ) -> Result<(), StorageError> {
+        assert!(!embedding.is_empty(), "an empty vector is not a bucket");
+        assert!(!model.is_empty(), "a bucket must name the model that filled it");
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let dim = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            PUT_CHUNK_VECTOR,
+            turso::params![memory_id.to_string(), ordinal, model.to_string(), blob, dim],
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // The durable embedding queue
+    // ------------------------------------------------------------------
+
+    /// Enqueue `(memory_id, ordinal, model)` for embedding.
+    ///
+    /// `ordinal` is [`ROW_ORDINAL`] for a whole-row vector and `>= 0` for a
+    /// chunk, so one queue covers both without a discriminator column that
+    /// could disagree with the key.
+    ///
+    /// Idempotent, and deliberately does NOT reset `attempts`: re-enqueueing
+    /// must not let a repeatedly-failing item disguise itself as fresh work and
+    /// jump the queue forever.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the write fails.
+    ///
+    /// # Panics
+    /// Panics if `model` is empty.
+    pub async fn enqueue_embedding(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+    ) -> Result<(), StorageError> {
+        assert!(!model.is_empty(), "queued work must name the model it is for");
+        let conn = self.conn.lock().await;
+        conn.execute(
+            ENQUEUE_EMBEDDING,
+            turso::params![memory_id.to_string(), ordinal, model.to_string()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Up to `limit` pending items for `model`: fewest attempts first, then
+    /// oldest first.
+    ///
+    /// Attempts before age means an item that fails forever drifts to the back
+    /// instead of blocking everything behind it — a dead-letter state without
+    /// the extra column.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn pending_embeddings(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                PENDING_EMBEDDINGS,
+                turso::params![model.to_string(), i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?));
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+    /// Remove a completed item.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the delete fails.
+    pub async fn dequeue_embedding(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM embedding_queue WHERE memory_id = ?1 AND ordinal = ?2 AND embedding_model = ?3",
+            turso::params![memory_id.to_string(), ordinal, model.to_string()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Record a failed attempt, keeping the reason.
+    ///
+    /// The reason is what separates a queue that is stuck from one that is
+    /// merely slow. A 402 with nothing attached reads as silence, and silence
+    /// is how an entire day of writes went unembedded unnoticed.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the update fails.
+    pub async fn record_embedding_failure(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            RECORD_EMBEDDING_FAILURE,
+            turso::params![
+                memory_id.to_string(),
+                ordinal,
+                model.to_string(),
+                truncate_queue_error(error)
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Queue depth per model with the most recent error for each.
+    ///
+    /// Exists so the daemon can SAY that work is piling up and why, rather than
+    /// leaving it to be inferred from search results that quietly went missing.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the query fails.
+    pub async fn embedding_queue_health(&self) -> Result<Vec<(String, usize, Option<String>)>, StorageError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(EMBEDDING_QUEUE_HEALTH, ()).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let model: String = row.get(0)?;
+            let n: i64 = row.get(1)?;
+            let err: Option<String> = row.get(2).ok();
+            out.push((model, usize::try_from(n).unwrap_or(0), err));
+        }
+        drop(rows);
+        Ok(out)
+    }
+
+
     // ---------------------------------------------------------------
     // Per-chunk vectors
     //
@@ -1139,6 +1434,25 @@ impl MemoryRepository {
                 turso::params![*id],
             )
             .await?;
+            // Buckets and queued work are children by the same convention, and
+            // an orphaned bucket is worse than an orphaned chunk: it is a live
+            // vector for text that no longer exists, so a deleted memory would
+            // keep matching queries forever.
+            conn.execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                turso::params![*id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM memory_chunk_vectors WHERE memory_id = ?1",
+                turso::params![*id],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM embedding_queue WHERE memory_id = ?1",
+                turso::params![*id],
+            )
+            .await?;
             let n = conn
                 .execute(
                     "DELETE FROM memories WHERE memory_id = ?1",
@@ -1184,6 +1498,22 @@ impl MemoryRepository {
             "UPDATE memory_chunks SET \
                  embedding = zeroblob(COALESCE(octet_length(embedding), 0)), \
                  content = zeroblob(octet_length(content)) \
+             WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        // Per-model buckets are the same hole a third and fourth time. Each
+        // bucket is an independent inversion of the same text, so leaving one
+        // model's vector behind reconstructs the memory just as well as the one
+        // we zeroed.
+        conn.execute(
+            "UPDATE memory_vectors SET embedding = zeroblob(octet_length(embedding)) \
+             WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        conn.execute(
+            "UPDATE memory_chunk_vectors SET embedding = zeroblob(octet_length(embedding)) \
              WHERE memory_id = ?1",
             turso::params![memory_id],
         )
@@ -1246,6 +1576,24 @@ impl MemoryRepository {
         // matching queries through its orphaned chunk vectors.
         conn.execute(
             "DELETE FROM memory_chunks WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        // Same convention, same reason: an orphaned bucket is a live vector for
+        // text that no longer exists, which keeps a deleted memory matching
+        // queries indefinitely.
+        conn.execute(
+            "DELETE FROM memory_vectors WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM memory_chunk_vectors WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM embedding_queue WHERE memory_id = ?1",
             turso::params![memory_id],
         )
         .await?;
