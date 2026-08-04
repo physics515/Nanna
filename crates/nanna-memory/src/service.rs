@@ -71,6 +71,9 @@ pub struct MemoryService {
     /// for the next several minutes failed `DimensionMismatch` while the log
     /// said the store had been rebound.
     binding: RwLock<EmbeddingBinding>,
+    /// Consecutive writes whose vector width disagreed with the binding, and
+    /// the width they all reported. See [`MemoryService::note_width_mismatch`].
+    width_mismatch_streak: RwLock<(usize, usize)>,
 }
 
 /// The identity half of the embedding binding.
@@ -106,6 +109,7 @@ impl MemoryService {
             pending_updates: RwLock::new(Vec::new()),
             min_score_override: RwLock::new(None),
             binding: RwLock::new(EmbeddingBinding::default()),
+            width_mismatch_streak: RwLock::new((0, 0)),
         }
     }
 
@@ -437,6 +441,75 @@ impl MemoryService {
         Ok((embedded, chunked))
     }
 
+    /// How many consecutive width mismatches make a wrong binding rather than a
+    /// race.
+    ///
+    /// A provider switch corrects itself on the very call that observes it —
+    /// the router hands back `switched_to` and the store rebinds before the
+    /// write lands — so a mismatch is normally a one-shot: writes already in
+    /// flight when the switch happened, carrying the previous provider's width.
+    /// Concurrency bounds how many of those there can be. Nothing bounds how
+    /// long a genuinely wrong binding persists, which is the difference this
+    /// number is drawing. Eight is comfortably above plausible in-flight
+    /// concurrency and far below "all day".
+    const WIDTH_MISMATCH_ESCALATION: usize = 8;
+
+    /// Record that a write arrived with `observed` width against the current
+    /// binding, and re-probe the provider when that stops looking like a race.
+    ///
+    /// The 2026-08-04 incident this exists for: the store was latched at 1536
+    /// (a paid embedder returning 402) while the live provider produced 768.
+    /// Every write for an entire day queued for backfill — 2167 of them — and
+    /// the backfill could not drain them either, because activating a
+    /// backfilled vector runs the same width gate that rejected them. Nothing
+    /// escalated, because queueing a write is *correct* behaviour for the race
+    /// it was written for, and a correct-looking line repeated 2167 times still
+    /// reads as correct.
+    ///
+    /// The re-probe is authoritative rather than a guess: it asks the live
+    /// provider for a vector and takes its width. Inferring the width from the
+    /// rejected vector instead would be wrong in exactly the race case, where
+    /// that vector is the OLD provider's and the binding is already right.
+    async fn note_width_mismatch(&self, observed: usize) {
+        let escalate = {
+            let mut streak = self.width_mismatch_streak.write().await;
+            if streak.1 == observed {
+                streak.0 += 1;
+            } else {
+                *streak = (1, observed);
+            }
+            streak.0 == Self::WIDTH_MISMATCH_ESCALATION
+        };
+        if !escalate {
+            return;
+        }
+        warn!(
+            "{} consecutive writes queued at {observed} dims against a {} dim binding — that is \
+             no longer a provider switch in flight, it is a stale binding. Re-probing the live \
+             embedding provider.",
+            Self::WIDTH_MISMATCH_ESCALATION,
+            self.dimension()
+        );
+        match self.probe_and_align_dimension().await {
+            Ok(actual) => {
+                info!("Re-probe settled the binding at {actual} dims; queued writes can now backfill");
+                *self.width_mismatch_streak.write().await = (0, 0);
+            }
+            // Leave the streak intact: the next write re-escalates, which is
+            // the behaviour we want while the provider is still unreachable.
+            Err(e) => warn!("Re-probe could not reach the embedding provider: {e}"),
+        }
+    }
+
+    /// Reset the mismatch streak — a write whose width agreed with the binding
+    /// is direct evidence the binding is fine.
+    async fn note_width_agreement(&self) {
+        let mut streak = self.width_mismatch_streak.write().await;
+        if streak.0 != 0 {
+            *streak = (0, 0);
+        }
+    }
+
     /// Identity of the embedding model currently in use, if the daemon has said.
     pub async fn active_embedding_model(&self) -> Option<String> {
         self.binding.read().await.model.clone()
@@ -548,6 +621,11 @@ impl MemoryService {
         // Create new memory
         let id = uuid::Uuid::new_v4().to_string();
         let (active_model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.note_width_agreement().await;
+        } else {
+            self.note_width_mismatch(embedding.len()).await;
+        }
         let (embedding_model, embedding, embeddings) =
             resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
@@ -765,6 +843,11 @@ impl MemoryService {
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
         
         let (active_model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.note_width_agreement().await;
+        } else {
+            self.note_width_mismatch(embedding.len()).await;
+        }
         let (embedding_model, embedding, embeddings) =
             resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
@@ -904,6 +987,11 @@ impl MemoryService {
         fsrs.importance = (importance / 5.0).clamp(0.5, 1.5);
 
         let (active_model, bound_dim) = self.active_binding().await;
+        if embedding.len() == bound_dim {
+            self.note_width_agreement().await;
+        } else {
+            self.note_width_mismatch(embedding.len()).await;
+        }
         let (embedding_model, embedding, embeddings) =
             resolve_entry_vectors(active_model, bound_dim, embedding);
         let entry = MemoryEntry {
@@ -2853,6 +2941,81 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// The 2026-08-04 incident: the store latched at 1536 (a paid embedder
+    /// answering 402) while the live provider produced 768. Every write for a
+    /// day queued for backfill — 2167 of them — and the backfill could not
+    /// drain them either, because activating a backfilled vector runs the same
+    /// width gate. Queueing is CORRECT for the race it was written for, which
+    /// is why nothing escalated: a correct-looking line repeated 2167 times
+    /// still reads as correct.
+    #[tokio::test]
+    async fn a_persistent_width_mismatch_re_probes_the_binding() {
+        // Binding says 1536; the live provider produces 768, consistently.
+        let width = Arc::new(AtomicUsize::new(768));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 1536,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        assert_eq!(service.dimension(), 1536, "precondition — a stale binding");
+
+        for i in 0..MemoryService::WIDTH_MISMATCH_ESCALATION {
+            service
+                .remember_with_importance(&format!("observation {i}"), HashMap::new(), 3.0)
+                .await
+                .expect("the write must always land, vector or not");
+        }
+
+        assert_eq!(
+            service.dimension(),
+            768,
+            "a mismatch that repeats is a stale binding, and must re-probe rather than queue              writes forever"
+        );
+    }
+
+    /// A handful of mismatches IS the race the queue policy was written for —
+    /// writes already in flight when a switch landed, carrying the previous
+    /// provider's width. Re-probing on those would flap the latch.
+    #[tokio::test]
+    async fn a_brief_width_mismatch_does_not_disturb_the_binding() {
+        let width = Arc::new(AtomicUsize::new(768));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 1536,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        for i in 0..(MemoryService::WIDTH_MISMATCH_ESCALATION - 1) {
+            service
+                .remember_with_importance(&format!("in flight {i}"), HashMap::new(), 3.0)
+                .await
+                .expect("write");
+        }
+        assert_eq!(service.dimension(), 1536, "a short streak must not rebind");
+    }
+
+    /// A width that agrees clears the streak, so mismatches have to be
+    /// genuinely consecutive — otherwise a slow drip of races across an
+    /// otherwise healthy day would eventually escalate on its own.
+    #[tokio::test]
+    async fn an_agreeing_write_clears_the_streak() {
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            ..Default::default()
+        })
+        .with_embed_fn(switchable_width_embed(&width));
+
+        for _ in 0..(MemoryService::WIDTH_MISMATCH_ESCALATION - 1) {
+            width.store(9, Ordering::SeqCst);
+            service.remember_with_importance("mismatch", HashMap::new(), 3.0).await.expect("write");
+            width.store(4, Ordering::SeqCst);
+            service.remember_with_importance("agreement", HashMap::new(), 3.0).await.expect("write");
+        }
+        assert_eq!(service.dimension(), 4, "interleaved agreement must reset the streak");
     }
 
     fn recall_of(content: &str) -> RecallResult {
