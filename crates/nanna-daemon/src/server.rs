@@ -580,15 +580,47 @@ fn build_script_services(
                         .unwrap_or("")
                         .to_string();
                     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                    // Per-result page budget. Storage is unbounded now, so a
+                    // recall that returned whole memories would put an
+                    // arbitrarily large payload into a fixed context window —
+                    // `limit` times over. The default is one embedding chunk's
+                    // worth of text: the same unit the memory was indexed in,
+                    // so a page corresponds to something the retrieval actually
+                    // reasoned about rather than to a round number of bytes.
+                    let page_chars = params
+                        .get("page_chars")
+                        .and_then(|v| v.as_u64())
+                        .map_or(nanna_memory::MEMORY_CHUNK_TARGET_CHARS, |v| v as usize);
+                    let offset = params
+                        .get("offset")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
                     let workspace = ws.read().await;
                     match mem.recall_scoped(&query, workspace.as_deref()).await {
                         Ok(results) => {
                             let items: Vec<Value> = results
                                 .into_iter()
                                 .take(limit)
-                                .map(
-                                    |r| json!({"id": r.id, "content": r.content, "score": r.score}),
-                                )
+                                .map(|r| {
+                                    let (content, start, total) = r.excerpt(offset, page_chars);
+                                    let returned = content.chars().count();
+                                    json!({
+                                        "id": r.id,
+                                        "content": content,
+                                        "score": r.score,
+                                        // Always present, never inferred from
+                                        // whether `content` "looks" cut off. A
+                                        // page that does not announce itself is
+                                        // indistinguishable from a whole
+                                        // memory, and a reader that believes it
+                                        // has the whole thing stops looking.
+                                        "offset": start,
+                                        "returned": returned,
+                                        "total": total,
+                                        "truncated": start + returned < total,
+                                        "best_chunk": r.best_chunk,
+                                    })
+                                })
                                 .collect();
                             Ok(Value::Array(items))
                         }

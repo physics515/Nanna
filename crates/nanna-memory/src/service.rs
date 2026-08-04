@@ -931,75 +931,15 @@ impl MemoryService {
     ///
     /// Returns `MemoryError` if no embedding function is configured.
     pub async fn recall(&self, query: &str) -> Result<Vec<RecallResult>, MemoryError> {
-        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
-
-        let store_count = self.store.len().await;
-        info!("Recall: generating embedding for query (store has {} entries)", store_count);
-
-        // Generate query embedding
-        let query_embedding = (embed_fn)(query)
-            .await
-            .map_err(|e| {
-                warn!("Recall: embedding generation failed: {}", e);
-                MemoryError::Io(std::io::Error::other(e))
-            })?;
-        
-        info!("Recall: embedding generated ({} dims), searching...", query_embedding.len());
-
-        // Search
-        let results = self.store.search(&query_embedding, self.config.max_results * 2).await;
-        let min_score = self.get_min_score();
-        info!("Recall: raw search returned {} results (min_score: {:.2}, min_weight: {:.2})", 
-               results.len(), min_score, self.config.min_weight);
-        
-        // Log top results before filtering
-        for (i, (entry, score)) in results.iter().take(3).enumerate() {
-            info!("  [{}] score={:.3}: {}", i, score, truncate(&entry.content, 50));
-        }
-
-        // Filter by min score and weight, apply testing effect
-        let mut filtered = Vec::new();
-        let mut updates = Vec::new();
-        
-        for (entry, score) in results {
-            if score < min_score {
-                continue;
-            }
-            
-            let weight = entry.fsrs.weight(&self.config.fsrs);
-            let state = entry.fsrs.state(&self.config.fsrs);
-            
-            // Skip effectively forgotten memories
-            if weight < self.config.min_weight {
-                debug!("Skipping forgotten memory: {} (weight: {:.3})", entry.id, weight);
-                continue;
-            }
-            
-            // Queue testing effect update
-            updates.push((entry.id.clone(), Rating::Good));
-            
-            filtered.push(RecallResult {
-                id: entry.id,
-                content: entry.content,
-                score,
-                weight,
-                state,
-                metadata: entry.metadata,
-                workspace_id: entry.workspace_id,
-            });
-            
-            if filtered.len() >= self.config.max_results {
-                break;
-            }
-        }
-
-        // Queue FSRS updates (testing effect)
-        if !updates.is_empty() {
-            self.pending_updates.write().await.extend(updates);
-        }
-
-        debug!("Recall '{}' found {} results", truncate(query, 30), filtered.len());
-        Ok(filtered)
+        // Delegates rather than duplicating. This used to be a second,
+        // near-identical search loop, and it drifted the moment chunk-level
+        // recall was added: the scoped path gained it, this one silently did
+        // not, so whether a memory could be found at all depended on which
+        // entry point the caller happened to use. `search_scoped(.., None)` is
+        // the unscoped search exactly — it takes the same `top_k` off the same
+        // ranking with no workspace filter — so there is nothing here for a
+        // separate implementation to be more correct about.
+        self.recall_scoped(query, None).await
     }
 
     /// Recall memories with workspace scope filtering.
@@ -1007,6 +947,10 @@ impl MemoryService {
     /// Scope rules:
     /// - `workspace_id = Some(id)`: returns global + that workspace's memories
     /// - `workspace_id = None` (global): returns all memories
+    ///
+    /// Searches row vectors and chunk vectors together, keeping the stronger
+    /// evidence per memory — see [`crate::chunk_rank`] for why the two are
+    /// merged rather than one replacing the other.
     ///
     /// # Errors
     ///
@@ -1051,7 +995,7 @@ impl MemoryService {
         // Filter by min score and weight, apply testing effect
         let mut filtered = Vec::new();
         let mut updates = Vec::new();
-        let mut scored: Vec<(MemoryEntry, f32, f32)> = Vec::new();
+        let mut scored: Vec<(MemoryEntry, f32, f32, Option<i64>)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (entry, score) in results {
@@ -1065,8 +1009,11 @@ impl MemoryService {
                 continue;
             }
             let rank = hit.map_or(score, |h| h.rank().max(score));
+            // Only name a chunk when the chunk is what actually won; a row-level
+            // hit has no "part that matched" to point at.
+            let best_chunk = hit.filter(|h| h.best >= score).map(|h| h.best_ordinal);
             seen.insert(entry.id.clone());
-            scored.push((entry, best, rank));
+            scored.push((entry, best, rank, best_chunk));
         }
 
         // Memories whose chunks matched but whose whole-row vector did not
@@ -1081,13 +1028,13 @@ impl MemoryService {
                 if workspace_id.is_some() && entry.workspace_id.as_deref() != workspace_id {
                     continue;
                 }
-                scored.push((entry, hit.best, hit.rank()));
+                scored.push((entry, hit.best, hit.rank(), Some(hit.best_ordinal)));
             }
         }
 
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (entry, score, _rank) in scored {
+        for (entry, score, _rank, best_chunk) in scored {
             let weight = entry.fsrs.weight(&self.config.fsrs);
             let state = entry.fsrs.state(&self.config.fsrs);
 
@@ -1100,6 +1047,7 @@ impl MemoryService {
             filtered.push(RecallResult {
                 id: entry.id,
                 content: entry.content,
+                best_chunk,
                 score,
                 weight,
                 state,
@@ -1921,7 +1869,17 @@ pub struct ConsolidationBands {
 #[derive(Debug, Clone)]
 pub struct RecallResult {
     pub id: String,
+    /// The memory's full content.
+    ///
+    /// Full, because a `RecallResult` is a value, not a rendering — the caller
+    /// that puts this in front of a model is the one that must page it (see
+    /// [`Self::excerpt`]), and a caller that needs the whole thing (dreaming,
+    /// consolidation, export) must not be silently handed a prefix.
     pub content: String,
+    /// Ordinal of the chunk that produced [`Self::score`], when the hit came
+    /// from chunk search. Lets a paged read open at the part that matched
+    /// rather than at the beginning of a long memory.
+    pub best_chunk: Option<i64>,
     /// Similarity score from vector search
     pub score: f32,
     /// FSRS weight (retrievability × importance)
@@ -1931,6 +1889,29 @@ pub struct RecallResult {
     pub metadata: HashMap<String, String>,
     /// Workspace ID if scoped (None = global)
     pub workspace_id: Option<String>,
+}
+
+impl RecallResult {
+    /// A bounded window of [`Self::content`], as `(text, start, total)` in
+    /// characters.
+    ///
+    /// Storage is unbounded by design, so a recall that returned whole
+    /// memories would put an arbitrarily large payload into a fixed context
+    /// window — and would do it `limit` times over. Paging is therefore a
+    /// property of *reading*, not of storing.
+    ///
+    /// The window opens at `start`, clamped so it never begins past the end,
+    /// and is cut on a character boundary. It reports `total` so the caller can
+    /// say what fraction is shown and compute the next offset; a window that
+    /// silently showed a prefix would read as the whole memory, which is the
+    /// unannounced-truncation failure this codebase keeps paying for.
+    #[must_use]
+    pub fn excerpt(&self, start: usize, budget: usize) -> (String, usize, usize) {
+        let total = self.content.chars().count();
+        let start = start.min(total);
+        let text: String = self.content.chars().skip(start).take(budget.max(1)).collect();
+        (text, start, total)
+    }
 }
 
 fn chrono_timestamp() -> i64 {
@@ -2872,6 +2853,80 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    fn recall_of(content: &str) -> RecallResult {
+        RecallResult {
+            id: "m".to_string(),
+            content: content.to_string(),
+            best_chunk: None,
+            score: 0.9,
+            weight: 1.0,
+            state: MemoryState::Active,
+            metadata: HashMap::new(),
+            workspace_id: None,
+        }
+    }
+
+    /// Storage is unbounded, so reading has to be paged — and every page has
+    /// to report the whole size, or a prefix is indistinguishable from the
+    /// complete memory and the reader stops early.
+    #[test]
+    fn an_excerpt_reports_the_true_total_not_the_page_size() {
+        let long = "x".repeat(10_000);
+        let (text, start, total) = recall_of(&long).excerpt(0, 100);
+        assert_eq!(text.chars().count(), 100);
+        assert_eq!(start, 0);
+        assert_eq!(total, 10_000, "the page must not hide how much there is");
+    }
+
+    /// Paging must terminate: the last page is short, the page after the end
+    /// is empty, and neither panics. Offsets past the end are what a naive
+    /// continuation loop produces.
+    #[test]
+    fn paging_terminates_at_the_end_instead_of_panicking() {
+        let content = "abcdefghij";
+        let r = recall_of(content);
+
+        let (last, start, total) = r.excerpt(8, 100);
+        assert_eq!(last, "ij");
+        assert_eq!((start, total), (8, 10));
+
+        let (past, start, total) = r.excerpt(10, 100);
+        assert!(past.is_empty(), "a page at the end is empty, not an error");
+        assert_eq!((start, total), (10, 10));
+
+        let (way_past, start, _) = r.excerpt(9_999, 100);
+        assert!(way_past.is_empty());
+        assert_eq!(start, 10, "the offset is clamped to the end, not echoed back");
+    }
+
+    /// Walking the pages must reproduce the memory exactly — the same
+    /// losslessness the chunker guarantees, on the read side.
+    #[test]
+    fn walking_the_pages_rebuilds_the_memory() {
+        let content = "héllo wörld, 日本語もある. ".repeat(200);
+        let r = recall_of(&content);
+        let mut rebuilt = String::new();
+        let mut offset = 0usize;
+        loop {
+            let (page, start, total) = r.excerpt(offset, 37);
+            if page.is_empty() {
+                assert_eq!(start, total);
+                break;
+            }
+            offset = start + page.chars().count();
+            rebuilt.push_str(&page);
+        }
+        assert_eq!(rebuilt, content, "paging must not drop or duplicate characters");
+    }
+
+    /// A zero budget would otherwise make no progress and hang any
+    /// continuation loop built on the returned offset.
+    #[test]
+    fn a_zero_page_budget_still_advances() {
+        let (page, _, _) = recall_of("abc").excerpt(0, 0);
+        assert_eq!(page.chars().count(), 1, "a page must contain at least one character");
     }
 
     /// Returns fixed chunk hits so recall's merge can be driven without an
