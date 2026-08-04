@@ -1373,24 +1373,67 @@ pub fn is_claude_model(model: &str) -> bool {
 pub fn conform_to_anthropic_contract(
     request: &AnthropicRequest,
 ) -> std::borrow::Cow<'_, AnthropicRequest> {
+    /// How `thinking` must change for the target model.
+    enum Fix {
+        Leave,
+        Set(ThinkingConfig),
+        Clear,
+    }
+
     if !is_claude_model(&request.model) {
         return std::borrow::Cow::Borrowed(request);
     }
     let contract = anthropic_model_contract(&request.model);
 
-    let thinking_active = request
-        .thinking
-        .as_ref()
-        .is_some_and(ThinkingConfig::is_thinking);
+    // How `thinking` must change for THIS model.
+    //
+    // The shape is rewritten, not merely filled in, because the model on a
+    // request is not fixed once it is built: `route_model` replaces it after
+    // the fact, so a shape derived from the configured model can arrive here
+    // attached to a different generation. Filling in only the `None` case
+    // would let a `budget_tokens` body reach a model that rejects it.
+    let fix = match &request.thinking {
+        // Omission used to mean "no thinking" everywhere; on adaptive models it
+        // now means adaptive. Make that original intent explicit where the
+        // model accepts an explicit off.
+        None if contract.adaptive_thinking && !contract.thinking_always_on => {
+            Fix::Set(ThinkingConfig::Disabled)
+        }
+        // A fixed budget on a model that removed `budget_tokens`.
+        Some(ThinkingConfig::Enabled { .. }) if contract.adaptive_thinking => {
+            Fix::Set(if contract.display_defaults_omitted {
+                ThinkingConfig::adaptive_summarized()
+            } else {
+                ThinkingConfig::adaptive()
+            })
+        }
+        // An adaptive request on a model that predates adaptive. This layer
+        // knows the wire contract but not the step's output reserve, so it
+        // cannot synthesize an honest `budget_tokens`; dropping the field is
+        // the valid degradation, since omission means no thinking on these
+        // models. Reaching this means a caller skipped its own derivation.
+        Some(ThinkingConfig::Adaptive { .. }) if !contract.adaptive_thinking => {
+            tracing::debug!(
+                model = %request.model,
+                "adaptive thinking requested on a pre-4.6 model; sending no thinking field"
+            );
+            Fix::Clear
+        }
+        // An explicit off on a model that rejects one.
+        Some(ThinkingConfig::Disabled) if contract.thinking_always_on => Fix::Clear,
+        _ => Fix::Leave,
+    };
+
+    let effective_thinking = match &fix {
+        Fix::Set(c) => Some(c),
+        Fix::Clear => None,
+        Fix::Leave => request.thinking.as_ref(),
+    };
+    let thinking_active = effective_thinking.is_some_and(ThinkingConfig::is_thinking);
     let drop_temperature =
         request.temperature.is_some() && (contract.sampling_removed || thinking_active);
-    // Only where an explicit off is accepted: legacy models already mean "off"
-    // by omission, and Fable/Mythos reject `disabled` outright.
-    let mute_explicitly = request.thinking.is_none()
-        && contract.adaptive_thinking
-        && !contract.thinking_always_on;
 
-    if !drop_temperature && !mute_explicitly {
+    if !drop_temperature && matches!(fix, Fix::Leave) {
         return std::borrow::Cow::Borrowed(request);
     }
 
@@ -1398,8 +1441,10 @@ pub fn conform_to_anthropic_contract(
     if drop_temperature {
         conformed.temperature = None;
     }
-    if mute_explicitly {
-        conformed.thinking = Some(ThinkingConfig::Disabled);
+    match fix {
+        Fix::Set(c) => conformed.thinking = Some(c),
+        Fix::Clear => conformed.thinking = None,
+        Fix::Leave => {}
     }
     std::borrow::Cow::Owned(conformed)
 }
@@ -6915,6 +6960,42 @@ mod anthropic_model_contract_tests {
             Some(ThinkingConfig::adaptive_summarized())
         );
         assert_eq!(conformed.temperature, None);
+    }
+
+    /// The routing case: a request is built against the configured model, then
+    /// `route_model` replaces `request.model` with a different generation. The
+    /// boundary must rewrite a now-illegal shape, not just fill in a missing
+    /// one, or a `budget_tokens` body reaches a model that rejects it.
+    #[test]
+    fn the_boundary_rewrites_a_shape_left_over_from_another_model() {
+        let mut legacy_shape_on_current = probe_request("claude-opus-5");
+        legacy_shape_on_current.thinking = Some(ThinkingConfig::enabled(4096));
+        let conformed = conform_to_anthropic_contract(&legacy_shape_on_current);
+        assert_eq!(
+            conformed.thinking,
+            Some(ThinkingConfig::adaptive_summarized()),
+            "budget_tokens is a 400 on Opus 5 — the shape must be replaced"
+        );
+        assert_eq!(conformed.temperature, None);
+
+        // And the mirror direction: adaptive left over on a pre-4.6 model.
+        // This layer cannot invent an honest budget, so it drops the field —
+        // valid, since omission means no thinking there.
+        let mut current_shape_on_legacy = probe_request("claude-sonnet-4-20250514");
+        current_shape_on_legacy.thinking = Some(ThinkingConfig::adaptive_summarized());
+        let conformed = conform_to_anthropic_contract(&current_shape_on_legacy);
+        assert_eq!(conformed.thinking, None);
+    }
+
+    #[test]
+    fn the_boundary_drops_an_explicit_disable_that_the_model_rejects() {
+        let mut req = probe_request("claude-fable-5");
+        req.thinking = Some(ThinkingConfig::Disabled);
+        let conformed = conform_to_anthropic_contract(&req);
+        assert_eq!(
+            conformed.thinking, None,
+            "Fable rejects an explicit disable; omission is the only legal form"
+        );
     }
 
     #[test]

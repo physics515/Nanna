@@ -291,6 +291,23 @@ fn thinking_for_model(
     }
 
     if contract.adaptive_thinking {
+        // An adaptive model has no budget knob, so the only protection against
+        // it spending the whole ceiling on reasoning is refusing to think at
+        // all when the ceiling cannot hold both. The floor is the same pair the
+        // legacy branch clamps against: the smallest visible answer a step can
+        // emit, plus the smallest amount of reasoning the API considers worth
+        // asking for. Below that, thinking guarantees a truncated answer.
+        let viable = u32::try_from(MIN_OUTPUT_RESERVE_TOKENS).unwrap_or(u32::MAX)
+            .saturating_add(MIN_THINKING_BUDGET_TOKENS);
+        if max_output < viable {
+            tracing::debug!(
+                max_output,
+                viable,
+                "output ceiling too small to hold reasoning and an answer; disabling thinking"
+            );
+            return (!contract.thinking_always_on)
+                .then_some(nanna_llm::ThinkingConfig::Disabled);
+        }
         return Some(if contract.display_defaults_omitted {
             nanna_llm::ThinkingConfig::adaptive_summarized()
         } else {
@@ -2331,9 +2348,11 @@ impl Agent {
         // Reserve output room from the ACTUAL request budget, not the
         // provider's max_output claim — a small-output agent keeps most of
         // the window for input (the request clamp below pairs with this).
-        // Claude interleaved thinking generates ON TOP of max_tokens, so its
-        // budget joins the reserve; Ollama bounds thinking inside num_predict
-        // and needs no extra.
+        // Claude's `max_tokens` is one shared ceiling over thinking AND the
+        // visible answer, so a thinking run needs the reserve widened by the
+        // reasoning budget or the answer is what gets squeezed out; the request
+        // budget is widened to match (see `build_request_with_thinking`).
+        // Ollama bounds thinking inside num_predict and needs no extra.
         let thinking_reserve_tokens = if self.config.model.starts_with("claude") {
             options
                 .thinking_mode
@@ -2820,6 +2839,33 @@ impl Agent {
                     Some(CacheControl::ephemeral())
                 } else {
                     None
+                };
+                // `thinking` and `temperature` were derived from the CONFIGURED
+                // model a moment ago; routing has just replaced it with a
+                // different one, and those two fields are contract-bound per
+                // model generation. Routing a legacy-configured agent to
+                // `claude-opus-5` would otherwise ship `budget_tokens` to a
+                // model that rejects it — a 400 on every routed step, which
+                // `should_escalate` then retries on the primary, so routing
+                // silently degrades into doubled latency and a false failure
+                // record against the routed model rather than an visible error.
+                let routed_contract = nanna_llm::anthropic_model_contract(&request.model);
+                let routed_mode = options.thinking_mode.unwrap_or(self.config.thinking_mode);
+                request.thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic {
+                    thinking_for_model(routed_contract, routed_mode, request.max_tokens)
+                } else {
+                    None
+                };
+                let routed_thinks = request
+                    .thinking
+                    .as_ref()
+                    .is_some_and(nanna_llm::ThinkingConfig::is_thinking);
+                request.temperature = if nanna_llm::is_claude_model(&request.model)
+                    && (routed_contract.sampling_removed || routed_thinks)
+                {
+                    None
+                } else {
+                    Some(self.config.temperature)
                 };
             }
             let complexity = if routed_model.is_some() {
@@ -3756,12 +3802,31 @@ impl Agent {
 
                     // Detect thinking spirals: model going in circles during reasoning.
                     // Check periodically (every ~3000 chars of thinking) to avoid overhead.
-                    if state.reasoning_content.len() > 3000
-                        && state.reasoning_content.len() % 3000 < thinking.len()
-                        && detect_thinking_spiral(&state.reasoning_content)
+                    //
+                    // Measured over `current_reasoning` — THIS reasoning block —
+                    // not the run-accumulated `reasoning_content`. The detector's
+                    // indicators are repetition counts, so feeding it every
+                    // iteration's reasoning concatenated makes them aggregate
+                    // across unrelated passages and cross the threshold on volume
+                    // alone. Indicator 3 in particular counts ordinary hedging
+                    // ("wait,", "but ", "however", "alternatively") and needs only
+                    // 8 across >4000 chars, which any few thousand words of
+                    // English clears. This was unreachable while the Anthropic
+                    // path streamed empty thinking text; asking for
+                    // `display: "summarized"` fills it with real prose and arms it.
+                    //
+                    // Guarded by `thinking_spiral_nudged` because the abort
+                    // discards the reply: without it a second trip in the same
+                    // run has no recovery path left (the nudge at the loop head
+                    // is one-shot and only re-arms in mission mode) and the turn
+                    // ends with empty text and no error.
+                    if !state.thinking_spiral_nudged
+                        && state.current_reasoning.len() > 3000
+                        && state.current_reasoning.len() % 3000 < thinking.len()
+                        && detect_thinking_spiral(&state.current_reasoning)
                     {
                         warn!(
-                            thinking_len = state.reasoning_content.len(),
+                            thinking_len = state.current_reasoning.len(),
                             thinking_tokens = state.reasoning_tokens,
                             "🌀 Thinking spiral detected — aborting stream and forcing action"
                         );
@@ -3771,6 +3836,9 @@ impl Agent {
                         // the persisted chat reply, observed live 2026-08-02).
                         // Partial text is discarded with the aborted stream.
                         state.thinking_spiral_detected = true;
+                        // Drop the block that tripped it, or the next delta
+                        // re-measures the same text and trips again immediately.
+                        state.current_reasoning.clear();
                         asm.text.clear();
                         break;
                     }
@@ -5341,12 +5409,41 @@ impl Agent {
         // minimum, capped at the configured max_tokens) so the request claims
         // the same reserve the floor counted. Routed cheaper tiers with
         // smaller windows remain the pre-existing escalate-on-reject path.
-        let max_tokens = u32::try_from(model_info.effective_output_budget(
-            window_scaled_output_reserve(
-                model_info.context_window,
-                self.config.max_tokens as usize,
-            ),
-        ))
+        let answer_budget = window_scaled_output_reserve(
+            model_info.context_window,
+            self.config.max_tokens as usize,
+        );
+        // `max_tokens` caps thinking AND the visible answer together — it is one
+        // shared ceiling, not a cap on the answer with reasoning billed on top.
+        // So on a model that thinks, the request has to ask for both or the
+        // answer is what gets truncated: the model spends the budget reasoning
+        // and the turn ends `stop_reason: "max_tokens"` with short or empty
+        // text. The legacy shape enforces the same relationship explicitly by
+        // requiring `budget_tokens < max_tokens`; adaptive models have no
+        // budget field to check, so the room has to be added here instead.
+        //
+        // The added amount is the mode's nominal budget — the same figure the
+        // context reserve at run start already sets aside for reasoning — so
+        // the answer keeps the full configured `max_tokens` it was sized for.
+        // `effective_output_budget` then clamps the total to what the model
+        // will actually accept.
+        let thinking_headroom = if nanna_llm::anthropic_model_contract(&self.config.model)
+            .adaptive_thinking
+            && thinking_override
+                .unwrap_or(self.config.thinking_mode)
+                .is_enabled()
+            && self.llm.provider() == nanna_llm::Provider::Anthropic
+        {
+            thinking_override
+                .unwrap_or(self.config.thinking_mode)
+                .budget_tokens()
+                .unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let max_tokens = u32::try_from(
+            model_info.effective_output_budget(answer_budget.saturating_add(thinking_headroom)),
+        )
         .unwrap_or(u32::MAX);
 
         // Thinking mode (per-run override takes precedence over config), then
@@ -9220,6 +9317,40 @@ mod thinking_always_on_tests {
                 "{model} removed temperature; sending it is a 400"
             );
         }
+    }
+
+    /// `max_tokens` caps thinking AND the answer together. If the request asks
+    /// only for the answer budget, a thinking model spends it reasoning and the
+    /// turn ends `stop_reason: "max_tokens"` with the answer truncated — the
+    /// failure this widening exists to prevent.
+    #[tokio::test]
+    async fn a_thinking_request_asks_for_more_than_the_answer_budget() {
+        // A configured answer budget below the model's output cap, so the cap
+        // is not what decides the comparison.
+        let thinking = anthropic_agent(AgentConfig {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 2048,
+            ..Default::default()
+        })
+        .build_request_with_thinking(None, &HashSet::new(), false)
+        .await;
+
+        let muted = anthropic_agent(AgentConfig {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 2048,
+            thinking_mode: ThinkingMode::Instant,
+            ..Default::default()
+        })
+        .build_request_with_thinking(None, &HashSet::new(), false)
+        .await;
+
+        assert!(
+            thinking.max_tokens > muted.max_tokens,
+            "a thinking request must reserve room beyond the answer budget \
+             ({} vs {})",
+            thinking.max_tokens,
+            muted.max_tokens
+        );
     }
 
     #[tokio::test]
