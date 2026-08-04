@@ -392,7 +392,16 @@ const ENQUEUE_EMBEDDING: &str = "INSERT INTO embedding_queue (memory_id, ordinal
 
 const PENDING_EMBEDDINGS: &str = "SELECT memory_id, ordinal FROM embedding_queue WHERE embedding_model = ?1 ORDER BY attempts ASC, enqueued_at ASC LIMIT ?2";
 
-const RECORD_EMBEDDING_FAILURE: &str = "UPDATE embedding_queue SET attempts = attempts + 1, last_error = ?4, last_attempt_at = datetime('now') WHERE memory_id = ?1 AND ordinal = ?2 AND embedding_model = ?3";
+/// Upsert, not UPDATE.
+///
+/// A bare UPDATE matches nothing when the work was never enqueued — and that is
+/// the common case for the paths that most need a record, since a chunk written
+/// before this table existed, or one whose enqueue itself failed, has no row to
+/// update. The statement then affects zero rows and reports success, which is
+/// the exact silent-failure shape this table was added to eliminate. Inserting
+/// on conflict-miss also states the truth: work that just failed is work that
+/// still needs doing.
+const RECORD_EMBEDDING_FAILURE: &str = "INSERT INTO embedding_queue (memory_id, ordinal, embedding_model, attempts, last_error, last_attempt_at) VALUES (?1, ?2, ?3, 1, ?4, datetime('now')) ON CONFLICT(memory_id, ordinal, embedding_model) DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error, last_attempt_at = excluded.last_attempt_at";
 
 const EMBEDDING_QUEUE_HEALTH: &str = "SELECT embedding_model, COUNT(*) AS n, MAX(last_error) FROM embedding_queue GROUP BY embedding_model ORDER BY n DESC";
 

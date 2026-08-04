@@ -274,3 +274,43 @@ async fn deleting_a_memory_zeroes_every_bucket_not_just_one() {
         "a surviving bucket inverts back to the deleted memory's text — zeroing          one model's vector while another remains is not a delete"
     );
 }
+
+/// A failure recorded against work that was never enqueued must still leave a
+/// trace. A bare UPDATE matches nothing there and reports success — the exact
+/// silence this table exists to remove, reappearing inside the mechanism meant
+/// to prevent it.
+#[tokio::test]
+async fn a_failure_on_unqueued_work_still_leaves_a_record() {
+    let db = temp_db_path("unqueued_failure");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+
+    // Never enqueued.
+    repo.record_embedding_failure("m1", 0, "model", "402 Insufficient credits")
+        .await
+        .expect("record");
+
+    let health = repo.embedding_queue_health().await.expect("health");
+    assert_eq!(health.len(), 1, "the failure must create the work item it names");
+    assert_eq!(health[0].1, 1);
+    assert!(health[0].2.as_deref().unwrap_or("").contains("402"));
+}
+
+/// Repeated failures accumulate rather than resetting, so a poison item is
+/// visibly poison.
+#[tokio::test]
+async fn repeated_failures_accumulate_attempts() {
+    let db = temp_db_path("accumulate");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+
+    for _ in 0..3 {
+        repo.record_embedding_failure("m1", 0, "model", "boom")
+            .await
+            .expect("record");
+    }
+    let pending = repo.pending_embeddings("model", 10).await.expect("pending");
+    assert_eq!(pending.len(), 1, "three failures are one work item, not three");
+}

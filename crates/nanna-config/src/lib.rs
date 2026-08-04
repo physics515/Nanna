@@ -542,9 +542,20 @@ impl Default for MemoryConfig {
             storage_path: None,
             ollama_host: "http://localhost:11434".to_string(),
             extraction_model: String::new(), // Empty = use chat model
-            embedding_priority: vec![
-                "openai/text-embedding-3-small".to_string(),
-            ],
+            // EMPTY means "not configured", which falls back to the
+            // `embedding_provider`/`embedding_model` pair.
+            //
+            // It must stay empty. `#[serde(default)]` is on the CONTAINER, so
+            // every config.toml that never wrote an `embedding_priority` key
+            // gets this value — and since the daemon treats a non-empty list as
+            // authoritative, a default entry here silently overrides the
+            // provider the user actually chose. With
+            // `openai/text-embedding-3-small` as the default and no
+            // OPENAI_API_KEY set, a user who picked Ollama in Settings resolved
+            // ZERO providers and the memory subsystem switched off entirely.
+            // The Settings dropdown writes provider/model and never touches
+            // this list, so that state was one click away.
+            embedding_priority: Vec::new(),
             max_compression_ratio: default_max_compression_ratio(),
             min_remaining_memories: default_min_remaining_memories(),
             auto_remember_messages: default_auto_remember_messages(),

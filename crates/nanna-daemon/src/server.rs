@@ -1284,16 +1284,29 @@ impl DaemonServer {
             model: model.clone(),
         };
         match provider.as_str() {
-            "openai" => match std::env::var("OPENAI_API_KEY").ok() {
-                Some(key) => Some((
-                    info,
-                    Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
-                )),
-                None => {
-                    warn!("Embedding provider '{spec}' skipped: OPENAI_API_KEY is not set");
-                    None
+            // Config first, then env — matching the OpenRouter arm below.
+            // Reading only the environment made this arm resolvable in the GUI
+            // process (which exports the key) and unresolvable in the daemon
+            // (which does not), so the same configuration behaved differently
+            // depending on who started it.
+            "openai" => {
+                let key = self
+                    .config
+                    .llm
+                    .openai_api_key
+                    .clone()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                match key {
+                    Some(key) => Some((
+                        info,
+                        Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
+                    )),
+                    None => {
+                        warn!("Embedding provider '{spec}' skipped: no OpenAI API key");
+                        None
+                    }
                 }
-            },
+            }
             "openrouter" => {
                 let key = self
                     .config
@@ -3585,6 +3598,27 @@ mod tests {
         assert_eq!(split_embedding_spec(""), None);
         assert_eq!(split_embedding_spec("   "), None);
         assert_eq!(split_embedding_spec("openrouter/"), None);
+    }
+
+    /// `#[serde(default)]` sits on the `MemoryConfig` CONTAINER, so every
+    /// config.toml that never wrote an `embedding_priority` key is handed this
+    /// default — and the daemon treats a non-empty list as authoritative over
+    /// `embedding_provider`. A default entry here therefore overrides the
+    /// provider the user actually selected, silently.
+    ///
+    /// It was `["openai/text-embedding-3-small"]`. With no OpenAI key that
+    /// resolved zero providers and switched the whole memory subsystem off, and
+    /// the Settings dropdown writes provider/model without touching this list,
+    /// so the state was one click away for anyone who chose Ollama.
+    #[test]
+    fn the_default_priority_must_stay_empty_or_it_overrides_the_chosen_provider() {
+        let defaults = nanna_config::MemoryConfig::default();
+        assert!(
+            defaults.embedding_priority.is_empty(),
+            "a non-empty default silently overrides embedding_provider for every config that \
+             never wrote the key; got {:?}",
+            defaults.embedding_priority
+        );
     }
 
     /// REGRESSION: a scheduled run must see its own session — every one of the
