@@ -359,6 +359,84 @@ impl MemoryService {
         Ok(filled)
     }
 
+    /// Embed up to `batch` chunks that have no vector for `model` yet, and
+    /// chunk up to `batch` memories that have no chunks at all.
+    ///
+    /// The chunk analogue of [`Self::backfill_embeddings`], with the same
+    /// discipline and for the same reasons: the binding is re-checked AFTER
+    /// every embed call, because the daemon's `embed_fn` rebinds mid-call on a
+    /// provider switch and the vector then in hand belongs to the new provider,
+    /// not to `model`. Writing it under `model` would poison that bucket with
+    /// another model's vectors — wrong space, usually wrong width — and nothing
+    /// downstream could tell.
+    ///
+    /// Returns `(chunks_embedded, parents_chunked)`. Both zero means the store
+    /// is complete for this model.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError` if no embedding provider is configured.
+    pub async fn backfill_chunks(
+        &self,
+        model: &str,
+        batch: usize,
+    ) -> Result<(usize, usize), MemoryError> {
+        let embed_fn = self.embed_fn.as_ref().ok_or(MemoryError::NoEmbeddingProvider)?;
+
+        if self.active_embedding_model().await.as_deref() != Some(model) {
+            debug!("Chunk backfill for '{model}' skipped — it is not the active binding");
+            return Ok((0, 0));
+        }
+
+        // Chunk the unchunked FIRST. Those memories have no chunk rows at all,
+        // so they contribute nothing to the embedding queue until they do —
+        // running the queue first would report "complete" while whole memories
+        // sat outside the index.
+        let mut chunked = 0usize;
+        for id in self.store.parents_without_chunks(batch).await {
+            match self.store.rechunk(&id).await {
+                Ok(()) => chunked += 1,
+                // A memory in the database but not in the RAM cache is not an
+                // error worth stopping for: the cache is authoritative on
+                // content, so chunking it from a stale row would write chunks
+                // that disagree with the memory.
+                Err(e) => debug!("Could not chunk memory {id} yet: {e}"),
+            }
+        }
+
+        let mut embedded = 0usize;
+        for (chunk_id, content) in self.store.chunks_needing_embedding(model, batch).await {
+            match (embed_fn)(&content).await {
+                Ok(embedding) => {
+                    if self.active_embedding_model().await.as_deref() != Some(model) {
+                        debug!("Chunk backfill for '{model}' abandoned — provider changed underneath it");
+                        break;
+                    }
+                    if embedding.is_empty() {
+                        debug!("Chunk {chunk_id} embedded to an empty vector; leaving it queued");
+                        continue;
+                    }
+                    if let Err(e) = self.store.set_chunk_embedding(chunk_id, &embedding, model).await {
+                        debug!("Chunk backfill could not store embedding for {chunk_id}: {e}");
+                    } else {
+                        embedded += 1;
+                    }
+                }
+                Err(e) => {
+                    // The router already waited out congestion before erroring,
+                    // so this provider is genuinely unavailable. Leave the rest.
+                    warn!("Chunk backfill for '{model}' stopped after {embedded}: {e}");
+                    break;
+                }
+            }
+        }
+
+        if embedded > 0 || chunked > 0 {
+            info!("Chunk backfill for '{model}': {embedded} chunks embedded, {chunked} memories chunked");
+        }
+        Ok((embedded, chunked))
+    }
+
     /// Identity of the embedding model currently in use, if the daemon has said.
     pub async fn active_embedding_model(&self) -> Option<String> {
         self.binding.read().await.model.clone()
@@ -2676,6 +2754,159 @@ mod tests {
             let n = width.load(Ordering::SeqCst);
             Box::pin(async move { Ok(vec![0.5_f32; n]) })
         })
+    }
+
+    /// A store that records chunk state so the backfill can be driven without
+    /// a database.
+    #[derive(Default)]
+    struct ChunkBackfillDb {
+        /// (chunk_id, content, embedded_by)
+        chunks: std::sync::Mutex<Vec<(i64, String, Option<String>)>>,
+        unchunked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::MemoryPersistence for ChunkBackfillDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &crate::FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+
+        async fn chunks_needing_embedding(
+            &self,
+            model: &str,
+            limit: usize,
+        ) -> Result<Vec<(i64, String)>, MemoryError> {
+            Ok(self
+                .chunks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, by)| by.as_deref() != Some(model))
+                .take(limit)
+                .map(|(id, content, _)| (*id, content.clone()))
+                .collect())
+        }
+
+        async fn set_chunk_embedding(
+            &self,
+            chunk_id: i64,
+            _embedding: &[f32],
+            model: &str,
+        ) -> Result<(), MemoryError> {
+            for (id, _, by) in self.chunks.lock().unwrap().iter_mut() {
+                if *id == chunk_id {
+                    *by = Some(model.to_string());
+                }
+            }
+            Ok(())
+        }
+
+        async fn parents_without_chunks(&self, limit: usize) -> Result<Vec<String>, MemoryError> {
+            Ok(self.unchunked.lock().unwrap().iter().take(limit).cloned().collect())
+        }
+
+        async fn replace_chunks(
+            &self,
+            memory_id: &str,
+            _workspace_id: Option<&str>,
+            chunks: &[crate::ChunkWrite],
+        ) -> Result<(), MemoryError> {
+            self.unchunked.lock().unwrap().retain(|id| id != memory_id);
+            let mut store = self.chunks.lock().unwrap();
+            let next = store.iter().map(|(id, _, _)| *id).max().unwrap_or(0) + 1;
+            for (i, c) in chunks.iter().enumerate() {
+                store.push((
+                    next + i as i64,
+                    c.content.clone(),
+                    c.embedding_model.clone().filter(|_| c.embedding.is_some()),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// A chunk whose vector came from another model is exactly as unsearchable
+    /// as a chunk with no vector, so both are one queue — which is what makes
+    /// an embedding-model switch a resumable incremental backfill rather than a
+    /// full rebuild.
+    #[tokio::test]
+    async fn a_model_switch_requeues_chunks_without_rebuilding_them() {
+        let db = Arc::new(ChunkBackfillDb::default());
+        *db.chunks.lock().unwrap() = vec![
+            (1, "alpha".into(), Some("prov:a".into())),
+            (2, "beta".into(), None),
+            (3, "gamma".into(), Some("prov:b".into())),
+        ];
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig { dimension: 4, ..Default::default() })
+            .with_embed_fn(switchable_width_embed(&width))
+            .with_persistence(db.clone());
+
+        service.rebind_embeddings("prov:a", 4, None).await;
+        let (embedded, _) = service.backfill_chunks("prov:a", 64).await.unwrap();
+        assert_eq!(embedded, 2, "the unembedded one and the other model's one");
+        assert!(
+            db.chunks.lock().unwrap().iter().all(|(_, _, by)| by.as_deref() == Some("prov:a")),
+            "every chunk now carries the active model's vector"
+        );
+
+        // Nothing left to do: a completed queue must report zero, or the
+        // daemon's drain loop never terminates.
+        assert_eq!(service.backfill_chunks("prov:a", 64).await.unwrap(), (0, 0));
+    }
+
+    /// Memories that predate chunking have no chunk rows, so they contribute
+    /// nothing to the embedding queue until they are split. Running the
+    /// embedding queue first would report the store complete while whole
+    /// memories sat outside the index entirely.
+    #[tokio::test]
+    async fn unchunked_memories_are_split_before_the_queue_is_measured() {
+        let db = Arc::new(ChunkBackfillDb::default());
+        *db.unchunked.lock().unwrap() = vec!["old-1".into()];
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig { dimension: 4, ..Default::default() })
+            .with_embed_fn(switchable_width_embed(&width))
+            .with_persistence(db.clone());
+        service.rebind_embeddings("prov:a", 4, None).await;
+
+        // The memory has to be in the RAM cache — it is the authority on
+        // content, and chunking from a stale row would disagree with it.
+        service
+            .remember_with_importance("a memory written before chunking existed", HashMap::new(), 3.0)
+            .await
+            .expect("write");
+        let id = service.store.all_entries().await[0].id.clone();
+        *db.unchunked.lock().unwrap() = vec![id];
+        db.chunks.lock().unwrap().clear();
+
+        let (_, chunked) = service.backfill_chunks("prov:a", 64).await.unwrap();
+        assert_eq!(chunked, 1, "the unchunked memory was split");
+        assert!(
+            !db.chunks.lock().unwrap().is_empty(),
+            "splitting it must have produced chunk rows"
+        );
+    }
+
+    /// Backfilling a bucket that is no longer the active binding poisons it
+    /// with another model's vectors — wrong space, usually wrong width, and
+    /// nothing downstream can tell. The guard is a skip, not an error.
+    #[tokio::test]
+    async fn a_chunk_backfill_for_an_inactive_binding_does_nothing() {
+        let db = Arc::new(ChunkBackfillDb::default());
+        *db.chunks.lock().unwrap() = vec![(1, "alpha".into(), None)];
+        let width = Arc::new(AtomicUsize::new(4));
+        let service = MemoryService::new(MemoryServiceConfig { dimension: 4, ..Default::default() })
+            .with_embed_fn(switchable_width_embed(&width))
+            .with_persistence(db.clone());
+
+        service.rebind_embeddings("prov:a", 4, None).await;
+        assert_eq!(service.backfill_chunks("prov:b", 64).await.unwrap(), (0, 0));
+        assert_eq!(
+            db.chunks.lock().unwrap()[0].2, None,
+            "the inactive model must not have written a vector"
+        );
     }
 
     /// Chunk geometry is the third leg of the binding, and it fails more

@@ -1187,6 +1187,25 @@ async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
             }
         }
     }
+
+    // Chunk vectors drain in the same pass, after the whole-row ones.
+    //
+    // Row vectors first because they are what search falls back to: until a
+    // memory has one, it is invisible to recall entirely, whereas a memory
+    // with a row vector but no chunk vectors is merely coarser to retrieve.
+    // Draining eagerly rather than on demand is deliberate — a lazy chunk
+    // backfill would put the embed latency of a whole memory inside the first
+    // recall that happened to touch it.
+    loop {
+        match mem.backfill_chunks(model, BATCH).await {
+            Ok((0, 0)) => break,
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Chunk backfill for '{model}' halted: {e}");
+                break;
+            }
+        }
+    }
 }
 
 /// The main daemon server
@@ -2527,12 +2546,20 @@ impl DaemonServer {
                                 // inline: the store can hold thousands of
                                 // entries and the provider we just failed over
                                 // to may be the rate-limited one.
-                                if missing > 0 {
-                                    let mem = mem.clone();
-                                    tokio::spawn(async move {
-                                        drain_backfill(&mem, &model).await;
-                                    });
-                                }
+                                //
+                                // Unconditional for the same reason as the
+                                // startup bind: `missing` counts ROW vectors,
+                                // and the chunk queue is independent of it. A
+                                // flap back to a model whose row buckets were
+                                // all retained reports zero missing while its
+                                // chunk vectors are still stamped with the
+                                // other provider, and a drain interrupted
+                                // partway leaves exactly that state.
+                                let _ = missing;
+                                let mem = mem.clone();
+                                tokio::spawn(async move {
+                                    drain_backfill(&mem, &model).await;
+                                });
                             }
 
                             Ok(embedding)
@@ -2707,12 +2734,19 @@ impl DaemonServer {
                             // costs a request, and startup must not block on it.
                             let window =
                                 router_for_bind.context_window_for(&bind_provider).await;
-                            let (_, missing) = memory_for_bind
+                            let (_, _missing) = memory_for_bind
                                 .rebind_embeddings(&bind_model, dimension, window)
                                 .await;
-                            if missing > 0 {
-                                drain_backfill(&memory_for_bind, &bind_model).await;
-                            }
+                            // Unconditional, NOT gated on missing row vectors.
+                            // The two queues are independent: after the chunk
+                            // migration every existing memory has a row vector
+                            // and no chunks at all, so `missing == 0` while the
+                            // entire store is unchunked. Gating on the row
+                            // count would leave it that way forever. Both
+                            // drains no-op immediately when their queue is
+                            // empty, so the unconditional call costs one query
+                            // each on a store that is already complete.
+                            drain_backfill(&memory_for_bind, &bind_model).await;
                         });
                         tokio::spawn(async move {
                             match memory_for_probe.probe_and_align_dimension().await {

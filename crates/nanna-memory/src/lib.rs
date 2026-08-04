@@ -152,6 +152,43 @@ pub trait MemoryPersistence: Send + Sync {
         Ok(())
     }
 
+    /// Chunks with no vector for `model` yet, oldest first, at most `limit`.
+    ///
+    /// "No vector" and "a vector from a different model" are the same state
+    /// here, and that is what makes an embedding-model switch a resumable
+    /// incremental backfill instead of a full rebuild: vectors from two models
+    /// live in unrelated spaces, so a chunk carrying another model's vector is
+    /// exactly as unsearchable under `model` as a chunk carrying none.
+    ///
+    /// Returns `(chunk_id, content)`. Default: nothing to do.
+    async fn chunks_needing_embedding(
+        &self,
+        _model: &str,
+        _limit: usize,
+    ) -> Result<Vec<(i64, String)>, MemoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Attach `embedding` to the chunk with `chunk_id`, stamped with `model`.
+    async fn set_chunk_embedding(
+        &self,
+        _chunk_id: i64,
+        _embedding: &[f32],
+        _model: &str,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Memory ids that have no chunk rows at all, at most `limit`.
+    ///
+    /// These are memories written before chunking existed. They are searchable
+    /// by their whole-row vector, so this is a quality backfill rather than a
+    /// repair — but a store where only new memories are chunk-searchable
+    /// retrieves inconsistently, which is worse than either extreme.
+    async fn parents_without_chunks(&self, _limit: usize) -> Result<Vec<String>, MemoryError> {
+        Ok(Vec::new())
+    }
+
     /// Load all persisted entries (called on startup to populate the in-memory cache).
     async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError>;
 
@@ -1218,6 +1255,72 @@ impl VectorStore {
     /// write-lock, beside `set_dimension`.
     pub fn set_chunk_params(&self, params: crate::chunking::ChunkParams) {
         self.config.set_chunk_max_chars(params.max_chars);
+    }
+
+    /// Chunks awaiting a vector under `model`, as `(chunk_id, content)`.
+    pub async fn chunks_needing_embedding(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Vec<(i64, String)> {
+        match self.db {
+            Some(ref db) => db.chunks_needing_embedding(model, limit).await.unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Attach a backfilled vector to a chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::Persistence` if the write fails.
+    pub async fn set_chunk_embedding(
+        &self,
+        chunk_id: i64,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<(), MemoryError> {
+        match self.db {
+            Some(ref db) => db.set_chunk_embedding(chunk_id, embedding, model).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Memories with no chunk rows yet — written before chunking existed.
+    pub async fn parents_without_chunks(&self, limit: usize) -> Vec<String> {
+        match self.db {
+            Some(ref db) => db.parents_without_chunks(limit).await.unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-split and store the chunk set for the in-RAM entry `id`.
+    ///
+    /// Used by the backfill to chunk memories that predate chunking. Reads the
+    /// entry from the cache rather than the database because the cache is the
+    /// authority on current content — a memory updated in this session has its
+    /// new text here before the write-through completes.
+    pub async fn rechunk(&self, id: &str) -> Result<(), MemoryError> {
+        let snapshot = {
+            let entries = self.entries.read().await;
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .cloned()
+                .ok_or_else(|| MemoryError::NotFound(id.to_string()))?
+        };
+        self.write_chunks(
+            &snapshot.id,
+            &snapshot.content,
+            snapshot.workspace_id.as_deref(),
+            snapshot
+                .embedding_model
+                .as_deref()
+                .filter(|_| !snapshot.embedding.is_empty())
+                .map(|m| (m, snapshot.embedding.as_slice())),
+        )
+        .await;
+        Ok(())
     }
 
     /// Re-split `content` and replace the stored chunk set for `id`.

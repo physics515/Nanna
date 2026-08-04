@@ -222,6 +222,38 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
+    async fn chunks_needing_embedding(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>, MemoryError> {
+        self.repo
+            .chunks_needing_embedding(model, limit)
+            .await
+            .map(|rows| rows.into_iter().map(|c| (c.id, c.content)).collect())
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn set_chunk_embedding(
+        &self,
+        chunk_id: i64,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<(), MemoryError> {
+        self.repo
+            .set_chunk_embedding(chunk_id, embedding, model)
+            .await
+            .map(|_| ())
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn parents_without_chunks(&self, limit: usize) -> Result<Vec<String>, MemoryError> {
+        self.repo
+            .parents_without_chunks(limit)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
     async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
         self.repo
             .delete(id)
