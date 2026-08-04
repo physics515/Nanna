@@ -73,32 +73,19 @@ pub struct MemoryService {
     binding: RwLock<EmbeddingBinding>,
 }
 
-/// Everything about the active embedding model that a write has to agree on.
+/// The identity half of the embedding binding.
 ///
-/// Model identity and chunk size live in one struct behind one lock for the
-/// same reason the width latch is only touched while that lock is held: a
-/// reader that sees the new model but the old chunk size writes chunks the new
-/// embedder will silently truncate, and a reader that sees the new chunk size
-/// but the old model stamps those chunks with the wrong provenance and they
-/// never get backfilled. Both are the 2026-08-02 split-brain wearing a
-/// different hat, so there is nowhere for the pair to come apart.
-#[derive(Clone, Debug)]
+/// The other two halves — vector width and chunk geometry — are latches on the
+/// store, moved ONLY while this lock's write half is held. That is not an
+/// accident of layout: a reader that sees the new model with the old width gets
+/// `DimensionMismatch` on every write (the 2026-08-02 incident), and a reader
+/// that sees the new model with the old chunk size writes chunks the new
+/// embedder silently truncates — same split-brain, quieter symptom. Holding the
+/// read half is what makes all three consistent.
+#[derive(Clone, Debug, Default)]
 struct EmbeddingBinding {
     /// `provider:model` of the embedder currently in use, once the daemon says.
     model: Option<String>,
-    /// Chunk geometry derived from that model's input window.
-    chunk_params: ChunkParams,
-}
-
-impl Default for EmbeddingBinding {
-    fn default() -> Self {
-        Self {
-            model: None,
-            // No model bound yet means no window learned yet, which resolves to
-            // the retrieval-granularity target rather than to "unbounded".
-            chunk_params: derive_chunk_params(None),
-        }
-    }
 }
 
 impl MemoryService {
@@ -107,6 +94,9 @@ impl MemoryService {
     pub fn new(config: MemoryServiceConfig) -> Self {
         let store_config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(config.dimension),
+            // Unbound until the daemon names an embedding model; reads resolve
+            // to the retrieval-granularity default meanwhile.
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: true,
         };
         Self {
@@ -269,9 +259,9 @@ impl MemoryService {
         assert!(dimension > 0, "a provider that produced a vector has a positive width");
         let params = derive_chunk_params(window_tokens);
         let mut binding = self.binding.write().await;
-        let previous = binding.chunk_params;
+        let previous = self.store.chunk_params();
         binding.model = Some(model.to_string());
-        binding.chunk_params = params;
+        self.store.set_chunk_params(params);
         self.store.set_dimension(dimension);
         let (rebound, missing) = self.store.rebind_to_model(model).await;
         drop(binding);
@@ -380,7 +370,8 @@ impl MemoryService {
     /// await — a provider switch mid-write would otherwise chunk to the old
     /// model's window and hand the new embedder text it silently truncates.
     pub async fn chunk_params(&self) -> ChunkParams {
-        self.binding.read().await.chunk_params
+        let _binding = self.binding.read().await;
+        self.store.chunk_params()
     }
 
     /// The current binding as one consistent `(model, dimension)` pair.

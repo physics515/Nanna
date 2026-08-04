@@ -133,6 +133,25 @@ pub trait MemoryPersistence: Send + Sync {
     async fn update_entry_fsrs(&self, id: &str, fsrs: &FsrsState) -> Result<(), MemoryError>;
     /// Update only the text content for an existing entry.
     async fn update_entry_content(&self, id: &str, content: &str) -> Result<(), MemoryError>;
+    /// Replace the stored chunk set for `memory_id` with `chunks`.
+    ///
+    /// Whole-set replacement, not a patch: chunk boundaries move when content
+    /// changes, so an ordinal that meant one span before means a different span
+    /// after, and merging the two would interleave text from two different
+    /// splittings. Deleting and rewriting is the only operation whose result
+    /// does not depend on what was there.
+    ///
+    /// The default is a no-op, which is correct for a store with no durable
+    /// backing: chunks are derived data, reproducible from content at any time.
+    async fn replace_chunks(
+        &self,
+        _memory_id: &str,
+        _workspace_id: Option<&str>,
+        _chunks: &[ChunkWrite],
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
     /// Load all persisted entries (called on startup to populate the in-memory cache).
     async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError>;
 
@@ -146,6 +165,27 @@ pub trait MemoryPersistence: Send + Sync {
         let expected = entries.len();
         Ok(LoadReport { entries, corrupt_rows: 0, expected })
     }
+}
+
+/// One chunk on its way to durable storage.
+///
+/// Mirrors the stored row minus the parent identity, which travels alongside as
+/// an argument to [`MemoryPersistence::replace_chunks`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkWrite {
+    pub ordinal: i64,
+    pub content: String,
+    pub char_start: i64,
+    pub char_end: i64,
+    /// Usually `None` — chunk vectors are filled by the backfill pass, not on
+    /// the write path, because embedding N chunks inline would put N network
+    /// round trips in front of every remember. The exception is a memory that
+    /// fits in one chunk: its single chunk IS the parent text, so the parent's
+    /// vector already describes it exactly and re-embedding would be waste.
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub chunk_max_chars: i64,
+    pub chunker_version: i64,
 }
 
 /// A memory entry with embedding, metadata, and FSRS cognitive state
@@ -192,6 +232,13 @@ pub struct VectorStoreConfig {
     /// updated at runtime (e.g., when the embedding model changes via fallback)
     /// without requiring `&mut self` on the `VectorStore`.
     pub dimension: std::sync::atomic::AtomicUsize,
+    /// Chunk budget in chars for the currently bound embedding model, derived
+    /// from that model's input window. Atomic for the same reason `dimension`
+    /// is: a provider switch has to move it without `&mut self`.
+    ///
+    /// Zero is the unbound sentinel, NOT a bound of nothing — see
+    /// [`Self::get_chunk_max_chars`].
+    pub chunk_max_chars: std::sync::atomic::AtomicUsize,
     pub use_f16: bool,  // Store embeddings as f16 to save memory
 }
 
@@ -200,6 +247,9 @@ impl Clone for VectorStoreConfig {
         Self {
             dimension: std::sync::atomic::AtomicUsize::new(
                 self.dimension.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(
+                self.chunk_max_chars.load(std::sync::atomic::Ordering::Relaxed)
             ),
             use_f16: self.use_f16,
         }
@@ -210,6 +260,7 @@ impl Default for VectorStoreConfig {
     fn default() -> Self {
         Self {
             dimension: std::sync::atomic::AtomicUsize::new(1536),  // OpenAI ada-002 default
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: true,
         }
     }
@@ -220,6 +271,7 @@ impl VectorStoreConfig {
     pub fn with_dimension(dim: usize) -> Self {
         Self {
             dimension: std::sync::atomic::AtomicUsize::new(dim),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: true,
         }
     }
@@ -232,6 +284,30 @@ impl VectorStoreConfig {
     /// Set a new dimension at runtime
     pub fn set_dimension(&self, dim: usize) {
         self.dimension.store(dim, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The chunk budget for the currently bound embedding model, in chars.
+    ///
+    /// Zero means nothing has bound yet, which resolves to the
+    /// retrieval-granularity default rather than to "no limit" — see
+    /// [`crate::chunking::derive_chunk_params`].
+    pub fn get_chunk_max_chars(&self) -> usize {
+        let latched = self.chunk_max_chars.load(std::sync::atomic::Ordering::Relaxed);
+        if latched == 0 {
+            crate::chunking::derive_chunk_params(None).max_chars
+        } else {
+            latched
+        }
+    }
+
+    /// Set the chunk budget at runtime.
+    ///
+    /// Lives beside the dimension latch, and under the same discipline: both
+    /// are only ever moved while `MemoryService`'s binding write-lock is held,
+    /// so no reader can observe a new model with an old geometry.
+    pub fn set_chunk_max_chars(&self, max_chars: usize) {
+        self.chunk_max_chars
+            .store(max_chars, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -421,6 +497,22 @@ impl VectorStore {
                 // Non-fatal: continue with in-memory add
             }
         }
+
+        // Chunks follow the content, on EVERY path that writes content — not
+        // just `remember`. The consolidation and dream paths mutate entries
+        // through these primitives directly, and a chunk set that only tracked
+        // the ingest API would go stale exactly where memories change most.
+        self.write_chunks(
+            &entry.id,
+            &entry.content,
+            entry.workspace_id.as_deref(),
+            entry
+                .embedding_model
+                .as_deref()
+                .filter(|_| !entry.embedding.is_empty())
+                .map(|m| (m, entry.embedding.as_slice())),
+        )
+        .await;
 
         self.entries.write().await.push(entry);
         Ok(())
@@ -696,6 +788,7 @@ impl VectorStore {
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
         entry.content = content.to_string();
+        let workspace_id = entry.workspace_id.clone();
         drop(entries);
 
         // Write-through to persistence backend
@@ -705,6 +798,12 @@ impl VectorStore {
                 // Non-fatal
             }
         }
+
+        // New text, new boundaries. The parent's vector is NOT reused as a
+        // single-chunk seed here: this path changes content without touching
+        // the embedding, so that vector still describes the OLD text and
+        // seeding it would assert a chunk had been embedded when it had not.
+        self.write_chunks(id, content, workspace_id.as_deref(), None).await;
 
         Ok(())
     }
@@ -776,6 +875,18 @@ impl VectorStore {
             warn!("Failed to persist merged memory {}: {}", id, e);
             // Non-fatal: in-memory cache already updated.
         }
+
+        self.write_chunks(
+            id,
+            content,
+            snapshot.workspace_id.as_deref(),
+            snapshot
+                .embedding_model
+                .as_deref()
+                .filter(|_| !snapshot.embedding.is_empty())
+                .map(|m| (m, snapshot.embedding.as_slice())),
+        )
+        .await;
 
         debug_assert_eq!(snapshot.id, id, "merged entry id must be unchanged");
         Ok(())
@@ -1093,6 +1204,74 @@ impl VectorStore {
     pub fn set_dimension(&self, new_dim: usize) {
         self.config.set_dimension(new_dim);
     }
+
+    /// Chunk geometry for the currently bound embedding model.
+    #[must_use]
+    pub fn chunk_params(&self) -> crate::chunking::ChunkParams {
+        crate::chunking::ChunkParams {
+            max_chars: self.config.get_chunk_max_chars(),
+            version: crate::chunking::CHUNKER_VERSION,
+        }
+    }
+
+    /// Move the chunk budget. Only called under `MemoryService`'s binding
+    /// write-lock, beside `set_dimension`.
+    pub fn set_chunk_params(&self, params: crate::chunking::ChunkParams) {
+        self.config.set_chunk_max_chars(params.max_chars);
+    }
+
+    /// Re-split `content` and replace the stored chunk set for `id`.
+    ///
+    /// Called after every mutation that changes a memory's text. Chunks are
+    /// derived data, so a failure here is logged and swallowed exactly like the
+    /// entry write-throughs around it: losing the retrieval index for one
+    /// memory must not fail the write that produced it, and the backfill pass
+    /// rebuilds what is missing.
+    ///
+    /// `parent_vector` is the entry's own embedding, if it has one under the
+    /// active model. When the content fits in a single chunk that vector
+    /// already describes the chunk exactly — same text, same model — so it is
+    /// reused and the backfill has nothing to do. Multi-chunk memories get
+    /// text-only rows and are embedded by the backfill pass; doing it inline
+    /// would put one network round trip per chunk in front of every write.
+    async fn write_chunks(
+        &self,
+        id: &str,
+        content: &str,
+        workspace_id: Option<&str>,
+        parent_vector: Option<(&str, &[f32])>,
+    ) {
+        let Some(ref db) = self.db else { return };
+        let params = self.chunk_params();
+        let pieces = crate::chunking::chunk_text(content, &params);
+
+        let single = pieces.len() == 1;
+        let writes: Vec<ChunkWrite> = pieces
+            .into_iter()
+            .map(|c| {
+                let (embedding, embedding_model) = match parent_vector {
+                    Some((model, vector)) if single => {
+                        (Some(vector.to_vec()), Some(model.to_string()))
+                    }
+                    _ => (None, None),
+                };
+                ChunkWrite {
+                    ordinal: c.ordinal,
+                    content: c.content,
+                    char_start: c.char_start,
+                    char_end: c.char_end,
+                    embedding,
+                    embedding_model,
+                    chunk_max_chars: i64::try_from(params.max_chars).unwrap_or(i64::MAX),
+                    chunker_version: params.version,
+                }
+            })
+            .collect();
+
+        if let Err(e) = db.replace_chunks(id, workspace_id, &writes).await {
+            warn!("Failed to write chunks for memory {}: {} (retrieval for this memory falls back to its whole-row vector until the backfill rebuilds them)", id, e);
+        }
+    }
 }
 
 /// Conversation memory for maintaining chat context
@@ -1164,6 +1343,7 @@ mod tests {
     async fn test_vector_store() {
         let config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         };
         let store = VectorStore::new(config);
@@ -1239,10 +1419,160 @@ mod tests {
         }
     }
 
+    /// Records every chunk-set replacement so a test can assert what the
+    /// mutation paths actually wrote.
+    struct ChunkRecordingDb {
+        calls: std::sync::Mutex<Vec<(String, Vec<ChunkWrite>)>>,
+    }
+
+    impl ChunkRecordingDb {
+        fn new() -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()) }
+        }
+        fn last(&self) -> (String, Vec<ChunkWrite>) {
+            self.calls.lock().unwrap().last().cloned().expect("a chunk write happened")
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryPersistence for ChunkRecordingDb {
+        async fn save_entry(&self, _e: &MemoryEntry) -> Result<(), MemoryError> { Ok(()) }
+        async fn remove_entry(&self, _id: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_fsrs(&self, _id: &str, _f: &FsrsState) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_entry_content(&self, _id: &str, _c: &str) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> { Ok(Vec::new()) }
+        async fn replace_chunks(
+            &self,
+            memory_id: &str,
+            _workspace_id: Option<&str>,
+            chunks: &[ChunkWrite],
+        ) -> Result<(), MemoryError> {
+            self.calls.lock().unwrap().push((memory_id.to_string(), chunks.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn chunking_store(db: &Arc<ChunkRecordingDb>, max_chars: usize) -> VectorStore {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(4),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(max_chars),
+            use_f16: false,
+        })
+        .with_persistence(db.clone());
+        store
+    }
+
+    fn chunked_entry(id: &str, content: &str, embedding: Vec<f32>, model: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            content: content.to_string(),
+            embeddings: HashMap::new(),
+            embedding_model: model.map(str::to_string),
+            embedding,
+            metadata: HashMap::new(),
+            timestamp: 0,
+            fsrs: FsrsState::default(),
+            workspace_id: None,
+        }
+    }
+
+    /// Chunks have to be written by the STORE primitive, not by the ingest
+    /// API. Consolidation and dreaming mutate entries through these directly,
+    /// so a chunk set maintained only by `remember` would go stale exactly
+    /// where memories change most.
+    #[tokio::test]
+    async fn adding_an_entry_writes_its_chunks() {
+        let db = Arc::new(ChunkRecordingDb::new());
+        let store = chunking_store(&db, 40);
+        let content = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        store
+            .add(chunked_entry("m1", content, vec![1.0, 0.0, 0.0, 0.0], Some("prov:a")))
+            .await
+            .unwrap();
+
+        let (id, chunks) = db.last();
+        assert_eq!(id, "m1");
+        assert!(chunks.len() > 1, "content longer than the budget must split");
+        let rebuilt: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert_eq!(rebuilt, content, "the stored chunks must rebuild the memory");
+        assert!(
+            chunks.iter().all(|c| c.embedding.is_none()),
+            "multi-chunk vectors are backfill work, not inline network calls"
+        );
+        assert!(chunks.iter().all(|c| c.chunk_max_chars == 40));
+    }
+
+    /// A memory that fits in one chunk already has a vector for exactly that
+    /// text under exactly that model. Re-embedding it would be pure waste, so
+    /// the parent vector seeds the single chunk.
+    #[tokio::test]
+    async fn a_single_chunk_memory_reuses_the_parent_vector() {
+        let db = Arc::new(ChunkRecordingDb::new());
+        let store = chunking_store(&db, 4000);
+        store
+            .add(chunked_entry("m2", "short enough", vec![1.0, 0.0, 0.0, 0.0], Some("prov:a")))
+            .await
+            .unwrap();
+
+        let (_, chunks) = db.last();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].embedding.as_deref(), Some(&[1.0, 0.0, 0.0, 0.0][..]));
+        assert_eq!(chunks[0].embedding_model.as_deref(), Some("prov:a"));
+    }
+
+    /// `update_content` changes text WITHOUT touching the embedding, so the
+    /// parent vector now describes the old text. Seeding it into the new
+    /// single chunk would assert that chunk had been embedded when it had not
+    /// — a vector claiming to describe text it never saw.
+    #[tokio::test]
+    async fn a_content_only_update_rechunks_without_seeding_a_stale_vector() {
+        let db = Arc::new(ChunkRecordingDb::new());
+        let store = chunking_store(&db, 4000);
+        store
+            .add(chunked_entry("m3", "the harbor light was green", vec![1.0, 0.0, 0.0, 0.0], Some("prov:a")))
+            .await
+            .unwrap();
+        store.update_content("m3", "the harbor light was red").await.unwrap();
+
+        let (id, chunks) = db.last();
+        assert_eq!(id, "m3");
+        assert_eq!(db.call_count(), 2, "the update must rewrite the chunk set");
+        assert_eq!(chunks[0].content, "the harbor light was red");
+        assert!(
+            chunks[0].embedding.is_none(),
+            "the parent vector describes the OLD text and must not be reused"
+        );
+    }
+
+    /// The merge/dream path replaces content and embedding together, so the
+    /// incoming vector genuinely describes the new text.
+    #[tokio::test]
+    async fn a_merge_rechunks_and_may_seed_the_new_vector() {
+        let db = Arc::new(ChunkRecordingDb::new());
+        let store = chunking_store(&db, 4000);
+        store
+            .add(chunked_entry("m4", "first", vec![1.0, 0.0, 0.0, 0.0], Some("prov:a")))
+            .await
+            .unwrap();
+        store
+            .update_content_and_embedding("m4", "merged text", vec![0.0, 1.0, 0.0, 0.0], Some("prov:a"))
+            .await
+            .unwrap();
+
+        let (_, chunks) = db.last();
+        assert_eq!(db.call_count(), 2);
+        assert_eq!(chunks[0].content, "merged text");
+        assert_eq!(chunks[0].embedding_model.as_deref(), Some("prov:a"));
+    }
+
     #[tokio::test]
     async fn store_health_reflects_salvage_report() {
         let config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         };
         let store = VectorStore::new(config).with_persistence(Arc::new(DegradedDb));
@@ -1259,6 +1589,7 @@ mod tests {
     async fn store_health_clean_when_no_corruption() {
         let config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         };
         let store = VectorStore::new(config).with_persistence(Arc::new(CleanDb));
@@ -1290,6 +1621,7 @@ mod tests {
         // /status can't report a corrupt store as healthy-but-empty.
         let config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         };
         let store = VectorStore::new(config).with_persistence(Arc::new(FailingDb));
@@ -1346,6 +1678,7 @@ mod tests {
         let db = Arc::new(CountingRemovalDb::default());
         let store = VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         })
         .with_persistence(db.clone());
@@ -1379,6 +1712,7 @@ mod tests {
         let db = Arc::new(CountingRemovalDb::default());
         let store = VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         })
         .with_persistence(db.clone());
@@ -1395,6 +1729,7 @@ mod tests {
     async fn test_save_is_atomic_and_roundtrips() {
         let config = VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         };
         let store = VectorStore::new(config);
@@ -1425,6 +1760,7 @@ mod tests {
         // The store round-trips through load into a fresh store.
         let reloaded = VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         });
         reloaded.load(&path).await.unwrap();
@@ -1453,6 +1789,7 @@ mod tests {
     async fn add_accepts_a_queued_entry_awaiting_backfill() {
         let store = VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         });
         let mut queued = entry_dim8("queued");
@@ -1474,6 +1811,7 @@ mod tests {
     async fn search_skips_queued_rows_instead_of_panicking() {
         let store = VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         });
         let good = MemoryEntry {
@@ -1504,6 +1842,7 @@ mod tests {
     async fn update_content_and_embedding_resets_stale_buckets() {
         let store = VectorStore::new(VectorStoreConfig {
             dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
             use_f16: false,
         });
         let mut entry = entry_dim8("m");

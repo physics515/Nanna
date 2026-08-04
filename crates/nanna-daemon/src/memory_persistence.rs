@@ -5,8 +5,8 @@
 //! (storage models).  All FSRS fields are round-tripped losslessly.
 
 use async_trait::async_trait;
-use nanna_memory::{FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence};
-use nanna_storage::{MemoryRepository, NewMemory};
+use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence};
+use nanna_storage::{MemoryRepository, NewMemory, NewMemoryChunk};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -185,6 +185,41 @@ impl MemoryPersistence for TursoMemoryPersistence {
             }
             Err(e) => Err(MemoryError::Persistence(e.to_string())),
         }
+    }
+
+    /// Whole-set replacement, which is what `MemoryRepository::replace_chunks`
+    /// does under one connection lock — the delete and the inserts are one
+    /// transaction, so a crash mid-write cannot leave a parent holding half of
+    /// its old chunking and half of its new one.
+    async fn replace_chunks(
+        &self,
+        memory_id: &str,
+        workspace_id: Option<&str>,
+        chunks: &[ChunkWrite],
+    ) -> Result<(), MemoryError> {
+        let rows: Vec<NewMemoryChunk> = chunks
+            .iter()
+            .map(|c| NewMemoryChunk {
+                memory_id: memory_id.to_string(),
+                ordinal: c.ordinal,
+                content: c.content.clone(),
+                char_start: c.char_start,
+                char_end: c.char_end,
+                embedding: c.embedding.clone(),
+                embedding_model: c.embedding_model.clone(),
+                chunk_max_chars: c.chunk_max_chars,
+                chunker_version: c.chunker_version,
+                // Denormalized so scoped search filters inline instead of
+                // joining back to the parent on every candidate.
+                workspace_id: workspace_id.map(str::to_string),
+            })
+            .collect();
+
+        self.repo
+            .replace_chunks(memory_id, &rows)
+            .await
+            .map(|_| ())
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
     async fn remove_entry(&self, id: &str) -> Result<(), MemoryError> {
