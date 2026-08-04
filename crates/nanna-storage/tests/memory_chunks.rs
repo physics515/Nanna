@@ -220,7 +220,7 @@ async fn chunk_knn_returns_parent_and_ordinal_nearest_first() {
         .expect("write m2");
 
     let hits = repo
-        .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], 10, None)
+        .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], "probe", 10, None)
         .await
         .expect("knn");
     assert!(!hits.is_empty());
@@ -254,7 +254,7 @@ async fn deleting_a_memory_deletes_its_chunks() {
         "orphaned chunks would keep a deleted memory searchable"
     );
     let hits = repo
-        .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], 10, None)
+        .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], "probe", 10, None)
         .await
         .expect("knn");
     assert!(hits.is_empty(), "no vector of a deleted memory may survive");
@@ -340,4 +340,38 @@ async fn deleting_a_memory_destroys_its_chunk_text_on_disk() {
         !file_contains(&db_path, secret.as_bytes()).await,
         "chunk plaintext survived the delete"
     );
+}
+
+/// Equal width is not equal vector space: two different models produce vectors
+/// that `vector_distance_cos` compares without complaint and that mean nothing.
+/// The k-NN must therefore filter on the model, not merely on `octet_length` —
+/// which it did not when chunk search first landed, so every chunk still
+/// carrying a previous provider's vector could rank its parent into results
+/// after any same-width failover.
+#[tokio::test]
+async fn chunk_knn_filters_on_model_not_only_width() {
+    let db_path = temp_db_path("knn_model");
+    let storage = open(&db_path).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+
+    // Same width, different model, and a near-perfect match on the query.
+    let mut stale = chunk("m1", 0, "stale", Some(vec![1.0, 0.0, 0.0, 0.0]));
+    stale.embedding_model = Some("prov:old".to_string());
+    repo.replace_chunks("m1", &[stale]).await.expect("write");
+
+    let foreign = repo
+        .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], "prov:new", 10, None)
+        .await
+        .expect("knn");
+    assert!(
+        foreign.is_empty(),
+        "a perfect-scoring vector from another model must not be returned"
+    );
+
+    let own = repo
+        .search_chunks_by_embedding_sql(&[1.0, 0.0, 0.0, 0.0], "prov:old", 10, None)
+        .await
+        .expect("knn");
+    assert_eq!(own.len(), 1, "the same row is returned under its own model");
 }

@@ -1070,10 +1070,16 @@ impl MemoryService {
         // is the failure chunking exists to fix, so the two signals are merged
         // rather than one replacing the other, and each memory keeps whichever
         // evidence is stronger.
+        // The model that produced `query_embedding` is the only space its
+        // chunk neighbours can legitimately be drawn from. Read once, here, and
+        // pass it down — re-reading it inside the search could straddle a
+        // provider switch and compare the query against another model's chunks.
+        let active_model = self.active_embedding_model().await.unwrap_or_default();
         let chunk_hits = self
             .store
             .search_chunks(
                 &query_embedding,
+                &active_model,
                 self.config.max_results * 2,
                 workspace_id,
                 min_score,
@@ -3096,6 +3102,8 @@ mod tests {
     /// embedding index.
     struct StubChunkSearch {
         hits: Vec<(String, i64, f32)>,
+        /// The model these chunk vectors were produced by.
+        model: String,
     }
 
     #[async_trait::async_trait]
@@ -3108,9 +3116,16 @@ mod tests {
         async fn search_chunks(
             &self,
             _query: &[f32],
+            model: &str,
             _limit: usize,
             _workspace_id: Option<&str>,
         ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
+            // Mirrors the real filter: only this model's chunks are visible.
+            // A stub that ignored the model would let a cross-space regression
+            // pass its own test.
+            if model != self.model {
+                return Ok(Vec::new());
+            }
             Ok(self.hits.clone())
         }
     }
@@ -3154,8 +3169,10 @@ mod tests {
         );
 
         // Now the same store, with a chunk of that memory matching strongly.
+        service.rebind_embeddings("prov:a", 4, None).await;
         let service = service.with_persistence(Arc::new(StubChunkSearch {
             hits: vec![("buried".to_string(), 7, 0.88)],
+            model: "prov:a".to_string(),
         }));
         let found = service.recall_scoped("the query", None).await.unwrap();
         assert_eq!(found.len(), 1, "the chunk hit must surface its parent");
@@ -3164,6 +3181,93 @@ mod tests {
             (found[0].score - 0.88).abs() < 1e-6,
             "the reported score is the chunk's true similarity, not a synthetic rank: {}",
             found[0].score
+        );
+    }
+
+    /// Chunk vectors carry the model that produced them, and equal width is
+    /// NOT equal vector space — two different 1024-dim models compare without
+    /// complaint and mean nothing. Because a chunk hit can admit its parent on
+    /// chunk evidence alone, an unfiltered chunk index would let every
+    /// not-yet-backfilled chunk after a same-width failover rank its memory
+    /// against a query from a different space, silently and with no floor.
+    ///
+    /// The whole-row path never had this hole, but only by accident:
+    /// `rebind_to_model` clears an entry's active vector when the new model has
+    /// no bucket for it. Chunks have no equivalent, so the filter is the gate.
+    #[tokio::test]
+    async fn chunks_from_another_model_are_never_scored() {
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) })
+        });
+        let service = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(embed)
+        // The chunk index holds vectors from the PREVIOUS provider, at a
+        // strong-looking similarity and the very same width.
+        .with_persistence(Arc::new(StubChunkSearch {
+            hits: vec![("stale".to_string(), 0, 0.97)],
+            model: "prov:old".to_string(),
+        }));
+
+        service
+            .store
+            .add(MemoryEntry {
+                id: "stale".to_string(),
+                content: "embedded by the provider we just failed away from".to_string(),
+                embeddings: HashMap::new(),
+                embedding_model: Some("prov:old".to_string()),
+                embedding: vec![0.0, 1.0, 0.0, 0.0],
+                metadata: HashMap::new(),
+                timestamp: 0,
+                fsrs: crate::FsrsState::default(),
+                workspace_id: None,
+            })
+            .await
+            .expect("add");
+
+        // Now bound to a DIFFERENT model of the same width.
+        service.rebind_embeddings("prov:new", 4, None).await;
+
+        assert!(
+            service.recall_scoped("the query", None).await.unwrap().is_empty(),
+            "a 0.97 chunk hit from another model's vector space must not surface its parent"
+        );
+
+        // Sanity: the same store DOES return it once the binding matches, so
+        // the assertion above is testing the model filter and not a dead path.
+        let matching = MemoryService::new(MemoryServiceConfig {
+            dimension: 4,
+            min_score: 0.4,
+            ..Default::default()
+        })
+        .with_embed_fn(Arc::new(|_t: &str| Box::pin(async move { Ok(vec![1.0_f32, 0.0, 0.0, 0.0]) })))
+        .with_persistence(Arc::new(StubChunkSearch {
+            hits: vec![("stale".to_string(), 0, 0.97)],
+            model: "prov:old".to_string(),
+        }));
+        matching
+            .store
+            .add(MemoryEntry {
+                id: "stale".to_string(),
+                content: "embedded by the provider we just failed away from".to_string(),
+                embeddings: HashMap::new(),
+                embedding_model: Some("prov:old".to_string()),
+                embedding: vec![0.0, 1.0, 0.0, 0.0],
+                metadata: HashMap::new(),
+                timestamp: 0,
+                fsrs: crate::FsrsState::default(),
+                workspace_id: None,
+            })
+            .await
+            .expect("add");
+        matching.rebind_embeddings("prov:old", 4, None).await;
+        assert_eq!(
+            matching.recall_scoped("the query", None).await.unwrap().len(),
+            1,
+            "with the binding matching, the very same chunk hit must surface"
         );
     }
 
@@ -3183,7 +3287,10 @@ mod tests {
             ..Default::default()
         })
         .with_embed_fn(embed)
-        .with_persistence(Arc::new(StubChunkSearch { hits }));
+        .with_persistence(Arc::new(StubChunkSearch { hits, model: "prov:a".to_string() }));
+        // Without a bound model the chunk search refuses to run at all, which
+        // would make the assertion below pass for the wrong reason.
+        service.rebind_embeddings("prov:a", 4, None).await;
 
         service
             .store

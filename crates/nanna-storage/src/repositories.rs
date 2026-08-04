@@ -354,9 +354,9 @@ const CHUNK_SELECT_PAGE: &str = "SELECT id, memory_id, ordinal, content, char_st
 
 const CHUNK_SELECT_STALE: &str = "SELECT id, memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id, created_at, updated_at FROM memory_chunks WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?1 ORDER BY id ASC LIMIT ?2";
 
-const CHUNK_KNN_SCOPED: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND octet_length(embedding) = ?2 AND (workspace_id = ?3 OR workspace_id IS NULL) ORDER BY dist ASC LIMIT ?4";
+const CHUNK_KNN_SCOPED: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND embedding_model = ?2 AND octet_length(embedding) = ?3 AND (workspace_id = ?4 OR workspace_id IS NULL) ORDER BY dist ASC LIMIT ?5";
 
-const CHUNK_KNN_GLOBAL: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND octet_length(embedding) = ?2 ORDER BY dist ASC LIMIT ?3";
+const CHUNK_KNN_GLOBAL: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND embedding_model = ?2 AND octet_length(embedding) = ?3 ORDER BY dist ASC LIMIT ?4";
 
 impl MemoryRepository {
     // ---------------------------------------------------------------
@@ -587,10 +587,28 @@ impl MemoryRepository {
 
     /// k-NN over CHUNK vectors, returning `(parent memory_id, ordinal, distance)`.
     ///
-    /// Twin of [`Self::search_by_embedding_sql`], including the
-    /// `octet_length(embedding) = ?` guard that keeps foreign-dimension vectors
-    /// out of the comparison, and the explicit `drop(rows)` — an unfinished
-    /// cursor on the shared connection silently swallows later writes.
+    /// Only chunks embedded by `model` are compared. This is the correctness
+    /// gate, and width is NOT a substitute for it: two different models of the
+    /// same dimension produce vectors that compare without complaint and mean
+    /// nothing, so an `octet_length` guard alone lets a foreign embedding space
+    /// be scored as if it were valid — silently, with no floor and no log.
+    ///
+    /// This filter was missing when chunk search first landed. Because a chunk
+    /// hit can admit its parent on chunk evidence alone, every chunk still
+    /// carrying a previous provider's vector — the entire not-yet-backfilled
+    /// tail after any same-width failover — could rank its memory into results
+    /// against a query from a different space. The whole-row path never had
+    /// this hole, but only by accident: `rebind_to_model` clears an entry's
+    /// active vector when the new model has no bucket for it, and chunks have
+    /// no equivalent.
+    ///
+    /// Also keeps the `octet_length(embedding) = ?` guard, which is now purely
+    /// a crash guard rather than an identity check: `vector_distance_cos`
+    /// errors on a width mismatch and would abort the whole scan.
+    ///
+    /// Twin of [`Self::search_by_embedding_sql`], including the explicit
+    /// `drop(rows)` — an unfinished cursor on the shared connection silently
+    /// swallows later writes.
     ///
     /// `limit` counts CHUNKS, not parents: several chunks of one memory can
     /// occupy consecutive positions, so a caller wanting k parents over-fetches.
@@ -599,10 +617,11 @@ impl MemoryRepository {
     /// Returns [`StorageError`] if the query fails.
     ///
     /// # Panics
-    /// Panics if the query embedding is empty or `limit` is 0.
+    /// Panics if the query embedding is empty, `model` is empty, or `limit` is 0.
     pub async fn search_chunks_by_embedding_sql(
         &self,
         query_embedding: &[f32],
+        model: &str,
         limit: usize,
         workspace_id: Option<&str>,
     ) -> Result<Vec<(String, i64, f64)>, StorageError> {
@@ -610,6 +629,7 @@ impl MemoryRepository {
             !query_embedding.is_empty(),
             "query embedding must not be empty"
         );
+        assert!(!model.is_empty(), "a chunk search must name the model it is searching");
         assert!(limit > 0, "limit must be positive");
 
         let query_blob: Vec<u8> = query_embedding
@@ -624,14 +644,14 @@ impl MemoryRepository {
             Some(ws) => {
                 conn.query(
                     CHUNK_KNN_SCOPED,
-                    turso::params![query_blob, query_bytes, ws, limit_i64],
+                    turso::params![query_blob, model.to_string(), query_bytes, ws, limit_i64],
                 )
                 .await?
             }
             None => {
                 conn.query(
                     CHUNK_KNN_GLOBAL,
-                    turso::params![query_blob, query_bytes, limit_i64],
+                    turso::params![query_blob, model.to_string(), query_bytes, limit_i64],
                 )
                 .await?
             }

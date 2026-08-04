@@ -250,14 +250,15 @@ impl MemoryPersistence for TursoMemoryPersistence {
     async fn search_chunks(
         &self,
         query: &[f32],
+        model: &str,
         limit: usize,
         workspace_id: Option<&str>,
     ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
-        if query.is_empty() || limit == 0 {
+        if query.is_empty() || model.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         self.repo
-            .search_chunks_by_embedding_sql(query, limit, workspace_id)
+            .search_chunks_by_embedding_sql(query, model, limit, workspace_id)
             .await
             .map(|rows| {
                 rows.into_iter()
