@@ -2430,16 +2430,29 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         // field-name bug: every Claude model silently resolved to 32k/4k, was
         // cached with a fresh timestamp, and nothing anywhere said so. A model
         // running on guessed limits is worth one line per cache TTL.
-        if info.context_window == UNKNOWN_CONTEXT_WINDOW
-            && info.max_output_tokens == UNKNOWN_MAX_OUTPUT_TOKENS
-        {
+        // Keyed on the window alone. Pairing it with the output floor made the
+        // check unreachable for the two providers most likely to need it:
+        // Ollama and OpenRouter derive the output cap as `context_window / 2`
+        // when the provider answers but publishes no window, landing on
+        // 32000/16000, which never matches 32000/4096. Ollama takes that path
+        // routinely — GGUF keys the window by architecture
+        // (`llama.context_length`, `qwen3.context_length`) while only
+        // `general.context_length` is read — so the invented window was cached
+        // for a week and every budget sized from it, in silence.
+        //
+        // A model whose real window happens to be exactly the floor trips this
+        // too. That is unavoidable without recording provenance on ModelInfo,
+        // and a false line once per cache TTL is the cheaper error: the floor
+        // is a "we do not know" sentinel, and the failure this exists to catch
+        // is total silence.
+        if info.context_window == UNKNOWN_CONTEXT_WINDOW {
             warn!(
                 model = %model,
                 provider = ?self.provider,
                 context_window = info.context_window,
                 max_output_tokens = info.max_output_tokens,
-                "model limits unavailable from the provider; using the unknown-model floor \
-                 — budgets will be sized for a far smaller model than this may be"
+                "model window matches the unknown-model floor — the provider likely published \
+                 none, so budgets are sized for a far smaller model than this may be"
             );
         }
 
