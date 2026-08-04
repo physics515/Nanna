@@ -1268,6 +1268,68 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
+    /// Resolve one `provider/model` spec to a live embedding client.
+    ///
+    /// `None` means the provider's credential is absent — the entry is skipped
+    /// with a line saying so, rather than substituting a different model. A
+    /// silent substitution is what put a hardcoded paid embedder in front of
+    /// the free one the user had chosen.
+    fn embedding_provider_for(
+        &self,
+        spec: &str,
+    ) -> Option<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> {
+        let (provider, model) = split_embedding_spec(spec)?;
+        let info = EmbeddingProviderInfo {
+            name: provider.clone(),
+            model: model.clone(),
+        };
+        match provider.as_str() {
+            "openai" => match std::env::var("OPENAI_API_KEY").ok() {
+                Some(key) => Some((
+                    info,
+                    Arc::new(nanna_llm::EmbeddingClient::openai(&key).with_model(&model)),
+                )),
+                None => {
+                    warn!("Embedding provider '{spec}' skipped: OPENAI_API_KEY is not set");
+                    None
+                }
+            },
+            "openrouter" => {
+                let key = self
+                    .config
+                    .llm
+                    .openrouter_api_key
+                    .clone()
+                    .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+                match key {
+                    Some(key) => Some((
+                        info,
+                        Arc::new(
+                            nanna_llm::EmbeddingClient::openai(&key)
+                                .with_model(&model)
+                                .with_base_url("https://openrouter.ai/api"),
+                        ),
+                    )),
+                    None => {
+                        warn!("Embedding provider '{spec}' skipped: no OpenRouter API key");
+                        None
+                    }
+                }
+            }
+            "ollama" => Some((
+                info,
+                Arc::new(
+                    nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
+                        .with_model(&model),
+                ),
+            )),
+            other => {
+                warn!("Embedding provider '{spec}' skipped: unknown provider '{other}'");
+                None
+            }
+        }
+    }
+
     /// Discover the embedding dimension by probing **the same router the live
     /// embed path uses**.
     ///
@@ -2388,125 +2450,55 @@ impl DaemonServer {
 
         // Initialize memory service with embeddings if enabled
         let memory: Option<Arc<MemoryService>> = if self.config.enable_memory {
-            // Build primary embedding client
-            let primary_client = match self.embedding.provider.as_str() {
-                "openai" => {
-                    let api_key = std::env::var("OPENAI_API_KEY").ok();
-                    api_key.map(|key| {
-                        info!("Primary embeddings: OpenAI {}", self.embedding.model);
-                        (
-                            EmbeddingProviderInfo {
-                                name: "openai".into(),
-                                model: self.embedding.model.clone(),
-                            },
-                            Arc::new(
-                                nanna_llm::EmbeddingClient::openai(&key)
-                                    .with_model(&self.embedding.model),
-                            ),
-                        )
-                    })
-                }
-                "openrouter" => {
-                    let api_key = self
-                        .config
-                        .llm
-                        .openrouter_api_key
-                        .clone()
-                        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
-                    api_key.map(|key| {
-                        info!("Primary embeddings: OpenRouter {}", self.embedding.model);
-                        (
-                            EmbeddingProviderInfo {
-                                name: "openrouter".into(),
-                                model: self.embedding.model.clone(),
-                            },
-                            Arc::new(
-                                nanna_llm::EmbeddingClient::openai(&key)
-                                    .with_model(&self.embedding.model)
-                                    .with_base_url("https://openrouter.ai/api"),
-                            ),
-                        )
-                    })
-                }
-                "ollama" | _ => {
-                    info!(
-                        "Primary embeddings: Ollama {} at {}",
-                        self.embedding.model, self.embedding.ollama_host
-                    );
-                    Some((
-                        EmbeddingProviderInfo {
-                            name: "ollama".into(),
-                            model: self.embedding.model.clone(),
-                        },
-                        Arc::new(
-                            nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
-                                .with_model(&self.embedding.model),
-                        ),
-                    ))
-                }
+            // Resolve the ordered provider list the user actually configured.
+            //
+            // `embedding_priority` is authoritative and is walked in order:
+            // the first entry whose credential resolves becomes primary, the
+            // rest become fallbacks in the same order. Failover happens ONLY on
+            // error, exactly like `model_priority` for chat, so one model
+            // embeds at a time.
+            //
+            // What this replaces: a single configured provider plus THREE
+            // hardcoded fallbacks appended by credential sniffing —
+            // `text-embedding-3-small` (1536) for OpenAI and
+            // `openai/text-embedding-3-small` (1536) for OpenRouter. Those were
+            // injected whether or not the user wanted them, which is how a paid
+            // 1536-dim embedder ended up live on an install whose config asked
+            // for a free one first and a 768-dim local model second.
+            let specs: Vec<String> = if self.embedding.priority.is_empty() {
+                let legacy = format!("{}/{}", self.embedding.provider, self.embedding.model);
+                info!("No embedding_priority configured; using the single pair '{legacy}'");
+                vec![legacy]
+            } else {
+                self.embedding.priority.clone()
             };
+
+            let resolved: Vec<(EmbeddingProviderInfo, Arc<nanna_llm::EmbeddingClient>)> = specs
+                .iter()
+                .filter_map(|spec| self.embedding_provider_for(spec))
+                .collect();
+
+            let primary_client = resolved.first().cloned();
+            let fallbacks: Vec<_> = resolved.into_iter().skip(1).collect();
+
+            if primary_client.is_none() && !specs.is_empty() {
+                warn!(
+                    "No embedding provider in embedding_priority could be resolved ({} entries                      tried) — memory will be written without vectors and queued for backfill",
+                    specs.len()
+                );
+            }
 
             match primary_client {
                 Some((primary_info, primary)) => {
                     // Build the embedding router with fallback providers
                     let mut embed_router = EmbeddingRouter::new(primary_info.clone(), primary);
 
-                    // Add fallback providers from available credentials
-                    if primary_info.name != "openai" {
-                        if let Some(api_key) = std::env::var("OPENAI_API_KEY").ok() {
-                            let fallback_model = "text-embedding-3-small".to_string();
-                            info!("Adding OpenAI embedding fallback: {}", fallback_model);
-                            embed_router = embed_router.with_fallback(
-                                EmbeddingProviderInfo {
-                                    name: "openai".into(),
-                                    model: fallback_model.clone(),
-                                },
-                                Arc::new(
-                                    nanna_llm::EmbeddingClient::openai(&api_key)
-                                        .with_model(&fallback_model),
-                                ),
-                            );
-                        }
-                    }
-                    if primary_info.name != "openrouter" {
-                        if let Some(api_key) = self
-                            .config
-                            .llm
-                            .openrouter_api_key
-                            .clone()
-                            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                        {
-                            let fallback_model = "openai/text-embedding-3-small".to_string();
-                            info!("Adding OpenRouter embedding fallback: {}", fallback_model);
-                            embed_router = embed_router.with_fallback(
-                                EmbeddingProviderInfo {
-                                    name: "openrouter".into(),
-                                    model: fallback_model.clone(),
-                                },
-                                Arc::new(
-                                    nanna_llm::EmbeddingClient::openai(&api_key)
-                                        .with_model(&fallback_model)
-                                        .with_base_url("https://openrouter.ai/api"),
-                                ),
-                            );
-                        }
-                    }
-                    if primary_info.name != "ollama" {
-                        let fallback_model = "nomic-embed-text".to_string();
-                        info!(
-                            "Adding Ollama embedding fallback: {} at {}",
-                            fallback_model, self.embedding.ollama_host
-                        );
-                        embed_router = embed_router.with_fallback(
-                            EmbeddingProviderInfo {
-                                name: "ollama".into(),
-                                model: fallback_model.clone(),
-                            },
-                            Arc::new(
-                                nanna_llm::EmbeddingClient::ollama(&self.embedding.ollama_host)
-                                    .with_model(&fallback_model),
-                            ),
-                        );
+                    // Fallbacks are the REST OF THE USER'S LIST, in their
+                    // order — not a credential sweep. The list is the whole
+                    // policy: what to try, and in what sequence.
+                    for (info, client) in fallbacks {
+                        info!("Embedding fallback: {info}");
+                        embed_router = embed_router.with_fallback(info, client);
                     }
 
                     info!(
@@ -3035,6 +3027,40 @@ fn build_tool_policy(enabled: Option<&[String]>, disabled: &[String]) -> ToolPol
 }
 
 /// Embedding configuration for the daemon
+
+/// Split an `embedding_priority` entry into `(provider, model)`.
+///
+/// Splits on the FIRST slash only: model names routinely contain slashes of
+/// their own (`openrouter/nvidia/nemotron-3-embed-1b:free` is provider
+/// `openrouter`, model `nvidia/nemotron-3-embed-1b:free`), and splitting on the
+/// last slash — or on all of them — silently addresses a different model than
+/// the one written down.
+///
+/// An entry with no slash is treated as a bare model on the default local
+/// provider, matching how a bare chat model name resolves.
+fn split_embedding_spec(spec: &str) -> Option<(String, String)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    match spec.split_once('/') {
+        // A slash was written, so a provider WAS stated. If the model half is
+        // empty the entry is malformed and must be rejected — falling through
+        // to the bare-name arm below would resolve `openrouter/` to the local
+        // provider with the literal model name `openrouter/`, which is a
+        // request that can only fail at the network, far from the typo.
+        Some((provider, model)) => {
+            let model = model.trim();
+            if model.is_empty() || provider.trim().is_empty() {
+                return None;
+            }
+            Some((provider.trim().to_ascii_lowercase(), model.to_string()))
+        }
+        // "nomic-embed-text:latest" — no provider stated.
+        None => Some(("ollama".to_string(), spec.to_string())),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
     /// Provider (ollama, openai, openrouter)
@@ -3043,6 +3069,18 @@ pub struct EmbeddingConfig {
     pub model: String,
     /// Ollama host (if using Ollama)
     pub ollama_host: String,
+    /// Ordered `provider/model` specs, most preferred first.
+    ///
+    /// This is the user's stated order and it is authoritative: the router
+    /// tries them in sequence and falls to the next ONLY on failure, exactly
+    /// like `model_priority` does for chat. Empty means "not configured",
+    /// which falls back to the single [`Self::provider`]/[`Self::model`] pair.
+    ///
+    /// This field existed in the config file and in the settings UI for a long
+    /// time while nothing in the daemon read it. The list was therefore inert:
+    /// a user could put a free embedder first and watch a hardcoded paid one
+    /// run instead, with no way to tell from the outside.
+    pub priority: Vec<String>,
 }
 
 impl Default for EmbeddingConfig {
@@ -3051,6 +3089,7 @@ impl Default for EmbeddingConfig {
             provider: "ollama".to_string(),
             model: "nomic-embed-text".to_string(),
             ollama_host: "http://localhost:11434".to_string(),
+            priority: Vec::new(),
         }
     }
 }
@@ -3129,6 +3168,7 @@ impl DaemonBuilder {
         builder.embedding.provider = config.memory.embedding_provider.clone();
         builder.embedding.model = config.memory.embedding_model.clone();
         builder.embedding.ollama_host = config.memory.ollama_host.clone();
+        builder.embedding.priority = config.memory.embedding_priority.clone();
 
         // Thread the memory-compression settings so the scheduled dream cycle
         // honors them (previously only the IPC-triggered path did).
@@ -3498,6 +3538,54 @@ fn build_daemon_channels_config(src: &nanna_config::ChannelsConfig) -> ChannelsC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The entry that motivated this: provider `openrouter`, model
+    /// `nvidia/nemotron-3-embed-1b:free`. Splitting on the LAST slash would
+    /// address model `free` on provider `openrouter/nvidia/nemotron-3-embed-1b`
+    /// — a silent mis-address, not an error.
+    #[test]
+    fn a_spec_splits_on_the_first_slash_only() {
+        assert_eq!(
+            split_embedding_spec("openrouter/nvidia/nemotron-3-embed-1b:free"),
+            Some(("openrouter".into(), "nvidia/nemotron-3-embed-1b:free".into()))
+        );
+        assert_eq!(
+            split_embedding_spec("ollama/nomic-embed-text:latest"),
+            Some(("ollama".into(), "nomic-embed-text:latest".into()))
+        );
+        assert_eq!(
+            split_embedding_spec("openai/text-embedding-3-small"),
+            Some(("openai".into(), "text-embedding-3-small".into()))
+        );
+    }
+
+    /// A bare name resolves to the local provider, matching how a bare chat
+    /// model name resolves — and NOT to a cloud provider, which would send the
+    /// user's memories somewhere they never named.
+    #[test]
+    fn a_bare_model_name_stays_local() {
+        assert_eq!(
+            split_embedding_spec("nomic-embed-text:latest"),
+            Some(("ollama".into(), "nomic-embed-text:latest".into()))
+        );
+    }
+
+    #[test]
+    fn a_provider_is_matched_case_insensitively_and_trimmed() {
+        assert_eq!(
+            split_embedding_spec("  OpenRouter/some-model  "),
+            Some(("openrouter".into(), "some-model".into()))
+        );
+    }
+
+    /// A trailing slash names no model. Treating it as a bare name would embed
+    /// against provider `ollama` model `openrouter/`, which does not exist.
+    #[test]
+    fn an_empty_or_modelless_spec_is_rejected() {
+        assert_eq!(split_embedding_spec(""), None);
+        assert_eq!(split_embedding_spec("   "), None);
+        assert_eq!(split_embedding_spec("openrouter/"), None);
+    }
 
     /// REGRESSION: a scheduled run must see its own session — every one of the
     /// 35 logged "session scope requires session_id" `todo` failures came from
