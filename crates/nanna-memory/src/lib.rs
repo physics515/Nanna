@@ -171,7 +171,7 @@ pub trait MemoryPersistence: Send + Sync {
         &self,
         _model: &str,
         _limit: usize,
-    ) -> Result<Vec<(i64, String)>, MemoryError> {
+    ) -> Result<Vec<PendingChunk>, MemoryError> {
         Ok(Vec::new())
     }
 
@@ -204,6 +204,16 @@ pub trait MemoryPersistence: Send + Sync {
         _workspace_id: Option<&str>,
     ) -> Result<Vec<(String, i64, f32)>, MemoryError> {
         Ok(Vec::new())
+    }
+
+    /// Remove completed work from the durable queue.
+    async fn dequeue_embedding(
+        &self,
+        _memory_id: &str,
+        _ordinal: i64,
+        _model: &str,
+    ) -> Result<(), MemoryError> {
+        Ok(())
     }
 
     /// Record a failed embedding attempt against queued work, with its reason.
@@ -250,6 +260,21 @@ pub trait MemoryPersistence: Send + Sync {
         let expected = entries.len();
         Ok(LoadReport { entries, corrupt_rows: 0, expected })
     }
+}
+
+/// A chunk awaiting a vector, carrying everything needed to embed it AND to
+/// report against it.
+///
+/// The queue key (`memory_id`, `ordinal`) travels with the row id because a
+/// failure has to be recorded against the durable queue, not against the
+/// chunk table — otherwise a provider that fails forever leaves no trace and
+/// the queue looks merely slow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingChunk {
+    pub chunk_id: i64,
+    pub memory_id: String,
+    pub ordinal: i64,
+    pub content: String,
 }
 
 /// One chunk on its way to durable storage.
@@ -1365,7 +1390,7 @@ impl VectorStore {
         &self,
         model: &str,
         limit: usize,
-    ) -> Vec<(i64, String)> {
+    ) -> Vec<PendingChunk> {
         match self.db {
             Some(ref db) => db.chunks_needing_embedding(model, limit).await.unwrap_or_default(),
             None => Vec::new(),
@@ -1386,6 +1411,47 @@ impl VectorStore {
         match self.db {
             Some(ref db) => db.set_chunk_embedding(chunk_id, embedding, model).await,
             None => Ok(()),
+        }
+    }
+
+    /// Mark queued work complete.
+    ///
+    /// Best-effort: a lost dequeue costs one redundant re-embed on the next
+    /// drain, which is strictly better than a lost vector.
+    pub async fn dequeue_embedding(&self, memory_id: &str, ordinal: i64, model: &str) {
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.dequeue_embedding(memory_id, ordinal, model).await {
+                debug!("Could not dequeue {memory_id}#{ordinal}: {e}");
+            }
+        }
+    }
+
+    /// Note a failed embedding attempt against the durable queue.
+    ///
+    /// Best-effort: losing the note must not abort the drain, but the note is
+    /// the difference between a stuck queue and a silent one.
+    pub async fn record_embedding_failure(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+        error: &str,
+    ) {
+        if let Some(ref db) = self.db {
+            if let Err(e) = db
+                .record_embedding_failure(memory_id, ordinal, model, error)
+                .await
+            {
+                debug!("Could not record embedding failure for {memory_id}#{ordinal}: {e}");
+            }
+        }
+    }
+
+    /// Queue depth per model with the most recent error for each.
+    pub async fn embedding_queue_health(&self) -> Vec<(String, usize, Option<String>)> {
+        match self.db {
+            Some(ref db) => db.embedding_queue_health().await.unwrap_or_default(),
+            None => Vec::new(),
         }
     }
 

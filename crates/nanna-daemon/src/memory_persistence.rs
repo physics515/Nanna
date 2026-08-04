@@ -5,7 +5,7 @@
 //! (storage models).  All FSRS fields are round-tripped losslessly.
 
 use async_trait::async_trait;
-use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence};
+use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence, PendingChunk};
 use nanna_storage::{MemoryRepository, NewMemory, NewMemoryChunk};
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -294,11 +294,20 @@ impl MemoryPersistence for TursoMemoryPersistence {
         &self,
         model: &str,
         limit: usize,
-    ) -> Result<Vec<(i64, String)>, MemoryError> {
+    ) -> Result<Vec<PendingChunk>, MemoryError> {
         self.repo
             .chunks_needing_embedding(model, limit)
             .await
-            .map(|rows| rows.into_iter().map(|c| (c.id, c.content)).collect())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|c| PendingChunk {
+                        chunk_id: c.id,
+                        memory_id: c.memory_id,
+                        ordinal: c.ordinal,
+                        content: c.content,
+                    })
+                    .collect()
+            })
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
@@ -312,6 +321,18 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .set_chunk_embedding(chunk_id, embedding, model)
             .await
             .map(|_| ())
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn dequeue_embedding(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+    ) -> Result<(), MemoryError> {
+        self.repo
+            .dequeue_embedding(memory_id, ordinal, model)
+            .await
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 

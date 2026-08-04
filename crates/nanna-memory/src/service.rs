@@ -410,26 +410,67 @@ impl MemoryService {
         }
 
         let mut embedded = 0usize;
-        for (chunk_id, content) in self.store.chunks_needing_embedding(model, batch).await {
-            match (embed_fn)(&content).await {
+        for pending in self.store.chunks_needing_embedding(model, batch).await {
+            match (embed_fn)(&pending.content).await {
                 Ok(embedding) => {
                     if self.active_embedding_model().await.as_deref() != Some(model) {
                         debug!("Chunk backfill for '{model}' abandoned — provider changed underneath it");
                         break;
                     }
                     if embedding.is_empty() {
-                        debug!("Chunk {chunk_id} embedded to an empty vector; leaving it queued");
+                        debug!(
+                            "Chunk {} embedded to an empty vector; leaving it queued",
+                            pending.chunk_id
+                        );
+                        self.store
+                            .record_embedding_failure(
+                                &pending.memory_id,
+                                pending.ordinal,
+                                model,
+                                "provider returned an empty vector",
+                            )
+                            .await;
                         continue;
                     }
-                    if let Err(e) = self.store.set_chunk_embedding(chunk_id, &embedding, model).await {
-                        debug!("Chunk backfill could not store embedding for {chunk_id}: {e}");
+                    if let Err(e) = self
+                        .store
+                        .set_chunk_embedding(pending.chunk_id, &embedding, model)
+                        .await
+                    {
+                        debug!(
+                            "Chunk backfill could not store embedding for {}: {e}",
+                            pending.chunk_id
+                        );
+                        self.store
+                            .record_embedding_failure(
+                                &pending.memory_id,
+                                pending.ordinal,
+                                model,
+                                &e.to_string(),
+                            )
+                            .await;
                     } else {
+                        self.store
+                            .dequeue_embedding(&pending.memory_id, pending.ordinal, model)
+                            .await;
                         embedded += 1;
                     }
                 }
                 Err(e) => {
                     // The router already waited out congestion before erroring,
-                    // so this provider is genuinely unavailable. Leave the rest.
+                    // so this provider is genuinely unavailable. Leave the rest
+                    // — but WRITE DOWN WHY. A queue that stops with no reason
+                    // attached is indistinguishable from a queue that is merely
+                    // slow, and that ambiguity is exactly what let 2167
+                    // memories sit unembedded for a day.
+                    self.store
+                        .record_embedding_failure(
+                            &pending.memory_id,
+                            pending.ordinal,
+                            model,
+                            &e.to_string(),
+                        )
+                        .await;
                     warn!("Chunk backfill for '{model}' stopped after {embedded}: {e}");
                     break;
                 }
@@ -2900,7 +2941,7 @@ mod tests {
             &self,
             model: &str,
             limit: usize,
-        ) -> Result<Vec<(i64, String)>, MemoryError> {
+        ) -> Result<Vec<crate::PendingChunk>, MemoryError> {
             Ok(self
                 .chunks
                 .lock()
@@ -2908,7 +2949,12 @@ mod tests {
                 .iter()
                 .filter(|(_, _, by)| by.as_deref() != Some(model))
                 .take(limit)
-                .map(|(id, content, _)| (*id, content.clone()))
+                .map(|(id, content, _)| crate::PendingChunk {
+                    chunk_id: *id,
+                    memory_id: format!("m{id}"),
+                    ordinal: 0,
+                    content: content.clone(),
+                })
                 .collect())
         }
 
