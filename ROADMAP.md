@@ -2655,6 +2655,24 @@ skill.
       a temperature and resolve their model dynamically (falling back to the main model), so all
       five failed outright against Opus 5 before this. `sampling_temperature_for_model` gates on
       `is_claude_model` first so a local `qwen3.5:9b` is not mistaken for an unrecognized Claude.
+      **The gate belongs at the wire boundary, not the call site** (`conform_to_anthropic_contract`,
+      run on the `complete_anthropic` / `stream_anthropic` dispatchers). Fixing the six
+      `AnthropicRequest` literals still missed the whole `CompletionRequest` family:
+      `CompletionRequest::default()` carries `temperature: Some(0.7)` and
+      `complete_anthropic_simple` converted it ungated, so sub-agent questions, multi-agent
+      decomposition/aggregation, dream summaries and `AgentContext::compress` all 400'd against
+      Opus 5. (The streaming arm's `if request.thinking.is_some()` rule never fired at all —
+      `with_thinking` has zero callers.) The dispatcher covers every caller at once, including the
+      OpenRouter/proxy paths that route Claude through the OpenAI-compat conversion.
+      The boundary also **translates `thinking: None` into an explicit `disabled`** where the model
+      accepts one. Omission used to mean "no thinking" everywhere — which is what every
+      `thinking: None` in this codebase was written to mean — but on Opus 5 / Sonnet 5 / Fable it
+      now means *adaptive*, so those auxiliary requests would reason inside a `max_tokens` sized for
+      no reasoning (512 for the distiller) and return `stop_reason: "max_tokens"` with empty text.
+      A silent truncation is worse than the 400 it replaced. Always-on models keep `None`.
+      **`claude-mythos-preview` is LEGACY, not Mythos 5** — it is the model those were migrated away
+      from (its published "before" example configures `budget_tokens`, and its prompt-cache minimum
+      groups with Opus 4.7), so the `mythos` substring must not sweep it into the always-on row.
       Provider gate unchanged in effect: only `Provider::Anthropic` requests carry the field (the
       OpenAI-compat conversion drops it, Ollama enables `think` by model detection).
       `RunOptions::thinking_mode` stays as the internal per-run escape hatch.
