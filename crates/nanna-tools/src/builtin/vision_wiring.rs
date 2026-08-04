@@ -38,10 +38,10 @@ pub fn create_vision_tool(llm: Arc<LlmClient>, model: String) -> AnalyzeImageToo
             };
 
             let request = AnthropicRequest {
-                model,
                 messages: vec![AnthropicMessage::user(content)],
                 max_tokens: 4096,
-                temperature: Some(0.3),
+                temperature: nanna_llm::sampling_temperature_for_model(&model, 0.3),
+                model,
                 system: Some("You are a helpful vision assistant. Analyze the image and respond to the user's prompt accurately and concisely.".to_string()),
                 tools: None,
                 stream: None,

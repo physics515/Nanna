@@ -2630,16 +2630,33 @@ skill.
       `config.toml` files still carrying `thinking_enabled = true` load unchanged (no
       `deny_unknown_fields` anywhere in the chain; test:
       `legacy_thinking_enabled_key_still_loads`).
-      `Medium` is derived, not chosen: the sent budget must leave the visible answer
-      `MIN_OUTPUT_RESERVE_TOKENS` (1112) of room inside the shipped `max_tokens: 8192`, so the
-      largest enum step that survives the standard budget unclamped is 4096.
-      The budget is then clamped per request against the LIVE effective output budget
+      **The wire shape is the model's to dictate, not ours** (`anthropic_model_contract`,
+      nanna-llm). `budget_tokens` was REMOVED on Opus 5 / 4.8 / 4.7, Sonnet 5, and Fable 5 — the
+      first cut of this change sent `{"type":"enabled","budget_tokens":4096}` on every native
+      Anthropic request, which is a hard 400 on the model the owner actually runs. Three families:
+      adaptive (`{"type":"adaptive"}`, 4.6 and newer), legacy budgets (pre-4.6, clamped as below),
+      and always-on (Fable/Mythos, where an explicit `disabled` is itself rejected so muting
+      degrades to sending no field). An unrecognized `claude-*` name is assumed **current**, since
+      every generation since 4.6 has removed parameters rather than added them.
+      **`display` is why a correct adaptive request can still look broken:** on Opus 5 / 4.8 / 4.7,
+      Sonnet 5 and Fable 5 it defaults to `"omitted"`, which streams thinking blocks with *empty
+      text* — the actual reason no thinking rendered, and the reason we send
+      `display: "summarized"` there. The 4.6 family already defaults to summarized, so the field is
+      left off rather than sent speculatively.
+      Legacy budgets keep the derivation: `Medium` (4096) is the largest enum step that leaves the
+      visible answer `MIN_OUTPUT_RESERVE_TOKENS` (1112) of room inside the shipped
+      `max_tokens: 8192`, then clamped per request against the LIVE effective output budget
       (`thinking_budget_for_output`): `min(configured, max_output − 1112)`, and **no** `thinking`
       field at all when that leaves less than the API's 1024 minimum — the demoted-window path
-      (reserve as low as 1112) would otherwise emit `budget_tokens >= max_tokens`, an invalid
-      request. Provider gate unchanged in effect: only `Provider::Anthropic` requests carry the
-      field (the OpenAI-compat conversion drops it, Ollama enables `think` by model detection), and
-      the existing `temperature: None` pairing rides with it, so Ollama's temperature is untouched.
+      (reserve as low as 1112) would otherwise emit `budget_tokens >= max_tokens`.
+      **`temperature` is dropped by model family, not by `thinking.is_some()`** — it was removed on
+      the same five models and 400s on its own. That fixed a live latent break beyond the main
+      loop: the summarizer, distiller, compressor, memory extractor and vision tool each hard-coded
+      a temperature and resolve their model dynamically (falling back to the main model), so all
+      five failed outright against Opus 5 before this. `sampling_temperature_for_model` gates on
+      `is_claude_model` first so a local `qwen3.5:9b` is not mistaken for an unrecognized Claude.
+      Provider gate unchanged in effect: only `Provider::Anthropic` requests carry the field (the
+      OpenAI-compat conversion drops it, Ollama enables `think` by model detection).
       `RunOptions::thinking_mode` stays as the internal per-run escape hatch.
 
 **Live GUI drive (2026-07-24, gemma4:12b):** planner does NOT over-decompose — "what is 2+2?" planned

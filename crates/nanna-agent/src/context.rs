@@ -1075,10 +1075,10 @@ impl AgentContext {
 
         let request = AnthropicRequest {
             context_limit: None,
-            model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: u32::try_from(model_info.max_output_tokens.min(2_048)).unwrap_or(u32::MAX),
-            temperature: Some(0.3),
+            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.3),
+            model: model_name,
             system: Some("You are a conversation summarizer. Output only the summary, no preamble.".to_string()),
             tools: None,
             stream: None,

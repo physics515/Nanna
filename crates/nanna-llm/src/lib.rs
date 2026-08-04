@@ -1106,25 +1106,237 @@ impl CompletionRequest {
     }
 }
 
-/// Extended thinking configuration
-#[derive(Debug, Clone, Serialize)]
-pub struct ThinkingConfig {
-    /// Type of thinking (always "enabled" when present)
-    #[serde(rename = "type")]
-    pub thinking_type: String,
-    /// Budget in tokens for thinking
-    pub budget_tokens: u32,
+/// How the model should surface its reasoning.
+///
+/// `Summarized` returns readable summary text in the thinking blocks;
+/// `Omitted` still emits thinking blocks but leaves their text empty. The raw
+/// chain of thought is never returned under either setting, and both are
+/// billed the same — this controls visibility only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    /// Readable summary of the reasoning.
+    Summarized,
+    /// Thinking blocks arrive with empty text.
+    Omitted,
+}
+
+/// Extended thinking configuration.
+///
+/// Three wire shapes, and which ones a model accepts is part of that model's
+/// request contract — see [`AnthropicModelContract`]. Sending the wrong shape
+/// is a 400, not a degraded response:
+///
+/// - `{"type":"adaptive"}` — Claude 4.6 and newer. The model decides depth per
+///   request; there is no token budget to set.
+/// - `{"type":"enabled","budget_tokens":N}` — pre-4.6 models **only**.
+///   `budget_tokens` was removed on Opus 5, Opus 4.8, Opus 4.7, Sonnet 5, and
+///   Fable 5; sending it to any of them fails the request.
+/// - `{"type":"disabled"}` — explicit opt-out, where the model accepts one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ThinkingConfig {
+    /// Model-chosen thinking depth (Claude 4.6+).
+    Adaptive {
+        /// Omitted from the wire when `None`, which takes the model's default.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
+    /// Fixed thinking budget — pre-4.6 models only.
+    Enabled {
+        /// Budget in tokens. Must be strictly less than the request's
+        /// `max_tokens`, minimum 1024.
+        budget_tokens: u32,
+    },
+    /// Explicit opt-out.
+    Disabled,
 }
 
 impl ThinkingConfig {
-    /// Create a new thinking config with the given budget
+    /// A fixed-budget config, for pre-4.6 models.
     #[must_use]
-    pub fn new(budget_tokens: u32) -> Self {
-        Self {
-            thinking_type: "enabled".to_string(),
-            budget_tokens,
+    pub const fn enabled(budget_tokens: u32) -> Self {
+        Self::Enabled { budget_tokens }
+    }
+
+    /// An adaptive config that asks for readable reasoning summaries.
+    #[must_use]
+    pub const fn adaptive_summarized() -> Self {
+        Self::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
         }
     }
+
+    /// An adaptive config that takes the model's own `display` default.
+    #[must_use]
+    pub const fn adaptive() -> Self {
+        Self::Adaptive { display: None }
+    }
+
+    /// The fixed budget, if this is a budgeted config.
+    #[must_use]
+    pub const fn budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Enabled { budget_tokens } => Some(*budget_tokens),
+            _ => None,
+        }
+    }
+
+    /// Whether this config asks the model to reason.
+    #[must_use]
+    pub const fn is_thinking(&self) -> bool {
+        matches!(self, Self::Adaptive { .. } | Self::Enabled { .. })
+    }
+}
+
+/// The parts of a Claude model's request contract that differ by model family
+/// and fail closed — send the wrong shape and the API returns 400 rather than
+/// ignoring the field.
+///
+/// Derived from the published per-model table; the two axes that bite are the
+/// `thinking` shape and whether sampling parameters still exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Four independent capability facts about one model, not a state machine:
+// every combination below is a real published contract, and they are read
+// individually at different points in the request build.
+#[allow(clippy::struct_excessive_bools)]
+pub struct AnthropicModelContract {
+    /// Takes `{"type":"adaptive"}`; `budget_tokens` is rejected.
+    pub adaptive_thinking: bool,
+    /// `thinking.display` defaults to `"omitted"`, so reasoning text only
+    /// arrives if `"summarized"` is asked for explicitly. On the 4.6 family
+    /// the default is already `"summarized"`.
+    pub display_defaults_omitted: bool,
+    /// `temperature`, `top_p`, and `top_k` were removed; sending one is a 400.
+    pub sampling_removed: bool,
+    /// Thinking cannot be turned off — `{"type":"disabled"}` is rejected, so
+    /// the only legal request is one with no `thinking` field.
+    pub thinking_always_on: bool,
+}
+
+impl AnthropicModelContract {
+    /// The pre-4.6 contract: fixed thinking budgets, sampling parameters live.
+    const LEGACY: Self = Self {
+        adaptive_thinking: false,
+        display_defaults_omitted: false,
+        sampling_removed: false,
+        thinking_always_on: false,
+    };
+}
+
+/// Classify a Claude model into its request contract.
+///
+/// Matching is by family substring rather than an exact allow-list so dated
+/// snapshots (`claude-sonnet-4-5-20250929`) and the Bedrock `anthropic.`
+/// prefix land in the right family. The patterns cannot collide across
+/// generations: `"sonnet-5"` does not occur inside `"sonnet-4-5"`, because the
+/// character after `sonnet` differs.
+///
+/// Unknown `claude-*` models get the **current-generation** contract, not the
+/// legacy one. Every model released since 4.6 has removed `budget_tokens` and
+/// the sampling parameters, so an unrecognized name is far more likely to be
+/// newer than the table than older than it — and guessing legacy for a new
+/// model produces a hard 400 on the very first request.
+#[must_use]
+pub fn anthropic_model_contract(model: &str) -> AnthropicModelContract {
+    let lowered = model.to_ascii_lowercase().replace('.', "-");
+    let name = lowered
+        .strip_prefix("anthropic.")
+        .or_else(|| lowered.strip_prefix("anthropic/"))
+        .unwrap_or(&lowered);
+
+    // Thinking is always on and cannot be disabled.
+    if name.contains("fable-5") || name.contains("mythos") {
+        return AnthropicModelContract {
+            adaptive_thinking: true,
+            display_defaults_omitted: true,
+            sampling_removed: true,
+            thinking_always_on: true,
+        };
+    }
+
+    // Adaptive-only, sampling removed, reasoning hidden unless asked for.
+    if name.contains("opus-5")
+        || name.contains("sonnet-5")
+        || name.contains("opus-4-8")
+        || name.contains("opus-4-7")
+    {
+        return AnthropicModelContract {
+            adaptive_thinking: true,
+            display_defaults_omitted: true,
+            sampling_removed: true,
+            thinking_always_on: false,
+        };
+    }
+
+    // The 4.6 family: adaptive, but sampling still works and reasoning
+    // summaries are already the default.
+    if name.contains("opus-4-6") || name.contains("sonnet-4-6") {
+        return AnthropicModelContract {
+            adaptive_thinking: true,
+            display_defaults_omitted: false,
+            sampling_removed: false,
+            thinking_always_on: false,
+        };
+    }
+
+    // Pre-4.6 generations keep fixed budgets and sampling. The `-4-20…` arms
+    // catch dated Claude 4.0 snapshots (`claude-sonnet-4-20250514`), whose
+    // family digit is followed straight by the date.
+    if name.contains("opus-4-5")
+        || name.contains("opus-4-1")
+        || name.contains("opus-4-0")
+        || name.contains("opus-4-20")
+        || name.contains("sonnet-4-5")
+        || name.contains("sonnet-4-0")
+        || name.contains("sonnet-4-20")
+        || name.contains("haiku-4-5")
+        || name.contains("haiku-4-20")
+        || name.contains("claude-3")
+        || name.contains("claude-2")
+    {
+        return AnthropicModelContract::LEGACY;
+    }
+
+    // Unknown: assume current generation. See the doc comment.
+    AnthropicModelContract {
+        adaptive_thinking: true,
+        display_defaults_omitted: true,
+        sampling_removed: true,
+        thinking_always_on: false,
+    }
+}
+
+/// Whether `model` names a Claude model, as opposed to an Ollama tag, an
+/// `OpenRouter` slug for someone else's model, or an `OpenAI` id.
+///
+/// [`anthropic_model_contract`] answers "which Claude contract"; it assumes
+/// the answer here is already yes. Callers that resolve a model dynamically —
+/// the summarizer and distiller pick one from `summarization_priority` and
+/// fall back to the main model — have to ask this first, or a local
+/// `qwen3.5:9b` would be classified as an unrecognized Claude model and lose
+/// its sampling parameters.
+///
+/// `OpenRouter`'s `anthropic/claude-*` slugs count: that path proxies to the
+/// same API and rejects the same removed parameters.
+#[must_use]
+pub fn is_claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
+/// The `temperature` to actually send for `model`, given what the caller
+/// wanted. `None` means the field must be omitted entirely.
+///
+/// `temperature` was removed on Opus 5 / 4.8 / 4.7, Sonnet 5, and Fable 5 —
+/// sending one is a 400, so a hard-coded temperature on an auxiliary request
+/// (summarize, distill, score, extract) fails that request outright once the
+/// model it resolves to is current-generation.
+#[must_use]
+pub fn sampling_temperature_for_model(model: &str, requested: f32) -> Option<f32> {
+    if is_claude_model(model) && anthropic_model_contract(model).sampling_removed {
+        return None;
+    }
+    Some(requested)
 }
 
 /// Full Anthropic request with tools
@@ -6422,6 +6634,134 @@ mod tests {
             tiny.conversation_history_budget(10_000, 10_000, 5_000),
             tiny.hard_input_limit()
         );
+    }
+}
+
+#[cfg(test)]
+mod anthropic_model_contract_tests {
+    use super::{anthropic_model_contract, ThinkingConfig, ThinkingDisplay};
+
+    #[test]
+    fn the_current_generation_dropped_budgets_and_sampling() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        ] {
+            let c = anthropic_model_contract(model);
+            assert!(c.adaptive_thinking, "{model} takes adaptive thinking");
+            assert!(c.sampling_removed, "{model} rejects temperature");
+            assert!(
+                c.display_defaults_omitted,
+                "{model} hides reasoning text unless display is asked for"
+            );
+            assert!(!c.thinking_always_on, "{model} accepts an explicit disable");
+        }
+    }
+
+    #[test]
+    fn fable_and_mythos_cannot_be_told_not_to_think() {
+        for model in ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"] {
+            let c = anthropic_model_contract(model);
+            assert!(c.thinking_always_on, "{model} rejects an explicit disable");
+            assert!(c.adaptive_thinking);
+            assert!(c.sampling_removed);
+        }
+    }
+
+    #[test]
+    fn the_four_six_family_is_adaptive_but_kept_sampling() {
+        for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+            let c = anthropic_model_contract(model);
+            assert!(c.adaptive_thinking, "{model} takes adaptive thinking");
+            assert!(!c.sampling_removed, "{model} kept temperature");
+            assert!(
+                !c.display_defaults_omitted,
+                "{model} already defaults to summarized reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_four_six_models_keep_budgets_and_sampling() {
+        for model in [
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+        ] {
+            let c = anthropic_model_contract(model);
+            assert!(!c.adaptive_thinking, "{model} still takes budget_tokens");
+            assert!(!c.sampling_removed, "{model} still takes temperature");
+        }
+    }
+
+    /// The family patterns are substrings, so the generations they must not
+    /// confuse are worth pinning: `sonnet-5` does not occur inside
+    /// `sonnet-4-5`, and `opus-5` does not occur inside `opus-4-5`. Getting
+    /// this wrong sends `budget_tokens` to a model that 400s on it, or strips
+    /// `temperature` from one that wanted it.
+    #[test]
+    fn adjacent_generations_do_not_collide() {
+        assert!(anthropic_model_contract("claude-sonnet-5").adaptive_thinking);
+        assert!(!anthropic_model_contract("claude-sonnet-4-5").adaptive_thinking);
+        assert!(anthropic_model_contract("claude-opus-5").adaptive_thinking);
+        assert!(!anthropic_model_contract("claude-opus-4-5").adaptive_thinking);
+    }
+
+    #[test]
+    fn provider_prefixes_and_dotted_aliases_still_classify() {
+        // Bedrock prefixes the first-party id; some configs write `4.6`.
+        assert!(anthropic_model_contract("anthropic.claude-opus-5").sampling_removed);
+        assert!(anthropic_model_contract("anthropic/claude-opus-4-6").adaptive_thinking);
+        assert!(!anthropic_model_contract("claude-opus-4.6").sampling_removed);
+        assert!(anthropic_model_contract("CLAUDE-OPUS-5").adaptive_thinking);
+    }
+
+    /// An unrecognized name is assumed to be newer than this table, not older:
+    /// every generation since 4.6 removed `budget_tokens`, so guessing legacy
+    /// would 400 on the first request against a model we simply had not heard
+    /// of yet.
+    #[test]
+    fn unknown_models_get_the_current_contract() {
+        let c = anthropic_model_contract("claude-something-unreleased");
+        assert!(c.adaptive_thinking);
+        assert!(c.sampling_removed);
+        assert!(c.display_defaults_omitted);
+    }
+
+    #[test]
+    fn the_wire_shapes_serialize_as_the_api_spells_them() {
+        let adaptive = serde_json::to_value(ThinkingConfig::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
+        })
+        .expect("serializes");
+        assert_eq!(
+            adaptive,
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+
+        let bare = serde_json::to_value(ThinkingConfig::adaptive()).expect("serializes");
+        assert_eq!(
+            bare,
+            serde_json::json!({"type": "adaptive"}),
+            "an unset display must be absent, not null"
+        );
+
+        let budgeted = serde_json::to_value(ThinkingConfig::enabled(4096)).expect("serializes");
+        assert_eq!(
+            budgeted,
+            serde_json::json!({"type": "enabled", "budget_tokens": 4096})
+        );
+
+        let off = serde_json::to_value(ThinkingConfig::Disabled).expect("serializes");
+        assert_eq!(off, serde_json::json!({"type": "disabled"}));
     }
 }
 

@@ -130,12 +130,17 @@ fn window_scaled_output_reserve(window: usize, requested_max_tokens: usize) -> u
     )
 }
 
-/// The smallest `thinking.budget_tokens` the Anthropic API accepts.
+/// The smallest `thinking.budget_tokens` the Anthropic API accepts, on the
+/// models that still have a `budget_tokens` at all.
 ///
 /// Not a preference — the API rejects anything below it, and it is exactly
 /// [`ThinkingMode::Low`]'s budget. Used as the "is there room to think at
 /// all?" test in [`thinking_budget_for_output`]: below this the only valid
 /// request is one with **no** `thinking` field.
+///
+/// Applies to the pre-4.6 contract only. Claude 4.6 and newer take
+/// `{"type":"adaptive"}` and have no budget to floor — see
+/// [`thinking_for_model`].
 pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
 
 /// Thinking mode for extended reasoning.
@@ -165,6 +170,11 @@ pub enum ThinkingMode {
     /// output budget and would be clamped on every single request, i.e. the
     /// enum value would be a lie. `Medium` is the largest step that survives
     /// the standard budget unclamped.
+    ///
+    /// The budget reaches the wire only on the pre-4.6 contract; on adaptive
+    /// models the model chooses its own depth and this figure survives solely
+    /// as the *context* reserve (thinking generates on top of `max_tokens`
+    /// either way). See [`thinking_for_model`].
     #[default]
     Medium,
     /// High thinking budget (8192 tokens).
@@ -237,6 +247,59 @@ fn thinking_budget_for_output(configured: Option<u32>, max_output: u32) -> Optio
         return None;
     }
     Some(configured.min(room))
+}
+
+/// The `thinking` field to send for this model, or `None` for no field at all.
+///
+/// The shape is not ours to choose — it is the model's request contract, and
+/// the wrong shape is a 400 rather than a degraded response. Three families,
+/// from [`nanna_llm::anthropic_model_contract`]:
+///
+/// - **Adaptive (4.6 and newer).** No token budget exists; the model decides
+///   depth per request. `ThinkingMode`'s budget still shapes the *context*
+///   reserve — thinking generates on top of `max_tokens` either way — but it
+///   has no wire representation here.
+/// - **Legacy (pre-4.6).** `{"type":"enabled","budget_tokens":N}`, clamped by
+///   [`thinking_budget_for_output`] so the budget stays strictly under this
+///   request's `max_tokens`.
+/// - **Always-on (Fable/Mythos).** Reasoning cannot be turned off; an explicit
+///   `disabled` is rejected, so muting degrades to sending no field.
+///
+/// `display` is the reason a correct-looking adaptive request can still show
+/// the user nothing: on Opus 5 / 4.8 / 4.7, Sonnet 5, and Fable 5 it defaults
+/// to `"omitted"`, which streams thinking blocks with **empty text**. Asking
+/// for `"summarized"` is what makes reasoning visible. The 4.6 family already
+/// defaults to summarized, so the field is left off there rather than sent
+/// speculatively.
+#[must_use]
+fn thinking_for_model(
+    contract: nanna_llm::AnthropicModelContract,
+    mode: ThinkingMode,
+    max_output: u32,
+) -> Option<nanna_llm::ThinkingConfig> {
+    if !mode.is_enabled() {
+        // The internal `Instant` escape hatch. Omitting the field means "no
+        // thinking" on the generations that default off, but means "adaptive"
+        // on Opus 5 and Sonnet 5 — so muting has to be explicit where the
+        // model accepts an explicit off, and degrades to omission where it
+        // does not (Fable/Mythos reject `disabled` outright).
+        return if contract.adaptive_thinking && !contract.thinking_always_on {
+            Some(nanna_llm::ThinkingConfig::Disabled)
+        } else {
+            None
+        };
+    }
+
+    if contract.adaptive_thinking {
+        return Some(if contract.display_defaults_omitted {
+            nanna_llm::ThinkingConfig::adaptive_summarized()
+        } else {
+            nanna_llm::ThinkingConfig::adaptive()
+        });
+    }
+
+    thinking_budget_for_output(mode.budget_tokens(), max_output)
+        .map(nanna_llm::ThinkingConfig::enabled)
 }
 
 /// Agent configuration
@@ -4837,10 +4900,10 @@ impl Agent {
 
         let request = AnthropicRequest {
             context_limit: None,
-            model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: 512,
-            temperature: Some(0.2),
+            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.2),
+            model: model_name,
             system: Some("You are a conversation distiller. Output ONLY structured key-value facts, one per line. No prose.".to_string()),
             tools: None,
             stream: None,
@@ -5130,10 +5193,10 @@ impl Agent {
 
         let request = AnthropicRequest {
             context_limit: None,
-            model: model_name,
             messages: vec![AnthropicMessage::user_text(prompt)],
             max_tokens: 1024,
-            temperature: Some(0.2),
+            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.2),
+            model: model_name,
             system: Some("You are a tool output summarizer. Output ONLY the summarized content, no preamble or explanation. Preserve key information density.".to_string()),
             tools: None,
             stream: None,
@@ -5296,24 +5359,33 @@ impl Agent {
         //    field off providers that would reject it AND keeps the paired
         //    `temperature: None` below from silently retuning Ollama, which
         //    substitutes its own 0.6 when temperature is absent.
-        // 2. BUDGET. See `thinking_budget_for_output`: the budget must stay
-        //    strictly under this request's `max_tokens`, which is derived
-        //    per-window and can be as small as the per-step output floor.
+        // 2. MODEL CONTRACT. Which `thinking` shape is legal — and whether
+        //    `temperature` exists at all — differs by Claude generation and
+        //    fails closed. See `thinking_for_model`.
         let thinking_mode = thinking_override.unwrap_or(self.config.thinking_mode);
-        let thinking = if self.llm.provider() == nanna_llm::Provider::Anthropic {
-            thinking_budget_for_output(thinking_mode.budget_tokens(), max_tokens)
-                .map(nanna_llm::ThinkingConfig::new)
+        let is_anthropic = self.llm.provider() == nanna_llm::Provider::Anthropic;
+        let contract = nanna_llm::anthropic_model_contract(&self.config.model);
+        let thinking = if is_anthropic {
+            thinking_for_model(contract, thinking_mode, max_tokens)
         } else {
             None
         };
+
+        // `temperature` was REMOVED on Opus 5 / 4.8 / 4.7, Sonnet 5, and
+        // Fable 5 — sending it is a 400 regardless of what `thinking` says, so
+        // the drop is keyed to the model, not to the thinking field. The
+        // second arm is the older rule that still holds on the generations
+        // that kept sampling: an explicit temperature alongside extended
+        // thinking is rejected.
+        let thinking_is_active = thinking.as_ref().is_some_and(nanna_llm::ThinkingConfig::is_thinking);
+        let drop_temperature = is_anthropic && (contract.sampling_removed || thinking_is_active);
 
         AnthropicRequest {
             context_limit: None,
             model: self.config.model.clone(),
             messages,
             max_tokens,
-            // Anthropic requires temperature=1 (or None) when thinking is enabled
-            temperature: if thinking.is_some() {
+            temperature: if drop_temperature {
                 None
             } else {
                 Some(self.config.temperature)
@@ -5599,10 +5671,12 @@ impl Agent {
 
         let request = AnthropicRequest {
             context_limit: None,
-            model: model_name,
             messages: vec![AnthropicMessage::user_text(extraction_prompt)],
             max_tokens: 1024,
-            temperature: Some(0.3), // Lower temperature for more consistent extraction
+            // Lower temperature for more consistent extraction — where the
+            // resolved model still has a temperature to set.
+            temperature: nanna_llm::sampling_temperature_for_model(&model_name, 0.3),
+            model: model_name,
             system: Some("You are a memory extraction system. Output only valid JSON.".to_string()),
             tools: None,
             stream: None,
@@ -8969,7 +9043,11 @@ mod thinking_always_on_tests {
     /// depend on test order, and the on-disk model-info cache cannot serve a
     /// real entry for it. `model_info_from_cache_or_unknown` therefore returns
     /// the documented unknown floor: 32000 window / 4096 max output.
-    const MODEL: &str = "claude-thinking-default-probe";
+    ///
+    /// The `claude-3` stem is load-bearing: it classifies as the legacy
+    /// request contract, which is the one with a `budget_tokens` knob for the
+    /// clamp assertions to exercise.
+    const MODEL: &str = "claude-3-thinking-default-probe";
 
     fn anthropic_agent(config: AgentConfig) -> Agent {
         // Never contacted — only `build_request_with_thinking` is driven, and
@@ -9072,9 +9150,10 @@ mod thinking_always_on_tests {
     }
 
     #[tokio::test]
-    async fn an_anthropic_request_carries_thinking_and_drops_temperature() {
+    async fn a_legacy_anthropic_request_carries_a_budget_and_drops_temperature() {
+        // Pre-4.6 models are the only ones that still take `budget_tokens`.
         let agent = anthropic_agent(AgentConfig {
-            model: MODEL.to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
             ..Default::default()
         });
         let request = agent
@@ -9084,19 +9163,115 @@ mod thinking_always_on_tests {
         let thinking = request
             .thinking
             .as_ref()
-            .expect("an Anthropic request must carry a thinking budget by default");
-        assert_eq!(thinking.thinking_type, "enabled");
+            .expect("a legacy Anthropic request must carry a thinking budget by default");
+        let budget = thinking
+            .budget_tokens()
+            .expect("legacy models take the budgeted shape");
         assert!(
-            thinking.budget_tokens < request.max_tokens,
-            "budget {} must be strictly under max_tokens {}",
-            thinking.budget_tokens,
+            budget < request.max_tokens,
+            "budget {budget} must be strictly under max_tokens {}",
             request.max_tokens
         );
-        // Anthropic rejects an explicit temperature alongside thinking; the
-        // pairing must survive thinking becoming the default.
+        // The generations that kept sampling still reject an explicit
+        // temperature alongside extended thinking.
         assert!(
             request.temperature.is_none(),
-            "temperature must be omitted whenever thinking is sent"
+            "temperature must be omitted whenever a thinking budget is sent"
+        );
+    }
+
+    /// The regression this whole change exists to prevent: `budget_tokens` was
+    /// removed on the current generation, so the shape that is correct on
+    /// Sonnet 4 is a hard 400 on the model the owner actually runs.
+    #[tokio::test]
+    async fn a_current_generation_request_is_adaptive_visible_and_sampling_free() {
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            let agent = anthropic_agent(AgentConfig {
+                model: model.to_string(),
+                ..Default::default()
+            });
+            let request = agent
+                .build_request_with_thinking(None, &HashSet::new(), false)
+                .await;
+
+            let thinking = request
+                .thinking
+                .as_ref()
+                .unwrap_or_else(|| panic!("{model} must ask to think"));
+            assert_eq!(
+                thinking,
+                &nanna_llm::ThinkingConfig::adaptive_summarized(),
+                "{model} takes adaptive thinking and hides reasoning unless \
+                 `display: summarized` is asked for"
+            );
+            assert_eq!(
+                thinking.budget_tokens(),
+                None,
+                "{model} rejects budget_tokens with a 400"
+            );
+            assert!(
+                request.temperature.is_none(),
+                "{model} removed temperature; sending it is a 400"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_four_six_family_takes_adaptive_without_naming_display() {
+        // 4.6 already defaults to summarized reasoning, so the field is left
+        // off rather than sent speculatively — and sampling still exists there.
+        let agent = anthropic_agent(AgentConfig {
+            model: "claude-sonnet-4-6".to_string(),
+            thinking_mode: ThinkingMode::Instant,
+            ..Default::default()
+        });
+        let muted = agent
+            .build_request_with_thinking(None, &HashSet::new(), false)
+            .await;
+        assert_eq!(muted.thinking, Some(nanna_llm::ThinkingConfig::Disabled));
+        assert_eq!(
+            muted.temperature,
+            Some(AgentConfig::default().temperature),
+            "the 4.6 family kept sampling parameters"
+        );
+
+        let agent = anthropic_agent(AgentConfig {
+            model: "claude-sonnet-4-6".to_string(),
+            ..Default::default()
+        });
+        let thinking = agent
+            .build_request_with_thinking(None, &HashSet::new(), false)
+            .await;
+        assert_eq!(
+            thinking.thinking,
+            Some(nanna_llm::ThinkingConfig::adaptive())
+        );
+    }
+
+    #[tokio::test]
+    async fn always_on_models_mute_by_omission_rather_than_a_rejected_disable() {
+        // Fable/Mythos reject an explicit `disabled`, so the only legal way to
+        // express "don't think" is to send no field — the model thinks anyway.
+        let agent = anthropic_agent(AgentConfig {
+            model: "claude-fable-5".to_string(),
+            ..Default::default()
+        });
+        let muted = agent
+            .build_request_with_thinking(Some(ThinkingMode::Instant), &HashSet::new(), false)
+            .await;
+        assert_eq!(
+            muted.thinking, None,
+            "an explicit disable is a 400 on always-on models"
+        );
+        assert!(
+            muted.temperature.is_none(),
+            "sampling is removed on always-on models regardless of thinking"
         );
     }
 
@@ -9143,7 +9318,7 @@ mod thinking_always_on_tests {
             .build_request_with_thinking(Some(ThinkingMode::Low), &HashSet::new(), false)
             .await;
         assert_eq!(
-            raised.thinking.as_ref().map(|t| t.budget_tokens),
+            raised.thinking.as_ref().and_then(nanna_llm::ThinkingConfig::budget_tokens),
             Some(MIN_THINKING_BUDGET_TOKENS)
         );
     }
