@@ -1,0 +1,63 @@
+# Performance budget gate.
+#
+# Fails a PR that regresses a committed deterministic budget. The sources are
+# the tests named in `bench/budgets.toml` (and the nanna-bench lib that owns the
+# suite registry) — offline, fixed-seed, hardware-independent. Criterion timing
+# benches and live on-model evals are NOT run here: those need the reference GPU
+# and belong to a scheduled/manual job, not a PR gate.
+#
+# See bench/BASELINE.md and the daily-dev skill (Appendix B) for methodology.
+name: budget-gate
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: budget-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic-budgets:
+    # Windows on purpose: platform of record for this workspace (same as
+    # test-compile.yml). Deterministic suites are hardware-independent, but the
+    # MSVC/pure-Rust path is what we ship against.
+    runs-on: windows-latest
+    # Retention + harness are pure CPU and finish in seconds once compiled;
+    # the budget is dominated by a cold build of nanna-memory / nanna-agent.
+    # 30m matches test-compile headroom.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Honour rust-toolchain.toml (single source of truth for the pin). Do not
+      # float to "latest nightly" — release codegen on newer nightlies has ICE'd
+      # on tokio under this workspace's fat-LTO profile (see rust-toolchain.toml).
+      # Omitting `toolchain:` makes dtolnay/rust-toolchain read the file.
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: budget-gate
+          # Only the three crates under test + their dep trees.
+          cache-targets: true
+
+      # Suite 3 — Dreaming & compression (bench/budgets.toml dreaming.*)
+      # Sources: nanna_memory::retention::tests::*
+      - name: Suite 3 — memory retention budgets
+        run: cargo test -p nanna-memory --lib retention --locked -- --nocapture
+
+      # Suite 4 — Long-horizon harness, deterministic half
+      # (bench/budgets.toml agent_loop.*)
+      # Sources: nanna_agent::harness::tests::*
+      - name: Suite 4 — agent harness budgets
+        run: cargo test -p nanna-agent --lib harness --locked -- --nocapture
+
+      # Suite registry + fixture determinism (nanna-bench lib tests).
+      # Criterion timing benches are excluded: they need the reference tier.
+      - name: nanna-bench lib (suite registry)
+        run: cargo test -p nanna-bench --lib --locked -- --nocapture

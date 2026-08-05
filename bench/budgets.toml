@@ -1,0 +1,96 @@
+# Machine-readable performance budgets.
+# The committed gate the daily-dev routine and (eventually) CI diff against.
+# Human-readable rationale lives in the document named by `baseline_doc`.
+#
+# Schema:
+#   id        — stable key, dotted as `<suite>.<metric>`
+#   suite     — one of `nanna_bench::Suite::id()`:
+#               inference | vector_search | dreaming | agent_loop | guardrails | efficiency
+#   metric    — the measured quantity
+#   direction — "min" (measured >= value) | "max" (measured <= value) | "exact" (measured == value)
+#   value     — the budget threshold
+#   source    — the test that produces the number
+#   note      — one line of context; see BASELINE.md for the full rationale
+
+version = 1
+baseline_doc = "bench/BASELINE.md"
+
+# --- Suite 3 — Dreaming & compression -----------------------------------------
+
+[[budget]]
+id = "dreaming.compression"
+suite = "dreaming"
+metric = "compression"
+direction = "min"
+value = 0.90
+source = "nanna_memory::retention::tests::dreaming_shrinks_store_while_holding_recall"
+note = "60 -> 6 memories on the fixed-seed corpus; deterministic, hardware-independent."
+
+[[budget]]
+id = "dreaming.recall_retention"
+suite = "dreaming"
+metric = "recall_retention"
+direction = "min"
+value = 1.0
+source = "nanna_memory::retention::tests::dreaming_shrinks_store_while_holding_recall"
+note = "recall@3 held 1.0 -> 1.0 across a dream cycle; same-topic merges keep every topic reachable."
+
+[[budget]]
+id = "dreaming.summarizer_calls"
+suite = "dreaming"
+metric = "summarizer_calls"
+direction = "max"
+value = 0.0
+source = "nanna_memory::retention::tests::dreaming_shrinks_store_while_holding_recall"
+note = "Phase (b) folds true restatements with zero LLM calls on this corpus (was 6)."
+
+# --- Suite 4 — Long-horizon harness (deterministic half) ----------------------
+
+[[budget]]
+id = "agent_loop.false_success_admitted"
+suite = "agent_loop"
+metric = "false_success_admitted"
+direction = "exact"
+value = 0.0
+source = "nanna_agent::harness::tests::false_success_claim_is_refuted_replanned_then_abandoned"
+note = "Correctness fixture: harness must never admit a TASK COMPLETE the environment refutes."
+
+[[budget]]
+id = "agent_loop.drift_containment_tokens"
+suite = "agent_loop"
+metric = "drift_containment_tokens"
+direction = "max"
+value = 6000.0
+source = "nanna_agent::harness::tests::drift_containment_cost_baseline"
+note = "Perma-claiming model is replanned once then abandoned; grinding is bounded."
+
+# --- Suite 2 — Vector search (SIMD default path) --------------------------------
+# Values are p95 latency ceilings in milliseconds on the reference tier
+# (Zen 4 / AVX-512, 768-dim). Measured 2026-08-05; ceilings ≈2× measured p95.
+
+[[budget]]
+id = "vector_search.simd_batch_1k_p95_ms"
+suite = "vector_search"
+metric = "simd_batch_1k_p95_ms"
+direction = "max"
+value = 0.20
+source = "nanna_bench::benches::vector_search::simd_batch/1000"
+note = "Measured p95 0.072 ms @ N=1000; ceiling leaves ~2× CI headroom."
+
+[[budget]]
+id = "vector_search.simd_batch_10k_p95_ms"
+suite = "vector_search"
+metric = "simd_batch_10k_p95_ms"
+direction = "max"
+value = 5.0
+source = "nanna_bench::benches::vector_search::simd_batch/10000"
+note = "Measured p95 2.55 ms @ N=10000; ceiling leaves ~2× CI headroom."
+
+[[budget]]
+id = "vector_search.simd_batch_50k_p95_ms"
+suite = "vector_search"
+metric = "simd_batch_50k_p95_ms"
+direction = "max"
+value = 25.0
+source = "nanna_bench::benches::vector_search::simd_batch/50000"
+note = "Measured p95 11.0 ms @ N=50000 (GPU_THRESHOLD); ceiling leaves ~2× CI headroom."

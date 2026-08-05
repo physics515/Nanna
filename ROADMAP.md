@@ -186,37 +186,35 @@ closed; the Update-band ingest now truly merges instead of accreting near-duplic
 
 ---
 
-## Performance & Benchmarking
+## Performance & Benchmarking ✅ (gate infrastructure landed 2026-08-05)
 
-Performance is a **gate**, not a phase (small single-GPU budget): a change ships only when a benchmark
-holds or improves the budget, and README perf claims link to an artifact. Governing metric: **task
-success @ budget** — the fraction of the agent-eval suite the local model solves within the reference
-GPU's VRAM ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). *Methodology, the six
-benchmark suites, and per-tier budgets live in the `daily-dev` skill.* Build-out:
+Performance is a **gate**, not a phase: a change ships only when a reproducible benchmark holds or
+improves the budget, and README perf claims link to an artifact. Governing metric: **task success @
+budget** — the fraction of the agent-eval suite the local model solves within the reference GPU's VRAM
+ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodology lives in the
+`daily-dev` skill; numbers live in `bench/BASELINE.md` + `bench/budgets.toml`.
 
-- [ ] `nanna-bench` crate (criterion) — unify the existing `nanna-gpu` benches
-- [ ] Define the **agent-eval suite** (the task-success denominator)
-- [~] Per-tier budgets in `bench/BASELINE.md` (VRAM ceilings, min decode tok/s, max TTFT, max dream-cycle time)
-      *(2026-07-17)* **`bench/BASELINE.md` created** — the committed diff-target the routine was missing.
-      First rows seeded from the Suite 3 (dreaming/compression) retention harness: consolidation
-      compression 0.90 @ recall retention 1.000, plus the w20 aged-recall correctness fixture (6/6 vs 0/6).
-      Other suites (inference/vector-search/agent-loop/guardrails/efficiency) are listed as not-yet-baselined.
-- [ ] CI gate — fail a PR that regresses a budget past threshold
-- [~] Inference **parity** harness (logit/sequence vs reference); memory **retention** harness (recall before/after a dream cycle)
-      *(2026-07-17)* **Memory retention harness shipped** (`nanna-memory::retention`) — the instrument the FSRS
-      `w20` fix (P13) is gated on. Measures **topic recall@k** (fraction of probe queries whose raw top-`k`
-      vector neighbours still include a same-topic memory) once before and once after a real `consolidate()`
-      dream cycle, and reports compression alongside `recall_retention` (after/before). Deterministic + offline:
-      a `RetentionCorpus` fabricates topic clusters from a `SplitMix64` seed with per-topic **era + salience +
-      access** separation (so the composite clusterer keeps topics apart instead of merging everything — the
-      non-similarity signals otherwise dominate the fixed clustering weights and cross-cluster). Replay the same
-      corpus under two `FsrsParameters` to compare `recall_retention` — that is the w20 experiment. Added thin
-      `MemoryService::{add_entry, search_by_embedding}` accessors (controlled vectors/aged FSRS + raw top-k,
-      bypassing the recall gating). Demonstration run: **60 → 6 memories (0.90 compression) with recall
-      1.000 → 1.000** (each 10-memory topic collapsed to one, recall perfectly held). 5 unit tests
-      (determinism, tag-parse, ratio-math edge cases incl. empty/appeared, fresh-corpus recall, shrink-while-
-      holding-recall); 51 nanna-memory tests green. Inference parity harness still open (belongs to Mummu).
-- [ ] Perf dashboard — live TTFT / tok-s / VRAM / cache-hit in the GUI
+- [x] **`nanna-bench` crate (criterion)** — suite taxonomy (`Suite::{Inference,VectorSearch,Dreaming,
+      AgentLoop,Guardrails,Efficiency}`), deterministic `fixture_vectors` (SplitMix64, shared with the
+      retention harness), `Budgets` parser over `bench/budgets.toml`, and the first real criterion body
+      (`benches/vector_search.rs`) unifying the existing `nanna-gpu` SIMD/GPU crossover benches.
+- [x] **Agent-eval suite defined** — `bench/AGENT_EVAL.md` is the task-success denominator: smoke (5),
+      endurance (42-feature `minidb`), and the published-set placeholders (Terminal-Bench easy /
+      SWE-bench Lite). Scoring rules, reference tiers, and reproduce commands are pinned there; live
+      numbers already land in Suite 4 of `BASELINE.md` (P14/P20).
+- [x] **Per-tier budgets in `bench/BASELINE.md` + machine-readable `bench/budgets.toml`** — Suite 3
+      (dreaming compression 0.90 @ recall 1.000, w20 aged-recall 6/6 vs 0/6, drift fixtures) and Suite 4
+      (harness task-success @ tokens, endurance) are baselined; Suites 1/2/5/6 carry structural rows and
+      fill in as their instruments land. Every budget has an `id` / `direction` / `value` / `source`.
+- [x] **CI budget gate** — `.github/workflows/budget-gate.yml` runs the deterministic Suite 3 retention
+      tests and fails a PR that regresses a committed threshold.
+- [x] **Memory retention harness** (`nanna-memory::retention`) — topic recall@k before/after a real
+      `consolidate()` dream cycle; the instrument the FSRS `w20` flip and the no-LLM dedup phase were
+      gated on. Deterministic + offline.
+- [ ] **Inference parity harness** (logit/sequence vs reference) — **deferred to Mummu** (P12). The
+      runner owns parity; Nanna consumes the gate, does not re-implement it.
+- [ ] **Perf dashboard** (live TTFT / tok-s / VRAM / cache-hit in the GUI) — **deferred** to a GUI
+      polish pass once `nanna-infer` streams real on-device metrics. Not blocking the gate.
 
 ---
 
