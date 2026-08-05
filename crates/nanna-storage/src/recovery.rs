@@ -53,6 +53,12 @@ const SALVAGE_TABLES: &[&str] = &[
     "messages",
     "memories",
     "memory_chunks",
+    // Buckets and queued work salvage alongside their parents: recovering the
+    // memories but not their vectors would leave a store that looks intact and
+    // retrieves nothing until a full re-embed.
+    "memory_vectors",
+    "memory_chunk_vectors",
+    "embedding_queue",
     "memory_tags",
     "config",
     "cron_jobs",

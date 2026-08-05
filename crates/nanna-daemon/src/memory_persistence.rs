@@ -5,7 +5,7 @@
 //! (storage models).  All FSRS fields are round-tripped losslessly.
 
 use async_trait::async_trait;
-use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence};
+use nanna_memory::{ChunkWrite, FsrsState, LoadReport, MemoryEntry, MemoryError, MemoryPersistence, PendingChunk};
 use nanna_storage::{MemoryRepository, NewMemory, NewMemoryChunk};
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -55,6 +55,31 @@ fn entry_to_new_memory(entry: &MemoryEntry) -> NewMemory {
         fsrs_importance: entry.fsrs.importance,
         fsrs_storage_strength: entry.fsrs.storage_strength,
         fsrs_generation: i64::from(entry.fsrs.generation),
+    }
+}
+
+/// Attach every persisted bucket to `entry`, and activate the one matching its
+/// recorded model.
+///
+/// Buckets used to live only in RAM, so a restart collapsed a memory's whole
+/// embedding history down to the single vector in the row. Restoring them is
+/// what makes a provider flap cost nothing across process boundaries.
+fn attach_buckets(entry: &mut MemoryEntry, buckets: Vec<(String, Vec<f32>)>) {
+    for (model, vector) in buckets {
+        if vector.is_empty() {
+            continue;
+        }
+        // The row's own vector wins for the model it names — it is the copy the
+        // search path materialized, and disagreeing with it here would make the
+        // active vector and its bucket differ for the same model.
+        entry.embeddings.entry(model).or_insert(vector);
+    }
+    if entry.embedding.is_empty() {
+        if let Some(model) = entry.embedding_model.clone() {
+            if let Some(vector) = entry.embeddings.get(&model) {
+                entry.embedding = vector.clone();
+            }
+        }
     }
 }
 
@@ -145,6 +170,19 @@ pub fn db_memory_to_entry(mem: nanna_storage::Memory) -> MemoryEntry {
 impl MemoryPersistence for TursoMemoryPersistence {
     async fn save_entry(&self, entry: &MemoryEntry) -> Result<(), MemoryError> {
         let new_mem = entry_to_new_memory(entry);
+        // Persist every bucket the entry carries, not only the active one.
+        // `memories.embedding` remains the materialized active copy for the
+        // existing search path; `memory_vectors` is the durable set, and it is
+        // what makes returning to a provider after an outage a lookup instead
+        // of a re-embed.
+        for (model, vector) in &entry.embeddings {
+            if vector.is_empty() || model.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.repo.put_memory_vector(&entry.id, model, vector).await {
+                warn!("Could not persist bucket '{model}' for {}: {e}", entry.id);
+            }
+        }
 
         // Try INSERT; if a duplicate memory_id exists, update all fields instead.
         // We use a two-step approach because turso INSERT OR REPLACE would reset
@@ -195,6 +233,7 @@ impl MemoryPersistence for TursoMemoryPersistence {
         &self,
         memory_id: &str,
         workspace_id: Option<&str>,
+        active_model: Option<&str>,
         chunks: &[ChunkWrite],
     ) -> Result<(), MemoryError> {
         let rows: Vec<NewMemoryChunk> = chunks
@@ -218,19 +257,57 @@ impl MemoryPersistence for TursoMemoryPersistence {
         self.repo
             .replace_chunks(memory_id, &rows)
             .await
-            .map(|_| ())
-            .map_err(|e| MemoryError::Persistence(e.to_string()))
+            .map_err(|e| MemoryError::Persistence(e.to_string()))?;
+
+        // Queue what still needs a vector, durably. A chunk written with a
+        // seeded vector (single-chunk memories reuse the parent's) is already
+        // complete and is not queued; everything else is work that must survive
+        // a restart, because the process that would have done it may not.
+        for c in chunks {
+            match (&c.embedding, &c.embedding_model) {
+                (Some(v), Some(model)) if !v.is_empty() && !model.is_empty() => {
+                    if let Err(e) = self
+                        .repo
+                        .put_chunk_vector(memory_id, c.ordinal, model, v)
+                        .await
+                    {
+                        warn!("Could not persist chunk bucket for {memory_id}#{}: {e}", c.ordinal);
+                    }
+                }
+                _ => {
+                    if let Some(model) = active_model {
+                        if let Err(e) = self
+                            .repo
+                            .enqueue_embedding(memory_id, c.ordinal, model)
+                            .await
+                        {
+                            warn!("Could not queue chunk {memory_id}#{} : {e}", c.ordinal);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn chunks_needing_embedding(
         &self,
         model: &str,
         limit: usize,
-    ) -> Result<Vec<(i64, String)>, MemoryError> {
+    ) -> Result<Vec<PendingChunk>, MemoryError> {
         self.repo
             .chunks_needing_embedding(model, limit)
             .await
-            .map(|rows| rows.into_iter().map(|c| (c.id, c.content)).collect())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|c| PendingChunk {
+                        chunk_id: c.id,
+                        memory_id: c.memory_id,
+                        ordinal: c.ordinal,
+                        content: c.content,
+                    })
+                    .collect()
+            })
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
@@ -244,6 +321,52 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .set_chunk_embedding(chunk_id, embedding, model)
             .await
             .map(|_| ())
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn clear_memory_buckets(&self, memory_id: &str) -> Result<(), MemoryError> {
+        self.repo
+            .clear_memory_buckets(memory_id)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn restore_chunk_vectors(&self, model: &str) -> Result<usize, MemoryError> {
+        self.repo
+            .restore_chunk_vectors(model)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn dequeue_embedding(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+    ) -> Result<(), MemoryError> {
+        self.repo
+            .dequeue_embedding(memory_id, ordinal, model)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn record_embedding_failure(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+        error: &str,
+    ) -> Result<(), MemoryError> {
+        self.repo
+            .record_embedding_failure(memory_id, ordinal, model, error)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn embedding_queue_health(&self) -> Result<Vec<(String, usize, Option<String>)>, MemoryError> {
+        self.repo
+            .embedding_queue_health()
+            .await
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
@@ -333,7 +456,8 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .await
             .map_err(|e| MemoryError::Persistence(e.to_string()))?;
 
-        let (entries, awaiting_embedding) = Self::convert_rows(db_memories);
+        let (mut entries, awaiting_embedding) = Self::convert_rows(db_memories);
+        self.attach_all_buckets(&mut entries).await;
         if awaiting_embedding > 0 {
             info!(
                 "Loaded {awaiting_embedding} memories with no vector yet; they are queued for \
@@ -356,7 +480,8 @@ impl MemoryPersistence for TursoMemoryPersistence {
         match self.repo.bulk_load().await {
             Ok(db_memories) => {
                 let expected = db_memories.len();
-                let (entries, awaiting_embedding) = Self::convert_rows(db_memories);
+                let (mut entries, awaiting_embedding) = Self::convert_rows(db_memories);
+                self.attach_all_buckets(&mut entries).await;
                 if awaiting_embedding > 0 {
                     info!(
                         "Loaded {awaiting_embedding} memories with no vector yet; they are queued \
@@ -374,7 +499,8 @@ impl MemoryPersistence for TursoMemoryPersistence {
                     .map_err(|se| MemoryError::Persistence(se.to_string()))?;
                 let expected = report.expected;
                 let corrupt_rows = report.corrupt_ids.len();
-                let (entries, awaiting_embedding) = Self::convert_rows(report.memories);
+                let (mut entries, awaiting_embedding) = Self::convert_rows(report.memories);
+                self.attach_all_buckets(&mut entries).await;
                 if awaiting_embedding > 0 {
                     info!(
                         "Salvaged {awaiting_embedding} memories with no vector yet; they are \
@@ -412,6 +538,41 @@ impl TursoMemoryPersistence {
             entries.push(entry);
         }
         (entries, awaiting_embedding)
+    }
+
+    /// Attach persisted buckets to already-converted entries.
+    ///
+    /// ONE scan of `memory_vectors`, grouped in memory, rather than a lookup
+    /// per entry: the loader needs every bucket for every row, and N+1 point
+    /// queries over a few thousand memories is a startup stall on the path
+    /// that already has to finish before the GUI's ready timeout.
+    async fn attach_all_buckets(&self, entries: &mut [MemoryEntry]) {
+        let all = match self.repo.all_memory_vectors().await {
+            Ok(all) => all,
+            Err(e) => {
+                warn!(
+                    "Could not load embedding buckets ({e}); memories keep only their active                      vector and a provider switch will re-embed instead of reusing"
+                );
+                return;
+            }
+        };
+        if all.is_empty() {
+            return;
+        }
+        let mut by_id: HashMap<String, Vec<(String, Vec<f32>)>> = HashMap::new();
+        for (id, model, vector) in all {
+            by_id.entry(id).or_default().push((model, vector));
+        }
+        let mut restored = 0usize;
+        for entry in entries.iter_mut() {
+            if let Some(buckets) = by_id.remove(&entry.id) {
+                restored += buckets.len();
+                attach_buckets(entry, buckets);
+            }
+        }
+        if restored > 0 {
+            info!("Restored {restored} embedding buckets across {} memories", entries.len());
+        }
     }
 }
 

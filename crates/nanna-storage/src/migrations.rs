@@ -14,6 +14,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("010_checkpoints", MIGRATION_010),
     ("011_tasks", MIGRATION_011),
     ("012_memory_chunks", MIGRATION_012),
+    ("013_embedding_buckets", MIGRATION_013),
 ];
 
 const MIGRATION_001: &str = r"
@@ -408,4 +409,75 @@ CREATE INDEX IF NOT EXISTS idx_memory_chunks_model
 -- not yet.
 CREATE INDEX IF NOT EXISTS idx_memory_chunks_pending
     ON memory_chunks(embedding_model, id);
+";
+
+const MIGRATION_013: &str = r"
+-- One row per (memory, model). This is the bucket: a model's vectors live
+-- beside every other model's rather than overwriting them, so returning to a
+-- provider after an outage costs a lookup instead of a full re-embed.
+CREATE TABLE IF NOT EXISTS memory_vectors (
+    memory_id TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (memory_id, embedding_model)
+);
+
+-- Same, per chunk. Chunk re-embedding used to overwrite in place, destroying
+-- the previous model's vector, which made a provider flap cost a full rebuild
+-- of the chunk index.
+CREATE TABLE IF NOT EXISTS memory_chunk_vectors (
+    memory_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (memory_id, ordinal, embedding_model)
+);
+
+-- Durable work queue, keyed the same way the buckets are.
+--
+-- A derived queue cannot express this. The old one tested embedding_model
+-- against the active model using a single column per row, and one column can
+-- record only ONE model -- so it could not represent a chunk that has an
+-- ollama vector but not an open-router one, which is the normal state once
+-- buckets are real.
+--
+-- attempts and last_error exist so a provider answering 402 shows up as a
+-- stuck queue with a reason attached, rather than as silence. That silence is
+-- what let 2167 memories sit unembedded for a day.
+CREATE TABLE IF NOT EXISTS embedding_queue (
+    memory_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    embedding_model TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TEXT,
+    PRIMARY KEY (memory_id, ordinal, embedding_model)
+);
+
+-- Bucket selection counts vectors per model, and the backfill scans by model.
+CREATE INDEX IF NOT EXISTS idx_memory_vectors_model
+    ON memory_vectors(embedding_model);
+CREATE INDEX IF NOT EXISTS idx_memory_chunk_vectors_model
+    ON memory_chunk_vectors(embedding_model);
+
+-- Drives the drain: oldest work first, per model.
+CREATE INDEX IF NOT EXISTS idx_embedding_queue_model
+    ON embedding_queue(embedding_model, attempts, enqueued_at);
+
+-- Cascade deletes are manual everywhere in this schema because nothing sets
+-- PRAGMA foreign_keys, so these carry no REFERENCES clause that would read as
+-- enforcement it does not provide.
+CREATE INDEX IF NOT EXISTS idx_memory_vectors_parent
+    ON memory_vectors(memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_chunk_vectors_parent
+    ON memory_chunk_vectors(memory_id);
+CREATE INDEX IF NOT EXISTS idx_embedding_queue_parent
+    ON embedding_queue(memory_id);
 ";

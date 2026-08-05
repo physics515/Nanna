@@ -145,10 +145,14 @@ pub trait MemoryPersistence: Send + Sync {
     ///
     /// The default is a no-op, which is correct for a store with no durable
     /// backing: chunks are derived data, reproducible from content at any time.
+    /// `model` is the binding these chunks were produced under, and is what
+    /// unembedded chunks get queued against. Without it the queue could not
+    /// name which bucket the work belongs to.
     async fn replace_chunks(
         &self,
         _memory_id: &str,
         _workspace_id: Option<&str>,
+        _model: Option<&str>,
         _chunks: &[ChunkWrite],
     ) -> Result<(), MemoryError> {
         Ok(())
@@ -167,7 +171,7 @@ pub trait MemoryPersistence: Send + Sync {
         &self,
         _model: &str,
         _limit: usize,
-    ) -> Result<Vec<(i64, String)>, MemoryError> {
+    ) -> Result<Vec<PendingChunk>, MemoryError> {
         Ok(Vec::new())
     }
 
@@ -202,6 +206,52 @@ pub trait MemoryPersistence: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Discard every durable bucket for `memory_id`.
+    ///
+    /// Called when content is rewritten: every stored vector describes the old
+    /// text, so keeping any of them leaves the memory findable by words it no
+    /// longer contains.
+    async fn clear_memory_buckets(&self, _memory_id: &str) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Re-activate a model's stored chunk vectors after a rebind, returning how
+    /// many were restored. This is what makes returning to a provider free.
+    async fn restore_chunk_vectors(&self, _model: &str) -> Result<usize, MemoryError> {
+        Ok(0)
+    }
+
+    /// Remove completed work from the durable queue.
+    async fn dequeue_embedding(
+        &self,
+        _memory_id: &str,
+        _ordinal: i64,
+        _model: &str,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Record a failed embedding attempt against queued work, with its reason.
+    ///
+    /// The reason is what separates a queue that is stuck from one that is
+    /// merely slow — a 402 with nothing attached reads as silence.
+    async fn record_embedding_failure(
+        &self,
+        _memory_id: &str,
+        _ordinal: i64,
+        _model: &str,
+        _error: &str,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Queue depth per model with the most recent error for each.
+    async fn embedding_queue_health(
+        &self,
+    ) -> Result<Vec<(String, usize, Option<String>)>, MemoryError> {
+        Ok(Vec::new())
+    }
+
     /// Memory ids that have no chunk rows at all, at most `limit`.
     ///
     /// These are memories written before chunking existed. They are searchable
@@ -225,6 +275,21 @@ pub trait MemoryPersistence: Send + Sync {
         let expected = entries.len();
         Ok(LoadReport { entries, corrupt_rows: 0, expected })
     }
+}
+
+/// A chunk awaiting a vector, carrying everything needed to embed it AND to
+/// report against it.
+///
+/// The queue key (`memory_id`, `ordinal`) travels with the row id because a
+/// failure has to be recorded against the durable queue, not against the
+/// chunk table — otherwise a provider that fails forever leaves no trace and
+/// the queue looks merely slow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingChunk {
+    pub chunk_id: i64,
+    pub memory_id: String,
+    pub ordinal: i64,
+    pub content: String,
 }
 
 /// One chunk on its way to durable storage.
@@ -384,6 +449,13 @@ pub struct VectorStore {
     /// Durable-store health from the last `load_from_db` (degraded if any row was
     /// unreadable). Surfaced so a corrupt store isn't a silent empty one.
     store_health: RwLock<MemoryStoreHealth>,
+    /// `provider:model` of the embedder currently bound.
+    ///
+    /// Lives HERE, with the width and chunk-geometry latches, rather than
+    /// beside them in `MemoryService` — one copy, moved under one lock, so
+    /// there is no second value that can go stale. Every write path needs it to
+    /// stamp which bucket its work belongs to.
+    active_model: RwLock<Option<String>>,
 }
 
 impl VectorStore {
@@ -396,6 +468,7 @@ impl VectorStore {
             gpu_pipeline: None,
             db: None,
             store_health: RwLock::new(MemoryStoreHealth::default()),
+            active_model: RwLock::new(None),
         }
     }
 
@@ -416,6 +489,7 @@ impl VectorStore {
                             gpu_pipeline: Some(pipeline),
                             db: None,
                             store_health: RwLock::new(MemoryStoreHealth::default()),
+                            active_model: RwLock::new(None),
                         }
                     }
                     Err(e) => {
@@ -929,11 +1003,21 @@ impl VectorStore {
         drop(entries);
 
         // Write-through the whole entry (content + embedding stay consistent).
-        if let Some(ref db) = self.db
-            && let Err(e) = db.save_entry(&snapshot).await
-        {
-            warn!("Failed to persist merged memory {}: {}", id, e);
-            // Non-fatal: in-memory cache already updated.
+        //
+        // Buckets are cleared FIRST. This path rewrote the content, so every
+        // previously stored vector describes text that no longer exists —
+        // `entry.embeddings` was cleared above for exactly that reason, and
+        // leaving the durable copies behind would let a restart resurrect what
+        // the rewrite discarded. `save_entry` then writes back only the vector
+        // that actually matches the new content.
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.clear_memory_buckets(id).await {
+                warn!("Could not clear stale buckets for {id}: {e}");
+            }
+            if let Err(e) = db.save_entry(&snapshot).await {
+                warn!("Failed to persist merged memory {}: {}", id, e);
+                // Non-fatal: in-memory cache already updated.
+            }
         }
 
         self.write_chunks(
@@ -1265,6 +1349,17 @@ impl VectorStore {
         self.config.set_dimension(new_dim);
     }
 
+    /// The bound embedding model, if the daemon has named one.
+    pub async fn active_model(&self) -> Option<String> {
+        self.active_model.read().await.clone()
+    }
+
+    /// Bind `model`. Only called under `MemoryService`'s binding write-lock,
+    /// beside `set_dimension` and `set_chunk_params`.
+    pub async fn set_active_model(&self, model: &str) {
+        *self.active_model.write().await = Some(model.to_string());
+    }
+
     /// Chunk geometry for the currently bound embedding model.
     #[must_use]
     pub fn chunk_params(&self) -> crate::chunking::ChunkParams {
@@ -1320,7 +1415,7 @@ impl VectorStore {
         &self,
         model: &str,
         limit: usize,
-    ) -> Vec<(i64, String)> {
+    ) -> Vec<PendingChunk> {
         match self.db {
             Some(ref db) => db.chunks_needing_embedding(model, limit).await.unwrap_or_default(),
             None => Vec::new(),
@@ -1341,6 +1436,55 @@ impl VectorStore {
         match self.db {
             Some(ref db) => db.set_chunk_embedding(chunk_id, embedding, model).await,
             None => Ok(()),
+        }
+    }
+
+    /// Re-activate a model's durable chunk vectors after a rebind.
+    pub async fn restore_chunk_vectors(&self, model: &str) -> usize {
+        match self.db {
+            Some(ref db) => db.restore_chunk_vectors(model).await.unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Mark queued work complete.
+    ///
+    /// Best-effort: a lost dequeue costs one redundant re-embed on the next
+    /// drain, which is strictly better than a lost vector.
+    pub async fn dequeue_embedding(&self, memory_id: &str, ordinal: i64, model: &str) {
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.dequeue_embedding(memory_id, ordinal, model).await {
+                debug!("Could not dequeue {memory_id}#{ordinal}: {e}");
+            }
+        }
+    }
+
+    /// Note a failed embedding attempt against the durable queue.
+    ///
+    /// Best-effort: losing the note must not abort the drain, but the note is
+    /// the difference between a stuck queue and a silent one.
+    pub async fn record_embedding_failure(
+        &self,
+        memory_id: &str,
+        ordinal: i64,
+        model: &str,
+        error: &str,
+    ) {
+        if let Some(ref db) = self.db {
+            if let Err(e) = db
+                .record_embedding_failure(memory_id, ordinal, model, error)
+                .await
+            {
+                debug!("Could not record embedding failure for {memory_id}#{ordinal}: {e}");
+            }
+        }
+    }
+
+    /// Queue depth per model with the most recent error for each.
+    pub async fn embedding_queue_health(&self) -> Vec<(String, usize, Option<String>)> {
+        match self.db {
+            Some(ref db) => db.embedding_queue_health().await.unwrap_or_default(),
+            None => Vec::new(),
         }
     }
 
@@ -1429,7 +1573,11 @@ impl VectorStore {
             })
             .collect();
 
-        if let Err(e) = db.replace_chunks(id, workspace_id, &writes).await {
+        let model = self.active_model().await;
+        if let Err(e) = db
+            .replace_chunks(id, workspace_id, model.as_deref(), &writes)
+            .await
+        {
             warn!("Failed to write chunks for memory {}: {} (retrieval for this memory falls back to its whole-row vector until the backfill rebuilds them)", id, e);
         }
     }
@@ -1609,6 +1757,7 @@ mod tests {
             &self,
             memory_id: &str,
             _workspace_id: Option<&str>,
+            _model: Option<&str>,
             chunks: &[ChunkWrite],
         ) -> Result<(), MemoryError> {
             self.calls.lock().unwrap().push((memory_id.to_string(), chunks.to_vec()));
