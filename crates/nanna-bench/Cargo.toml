@@ -1,0 +1,23 @@
+[package]
+name = "nanna-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified criterion harness for Nanna's six benchmark suites"
+publish = false
+
+[dependencies]
+# Criterion is the harness; suites pull in the crates they measure as needed.
+criterion = { version = "0.8", features = ["html_reports"] }
+nanna-simd = { path = "../nanna-simd" }
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "vector_search"
+harness = false

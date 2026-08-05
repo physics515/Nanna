@@ -5,6 +5,10 @@ ships only when the relevant number here holds or improves (see the `daily-dev` 
 Appendix B for methodology, suites, and the reference hardware tier). Update a number
 only on a legitimate, measured improvement, and cite the commit.
 
+**Governing metric — task success @ budget.** The agent-eval suite denominator (which
+live/harness evals count, how pass rate is scored, reference tiers) is defined in
+[`AGENT_EVAL.md`](./AGENT_EVAL.md). Machine-readable budget rows: [`budgets.toml`](./budgets.toml).
+
 Reference tier (name it in every number): RTX 4070 Ti SUPER 16 GB (Vulkan/wgpu) +
 AMD Zen 4 (AVX-512). Numbers without a hardware note are deterministic, hardware-independent
 harness results (fixed-seed synthetic corpora), reproducible on any host.
@@ -61,6 +65,7 @@ below it would paraphrase-merge genuinely distinct memories.
 
 ## Suite 4 — Long-horizon harness (task-success @ tokens)
 
+Denominator (which evals count, tiers, pass-rate rules): [`AGENT_EVAL.md`](./AGENT_EVAL.md).
 Instrument: `nanna-agent::harness` — the P14 control loop driven by scripted step runners
 and an in-memory task source. Deterministic, offline, model-free: these rows measure the
 *harness* (acceptance gating, progress-or-replan, drift containment), which is the P14
@@ -152,17 +157,74 @@ pass^k on the endurance suite, and the 8 GB reference tier.
 
 ---
 
-## Suites not yet baselined
+## Suite 1 — Inference (not yet baselined)
 
-The remaining suites from Appendix B have no committed baseline yet — establishing them is
-open work in *Performance & Benchmarking* / P12 / P13:
+Instrument: Mummu / `nanna-infer` (P12). Local-model decode on the reference tier
+(RTX 4070 Ti SUPER 16 GB, Vulkan/wgpu) and the low-VRAM / CPU-only guardrails.
 
-- **Suite 1 — Inference** (TTFT, prefill/decode tok/s, peak VRAM, load time): belongs to the
-  Mummu runner; not measured here.
-- **Suite 2 — Memory & vector search** (recall p50/p95, search latency at N=1k/10k/50k/100k,
-  RAM/100k). The SIMD↔GPU crossover is characterized (`nanna-gpu` benches: `GPU_THRESHOLD` = 50k;
-  GPU fixed dispatch ~200µs after the wgpu 30 bump) but not yet folded into a committed budget row.
-- **Suite 4 (live)** — the on-model half of the long-horizon suite (see above): task-success @
-  tokens for a real local model on the 8 GB tier.
-- **Suite 5 — Resource guardrails** (binary size, idle RAM, VRAM ceiling, cold-start).
-- **Suite 6 — Efficiency** (cache-hit rate, tokens saved by routing/compression/dedup).
+| Metric | Baseline | Source | Notes |
+| --- | --- | --- | --- |
+| TTFT (p95) | *not yet baselined* | — | time-to-first-token |
+| Prefill tok/s | *not yet baselined* | — | |
+| Decode tok/s | *not yet baselined* | — | min decode rate at the reference tier |
+| Peak VRAM | *not yet baselined* | — | must fit the 16 GB ceiling (8 GB guardrail tier separate) |
+| Model load time | *not yet baselined* | — | cold load from cache |
+
+Blocked on the Mummu runner surface. Machine-readable rows land in `bench/budgets.toml`
+under `suite = "inference"` once measured.
+
+---
+
+## Suite 2 — Vector search (SIMD default path)
+
+Instrument: `nanna-bench` criterion body `benches/vector_search.rs` (unifies the ad-hoc
+`nanna-gpu` SIMD half onto the harness) + `nanna_simd::cosine_similarity_f32`. SIMD is the
+default path; GPU engages only above `GPU_THRESHOLD = 50_000` (`nanna-memory`). Run with
+`cargo bench -p nanna-bench --bench vector_search`.
+
+Reference measurement *(2026-08-05, release, AMD Zen 4 / AVX-512, 768-dim, fixed seed
+`0x0A_11A_B01`)* — batch cosine of one query against N store vectors:
+
+| Metric | Baseline (p50 / p95) | Budget (p95 max) | Source | Notes |
+| --- | --- | --- | --- | --- |
+| SIMD batch search @ N=1k | **0.042 / 0.072 ms** | **≤ 0.20 ms** | `nanna-bench` `vector_search` / `simd_batch/1000` | default store size |
+| SIMD batch search @ N=10k | **1.63 / 2.55 ms** | **≤ 5.0 ms** | same / `simd_batch/10000` | |
+| SIMD batch search @ N=50k | **10.1 / 11.0 ms** | **≤ 25 ms** | same / `simd_batch/50000` | GPU crossover threshold |
+| GPU fixed dispatch overhead | ~200 µs (characterized) | not budgeted | `nanna-gpu` after wgpu 30 | was ~750 µs; GPU path still needs a live adapter |
+
+Budget: SIMD p95 must not exceed the ceilings above on the reference tier (≈2× measured headroom
+for CI noise). N=100k and RAM/100k remain unbaselined until a criterion body covers them. The
+GPU half of the crossover stays in `nanna-gpu` benches (adapter-dependent) and is not a CI gate.
+Machine-readable rows: `suite = "vector_search"` in `bench/budgets.toml`.
+
+---
+
+## Suite 5 — Resource guardrails (not yet baselined)
+
+Instrument: release-binary size, idle RSS, VRAM ceiling under the reference tier, cold-start
+to first healthy `/readyz`.
+
+| Metric | Baseline | Source | Notes |
+| --- | --- | --- | --- |
+| Release binary size (`nanna-daemon`) | *not yet baselined* | — | stripped, fat LTO |
+| Idle RAM (daemon, no model loaded) | *not yet baselined* | — | |
+| VRAM ceiling (local model loaded) | *not yet baselined* | — | must hold the 16 GB reference / 8 GB guardrail |
+| Cold-start to `/readyz` | *not yet baselined* | — | |
+
+Machine-readable rows land under `suite = "guardrails"`.
+
+---
+
+## Suite 6 — Efficiency (not yet baselined)
+
+Instrument: prompt-cache hit rate, tokens saved by routing / compression / dedup, wall-clock
+per unit of agent work.
+
+| Metric | Baseline | Source | Notes |
+| --- | --- | --- | --- |
+| Prompt-cache hit rate | *not yet baselined* | — | Anthropic / OpenAI native cache |
+| Tokens saved by tiered compression | *not yet baselined* | — | |
+| Tokens saved by dream-phase dedup | *not yet baselined* | Suite 3 summarizer_calls row | already 6 → 0 on the retention corpus |
+| Wall-clock per completed harness item | *not yet baselined* | — | pairs with Suite 4 tokens/item |
+
+Machine-readable rows land under `suite = "efficiency"`.
