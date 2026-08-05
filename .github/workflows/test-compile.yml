@@ -37,10 +37,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # No rust-toolchain.toml in the repo; the workspace uses edition 2024 and
-      # `-Z` flags locally, so nightly is the honest choice here.
+      # The workspace pins nightly-2026-07-13 in rust-toolchain.toml (the last
+      # nightly that compiles the release profile — see that file for the ICE
+      # rationale). dtolnay/rust-toolchain reads its `toolchain` input, not the
+      # toml, so pass the pinned channel explicitly rather than `@nightly`.
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-13
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2

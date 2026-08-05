@@ -35,9 +35,13 @@ jobs:
       # Honour rust-toolchain.toml (single source of truth for the pin). Do not
       # float to "latest nightly" — release codegen on newer nightlies has ICE'd
       # on tokio under this workspace's fat-LTO profile (see rust-toolchain.toml).
-      # Omitting `toolchain:` makes dtolnay/rust-toolchain read the file.
+      # dtolnay/rust-toolchain reads its `toolchain` input, not the toml, and the
+      # current @master requires that input (omitting it fails with "'toolchain'
+      # is a required input"), so pass the pinned channel explicitly.
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-13
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
