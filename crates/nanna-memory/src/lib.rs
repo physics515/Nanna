@@ -206,6 +206,21 @@ pub trait MemoryPersistence: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Discard every durable bucket for `memory_id`.
+    ///
+    /// Called when content is rewritten: every stored vector describes the old
+    /// text, so keeping any of them leaves the memory findable by words it no
+    /// longer contains.
+    async fn clear_memory_buckets(&self, _memory_id: &str) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Re-activate a model's stored chunk vectors after a rebind, returning how
+    /// many were restored. This is what makes returning to a provider free.
+    async fn restore_chunk_vectors(&self, _model: &str) -> Result<usize, MemoryError> {
+        Ok(0)
+    }
+
     /// Remove completed work from the durable queue.
     async fn dequeue_embedding(
         &self,
@@ -988,11 +1003,21 @@ impl VectorStore {
         drop(entries);
 
         // Write-through the whole entry (content + embedding stay consistent).
-        if let Some(ref db) = self.db
-            && let Err(e) = db.save_entry(&snapshot).await
-        {
-            warn!("Failed to persist merged memory {}: {}", id, e);
-            // Non-fatal: in-memory cache already updated.
+        //
+        // Buckets are cleared FIRST. This path rewrote the content, so every
+        // previously stored vector describes text that no longer exists —
+        // `entry.embeddings` was cleared above for exactly that reason, and
+        // leaving the durable copies behind would let a restart resurrect what
+        // the rewrite discarded. `save_entry` then writes back only the vector
+        // that actually matches the new content.
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.clear_memory_buckets(id).await {
+                warn!("Could not clear stale buckets for {id}: {e}");
+            }
+            if let Err(e) = db.save_entry(&snapshot).await {
+                warn!("Failed to persist merged memory {}: {}", id, e);
+                // Non-fatal: in-memory cache already updated.
+            }
         }
 
         self.write_chunks(
@@ -1411,6 +1436,14 @@ impl VectorStore {
         match self.db {
             Some(ref db) => db.set_chunk_embedding(chunk_id, embedding, model).await,
             None => Ok(()),
+        }
+    }
+
+    /// Re-activate a model's durable chunk vectors after a rebind.
+    pub async fn restore_chunk_vectors(&self, model: &str) -> usize {
+        match self.db {
+            Some(ref db) => db.restore_chunk_vectors(model).await.unwrap_or(0),
+            None => 0,
         }
     }
 

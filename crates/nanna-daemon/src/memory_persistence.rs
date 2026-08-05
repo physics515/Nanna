@@ -324,6 +324,20 @@ impl MemoryPersistence for TursoMemoryPersistence {
             .map_err(|e| MemoryError::Persistence(e.to_string()))
     }
 
+    async fn clear_memory_buckets(&self, memory_id: &str) -> Result<(), MemoryError> {
+        self.repo
+            .clear_memory_buckets(memory_id)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
+    async fn restore_chunk_vectors(&self, model: &str) -> Result<usize, MemoryError> {
+        self.repo
+            .restore_chunk_vectors(model)
+            .await
+            .map_err(|e| MemoryError::Persistence(e.to_string()))
+    }
+
     async fn dequeue_embedding(
         &self,
         memory_id: &str,

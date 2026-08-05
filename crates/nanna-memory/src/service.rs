@@ -270,6 +270,16 @@ impl MemoryService {
         self.store.set_dimension(dimension);
         let (rebound, missing) = self.store.rebind_to_model(model).await;
         drop(binding);
+        // Chunks have no in-RAM bucket map — their vectors live only on disk —
+        // so rebinding them is a durable operation, not a lookup. Restoring
+        // this model's stored chunk vectors is what stops a provider that
+        // flaps away and back from re-embedding every chunk it had already
+        // done, and it clears the matching queue entries so the drain does not
+        // redo the work either.
+        let restored = self.store.restore_chunk_vectors(model).await;
+        if restored > 0 {
+            info!("Re-activated {restored} chunk vectors already embedded by '{model}'");
+        }
         if missing > 0 {
             info!(
                 "Rebound {rebound} memories to '{model}' ({dimension} dims, {} char chunks); \

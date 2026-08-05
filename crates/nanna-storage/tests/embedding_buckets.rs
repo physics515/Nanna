@@ -314,3 +314,107 @@ async fn repeated_failures_accumulate_attempts() {
     let pending = repo.pending_embeddings("model", 10).await.expect("pending");
     assert_eq!(pending.len(), 1, "three failures are one work item, not three");
 }
+
+/// The queue has to be the thing the drain READS, not just a table it writes.
+/// It also has to work on a database whose chunks predate it, or the durable
+/// queue would replace a derived one and know about nothing.
+#[tokio::test]
+async fn the_drain_reads_the_queue_and_seeds_it_from_existing_chunks() {
+    let db = temp_db_path("drain");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+    repo.replace_chunks(
+        "m1",
+        &[chunk("m1", 0, "alpha"), chunk("m1", 1, "beta")],
+    )
+    .await
+    .expect("chunks");
+
+    // Nothing was enqueued explicitly — these chunks predate the queue.
+    let work = repo.chunks_needing_embedding("model", 10).await.expect("work");
+    assert_eq!(work.len(), 2, "the drain must seed itself from existing chunks");
+    assert!(work.iter().any(|c| c.content == "alpha"));
+}
+
+/// A chunk already embedded must NOT be re-embedded on migration. Without
+/// adopting the materialized vectors into the bucket table first, the seed sees
+/// an empty bucket table and re-indexes the entire store against a provider
+/// that may be paid or rate-limited.
+#[tokio::test]
+async fn migration_does_not_re_embed_work_already_done() {
+    let db = temp_db_path("adopt");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+
+    let mut done = chunk("m1", 0, "already embedded");
+    done.embedding = Some(vec![1.0, 0.0]);
+    done.embedding_model = Some("model".to_string());
+    repo.replace_chunks("m1", &[done, chunk("m1", 1, "not yet")])
+        .await
+        .expect("chunks");
+
+    let work = repo.chunks_needing_embedding("model", 10).await.expect("work");
+    assert_eq!(work.len(), 1, "only the unembedded chunk is work");
+    assert_eq!(work[0].content, "not yet");
+}
+
+/// Returning to a provider must be free. Its chunk vectors are still on disk,
+/// so a rebind re-activates them instead of queueing them for a second embed.
+#[tokio::test]
+async fn returning_to_a_provider_reactivates_its_chunk_vectors() {
+    let db = temp_db_path("flap");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+    repo.replace_chunks("m1", &[chunk("m1", 0, "text")]).await.expect("chunks");
+
+    // Provider A embeds it, then we fail over to B.
+    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    repo.set_chunk_embedding(work[0].id, &[1.0, 0.0], "prov:a").await.expect("embed a");
+    let b_work = repo.chunks_needing_embedding("prov:b", 10).await.expect("work b");
+    assert_eq!(b_work.len(), 1, "B has not embedded this chunk");
+    repo.set_chunk_embedding(b_work[0].id, &[0.0, 1.0], "prov:b").await.expect("embed b");
+
+    // Back to A. Its vector is still stored, so nothing is owed.
+    let restored = repo.restore_chunk_vectors("prov:a").await.expect("restore");
+    assert_eq!(restored, 1, "A's stored vector is re-activated");
+    assert!(
+        repo.chunks_needing_embedding("prov:a", 10).await.expect("work").is_empty(),
+        "returning to a provider must not re-embed what it already did"
+    );
+
+    let hits = repo
+        .search_chunks_by_embedding_sql(&[1.0, 0.0], "prov:a", 10, None)
+        .await
+        .expect("knn");
+    assert_eq!(hits.len(), 1, "the restored vector is searchable under A");
+}
+
+/// Rewriting a memory's content invalidates every vector for it — each one
+/// describes text that no longer exists. Keeping any would leave the memory
+/// findable by words it no longer contains, and the backfill would never
+/// replace it because a bucket already exists for the active model.
+#[tokio::test]
+async fn rewriting_content_discards_every_stale_bucket() {
+    let db = temp_db_path("prune");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+    repo.replace_chunks("m1", &[chunk("m1", 0, "old text")]).await.expect("chunks");
+
+    let secret = sentinel();
+    repo.put_memory_vector("m1", "a", &secret).await.expect("a");
+    repo.put_memory_vector("m1", "b", &secret).await.expect("b");
+    repo.put_chunk_vector("m1", 0, "a", &secret).await.expect("chunk a");
+
+    repo.clear_memory_buckets("m1").await.expect("clear");
+
+    assert!(repo.memory_vectors("m1").await.expect("read").is_empty());
+    let needle: Vec<u8> = secret.iter().flat_map(|f| f.to_le_bytes()).collect();
+    assert!(
+        !file_contains(&db, &needle).await,
+        "a superseded vector is a copy of the superseded text, so it must be zeroed, not just unlinked"
+    );
+}
