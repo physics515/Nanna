@@ -332,7 +332,7 @@ async fn the_drain_reads_the_queue_and_seeds_it_from_existing_chunks() {
     .expect("chunks");
 
     // Nothing was enqueued explicitly — these chunks predate the queue.
-    let work = repo.chunks_needing_embedding("model", 10).await.expect("work");
+    let work = repo.chunks_needing_embedding("model", 10, true).await.expect("work");
     assert_eq!(work.len(), 2, "the drain must seed itself from existing chunks");
     assert!(work.iter().any(|c| c.content == "alpha"));
 }
@@ -355,7 +355,7 @@ async fn migration_does_not_re_embed_work_already_done() {
         .await
         .expect("chunks");
 
-    let work = repo.chunks_needing_embedding("model", 10).await.expect("work");
+    let work = repo.chunks_needing_embedding("model", 10, true).await.expect("work");
     assert_eq!(work.len(), 1, "only the unembedded chunk is work");
     assert_eq!(work[0].content, "not yet");
 }
@@ -371,9 +371,9 @@ async fn returning_to_a_provider_reactivates_its_chunk_vectors() {
     repo.replace_chunks("m1", &[chunk("m1", 0, "text")]).await.expect("chunks");
 
     // Provider A embeds it, then we fail over to B.
-    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    let work = repo.chunks_needing_embedding("prov:a", 10, true).await.expect("work");
     repo.set_chunk_embedding(work[0].id, &[1.0, 0.0], "prov:a").await.expect("embed a");
-    let b_work = repo.chunks_needing_embedding("prov:b", 10).await.expect("work b");
+    let b_work = repo.chunks_needing_embedding("prov:b", 10, true).await.expect("work b");
     assert_eq!(b_work.len(), 1, "B has not embedded this chunk");
     repo.set_chunk_embedding(b_work[0].id, &[0.0, 1.0], "prov:b").await.expect("embed b");
 
@@ -381,7 +381,7 @@ async fn returning_to_a_provider_reactivates_its_chunk_vectors() {
     let restored = repo.restore_chunk_vectors("prov:a").await.expect("restore");
     assert_eq!(restored, 1, "A's stored vector is re-activated");
     assert!(
-        repo.chunks_needing_embedding("prov:a", 10).await.expect("work").is_empty(),
+        repo.chunks_needing_embedding("prov:a", 10, true).await.expect("work").is_empty(),
         "returning to a provider must not re-embed what it already did"
     );
 
@@ -437,7 +437,7 @@ async fn a_rewrite_then_rebind_does_not_resurrect_the_old_texts_vector() {
     repo.replace_chunks("m1", &[chunk("m1", 0, "the harbor light was green")])
         .await
         .expect("chunks");
-    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    let work = repo.chunks_needing_embedding("prov:a", 10, true).await.expect("work");
     repo.set_chunk_embedding(work[0].id, &[1.0, 0.0], "prov:a")
         .await
         .expect("embed");
@@ -460,7 +460,7 @@ async fn a_rewrite_then_rebind_does_not_resurrect_the_old_texts_vector() {
         hits.is_empty(),
         "the old text's vector must not answer for the new text"
     );
-    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    let work = repo.chunks_needing_embedding("prov:a", 10, true).await.expect("work");
     assert_eq!(work.len(), 1, "the re-embed must still be owed");
     assert_eq!(work[0].content, "TOTALLY DIFFERENT TEXT NOW");
 }
@@ -479,7 +479,7 @@ async fn a_rewrite_destroys_the_old_chunk_vectors_on_disk() {
         .expect("chunks");
 
     let secret = sentinel();
-    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    let work = repo.chunks_needing_embedding("prov:a", 10, true).await.expect("work");
     repo.set_chunk_embedding(work[0].id, &secret, "prov:a").await.expect("embed");
 
     repo.replace_chunks("m1", &[chunk("m1", 0, "replacement text")])
@@ -490,5 +490,57 @@ async fn a_rewrite_destroys_the_old_chunk_vectors_on_disk() {
     assert!(
         !file_contains(&db, &needle).await,
         "the superseded vector inverts back to the superseded text"
+    );
+}
+
+/// The pre-existing-work sweep is opt-in per call. Without the flag, only
+/// explicitly enqueued work is returned — the sweep scans the whole chunk
+/// table, and running it per drain batch made the backfill quadratic.
+#[tokio::test]
+async fn an_unseeded_drain_reads_only_the_queue() {
+    let db = temp_db_path("unseeded");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+    repo.replace_chunks("m1", &[chunk("m1", 0, "pre-existing, never enqueued")])
+        .await
+        .expect("chunks");
+    // replace_chunks purges this parent's queue rows; nothing re-enqueued.
+    repo.dequeue_embedding("m1", 0, "model").await.expect("ensure absent");
+
+    let unseeded = repo.chunks_needing_embedding("model", 10, false).await.expect("work");
+    assert!(unseeded.is_empty(), "no sweep, no derived work");
+
+    let seeded = repo.chunks_needing_embedding("model", 10, true).await.expect("work");
+    assert_eq!(seeded.len(), 1, "the sweep derives the pre-existing chunk");
+}
+
+/// Queue rows for a model that left the priority list can never drain; they
+/// sit forever and pollute health. Pruning keeps only configured models — and
+/// refuses an empty keep-list, which would wipe the queue over a missing key.
+#[tokio::test]
+async fn pruning_keeps_configured_models_and_refuses_to_wipe() {
+    let db = temp_db_path("retain");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+    repo.enqueue_embedding("m1", 0, "kept-model").await.expect("kept");
+    repo.enqueue_embedding("m1", 0, "retired-model").await.expect("retired");
+
+    let dropped = repo
+        .retain_queue_models(&["kept-model".to_string()])
+        .await
+        .expect("retain");
+    assert_eq!(dropped, 1);
+    assert_eq!(repo.pending_embeddings("kept-model", 10).await.expect("kept").len(), 1);
+    assert!(repo.pending_embeddings("retired-model", 10).await.expect("gone").is_empty());
+
+    let storage_for_panic = open(&db).await;
+    let wipe = tokio::spawn(async move {
+        storage_for_panic.memories().retain_queue_models(&[]).await
+    });
+    assert!(
+        wipe.await.expect_err("must panic").is_panic(),
+        "an empty keep-list must refuse, not silently clear the queue"
     );
 }

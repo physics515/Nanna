@@ -2491,12 +2491,29 @@ impl DaemonServer {
                 .filter_map(|spec| self.embedding_provider_for(spec))
                 .collect();
 
+            // Queue rows for models no longer in the list can never drain and
+            // would pollute queue health forever. Pruned only when something
+            // resolved — an empty resolution means a missing key, and wiping
+            // the queue over a missing key would turn a config hiccup into
+            // lost work tracking.
+            if !resolved.is_empty()
+                && let Some(ref storage) = self.storage
+            {
+                let keep: Vec<String> = resolved.iter().map(|(info, _)| info.to_string()).collect();
+                match storage.memories().retain_queue_models(&keep).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("Dropped {n} queued embeddings for models no longer configured"),
+                    Err(e) => warn!("Could not prune the embedding queue: {e}"),
+                }
+            }
+
             let primary_client = resolved.first().cloned();
             let fallbacks: Vec<_> = resolved.into_iter().skip(1).collect();
 
             if primary_client.is_none() && !specs.is_empty() {
                 warn!(
-                    "No embedding provider in embedding_priority could be resolved ({} entries                      tried) — memory will be written without vectors and queued for backfill",
+                    "No embedding provider in embedding_priority could be resolved ({} entries tried) — \
+                     memory will be written without vectors and queued for backfill",
                     specs.len()
                 );
             }
@@ -2753,7 +2770,12 @@ impl DaemonServer {
                     // re-embedded) as soon as the probe completes.
                     {
                         let memory_for_probe = memory_arc.clone();
-                        let model_name = self.embedding.model.clone();
+                        // Name the model the router actually bound — not the
+                        // legacy `embedding.model` config field, which the
+                        // priority list overrides. A log that names the wrong
+                        // model sends whoever reads it to debug a provider that
+                        // is not even running.
+                        let model_name = primary_info.to_string();
                         // Bind the store to the model that is about to write to
                         // it, BEFORE any probe or write. Without this the first
                         // entries of a session get bucketed under `None` — they
@@ -2824,11 +2846,38 @@ impl DaemonServer {
                     Some(memory_arc)
                 }
                 None => {
-                    warn!("Memory service disabled: no embedding provider available");
+                    // No provider resolved — but memory does NOT switch off.
+                    // The service runs with persistence and no embedder:
+                    // writes land in Turso with no vector, exactly the
+                    // queued-for-backfill state the loader and the drain
+                    // already handle, and they become searchable the moment a
+                    // provider is configured and the daemon restarts. The old
+                    // arm returned `None` here, which contradicted the warn
+                    // above it promising vectorless writes — and quietly
+                    // discarded every memory of a session that merely had a
+                    // missing API key.
                     warn!(
-                        "To enable memory: set OPENAI_API_KEY or use Ollama with embeddings model"
+                        "No embedding provider available — memory runs WITHOUT vectors: writes \
+                         persist and queue for backfill, recall is unavailable until an \
+                         embedding provider is configured"
                     );
-                    None
+                    let config = nanna_memory::MemoryServiceConfig::default();
+                    let memory_service = if let Some(ref storage) = self.storage {
+                        let repo = storage.memories();
+                        let db = Arc::new(TursoMemoryPersistence::new(repo));
+                        nanna_memory::MemoryService::new(config).with_persistence(db)
+                    } else {
+                        // No storage either: in-RAM only, still better than
+                        // dropping writes on the floor for the session.
+                        nanna_memory::MemoryService::new(config)
+                    };
+                    match memory_service.load_from_db().await {
+                        Ok(count) => info!("Loaded {count} memories from Turso (no embedder yet)"),
+                        Err(nanna_memory::MemoryError::Persistence(ref e))
+                            if e.contains("No persistence backend") => {}
+                        Err(e) => warn!("Failed to load memories from Turso: {e}"),
+                    }
+                    Some(Arc::new(memory_service))
                 }
             }
         } else {

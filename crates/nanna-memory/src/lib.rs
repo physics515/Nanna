@@ -167,10 +167,15 @@ pub trait MemoryPersistence: Send + Sync {
     /// exactly as unsearchable under `model` as a chunk carrying none.
     ///
     /// Returns `(chunk_id, content)`. Default: nothing to do.
+    /// `seed` asks the backing store to first sweep for pre-existing work
+    /// (chunks from before this process, or before the queue existed). The
+    /// sweep scans the whole chunk table, so callers pass it once per model
+    /// per process — new writes enqueue themselves and need no sweep.
     async fn chunks_needing_embedding(
         &self,
         _model: &str,
         _limit: usize,
+        _seed: bool,
     ) -> Result<Vec<PendingChunk>, MemoryError> {
         Ok(Vec::new())
     }
@@ -449,6 +454,10 @@ pub struct VectorStore {
     /// Durable-store health from the last `load_from_db` (degraded if any row was
     /// unreadable). Surfaced so a corrupt store isn't a silent empty one.
     store_health: RwLock<MemoryStoreHealth>,
+    /// Models whose pre-existing-work sweep (adopt + seed) has already run
+    /// this process. The sweep scans the whole chunk table, and running it on
+    /// every drain batch made the backfill quadratic in store size.
+    seeded_models: std::sync::Mutex<std::collections::HashSet<String>>,
     /// `provider:model` of the embedder currently bound.
     ///
     /// Lives HERE, with the width and chunk-geometry latches, rather than
@@ -468,6 +477,7 @@ impl VectorStore {
             gpu_pipeline: None,
             db: None,
             store_health: RwLock::new(MemoryStoreHealth::default()),
+            seeded_models: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_model: RwLock::new(None),
         }
     }
@@ -489,6 +499,7 @@ impl VectorStore {
                             gpu_pipeline: Some(pipeline),
                             db: None,
                             store_health: RwLock::new(MemoryStoreHealth::default()),
+            seeded_models: std::sync::Mutex::new(std::collections::HashSet::new()),
                             active_model: RwLock::new(None),
                         }
                     }
@@ -1421,7 +1432,12 @@ impl VectorStore {
         let hits = db
             .search_chunks(query, model, limit.saturating_mul(CHUNK_OVERFETCH), workspace_id)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                // Degrading to row-only search is correct; doing it silently is
+                // not — recall would just quietly get coarser.
+                warn!("Chunk search failed ({e}); this recall uses row vectors only");
+                Vec::new()
+            });
         crate::chunk_rank::collapse_chunk_hits(&hits, min_score)
     }
 
@@ -1431,8 +1447,33 @@ impl VectorStore {
         model: &str,
         limit: usize,
     ) -> Vec<PendingChunk> {
+        // First call for a model this process pays the pre-existing-work
+        // sweep; after that the queue alone is consulted. Marked seeded only
+        // on success, so a failed sweep is retried rather than skipped forever.
+        let seed = !self
+            .seeded_models
+            .lock()
+            .expect("seeded_models lock")
+            .contains(model);
         match self.db {
-            Some(ref db) => db.chunks_needing_embedding(model, limit).await.unwrap_or_default(),
+            Some(ref db) => match db.chunks_needing_embedding(model, limit, seed).await {
+                Ok(work) => {
+                    if seed {
+                        self.seeded_models
+                            .lock()
+                            .expect("seeded_models lock")
+                            .insert(model.to_string());
+                    }
+                    work
+                }
+                Err(e) => {
+                    // An error absorbed to an empty batch reads as "queue
+                    // complete" and stops the drain — with pending work still
+                    // in the table and nothing anywhere saying so.
+                    warn!("Could not read the embedding queue ({e}); the drain will retry next pass");
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         }
     }
@@ -1457,7 +1498,10 @@ impl VectorStore {
     /// Re-activate a model's durable chunk vectors after a rebind.
     pub async fn restore_chunk_vectors(&self, model: &str) -> usize {
         match self.db {
-            Some(ref db) => db.restore_chunk_vectors(model).await.unwrap_or(0),
+            Some(ref db) => db.restore_chunk_vectors(model).await.unwrap_or_else(|e| {
+                warn!("Could not restore '{model}' chunk vectors ({e}); they will be re-embedded by the drain instead");
+                0
+            }),
             None => 0,
         }
     }
@@ -1498,7 +1542,10 @@ impl VectorStore {
     /// Queue depth per model with the most recent error for each.
     pub async fn embedding_queue_health(&self) -> Vec<(String, usize, Option<String>)> {
         match self.db {
-            Some(ref db) => db.embedding_queue_health().await.unwrap_or_default(),
+            Some(ref db) => db.embedding_queue_health().await.unwrap_or_else(|e| {
+                warn!("Could not read embedding queue health: {e}");
+                Vec::new()
+            }),
             None => Vec::new(),
         }
     }
@@ -1506,7 +1553,10 @@ impl VectorStore {
     /// Memories with no chunk rows yet — written before chunking existed.
     pub async fn parents_without_chunks(&self, limit: usize) -> Vec<String> {
         match self.db {
-            Some(ref db) => db.parents_without_chunks(limit).await.unwrap_or_default(),
+            Some(ref db) => db.parents_without_chunks(limit).await.unwrap_or_else(|e| {
+                warn!("Could not list unchunked memories ({e}); the chunk backfill will retry next pass");
+                Vec::new()
+            }),
             None => Vec::new(),
         }
     }
