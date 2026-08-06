@@ -1,11 +1,11 @@
 {
-  "version": "0.3.2",
-  "notes": "Public Beta 7 \u2014 memory stops losing writes, and starts retrieving what it kept. Fixes three data-loss bugs found in a live store: memories written while the embedder was down vanished on restart, a stale width binding queued every write for a day, and every local model reported a fake 32k context window. Memory is now unbounded, chunked for retrieval, and paged on read.",
-  "pub_date": "2026-08-04T21:49:31.000Z",
+  "version": "0.3.3",
+  "notes": "Public Beta 8 \u2014 per-model embedding buckets persisted in Turso, a durable embedding queue that reports why it is stuck, and the embedding_priority list finally honored: providers run in your order, one at a time, failing over only on error. Existing vectors are adopted by the migration, not recomputed.",
+  "pub_date": "2026-08-06T05:35:21.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWlYWGZQZEV6dVpldiszN3BvQ3BOQURlakhyRlVORldMR2ZPcTlCWEVTeEJnTU9vZ2tFZDlPVkhaNDdDalRwZk9QN2I3NjFOc1NmbHFpQXJUN0UxS1E4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1ODgwMTEzCWZpbGU6TmFubmFfMC4zLjJfeDY0LXNldHVwLmV4ZQpjb0EwbGdJUVRrV0ZjR1RCWDdjTytmbS84UE9zNUtXSXc0dXVmbUc5OGNjL1VuVDhrVzhXS3NZNEptcVUzNTJyMXlPZnlhbXBBbTRDNVI4SEVUUmRCQT09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.2-beta.7/Nanna_0.3.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW9kMXhXbHp0Z0hkWGtOejlBazRFWENmS0hBQ1dYUWhLOFNtdVF1Q09KeUdwTGs4UnFJT1Z4MTJqQmg2L2h0NDNzUyttZG9NMG5UK0pDRmw0cjN4NHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1OTk0NDg4CWZpbGU6TmFubmFfMC4zLjNfeDY0LXNldHVwLmV4ZQpZTlVmVjZQei8xSmZaY1Nydjl1SXQzMkhPdUw0KzkvTnFzTUZkUy9TRmY5NjBDaHV2SFVLUGp6blVRVlVWNE1qTDhSTE03bE05TmMrakdoMFRnc01DZz09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.3-beta.8/Nanna_0.3.3_x64-setup.exe"
     }
   }
 }
