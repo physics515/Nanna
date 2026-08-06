@@ -418,3 +418,77 @@ async fn rewriting_content_discards_every_stale_bucket() {
         "a superseded vector is a copy of the superseded text, so it must be zeroed, not just unlinked"
     );
 }
+
+/// The resurrection sequence, verbatim from the review that found it: embed a
+/// chunk, rewrite the parent's text, then rebind to the same model. The stale
+/// bucket used to win twice — `restore_chunk_vectors` copied the OLD text's
+/// vector back into the active column, then deleted the queue row that would
+/// have re-embedded the new text, and the seed refused to re-add it because a
+/// bucket existed. The chunk was permanently searchable by words it no longer
+/// contained, and the only log line said "Re-activated 1 chunk vectors".
+#[tokio::test]
+async fn a_rewrite_then_rebind_does_not_resurrect_the_old_texts_vector() {
+    let db = temp_db_path("resurrect");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+
+    // Embed the original text under prov:a.
+    repo.replace_chunks("m1", &[chunk("m1", 0, "the harbor light was green")])
+        .await
+        .expect("chunks");
+    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    repo.set_chunk_embedding(work[0].id, &[1.0, 0.0], "prov:a")
+        .await
+        .expect("embed");
+
+    // Rewrite the text. The daemon adapter would re-enqueue; mirror that.
+    repo.replace_chunks("m1", &[chunk("m1", 0, "TOTALLY DIFFERENT TEXT NOW")])
+        .await
+        .expect("rewrite");
+    repo.enqueue_embedding("m1", 0, "prov:a").await.expect("enqueue");
+
+    // The rebind that used to trigger the resurrection.
+    let restored = repo.restore_chunk_vectors("prov:a").await.expect("restore");
+    assert_eq!(restored, 0, "there is no valid stored vector to restore");
+
+    let hits = repo
+        .search_chunks_by_embedding_sql(&[1.0, 0.0], "prov:a", 10, None)
+        .await
+        .expect("knn");
+    assert!(
+        hits.is_empty(),
+        "the old text's vector must not answer for the new text"
+    );
+    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    assert_eq!(work.len(), 1, "the re-embed must still be owed");
+    assert_eq!(work[0].content, "TOTALLY DIFFERENT TEXT NOW");
+}
+
+/// The zeroing in `replace_chunks` must reach the disk, WAL included, for the
+/// same Ghost-Vectors reason as a delete: the superseded vector is a copy of
+/// the superseded text.
+#[tokio::test]
+async fn a_rewrite_destroys_the_old_chunk_vectors_on_disk() {
+    let db = temp_db_path("rewrite_ghost");
+    let storage = open(&db).await;
+    let repo = storage.memories();
+    repo.create(memory("m1")).await.expect("create");
+    repo.replace_chunks("m1", &[chunk("m1", 0, "secret original text")])
+        .await
+        .expect("chunks");
+
+    let secret = sentinel();
+    let work = repo.chunks_needing_embedding("prov:a", 10).await.expect("work");
+    repo.set_chunk_embedding(work[0].id, &secret, "prov:a").await.expect("embed");
+
+    repo.replace_chunks("m1", &[chunk("m1", 0, "replacement text")])
+        .await
+        .expect("rewrite");
+
+    let needle: Vec<u8> = secret.iter().flat_map(|f| f.to_le_bytes()).collect();
+    assert!(
+        !file_contains(&db, &needle).await,
+        "the superseded vector inverts back to the superseded text"
+    );
+}

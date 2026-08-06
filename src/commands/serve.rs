@@ -181,7 +181,17 @@ pub async fn run_daemon(config: &Config, host: String, port: u16) -> anyhow::Res
     };
 
     info!("Initializing daemon server...");
-    let mut server = DaemonServer::new(daemon_config, EmbeddingConfig::default(), None, None);
+    // From the user's config, not `EmbeddingConfig::default()` — the default
+    // ignores the configured provider, model, AND priority list, so this
+    // entry point ran a different embedder than the daemon path did from the
+    // same config file.
+    let embedding = EmbeddingConfig {
+        provider: config.memory.embedding_provider.clone(),
+        model: config.memory.embedding_model.clone(),
+        ollama_host: config.memory.ollama_host.clone(),
+        priority: config.memory.embedding_priority.clone(),
+    };
+    let mut server = DaemonServer::new(daemon_config, embedding, None, None);
 
     info!("Daemon listening on {}:{}", host, port);
     info!("WebSocket endpoint: ws://{}:{}/ws", host, port);
