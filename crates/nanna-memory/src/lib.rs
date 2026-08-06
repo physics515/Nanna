@@ -922,11 +922,26 @@ impl VectorStore {
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
         entry.content = content.to_string();
+        // Every vector this entry holds describes the text that just stopped
+        // existing. Clearing them is what `update_content_and_embedding` does
+        // for the same reason — and this path skipping it was found live: the
+        // stale buckets survived in RAM and on disk, a later rebind reactivated
+        // them, and the backfill then skipped the entry because a bucket
+        // existed for the active model. The memory stayed findable by its old
+        // words, permanently. Cleared, the entry is the ordinary
+        // queued-for-backfill state and the drain re-embeds the new text.
+        entry.embedding = Vec::new();
+        entry.embedding_model = None;
+        entry.embeddings.clear();
         let workspace_id = entry.workspace_id.clone();
         drop(entries);
 
         // Write-through to persistence backend
         if let Some(ref db) = self.db {
+            // Durable buckets first, for the same reason as the RAM map above.
+            if let Err(e) = db.clear_memory_buckets(id).await {
+                warn!("Could not clear stale buckets for {id}: {e}");
+            }
             if let Err(e) = db.update_entry_content(id, content).await {
                 warn!("Failed to persist content update for {}: {}", id, e);
                 // Non-fatal
