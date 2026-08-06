@@ -388,6 +388,76 @@ fn canonical_acceptance(params: &Value) -> Result<Option<Value>, String> {
 // tasks.* script services
 // ---------------------------------------------------------------------------
 
+/// Planning depth at which creating a task earns a do-the-work note.
+///
+/// Depth 0 is a root item, 1 a subtask, 2 a subtask of a subtask. The two
+/// endurance datapoints split cleanly on this line: qwen3.5:9b's baseline runs
+/// created only depth-1 subtasks (9 over six hours, 14/42 → 32/42 verified),
+/// while gemma4:e4b-it-qat recursed to depth 3 ("Subtask 1 of #115", #115
+/// itself a subtask), created 103 items against 42 seeded, and verified 7 —
+/// it never advanced past feature ~10 because the window went to planning.
+/// A NOTE, never a refusal: the owner's directive is no hard caps, and the
+/// escalating-soft-nudge family is the loop's containment idiom.
+const LADDER_NUDGE_DEPTH: usize = 2;
+
+/// Open-subtask count under one parent at which the (N+1)th add earns a
+/// finish-what-you-started note. qwen's whole six-hour run created nine
+/// subtasks TOTAL; a parent holding four open ones at once is planning
+/// outrunning work.
+const SIBLING_NUDGE_AT: usize = 4;
+
+/// How deep this new task would sit in the ladder: 0 for a root item, 1 for
+/// a child of a root, and so on.
+///
+/// Bounded and cycle-safe: the walk stops at 6 hops (deeper than anything a
+/// sane plan holds, and the nudge wording maxes out long before) and on any
+/// id it has already seen — a corrupted parent cycle must degrade to a capped
+/// depth, not an infinite loop on the model's write path.
+async fn ladder_depth(storage: &Arc<Storage>, parent_id: Option<i64>) -> usize {
+    let mut depth = 0usize;
+    let mut cursor = parent_id;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = cursor {
+        if depth >= 6 || !seen.insert(id) {
+            break;
+        }
+        depth += 1;
+        cursor = match storage.tasks().get(id).await {
+            Ok(parent) => parent.parent_id,
+            // An unreadable parent ends the walk at the depth proven so far.
+            Err(_) => None,
+        };
+    }
+    depth
+}
+
+/// The decomposition-damping note for a task created at `depth` whose parent
+/// already had `open_siblings` open children, or `None` when neither signal
+/// fires. Pure so the wording and thresholds are testable without storage.
+fn decomposition_note(depth: usize, open_siblings: usize, parent_id: Option<i64>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if depth >= LADDER_NUDGE_DEPTH + 1 {
+        parts.push(format!(
+            "STOP SPLITTING: this item sits at planning depth {depth} (a subtask of a subtask              of a subtask). Every level of decomposition here has produced more planning, not              more working code. Execute this item's work in your very next step."
+        ));
+    } else if depth >= LADDER_NUDGE_DEPTH {
+        parts.push(format!(
+            "Note: this is a subtask of a subtask (planning depth {depth}). Planning is not              progress — in your next step, DO the work for this item directly instead of              splitting it again."
+        ));
+    }
+    if let (Some(parent), true) = (parent_id, open_siblings >= SIBLING_NUDGE_AT) {
+        parts.push(format!(
+            "Parent task #{parent} now has {} open subtasks. Finish and verify some of them              before adding more.",
+            open_siblings + 1
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
 /// Build the `tasks.*` services the todo skill calls. Registered in
 /// `build_script_services` when storage is available.
 #[allow(clippy::too_many_lines)]
@@ -474,12 +544,13 @@ pub fn build_task_services(
                     // ("run the tests") must still be addable after the
                     // previous one is closed, and reopening history would be
                     // the worse failure.
-                    if let Some(existing) = storage
+                    let open_items = storage
                         .tasks()
                         .list(&scope, scope_id.as_deref(), false)
                         .await
-                        .map_err(err_str)?
-                        .into_iter()
+                        .map_err(err_str)?;
+                    if let Some(existing) = open_items
+                        .iter()
                         .find(|t| t.parent_id == parent_id && same_title(&t.title, &title))
                     {
                         return Ok(json!({
@@ -579,8 +650,26 @@ pub fn build_task_services(
                         assignee: opt_string(&params, "assignee"),
                         sort_order,
                     };
+                    // Decomposition damping — a returned note, never a
+                    // refusal. The item is created regardless; the note rides
+                    // the tool result, which is exactly where the model is
+                    // looking at the moment it chose planning over working.
+                    let open_siblings = parent_id
+                        .map(|pid| {
+                            open_items
+                                .iter()
+                                .filter(|t| t.parent_id == Some(pid))
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    let depth = ladder_depth(&storage, parent_id).await;
+                    let note = decomposition_note(depth, open_siblings, parent_id);
+
                     let task = storage.tasks().create(new).await.map_err(err_str)?;
-                    Ok(json!({ "task": task_to_json(&task) }))
+                    match note {
+                        Some(note) => Ok(json!({ "task": task_to_json(&task), "note": note })),
+                        None => Ok(json!({ "task": task_to_json(&task) })),
+                    }
                 })
             }),
         );
@@ -3964,6 +4053,152 @@ mod tests {
             .expect("tasks.add service")(params)
         .await
         .expect("add succeeds")
+    }
+
+    // -----------------------------------------------------------------
+    // Decomposition damping — notes, never refusals
+    //
+    // REGRESSION (gemma4:e4b-it-qat endurance, 2026-08-06): the model
+    // recursed features into subtasks of subtasks (103 self-created items
+    // against 42 seeded, three levels deep), closed 108 items in 4.5h, and
+    // verified 7/42 — the window went to planning. qwen3.5:9b on the same
+    // harness created 9 depth-1 subtasks over six hours.
+    // -----------------------------------------------------------------
+
+    /// The thresholds separate the two live datapoints exactly: everything
+    /// qwen's baseline run did is note-free, and everything in gemma's
+    /// signature earns one.
+    #[test]
+    fn qwen_shaped_planning_is_note_free_and_gemma_shaped_planning_is_not() {
+        // Root items and first-level subtasks with few siblings: silent.
+        assert_eq!(decomposition_note(0, 0, None), None);
+        assert_eq!(decomposition_note(1, 0, Some(1)), None);
+        assert_eq!(decomposition_note(1, SIBLING_NUDGE_AT - 1, Some(1)), None);
+
+        // A subtask of a subtask: the do-the-work note.
+        let depth2 = decomposition_note(2, 0, Some(9)).expect("depth-2 note");
+        assert!(depth2.contains("DO the work"), "{depth2}");
+
+        // Depth three and beyond escalates.
+        let depth3 = decomposition_note(3, 0, Some(9)).expect("depth-3 note");
+        assert!(depth3.contains("STOP SPLITTING"), "{depth3}");
+
+        // A parent accumulating open subtasks: finish-first note, with the
+        // count the model is about to be responsible for.
+        let crowded = decomposition_note(1, SIBLING_NUDGE_AT, Some(7)).expect("sibling note");
+        assert!(crowded.contains("#7") && crowded.contains("5 open subtasks"), "{crowded}");
+
+        // Both signals join into one note.
+        let both = decomposition_note(3, SIBLING_NUDGE_AT, Some(7)).expect("both");
+        assert!(both.contains("STOP SPLITTING") && both.contains("open subtasks"), "{both}");
+    }
+
+    /// The note rides the created task — creation is NEVER refused. A hard
+    /// cap is the owner-rejected design; the damping must be advisory even at
+    /// absurd depth.
+    #[tokio::test]
+    async fn a_sub_subtask_is_created_with_a_note_not_refused() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(TurnBaselines::new()),
+        );
+
+        let feature = add_task(
+            &services,
+            json!({"title": "Feature: exists command", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        assert!(feature.get("note").is_none(), "a root item earns no note");
+
+        let sub = add_task(
+            &services,
+            json!({"title": "parse arguments", "parent_id": feature["task"]["id"]}),
+        )
+        .await;
+        assert!(sub.get("note").is_none(), "a first-level subtask earns no note");
+
+        let subsub = add_task(
+            &services,
+            json!({"title": "split on tabs", "parent_id": sub["task"]["id"]}),
+        )
+        .await;
+        assert!(subsub["task"]["id"].is_i64(), "creation must never be refused");
+        let note = subsub["note"].as_str().expect("depth-2 add carries the note");
+        assert!(note.contains("DO the work"), "{note}");
+
+        let subsubsub = add_task(
+            &services,
+            json!({"title": "handle empty field", "parent_id": subsub["task"]["id"]}),
+        )
+        .await;
+        assert!(subsubsub["task"]["id"].is_i64());
+        assert!(
+            subsubsub["note"].as_str().expect("note").contains("STOP SPLITTING"),
+            "depth 3 escalates"
+        );
+    }
+
+    /// The sibling nudge counts OPEN children only — a parent whose subtasks
+    /// are getting finished can keep planning, because that is the loop
+    /// working as intended.
+    #[tokio::test]
+    async fn the_sibling_nudge_fires_on_open_children_and_clears_as_they_close() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let services = build_task_services(
+            storage.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(TurnBaselines::new()),
+        );
+
+        let parent = add_task(
+            &services,
+            json!({"title": "Feature: put command", "scope": "session", "session_id": "s1"}),
+        )
+        .await;
+        let pid = parent["task"]["id"].as_i64().expect("id");
+
+        let mut child_ids = Vec::new();
+        for i in 0..SIBLING_NUDGE_AT {
+            let child = add_task(
+                &services,
+                json!({"title": format!("step {i}"), "parent_id": pid}),
+            )
+            .await;
+            child_ids.push(child["task"]["id"].as_i64().expect("id"));
+            if i < SIBLING_NUDGE_AT - 1 {
+                assert!(
+                    child.get("note").is_none(),
+                    "under the threshold planning stays silent (child {i})"
+                );
+            }
+        }
+
+        // The add that crossed the line carried the finish-first note.
+        let crowded = add_task(&services, json!({"title": "one more", "parent_id": pid})).await;
+        assert!(
+            crowded["note"].as_str().expect("note").contains("open subtasks"),
+            "the parent has {SIBLING_NUDGE_AT}+ open children"
+        );
+
+        // Close enough children and the same shape of add is silent again.
+        for id in &child_ids {
+            storage
+                .tasks()
+                .update(
+                    *id,
+                    TaskPatch { status: Some("cancelled".to_string()), ..TaskPatch::default() },
+                    Some("test"),
+                )
+                .await
+                .expect("close");
+        }
+        let after = add_task(&services, json!({"title": "post-close step", "parent_id": pid})).await;
+        assert!(
+            after.get("note").is_none(),
+            "closed children do not count against the parent"
+        );
     }
 
     /// REGRESSION (lfm2.5 smoke, 2026-07-25): the model re-planned the same
