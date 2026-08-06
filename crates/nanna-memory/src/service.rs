@@ -2951,6 +2951,7 @@ mod tests {
             &self,
             model: &str,
             limit: usize,
+            _seed: bool,
         ) -> Result<Vec<crate::PendingChunk>, MemoryError> {
             Ok(self
                 .chunks
@@ -3036,7 +3037,8 @@ mod tests {
         assert_eq!(
             service.dimension(),
             768,
-            "a mismatch that repeats is a stale binding, and must re-probe rather than queue              writes forever"
+            "a mismatch that repeats is a stale binding, and must re-probe rather than queue \
+             writes forever"
         );
     }
 

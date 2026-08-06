@@ -163,7 +163,7 @@ async fn the_backfill_queue_finds_missing_and_stale_vectors() {
     .expect("write");
 
     let pending = repo
-        .chunks_needing_embedding("probe", 10)
+        .chunks_needing_embedding("probe", 10, true)
         .await
         .expect("queue");
     let ordinals: Vec<i64> = pending.iter().map(|c| c.ordinal).collect();
@@ -182,7 +182,7 @@ async fn the_backfill_queue_finds_missing_and_stale_vectors() {
         .await
         .expect("set"));
     let after = repo
-        .chunks_needing_embedding("probe", 10)
+        .chunks_needing_embedding("probe", 10, true)
         .await
         .expect("queue again");
     assert_eq!(after.len(), 1, "the refilled chunk left the queue");

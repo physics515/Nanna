@@ -294,9 +294,10 @@ impl MemoryPersistence for TursoMemoryPersistence {
         &self,
         model: &str,
         limit: usize,
+        seed: bool,
     ) -> Result<Vec<PendingChunk>, MemoryError> {
         self.repo
-            .chunks_needing_embedding(model, limit)
+            .chunks_needing_embedding(model, limit, seed)
             .await
             .map(|rows| {
                 rows.into_iter()
@@ -551,7 +552,8 @@ impl TursoMemoryPersistence {
             Ok(all) => all,
             Err(e) => {
                 warn!(
-                    "Could not load embedding buckets ({e}); memories keep only their active                      vector and a provider switch will re-embed instead of reusing"
+                    "Could not load embedding buckets ({e}); memories keep only their active \
+                     vector and a provider switch will re-embed instead of reusing"
                 );
                 return;
             }

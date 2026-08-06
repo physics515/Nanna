@@ -352,8 +352,6 @@ const CHUNK_SELECT_BY_PARENT: &str = "SELECT id, memory_id, ordinal, content, ch
 
 const CHUNK_SELECT_PAGE: &str = "SELECT id, memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id, created_at, updated_at FROM memory_chunks WHERE memory_id = ?1 ORDER BY ordinal ASC LIMIT ?2 OFFSET ?3";
 
-const CHUNK_SELECT_STALE: &str = "SELECT id, memory_id, ordinal, content, char_start, char_end, embedding, embedding_model, chunk_max_chars, chunker_version, workspace_id, created_at, updated_at FROM memory_chunks WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?1 ORDER BY id ASC LIMIT ?2";
-
 const CHUNK_KNN_SCOPED: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND embedding_model = ?2 AND octet_length(embedding) = ?3 AND (workspace_id = ?4 OR workspace_id IS NULL) ORDER BY dist ASC LIMIT ?5";
 
 const CHUNK_KNN_GLOBAL: &str = "SELECT memory_id, ordinal, vector_distance_cos(embedding, ?1) AS dist FROM memory_chunks WHERE embedding IS NOT NULL AND embedding_model = ?2 AND octet_length(embedding) = ?3 ORDER BY dist ASC LIMIT ?4";
@@ -714,6 +712,42 @@ impl MemoryRepository {
         Ok(())
     }
 
+    /// Drop queued work for models not in `keep`.
+    ///
+    /// Rows for a model that left the priority list can never drain — the
+    /// drain only ever runs for bound models — so they sit forever and pollute
+    /// `embedding_queue_health` with depth that no configuration change short
+    /// of re-adding the model will move. Safe to delete: the queue stores
+    /// identity, not work product, and if the model returns to the list the
+    /// seeding sweep re-derives exactly these rows from what its buckets are
+    /// still missing.
+    ///
+    /// A caller with NOTHING resolved must not call this — an empty `keep`
+    /// here would wipe the whole queue because one API key was missing at
+    /// boot, so it is rejected loudly instead.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if the delete fails.
+    ///
+    /// # Panics
+    /// Panics if `keep` is empty.
+    pub async fn retain_queue_models(&self, keep: &[String]) -> Result<usize, StorageError> {
+        assert!(
+            !keep.is_empty(),
+            "refusing to clear the whole queue — an empty keep-list means no provider resolved,              which is a configuration problem, not a cleanup request"
+        );
+        let placeholders: Vec<String> = (1..=keep.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "DELETE FROM embedding_queue WHERE embedding_model NOT IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<turso::Value> =
+            keep.iter().map(|m| turso::Value::Text(m.clone())).collect();
+        let conn = self.conn.lock().await;
+        let n = conn.execute(&sql, params).await?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Queue depth per model with the most recent error for each.
     ///
     /// Exists so the daemon can SAY that work is piling up and why, rather than
@@ -1008,25 +1042,42 @@ impl MemoryRepository {
     ///
     /// # Errors
     /// Returns [`StorageError`] if the query fails.
+    ///
+    /// # Panics
+    /// Panics if `model` is empty.
     pub async fn chunks_needing_embedding(
         &self,
         model: &str,
         limit: usize,
+        seed: bool,
     ) -> Result<Vec<MemoryChunk>, StorageError> {
         assert!(!model.is_empty(), "chunk work must name the model it is for");
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
-        // Adopt first: work already done must be visible as done before we ask
-        // what is missing, or a migration re-embeds the whole store.
-        conn.execute(ADOPT_CHUNK_VECTORS, ()).await?;
+        if seed {
+            // Adopt first: work already done must be visible as done before we
+            // ask what is missing, or a migration re-embeds the whole store.
+            //
+            // Behind a flag because both statements scan all of
+            // `memory_chunks`, and the drain calls this every 64 items — the
+            // backfill was quadratic in store size. One seeding per (model,
+            // process) suffices: new writes enqueue themselves at write time,
+            // so the scan only exists to pick up rows from BEFORE this process
+            // (or before the queue existed at all).
+            conn.execute(ADOPT_CHUNK_VECTORS, ()).await?;
         // Seed generously relative to the batch: the drain takes `limit` items,
         // but the seed is what makes them exist at all, and under-seeding would
         // stall progress at a fraction of the batch per pass.
-        conn.execute(
-            SEED_CHUNK_QUEUE,
-            turso::params![model.to_string(), limit_i64.saturating_mul(8)],
-        )
-        .await?;
+            // The seed cap is generous but finite; the caller re-seeds only
+            // once per process, so a store larger than the cap finishes over
+            // successive restarts rather than in one. Uncapped would hold the
+            // shared connection through one giant insert.
+            conn.execute(
+                SEED_CHUNK_QUEUE,
+                turso::params![model.to_string(), 100_000_i64],
+            )
+            .await?;
+        }
         let mut rows = conn
             .query(QUEUED_CHUNKS, turso::params![model.to_string(), limit_i64])
             .await?;
