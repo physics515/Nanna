@@ -151,6 +151,20 @@ variance handled by design. Smoke on the same router: 5/5 @ 17 k tokens/item. He
 provider-aware: cloud incidents heal by pause+resume+retries only (local-server surgery is
 gated to Ollama-served models via `ProviderId::from_model`).
 
+**Small-model datapoint — `gemma4:e4b-it-qat` (2026-08-06).** First candidate in the
+smaller-than-qwen search (6.1 GB QAT quant, effective-4B MatFormer). Reference 16 GB tier,
+master `7f129c0f` (v0.3.4-beta.9 tree), fresh store, 4.5 h window, VRAM 7.2→9.5 GB across the
+run (no ceiling pressure, zero `num_ctx` demotions, zero CUDA faults; `num_ctx` latch not
+captured — eval log level was warn+registry only). Smoke first: **5/5 @ 22.7 k tokens/item,
+79 s** — statistically identical to qwen3.5:9b's 22.6 k, all 28 tool calls registry-valid.
+Endurance: **7/42 features verified in 4.50 h, 0 false successes, 1 resume**. The failure
+mode is not dialect, drift, or infrastructure — it is **recursive self-decomposition**: the
+model spawned 103 extra items against 42 seeded (subtasks of subtasks, three levels deep),
+closed 108 items total, and spent the window on ceremony — it never advanced past feature ~10
+of the dependency ladder, and 9 seeded features ended cancelled. Same harness, same machine,
+qwen ships features directly where gemma splits them. Next lever: decomposition damping
+(soft-nudge family, per the no-hard-cap directive) before writing this model off.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
