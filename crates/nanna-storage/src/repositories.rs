@@ -436,7 +436,10 @@ const RECORD_EMBEDDING_FAILURE: &str = "INSERT INTO embedding_queue (memory_id, 
 
 const RESTORE_CHUNK_VECTORS: &str = "UPDATE memory_chunks SET embedding = (SELECT v.embedding FROM memory_chunk_vectors v WHERE v.memory_id = memory_chunks.memory_id AND v.ordinal = memory_chunks.ordinal AND v.embedding_model = ?1), embedding_model = ?1, updated_at = datetime('now') WHERE EXISTS (SELECT 1 FROM memory_chunk_vectors v WHERE v.memory_id = memory_chunks.memory_id AND v.ordinal = memory_chunks.ordinal AND v.embedding_model = ?1)";
 
-const EMBEDDING_QUEUE_HEALTH: &str = "SELECT embedding_model, COUNT(*) AS n, MAX(last_error) FROM embedding_queue GROUP BY embedding_model ORDER BY n DESC";
+/// The error shown per model is the MOST RECENT one, not `MAX(last_error)` —
+/// MAX is lexicographic, so a stale "502 upstream" would forever outrank a
+/// current "402 no credit" and the health line would name the wrong problem.
+const EMBEDDING_QUEUE_HEALTH: &str = "SELECT q.embedding_model, COUNT(*) AS n, (SELECT q2.last_error FROM embedding_queue q2 WHERE q2.embedding_model = q.embedding_model AND q2.last_error IS NOT NULL ORDER BY q2.last_attempt_at DESC LIMIT 1) FROM embedding_queue q GROUP BY q.embedding_model ORDER BY n DESC";
 
 impl MemoryRepository {
     // ------------------------------------------------------------------
@@ -765,6 +768,41 @@ impl MemoryRepository {
             "every chunk must name the parent it is written under"
         );
         let conn = self.conn.lock().await;
+        // The chunk set is being replaced, so every stored chunk VECTOR for
+        // this parent describes spans of text that are about to stop existing.
+        // They go in the same statement batch, zeroed first, because a stale
+        // bucket is not merely wasteful — `restore_chunk_vectors` re-activates
+        // whatever bucket exists on the next rebind and deletes the queue row
+        // that would have re-embedded the new text, so one surviving stale
+        // bucket makes the rewritten chunk permanently searchable by words it
+        // no longer contains. That exact sequence was reproduced against a
+        // live schema before this block existed.
+        //
+        // Zero-then-delete, matching `clear_memory_buckets`: an embedding
+        // inverts back to its source text, so a superseded vector is a copy of
+        // the superseded text. The checkpoint that makes the zeroing real is
+        // paid only when there was something to zero — for a brand-new memory
+        // (the overwhelmingly common caller, via `add`) both statements match
+        // nothing and no fsync happens.
+        let stale = conn
+            .execute(
+                "UPDATE memory_chunk_vectors SET embedding = zeroblob(octet_length(embedding)) WHERE memory_id = ?1",
+                turso::params![memory_id],
+            )
+            .await?;
+        conn.execute(
+            "DELETE FROM memory_chunk_vectors WHERE memory_id = ?1",
+            turso::params![memory_id],
+        )
+        .await?;
+        // Queued chunk work names ordinals of the OLD splitting; the caller
+        // re-enqueues against the new one. Row-level work (ordinal -1) is not
+        // touched here — this primitive replaces chunks, not the row vector.
+        conn.execute(
+            "DELETE FROM embedding_queue WHERE memory_id = ?1 AND ordinal >= 0",
+            turso::params![memory_id],
+        )
+        .await?;
         conn.execute(
             "DELETE FROM memory_chunks WHERE memory_id = ?1",
             turso::params![memory_id],
@@ -791,6 +829,11 @@ impl MemoryRepository {
                 ],
             )
             .await?;
+        }
+        if stale > 0 {
+            // Without the checkpoint the zeroing is cosmetic: turso 0.6.1 keeps
+            // the pre-overwrite pages readable in the WAL indefinitely.
+            Self::checkpoint_truncate(&conn).await;
         }
         Ok(chunks.len())
     }
