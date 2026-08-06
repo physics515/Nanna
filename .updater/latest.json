@@ -1,11 +1,11 @@
 {
-  "version": "0.3.3",
-  "notes": "Public Beta 8 \u2014 per-model embedding buckets persisted in Turso, a durable embedding queue that reports why it is stuck, and the embedding_priority list finally honored: providers run in your order, one at a time, failing over only on error. Existing vectors are adopted by the migration, not recomputed.",
-  "pub_date": "2026-08-06T05:35:21.000Z",
+  "version": "0.3.4",
+  "notes": "Public Beta 9 \u2014 hardening pass: memory keeps running (persisting, queued for backfill) when no embedding provider resolves; drain and recall storage errors announce themselves; the chunk backfill is linear in store size; retired-model queue rows are pruned at startup.",
+  "pub_date": "2026-08-06T06:30:03.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaW9kMXhXbHp0Z0hkWGtOejlBazRFWENmS0hBQ1dYUWhLOFNtdVF1Q09KeUdwTGs4UnFJT1Z4MTJqQmg2L2h0NDNzUyttZG9NMG5UK0pDRmw0cjN4NHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1OTk0NDg4CWZpbGU6TmFubmFfMC4zLjNfeDY0LXNldHVwLmV4ZQpZTlVmVjZQei8xSmZaY1Nydjl1SXQzMkhPdUw0KzkvTnFzTUZkUy9TRmY5NjBDaHV2SFVLUGp6blVRVlVWNE1qTDhSTE03bE05TmMrakdoMFRnc01DZz09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.3-beta.8/Nanna_0.3.3_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWkxMXgvTlZ6Z0phbDFMMUdvNTJvMitadExHL3lUOEdLZlY2bExybWtCd3QyQzF3bkw1akRiYVJiRDNSR3J2SzVDUFBHMDNtNTlvT1pJRlRBVE1kSFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1OTk3NzcyCWZpbGU6TmFubmFfMC4zLjRfeDY0LXNldHVwLmV4ZQpoMy82eWN2Z0lmd1Q2b24rWDBLeWdqK1V2KzhyRDhEcHlNS3Q2RVljcHgzNDNBN2x1Vkt3VEkwczJwSkhQR1BHNjJKaHJDYUM0SHdMcndoempaV1REQT09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.4-beta.9/Nanna_0.3.4_x64-setup.exe"
     }
   }
 }
