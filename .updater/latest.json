@@ -1,11 +1,11 @@
 {
-  "version": "0.3.4",
-  "notes": "Public Beta 9 \u2014 hardening pass: memory keeps running (persisting, queued for backfill) when no embedding provider resolves; drain and recall storage errors announce themselves; the chunk backfill is linear in store size; retired-model queue rows are pruned at startup.",
-  "pub_date": "2026-08-06T06:30:03.000Z",
+  "version": "0.3.5",
+  "notes": "Public Beta 10 \u2014 decomposition damping merged as the single path: depth-biased task scheduling (doubled small-model endurance output), advisory decomposition notes, parent refocus, and verified-parent hygiene. Experimental levers that measured neutral-or-worse were discarded.",
+  "pub_date": "2026-08-07T19:35:39.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaWkxMXgvTlZ6Z0phbDFMMUdvNTJvMitadExHL3lUOEdLZlY2bExybWtCd3QyQzF3bkw1akRiYVJiRDNSR3J2SzVDUFBHMDNtNTlvT1pJRlRBVE1kSFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1OTk3NzcyCWZpbGU6TmFubmFfMC4zLjRfeDY0LXNldHVwLmV4ZQpoMy82eWN2Z0lmd1Q2b24rWDBLeWdqK1V2KzhyRDhEcHlNS3Q2RVljcHgzNDNBN2x1Vkt3VEkwczJwSkhQR1BHNjJKaHJDYUM0SHdMcndoempaV1REQT09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.4-beta.9/Nanna_0.3.4_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXZVVTV5ME1nNC9HcGE1NWloRG9MblBVb1RiR2wvT2pqY255MlFXTVkvR3FsTVZYQytZZmd0MjVEYVpTenNBUzIwckNnTXMvZ0tHbnZ5UXFKMzU3VVFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MTMxMjc3CWZpbGU6TmFubmFfMC4zLjVfeDY0LXNldHVwLmV4ZQpWQWpaWHNXckNtSUNSTW5vNjlMZy9BL3daMG9lTmZ0YnhOclZpdjRvRXc2b0pkc0dvVE9xRmlkK0hnQ3RFK0w2L0s2aXNiTlBXcXFpZzFvUWp1R29CQT09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.5-beta.10/Nanna_0.3.5_x64-setup.exe"
     }
   }
 }
