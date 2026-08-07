@@ -1286,6 +1286,33 @@ impl TaskSource for TursoTaskSource {
         if detail.get("verified").and_then(Value::as_bool) == Some(true) {
             self.clear_open_descendants(id).await;
         }
+        // Parent refocus, harness-door edition. The tasks.done service carries
+        // the same hint in its response, but eval completions flow through
+        // THIS door (observed: 25 completions, zero service-door refocus
+        // firings), so the hint must live where the model will actually meet
+        // it: as a note on the PARENT, which surfaces in notes_tail the moment
+        // the parent becomes the actionable leaf again. The model still makes
+        // the claim; verification is unchanged.
+        if let Ok(done) = self.storage.tasks().get(id).await
+            && let Some(pid) = done.parent_id
+            && let Ok(parent) = self.storage.tasks().get(pid).await
+            && parent.status != "done"
+            && parent.status != "cancelled"
+        {
+            let _ = self
+                .storage
+                .tasks()
+                .add_note(
+                    pid,
+                    Some(&self.actor),
+                    &format!(
+                        "Subtask #{} '{}' is done. If this goal is now satisfied, mark THIS \
+                         task done — its acceptance check will verify. Do not split it further.",
+                        done.id, done.title
+                    ),
+                )
+                .await;
+        }
         Ok(())
     }
 
