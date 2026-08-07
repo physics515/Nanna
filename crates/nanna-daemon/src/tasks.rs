@@ -1080,6 +1080,10 @@ pub struct TursoTaskSource {
     scope_id: Option<String>,
     actor: String,
     event_tx: Option<tokio::sync::broadcast::Sender<Event>>,
+    /// Where ancestor acceptance checks run during promotion. `None` disables
+    /// promotion entirely — a check executed in the wrong directory would
+    /// verify against the wrong tree, which is worse than not promoting.
+    workdir: Option<PathBuf>,
 }
 
 impl TursoTaskSource {
@@ -1097,6 +1101,7 @@ impl TursoTaskSource {
             scope_id,
             actor,
             event_tx,
+            workdir: None,
         }
     }
 
@@ -1109,6 +1114,129 @@ impl TursoTaskSource {
                 kind: kind.to_string(),
                 detail,
             });
+        }
+    }
+}
+
+impl TursoTaskSource {
+    /// Enable ancestor promotion, running acceptance checks in `workdir`.
+    #[must_use]
+    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+        self.workdir = Some(workdir);
+        self
+    }
+
+    /// After a VERIFIED completion, climb the parent chain: any open ancestor
+    /// whose acceptance check already passes is completed (verified — the
+    /// check genuinely ran) and its remaining open descendants are cancelled
+    /// as moot scaffolding.
+    ///
+    /// This is the conversion step the gemma4:e4b endurance runs exposed: the
+    /// model had working `get`/`exists` implementations early, but the
+    /// features they belonged to stayed open behind trees of self-created
+    /// subtasks — 7/42 then 5/42 verified while the underlying code passed.
+    /// The feature's own check is the ground truth; once it passes, every
+    /// open descendant is planning about work that no longer needs doing.
+    ///
+    /// Bounded: the climb stops at 6 levels or at the first ancestor whose
+    /// check fails (the feature genuinely is not done). An ancestor with no
+    /// check is climbed through, so scaffolding middle layers cannot shield a
+    /// checkable feature above them.
+    async fn promote_verified_ancestors(&self, completed_id: i64) {
+        let Some(workdir) = self.workdir.clone() else { return };
+        let repo = self.storage.tasks();
+        let mut cursor = match repo.get(completed_id).await {
+            Ok(t) => t.parent_id,
+            Err(_) => return,
+        };
+        let mut hops = 0usize;
+        while let Some(ancestor_id) = cursor {
+            hops += 1;
+            if hops > 6 {
+                break;
+            }
+            let Ok(ancestor) = repo.get(ancestor_id).await else { break };
+            cursor = ancestor.parent_id;
+            if ancestor.status == "done" || ancestor.status == "cancelled" {
+                continue;
+            }
+            let Some(acceptance) = &ancestor.acceptance else { continue };
+            let Ok(check) = AcceptanceCheck::from_json(acceptance) else { continue };
+            let verdict = check.run(&workdir).await;
+            let _ = repo
+                .log_activity(
+                    ancestor_id,
+                    Some(&self.actor),
+                    "acceptance_checked",
+                    Some(json!({ "passed": verdict.passed, "detail": verdict.detail, "promoted_probe": true })),
+                )
+                .await;
+            if !verdict.passed {
+                // The feature above is genuinely unfinished; higher ancestors
+                // depend on it, so stop climbing.
+                break;
+            }
+            // Cancel open descendants FIRST: completing a parent that still
+            // has open children would fight the leaf discipline, and either
+            // way the scaffolding is now planning about finished work.
+            if let Ok(open_items) = repo.list(&self.scope, self.scope_id.as_deref(), false).await {
+                let mut frontier = vec![ancestor_id];
+                let mut to_cancel: Vec<i64> = Vec::new();
+                while let Some(pid) = frontier.pop() {
+                    for child in open_items.iter().filter(|t| t.parent_id == Some(pid)) {
+                        frontier.push(child.id);
+                        if child.id != completed_id {
+                            to_cancel.push(child.id);
+                        }
+                    }
+                }
+                for id in to_cancel {
+                    let _ = repo
+                        .update(
+                            id,
+                            TaskPatch { status: Some("cancelled".to_string()), ..TaskPatch::default() },
+                            Some(&self.actor),
+                        )
+                        .await;
+                    let _ = repo
+                        .log_activity(
+                            id,
+                            Some(&self.actor),
+                            "scaffolding_cleared",
+                            Some(json!({ "ancestor": ancestor_id, "reason": "ancestor acceptance already passes" })),
+                        )
+                        .await;
+                }
+            }
+            match repo
+                .complete(
+                    ancestor_id,
+                    Some(&self.actor),
+                    Some(json!({
+                        "verified": true,
+                        "verdict": verdict.detail,
+                        "promoted_from": completed_id,
+                    })),
+                )
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        ancestor = ancestor_id,
+                        from = completed_id,
+                        "Ancestor promoted: its acceptance check already passes"
+                    );
+                    self.emit(
+                        ancestor_id,
+                        "completed",
+                        json!({ "verified": true, "promoted_from": completed_id }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(ancestor = ancestor_id, error = %e, "ancestor promotion failed to complete");
+                    break;
+                }
+            }
         }
     }
 }
@@ -1202,7 +1330,13 @@ impl TaskSource for TursoTaskSource {
             .complete(id, Some(&self.actor), Some(detail.clone()))
             .await
             .map_err(|e| e.to_string())?;
-        self.emit(id, "completed", detail);
+        self.emit(id, "completed", detail.clone());
+        // Promotion only from VERIFIED completions: an unverified close is a
+        // claim, and promoting ancestors off a claim would score unearned
+        // features.
+        if detail.get("verified").and_then(Value::as_bool) == Some(true) {
+            self.promote_verified_ancestors(id).await;
+        }
         Ok(())
     }
 

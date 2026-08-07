@@ -157,6 +157,10 @@ fn source_for(storage: &Arc<Storage>) -> TursoTaskSource {
         "harness".to_string(),
         None,
     )
+    // Ancestor promotion: a verified completion probes open ancestors'
+    // acceptance in the eval workspace, converting already-passing features
+    // out from under the model's scaffolding.
+    .with_workdir(eval_state_dir())
 }
 
 fn task(title: &str, description: &str, tools: &[&str], acceptance: serde_json::Value) -> NewTask {
