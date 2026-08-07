@@ -165,6 +165,54 @@ of the dependency ladder, and 9 seeded features ended cancelled. Same harness, s
 qwen ships features directly where gemma splits them. Next lever: decomposition damping
 (soft-nudge family, per the no-hard-cap directive) before writing this model off.
 
+**Iteration 2 — decomposition damping (PR #194, 2026-08-07).** Same model, tier, and
+window; `tasks.add` now returns escalating do-the-work notes on depth-2+ creation and
+sibling overhang. Result: **5/42 verified in 4.50 h** — no improvement (iteration 1: 7/42;
+the delta is run noise). The decisive observation: the notes fired 69 times (32 "STOP
+SPLITTING", 36 "DO the work") and the model kept splitting — item creation barely moved
+(133 vs 145). **In-band tool-result feedback does not alter this model's planning
+behavior.** One CUDA fault at t=66m, contained by the first-fault reset ladder; 0
+demotions. Next lever must be structural: scheduler-level deprioritization of depth-2+
+items, which cannot affect qwen (it never creates them).
+
+**Iteration 3 — depth-biased scheduling (2026-08-07): INVALIDATED by operations, 7/42.**
+`next()` deprioritizes ladder depth >= 2 (commit 1665610c). The run was paused for the
+owner's gaming session and the first two RESUME attempts wedged: the pre-warm loaded a
+default-ctx model instance that starved the eval runner's VRAM sizing, demoting `num_ctx`
+to 4096 — below the 4211-token minimum viable window — and the harness FAILED LOUDLY with
+the full arithmetic instead of running truncated (the post-2026-08-03 machinery working as
+designed). Those wedged segments mass-cancelled 26/42 seeded features before the fix
+(launch resumes with the model UNLOADED), capping the achievable score at 16. Early
+in-flight evidence before the pause was promising — item creation ran ~20-25% below runs
+1-2 at every checkpoint — but the verified count cannot be attributed. Operational lessons
+banked: resumes must start with the model unloaded (fresh launches may pre-warm), and the
+viable-floor abort turned what would have been a silent 4-hour loss into a 3-minute loud
+one, twice.
+
+**Iteration 4 — depth-biased scheduling, clean run (2026-08-07): 15/42.** The first
+genuine improvement: more than double the 7/42 baseline, on an uncontaminated full 4.5 h
+window with zero CUDA faults, zero context demotions, and only 6 features cancelled. The
+scheduler ranking depth-2+ scaffolding below the seeded ladder (commit 1665610c) is the
+only active lever this run — the parent-refocus hint sat on the service door while eval
+completions flow through the harness door (0 firings at 25 completions; moved to a note on
+the parent in 1a0cebfb for iteration 5). Item creation ran ~20-25% below the un-damped
+runs throughout. Progression: 7/42 baseline → 5/42 advisory notes (no effect, model
+ignored 69 firings) → invalid (ops) → **15/42 structural scheduling**. Bar: qwen3.5:9b
+32/42.
+
+**Iteration 5 — full honest lever set (2026-08-07): 8/42.** Depth bias + parent-refocus
+notes (1a0cebfb, confirmed planting: 21 notes by t=94m) + verified-parent hygiene. Clean
+full window, zero faults, zero demotions — and a REGRESSION from iteration 4's 15/42. The
+only configuration delta was the refocus notes; they did not convert (12 features ended
+cancelled vs 6, hygiene never fired). Two readings, both honest: the notes may add step-frame
+weight that hurts more than the redirect helps, and run-to-run variance on this model is
+large (8-15 across two clean runs of near-identical config — a single run cannot rank
+levers). **Campaign verdict:** structural scheduling is worth ~2x (7 → 15 best case);
+advisory text is worth nothing; gemma4:e4b-it-qat sits at 8-15/42 against qwen3.5:9b's
+32/42 with the honest harness. The remaining gap looks like model capability, not harness —
+further levers risk shading into scoring the benchmark for it. Decision escalated to the
+owner: accept, keep iterating, or try qwen3.5-4B as the small-model candidate.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.

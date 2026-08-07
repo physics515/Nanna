@@ -245,6 +245,24 @@ impl TaskRepository {
                 open_children.insert(parent);
             }
         }
+        // Ladder depth per task, from the same in-memory scope list. Depth
+        // 0 is a root (a seeded feature), 1 its direct subtask, 2+ the
+        // model's recursive scaffolding. Cycle-safe by construction: the walk
+        // is bounded by the map size.
+        let parent_of: HashMap<i64, i64> =
+            tasks.iter().filter_map(|t| t.parent_id.map(|p| (t.id, p))).collect();
+        let depth_of = |id: i64| -> usize {
+            let mut depth = 0usize;
+            let mut cursor = id;
+            while let Some(&p) = parent_of.get(&cursor) {
+                depth += 1;
+                cursor = p;
+                if depth >= tasks.len() {
+                    break;
+                }
+            }
+            depth
+        };
         let mut candidates: Vec<&Task> = tasks
             .iter()
             .filter(|t| !t.blocked && !open_children.contains(&t.id))
@@ -252,8 +270,21 @@ impl TaskRepository {
         candidates.sort_by(|a, b| {
             let a_progress = i32::from(a.status != "in_progress");
             let b_progress = i32::from(b.status != "in_progress");
+            // Depth ranks after resume-what-you-started and BEFORE priority:
+            // the seeded ladder and its direct subtasks always outrank the
+            // model's recursive scaffolding. This is the structural half of
+            // decomposition damping — the advisory notes on `tasks.add` fired
+            // 69 times in one endurance run while the model split anyway, so
+            // the schedule, not the model, has to hold the line. Depth 0 and 1
+            // rank EQUALLY (a feature and its direct subtasks are both real
+            // work); only depth 2+ is deprioritized, which no baseline
+            // qwen3.5:9b run ever created, so its 32/42 is untouched by
+            // construction.
+            let a_deep = i32::from(depth_of(a.id) >= 2);
+            let b_deep = i32::from(depth_of(b.id) >= 2);
             a_progress
                 .cmp(&b_progress)
+                .then(a_deep.cmp(&b_deep))
                 .then(a.priority.cmp(&b.priority))
                 .then_with(|| match (&a.due_at, &b.due_at) {
                     (Some(x), Some(y)) => x.cmp(y),
