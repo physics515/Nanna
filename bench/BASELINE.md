@@ -175,6 +175,17 @@ banked: resumes must start with the model unloaded (fresh launches may pre-warm)
 viable-floor abort turned what would have been a silent 4-hour loss into a 3-minute loud
 one, twice.
 
+**Iteration 4 — depth-biased scheduling, clean run (2026-08-07): 15/42.** The first
+genuine improvement: more than double the 7/42 baseline, on an uncontaminated full 4.5 h
+window with zero CUDA faults, zero context demotions, and only 6 features cancelled. The
+scheduler ranking depth-2+ scaffolding below the seeded ladder (commit 1665610c) is the
+only active lever this run — the parent-refocus hint sat on the service door while eval
+completions flow through the harness door (0 firings at 25 completions; moved to a note on
+the parent in 1a0cebfb for iteration 5). Item creation ran ~20-25% below the un-damped
+runs throughout. Progression: 7/42 baseline → 5/42 advisory notes (no effect, model
+ignored 69 firings) → invalid (ops) → **15/42 structural scheduling**. Bar: qwen3.5:9b
+32/42.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
