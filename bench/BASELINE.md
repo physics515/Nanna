@@ -161,6 +161,20 @@ behavior.** One CUDA fault at t=66m, contained by the first-fault reset ladder; 
 demotions. Next lever must be structural: scheduler-level deprioritization of depth-2+
 items, which cannot affect qwen (it never creates them).
 
+**Iteration 3 — depth-biased scheduling (2026-08-07): INVALIDATED by operations, 7/42.**
+`next()` deprioritizes ladder depth >= 2 (commit 1665610c). The run was paused for the
+owner's gaming session and the first two RESUME attempts wedged: the pre-warm loaded a
+default-ctx model instance that starved the eval runner's VRAM sizing, demoting `num_ctx`
+to 4096 — below the 4211-token minimum viable window — and the harness FAILED LOUDLY with
+the full arithmetic instead of running truncated (the post-2026-08-03 machinery working as
+designed). Those wedged segments mass-cancelled 26/42 seeded features before the fix
+(launch resumes with the model UNLOADED), capping the achievable score at 16. Early
+in-flight evidence before the pause was promising — item creation ran ~20-25% below runs
+1-2 at every checkpoint — but the verified count cannot be attributed. Operational lessons
+banked: resumes must start with the model unloaded (fresh launches may pre-warm), and the
+viable-floor abort turned what would have been a silent 4-hour loss into a 3-minute loud
+one, twice.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
