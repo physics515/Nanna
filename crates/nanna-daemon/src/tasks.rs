@@ -1331,12 +1331,16 @@ impl TaskSource for TursoTaskSource {
             .await
             .map_err(|e| e.to_string())?;
         self.emit(id, "completed", detail.clone());
-        // Promotion only from VERIFIED completions: an unverified close is a
-        // claim, and promoting ancestors off a claim would score unearned
-        // features.
-        if detail.get("verified").and_then(Value::as_bool) == Some(true) {
-            self.promote_verified_ancestors(id).await;
-        }
+        // Promotion probes fire from EVERY completion, verified or not. The
+        // original gate (verified only) made the lever dead code: the only
+        // verified completions are seeded features — roots with no ancestors —
+        // while the scaffolding whose closure should trigger the probe carries
+        // no acceptance check and completes unverified. Observed live
+        // (iteration 3, 41 closes, 0 promotions). The safety property never
+        // lived in the child's status anyway: the ancestor is promoted only if
+        // ITS OWN acceptance check passes, run right here — a child's claim
+        // can trigger the probe, it cannot pass it.
+        self.promote_verified_ancestors(id).await;
         Ok(())
     }
 
