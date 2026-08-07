@@ -186,6 +186,19 @@ runs throughout. Progression: 7/42 baseline → 5/42 advisory notes (no effect, 
 ignored 69 firings) → invalid (ops) → **15/42 structural scheduling**. Bar: qwen3.5:9b
 32/42.
 
+**Iteration 5 — full honest lever set (2026-08-07): 8/42.** Depth bias + parent-refocus
+notes (1a0cebfb, confirmed planting: 21 notes by t=94m) + verified-parent hygiene. Clean
+full window, zero faults, zero demotions — and a REGRESSION from iteration 4's 15/42. The
+only configuration delta was the refocus notes; they did not convert (12 features ended
+cancelled vs 6, hygiene never fired). Two readings, both honest: the notes may add step-frame
+weight that hurts more than the redirect helps, and run-to-run variance on this model is
+large (8-15 across two clean runs of near-identical config — a single run cannot rank
+levers). **Campaign verdict:** structural scheduling is worth ~2x (7 → 15 best case);
+advisory text is worth nothing; gemma4:e4b-it-qat sits at 8-15/42 against qwen3.5:9b's
+32/42 with the honest harness. The remaining gap looks like model capability, not harness —
+further levers risk shading into scoring the benchmark for it. Decision escalated to the
+owner: accept, keep iterating, or try qwen3.5-4B as the small-model candidate.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
