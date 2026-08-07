@@ -1,6 +1,6 @@
 [package]
 name = "nanna"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 description = "High-performance AI assistant - patron deity of your digital realm"
 repository = "https://github.com/physics515/Nanna"
@@ -61,7 +61,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
