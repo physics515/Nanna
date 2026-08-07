@@ -151,6 +151,16 @@ variance handled by design. Smoke on the same router: 5/5 @ 17 k tokens/item. He
 provider-aware: cloud incidents heal by pause+resume+retries only (local-server surgery is
 gated to Ollama-served models via `ProviderId::from_model`).
 
+**Iteration 2 — decomposition damping (PR #194, 2026-08-07).** Same model, tier, and
+window; `tasks.add` now returns escalating do-the-work notes on depth-2+ creation and
+sibling overhang. Result: **5/42 verified in 4.50 h** — no improvement (iteration 1: 7/42;
+the delta is run noise). The decisive observation: the notes fired 69 times (32 "STOP
+SPLITTING", 36 "DO the work") and the model kept splitting — item creation barely moved
+(133 vs 145). **In-band tool-result feedback does not alter this model's planning
+behavior.** One CUDA fault at t=66m, contained by the first-fault reset ladder; 0
+demotions. Next lever must be structural: scheduler-level deprioritization of depth-2+
+items, which cannot affect qwen (it never creates them).
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
