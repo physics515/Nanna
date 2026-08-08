@@ -1,0 +1,234 @@
+name: Release Build & Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver version tag (e.g. 0.3.6)"
+        required: true
+        default: "0.3.6"
+      release_type:
+        description: "release or pre-release"
+        required: false
+        default: "release"
+
+jobs:
+  # ── Windows ──────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install WebView2 runtime
+        run: |
+          $webview2_url = "https://github.com/microsoft/webview2-bin/releases/download/1.0.1475.0/Microsoft.Web.WebView2.1.0.1475.0-win64.zip"
+          Invoke-WebRequest -Uri $webview2_url -OutFile "$env:TEMP\webview2.zip"
+          Expand-Archive -Path "$env:TEMP\webview2.zip" -DestinationPath "$env:TEMP\webview2" -Force
+
+      - name: Install build dependencies
+        run: |
+          choco install -y --params '/IAutoUpdate:false' 7zip
+          choco install -y --params '/IAutoUpdate:false' cmake
+          choco install -y --params '/IAutoUpdate:false' ninja
+
+      - name: Build daemon (release)
+        run: cargo build --release --package nanna-daemon
+
+      - name: Build GUI (release)
+        run: cargo tauri build
+
+      - name: Bundle installer
+        run: |
+          $daemonPath = "target\release\nanna-daemon.exe"
+          $guiPath = "target\release\gui\x86_64-pc-windows-msvc\release\tauri-app.exe"
+          if (Test-Path $daemonPath) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::CreateFromDirectory(
+              "target\release",
+              "build\windows-artifacts.zip",
+              [System.IO.Compression.CompressionLevel]::Optimal
+            )
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: build/windows-artifacts.zip
+
+  # ── macOS ────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: universal-apple-darwin
+
+      - name: Install dependencies
+        run: brew install cmake ninja pkg-config
+
+      - name: Build daemon (release)
+        run: cargo build --release --package nanna-daemon
+
+      - name: Build GUI (release)
+        run: cargo tauri build
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: target/release/gui/universal-apple-darwin/release/
+
+  # ── Linux ────────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev dpkg-deb debhelper
+
+      - name: Build daemon (release)
+        run: cargo build --release --package nanna-daemon
+
+      - name: Build GUI (release)
+        run: cargo tauri build
+
+      - name: Create .deb package
+        run: |
+          # Copy built artifacts to a staging directory
+          mkdir -p build/staging/opt/nanna/usr/bin
+          mkdir -p build/staging/opt/nanna/usr/lib/nanna
+          mkdir -p build/staging/opt/nanna/usr/share/applications
+          mkdir -p build/staging/opt/nanna/usr/share/icons/hicolor/256x256/apps
+
+          # Copy binaries (Linux native binary, not .exe)
+          cp target/release/gui/x86_64-unknown-linux-gnu/release/nanna build/staging/opt/nanna/usr/bin/nanna
+          cp target/release/nanna-daemon build/staging/opt/nanna/usr/bin/nanna-daemon
+
+          # Create desktop entry
+          cat > build/staging/opt/nanna/usr/share/applications/nanna.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Nanna
+          Exec=nanna %U
+          Icon=nanna
+          Type=Application
+          Categories=Utility;
+          Terminal=false
+          EOF
+
+          # Create control file for dpkg-deb
+          cat > build/control << 'EOF'
+          Package: nanna
+          Version: 0.3.6
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libgtk-3-0, libwebkit2gtk-4.1-0, libayatana-appindicator3-1
+          Maintainer: physics515 <physics515@example.com>
+          Description: Personal AI presence — local-first, always-on
+          EOF
+
+          # Create changelog
+          cat > build/changelog << 'EOF'
+          nanna (0.3.6) stable; urgency=medium
+
+            * Initial public preview release
+            * Local-first AI agent with cognitive memory
+            * Multi-channel support (Telegram, Discord, Slack, Signal, WhatsApp)
+
+          -- physics515 <physics515@example.com>  $(date -R)
+
+          EOF
+
+          # Create the .deb package
+          dpkg-deb --build build/ nanna_0.3.6_amd64.deb
+
+      - name: Create AppImage
+        run: |
+          # Create proper AppImage structure
+          mkdir -p build/appimage-root/App
+          mkdir -p build/appimage-root/usr/bin
+
+          # Copy binaries to AppImage structure
+          cp target/release/gui/x86_64-unknown-linux-gnu/release/nanna build/appimage-root/App/nanna
+          cp target/release/nanna-daemon build/appimage-root/App/nanna-daemon
+
+          # Create AppRun wrapper (required for AppImage)
+          cat > build/appimage-root/AppRun << 'EOF'
+          #!/bin/bash
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          exec "$HERE/App/nanna" "$@"
+          EOF
+          chmod +x build/appimage-root/AppRun
+
+          # Create the AppImage (tar.gz with executable bit)
+          tar -C build --create --files-from /dev/null \
+            -C build/appimage-root \
+            . | gzip > "build/nanna.AppImage"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            build/nanna_0.3.6_amd64.deb
+            build/nanna.AppImage
+
+  # ── Publish Release ──────────────────────────────────────────────────────
+  publish-release:
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          TAG="v${VERSION}"
+          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+
+          if [ "$RELEASE_TYPE" = "pre-release" ]; then
+            gh release create "$TAG" \
+              --prerelease \
+              --title "Nanna v${VERSION} (Pre-release)" \
+              --notes "Pre-release build for Nanna v${VERSION}"
+          else
+            gh release create "$TAG" \
+              --title "Nanna v${VERSION}" \
+              --notes "Release build for Nanna v${VERSION}"
+          fi
+
+      - name: Attach Windows artifacts
+        run: |
+          gh release upload "$TAG" "artifacts/windows-artifacts.zip" --clobber
+
+      - name: Attach macOS artifacts
+        run: |
+          gh release upload "$TAG" "artifacts/macos-artifacts/" --clobber
+
+      - name: Attach Linux artifacts
+        run: |
+          gh release upload "$TAG" "artifacts/linux-artifacts/" --clobber

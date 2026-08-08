@@ -1,0 +1,37 @@
+# Nanna Windows Installer Configuration
+# This file defines the MSI packaging manifest for the bundled daemon sidecar installer
+
+[installer]
+name = "Nanna"
+version = "0.2.1"
+publisher = "physics515"
+description = "Personal AI presence — local-first, always-on"
+display_name = "Nanna Personal AI"
+
+[paths]
+install_dir = "C:\\Program Files\\Nanna"
+uninstall_dir = "C:\\ProgramData\\{Publisher}\\Uninstall"
+daemon_path = "C:\\Program Files\\Nanna\\nanna-daemon.exe"
+app_path = "C:\\Program Files\\Nanna\\nanna.exe"
+
+[components]
+main_app = { path = "nanna.exe", description = "Nanna Application" }
+daemon = { path = "nanna-daemon.exe", description = "Nanna Daemon (background service)" }
+tools = { path = "tools/", description = "Tool scripts" }
+config = { path = "config/", description = "User configuration" }
+
+[features]
+start_menu_shortcut = true
+launch_at_login = true
+system_tray = true
+auto_update = true
+
+[daemon_sidecar]
+enabled = true
+auto_start = true
+health_check_interval = "30s"
+reconnect_timeout = "10s"
+
+[uninstall]
+remove_data = false
+preserve_config = true

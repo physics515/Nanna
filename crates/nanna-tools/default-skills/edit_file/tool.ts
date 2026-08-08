@@ -1,6 +1,6 @@
 export default {
   name: "edit_file",
-  version: "0.1.6",
+  version: "0.1.7",
   output: "memory",
   description: "Replace one exact text snippet in a file with new text — an in-place edit for small changes. Use this instead of rewriting the whole file with write_file. ALL THREE main parameters are REQUIRED: file_path, old_string, new_string. old_string must be text that exists in the file (copy it verbatim; indentation differences are tolerated) — include 2-3 surrounding lines to make it unique. Only the matched snippet changes; the rest of the file is untouched. Use write_file only for new files or full rewrites.",
   parameters: {
@@ -102,17 +102,18 @@ export default {
     // The high-water mark for a path, or 0 when there is no trustworthy one.
     //
     // Trust rule matches write_file's: the recorded `hi` is only meaningful
-    // while the tools have been the sole mutators. If the size on disk is not
-    // what we last left there, something else changed the file deliberately
-    // and the mark is stale — re-base to disk truth rather than judging
-    // against a size that no longer exists.
+    // while the file exists. The mark is MONOTONE: an out-of-band change
+    // (exec, the user) folds in as more evidence of held mass, never a
+    // license to restart the history — the re-base-on-mismatch rule this
+    // replaces let an exec append launder the high-water down and a
+    // truncating rewrite through (2026-08-08 ornith endurance log; full
+    // design comment in write_file).
     function hiwaterFloorBase(path, currentSize) {
       try {
         var key = hiwaterKey(path);
         if (hiwaterIsBuffer(key) || hiwaterIsState(key)) return 0;
         var entry = hiwaterLoad()[key];
         if (!entry || typeof entry.hi !== "number" || !isFinite(entry.hi)) return 0;
-        if (typeof entry.last !== "number" || entry.last !== currentSize) return 0;
         return entry.hi;
       } catch (e) {
         return 0;
@@ -126,8 +127,9 @@ export default {
         var map = hiwaterLoad();
         var entry = map[key];
         var hi = newSize > prevSize ? newSize : prevSize;
-        if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi &&
-            typeof entry.last === "number" && entry.last === prevSize) {
+        // Monotone: the previous mark survives regardless of who touched
+        // the file in between.
+        if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi) {
           hi = entry.hi;
         }
         map[key] = { hi: hi, last: newSize, at: Date.now() };

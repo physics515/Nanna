@@ -277,11 +277,17 @@ impl TaskRepository {
             // 69 times in one endurance run while the model split anyway, so
             // the schedule, not the model, has to hold the line. Depth 0 and 1
             // rank EQUALLY (a feature and its direct subtasks are both real
-            // work); only depth 2+ is deprioritized, which no baseline
-            // qwen3.5:9b run ever created, so its 32/42 is untouched by
-            // construction.
-            let a_deep = i32::from(depth_of(a.id) >= 2);
-            let b_deep = i32::from(depth_of(b.id) >= 2);
+            // work); beyond that the rank is GRADED by actual ladder depth,
+            // not a binary flag. The binary form went vacuous on a strict
+            // dependency chain (observed 2026-08-08, ministral: with every
+            // shallow leaf blocked, all schedulable work was depth 2-6 and
+            // tied — the model recursed to depth 6 with nothing pulling it
+            // back). Grading derives the rank from the structure itself:
+            // each level of scaffolding is one planning step farther from
+            // executable work, so within an all-deep candidate set the
+            // scheduler still pulls toward the shallowest.
+            let a_deep = depth_of(a.id).saturating_sub(1);
+            let b_deep = depth_of(b.id).saturating_sub(1);
             a_progress
                 .cmp(&b_progress)
                 .then(a_deep.cmp(&b_deep))
@@ -508,17 +514,58 @@ impl TaskRepository {
         }
 
         // Cancelling a branch closes its whole open subtree — children of a
-        // cancelled plan must not surface from next().
+        // cancelled plan must not surface from next() — EXCEPT children that
+        // carry their OWN acceptance contract (one differing from their
+        // parent's): those are independently verifiable work, not shards of
+        // the dead branch's contract, and they re-parent to the cancelled
+        // branch's own parent instead of dying with it. Observed 2026-08-08
+        // (qwen endurance): the model correctly diagnosed the run's two root
+        // causes and created repair tasks with their own checks — both were
+        // cascade-cancelled when the parent's budget ran out, and the
+        // cascade deleted the exact work that would have unstuck the run.
+        // Children whose acceptance is absent or inherited (byte-equal to
+        // the parent's) are scaffolding of the dead contract and still
+        // cancel; their subtrees are walked, so a grandchild with its own
+        // check survives the same way.
         if changed.contains(&"status") && task.status == "cancelled" {
             let scope_tasks = self
                 .load_scope(&task.scope, task.scope_id.as_deref())
                 .await?;
+            let acceptance_of: HashMap<i64, Option<serde_json::Value>> = scope_tasks
+                .iter()
+                .map(|t| (t.id, t.acceptance.clone()))
+                .chain(std::iter::once((task.id, task.acceptance.clone())))
+                .collect();
             let mut queue: VecDeque<i64> = VecDeque::from([task.id]);
             // Bounded by scope size: each task enters the queue at most once.
             let mut seen: HashSet<i64> = HashSet::from([task.id]);
             while let Some(current) = queue.pop_front() {
                 for t in &scope_tasks {
                     if t.parent_id == Some(current) && seen.insert(t.id) {
+                        let own_contract = t.status != "done"
+                            && t.status != "cancelled"
+                            && t.acceptance.is_some()
+                            && acceptance_of
+                                .get(&current)
+                                .is_none_or(|parent_acc| parent_acc != &t.acceptance);
+                        if own_contract {
+                            let mut child = t.clone();
+                            child.parent_id = task.parent_id;
+                            self.write_task(&child).await?;
+                            self.log_activity(
+                                t.id,
+                                actor,
+                                "reparented",
+                                Some(serde_json::json!({
+                                    "cascade_from": task.id,
+                                    "old_parent": current,
+                                    "reason": "carries its own acceptance contract",
+                                })),
+                            )
+                            .await?;
+                            // Its subtree moves with it — do not descend.
+                            continue;
+                        }
                         if t.status != "done" && t.status != "cancelled" {
                             let mut child = t.clone();
                             child.status = "cancelled".to_string();
@@ -1206,19 +1253,48 @@ pub fn canonicalize_acceptance(
     value: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     if value.is_object() {
-        return Ok(value.clone());
+        let mut obj = value.clone();
+        normalize_integral_timeout(&mut obj);
+        return Ok(obj);
     }
     let Some(text) = value.as_str() else {
         return Err(format!("invalid acceptance check: {ACCEPTANCE_SHAPES}"));
     };
-    let decoded = parse_stringified_acceptance(text)?;
+    let mut decoded = parse_stringified_acceptance(text)?;
     if !decoded.is_object() {
         return Err(format!(
             "invalid acceptance check: it arrived as a string, and the text inside is not an \
              object. {ACCEPTANCE_SHAPES}"
         ));
     }
+    normalize_integral_timeout(&mut decoded);
     Ok(decoded)
+}
+
+/// Coerce an integral float in `timeout_secs` to the integer it denotes.
+///
+/// Every number that crosses the JS tool bridge is an f64 — a model writing
+/// `timeout_secs: 60` hands the store `60.0` — so rejecting integral floats
+/// refuses calls the model wrote correctly (observed 2026-08-08: one run had
+/// 50 valid task-adds bounced on this, each answered with a rephrased
+/// duplicate batch). Only exact non-negative integers coerce; a fractional
+/// or negative value is left alone for [`validate_acceptance`] to reject —
+/// the leniency is lossless by construction. The f64→u64 cast is exact for
+/// every value that passes the guards: integral, non-negative, and below
+/// 2^53 (far beyond any plausible timeout).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn normalize_integral_timeout(value: &mut serde_json::Value) {
+    const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0; // 2^53
+    if let Some(obj) = value.as_object_mut()
+        && let Some(timeout) = obj.get_mut("timeout_secs")
+        && !timeout.is_u64()
+        && let Some(f) = timeout.as_f64()
+        && f.fract() == 0.0
+        && f >= 0.0
+        && f < MAX_EXACT_F64_INT
+    {
+        *timeout = serde_json::Value::from(f as u64);
+    }
 }
 
 /// Decode an acceptance object that arrived as a string: strict JSON first,
@@ -2338,6 +2414,45 @@ mod tests {
         }));
         assert!(matches!(
             repo.create(nt).await,
+            Err(StorageError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acceptance_timeout_integral_float_is_coerced() {
+        // Every number through the JS tool bridge is an f64: `60` arrives as
+        // `60.0`. The write boundary admits it as the integer it denotes —
+        // rejecting it bounced 50 valid adds in one observed run.
+        let (_s, repo) = repo().await;
+        let mut nt = new_task("float timeout");
+        nt.acceptance = Some(serde_json::json!({
+            "kind": "command", "command": "exit 0", "timeout_secs": 60.0
+        }));
+        let created = repo.create(nt).await.unwrap();
+        let stored = created.acceptance.expect("acceptance persisted");
+        assert_eq!(
+            stored.get("timeout_secs").and_then(serde_json::Value::as_u64),
+            Some(60),
+            "integral float canonicalizes to the integer it denotes: {stored}"
+        );
+
+        // A fractional timeout is NOT integral — no guessing, still rejected.
+        let mut frac = new_task("fractional timeout");
+        frac.acceptance = Some(serde_json::json!({
+            "kind": "command", "command": "exit 0", "timeout_secs": 60.5
+        }));
+        assert!(matches!(
+            repo.create(frac).await,
+            Err(StorageError::Invalid(_))
+        ));
+
+        // Negative stays rejected too: -1.0 denotes no valid duration.
+        let mut neg = new_task("negative timeout");
+        neg.acceptance = Some(serde_json::json!({
+            "kind": "command", "command": "exit 0", "timeout_secs": -1.0
+        }));
+        assert!(matches!(
+            repo.create(neg).await,
             Err(StorageError::Invalid(_))
         ));
     }
