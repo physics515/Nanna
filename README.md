@@ -199,20 +199,23 @@ export NANNA_EVAL_LOG="warn,nanna_tools::registry=debug"
 cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture live_endurance
 ```
 
-### Three-model comparison (v0.3.5-beta.10, 2026-08-08)
+### Model comparison (v0.3.5-beta.10, 2026-08-08)
 
 One build (master `914b19f1`), one scheduler, identical conditions per leg: model unloaded at
 launch, fresh store, 4.5 h wall-clock cap, RTX 4070 Ti SUPER 16 GB. Models that fail the 5-task
-smoke gate don't get an endurance leg. Full measurement trail: [bench/BASELINE.md](bench/BASELINE.md).
+smoke gate don't get an endurance leg (ministral-3 ran anyway at the owner's request). Full
+measurement trail: [bench/BASELINE.md](bench/BASELINE.md).
 
 | Model | Size | Smoke (5) | Endurance (42) | Wall clock | Notes |
 |---|---|---|---|---|---|
+| **ornith:9b** | 5.6 GB | 5/5 @ 11.0 k tok/item | **37 / 42** | **1.02 h** | **record** — drained the whole plan in an hour at half qwen's token cost; barely decomposed (8 extra items); 0 faults, 0 resumes. July-2026 agentic-coding family, added after lfm failed the gate |
 | qwen3.5:9b | 6.6 GB | 5/5 @ 22.6 k tok/item | **25 / 42** | 2.11 h | exited early with its plan drained: 25 verified + 17 abandoned-with-containment; 0 faults, 0 resumes |
 | gemma4:e4b-it-qat | 6.1 GB | 5/5 @ 22.7 k tok/item | **6 / 42** | 4.50 h (cap) | decomposition churn — 118 items from 42 seeded; high variance (15/42 on near-identical code); 0 faults |
+| ministral-3:8b | 6.0 GB | 4/5 @ 11.8 k tok/item | **2 / 42** | 3.20 h (early stop) | runaway decomposition (256 items from 42 seeded); stopped by the deterministic-failure detector after repeated Ollama mid-response aborts (2 heals first); the smoke miss was an Ollama-side 500, not a wrong call |
 | lfm2.5 | 5.2 GB | **2 / 5** @ 78 k tok/item | — (gate failed) | 124 s (smoke) | up from 0-for-tools in the prior campaign; now abandons cleanly via containment instead of wedging |
 
 The frozen-harness series below is a separate historical experiment — GUI-driven, no plan-drain
-early exit — so its qwen 32/42 is not directly comparable to the 25/42 above.
+early exit — so its qwen 32/42 is not directly comparable to the numbers above.
 
 ### Endurance (42 features)
 

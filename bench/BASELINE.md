@@ -213,7 +213,7 @@ advisory text is worth nothing; gemma4:e4b-it-qat sits at 8-15/42 against qwen3.
 further levers risk shading into scoring the benchmark for it. Decision escalated to the
 owner: accept, keep iterating, or try qwen3.5-4B as the small-model candidate.
 
-**Three-model comparison on the merged path (2026-08-08, v0.3.5-beta.10, master
+**Model comparison on the merged path (2026-08-08, v0.3.5-beta.10, master
 `914b19f1`).** The campaign's winning levers merged as the singular path (depth-biased
 scheduling + service-door refocus + verified-parent hygiene; the harness-door refocus notes
 reverted as a measured regression). One build, identical conditions per leg: model unloaded
@@ -221,9 +221,19 @@ at launch, fresh store, 4.5 h cap, reference 16 GB tier.
 
 | Model | Smoke | Endurance | Wall clock | Exit |
 |---|---|---|---|---|
+| **ornith:9b** | 5/5 @ 11.0 k tok/item, 68 s | **37/42** | **1.02 h** | early — plan drained: 37 verified on a 50-item plan (only 8 self-created), 0 faults, 0 resumes. **All-time record** — first model past qwen on this ladder, at half the token cost |
 | qwen3.5:9b | 5/5 @ 22.6 k tok/item (2026-07-18 row) | **25/42** | 2.11 h | early — plan drained at 100/101 closed: 25 verified, 17 abandoned-with-containment; 0 faults, 0 resumes |
 | gemma4:e4b-it-qat | 5/5 @ 22.7 k tok/item (2026-08-06 row) | **6/42** | 4.50 h (cap) | full window; 118 items from 42 seeded, 97 closed (81 done + 16 cancelled), mostly self-created scaffolding; 0 faults, 0 resumes |
+| ministral-3:8b | 4/5 @ 11.8 k tok/item, 66 s (miss = Ollama-side 500 `tool 'exec' not found`) | **2/42** | 3.20 h (early stop) | deterministic-failure stop: 3 consecutive segments ended by Ollama mid-response aborts after 2 successful heals (t=37m, t=141m); runaway decomposition — 256 items (199 self-created), 42 done + 32 cancelled; 639 steps, 30.3 M tokens |
 | lfm2.5:latest | **2/5** @ 78.1 k tok/item, 124 s | — (smoke gate failed) | — | 2 tasks abandoned after fruitless steps + 1 replan each; up from 0-for-tools in the 2026-08-03 campaign — dialect fixes hold, capability doesn't |
+
+**Candidate search, 2026-08-08.** After lfm failed the gate, a field sweep for modern
+tool-calling models inside the ~10 GB usable-VRAM budget surfaced ornith:9b (July-2026
+agentic-coding family) and ministral-3:8b (Dec-2025 Mistral small tier); both ran at the
+owner's request. The pair is the cleanest smoke-vs-endurance split yet measured: near-identical
+smoke (5/5 @ 11.0 k vs 4/5 @ 11.8 k) diverged to 37/42 vs 2/42 — the divider is decomposition
+discipline, not tool dialect or speed. ornith's 37/42 in 1.02 h also beats the frozen-era
+qwen 32/42 @ 4 h, with the same exit-semantics caveat as everywhere in this table.
 
 Two cross-run cautions. (1) qwen's frozen-harness 32/42 above is not comparable: those runs
 were GUI-driven with no plan-drain early exit; on the current path qwen closed its entire
