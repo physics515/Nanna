@@ -928,6 +928,14 @@ fn resolve_task_anchor(explicit: Option<&str>, message: &str) -> Option<String> 
 /// ran in between is irrelevant. Only a DIFFERENT outcome for the SAME key
 /// resets — which is the alternation that genuinely means progress
 /// (fail→ok→fail on one shape), not the alternation between two tools.
+///
+/// **A changed world grants a probe, not a reset.** Streak counts survive
+/// world changes; what the epoch gate ([`last_execution_epoch`]
+/// [`RepeatLedger::epoch`]) suspends is only the SHORT-CIRCUIT decision:
+/// after a successful side-effectful call, an at-threshold shape executes
+/// once more, because its evidence ("cannot succeed" / "byte-identical")
+/// predates the mutation. Same outcome again → short-circuiting resumes at
+/// once; different outcome → the ordinary reset rules above apply.
 #[derive(Debug, Clone, Default)]
 struct RepeatCallState {
     /// Consecutive failures of this exact call shape (cleared by any success).
@@ -959,6 +967,14 @@ struct RepeatCallState {
     /// Full byte length of the last successful result, so the notice can
     /// announce when the replayed excerpt is a cut.
     last_success_len: usize,
+    /// World epoch ([`RepeatLedger::epoch`]) at this shape's last REAL
+    /// execution. The breakers only short-circuit while this equals the
+    /// current epoch: once any successful side-effectful call has changed
+    /// the world, every at-threshold shape is granted exactly one probe
+    /// execution — its premise ("repeating cannot succeed" / "byte-identical
+    /// result") is no longer evidenced. The probe's own outcome re-records
+    /// the epoch, so an unchanged world resumes short-circuiting immediately.
+    last_execution_epoch: u64,
 }
 
 /// The sibling breakers' bookkeeping, shared by every step of one harness run.
@@ -994,6 +1010,16 @@ struct RepeatCallState {
 #[derive(Debug, Default)]
 pub struct RepeatLedger {
     inner: tokio::sync::RwLock<HashMap<String, RepeatCallState>>,
+    /// World epoch: how many successful side-effectful calls
+    /// ([`is_work_evidence_tool`]) this run has observed. Streak decisions
+    /// are gated on it (see [`RepeatCallState::last_execution_epoch`]):
+    /// observed live (2026-08-08 comparison logs), the run-long ledger's
+    /// pre-dispatch short-circuit otherwise DENIES the edit→retest and
+    /// edit→reread loops that are the correct response to a failure — qwen
+    /// was refused re-running a test 184 times after editing the file under
+    /// test, and all four models were refused re-reading files they had just
+    /// edited, forcing blind rewrites from stale context.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 impl RepeatLedger {
@@ -1017,6 +1043,20 @@ impl RepeatLedger {
     #[cfg(test)]
     async fn len(&self) -> usize {
         self.inner.read().await.len()
+    }
+
+    /// The current world epoch. Relaxed ordering is sufficient: the value
+    /// only ever moves forward, and a decision made one bump stale merely
+    /// short-circuits a call that would have been granted a probe on the
+    /// very next attempt.
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that a successful side-effectful call changed the world.
+    fn bump_epoch(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1114,10 +1154,12 @@ fn repeat_failure_breaker_notice(
         "{header}[REPEAT-FAILURE BREAKER] This call was NOT executed. `{name}` with these exact \
          arguments already failed {failures} times in a row in this run; the last error \
          was: {replay}\n\
-         Repeating the identical call cannot succeed, so this exact call is disabled for \
-         the rest of this run — it now fails instantly instead of re-running a known \
-         failure. Change the arguments or use a different tool: `{name}` itself still \
-         works, and any call with different arguments executes normally.\n\
+         Repeating the identical call cannot succeed while nothing has changed, so this \
+         exact call is paused — it now fails instantly instead of re-running a known \
+         failure. It re-runs once after any successful write/edit/exec changes the \
+         world (fix the cause, then retry). Otherwise change the arguments or use a \
+         different tool: `{name}` itself still works, and any call with different \
+         arguments executes normally.\n\
          {STEERING_CONTINUATION}",
         header = anchor_header(task_anchor)
     )
@@ -1167,9 +1209,10 @@ fn zero_info_breaker_notice(
          IS your answer, delivered without re-running the call. The result you already \
          have:\n{replay}\n\
          Act on the result you already have, change the arguments (e.g. a cursor, offset, \
-         or different target), or use a different tool; this exact call is paused for the \
-         rest of this run unless its arguments change. `{name}` itself still works, and \
-         any call with different arguments executes normally.\n\
+         or different target), or use a different tool; this exact call is paused until \
+         its arguments change or a successful write/edit/exec changes the world (then it \
+         re-runs once). `{name}` itself still works, and any call with different \
+         arguments executes normally.\n\
          {STEERING_CONTINUATION}",
         header = anchor_header(task_anchor)
     )
@@ -4223,6 +4266,16 @@ impl Agent {
                 }
                 let key = repeat_call_key(name, input);
                 ledger.get(&key).and_then(|entry| {
+                    // World-epoch gate: a streak only justifies a short-circuit
+                    // while the world is as the streak observed it. After any
+                    // successful side-effectful call (epoch bump), the shape
+                    // gets one probe execution — the probe's bookkeeping
+                    // re-records the epoch, so an unchanged outcome resumes
+                    // short-circuiting on the next attempt. Edit→retest and
+                    // edit→reread are exactly this path.
+                    if entry.last_execution_epoch != state.repeat_calls.current_epoch() {
+                        return None;
+                    }
                     if entry.failure_count >= REPEAT_FAILURE_BREAKER_AFTER {
                         warn!(
                             tool = %name,
@@ -4501,9 +4554,19 @@ impl Agent {
             // whose OWN outcome alternates is making some kind of progress and
             // trips neither breaker.
             if !short_circuited {
+                // A successful side-effectful call moves the world forward
+                // BEFORE this call's own bookkeeping records an epoch: the
+                // mutating shape itself stores the post-bump epoch (identical
+                // write spam still breaks), while every OTHER at-threshold
+                // shape now predates the bump and earns one probe.
+                if response.result.success && is_work_evidence_tool(&name) {
+                    state.repeat_calls.bump_epoch();
+                }
                 let key = repeat_call_key(&name, &input);
+                let current_epoch = state.repeat_calls.current_epoch();
                 let mut ledger = state.repeat_calls.write().await;
                 let entry = ledger.entry(key).or_default();
+                entry.last_execution_epoch = current_epoch;
                 if response.result.success {
                     entry.failure_count = 0;
                     entry.last_error.clear();
@@ -7659,7 +7722,10 @@ mod repeat_failure_breaker_tests {
         assert!(notice.contains("NOT executed"));
         assert!(notice.contains("3 times"));
         assert!(notice.contains("timeout after 30s"));
-        assert!(notice.contains("disabled for the rest of this run"));
+        // The pause is honest about its own scope: not permanent — a world
+        // change (successful write/edit/exec) re-arms one probe.
+        assert!(notice.contains("paused"));
+        assert!(notice.contains("changes the world"));
         assert!(notice.contains("different tool"));
 
         // A huge error is replayed bounded, and the cut announces itself.
@@ -7892,8 +7958,10 @@ mod zero_info_breaker_tests {
         assert!(notice.contains("UNCHANGED"));
         assert!(notice.contains(result), "replays the result: {notice}");
         assert!(notice.contains("Act on the result you already have"));
-        assert!(notice.contains("paused for the rest of this run"));
-        assert!(notice.contains("unless its arguments change"));
+        // Honest scope: paused until the arguments change or the world does.
+        assert!(notice.contains("paused until"));
+        assert!(notice.contains("its arguments change"));
+        assert!(notice.contains("changes the world"));
         assert!(notice.contains("different tool"));
 
         // A cut excerpt announces itself and never claims the operation
@@ -7903,6 +7971,155 @@ mod zero_info_breaker_tests {
             zero_info_breaker_notice(None, "explore", 3, &excerpt, BREAKER_REPLAY_MAX_BYTES * 3);
         assert!(bounded.contains("truncated for replay"));
         assert!(bounded.contains("SUCCEEDED"));
+    }
+
+    /// Always-succeeding mock registered under the name `exec` so the real
+    /// [`is_work_evidence_tool`] classification treats it as side-effectful:
+    /// each success bumps the world epoch exactly like a live shell call.
+    struct WorldTool;
+
+    #[async_trait::async_trait]
+    impl Tool for WorldTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "exec".to_string(),
+                description: "test stand-in for the shell".to_string(),
+                parameters: vec![],
+                output_schema: None,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::success("world changed"))
+        }
+    }
+
+    /// Like [`steady_agent`] but with the mutating `exec` stand-in alongside,
+    /// for the world-epoch probe tests.
+    async fn steady_world_agent(
+        executions: Arc<AtomicUsize>,
+        output: Arc<StdMutex<String>>,
+        fail: Arc<AtomicBool>,
+    ) -> Agent {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(SteadyTool {
+            executions,
+            output,
+            fail,
+        })
+        .await;
+        tools.register(WorldTool).await;
+        let llm = Arc::new(LlmClient::ollama("http://127.0.0.1:9"));
+        Agent::new(AgentConfig::default(), llm, tools)
+    }
+
+    /// Dispatch one call to an arbitrary registered tool through the real
+    /// tool path.
+    async fn run_named(agent: &Agent, state: &mut RunState, name: &str, input: Value) {
+        let uses = vec![(Uuid::new_v4().to_string(), name.to_string(), input)];
+        let blocks = agent
+            .execute_tools(&uses, state, &RunOptions::default(), None)
+            .await;
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_world_change_re_arms_one_probe_for_a_failing_shape() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("unused".to_string()));
+        let fail = Arc::new(AtomicBool::new(true));
+        let agent =
+            steady_world_agent(Arc::clone(&executions), output, Arc::clone(&fail)).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Arm the failure breaker: K real failures, then a short-circuit.
+        for _ in 0..REPEAT_FAILURE_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+        }
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER,
+            "at-threshold shape short-circuits while the world is unchanged"
+        );
+
+        // A successful side-effectful call moves the world: the failing
+        // shape earns exactly one probe — edit→retest must never be denied.
+        run_named(&agent, &mut state, "exec", serde_json::json!({})).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER + 1,
+            "the world changed, so the shape executes once as a probe"
+        );
+
+        // The probe failed again and nothing else changed the world:
+        // short-circuiting resumes immediately.
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            REPEAT_FAILURE_BREAKER_AFTER + 1,
+            "an unchanged world resumes the short-circuit after the probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_world_change_re_arms_one_probe_for_a_zero_info_shape() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let output = Arc::new(StdMutex::new("same bytes".to_string()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let agent =
+            steady_world_agent(Arc::clone(&executions), Arc::clone(&output), fail).await;
+        let mut state = RunState::new();
+        let input = serde_json::json!({});
+
+        // Arm the zero-information breaker: K identical successes, then a
+        // short-circuit.
+        for _ in 0..ZERO_INFO_BREAKER_AFTER {
+            run_once(&agent, &mut state, input.clone()).await;
+        }
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER,
+            "at-threshold shape short-circuits while the world is unchanged"
+        );
+
+        // A successful side-effectful call moves the world: the read earns
+        // one probe — edit→reread must never be denied, because the bytes it
+        // would observe may genuinely have changed.
+        run_named(&agent, &mut state, "exec", serde_json::json!({})).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 1,
+            "the world changed, so the read executes once as a probe"
+        );
+
+        // Identical bytes again with no further world change: paused again.
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 1,
+            "an identical probe result resumes the short-circuit"
+        );
+
+        // A world change AND changed bytes: the probe observes the new
+        // result, which restarts the identity streak — the shape then runs
+        // freely until it re-earns the threshold.
+        run_named(&agent, &mut state, "exec", serde_json::json!({})).await;
+        *output.lock().unwrap() = "new bytes".to_string();
+        run_once(&agent, &mut state, input.clone()).await;
+        run_once(&agent, &mut state, input.clone()).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ZERO_INFO_BREAKER_AFTER + 3,
+            "a changed result restarts the streak and the shape runs freely"
+        );
     }
 
     #[tokio::test]
