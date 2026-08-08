@@ -17,7 +17,10 @@
 //! NANNA_EVAL_MODEL=qwen3.5:9b cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture live_endurance
 //! ```
 
-use nanna_agent::harness::{LongHorizonConfig, LongHorizonReport, LongHorizonRunner, StopReason};
+use nanna_agent::harness::{
+    LongHorizonConfig, LongHorizonReport, LongHorizonRunner, StepOutcome, StepRequest, StepRunner,
+    StopReason,
+};
 use nanna_daemon::llm_router::LlmRouter;
 use nanna_daemon::tasks::{AgentStepRunner, TursoTaskSource, build_task_services};
 use nanna_storage::{NewTask, Storage};
@@ -51,6 +54,61 @@ fn init_tracing() {
     // and bypass the filter either way.
     let filter = std::env::var("NANNA_EVAL_LOG").unwrap_or_else(|_| "warn".to_string());
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+/// Teardown grace for the eval runtime: how long shutdown waits for
+/// in-flight blocking work before abandoning it.
+///
+/// Derivation: by teardown every verdict is already printed and asserted, so
+/// nothing left on the blocking pool can change the outcome — the grace
+/// exists only so HEALTHY stragglers (a child-pipe read whose EOF arrives as
+/// a killed tree's handles close) finish instead of leaking a thread. Handle
+/// teardown after a kill is near-instant; 5s is the same loaded-machine
+/// ceiling `nanna-daemon/src/job.rs` uses for its reap deadline. Anything
+/// still blocked past it is exactly the wedge this bound exists to abandon.
+const EVAL_TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Run an eval future on a runtime whose TEARDOWN IS BOUNDED, and return its
+/// output.
+///
+/// `#[tokio::test]` tears its runtime down with `Runtime::drop`, which joins
+/// the blocking pool with NO timeout. On Windows, tokio backs child-process
+/// stdio with synchronous reads on that same pool (`Blocking<ArcFile>` in
+/// `tokio/src/process/windows.rs`), so one pipe that never reaches EOF pins a
+/// pool thread forever and the test process never prints `test result:`.
+/// That is not hypothetical: a model-written exec command can background a
+/// grandchild (`cmd &`) that inherits the shell's stdout write handle — the
+/// shell exits, the timeout tree-kill walks the DEAD shell's pid and misses
+/// the survivor, and the inherited handle holds the pipe open. Observed live
+/// 2026-08-08: the ministral endurance leg printed its summary, then hung 25+
+/// minutes in teardown with one child process still alive, and had to be
+/// taskkill'd. The plan-drained legs (qwen, ornith) exited cleanly the same
+/// day — nothing in the stop path differs in code; the stop-path run is
+/// simply the one whose model weather leaves wedged pipes behind.
+///
+/// Two containments, both at the process boundary, because a survivor holding
+/// a pipe cannot be un-wedged from inside (its pid is unknown once its parent
+/// died, and Windows cannot cancel another thread's synchronous read):
+/// - `shutdown_timeout` abandons still-blocked pool threads after
+///   [`EVAL_TEARDOWN_GRACE`], so the run always reaches its verdict and the
+///   process exits.
+/// - the daemon's kill-on-close Job Object is adopted at entry, so process
+///   exit reaps every surviving descendant — the containment `Daemon::run`
+///   has had since PR #142; the eval process just never opted in.
+fn run_eval_bounded<F: std::future::Future>(fut: F) -> F::Output {
+    #[cfg(windows)]
+    if !nanna_daemon::job::adopt_kill_on_close_job() {
+        println!(
+            "[warn] kill-on-close job unavailable — orphaned exec children will outlive this test"
+        );
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("eval runtime");
+    let output = rt.block_on(fut);
+    rt.shutdown_timeout(EVAL_TEARDOWN_GRACE);
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -353,19 +411,25 @@ async fn run_smoke_once() -> (LongHorizonReport, usize, usize) {
 }
 
 /// Suite 4 live baseline row.
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "requires a running Ollama at localhost:11434"]
-async fn live_task_success_at_tokens() {
-    init_tracing();
-    let (report, completed, total) = run_smoke_once().await;
-    println!("smoke: {completed}/{total} @ {:?} tokens/item", report.tokens_per_completed_item);
+fn live_task_success_at_tokens() {
+    run_eval_bounded(async {
+        init_tracing();
+        let (report, completed, total) = run_smoke_once().await;
+        println!("smoke: {completed}/{total} @ {:?} tokens/item", report.tokens_per_completed_item);
+    });
 }
 
 /// pass^k over the smoke suite: the probability the harness+model succeed on
 /// ALL of k repeats. `NANNA_EVAL_K` (default 3).
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "requires a running Ollama at localhost:11434"]
-async fn live_pass_k() {
+fn live_pass_k() {
+    run_eval_bounded(live_pass_k_body());
+}
+
+async fn live_pass_k_body() {
     init_tracing();
     let k: usize = std::env::var("NANNA_EVAL_K")
         .ok()
@@ -919,11 +983,142 @@ fn identical_failure_streak_counts_only_consecutive_identical_errors() {
     assert_eq!(streak.observe(below_floor), 1, "after a success the count restarts");
 }
 
+/// The error text the ministral leg died with — byte-identical across
+/// segments, which is what lets the streak breaker call it deterministic.
+const ABORT_502: &str =
+    "step error: LLM error: API error: 502 - Ollama aborted generation mid-response (done=false)";
+
+/// A provider in the sticky degraded state: every step dies with the same
+/// text, exactly like the abort loop observed live 2026-08-08.
+struct Aborting502Runner;
+
+#[async_trait::async_trait]
+impl StepRunner for Aborting502Runner {
+    async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+        Err(ABORT_502.to_string())
+    }
+}
+
+/// Outer bound on the regression run below: three segments of store-backed
+/// steps that each fail instantly (seconds even on a loaded CI disk), plus
+/// [`EVAL_TEARDOWN_GRACE`]. 60s is a generous ceiling; the bug this guards
+/// against hung for 25+ minutes, so the two outcomes cannot be confused.
+const STOP_PATH_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Not `#[ignore]`d: the deterministic-failure stop must reach process exit
+/// without an Ollama, and WITHOUT waiting on wedged blocking work.
+///
+/// Regression for the 2026-08-08 ministral hang: the endurance loop printed
+/// `[stop] the same failure ended 3 consecutive segments...` and its summary,
+/// then the process sat 25+ minutes in `Runtime::drop` — the implicit
+/// `#[tokio::test]` teardown joins the blocking pool without a timeout, and a
+/// survivor-held child pipe kept one synchronous read pinned there. This test
+/// replays that shape end to end: real harness segments dying on the
+/// byte-identical 502 until the streak breaker fires, with the blocking pool
+/// deliberately wedged, run through the SAME [`run_eval_bounded`] helper the
+/// live tests use — and asserts the whole thing (teardown included) finishes.
+#[test]
+fn deterministic_failure_stop_exits_despite_a_wedged_blocking_task() {
+    // The eval runtime lives on its own thread so this test can put a
+    // deadline on that runtime's WHOLE life — including teardown, the phase
+    // the live hang was in — instead of deadlocking alongside it.
+    let eval = std::thread::spawn(|| {
+        run_eval_bounded(async {
+            let workspace = tempfile::tempdir().expect("tempdir");
+            let workdir = workspace.path().to_path_buf();
+            let db_path = workdir.join("eval-store.db");
+            // Storage + source only: the runner is scripted, no tools run.
+            let storage = Arc::new(
+                Storage::new(&nanna_storage::StorageConfig {
+                    path: db_path.to_string_lossy().to_string(),
+                })
+                .await
+                .expect("storage"),
+            );
+            // Four items: a RunnerErrors segment abandons at most one item
+            // (ITEM_RUNNER_ERRORS_MAX) before the run-level breaker fires at
+            // 3 consecutive errors, and a segment needs 2+ open items to
+            // reach the breaker at all — 4 sustains three such segments.
+            let repo = storage.tasks();
+            for n in 1..=4 {
+                repo.create(task(
+                    &format!("doomed {n}"),
+                    "unreachable — the runner aborts every generation",
+                    &["exec"],
+                    serde_json::json!({
+                        "kind": "regex", "path": "never.txt", "pattern": "x"
+                    }),
+                ))
+                .await
+                .expect("seed doomed task");
+            }
+
+            // Wedge the blocking pool the way a survivor-held pipe does: a
+            // synchronous read that never returns. The forgotten sender keeps
+            // `recv` blocked forever; only process exit ends this thread.
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            std::mem::forget(tx);
+            drop(tokio::task::spawn_blocking(move || {
+                let _ = rx.recv();
+            }));
+
+            // The endurance loop's exact break: segments ending in
+            // RunnerErrors with byte-identical text until the streak bound.
+            let source = source_for(&storage);
+            let mut identical_failures = IdenticalFailureStreak::default();
+            let mut segments = 0usize;
+            loop {
+                segments += 1;
+                assert!(
+                    segments <= IDENTICAL_FAILURE_STOP_AFTER,
+                    "the streak must reach the stop bound in exactly {IDENTICAL_FAILURE_STOP_AFTER} segments"
+                );
+                let config = LongHorizonConfig {
+                    // A segment is three instantly-failing steps; 120s is
+                    // loaded-machine slack, and a backstop if the error
+                    // breaker ever regresses.
+                    max_wall_clock: Duration::from_secs(120),
+                    ..LongHorizonConfig::default()
+                };
+                let report = LongHorizonRunner::new(config)
+                    .run(MINIDB_GOAL, &source, &Aborting502Runner, &workdir, None)
+                    .await;
+                let streak = match &report.stop {
+                    StopReason::RunnerErrors { message } => {
+                        assert_eq!(message, ABORT_502, "the breaker must carry the runner's text");
+                        identical_failures.observe(message)
+                    }
+                    other => panic!("every segment must die on the runner breaker, got {other:?}"),
+                };
+                if streak >= IDENTICAL_FAILURE_STOP_AFTER {
+                    break;
+                }
+            }
+        });
+    });
+
+    let deadline = std::time::Instant::now() + STOP_PATH_EXIT_DEADLINE;
+    while !eval.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop path hung in teardown: the eval runtime did not shut down within \
+             {STOP_PATH_EXIT_DEADLINE:?} of the deterministic-failure stop — the wedged \
+             blocking task is being waited on instead of abandoned"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eval.join().expect("eval thread panicked");
+}
+
 /// The endurance run: 42 dependency-chained fail-to-pass features. Progress
 /// prints every 2 minutes so a multi-hour run is observable from the log.
-#[tokio::test(flavor = "multi_thread")]
+#[test]
 #[ignore = "requires a running Ollama at localhost:11434; runs for hours"]
-async fn live_endurance() {
+fn live_endurance() {
+    run_eval_bounded(live_endurance_body());
+}
+
+async fn live_endurance_body() {
     init_tracing();
     let hours: f64 = std::env::var("NANNA_EVAL_HOURS")
         .ok()
