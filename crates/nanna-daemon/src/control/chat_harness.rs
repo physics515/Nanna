@@ -1181,6 +1181,8 @@ mod tests {
             side_effect_tool_calls: 0,
             items_completed: completed,
             items_completed_unverified: 0,
+            items_revived: 0,
+            items_regressed_reopened: 0,
             items_already_satisfied: 0,
             items_abandoned: abandoned,
             last_runner_error: last_err.map(String::from),

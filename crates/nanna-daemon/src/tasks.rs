@@ -1354,6 +1354,34 @@ impl TaskSource for TursoTaskSource {
         Ok(())
     }
 
+    async fn reopen(&self, id: i64, reason: &str) -> Result<(), String> {
+        // The environment's verdict changed after the item closed (a
+        // verified completion regressed, or an abandoned item's check now
+        // passes) — the store records what is true NOW. Same patch door as
+        // every other status change, so scope/cascade invariants hold.
+        let repo = self.storage.tasks();
+        repo.update(
+            id,
+            TaskPatch {
+                status: Some("pending".to_string()),
+                ..TaskPatch::default()
+            },
+            Some(&self.actor),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        repo.log_activity(
+            id,
+            Some(&self.actor),
+            "reopened",
+            Some(json!({ "reason": reason })),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        self.emit(id, "reopened", json!({ "reason": reason }));
+        Ok(())
+    }
+
     /// Open children of `id` in this scope — the runner's evidence that a
     /// replan step actually decomposed something. Counted from the scope's
     /// open list rather than a dedicated query because that is the same view
@@ -3549,6 +3577,8 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         steps_taken: 0,
         items_completed: 0,
         items_completed_unverified: 0,
+        items_revived: 0,
+        items_regressed_reopened: 0,
         items_already_satisfied: 0,
         items_abandoned: 0,
         last_runner_error: None,
@@ -3566,6 +3596,9 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.items_completed = segments.iter().map(|r| r.items_completed).sum();
     folded.items_completed_unverified =
         segments.iter().map(|r| r.items_completed_unverified).sum();
+    folded.items_revived = segments.iter().map(|r| r.items_revived).sum();
+    folded.items_regressed_reopened =
+        segments.iter().map(|r| r.items_regressed_reopened).sum();
     folded.items_already_satisfied = segments.iter().map(|r| r.items_already_satisfied).sum();
     folded.items_abandoned = segments.iter().map(|r| r.items_abandoned).sum();
     folded.replans = segments.iter().map(|r| r.replans).sum();
@@ -4114,6 +4147,8 @@ mod tests {
             steps_taken: steps,
             items_completed: completed,
             items_completed_unverified: 0,
+            items_revived: 0,
+            items_regressed_reopened: 0,
             items_already_satisfied: 0,
             items_abandoned: 0,
             last_runner_error: None,

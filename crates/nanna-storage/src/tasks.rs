@@ -514,17 +514,58 @@ impl TaskRepository {
         }
 
         // Cancelling a branch closes its whole open subtree — children of a
-        // cancelled plan must not surface from next().
+        // cancelled plan must not surface from next() — EXCEPT children that
+        // carry their OWN acceptance contract (one differing from their
+        // parent's): those are independently verifiable work, not shards of
+        // the dead branch's contract, and they re-parent to the cancelled
+        // branch's own parent instead of dying with it. Observed 2026-08-08
+        // (qwen endurance): the model correctly diagnosed the run's two root
+        // causes and created repair tasks with their own checks — both were
+        // cascade-cancelled when the parent's budget ran out, and the
+        // cascade deleted the exact work that would have unstuck the run.
+        // Children whose acceptance is absent or inherited (byte-equal to
+        // the parent's) are scaffolding of the dead contract and still
+        // cancel; their subtrees are walked, so a grandchild with its own
+        // check survives the same way.
         if changed.contains(&"status") && task.status == "cancelled" {
             let scope_tasks = self
                 .load_scope(&task.scope, task.scope_id.as_deref())
                 .await?;
+            let acceptance_of: HashMap<i64, Option<serde_json::Value>> = scope_tasks
+                .iter()
+                .map(|t| (t.id, t.acceptance.clone()))
+                .chain(std::iter::once((task.id, task.acceptance.clone())))
+                .collect();
             let mut queue: VecDeque<i64> = VecDeque::from([task.id]);
             // Bounded by scope size: each task enters the queue at most once.
             let mut seen: HashSet<i64> = HashSet::from([task.id]);
             while let Some(current) = queue.pop_front() {
                 for t in &scope_tasks {
                     if t.parent_id == Some(current) && seen.insert(t.id) {
+                        let own_contract = t.status != "done"
+                            && t.status != "cancelled"
+                            && t.acceptance.is_some()
+                            && acceptance_of
+                                .get(&current)
+                                .is_none_or(|parent_acc| parent_acc != &t.acceptance);
+                        if own_contract {
+                            let mut child = t.clone();
+                            child.parent_id = task.parent_id;
+                            self.write_task(&child).await?;
+                            self.log_activity(
+                                t.id,
+                                actor,
+                                "reparented",
+                                Some(serde_json::json!({
+                                    "cascade_from": task.id,
+                                    "old_parent": current,
+                                    "reason": "carries its own acceptance contract",
+                                })),
+                            )
+                            .await?;
+                            // Its subtree moves with it — do not descend.
+                            continue;
+                        }
                         if t.status != "done" && t.status != "cancelled" {
                             let mut child = t.clone();
                             child.status = "cancelled".to_string();

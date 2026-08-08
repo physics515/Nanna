@@ -501,6 +501,17 @@ pub trait TaskSource: Send + Sync {
     /// can move on instead of grinding.
     async fn abandon(&self, id: i64, reason: &str) -> Result<(), String>;
 
+    /// Reopen a closed item because the environment's verdict changed after
+    /// it closed: a verified completion whose acceptance now FAILS (later
+    /// work un-did it), or an abandoned item whose acceptance now PASSES
+    /// (later work fixed what it was stuck on). The world moved, so the old
+    /// verdict is stale evidence — the store is the checkpoint and must say
+    /// what is true NOW. Default refuses so sources without a reopen path
+    /// keep their closed-is-closed semantics.
+    async fn reopen(&self, _id: i64, _reason: &str) -> Result<(), String> {
+        Err("this source does not support reopening closed items".to_string())
+    }
+
     /// How many OPEN children an item has, or `None` when this source cannot
     /// report it.
     ///
@@ -727,6 +738,16 @@ pub struct LongHorizonReport {
     /// Items completed on the model's claim alone (no acceptance check
     /// existed) — logged so unverified completions are visible.
     pub items_completed_unverified: usize,
+    /// Abandoned items the drain sweep revived because their acceptance now
+    /// passes — later work fixed what they were stuck on, and the stale
+    /// verdict was corrected without spending a model step.
+    #[serde(default)]
+    pub items_revived: usize,
+    /// Verified completions the drain sweep reopened because their
+    /// acceptance fails again — later work un-did them, and "done" must not
+    /// outlive the evidence it was based on.
+    #[serde(default)]
+    pub items_regressed_reopened: usize,
     /// The subset of `items_completed` closed by the acceptance PRE-CHECK:
     /// their done-condition already passed before any step ran, so the run
     /// completed them for free (see
@@ -960,6 +981,17 @@ struct ItemProgress {
     last_result: Option<String>,
     last_tool_calls: Vec<StepToolCall>,
     runner_errors: usize,
+    /// Normalized signatures ([`failure_signature`]) of every acceptance
+    /// failure this item has seen. A failure whose signature was NEVER seen
+    /// before is evidence the work moved — the check now fails differently —
+    /// and replenishes the fruitless budget (the same principle as stream
+    /// retries replenishing on tool progress). Revisiting a signature from
+    /// this set is oscillation, not progress, and charges normally — so
+    /// genuine thrash still converges on the abandonment rung (observed
+    /// 2026-08-08: one item advanced its failing assertion on the exact
+    /// check where the progress-blind counter abandoned it, while a
+    /// thrashing sibling cycled three known signatures without advancing).
+    seen_failure_signatures: std::collections::HashSet<u64>,
     /// Has the acceptance pre-check already run for this item in this run?
     ///
     /// The bound on the pre-check's cost: ONE extra acceptance execution per
@@ -1019,6 +1051,18 @@ impl LongHorizonRunner {
         let mut items_completed_unverified = 0usize;
         let mut items_already_satisfied = 0usize;
         let mut items_abandoned = 0usize;
+        let mut items_revived = 0usize;
+        let mut items_regressed_reopened = 0usize;
+        // Verdicts are per-moment; the drain sweep below re-asks the
+        // environment about every item this run closed with a check, so a
+        // later step that un-did verified work (or fixed abandoned work) is
+        // caught while there is still budget to act on it.
+        let mut verified_this_run: Vec<(i64, AcceptanceCheck)> = Vec::new();
+        let mut abandoned_this_run: Vec<(i64, AcceptanceCheck)> = Vec::new();
+        // Each item may be reopened at most once per run — the bound that
+        // makes the drain sweep a fixpoint instead of a loop.
+        let mut reopened_once: HashSet<i64> = HashSet::new();
+        let mut precheck_ids: HashSet<i64> = cfg.precheck_acceptance_items.clone();
         let mut replans = 0usize;
         let mut false_success_claims = 0usize;
         let mut input_tokens = 0u64;
@@ -1026,6 +1070,14 @@ impl LongHorizonRunner {
         let mut consecutive_errors = 0usize;
         let mut last_runner_error: Option<String> = None;
         let mut progress: HashMap<i64, ItemProgress> = HashMap::new();
+        // Which items have seen which acceptance-failure signature, run-wide.
+        // One root cause billed as N item failures is the cascade this
+        // detects (observed 2026-08-08: 12 of 17 abandonments carried one
+        // byte-identical syntax error a single earlier write had introduced;
+        // another run lost 3 features to one broken helper) — when a
+        // signature recurs across items, each affected item's step context
+        // names the cluster so the model treats it as ONE bug.
+        let mut failure_owners: HashMap<u64, std::collections::BTreeSet<i64>> = HashMap::new();
 
         let stop = loop {
             if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
@@ -1060,7 +1112,84 @@ impl LongHorizonRunner {
             // Re-anchor: the store, not the transcript, is the state.
             let step = match source.next().await {
                 Ok(Some(step)) => step,
-                Ok(None) => break StopReason::AllTasksDone,
+                Ok(None) => {
+                    // DRAIN SWEEP. The plan is empty, but every closed
+                    // verdict was per-moment: later steps may have un-done
+                    // verified work (observed 2026-08-08: a record run's
+                    // final artifact held 8 of 37 verified sections) or
+                    // fixed what an abandoned item was stuck on (the same
+                    // logs show abandoned features whose commands were
+                    // implemented afterwards, with no path back). Re-ask the
+                    // environment — one cheap check per closed item — and
+                    // reopen what it contradicts; reopening at most once per
+                    // item makes this a fixpoint, not a loop.
+                    let mut reopened_any = false;
+                    for (id, check) in abandoned_this_run.clone() {
+                        if reopened_once.contains(&id) {
+                            continue;
+                        }
+                        let verdict = check.run(workdir).await;
+                        if verdict.passed
+                            && source
+                                .reopen(id, "acceptance now passes — reviving abandoned item")
+                                .await
+                                .is_ok()
+                        {
+                            reopened_once.insert(id);
+                            // The check already passed: route it through the
+                            // precheck door so it completes verified without
+                            // spending a model step.
+                            precheck_ids.insert(id);
+                            progress.remove(&id);
+                            items_revived += 1;
+                            items_abandoned = items_abandoned.saturating_sub(1);
+                            reopened_any = true;
+                            let _ = source
+                                .log(
+                                    id,
+                                    "revived",
+                                    serde_json::json!({ "detail": verdict.detail }),
+                                )
+                                .await;
+                        }
+                    }
+                    for (id, check) in verified_this_run.clone() {
+                        if reopened_once.contains(&id) {
+                            continue;
+                        }
+                        let verdict = check.run(workdir).await;
+                        if !verdict.passed
+                            && source
+                                .reopen(
+                                    id,
+                                    &format!(
+                                        "verified completion regressed — the acceptance \
+                                         check fails again: {}",
+                                        verdict.detail
+                                    ),
+                                )
+                                .await
+                                .is_ok()
+                        {
+                            reopened_once.insert(id);
+                            progress.remove(&id);
+                            items_completed = items_completed.saturating_sub(1);
+                            items_regressed_reopened += 1;
+                            reopened_any = true;
+                            let _ = source
+                                .log(
+                                    id,
+                                    "regressed",
+                                    serde_json::json!({ "detail": verdict.detail }),
+                                )
+                                .await;
+                        }
+                    }
+                    if reopened_any {
+                        continue;
+                    }
+                    break StopReason::AllTasksDone;
+                }
                 Err(message) => break StopReason::SourceError { message },
             };
             // Scoped so the pre-check below (which may `progress.remove`) is
@@ -1086,6 +1215,9 @@ impl LongHorizonRunner {
                     break StopReason::SourceError { message };
                 }
                 items_abandoned += 1;
+                if let Some(check) = &step.acceptance {
+                    abandoned_this_run.push((step.id, check.clone()));
+                }
                 progress.remove(&step.id);
                 continue;
             }
@@ -1108,7 +1240,7 @@ impl LongHorizonRunner {
             // `AcceptanceCheck::run`, so it inherits the same workdir
             // resolution and the same clamped timeout as every other
             // acceptance run — no second execution path to keep in sync.
-            let precheck = if precheck_due && cfg.precheck_acceptance_items.contains(&step.id) {
+            let precheck = if precheck_due && precheck_ids.contains(&step.id) {
                 step.acceptance.as_ref()
             } else {
                 None
@@ -1138,6 +1270,7 @@ impl LongHorizonRunner {
                             consecutive_errors = 0;
                             items_completed += 1;
                             items_already_satisfied += 1;
+                            verified_this_run.push((step.id, check.clone()));
                             progress.remove(&step.id);
                             tracing::info!(
                                 item = step.id,
@@ -1353,6 +1486,7 @@ impl LongHorizonRunner {
                             Ok(()) => {
                                 consecutive_errors = 0;
                                 items_completed += 1;
+                                verified_this_run.push((step.id, check.clone()));
                                 progress.remove(&step.id);
                             }
                             Err(message) => {
@@ -1384,12 +1518,53 @@ impl LongHorizonRunner {
                                 )
                                 .await;
                         }
-                        item.steps_without_progress += 1;
-                        if repeated {
+                        let signature = failure_signature(&verdict.detail);
+                        let novel = item.seen_failure_signatures.insert(signature);
+                        if novel && item.seen_failure_signatures.len() > 1 {
+                            // The check fails DIFFERENTLY than every earlier
+                            // attempt: the work moved the failure, which is
+                            // progress by the environment's own evidence.
+                            // The fruitless budget replenishes (same
+                            // principle as stream retries replenishing on
+                            // tool progress). A first-ever failure is the
+                            // baseline, not progress; a revisited signature
+                            // is oscillation and charges normally.
+                            item.steps_without_progress = 0;
+                        } else {
                             item.steps_without_progress += 1;
+                            if repeated {
+                                item.steps_without_progress += 1;
+                            }
                         }
-                        item.last_result =
-                            Some(failed_acceptance_result(check, &verdict, repeated));
+                        let mut step_result =
+                            failed_acceptance_result(check, &verdict, repeated);
+                        let cluster = failure_owners.entry(signature).or_default();
+                        cluster.insert(step.id);
+                        if cluster.len() > 1 {
+                            let others: Vec<String> = cluster
+                                .iter()
+                                .filter(|id| **id != step.id)
+                                .map(|id| format!("#{id}"))
+                                .collect();
+                            let _ = source
+                                .log(
+                                    step.id,
+                                    "shared_failure",
+                                    serde_json::json!({
+                                        "items": cluster.iter().copied().collect::<Vec<_>>(),
+                                    }),
+                                )
+                                .await;
+                            step_result.push_str(&format!(
+                                "\nNOTE: {} of this plan {} failing with this EXACT same \
+                                 error. That is one underlying bug, not {} separate ones — \
+                                 find and fix the shared cause, then re-run the checks.",
+                                others.join(", "),
+                                if others.len() == 1 { "is also" } else { "are also" },
+                                cluster.len(),
+                            ));
+                        }
+                        item.last_result = Some(step_result);
                     }
                 }
                 None => {
@@ -1442,6 +1617,8 @@ impl LongHorizonRunner {
             side_effect_tool_calls,
             items_completed,
             items_completed_unverified,
+            items_revived,
+            items_regressed_reopened,
             items_already_satisfied,
             items_abandoned,
             last_runner_error,
@@ -1487,6 +1664,27 @@ impl LongHorizonRunner {
 /// directive names it via the command, and the model must exercise
 /// `read_file` itself — inlining would bloat every retry and the file can
 /// be large.
+/// Normalized identity of an acceptance failure: the first non-empty line of
+/// the verdict detail, whitespace-collapsed, hashed.
+///
+/// The first line is where an acceptance command names WHAT failed (the
+/// failing assertion, the shell error, the missing path); later lines carry
+/// context that can drift between otherwise-identical failures. Whitespace
+/// collapse tolerates re-wrapping without inventing identity — two failures
+/// share a signature only when they say the same thing.
+fn failure_signature(detail: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let first_line = detail
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let normalized: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut hasher = std::hash::DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn failed_acceptance_result(
     check: &AcceptanceCheck,
     verdict: &AcceptanceVerdict,
@@ -1615,6 +1813,15 @@ mod tests {
             if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
                 item.abandoned = true;
             }
+            Ok(())
+        }
+        async fn reopen(&self, id: i64, _reason: &str) -> Result<(), String> {
+            let mut items = self.items.lock().await;
+            if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
+                item.done = false;
+                item.abandoned = false;
+            }
+            self.log_entries.lock().await.push((id, "reopened".to_string()));
             Ok(())
         }
         async fn open_subtasks(&self, id: i64) -> Result<Option<usize>, String> {
@@ -2633,6 +2840,127 @@ mod tests {
         let completions = source.completions.lock().await;
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].1["verified"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn drain_sweep_revives_an_abandoned_item_whose_check_now_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        // Item 1 is stuck on a file that does not exist yet; item 2's work
+        // creates it as a side effect — the exact cascade shape observed
+        // live: an abandoned feature whose blocker was implemented later,
+        // with no path back to the verdict.
+        source
+            .push(step(
+                1,
+                "blocked feature",
+                Some(AcceptanceCheck::FileExists {
+                    path: "x.txt".to_string(),
+                }),
+            ))
+            .await;
+        source.push(step(2, "later work", None)).await;
+        struct LateProducer {
+            artifact: PathBuf,
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl StepRunner for LateProducer {
+            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                if *calls == 2 {
+                    std::fs::write(&self.artifact, "made by item 2").unwrap();
+                    return Ok(outcome("all wrapped up\nTASK COMPLETE"));
+                }
+                Ok(outcome("grinding"))
+            }
+        }
+        let runner = LateProducer {
+            artifact: dir.path().join("x.txt"),
+            calls: Mutex::new(0),
+        };
+        let config = LongHorizonConfig {
+            max_steps_per_item: 1,
+            max_replans_per_item: 0,
+            ..LongHorizonConfig::default()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        // Item 1 burned its budget and was abandoned, item 2 created the
+        // file — the drain sweep must revive item 1 and complete it verified
+        // WITHOUT spending another model step.
+        assert_eq!(report.items_revived, 1, "{report:?}");
+        assert_eq!(report.items_abandoned, 0, "revival corrects the count");
+        assert_eq!(report.items_completed, 2);
+        assert_eq!(report.steps_taken, 2, "the revival costs checks, not steps");
+        let completions = source.completions.lock().await;
+        let item1 = completions.iter().find(|(id, _)| *id == 1).unwrap();
+        assert_eq!(item1.1["verified"], serde_json::json!(true));
+        let log = source.log_entries.lock().await;
+        assert!(log.iter().any(|(id, a)| *id == 1 && a == "reopened"));
+        assert!(log.iter().any(|(id, a)| *id == 1 && a == "revived"));
+    }
+
+    #[tokio::test]
+    async fn drain_sweep_reopens_a_verified_item_that_later_work_un_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "build artifact",
+                Some(AcceptanceCheck::FileExists {
+                    path: "y.txt".to_string(),
+                }),
+            ))
+            .await;
+        source.push(step(2, "destructive later work", None)).await;
+        // Call 1 creates the artifact (item 1 verifies), call 2 DELETES it
+        // (item 2 "succeeds" while silently un-doing verified work — the
+        // rewrite-erosion shape), call 3 restores it when item 1 comes back.
+        struct Underminer {
+            artifact: PathBuf,
+            calls: Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl StepRunner for Underminer {
+            async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+                let mut calls = self.calls.lock().await;
+                *calls += 1;
+                match *calls {
+                    1 => {
+                        std::fs::write(&self.artifact, "v1").unwrap();
+                        Ok(outcome("built it"))
+                    }
+                    2 => {
+                        std::fs::remove_file(&self.artifact).unwrap();
+                        Ok(outcome("cleaned up\nTASK COMPLETE"))
+                    }
+                    _ => {
+                        std::fs::write(&self.artifact, "v2").unwrap();
+                        Ok(outcome("restored it"))
+                    }
+                }
+            }
+        }
+        let runner = Underminer {
+            artifact: dir.path().join("y.txt"),
+            calls: Mutex::new(0),
+        };
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        // "Done" must not outlive its evidence: the sweep caught the
+        // regression, reopened item 1, and the loop re-earned the verdict.
+        assert_eq!(report.items_regressed_reopened, 1, "{report:?}");
+        assert_eq!(report.items_completed, 2);
+        assert_eq!(report.steps_taken, 3);
+        let log = source.log_entries.lock().await;
+        assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
     }
 
     #[tokio::test]
