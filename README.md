@@ -199,6 +199,21 @@ export NANNA_EVAL_LOG="warn,nanna_tools::registry=debug"
 cargo test -p nanna-daemon --test live_long_horizon -- --ignored --nocapture live_endurance
 ```
 
+### Three-model comparison (v0.3.5-beta.10, 2026-08-08)
+
+One build (master `914b19f1`), one scheduler, identical conditions per leg: model unloaded at
+launch, fresh store, 4.5 h wall-clock cap, RTX 4070 Ti SUPER 16 GB. Models that fail the 5-task
+smoke gate don't get an endurance leg. Full measurement trail: [bench/BASELINE.md](bench/BASELINE.md).
+
+| Model | Size | Smoke (5) | Endurance (42) | Wall clock | Notes |
+|---|---|---|---|---|---|
+| qwen3.5:9b | 6.6 GB | 5/5 @ 22.6 k tok/item | **25 / 42** | 2.11 h | exited early with its plan drained: 25 verified + 17 abandoned-with-containment; 0 faults, 0 resumes |
+| gemma4:e4b-it-qat | 6.1 GB | 5/5 @ 22.7 k tok/item | **6 / 42** | 4.50 h (cap) | decomposition churn — 118 items from 42 seeded; high variance (15/42 on near-identical code); 0 faults |
+| lfm2.5 | 5.2 GB | **2 / 5** @ 78 k tok/item | — (gate failed) | 124 s (smoke) | up from 0-for-tools in the prior campaign; now abandons cleanly via containment instead of wedging |
+
+The frozen-harness series below is a separate historical experiment — GUI-driven, no plan-drain
+early exit — so its qwen 32/42 is not directly comparable to the 25/42 above.
+
 ### Endurance (42 features)
 
 **Frozen-harness series, 2026-07-30/31** — every model ran the identical harness (paged tool
