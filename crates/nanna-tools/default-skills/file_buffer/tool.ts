@@ -1,6 +1,6 @@
 export default {
   name: "file_buffer",
-  version: "0.1.4",
+  version: "0.1.5",
   output: "memory",
   description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit.",
   parameters: {
@@ -78,8 +78,10 @@ export default {
         var map = hiwaterLoad();
         var entry = map[key];
         var hi = newSize > prevSize ? newSize : prevSize;
-        if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi &&
-            typeof entry.last === "number" && entry.last === prevSize) {
+        // Monotone while the file exists: the previous mark survives
+        // regardless of who touched the file in between (out-of-band
+        // changes fold in as evidence — full design comment in write_file).
+        if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi) {
           hi = entry.hi;
         }
         map[key] = { hi: hi, last: newSize, at: Date.now() };

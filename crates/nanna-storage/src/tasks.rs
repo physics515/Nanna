@@ -1206,19 +1206,48 @@ pub fn canonicalize_acceptance(
     value: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     if value.is_object() {
-        return Ok(value.clone());
+        let mut obj = value.clone();
+        normalize_integral_timeout(&mut obj);
+        return Ok(obj);
     }
     let Some(text) = value.as_str() else {
         return Err(format!("invalid acceptance check: {ACCEPTANCE_SHAPES}"));
     };
-    let decoded = parse_stringified_acceptance(text)?;
+    let mut decoded = parse_stringified_acceptance(text)?;
     if !decoded.is_object() {
         return Err(format!(
             "invalid acceptance check: it arrived as a string, and the text inside is not an \
              object. {ACCEPTANCE_SHAPES}"
         ));
     }
+    normalize_integral_timeout(&mut decoded);
     Ok(decoded)
+}
+
+/// Coerce an integral float in `timeout_secs` to the integer it denotes.
+///
+/// Every number that crosses the JS tool bridge is an f64 — a model writing
+/// `timeout_secs: 60` hands the store `60.0` — so rejecting integral floats
+/// refuses calls the model wrote correctly (observed 2026-08-08: one run had
+/// 50 valid task-adds bounced on this, each answered with a rephrased
+/// duplicate batch). Only exact non-negative integers coerce; a fractional
+/// or negative value is left alone for [`validate_acceptance`] to reject —
+/// the leniency is lossless by construction. The f64→u64 cast is exact for
+/// every value that passes the guards: integral, non-negative, and below
+/// 2^53 (far beyond any plausible timeout).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn normalize_integral_timeout(value: &mut serde_json::Value) {
+    const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0; // 2^53
+    if let Some(obj) = value.as_object_mut()
+        && let Some(timeout) = obj.get_mut("timeout_secs")
+        && !timeout.is_u64()
+        && let Some(f) = timeout.as_f64()
+        && f.fract() == 0.0
+        && f >= 0.0
+        && f < MAX_EXACT_F64_INT
+    {
+        *timeout = serde_json::Value::from(f as u64);
+    }
 }
 
 /// Decode an acceptance object that arrived as a string: strict JSON first,
@@ -2338,6 +2367,45 @@ mod tests {
         }));
         assert!(matches!(
             repo.create(nt).await,
+            Err(StorageError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acceptance_timeout_integral_float_is_coerced() {
+        // Every number through the JS tool bridge is an f64: `60` arrives as
+        // `60.0`. The write boundary admits it as the integer it denotes —
+        // rejecting it bounced 50 valid adds in one observed run.
+        let (_s, repo) = repo().await;
+        let mut nt = new_task("float timeout");
+        nt.acceptance = Some(serde_json::json!({
+            "kind": "command", "command": "exit 0", "timeout_secs": 60.0
+        }));
+        let created = repo.create(nt).await.unwrap();
+        let stored = created.acceptance.expect("acceptance persisted");
+        assert_eq!(
+            stored.get("timeout_secs").and_then(serde_json::Value::as_u64),
+            Some(60),
+            "integral float canonicalizes to the integer it denotes: {stored}"
+        );
+
+        // A fractional timeout is NOT integral — no guessing, still rejected.
+        let mut frac = new_task("fractional timeout");
+        frac.acceptance = Some(serde_json::json!({
+            "kind": "command", "command": "exit 0", "timeout_secs": 60.5
+        }));
+        assert!(matches!(
+            repo.create(frac).await,
+            Err(StorageError::Invalid(_))
+        ));
+
+        // Negative stays rejected too: -1.0 denotes no valid duration.
+        let mut neg = new_task("negative timeout");
+        neg.acceptance = Some(serde_json::json!({
+            "kind": "command", "command": "exit 0", "timeout_secs": -1.0
+        }));
+        assert!(matches!(
+            repo.create(neg).await,
             Err(StorageError::Invalid(_))
         ));
     }

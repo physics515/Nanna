@@ -1,6 +1,6 @@
 export default {
   name: "write_file",
-  version: "0.1.13",
+  version: "0.1.14",
   output: "memory",
   description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the largest size the file has held (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
   parameters: {
@@ -82,15 +82,22 @@ export default {
     // is the non-markdown local-state dir — never beside user files, so no
     // sidecar clutter). Each entry stores {hi, last, at}: `hi` is the
     // high-water mark, `last` is the size write_file ITSELF last left on
-    // disk. The history is only trusted while write_file is the sole
-    // mutator: if the disk size no longer equals `last`, another actor
-    // (edit_file, file_buffer, exec, the user) changed the file
-    // deliberately, and the guard RE-BASES to disk truth instead of judging
-    // against a size that no longer exists — a stale mark must never refuse
-    // a write that the disk state itself would allow (verify-round blocker:
-    // grow-writes after an out-of-band shrink looped forever). Every state
-    // operation fails OPEN: a missing or corrupt state file degrades to the
-    // old current-size behavior, never blocks a write.
+    // disk. While the file EXISTS, `hi` is MONOTONE: an out-of-band change
+    // (edit_file, file_buffer, exec, the user) is more evidence of held
+    // mass, folded in as max(hi, disk) — never a license to restart the
+    // history downward. The 2026-08-08 ornith endurance log showed why the
+    // old rule (out-of-band change re-bases hi to disk truth) was a
+    // laundering hole: an exec append re-shaped the file, the next write
+    // re-based hi 3794→1566, and an 875-byte rewrite that the true history
+    // would have refused sailed through — the final artifact kept 8 of 37
+    // verified commands. Grow-writes are never refused regardless (the
+    // refusal requires bytes < current disk size), so the verify-round
+    // blocker this rule replaced (grow-writes after an out-of-band shrink
+    // looped forever) cannot recur; a deliberate whole-file re-shape has
+    // honest doors: delete + recreate (creation re-arms from the new size)
+    // or force. Every state operation fails OPEN: a missing or corrupt
+    // state file degrades to the old current-size behavior, never blocks a
+    // write.
     var HIWATER_STATE = ".nanna/write_hiwater.json";
     // Bound: the state file must stay trivially small over an unbounded
     // daemon lifetime; missions touch tens of files, so 200 entries with
@@ -99,10 +106,11 @@ export default {
     function hiwaterKey(path) {
       // Slash/case normalization plus "./" stripping only. Deliberately NO
       // workspace-root resolution (that lives on the Rust side): an aliased
-      // spelling of the same file gets an independent entry whose `last`
-      // never matches disk, so it re-bases to current-size behavior — it
-      // costs a little ratchet strength, never a false refusal. Lowercase is
-      // correct here because this daemon targets Windows paths.
+      // spelling of the same file gets an independent entry that observes
+      // only the writes sent under that spelling — each entry is monotone
+      // on its own evidence, so aliasing costs a little ratchet strength,
+      // never a false refusal. Lowercase is correct here because this
+      // daemon targets Windows paths.
       var k = path.split("\\").join("/").toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
@@ -304,10 +312,11 @@ export default {
       if (fileExists && !hiwaterExempt(hwKeyGuard)) {
         var hwEntry = hiwaterLoad()[hwKeyGuard];
         var hwHi = hiwaterHi(hwEntry);
-        // History is live only if the disk still holds exactly what OUR last
-        // write left there; otherwise another tool/user re-shaped the file
-        // deliberately and the stale mark must not judge this write.
-        if (hwHi > hwBase && hiwaterLast(hwEntry) === existingSize) {
+        // Monotone while the file exists: an out-of-band change since our
+        // last write is folded in as evidence, never a reason to forget the
+        // mass this file has held (the re-base rule was a laundering hole —
+        // see the ratchet design comment above).
+        if (hwHi > hwBase) {
           hwBase = hwHi;
         }
       }
@@ -474,15 +483,15 @@ export default {
       return fail("write_file failed writing " + filePath + " (" + writeErr + "). Retry the same call; if it fails again, read_file to verify the file state.");
     }
 
-    // Ratchet update AFTER a successful write. In-band writes only ever
-    // raise the high-water mark (so fluctuating rewrites stay pinned to the
-    // peak — a grow-write must NOT re-base, or shrink/grow alternation
-    // launders the ratchet). Force and creation-over-missing RESET it: both
-    // are deliberate re-shapes with nothing stale worth protecting. A write
-    // over a file that changed out-of-band re-bases to disk truth. And when
-    // the pre-write read failed for unknown reasons, the state is left
-    // completely alone — the next successful write re-bases naturally via
-    // the last-mismatch path.
+    // Ratchet update AFTER a successful write. While the file exists, the
+    // high-water mark only ever RISES — max of the previous mark, the disk
+    // size we just observed, and this write — so fluctuating rewrites stay
+    // pinned to the peak and out-of-band changes fold in as evidence
+    // instead of restarting the history (the old re-base-on-mismatch rule
+    // was the laundering hole documented in the ratchet design comment).
+    // Force and creation-over-missing RESET it: both are deliberate
+    // re-shapes with nothing stale worth protecting. When the pre-write
+    // read failed for unknown reasons, the state is left completely alone.
     if (!existsUnknown) {
       try {
         var hwMap = hiwaterLoad();
@@ -490,7 +499,7 @@ export default {
         if (!hiwaterExempt(hwKey)) {
           var hwPrevEntry = hwMap[hwKey];
           var hwNext = bytes > existingSize ? bytes : existingSize;
-          if (!input.force && fileExists && hiwaterLast(hwPrevEntry) === existingSize) {
+          if (!input.force && fileExists) {
             var hwPrevHi = hiwaterHi(hwPrevEntry);
             if (hwPrevHi > hwNext) hwNext = hwPrevHi;
           }
@@ -500,6 +509,52 @@ export default {
         }
       } catch (eHw) {
         // Best-effort; the user's write already succeeded.
+      }
+    }
+
+    // Rewrite-loss announcement (2026-08-08 ornith endurance lesson):
+    // full-file rewrites from a stale in-context copy silently deleted
+    // working sections all run long — the final artifact kept 8 of 37
+    // verified commands while every write reported plain success, and the
+    // model later filed "re-add X" tasks proving it never intended the
+    // deletions. Refusing is wrong (a complete rewrite is the model's one
+    // reliable move and may shrink legitimately); instead the result
+    // ANNOUNCES what the rewrite removed — the same announce-the-loss
+    // principle as the clobber guard. Detection is a single whole-string
+    // regex pass per side (no per-line split — the Boa split cost lesson):
+    // shell functions `name() {`, case arms `name)`, and def/class/function
+    // declarations at line starts. Informational only; never blocks.
+    function topSymbols(text) {
+      var names = {};
+      var re = /^[ \t]*(?:([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(\)[ \t]*\{?[ \t]*$|(?:def|class|function)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)|([A-Za-z_][A-Za-z0-9_-]*)\)[ \t]*$)/gm;
+      var m;
+      while ((m = re.exec(text)) !== null) {
+        var n = m[1] || m[2] || m[3];
+        if (n) names[n] = true;
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+      return names;
+    }
+    var lossNote = "";
+    if (fileExists && !input.force && typeof existing === "string") {
+      try {
+        var oldSyms = topSymbols(existing);
+        var newSyms = topSymbols(fileContent);
+        var dropped = [];
+        for (var sName in oldSyms) {
+          if (!newSyms[sName]) dropped.push(sName);
+        }
+        if (dropped.length > 0) {
+          var shown = dropped.slice(0, 10);
+          var moreCount = dropped.length - shown.length;
+          lossNote = " NOTE: this rewrite REMOVED sections that existed on disk before: `" +
+            shown.join("`, `") + "`" + (moreCount > 0 ? " (+" + moreCount + " more)" : "") +
+            ". The write SUCCEEDED and the file now holds exactly what you sent. If those " +
+            "sections were supposed to stay, they are gone — re-add them (read_file first " +
+            "to see the current state). If the removal was intentional, ignore this note.";
+        }
+      } catch (eLoss) {
+        // Informational only — never affects the write.
       }
     }
 
@@ -518,6 +573,6 @@ export default {
         " they were converted to real newlines before writing. The write SUCCEEDED and the file is correct —" +
         " nothing to redo. Send real line breaks next time and this note goes away.";
     }
-    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + repairNote };
+    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + repairNote + lossNote };
   }
 }
