@@ -213,6 +213,25 @@ advisory text is worth nothing; gemma4:e4b-it-qat sits at 8-15/42 against qwen3.
 further levers risk shading into scoring the benchmark for it. Decision escalated to the
 owner: accept, keep iterating, or try qwen3.5-4B as the small-model candidate.
 
+**Three-model comparison on the merged path (2026-08-08, v0.3.5-beta.10, master
+`914b19f1`).** The campaign's winning levers merged as the singular path (depth-biased
+scheduling + service-door refocus + verified-parent hygiene; the harness-door refocus notes
+reverted as a measured regression). One build, identical conditions per leg: model unloaded
+at launch, fresh store, 4.5 h cap, reference 16 GB tier.
+
+| Model | Smoke | Endurance | Wall clock | Exit |
+|---|---|---|---|---|
+| qwen3.5:9b | 5/5 @ 22.6 k tok/item (2026-07-18 row) | **25/42** | 2.11 h | early — plan drained at 100/101 closed: 25 verified, 17 abandoned-with-containment; 0 faults, 0 resumes |
+| gemma4:e4b-it-qat | 5/5 @ 22.7 k tok/item (2026-08-06 row) | **6/42** | 4.50 h (cap) | full window; 118 items from 42 seeded, 97 closed (81 done + 16 cancelled), mostly self-created scaffolding; 0 faults, 0 resumes |
+| lfm2.5:latest | **2/5** @ 78.1 k tok/item, 124 s | — (smoke gate failed) | — | 2 tasks abandoned after fruitless steps + 1 replan each; up from 0-for-tools in the 2026-08-03 campaign — dialect fixes hold, capability doesn't |
+
+Two cross-run cautions. (1) qwen's frozen-harness 32/42 above is not comparable: those runs
+were GUI-driven with no plan-drain early exit; on the current path qwen closed its entire
+plan in under half the window. (2) gemma's 6/42 against iteration 4's 15/42 on
+near-identical code confirms the iteration-5 variance reading — single runs cannot rank
+this model; its honest range is 6-15/42. lfm2.5's earlier harness-fix-era smoke was 5/5 @
+25 k; today's 2/5 @ 78 k on a much-evolved tree is the same variance lesson at smoke scale.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
