@@ -103,8 +103,17 @@ function serviceExecute(action, input, sessionId, scope) {
       // for either tells the model it created work it did not create, and
       // it plans the next step around a task that does not exist. The
       // service explains itself in `note`; pass that through verbatim.
-      if (res.note) {
+      if (res.note && res.created === false) {
         return res.note + "\n\n" + listSummary(base);
+      }
+      // A CREATED task always leads with its factual confirmation, with any
+      // advisory (decomposition damping) AFTER it. When the note replaced
+      // the confirmation, the model read the add as failed and retried —
+      // observed live 2026-08-07 (gemma): six adds in 30s under one parent,
+      // each answered only with "STOP SPLITTING", producing the duplicate
+      // triplet the note existed to prevent.
+      if (res.note) {
+        return "Added task #" + res.task.id + ": " + res.task.title + "\n\n" + res.note + "\n\n" + listSummary(base);
       }
       return "Added task #" + res.task.id + ": " + res.task.title + "\n\n" + listSummary(base);
     }

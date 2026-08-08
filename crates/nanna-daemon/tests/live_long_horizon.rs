@@ -1030,13 +1030,30 @@ async fn live_endurance() {
         segment_reports.push(report.clone());
         // Identical-failure breaker: a resume heals TRANSIENT incidents (a
         // wedged runner, a dropped stream). A segment that dies with the
-        // byte-identical error every time is deterministic — observed live
-        // 2026-08-03: a below-floor context window (AgentError::
-        // ContextBelowFloor) failed 8 segments identically, 20s apart, and
-        // the loop burned every resume treating physics as weather. Stop
-        // with a clear message instead of thrashing.
+        // byte-identical error every time AND completed nothing is
+        // deterministic — observed live 2026-08-03: a below-floor context
+        // window (AgentError::ContextBelowFloor) failed 8 segments
+        // identically, 20s apart, all at zero items, and the loop burned
+        // every resume treating physics as weather. Stop with a clear
+        // message instead of thrashing.
+        //
+        // Progress gates the verdict (2026-08-08 ministral counter-case):
+        // three segments ended with the byte-identical done=false abort,
+        // but they ran 37/104/51 productive MINUTES and completed 43 items
+        // between the aborts — the heals worked; the fault merely recurs.
+        // "Deterministic" must mean "reproduces immediately after the
+        // heal", and a segment that completed items is the definition of
+        // not-immediately. Derived from the definition, not a tuned knob.
         let streak = match &report.stop {
-            StopReason::RunnerErrors { message } => identical_failures.observe(message),
+            StopReason::RunnerErrors { message } => {
+                if report.items_completed > 0 {
+                    // The failure recurred but the segment did real work
+                    // first: the streak restarts at this sighting, so only
+                    // a string of zero-progress repeats reaches the stop.
+                    identical_failures.reset();
+                }
+                identical_failures.observe(message)
+            }
             _ => identical_failures.reset(),
         };
         if streak >= IDENTICAL_FAILURE_STOP_AFTER {

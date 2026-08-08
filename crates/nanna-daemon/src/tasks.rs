@@ -522,13 +522,19 @@ pub fn build_task_services(
                     // A subtask always lives in its parent's scope — replan
                     // steps only know the parent id, not the run's scope.
                     let parent_id = opt_i64(&params, "parent_id")?;
-                    let (scope, scope_id, parent_sort) = if let Some(parent_id) = parent_id {
-                        let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
-                        (parent.scope, parent.scope_id, Some(parent.sort_order))
-                    } else {
-                        let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
-                        (scope, scope_id, None)
-                    };
+                    let (scope, scope_id, parent_sort, parent_acceptance) =
+                        if let Some(parent_id) = parent_id {
+                            let parent = storage.tasks().get(parent_id).await.map_err(err_str)?;
+                            (
+                                parent.scope,
+                                parent.scope_id,
+                                Some(parent.sort_order),
+                                parent.acceptance,
+                            )
+                        } else {
+                            let (scope, scope_id) = resolve_scope(&params, &workspace_id).await?;
+                            (scope, scope_id, None, None)
+                        };
                     let title = opt_string(&params, "title")
                         .or_else(|| opt_string(&params, "text"))
                         .ok_or_else(|| "title is required".to_string())?;
@@ -556,6 +562,11 @@ pub fn build_task_services(
                         return Ok(json!({
                             "task": task_to_json(&existing),
                             "deduplicated": true,
+                            // Consistent with the closed-this-turn guard so
+                            // callers have ONE flag for "nothing was created"
+                            // — the todo skill suppresses its "Added task"
+                            // confirmation on exactly this field.
+                            "created": false,
                             "note": format!(
                                 "Task #{} \"{}\" already exists and is still open — reusing it \
                                  instead of creating a duplicate. Work on it rather than \
@@ -646,7 +657,18 @@ pub fn build_task_services(
                         due_at: opt_string(&params, "due_at"),
                         recurrence: opt_string(&params, "recurrence"),
                         depends_on: opt_i64_vec(&params, "depends_on")?.unwrap_or_default(),
-                        acceptance: canonical_acceptance(&params)?,
+                        // Acceptance inheritance: a subtask that declares no
+                        // check of its own answers to its parent's — the same
+                        // write-time principle as scope inheritance. Without
+                        // it, self-created children are self-graded: closing
+                        // them looks like progress to model and scheduler
+                        // alike while the parent's real check fails
+                        // byte-identically (observed 2026-08-07/08: 97 items
+                        // marked done against 6 features actually verified —
+                        // the whole gap was acceptance-less scaffolding).
+                        // "Done is a verdict" only binds where a verdict
+                        // exists; this gives every child one by default.
+                        acceptance: canonical_acceptance(&params)?.or(parent_acceptance),
                         assignee: opt_string(&params, "assignee"),
                         sort_order,
                     };
@@ -1845,8 +1867,26 @@ fn is_low_signal_memory(content: &str) -> bool {
 /// - "same token": the repetition watch caught a decoder emitting one token
 ///   forever. Both were surfacing as "no done=true" stream aborts before the
 ///   watch existed, and both come from the same degraded-runner condition.
+/// - "aborted generation mid-response": the server closed a generation with
+///   done=false. Observed live 2026-08-08 (ministral-3:8b endurance): five
+///   abort clusters ended all three run segments while this classifier
+///   stayed silent — and both segment-boundary heals (the same runner reset
+///   this gate arms) restored service instantly, one segment then running
+///   104 productive minutes. The retry backoff ladder alone can never heal
+///   it: only the model unload clears the runner state.
+/// - Ollama-side tool-call parse 500s ("invalid character ... in string
+///   literal" and Go-JSON kin): each is an aborted generation server-side,
+///   and in the same run parse-500 storms directly preceded every done=false
+///   cluster — accumulated aborts degrade the runner until no stream
+///   finishes. A single one is often sampling luck (the plain retry stays
+///   first); the reset arms only under the existing attempt>=2 repeat rule.
 fn wedged_runner_error(message: &str) -> bool {
-    message.contains("empty completion") || message.contains("same token")
+    message.contains("empty completion")
+        || message.contains("same token")
+        || message.contains("aborted generation mid-response")
+        || (message.contains("invalid character ") && message.contains(" in string literal"))
+        || message.contains(" in string escape code")
+        || message.contains("after object key:value pair")
 }
 
 /// What one repetition abort looked like, kept so the next one can be
@@ -5910,6 +5950,34 @@ mod wedged_runner_tests {
         assert!(wedged_runner_error(
             "Ollama emitted the same token 20x in a row (\"0\") — a wedged runner, not a generation."
         ));
+    }
+
+    /// REGRESSION (2026-08-08, ministral-3:8b endurance): five clusters of
+    /// done=false stream aborts ended all three run segments without one
+    /// mid-step reset — the classifier did not know the message, while the
+    /// segment-boundary resets healed the runner instantly each time. The
+    /// tool-call parse 500s that preceded every cluster are the same
+    /// degraded-runner evidence, one aborted generation at a time.
+    #[test]
+    fn abort_and_parse_wedge_shapes_trigger_a_reset() {
+        assert!(wedged_runner_error(
+            "step error: LLM error: API error: 502 - Ollama aborted generation mid-response (done=false)"
+        ));
+        assert!(wedged_runner_error(
+            "API error: 500 - {\"error\":\"invalid character '\\t' in string literal\"}"
+        ));
+        assert!(wedged_runner_error(
+            "API error: 500 - {\"error\":\"invalid character '$' in string escape code\"}"
+        ));
+        assert!(wedged_runner_error(
+            "API error: 500 - {\"error\":\"invalid character '.' after object key:value pair\"}"
+        ));
+        // Ordinary provider errors stay out of the wedge path: a 404, a
+        // refused connection, or a plain timeout heals by retry/backoff,
+        // not by unloading the model.
+        assert!(!wedged_runner_error("API error: 404 - model not found"));
+        assert!(!wedged_runner_error("connection refused"));
+        assert!(!wedged_runner_error("request timed out after 120s"));
     }
 
     use super::{wedge_reset_due, WedgeFingerprint, WedgeReset};

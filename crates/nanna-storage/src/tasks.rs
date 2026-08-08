@@ -277,11 +277,17 @@ impl TaskRepository {
             // 69 times in one endurance run while the model split anyway, so
             // the schedule, not the model, has to hold the line. Depth 0 and 1
             // rank EQUALLY (a feature and its direct subtasks are both real
-            // work); only depth 2+ is deprioritized, which no baseline
-            // qwen3.5:9b run ever created, so its 32/42 is untouched by
-            // construction.
-            let a_deep = i32::from(depth_of(a.id) >= 2);
-            let b_deep = i32::from(depth_of(b.id) >= 2);
+            // work); beyond that the rank is GRADED by actual ladder depth,
+            // not a binary flag. The binary form went vacuous on a strict
+            // dependency chain (observed 2026-08-08, ministral: with every
+            // shallow leaf blocked, all schedulable work was depth 2-6 and
+            // tied — the model recursed to depth 6 with nothing pulling it
+            // back). Grading derives the rank from the structure itself:
+            // each level of scaffolding is one planning step farther from
+            // executable work, so within an all-deep candidate set the
+            // scheduler still pulls toward the shallowest.
+            let a_deep = depth_of(a.id).saturating_sub(1);
+            let b_deep = depth_of(b.id).saturating_sub(1);
             a_progress
                 .cmp(&b_progress)
                 .then(a_deep.cmp(&b_deep))
