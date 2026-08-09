@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.3",
+  version: "0.1.4",
   output: "memory",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -95,8 +95,50 @@ export default {
       return targets;
     }
 
+    // Deletion/rename of a ratchet-protected file is the OTHER laundering
+    // verb: the high-water is monotone only while the file exists, and the
+    // model discovered `rm -f ./minidb` 48 seconds after a refused shrink —
+    // erasing a 7965-byte high-water so the next fragment write passed
+    // (observed 2026-08-09; repeats the redirect lesson through rm).
+    function destructiveTargets(command) {
+      var targets = [];
+      // Split on shell separators, walk word by word; after an `rm`/`unlink`
+      // token, every non-flag word is a target. After `mv`, the FIRST
+      // non-flag word is (the source moves away — same erasure).
+      var words = command.split(/[;&|\n]+/).join(" \n ").split(/[ \t]+/);
+      var mode = null;
+      var mvTaken = false;
+      // The verb only counts in COMMAND position (first word of a
+      // statement): `grep rm notes.txt` names rm as data, not as intent.
+      var cmdPos = true;
+      for (var w = 0; w < words.length; w++) {
+        var word = words[w];
+        if (word === "") continue;
+        if (word === "\n") { mode = null; mvTaken = false; cmdPos = true; continue; }
+        if (cmdPos) {
+          cmdPos = false;
+          if (word === "rm" || word === "unlink") { mode = "rm"; continue; }
+          if (word === "mv") { mode = "mv"; mvTaken = false; continue; }
+          mode = null;
+          continue;
+        }
+        if (mode === null) continue;
+        if (word.charAt(0) === "-") continue;
+        var tok = word;
+        if (tok.length >= 2) {
+          var f0 = tok.charAt(0), l0 = tok.charAt(tok.length - 1);
+          if ((f0 === '"' && l0 === '"') || (f0 === "'" && l0 === "'")) tok = tok.substring(1, tok.length - 1);
+        }
+        if (mode === "rm") { targets.push(tok); }
+        else if (mode === "mv" && !mvTaken) { targets.push(tok); mvTaken = true; }
+      }
+      return targets;
+    }
+
     function redirectClobberRefusal(command) {
       var targets = clobberTargets(command);
+      var destructive = destructiveTargets(command);
+      for (var d = 0; d < destructive.length; d++) targets.push(destructive[d]);
       if (targets.length === 0) return null;
       var map = hiwaterMap();
       for (var t = 0; t < targets.length; t++) {
@@ -108,11 +150,11 @@ export default {
         var hi = entry && typeof entry.hi === "number" && isFinite(entry.hi) ? entry.hi : 0;
         if (hi > 500) {
           return "NOT EXECUTED — the file was NOT modified and is fully intact. " +
-            "This command redirects over " + raw + ", which is a file you built with " +
-            "write_file/edit_file and which has held " + hi + " bytes. Shell redirection " +
-            "replaces the WHOLE file with no safety check, and that is how a working " +
-            "script gets silently replaced by a shorter one that drops features you " +
-            "already had passing.\n\n" +
+            "This command would replace or delete " + raw + ", which is a file you built with " +
+            "write_file/edit_file and which has held " + hi + " bytes. Redirecting over it, " +
+            "rm-ing it, or mv-ing it away destroys the WHOLE file with no safety check, and " +
+            "that is how a working script gets silently replaced by a shorter one that drops " +
+            "features you already had passing.\n\n" +
             "Nothing failed and nothing is lost — " + raw + " is exactly as it was.\n\n" +
             "To change part of it: edit_file(file_path=\"" + raw + "\", old_string=<exact current text>, new_string=<replacement>).\n" +
             "To replace all of it on purpose: read_file(\"" + raw + "\") first, merge your change " +
