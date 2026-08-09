@@ -644,6 +644,34 @@ impl ControlPlane {
                                 .await
                                 .is_ok_and(|(open, _closed)| open > 0);
                             if seeded.is_empty() || !has_work {
+                                // A FALLBACK plan that seeded nothing is not
+                                // "re-planning found nothing left" — the
+                                // planner never spoke (empty/degraded output)
+                                // and its regenerated monolith title always
+                                // collides with the closed-title dedup by
+                                // construction. Observed live 2026-08-08: two
+                                // such rounds read as dry and ended a mission
+                                // at 13/42 six minutes in. Planner silence is
+                                // an ERROR round: bounded by the error budget,
+                                // never proof the goal is done.
+                                if next_plan.origin == nanna_agent::planner::PlanOrigin::Fallback {
+                                    error_rounds += 1;
+                                    tracing::warn!(
+                                        continuations,
+                                        error_rounds,
+                                        "continuation planner fell back and seeded nothing — \
+                                         counting an error round, not a dry one"
+                                    );
+                                    if error_rounds > CONTINUATION_ERROR_ROUNDS {
+                                        tracing::error!(
+                                            "continuation planner keeps falling back — giving up \
+                                             after {} error rounds",
+                                            CONTINUATION_ERROR_ROUNDS
+                                        );
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 dry_rounds += 1;
                                 tracing::info!(
                                     continuations,

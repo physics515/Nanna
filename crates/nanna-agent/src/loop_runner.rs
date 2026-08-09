@@ -2951,6 +2951,17 @@ impl Agent {
                     options.restrict_to_active_tools && !options.all_tools_active,
                 )
                 .await;
+            // A planning step asks for one JSON answer and may not act:
+            // advertising tools invites the model to spend its single
+            // planning iteration on a tool call instead of the plan.
+            // Observed live 2026-08-08 (ornith, GUI mission): EVERY chat
+            // plan and continuation replan burned its one iteration on
+            // discover_tools, degraded to the fallback single task, and the
+            // turn died "dry" at 13/42 six minutes in. No tools sent means
+            // the only possible answer is the plan itself.
+            if matches!(options.step_kind, Some(crate::harness::StepKind::Plan)) {
+                request.tools = None;
+            }
             if let Some(ref routed) = routed_model {
                 // Strip provider prefix for the API request model field
                 // but keep the full spec for client routing

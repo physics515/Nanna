@@ -1211,6 +1211,12 @@ impl LongHorizonRunner {
                 let reason = format!(
                     "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
                 );
+                // Loud on purpose: abandonment used to reach only the store's
+                // activity log, and a run that silently gave up its one item
+                // read as "converged" in the daemon log (2026-08-08 forensics
+                // — recovering WHY took a database query; it should take a
+                // grep).
+                tracing::warn!(item = step.id, title = %step.title, %reason, "abandoning item");
                 if let Err(message) = source.abandon(step.id, &reason).await {
                     break StopReason::SourceError { message };
                 }

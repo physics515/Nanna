@@ -2692,53 +2692,76 @@ impl AgentPlanner {
         if cancel.is_some_and(CancelToken::is_cancelled) {
             return Plan::single(goal);
         }
-        let request = StepRequest {
-            // Planning is not attached to an item yet; the store assigns ids
-            // when the plan is seeded.
-            item_id: 0,
-            step_index: 0,
-            step_kind: nanna_agent::harness::StepKind::Plan,
-            item_title: "Planning".to_string(),
-            prompt: build_plan_prompt(goal, context),
-            tool_scope: Vec::new(),
-            token_budget: None,
-            max_iterations: Some(PLAN_ITERATIONS),
-            max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
-            // Threaded so the in-step LLM call aborts on Stop too.
-            cancel: cancel.cloned(),
-        };
+        // Two attempts, not one: even with tool definitions stripped from
+        // Plan steps, a local model can emit an empty completion on the
+        // single planning iteration, and one silent fallback here cost a
+        // whole mission (observed 2026-08-08: every plan degraded to the
+        // fallback monolith and the turn died dry at 13/42). The retry is
+        // bounded to one — a planner that answers empty twice is not going
+        // to speak on the third ask, and the fallback keeps the turn alive.
+        for attempt in 0..2 {
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Plan::single(goal);
+            }
+            let request = StepRequest {
+                // Planning is not attached to an item yet; the store assigns
+                // ids when the plan is seeded.
+                item_id: 0,
+                step_index: 0,
+                step_kind: nanna_agent::harness::StepKind::Plan,
+                item_title: "Planning".to_string(),
+                prompt: build_plan_prompt(goal, context),
+                tool_scope: Vec::new(),
+                token_budget: None,
+                max_iterations: Some(PLAN_ITERATIONS),
+                max_wall_clock: Some(std::time::Duration::from_secs(PLAN_TIMEOUT_SECS)),
+                // Threaded so the in-step LLM call aborts on Stop too.
+                cancel: cancel.cloned(),
+            };
 
-        let planning = tokio::time::timeout(
-            std::time::Duration::from_secs(PLAN_TIMEOUT_SECS),
-            self.runner.run_step(request),
-        );
-        let outcome = if let Some(token) = cancel {
-            tokio::select! {
-                biased;
-                outcome = planning => outcome,
-                () = token.cancelled() => {
-                    tracing::info!("planning cancelled — degrading to the single-task plan");
+            let planning = tokio::time::timeout(
+                std::time::Duration::from_secs(PLAN_TIMEOUT_SECS),
+                self.runner.run_step(request),
+            );
+            let outcome = if let Some(token) = cancel {
+                tokio::select! {
+                    biased;
+                    outcome = planning => outcome,
+                    () = token.cancelled() => {
+                        tracing::info!("planning cancelled — degrading to the single-task plan");
+                        return Plan::single(goal);
+                    }
+                }
+            } else {
+                planning.await
+            };
+
+            match outcome {
+                Ok(Ok(step)) => {
+                    if step.text.trim().is_empty() && attempt == 0 {
+                        tracing::warn!(
+                            "planner answered with empty text — retrying the planning call once"
+                        );
+                        continue;
+                    }
+                    return plan_or_fallback(goal, &step.text);
+                }
+                Ok(Err(message)) => {
+                    tracing::warn!(%message, "planner failed - falling back to a single-task plan");
+                    return Plan::single(goal);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = PLAN_TIMEOUT_SECS,
+                        "planner timed out - falling back to a single-task plan"
+                    );
                     return Plan::single(goal);
                 }
             }
-        } else {
-            planning.await
-        };
-
-        match outcome {
-            Ok(Ok(step)) => plan_or_fallback(goal, &step.text),
-            Ok(Err(message)) => {
-                tracing::warn!(%message, "planner failed - falling back to a single-task plan");
-                Plan::single(goal)
-            }
-            Err(_) => {
-                tracing::warn!(
-                    timeout_secs = PLAN_TIMEOUT_SECS,
-                    "planner timed out - falling back to a single-task plan"
-                );
-                Plan::single(goal)
-            }
         }
+        // Unreachable in practice (attempt 1 always returns), but the loop
+        // shape cannot prove it: both attempts empty degrades to fallback.
+        Plan::single(goal)
     }
 }
 
