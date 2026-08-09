@@ -78,6 +78,27 @@ fn pressure_tier_active_tools() -> HashSet<String> {
     PRESSURE_TIER_WORK_TOOLS.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// The tool name a provider refused to look up, parsed from its error body.
+///
+/// Some local templates validate tool names against the request's `tools`
+/// array and fail the WHOLE exchange when a name is missing. Observed live
+/// (2026-08-08, ministral-3:8b): Ollama's Mistral-family parser rejects a
+/// GENERATED call to an unserved tool with HTTP 500 and the body
+/// `{"error":"tool 'exec' not found"}` — the call never reaches the
+/// registry, so the normal unknown-tool guidance ("use discover_tools")
+/// can never fire, and re-sending the identical request dies identically.
+/// qwen/gemma parsers pass unknown names through to the registry instead,
+/// which is why only some models trip this.
+///
+/// Matches the provider's `tool '<name>' not found` shape anywhere in the
+/// rendered error (the message arrives wrapped in transport prefixes like
+/// `API error: 500 - {...}`).
+fn provider_unknown_tool_name(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("tool '")?;
+    let (name, tail) = rest.split_once('\'')?;
+    (!name.is_empty() && tail.trim_start().starts_with("not found")).then_some(name)
+}
+
 /// The smallest output reserve (in tokens) a step can do real work in — the
 /// floor of [`window_scaled_output_reserve`].
 ///
@@ -3124,6 +3145,54 @@ impl Agent {
                 }
             }
 
+            // Heal a provider-side unserved-tool rejection: the model reached
+            // for a tool by name (it knows the canonical names from the system
+            // prompt) without discovering it first, and the provider validated
+            // that name against the request's `tools` array and failed the
+            // whole exchange — see [`provider_unknown_tool_name`]. The tool
+            // exists and the model asked for it, so the heal performs the same
+            // activation `discover_tools` would have, triggered by the
+            // provider's own signal, and re-sends. Bounded by construction,
+            // not by a cap: a retry happens only when the named tool NEWLY
+            // resolves to something this request was not already serving, and
+            // the registry is finite, so each pass strictly grows the served
+            // set and the chain cannot cycle.
+            while let Err(ref e) = result {
+                let msg = e.to_string();
+                let Some(wanted) = provider_unknown_tool_name(&msg) else {
+                    break;
+                };
+                let Some((canonical, _)) = self.tools.resolve_tool(wanted).await else {
+                    // Nothing registered under that name — not healable by
+                    // serving a definition; let the normal error path run.
+                    break;
+                };
+                // Serve it under both the name the model reached for and its
+                // canonical resolution (an unregistered alias serves nothing
+                // and costs nothing). Non-short-circuiting `|`: both inserts
+                // must run so a repeat of either name reads as already-served.
+                let newly_served = state.active_tools.insert(canonical.clone())
+                    | state.active_tools.insert(wanted.to_string());
+                if !newly_served {
+                    // Already serving it — same message, different fault.
+                    break;
+                }
+                warn!(
+                    tool = %wanted,
+                    canonical = %canonical,
+                    error = %msg,
+                    "Provider rejected a call to an unserved tool — activating \
+                     it and retrying the request"
+                );
+                request.tools = self
+                    .request_tool_defs(
+                        &state.active_tools,
+                        options.restrict_to_active_tools && !options.all_tools_active,
+                    )
+                    .await;
+                result = self.call_llm(&request, &options, &mut state).await;
+            }
+
             // Handle context_length_exceeded: emergency truncate and retry once
             let result = match result {
                 Err(ref e) if Self::is_context_length_error(&e.to_string()) => {
@@ -5544,14 +5613,15 @@ impl Agent {
         }
     }
 
-    async fn build_request_with_thinking(
+    /// The tool definitions a request should carry for this active set — the
+    /// names → definitions → dedup path shared by `build_request_with_thinking`
+    /// and the unserved-tool heal, which rebuilds ONLY the tools of an
+    /// already-built request after a mid-step activation.
+    async fn request_tool_defs(
         &self,
-        thinking_override: Option<ThinkingMode>,
         active_tools: &HashSet<String>,
         restrict_to_active: bool,
-    ) -> AnthropicRequest {
-        let ctx = self.context.read().await;
-
+    ) -> Option<Vec<LlmToolDef>> {
         let names = tool_names_for_request(active_tools, restrict_to_active);
 
         let tool_defs = self.tools.definitions_for_names(&names).await;
@@ -5568,6 +5638,18 @@ impl Agent {
                 input_schema: t.to_anthropic_format()["input_schema"].clone(),
             })
             .collect();
+        (!tools.is_empty()).then_some(tools)
+    }
+
+    async fn build_request_with_thinking(
+        &self,
+        thinking_override: Option<ThinkingMode>,
+        active_tools: &HashSet<String>,
+        restrict_to_active: bool,
+    ) -> AnthropicRequest {
+        let tools = self.request_tool_defs(active_tools, restrict_to_active).await;
+
+        let ctx = self.context.read().await;
 
         // Get effective system prompt (includes workspace context if set)
         let system_prompt = ctx.effective_system_prompt();
@@ -5684,7 +5766,7 @@ impl Agent {
             } else {
                 Some(system_prompt)
             },
-            tools: if tools.is_empty() { None } else { Some(tools) },
+            tools,
             stream: None,
             thinking,
             cache_control,
@@ -6543,6 +6625,51 @@ mod tests {
         for core in CORE_TOOL_NAMES {
             assert!(empty.contains(*core), "empty scope keeps the core set");
         }
+    }
+
+    /// The heal keys off the provider's exact error shape, wrapped in every
+    /// transport prefix the loop actually sees. Live string from the
+    /// 2026-08-08 ministral-3:8b smoke run, where task #5 was abandoned on
+    /// this loop.
+    #[test]
+    fn provider_unknown_tool_name_parses_the_live_failure_string() {
+        assert_eq!(
+            provider_unknown_tool_name(
+                r#"API error: 500 - {"error":"tool 'exec' not found"}"#
+            ),
+            Some("exec")
+        );
+        // The loop-level rendering carries the AgentError prefix too.
+        assert_eq!(
+            provider_unknown_tool_name(
+                r#"LLM error: API error: 500 - {"error":"tool 'web_search' not found"}"#
+            ),
+            Some("web_search")
+        );
+    }
+
+    /// Anything that is not the provider's tool-lookup failure must fall
+    /// through to the normal error paths — a mis-triggered heal would spend a
+    /// generation on a doomed retry.
+    #[test]
+    fn provider_unknown_tool_name_ignores_other_errors() {
+        assert_eq!(provider_unknown_tool_name("API error: 500 - internal"), None);
+        // The registry's own unknown-tool guidance is a tool RESULT, not a
+        // provider rejection — different shape, and must not match.
+        assert_eq!(
+            provider_unknown_tool_name(
+                "Tool not found: zzz. Use discover_tools to see available tools."
+            ),
+            None
+        );
+        // Quoted name with no lookup-failure tail.
+        assert_eq!(
+            provider_unknown_tool_name("tool 'exec' timed out after 30s"),
+            None
+        );
+        // Empty name is not a name.
+        assert_eq!(provider_unknown_tool_name("tool '' not found"), None);
+        assert_eq!(provider_unknown_tool_name(""), None);
     }
 
     #[test]
