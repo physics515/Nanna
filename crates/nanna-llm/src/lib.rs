@@ -1891,7 +1891,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
     /// so it would have had no effect on the thing it was written to fix.)
     ///
     /// Source order: what the caller explicitly asked for, then the live
-    /// latch, then min(env pin, probed/nominal size) at latch initialization.
+    /// latch, then the env pin outright (falling back to the probed/nominal
+    /// size only when no pin is set) at latch initialization.
     fn resolve_num_ctx(model: &str, explicit: Option<u32>) -> u32 {
         if let Some(explicit) = explicit {
             return explicit;
@@ -1899,43 +1900,36 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         if let Some(latched) = Self::latched_num_ctx(model) {
             return latched;
         }
-        // Explicit beats computed — downward. `NANNA_OLLAMA_NUM_CTX` is set by
-        // someone who measured THIS machine with THIS model;
-        // `fit_context_to_free_vram` has only inferred a size from free bytes.
-        // Letting the heuristic promote past the operator's number was a
-        // silent override of a deliberate setting, and it was expensive: the
-        // same model on the same mission scored 31/42 at the operator's 16384
-        // and 8/42 once the heuristic promoted it to 32768. Fitting in VRAM is
-        // necessary, not sufficient — a 9B model given twice the window does
-        // not use it well, it loses the thread and rewrites work it had passing.
+        // Explicit beats computed — in BOTH directions. `NANNA_OLLAMA_NUM_CTX`
+        // is set by someone who measured THIS machine with THIS model;
+        // `fit_context_to_free_vram` has only inferred a size from a SNAPSHOT
+        // of free bytes. Both override directions have now been paid for:
+        // the heuristic promoting past the operator's number cost a mission
+        // (31/42 at the pinned 16384 vs 8/42 at the promoted 32768 — a 9B
+        // model given twice the window loses the thread), and the heuristic
+        // DEMOTING below it cost another (2026-08-09: a summarization burst
+        // held the card while the model's first request sized, the min(env,
+        // sized) start latched 4096 for the daemon's lifetime, and every
+        // later mission request inherited the poisoned latch on an
+        // otherwise-idle card).
         //
-        // So the pin is a ceiling on the STARTING latch, not a disable of the
-        // machinery around it: the start is min(env, sized), which lets the
-        // env shrink the start (a probed 16384 that faults under sustained
-        // mission KV load starts stable at a pinned 8192) but never grow it
-        // past what the probe — or the nominal fallback when the card cannot
-        // be measured — says this machine supports. And a pin that is still
-        // too large faults under load and gets walked down by
-        // `demote_context` (the caller demotes on the second fault of a run —
-        // one fault at a sane pin is usually a transient blip, healed by a
-        // runner reset alone): demotion below the pin keeps working because
-        // the latch, not the env, is consulted once it exists.
-        let sized = Self::fit_context_to_free_vram(model).unwrap_or(16_384);
+        // A transient probe must not override a durable measurement in
+        // either direction. A pin that is genuinely too large for the card
+        // still faults under load and gets walked down by `demote_context`
+        // (the caller demotes on the second fault of a run): the safety net
+        // for an over-pin is the fault ladder, not the snapshot.
         let start = match Self::env_num_ctx() {
             Some(pinned) => {
-                let start = pinned.min(sized);
                 tracing::info!(
                     model = %model,
-                    pinned = start,
-                    requested = pinned,
-                    sized,
+                    pinned,
                     source = "env",
                     "NANNA_OLLAMA_NUM_CTX pins the starting num_ctx latch; \
                      demote_context can still walk it lower on GPU faults"
                 );
-                start
+                pinned
             }
-            None => sized,
+            None => Self::fit_context_to_free_vram(model).unwrap_or(16_384),
         };
         Self::latch_num_ctx(model, start);
         start
@@ -6352,17 +6346,23 @@ mod tests {
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
 
-    /// The pin is min(env, sized) in BOTH directions. Fake model names are
-    /// absent from Ollama's tags, so the VRAM probe abstains and sizing lands
-    /// on the nominal 16384 deterministically on any machine — which makes
-    /// both sides of the min observable without mocking the card.
+    /// The pin IS the starting latch, in both directions. The probe is a
+    /// snapshot of free bytes and must not override a durable operator
+    /// measurement either way: promotion past the pin cost a mission
+    /// (31/42→8/42 at 32768), and demotion below it cost another
+    /// (2026-08-09: a summarization burst held the card while the first
+    /// request sized, min(env, sized) latched 4096 for the daemon's
+    /// lifetime, and every later request inherited the poisoned latch on an
+    /// idle card). A genuinely oversized pin is walked down by the fault
+    /// ladder, not by the snapshot. Fake model names are absent from
+    /// Ollama's tags, so the VRAM probe abstains deterministically here.
     #[test]
-    fn the_env_pin_is_a_ceiling_on_the_starting_latch_in_both_directions() {
+    fn the_env_pin_is_the_starting_latch_in_both_directions() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut request = request_with_tool_history(serde_json::json!({}));
         request.context_limit = None;
 
-        // Shrink: a pin below what sizing would pick IS the starting latch.
+        // Below nominal: the pin is the starting latch.
         // SAFETY: edition 2024 requires this; env_lock serialises the
         // env-touching tests, and nothing else reads this key.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "8192") };
@@ -6374,11 +6374,11 @@ mod tests {
             "the pin must be LATCHED as the start, not re-derived per request"
         );
 
-        // Never grow: a pin above what sizing supports starts at the sized
-        // value — the env cannot inflate the window past the machine.
+        // Above nominal: the pin still wins — the snapshot cannot demote a
+        // durable measurement; only the GPU fault ladder can.
         unsafe { std::env::set_var("NANNA_OLLAMA_NUM_CTX", "32768") };
-        request.model = "test-env-pin-cannot-grow:1b".to_string();
-        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 16_384);
+        request.model = "test-env-pin-wins-upward:1b".to_string();
+        assert_eq!(LlmClient::resolve_num_ctx(&request.model, request.context_limit), 32_768);
 
         unsafe { std::env::remove_var("NANNA_OLLAMA_NUM_CTX") };
     }
