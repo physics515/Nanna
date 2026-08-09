@@ -303,35 +303,6 @@ async fn run_command_check(command: &str, workdir: &Path, timeout: Duration) -> 
     }
 }
 
-/// Kill a process and its descendants, best-effort. Mirrors
-/// `kill_process_tree` in `nanna-scripting/src/bridge.rs` (this crate can't
-/// reach it — nanna-scripting sits behind nanna-tools' optional `scripting`
-/// feature); keep the two in sync.
-async fn kill_process_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-    }
-    #[cfg(not(windows))]
-    {
-        // pid is a fresh process-group id from the kernel: it fits i32, and a
-        // failed signal (group already gone) is exactly the no-op we want.
-        #[allow(clippy::cast_possible_wrap)]
-        let pgid = -(pid as i32);
-        // SAFETY: kill(2) with a negative pgid signals a process group we
-        // created; `process_group(0)` at spawn put the child in its own
-        // group, so this can never reach our own.
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
-        }
-    }
-}
-
 /// Run a shell command, returning (exit code, combined stdout+stderr).
 ///
 /// On Windows this prefers Git Bash `sh` when on PATH (matching the exec
@@ -340,8 +311,9 @@ async fn kill_process_tree(pid: u32) {
 /// Lifecycle matches the exec tool (`bridge.rs`): the child runs in its own
 /// process group so a check that signals its group can't reach us, and a
 /// timeout kills the whole tree — the shell *and* any wedged grandchild —
-/// instead of `kill_on_drop`'s shell-only reap, which let a stuck workload
-/// outlive the check and hold workspace/build locks.
+/// via `nanna_proc::kill_process_tree` plus a per-child Job Object
+/// (`nanna_proc::ChildJob`) that also reaps a detached grandchild whose
+/// shell already exited, the `foo &` shape the walk can't see.
 async fn run_shell(
     command: &str,
     workdir: &Path,
@@ -370,13 +342,30 @@ async fn run_shell(
     // Capture the pid before the wait future consumes the child, so a timeout
     // can kill the whole tree rooted here (not just the shell).
     let pid = child.id();
+    // Windows: contain the whole subtree in its own kill-on-close Job Object
+    // (see exec_with_timeout in nanna-scripting bridge.rs for the full
+    // rationale). Unix relies on the process group above.
+    let mut job = nanna_proc::ChildJob::assign(&child);
     let wait = child.wait_with_output();
     tokio::pin!(wait);
     let output = tokio::select! {
-        res = &mut wait => res.map_err(|e| e.to_string())?,
+        res = &mut wait => {
+            let output = res.map_err(|e| e.to_string())?;
+            // Completed: spare deliberate background survivors (the
+            // daemon-wide Job Object still bounds them).
+            if let Some(job) = job.take() {
+                job.disarm();
+            }
+            output
+        },
         () = tokio::time::sleep(timeout) => {
+            // Walk the live tree first, then terminate the job to sweep
+            // descendants the walk can't see (detached grandchildren).
             if let Some(pid) = pid {
-                kill_process_tree(pid).await;
+                nanna_proc::kill_process_tree(pid).await;
+            }
+            if let Some(job) = job.take() {
+                job.terminate();
             }
             return Err(format!("timed out after {}s", timeout.as_secs()));
         }
@@ -2176,6 +2165,57 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "timeout path must not wait for the workload"
         );
+    }
+
+    /// REGRESSION (2026-08-08): `foo &` under an acceptance check — the
+    /// shell exits immediately, the backgrounded grandchild inherits the
+    /// pipes so the timeout fires with the shell already dead, and the
+    /// `taskkill /T` parent-walk from that dead pid finds nothing. The
+    /// per-check Job Object must reap the grandchild anyway so the held
+    /// pipes EOF (full pipe-read teardown coverage lives in the exec-side
+    /// twin, nanna-scripting bridge.rs).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_timeout_reaps_detached_grandchild() {
+        if git_bash_path().is_none() {
+            eprintln!("skipping run_shell_timeout_reaps_detached_grandchild: Git Bash not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let pid_path = pid_file.display().to_string().replace('\\', "/");
+        // Git Bash `$!` is an MSYS pid; /proc/<msys-pid>/winpid maps it to
+        // the real Windows pid so tasklist can probe it.
+        let command =
+            format!("ping -n 60 127.0.0.1 & cat /proc/$!/winpid > '{pid_path}'; exit 0");
+
+        let result = run_shell(&command, dir.path(), Duration::from_secs(2)).await;
+        let err = result.expect_err("held pipes must force the timeout");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+
+        let text = std::fs::read_to_string(&pid_file).expect("grandchild pid file");
+        let grandchild_pid: u32 = text.trim().parse().expect("windows pid");
+
+        // Reap bound: `TerminateJobObject` is near-instant; 5s is a generous
+        // ceiling for a loaded CI machine, polled at 50ms.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = tokio::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {grandchild_pid}"), "/NH"])
+                .output()
+                .await
+                .is_ok_and(|out| {
+                    String::from_utf8_lossy(&out.stdout).contains(&grandchild_pid.to_string())
+                });
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached grandchild survived the acceptance timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[test]

@@ -5476,10 +5476,10 @@ dependencies = [
  "chrono",
  "futures",
  "image",
- "libc",
  "nanna-llm",
  "nanna-mcp",
  "nanna-memory",
+ "nanna-proc",
  "nanna-storage",
  "nanna-tools",
  "nanna-workspace",
@@ -5623,6 +5623,7 @@ dependencies = [
  "nanna-llm",
  "nanna-mcp",
  "nanna-memory",
+ "nanna-proc",
  "nanna-scripting",
  "nanna-storage",
  "nanna-tools",
@@ -5747,6 +5748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanna-proc"
+version = "0.3.6"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nanna-scripting"
 version = "0.3.6"
 dependencies = [
@@ -5758,7 +5770,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "directories",
- "libc",
+ "nanna-proc",
  "reqwest",
  "rustpython-pylib",
  "rustpython-stdlib",
