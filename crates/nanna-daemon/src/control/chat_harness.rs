@@ -314,7 +314,18 @@ impl ControlPlane {
         let content_owned = content.to_string();
         let message_id_for_run = message_id.clone();
 
-        tokio::spawn(async move {
+        // Handles for the death watcher below — the originals move into the
+        // turn task, and the watcher must be able to run the release tail
+        // without them.
+        let watcher_registry = registry.clone();
+        let watcher_agent = agent.clone();
+        let watcher_event_tx = event_tx.clone();
+        let watcher_sink = final_sink.clone();
+        let watcher_baselines = turn_baselines.clone();
+        let watcher_session = session_id.to_string();
+        let watcher_message_id = message_id.clone();
+
+        let turn = tokio::spawn(async move {
             let scope = "session".to_string();
             let scope_id = Some(session_id_owned.clone());
 
@@ -971,6 +982,47 @@ impl ControlPlane {
             registry.release(&session_id_owned).await;
             if let Some(ref baselines) = turn_baselines {
                 baselines.close_turn(&scope, scope_id.as_deref()).await;
+            }
+        });
+
+        // Death watcher: a turn that dies before its release tail must not
+        // leak its registrations. The task above is fire-and-forget, releases
+        // are MANUAL at its tail, and there is no process-wide panic hook —
+        // so a panic anywhere in the turn used to vanish without a log line
+        // while the run claim stayed held. That claim is what admits the
+        // session's next message AND what the dream gate consults (PR #207),
+        // so the leak wedges the session forever and freezes dreaming with
+        // it. The 2026-08-10 incident had exactly this signature: the step's
+        // last log line, then 50+ minutes of silence from a live session
+        // while every other subsystem ran normally.
+        //
+        // The watcher only acts on an abnormal death (`JoinError`: panic or
+        // abort); a normal return has already run the tail above, and
+        // re-running release on an already-released id is a harmless no-op
+        // anyway.
+        tokio::spawn(async move {
+            let Err(join_error) = turn.await else {
+                return;
+            };
+            tracing::error!(
+                session_id = %watcher_session,
+                panicked = join_error.is_panic(),
+                "chat turn task died before its release tail: {join_error}; \
+                 releasing its registrations"
+            );
+            watcher_sink.delta(
+                "\n\n_internal error: this turn crashed before finishing; the \
+                 session has been released — see the daemon log._",
+            );
+            let _ = watcher_event_tx.send(crate::protocol::Event::MessageEnd {
+                session_id: watcher_session.clone(),
+                message_id: watcher_message_id,
+                content: String::new(),
+            });
+            watcher_agent.unregister_external_run(&watcher_session).await;
+            watcher_registry.release(&watcher_session).await;
+            if let Some(baselines) = watcher_baselines {
+                baselines.close_turn("session", Some(&watcher_session)).await;
             }
         });
 

@@ -1433,6 +1433,29 @@ impl DaemonServer {
         info!("Starting Nanna daemon...");
         info!("Data directory: {:?}", self.config.data_dir);
 
+        // Route every panic through tracing BEFORE doing anything that can
+        // spawn a task. The default hook prints to stderr, which a headless
+        // daemon has nowhere useful to send — so a panicked task died with
+        // ZERO log lines and the wedge it left (2026-08-10: a chat turn's
+        // task panicked and its session went silent for 50+ minutes) was
+        // undiagnosable from the log alone. Chains to the previous hook so
+        // stderr output, where it exists, is preserved.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            tracing::error!(%location, "PANIC: {payload}");
+            previous_hook(info);
+        }));
+
         // Adopt a kill-on-close Job Object BEFORE anything can spawn a child:
         // every exec/acceptance process inherits membership, so the OS reaps
         // the whole tree when this process dies for any reason — clean stop,

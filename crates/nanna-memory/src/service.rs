@@ -45,6 +45,40 @@ impl Default for MemoryServiceConfig {
 /// Callback for generating embeddings (injected dependency)
 pub type EmbedFn = Arc<dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + Send>> + Send + Sync>;
 
+/// What a [`MemoryService::fold_into_memory`] attempt actually did.
+///
+/// Three outcomes, because two is what caused the loss: the old `bool`
+/// collapsed "the content is already there" and "the write was declined" into
+/// one value, and the caller could not tell which fallback keeps the content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldResult {
+    /// The merge was written; `incoming` now lives inside the target entry.
+    Merged,
+    /// The merge left the target byte-identical — `incoming` is either a true
+    /// subset of it or the byte bound declined the append. The caller decides
+    /// (by a containment check) whether the content is already present or
+    /// must become its own row.
+    Subset,
+    /// The target's content changed between the caller's read and the write:
+    /// the compare-and-swap declined, nothing was touched, and `incoming`
+    /// landed NOWHERE. The caller must store it another way.
+    Contended,
+}
+
+/// What one dream-dedup fold commit ([`MemoryService::commit_duplicate_fold`])
+/// actually did.
+#[derive(Debug, Clone, PartialEq)]
+enum DedupCommit {
+    /// The fold committed. Payload: the survivor's new embedding when its
+    /// content was rewritten (`None` for a pure superset fold that changed
+    /// nothing). The source is now safe to remove — via a MATCHED removal,
+    /// so a source rewritten after this commit is still kept.
+    Committed(Option<Vec<f32>>),
+    /// A concurrent write changed the pair under the fold; nothing was
+    /// touched. Both memories stay for the next cycle.
+    Stale,
+}
+
 /// Memory service for semantic search and recall with FSRS-6 cognitive model
 pub struct MemoryService {
     config: MemoryServiceConfig,
@@ -644,25 +678,39 @@ impl MemoryService {
                     let folded = self
                         .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
                         .await?;
-                    if folded {
-                        info!(
-                            "Merged into: {} (sim: {:.3})",
-                            truncate(&existing.content, 30),
-                            similarity
-                        );
-                    } else {
-                        info!(
-                            "Update no-op (subset): {} (sim: {:.3})",
-                            truncate(&existing.content, 30),
-                            similarity
-                        );
-                    }
                     // A related mention is a successful recall — reinforce FSRS.
                     self.pending_updates
                         .write()
                         .await
                         .push((existing.id.clone(), Rating::Good));
-                    return Ok((existing.id.clone(), IngestAction::Update));
+                    match folded {
+                        FoldResult::Merged => {
+                            info!(
+                                "Merged into: {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                            return Ok((existing.id.clone(), IngestAction::Update));
+                        }
+                        FoldResult::Subset => {
+                            info!(
+                                "Update no-op (subset): {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                            return Ok((existing.id.clone(), IngestAction::Update));
+                        }
+                        // The neighbour changed under the fold; the content
+                        // landed nowhere, so it must still become a row.
+                        FoldResult::Contended => {
+                            debug!(
+                                "Fold contended (memory changed mid-merge); \
+                                 storing separately (sim: {:.3})",
+                                similarity
+                            );
+                            // fall through to create
+                        }
+                    }
                 }
                 IngestAction::Create => {
                     // Novel content, create new
@@ -700,8 +748,16 @@ impl MemoryService {
     /// Fold `incoming` content into an existing memory (`existing_id`), re-embedding
     /// the merged text. Shared by every ingest path that lands in the `Update` band.
     ///
-    /// Returns `true` if a merge was written, `false` if `incoming` added nothing new
-    /// (a subset of the existing content). The caller is responsible for FSRS
+    /// Returns [`FoldResult::Merged`] when the merge was written,
+    /// [`FoldResult::Subset`] when `incoming` added nothing new (the merge
+    /// left the existing content byte-identical — a true subset, or a merge
+    /// the byte bound declined), and [`FoldResult::Contended`] when the
+    /// target's content changed between the caller's read and the write — the
+    /// rewrite is compare-and-swapped against `existing_content`, because
+    /// blindly writing a merge of a STALE snapshot would erase whatever the
+    /// concurrent writer (a dream-cycle fold, another ingest) just stored.
+    /// On `Contended` the caller must land `incoming` some other way (its own
+    /// row); it provably did NOT land here. The caller is responsible for FSRS
     /// reinforcement — this only rewrites content + embedding.
     ///
     /// # Errors
@@ -713,29 +769,42 @@ impl MemoryService {
         existing_id: &str,
         existing_content: &str,
         incoming: &str,
-    ) -> Result<bool, MemoryError> {
+    ) -> Result<FoldResult, MemoryError> {
         debug_assert!(
             !existing_id.is_empty(),
             "existing memory id must not be empty"
         );
         let merged = merge_memory_content(existing_content, incoming);
         if merged == existing_content {
-            return Ok(false);
+            return Ok(FoldResult::Subset);
         }
         let merged_embedding = (embed_fn)(&merged)
             .await
             .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-        self.rewrite_with_binding(existing_id, &merged, merged_embedding)
-            .await?;
-        Ok(true)
+        match self
+            .rewrite_with_binding(existing_id, &merged, merged_embedding, Some(existing_content))
+            .await?
+        {
+            Some(_) => Ok(FoldResult::Merged),
+            None => Ok(FoldResult::Contended),
+        }
     }
 
     /// Rewrite `id` to `content` with `embedding`, resolved against the
     /// CURRENT binding: a vector whose width no longer matches (the provider
     /// switched while it was being computed) is discarded and the entry queued
     /// for backfill instead of failing the rewrite — the merged content must
-    /// land either way. Returns the vector actually stored (empty when
-    /// queued), so callers can keep in-memory copies in step.
+    /// land either way.
+    ///
+    /// `expected_content`, when set, makes the rewrite a compare-and-swap on
+    /// the entry's live content (see
+    /// [`VectorStore::update_content_and_embedding_if`]): every caller here
+    /// computed `content` by merging FROM a snapshot, and applying that merge
+    /// over an entry someone else rewrote in between would silently drop the
+    /// concurrent write. `None` from this method means the swap was declined
+    /// and nothing was touched; `Some(vector)` is the vector actually stored
+    /// (empty when queued for backfill), so callers can keep in-memory copies
+    /// in step.
     ///
     /// # Errors
     ///
@@ -745,23 +814,32 @@ impl MemoryService {
         id: &str,
         content: &str,
         embedding: Vec<f32>,
-    ) -> Result<Vec<f32>, MemoryError> {
+        expected_content: Option<&str>,
+    ) -> Result<Option<Vec<f32>>, MemoryError> {
         let (model, bound_dim) = self.active_binding().await;
         if embedding.len() == bound_dim {
-            self.store
-                .update_content_and_embedding(id, content, embedding.clone(), model.as_deref())
+            let applied = self
+                .store
+                .update_content_and_embedding_if(
+                    id,
+                    expected_content,
+                    content,
+                    embedding.clone(),
+                    model.as_deref(),
+                )
                 .await?;
-            return Ok(embedding);
+            return Ok(applied.then_some(embedding));
         }
         info!(
             "Rewrite of {id} raced a provider switch ({} dims vs bound {bound_dim}) — \
              content updated, vector queued for backfill",
             embedding.len()
         );
-        self.store
-            .update_content_and_embedding(id, content, Vec::new(), None)
+        let applied = self
+            .store
+            .update_content_and_embedding_if(id, expected_content, content, Vec::new(), None)
             .await?;
-        Ok(Vec::new())
+        Ok(applied.then_some(Vec::new()))
     }
 
     /// Remember something - store with embedding.
@@ -857,27 +935,41 @@ impl MemoryService {
                     // leaving it on the old behaviour would have made whether a
                     // memory survives depend on whether a workspace happened to
                     // be selected — the same bug, hiding one branch over.
-                    if folded {
-                        info!(
-                            "Merged (importance): {} (sim: {:.3})",
-                            truncate(&existing.content, 30),
-                            similarity
-                        );
-                        return Ok((existing.id.clone(), action));
+                    match folded {
+                        FoldResult::Merged => {
+                            info!(
+                                "Merged (importance): {} (sim: {:.3})",
+                                truncate(&existing.content, 30),
+                                similarity
+                            );
+                            return Ok((existing.id.clone(), action));
+                        }
+                        FoldResult::Subset => {
+                            if existing.content.trim().contains(content.trim()) {
+                                info!(
+                                    "Related memory exists (already present): {} (sim: {:.3})",
+                                    truncate(&existing.content, 30),
+                                    similarity
+                                );
+                                return Ok((existing.id.clone(), action));
+                            }
+                            debug!(
+                                "Fold declined (bound); storing separately (sim: {:.3})",
+                                similarity
+                            );
+                            // fall through to create
+                        }
+                        // The neighbour changed under the fold — the CAS
+                        // declined and the content landed nowhere.
+                        FoldResult::Contended => {
+                            debug!(
+                                "Fold contended (memory changed mid-merge); \
+                                 storing separately (sim: {:.3})",
+                                similarity
+                            );
+                            // fall through to create
+                        }
                     }
-                    if existing.content.trim().contains(content.trim()) {
-                        info!(
-                            "Related memory exists (already present): {} (sim: {:.3})",
-                            truncate(&existing.content, 30),
-                            similarity
-                        );
-                        return Ok((existing.id.clone(), action));
-                    }
-                    debug!(
-                        "Fold declined (bound); storing separately (sim: {:.3})",
-                        similarity
-                    );
-                    // fall through to create
                 }
                 _ => {
                     // Novel content or skipped reinforcement — fall through to create
@@ -1000,27 +1092,39 @@ impl MemoryService {
                     return Ok((existing.id.clone(), action));
                 }
 
-                // Otherwise try to fold it in. `fold_into_memory` returns true
-                // only when the merged text actually differs from what was
-                // there — i.e. the content landed somewhere.
-                if self
+                // Otherwise try to fold it in. Only `Merged` means the content
+                // actually landed somewhere; `Subset` is the byte bound
+                // declining the append and `Contended` is the CAS declining a
+                // stale merge — both fall through to a row of its own.
+                match self
                     .fold_into_memory(embed_fn, &existing.id, &existing.content, content)
                     .await?
                 {
-                    info!(
-                        "Merged (scoped): {} (sim: {:.3})",
-                        truncate(&existing.content, 30),
-                        similarity
-                    );
-                    return Ok((existing.id.clone(), action));
+                    FoldResult::Merged => {
+                        info!(
+                            "Merged (scoped): {} (sim: {:.3})",
+                            truncate(&existing.content, 30),
+                            similarity
+                        );
+                        return Ok((existing.id.clone(), action));
+                    }
+                    FoldResult::Subset => {
+                        // Not absorbed — the merge would have breached the byte
+                        // bound. Keep the observation as its own entry rather
+                        // than losing it.
+                        debug!(
+                            "Fold declined (bound); storing separately (sim: {:.3})",
+                            similarity
+                        );
+                    }
+                    FoldResult::Contended => {
+                        debug!(
+                            "Fold contended (memory changed mid-merge); \
+                             storing separately (sim: {:.3})",
+                            similarity
+                        );
+                    }
                 }
-
-                // Not absorbed — the merge would have breached the byte bound.
-                // Keep the observation as its own entry rather than losing it.
-                debug!(
-                    "Fold declined (bound); storing separately (sim: {:.3})",
-                    similarity
-                );
             }
         }
 
@@ -1737,8 +1841,12 @@ impl MemoryService {
 
         let mut survivors: Vec<MemoryEntry> = Vec::with_capacity(ranked.len());
         let mut folded_count = 0_usize;
-        // Source ids of successful folds, removed in one batch after the pass.
-        let mut folded_source_ids: Vec<String> = Vec::new();
+        // `(id, content-at-fold-time)` of successful folds, removed in one
+        // MATCHED batch after the pass: a source that a live write rewrote
+        // after its fold committed no longer holds only the text the survivor
+        // absorbed, so the matched removal keeps it (transient duplicate,
+        // re-folded next cycle) instead of deleting the fresh write.
+        let mut folded_sources: Vec<(String, String)> = Vec::new();
 
         for candidate in ranked {
             let target = if folded_count < removal_budget_count {
@@ -1767,7 +1875,7 @@ impl MemoryService {
                 .commit_duplicate_fold(embed_fn, &survivors[target_index], &candidate, &merged)
                 .await
             {
-                Ok(new_embedding) => {
+                Ok(DedupCommit::Committed(new_embedding)) => {
                     // Keep the in-memory copy in step with the store — including
                     // the vector. A survivor left holding its pre-merge embedding
                     // would be compared (and later clustered) on a vector that no
@@ -1781,9 +1889,19 @@ impl MemoryService {
                         .importance
                         .max(candidate.fsrs.importance);
                     survivors[target_index].fsrs.access_count += candidate.fsrs.access_count;
-                    folded_source_ids.push(candidate.id.clone());
+                    folded_sources.push((candidate.id.clone(), candidate.content.clone()));
                     folded_count += 1;
                     result.memories_deduped += 1;
+                }
+                // A live write moved the pair under the fold. Nothing was
+                // written, so BOTH memories stay; the next cycle re-examines
+                // them against the store as it is then.
+                Ok(DedupCommit::Stale) => {
+                    debug!(
+                        "Dedup fold of {} skipped — the pair changed mid-fold",
+                        candidate.id
+                    );
+                    survivors.push(candidate);
                 }
                 Err(e) => {
                     result
@@ -1804,49 +1922,88 @@ impl MemoryService {
             "every memory must either survive or be folded — none may vanish"
         );
         debug_assert_eq!(
-            folded_source_ids.len(),
+            folded_sources.len(),
             folded_count,
-            "one source id recorded per fold"
+            "one source recorded per fold"
         );
 
         // Drop every folded source in a single batch — one WAL checkpoint for the
         // whole dedup pass instead of one per fold. Deferred to here (not inside
         // `commit_duplicate_fold`) precisely so it can be batched; the sources are
         // already absent from `survivors`, so this is pure write-through cleanup.
-        if !folded_source_ids.is_empty() {
-            let id_refs: Vec<&str> = folded_source_ids.iter().map(String::as_str).collect();
-            self.store.remove_many(&id_refs).await;
-            info!("Dream dedup: folded {folded_count} near-duplicate memories (no LLM call)");
+        // MATCHED on the content each fold absorbed: see `folded_sources` above.
+        if !folded_sources.is_empty() {
+            let pairs: Vec<(&str, &str)> = folded_sources
+                .iter()
+                .map(|(id, content)| (id.as_str(), content.as_str()))
+                .collect();
+            let removed = self.store.remove_many_matching(&pairs).await;
+            if removed == folded_count {
+                info!("Dream dedup: folded {folded_count} near-duplicate memories (no LLM call)");
+            } else {
+                info!(
+                    "Dream dedup: folded {folded_count} near-duplicate memories, removed \
+                     {removed} source rows ({} kept — rewritten mid-fold; no LLM call)",
+                    folded_count - removed
+                );
+            }
         }
         survivors
     }
 
     /// Persist one duplicate fold: rewrite the survivor (merged content, fresh
     /// embedding, inherited FSRS). The source row is **not** dropped here — the
-    /// caller batches all folded sources into a single `remove_many` at the end
-    /// of the pass (one WAL checkpoint for the whole batch, not one per fold).
-    /// Update-before-remove still holds at the pass level: every survivor rewrite
-    /// commits before any source is removed, so a partial failure can only leave a
-    /// transient duplicate (re-folded next cycle), never lose content.
+    /// caller batches all folded sources into a single matched removal at the
+    /// end of the pass (one WAL checkpoint for the whole batch, not one per
+    /// fold). Update-before-remove still holds at the pass level: every
+    /// survivor rewrite commits before any source is removed, so a partial
+    /// failure can only leave a transient duplicate (re-folded next cycle),
+    /// never lose content.
     ///
-    /// Returns the survivor's **new embedding** when the content changed (so the
-    /// caller's in-memory copy can be kept in step with the store — a stale
-    /// vector on a rewritten entry is the recurring bug class in this path), or
-    /// `None` when a pure superset fold left the content, and thus the vector,
-    /// already correct.
+    /// The dedup pass folds from a SNAPSHOT of the band, and a live `remember`
+    /// can rewrite either half of the pair while the pass runs — this is the
+    /// fold-vs-step interleave that used to lose the live write. Both halves
+    /// are therefore guarded here: the survivor rewrite is a compare-and-swap
+    /// on the snapshot content ([`Self::rewrite_with_binding`]), and a pure
+    /// superset fold re-verifies against the survivor's LIVE content that the
+    /// source's text is really present before authorizing its removal. When
+    /// either check declines, [`DedupCommit::Stale`] is returned with nothing
+    /// touched, and the caller keeps both memories for the next cycle.
+    ///
+    /// On [`DedupCommit::Committed`], the payload is the survivor's **new
+    /// embedding** when the content changed (so the caller's in-memory copy
+    /// can be kept in step with the store — a stale vector on a rewritten
+    /// entry is the recurring bug class in this path), or `None` when a pure
+    /// superset fold left the content, and thus the vector, already correct.
     async fn commit_duplicate_fold(
         &self,
         embed_fn: &EmbedFn,
         survivor: &MemoryEntry,
         source: &MemoryEntry,
         merged: &str,
-    ) -> Result<Option<Vec<f32>>, MemoryError> {
+    ) -> Result<DedupCommit, MemoryError> {
         debug_assert_ne!(survivor.id, source.id, "a memory cannot fold into itself");
         debug_assert!(!merged.is_empty(), "merged content must not be empty");
 
         // Re-embed only when the text actually changed; a pure superset fold
         // leaves the survivor's content (and therefore its vector) correct.
         let new_embedding = if merged == survivor.content {
+            // No rewrite happens on this arm, so the CAS below never runs —
+            // but the removal this fold authorizes is only sound while the
+            // LIVE survivor still contains the source's text. The snapshot
+            // said so; verify the store still does. (The residual window
+            // between this check and the batch removal is closed by the
+            // matched removal itself, which re-checks the SOURCE, and bounded
+            // on the survivor side by every merge path being
+            // content-preserving.)
+            let live_contains = self
+                .store
+                .get(&survivor.id)
+                .await
+                .is_some_and(|live| live.content.contains(source.content.trim()));
+            if !live_contains {
+                return Ok(DedupCommit::Stale);
+            }
             None
         } else {
             let embedding = (embed_fn)(merged)
@@ -1854,8 +2011,15 @@ impl MemoryService {
                 .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
             // Empty when the rewrite raced a provider switch and queued for
             // backfill — the caller's copy must reflect that, not the stale
-            // vector.
-            Some(self.rewrite_with_binding(&survivor.id, merged, embedding).await?)
+            // vector. `None` when the survivor changed under the fold: the
+            // CAS declined, nothing was written, and the pair stays.
+            match self
+                .rewrite_with_binding(&survivor.id, merged, embedding, Some(&survivor.content))
+                .await?
+            {
+                Some(stored) => Some(stored),
+                None => return Ok(DedupCommit::Stale),
+            }
         };
 
         let inherited_importance = survivor.fsrs.importance.max(source.fsrs.importance);
@@ -1868,7 +2032,7 @@ impl MemoryService {
             .await?;
 
         // NB: the source is removed by the caller in one batch, not here.
-        Ok(new_embedding)
+        Ok(DedupCommit::Committed(new_embedding))
     }
 
     /// Consolidate a single cluster of memories
@@ -1909,10 +2073,24 @@ impl MemoryService {
         // Remove the now-superseded source memories in ONE batch (best-effort):
         // a single persistence call / WAL checkpoint for the whole cluster rather
         // than one fsync per source.
-        let source_ids: Vec<&str> = cluster.memories.iter().map(|m| m.id.as_str()).collect();
-        let removed = self.store.remove_many(&source_ids).await;
+        //
+        // MATCHED on each source's snapshot content, not by bare id. The
+        // summary above was built from the cluster as it stood when the bands
+        // were snapshotted, and the summarize call between there and here
+        // takes SECONDS on the local tier — plenty of time for a live
+        // `remember` to fold fresh content into a source. That fresh content
+        // is not in the summary, so removing the rewritten source would
+        // silently delete it. A source whose content moved is kept (transient
+        // duplicate beside the summary; a later cycle re-consolidates it),
+        // which is the same lossless fallback every other dream path uses.
+        let source_pairs: Vec<(&str, &str)> = cluster
+            .memories
+            .iter()
+            .map(|m| (m.id.as_str(), m.content.as_str()))
+            .collect();
+        let removed = self.store.remove_many_matching(&source_pairs).await;
         debug_assert!(
-            removed <= source_ids.len(),
+            removed <= source_pairs.len(),
             "removed more sources than the cluster held"
         );
 
@@ -1962,8 +2140,21 @@ impl MemoryService {
             let embedding = (embed_fn)(&expanded)
                 .await
                 .map_err(|e| MemoryError::Io(std::io::Error::other(e)))?;
-            self.rewrite_with_binding(&memory.id, &expanded, embedding)
-                .await?;
+            // CAS on the snapshot content: the summarize call above takes
+            // seconds, and enrichment of a stale snapshot must not overwrite
+            // what a live write stored in the meantime. A declined swap just
+            // skips this expansion; the next cycle expands the fresh text.
+            if self
+                .rewrite_with_binding(&memory.id, &expanded, embedding, Some(&memory.content))
+                .await?
+                .is_none()
+            {
+                debug!(
+                    "Expansion of {} skipped — the memory changed mid-expansion",
+                    memory.id
+                );
+                return Ok(());
+            }
             debug!("Expanded memory {}: {} -> {} chars", memory.id, memory.content.len(), expanded.len());
         }
 
@@ -3677,5 +3868,244 @@ mod tests {
         let entry = service.store.get(&id).await.expect("present");
         assert_eq!(entry.embedding.len(), 8);
         assert_eq!(entry.embedding_model.as_deref(), Some("prov:b"));
+    }
+
+    // ---- Fold vs live-write concurrency (the 2026-08-10 incident class) ----
+
+    /// Shared slot letting a test embed_fn call back INTO the service — the
+    /// deterministic hook point for "a live write lands between the fold's
+    /// snapshot and its commit" (the embed of the merged text sits exactly
+    /// there).
+    type ServiceSlot = Arc<tokio::sync::Mutex<Option<Arc<MemoryService>>>>;
+
+    fn hooked_dedup_service(
+        hook_markers: (&'static str, &'static str),
+        rewrite_target: &'static str,
+        rewrite_content: &'static str,
+    ) -> (Arc<MemoryService>, ServiceSlot) {
+        let slot: ServiceSlot = Arc::new(tokio::sync::Mutex::new(None));
+        let embed: EmbedFn = {
+            let slot = Arc::clone(&slot);
+            Arc::new(move |text: &str| {
+                let slot = Arc::clone(&slot);
+                let text = text.to_string();
+                Box::pin(async move {
+                    // Only the fold's MERGED text carries both markers; that
+                    // embed call is the window between snapshot and commit.
+                    if text.contains(hook_markers.0) && text.contains(hook_markers.1) {
+                        if let Some(service) = slot.lock().await.clone() {
+                            service
+                                .update_content(rewrite_target, rewrite_content)
+                                .await
+                                .expect("the concurrent live rewrite must land");
+                        }
+                    }
+                    Ok(vec![1.0_f32, 0.0, 0.0])
+                })
+            })
+        };
+        let service = Arc::new(
+            MemoryService::new(MemoryServiceConfig {
+                dimension: 3,
+                ..Default::default()
+            })
+            .with_embed_fn(embed),
+        );
+        (service, slot)
+    }
+
+    /// A live rewrite of the SURVIVOR while its fold is mid-commit must win:
+    /// the fold's compare-and-swap declines the stale merge, nothing is
+    /// removed, and both memories stay for the next cycle. Before the guard,
+    /// the stale merge overwrote the live write — content loss with no trace.
+    #[tokio::test]
+    async fn a_live_rewrite_during_a_fold_is_not_clobbered() {
+        const LIVE: &str = "the port is 5149, and the daemon binds it at boot";
+        let (service, slot) =
+            hooked_dedup_service(("stated once", "stated again"), "survivor", LIVE);
+        *slot.lock().await = Some(Arc::clone(&service));
+
+        let mut survivor =
+            dedup_entry("survivor", "the port is 5149 — stated once", vec![1.0, 0.0, 0.0], None);
+        // Strongest first: make this the fold target deterministically.
+        survivor.fsrs.importance = 1.5;
+        let candidate =
+            dedup_entry("candidate", "the port is 5149 — stated again", vec![1.0, 0.0, 0.0], None);
+        service.add_entry(survivor.clone()).await.expect("seed");
+        service.add_entry(candidate.clone()).await.expect("seed");
+
+        let mut result = ConsolidationResult::default();
+        let survivors = service
+            .fold_near_duplicates(vec![survivor, candidate], 10, &mut result)
+            .await;
+
+        assert_eq!(result.memories_deduped, 0, "the stale fold must not commit");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(survivors.len(), 2, "both memories stay for the next cycle");
+        assert_eq!(service.count().await, 2, "nothing may be removed");
+        let live = service.get("survivor").await.expect("survivor exists");
+        assert_eq!(
+            live.content, LIVE,
+            "the live rewrite must win over the merge of the stale snapshot"
+        );
+        assert!(
+            service.get("candidate").await.is_some(),
+            "the source must not be removed when its fold declined"
+        );
+    }
+
+    /// A live rewrite of the SOURCE after its fold committed must survive the
+    /// end-of-pass batch removal: the survivor absorbed the source's OLD text,
+    /// so deleting the source would delete the fresh write that exists nowhere
+    /// else. The matched removal keeps it as a transient near-duplicate.
+    #[tokio::test]
+    async fn a_source_rewritten_after_its_fold_survives_the_batch_removal() {
+        const LIVE: &str = "the port is 5149 — stated again; ALSO the tls cert rotates monthly";
+        let (service, slot) =
+            hooked_dedup_service(("stated once", "stated again"), "candidate", LIVE);
+        *slot.lock().await = Some(Arc::clone(&service));
+
+        let mut survivor =
+            dedup_entry("survivor", "the port is 5149 — stated once", vec![1.0, 0.0, 0.0], None);
+        survivor.fsrs.importance = 1.5;
+        let candidate =
+            dedup_entry("candidate", "the port is 5149 — stated again", vec![1.0, 0.0, 0.0], None);
+        service.add_entry(survivor.clone()).await.expect("seed");
+        service.add_entry(candidate.clone()).await.expect("seed");
+
+        let mut result = ConsolidationResult::default();
+        let survivors = service
+            .fold_near_duplicates(vec![survivor, candidate], 10, &mut result)
+            .await;
+
+        // The fold itself committed (the survivor was untouched)…
+        assert_eq!(result.memories_deduped, 1);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(survivors.len(), 1);
+        let merged = service.get("survivor").await.expect("survivor exists");
+        assert!(
+            merged.content.contains("stated again"),
+            "the survivor absorbed the source's old text"
+        );
+
+        // …but the rewritten source is KEPT by the matched removal.
+        assert_eq!(service.count().await, 2, "the rewritten source must survive");
+        let kept = service.get("candidate").await.expect("source survives");
+        assert_eq!(
+            kept.content, LIVE,
+            "the fresh write exists nowhere else and must not be deleted"
+        );
+    }
+
+    /// THE incident test (2026-08-10): a dream dedup fold ran against the same
+    /// scoped store a live harness step was writing through, and the step never
+    /// returned. The contract under concurrency is forward progress — both
+    /// sides complete inside a generous bound — and losslessness: nothing the
+    /// step wrote disappears, however the folds interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fold_and_scoped_traffic_make_progress_concurrently() {
+        let embed: EmbedFn = Arc::new(|_text: &str| {
+            Box::pin(async {
+                // Yield so the fold and the traffic genuinely interleave.
+                tokio::task::yield_now().await;
+                Ok(vec![1.0_f32, 0.0, 0.0])
+            })
+        });
+        let service = Arc::new(
+            MemoryService::new(MemoryServiceConfig {
+                dimension: 3,
+                ..Default::default()
+            })
+            .with_embed_fn(embed),
+        );
+
+        // Two families of near-duplicates in the SAME scope the traffic
+        // writes to. The [1,0,0] family shares the traffic's direction, so
+        // its folds and the step's writes contend for the same entries (the
+        // CAS-decline path — under total contention every one of its folds
+        // may legitimately go stale). The [0,1,0] family is out of the
+        // traffic's reach and folds cleanly, so the cycle provably does real
+        // dedup work no matter how the contended family's races land.
+        for i in 0..30 {
+            let embedding = if i % 2 == 0 {
+                vec![1.0, 0.0, 0.0]
+            } else {
+                vec![0.0, 1.0, 0.0]
+            };
+            let entry = dedup_entry(
+                &format!("seed-{i}"),
+                &format!("the build passes — restatement {i}"),
+                embedding,
+                Some("ws1"),
+            );
+            service.add_entry(entry).await.expect("seed");
+        }
+
+        // Dedup-only cycle: an unreachable cluster size disables the
+        // summarizing clusterer, so this is exactly the fold phase the
+        // incident ran — and the summarizer must never be paid.
+        let config = ConsolidationConfig {
+            min_cluster_size: usize::MAX,
+            min_remaining_memories: 5,
+            ..ConsolidationConfig::default()
+        };
+
+        let fold = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .consolidate(&config, |_p| async { Ok::<String, String>(String::new()) })
+                    .await
+            })
+        };
+        let traffic = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                for i in 0..25 {
+                    service
+                        .remember_scoped(
+                            &format!("fresh observation {i}"),
+                            HashMap::new(),
+                            1.5,
+                            Some("ws1".to_string()),
+                        )
+                        .await
+                        .expect("a remember during a fold must land");
+                    service
+                        .recall_scoped(&format!("observation {i}"), Some("ws1"))
+                        .await
+                        .expect("a recall during a fold must answer");
+                }
+            })
+        };
+
+        // Forward progress: a deadlock between the fold and the step surfaces
+        // here as a timeout, which is the regression this test exists to catch.
+        let fold_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let fold_result = fold
+                .await
+                .expect("the fold task must not panic")
+                .expect("consolidate must succeed");
+            traffic.await.expect("the traffic task must not panic");
+            fold_result
+        })
+        .await
+        .expect("fold + live scoped traffic must make forward progress");
+
+        assert!(
+            fold_result.memories_deduped > 0,
+            "the fold must have actually folded, or this proved nothing"
+        );
+
+        // Losslessness under contention: every observation the step wrote is
+        // still readable — folded into a survivor or standing as its own row.
+        let all = service.list_all().await;
+        for i in 0..25 {
+            let needle = format!("fresh observation {i}");
+            assert!(
+                all.iter().any(|m| m.content.contains(&needle)),
+                "'{needle}' was written during the fold and must not be lost"
+            );
+        }
     }
 }

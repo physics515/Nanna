@@ -1862,6 +1862,34 @@ pub const CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS: usize = 2;
 ///
 /// Task-anchored (the injected-notice reset bug): opens with the
 /// [`anchor_header`] work context and closes with [`STEERING_CONTINUATION`].
+/// Upper bound on one progressive-distillation summarizer call.
+///
+/// Healthy distillations complete in 1–4 s (measured live, 2026-08-10 log:
+/// every one of 138 successful rounds). The bound is ~30× that headroom for a
+/// summarizer sharing the GPU with the chat model and a dream cycle — while
+/// still guaranteeing the STEP survives a call that never returns. The wedge
+/// this encodes: distillation is the only inline network call on the step's
+/// critical path that had no bound, and the 2026-08-10 run stalled exactly at
+/// the iteration its first distillation fired.
+const DISTILLATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// First `max_bytes` of `text`, cut on a char boundary, `...`-suffixed when cut.
+///
+/// The cut MUST walk back to a boundary: byte `max_bytes` can land inside a
+/// multi-byte character, and a raw `&text[..max_bytes]` there panics. This
+/// runs on model-written text (which freely mixes em-dashes, arrows, emoji)
+/// inside a fire-and-forget task, where a panic is a silent permanent wedge —
+/// the 2026-08-10 incident shape. Same walk-back the `remember` path uses for
+/// its 30 000-byte cap.
+fn preview_snippet(text: &str, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let end = text.floor_char_boundary(max_bytes);
+        format!("{}...", &text[..end])
+    } else {
+        text.to_string()
+    }
+}
+
 #[must_use]
 pub fn claim_nudge_message(task_anchor: Option<&str>) -> String {
     format!(
@@ -5186,6 +5214,16 @@ impl Agent {
 
     /// Run progressive context distillation: produce a structured rolling summary
     /// of recent conversation and evict old tool results that have been referenced.
+    ///
+    /// This runs INLINE on the step's critical path (every
+    /// `distillation_interval` iterations), so it is held to two liveness
+    /// rules the 2026-08-10 wedge paid for: the preview builder must not
+    /// panic on model-written text ([`preview_snippet`] — a raw `&text[..200]`
+    /// here killed the turn's fire-and-forget task silently), and the
+    /// summarizer call is bounded by [`DISTILLATION_TIMEOUT`] because an
+    /// unbounded inline network call wedges the whole step if it never
+    /// returns. Distillation is an optimization; skipping a round is always
+    /// acceptable, stalling the step never is.
     async fn run_progressive_distillation(&self) {
         if self.config.summarization_priority.is_empty() {
             return;
@@ -5217,21 +5255,10 @@ impl Agent {
                     .iter()
                     .take(3)
                     .map(|b| match b {
-                        ContentBlock::Text { text } => {
-                            if text.len() > 200 {
-                                format!("{}...", &text[..200])
-                            } else {
-                                text.clone()
-                            }
-                        }
+                        ContentBlock::Text { text } => preview_snippet(text, 200),
                         ContentBlock::ToolUse { name, .. } => format!("[tool_use: {name}]"),
                         ContentBlock::ToolResult { content, .. } => {
-                            if content.len() > 100 {
-                                let end = content.floor_char_boundary(100);
-                                format!("[result: {}...]", &content[..end])
-                            } else {
-                                format!("[result: {content}]")
-                            }
+                            format!("[result: {}]", preview_snippet(content, 100))
                         }
                         _ => "[...]".to_string(),
                     })
@@ -5262,8 +5289,13 @@ impl Agent {
             cache_control: None,
         };
 
-        match client.complete_anthropic(&request).await {
-            Ok(response) => {
+        let completion = tokio::time::timeout(
+            DISTILLATION_TIMEOUT,
+            client.complete_anthropic(&request),
+        )
+        .await;
+        match completion {
+            Ok(Ok(response)) => {
                 let facts: String = response
                     .content
                     .iter()
@@ -5285,8 +5317,17 @@ impl Agent {
                     );
                 }
             }
-            Err(e) => {
-                debug!(error = %e, "Progressive distillation failed");
+            // warn, not debug: a failure here is rare (at most once per
+            // distillation interval) and a silent one is exactly how the
+            // 2026-08-10 wedge stayed undiagnosable for 50 minutes.
+            Ok(Err(e)) => {
+                warn!(error = %e, "Progressive distillation failed — skipping this round");
+            }
+            Err(_elapsed) => {
+                warn!(
+                    timeout_secs = DISTILLATION_TIMEOUT.as_secs(),
+                    "Progressive distillation timed out — skipping this round"
+                );
             }
         }
     }
@@ -7253,6 +7294,46 @@ mod tests {
         );
         // The reply the user sees is still the whole turn.
         assert_eq!(asm.text, "first. second.");
+    }
+}
+
+#[cfg(test)]
+mod preview_snippet_tests {
+    use super::preview_snippet;
+
+    #[test]
+    fn short_text_is_returned_whole() {
+        assert_eq!(preview_snippet("hello", 200), "hello");
+        // Exactly at the bound is not "over" — no ellipsis.
+        let exact = "x".repeat(200);
+        assert_eq!(preview_snippet(&exact, 200), exact);
+    }
+
+    #[test]
+    fn a_multibyte_char_straddling_the_cut_does_not_panic() {
+        // The 2026-08-10 wedge: byte 200 lands inside a multi-byte character.
+        // 199 ASCII bytes, then an em-dash (3 bytes, occupying 199..202) —
+        // the raw `&text[..200]` slice this replaces panicked here and killed
+        // the turn's fire-and-forget task silently.
+        let text = format!("{}—and the rest of the model's sentence", "a".repeat(199));
+        let cut = preview_snippet(&text, 200);
+        assert!(cut.ends_with("..."), "an over-long text must be marked cut");
+        let kept = cut.strip_suffix("...").expect("suffix just asserted");
+        assert!(text.starts_with(kept), "the preview must be a prefix");
+        assert_eq!(kept, "a".repeat(199), "the straddled char is walked back over");
+    }
+
+    #[test]
+    fn emoji_heavy_text_stays_a_prefix_at_every_cut() {
+        // Sweep every cut point across a multibyte-dense string: no panic and
+        // always a char-boundary prefix. (4-byte emoji make every misaligned
+        // byte offset an invalid boundary, so this covers the whole class.)
+        let text = "🌀🧬🏁🔂".repeat(20);
+        for max in 0..text.len() + 2 {
+            let cut = preview_snippet(&text, max);
+            let kept = cut.strip_suffix("...").unwrap_or(&cut);
+            assert!(text.starts_with(kept));
+        }
     }
 }
 
