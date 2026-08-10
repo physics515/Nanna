@@ -52,6 +52,7 @@ members = [
     "crates/nanna-storage",
     "crates/nanna-browser",
     "crates/nanna-mcp",
+    "crates/nanna-proc",
     "crates/nanna-scripting",
     "crates/nanna-workspace",
     "crates/nanna-daemon",
