@@ -5672,6 +5672,7 @@ dependencies = [
  "futures-util",
  "nanna-config",
  "nanna-core",
+ "nanna-proc",
  "nanna-tools",
  "rand 0.10.2",
  "reqwest",
