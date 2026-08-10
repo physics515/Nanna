@@ -85,6 +85,16 @@ pub struct AcceptanceVerdict {
     pub detail: String,
 }
 
+/// An abandoned item whose acceptance still fails — carried on the report
+/// so the mission loop can distinguish "nothing new to plan" from "done".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbandonedUnmet {
+    pub id: i64,
+    pub title: String,
+    /// The failing verdict's detail at the drain sweep (bounded at capture).
+    pub detail: String,
+}
+
 // Every canonical acceptance shape, quoted verbatim in every parse error.
 // Defined by the store — the write boundary owns what an acceptance check
 // looks like — and used here so the reader's errors and the writer's errors
@@ -760,6 +770,15 @@ pub struct LongHorizonReport {
     #[serde(default)]
     pub items_already_satisfied: usize,
     pub items_abandoned: usize,
+    /// Abandoned items whose acceptance STILL FAILED at the drain sweep —
+    /// live evidence the goal is provably unmet when the plan drained.
+    /// The mission loop needs this: "the planner proposed nothing new" and
+    /// "the goal is done" are different claims, and a failing check the run
+    /// itself walked away from refutes the second (observed 2026-08-09: a
+    /// turn ended dry at 5/42 with its abandoned item's check failing —
+    /// the evidence existed and was discarded).
+    #[serde(default)]
+    pub abandoned_unmet: Vec<AbandonedUnmet>,
     /// The most recent step-runner error seen during the run, kept so a
     /// caller can say WHY when the plan drained through abandonment rather
     /// than completion. Poison containment turns a deterministic runner
@@ -1058,7 +1077,10 @@ impl LongHorizonRunner {
         // later step that un-did verified work (or fixed abandoned work) is
         // caught while there is still budget to act on it.
         let mut verified_this_run: Vec<(i64, AcceptanceCheck)> = Vec::new();
-        let mut abandoned_this_run: Vec<(i64, AcceptanceCheck)> = Vec::new();
+        let mut abandoned_this_run: Vec<(i64, String, AcceptanceCheck)> = Vec::new();
+        // Rebuilt at every drain sweep; the FINAL sweep's state ships on the
+        // report — an item revived later must not linger as "unmet".
+        let mut abandoned_unmet: Vec<AbandonedUnmet> = Vec::new();
         // Each item may be reopened at most once per run — the bound that
         // makes the drain sweep a fixpoint instead of a loop.
         let mut reopened_once: HashSet<i64> = HashSet::new();
@@ -1124,11 +1146,21 @@ impl LongHorizonRunner {
                     // reopen what it contradicts; reopening at most once per
                     // item makes this a fixpoint, not a loop.
                     let mut reopened_any = false;
-                    for (id, check) in abandoned_this_run.clone() {
+                    abandoned_unmet.clear();
+                    for (id, title, check) in abandoned_this_run.clone() {
                         if reopened_once.contains(&id) {
                             continue;
                         }
                         let verdict = check.run(workdir).await;
+                        if !verdict.passed {
+                            // Evidence for the mission loop: this walked-away
+                            // item's done-condition is still false, so the
+                            // goal is provably unmet however dry the planner
+                            // sounds. Bounded detail: one line is identity.
+                            let mut detail = verdict.detail.clone();
+                            detail.truncate(240);
+                            abandoned_unmet.push(AbandonedUnmet { id, title, detail });
+                        }
                         if verdict.passed
                             && source
                                 .reopen(id, "acceptance now passes — reviving abandoned item")
@@ -1222,7 +1254,7 @@ impl LongHorizonRunner {
                 }
                 items_abandoned += 1;
                 if let Some(check) = &step.acceptance {
-                    abandoned_this_run.push((step.id, check.clone()));
+                    abandoned_this_run.push((step.id, step.title.clone(), check.clone()));
                 }
                 progress.remove(&step.id);
                 continue;
@@ -1625,6 +1657,7 @@ impl LongHorizonRunner {
             items_completed_unverified,
             items_revived,
             items_regressed_reopened,
+            abandoned_unmet,
             items_already_satisfied,
             items_abandoned,
             last_runner_error,
