@@ -226,6 +226,33 @@ now attributed to leaked `llama-server` orphans starving VRAM, not the model. De
 The frozen-harness series below is a separate historical experiment — GUI-driven, no plan-drain
 early exit — so its qwen 32/42 is not directly comparable to the numbers above.
 
+### GUI-path series (2026-08-10) — the artifact-preservation finding
+
+The same 42-feature ladder driven through the REAL chat path (mission sent to a live
+daemon session over IPC, the GUI attached as a viewer) — the code path an actual user
+exercises, on a build carrying the full benchmark-lessons fix wave (PRs #198–#207).
+Identical conditions per leg: fresh read-only workspace, `num_ctx=16384` pinned and
+gate-verified, quiesced daemon, 4-hour snapshot scored against pristine tests, 15-minute
+sampling. Full trail: [bench/BASELINE.md](bench/BASELINE.md).
+
+| Model | 4 h official | Peak observed | Shape |
+|---|---|---|---|
+| ornith:9b | **5 / 42** | 16 @ t=211m | built fast, destroyed its own work late |
+| qwen3.5:9b | **1 / 42** | **22 @ t=15m** | held the peak three hours, then collapsed 22→0 |
+| gemma4:e4b-it-qat | **0 / 42** | 5 @ t=90m | small-rewrite churn, never held anything |
+| ministral-3:8b | **0 / 42** | 0 | tool-dialect failures froze it at 754 bytes |
+| lfm2.5 | **0 / 42** | — | never created the artifact in four hours |
+
+**The finding: capability is not the gap — artifact preservation is.** Every capable
+model peaked early (qwen passed 22 features in fifteen minutes) and then un-did its own
+verified work through full-file rewrites from compressed, stale context. The frozen-era
+GUI qwen 32/42 below is hereby reinterpreted: those turns DIED early (planner
+starvation) and accidentally parked the artifact at its peak — the very continuation
+fixes that now keep missions alive for the full window also keep pushing a small model
+past its productive phase. The counter-lever is landing next: the verified-work
+regression sweep running mid-mission, so a destructive rewrite reopens the items it
+broke with the failing verdict in the model's face.
+
 ### Endurance (42 features)
 
 **Frozen-harness series, 2026-07-30/31** — every model ran the identical harness (paged tool
