@@ -604,12 +604,43 @@ impl ControlPlane {
                             continuations += 1;
                             let outstanding =
                                 open_work_context(&storage, &scope, scope_id.as_deref()).await;
-                            let ctx = match (conversation.as_deref(), outstanding.as_deref()) {
-                                (Some(c), Some(w)) => Some(format!("{c}\n\n{w}")),
-                                (Some(c), None) => Some(c.to_string()),
-                                (None, Some(w)) => Some(w.to_string()),
-                                (None, None) => None,
+                            // Walked-away work whose done-condition STILL
+                            // fails is the strongest planning signal the run
+                            // holds: it names exactly where the goal is
+                            // unmet, in the environment's own words. Without
+                            // it the continuation planner re-plans blind and
+                            // proposes either nothing or the same wall
+                            // (observed 2026-08-09: turn ended "dry" at 5/42
+                            // with the failing verdict sitting unread on the
+                            // drain sweep).
+                            let unmet_block = if report.abandoned_unmet.is_empty() {
+                                None
+                            } else {
+                                let mut lines = vec![
+                                    "UNMET WORK — these items were given up on, but their \
+                                     done-conditions STILL FAIL (the goal is not achieved; \
+                                     plan a different approach to each):"
+                                        .to_string(),
+                                ];
+                                for u in report.abandoned_unmet.iter().take(5) {
+                                    lines.push(format!(
+                                        "- #{} {}: {}",
+                                        u.id, u.title, u.detail
+                                    ));
+                                }
+                                Some(lines.join("\n"))
                             };
+                            let ctx = [
+                                conversation.as_deref(),
+                                outstanding.as_deref(),
+                                unmet_block.as_deref(),
+                            ]
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                            let ctx = Some(ctx).filter(|c| !c.is_empty());
                             let next_plan = planner
                                 .plan(&content_owned, ctx.as_deref(), Some(&run_handle.cancel))
                                 .await;
@@ -743,14 +774,35 @@ impl ControlPlane {
                             if round_made_progress(&more) {
                                 dry_rounds = 0;
                             } else if !errored {
-                                dry_rounds += 1;
-                                tracing::info!(
-                                    continuations,
-                                    dry_rounds,
-                                    steps = more.steps_taken,
-                                    already_satisfied = more.items_already_satisfied,
-                                    "mission continuation changed nothing and closed nothing"
-                                );
+                                // A failing done-condition on walked-away work
+                                // REFUTES "the goal is done": this round found
+                                // nothing, but the environment says the mission
+                                // is unmet, so the round consumes the bounded
+                                // continuation budget (ROUNDS_MAX) instead of
+                                // the two-strike dry budget. Dryness may only
+                                // conclude a mission the evidence permits.
+                                if more.abandoned_unmet.is_empty()
+                                    && report.abandoned_unmet.is_empty()
+                                {
+                                    dry_rounds += 1;
+                                    tracing::info!(
+                                        continuations,
+                                        dry_rounds,
+                                        steps = more.steps_taken,
+                                        already_satisfied = more.items_already_satisfied,
+                                        "mission continuation changed nothing and closed nothing"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        continuations,
+                                        unmet = more
+                                            .abandoned_unmet
+                                            .len()
+                                            .max(report.abandoned_unmet.len()),
+                                        "round found nothing new but abandoned checks still \
+                                         fail — the goal is provably unmet; not a dry round"
+                                    );
+                                }
                             }
                             report.steps_taken += more.steps_taken;
                             report.tool_calls += more.tool_calls;
@@ -759,6 +811,17 @@ impl ControlPlane {
                             report.items_already_satisfied += more.items_already_satisfied;
                             report.items_abandoned += more.items_abandoned;
                             report.interjected_items += more.interjected_items;
+                            // Union by id: a round's sweep only re-checks the
+                            // items THAT round abandoned, so earlier rounds'
+                            // standing walls must persist (same-id entries
+                            // refresh to the newest verdict). A wall that has
+                            // since fallen is bounded by ROUNDS_MAX, and the
+                            // per-round context pushes the model straight at
+                            // it, which is the fastest way to find out.
+                            for u in &more.abandoned_unmet {
+                                report.abandoned_unmet.retain(|p| p.id != u.id);
+                            }
+                            report.abandoned_unmet.extend(more.abandoned_unmet.clone());
                             if more.last_runner_error.is_some() {
                                 report.last_runner_error = more.last_runner_error;
                             }
@@ -1210,6 +1273,7 @@ mod tests {
             items_completed: completed,
             items_completed_unverified: 0,
             items_revived: 0,
+            abandoned_unmet: Vec::new(),
             items_regressed_reopened: 0,
             items_already_satisfied: 0,
             items_abandoned: abandoned,
