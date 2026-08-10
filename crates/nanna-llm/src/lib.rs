@@ -2058,6 +2058,13 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         Some(next)
     }
 
+    /// Floor of the VRAM-fitted context: below this a run is not worth
+    /// starting; above it, diminishing returns for an agent whose steps
+    /// rarely exceed a few thousand tokens. Shared between the fit
+    /// arithmetic (its clamp floor) and the sizing probe's starved-card
+    /// check, which keys on "the fit was forced all the way down here".
+    const MIN_FIT_CTX: u32 = 4_096;
+
     /// Largest context that fits in the VRAM free *right now*, or `None` when
     /// the GPU cannot be queried (no NVIDIA tooling, or a non-CUDA backend) —
     /// in which case the caller falls back to a fixed size.
@@ -2073,12 +2080,37 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let free_bytes = Self::nvidia_free_vram_bytes()? as f64;
         let weights_bytes = Self::ollama_model_size_bytes(model)? as f64;
         let (ours_resident, others_resident) = Self::ollama_resident_vram(model);
-        Some(Self::fit_context_for_budget(
+        let fitted = Self::fit_context_for_budget(
             free_bytes,
             weights_bytes,
             ours_resident as f64,
             others_resident as f64,
-        ))
+        );
+        // Floor-fit on an EMPTY server is the orphaned-runner signature, so
+        // name it instead of latching quietly. `ollama ps` reports the
+        // server's own children, not what is on the card: a runner orphaned
+        // by a parent-only server kill (see the regression note on
+        // `nanna-daemon`'s `restart_ollama_server`) keeps its ~weights-worth
+        // of VRAM while being invisible here. Observed live 2026-08-09: four
+        // orphans held 12.5 of 16 GB, `ollama ps` was empty, and this probe
+        // honestly latched a below-floor 4096 that killed two endurance
+        // attempts. A card that cannot fit more than the floor while Ollama
+        // holds NOTHING is either starved by invisible consumers or too small
+        // for the model — both are worth a loud line before the latch sticks.
+        if fitted == Self::MIN_FIT_CTX && ours_resident + others_resident == 0 {
+            tracing::warn!(
+                model,
+                free_mib = (free_bytes / (1024.0 * 1024.0)) as u64,
+                weights_mib = (weights_bytes / (1024.0 * 1024.0)) as u64,
+                "num_ctx sized at the floor while `ollama ps` shows nothing \
+                 resident — something invisible to Ollama is holding the \
+                 card. Known cause: llama-server runner processes orphaned by \
+                 a parent-only Ollama restart. Check `nvidia-smi` for \
+                 llama-server/ollama processes and kill them; this size \
+                 latches for the process lifetime"
+            );
+        }
+        Some(fitted)
     }
 
     /// VRAM currently held by `model` and, separately, by every OTHER model the
@@ -2157,10 +2189,6 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         /// without slack is how the first request picks a size the tenth
         /// request cannot honour.
         const SLACK: f64 = 1.2 * 1024.0 * 1024.0 * 1024.0;
-        /// Below this a run is not worth starting; above it, diminishing
-        /// returns for an agent whose steps rarely exceed a few thousand
-        /// tokens.
-        const MIN_CTX: u32 = 4_096;
         const MAX_CTX: u32 = 32_768;
 
         // Add back what THIS model already holds before subtracting what it
@@ -2178,7 +2206,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
         let reserve = others_resident.max(EMBEDDER_RESERVE) + SLACK;
         let usable = effective_free - weights_bytes - reserve;
         if usable <= 0.0 {
-            return MIN_CTX;
+            return Self::MIN_FIT_CTX;
         }
         let raw = (usable / BYTES_PER_CTX_TOKEN) as u64;
 
@@ -2197,8 +2225,8 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
             .iter()
             .copied()
             .find(|b| u64::from(*b) <= raw)
-            .unwrap_or(MIN_CTX);
-        fitted.clamp(MIN_CTX, MAX_CTX)
+            .unwrap_or(Self::MIN_FIT_CTX);
+        fitted.clamp(Self::MIN_FIT_CTX, MAX_CTX)
     }
 
     /// Free VRAM in bytes, via `nvidia-smi`. `None` on any non-NVIDIA or

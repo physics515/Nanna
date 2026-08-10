@@ -837,6 +837,14 @@ async fn seed_minidb_tasks(storage: &Arc<Storage>, workdir: &Path) -> Vec<i64> {
 /// clear it; a server restart does (verified live). Gated by
 /// `NANNA_EVAL_ALLOW_OLLAMA_RESTART=1` because restarting a shared local
 /// service is an operator decision, not a test default.
+///
+/// The delegate MUST tree-kill: a parent-only `ollama.exe` kill leaves each
+/// loaded model's `llama-server.exe` runner (~6 GB VRAM for an 8B model)
+/// orphaned and invisible to the respawned server's `ollama ps`, so every
+/// heal quietly shrinks the card until the num_ctx probe latches below the
+/// min-viable floor and the eval dies on below-floor stops (2026-08-09: four
+/// orphans held 12.5 of 16 GB, killed two endurance attempts) — see the
+/// regression note on [`nanna_daemon::tasks::restart_ollama_server`].
 async fn restart_ollama_server() -> bool {
     if std::env::var("NANNA_EVAL_ALLOW_OLLAMA_RESTART").as_deref() != Ok("1") {
         return false;
