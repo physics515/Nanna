@@ -272,6 +272,44 @@ near-identical code confirms the iteration-5 variance reading — single runs ca
 this model; its honest range is 6-15/42. lfm2.5's earlier harness-fix-era smoke was 5/5 @
 25 k; today's 2/5 @ 78 k on a much-evolved tree is the same variance lesson at smoke scale.
 
+**GUI-path series (2026-08-10).** The same ladder driven through the real chat path
+(mission over IPC to a live daemon session, GUI attached as viewer), on a build carrying
+the full benchmark-lessons wave (PRs #198, #200, #201, #202, #204, #207). Conditions per
+leg: fresh read-only workspace, runtime IPC model+summarizer binding, quiesce + settle +
+fresh-daemon boot (per-process num_ctx latch), 16384 gate-verified, 4-hour snapshot
+against pristine tests, 15-minute sampling, execution-based stall watchdog with
+interjection-style nudges.
+
+| Model | 4 h official | Peak observed | Trail |
+|---|---|---|---|
+| ornith:9b | **5/42** | 16 @ t=211m | 2→10→0→16→5; final rewrite discarded 12 features in the last half hour |
+| qwen3.5:9b | **1/42** | **22 @ t=15m** | 22 held for THREE HOURS untouched, then organic collapse 22→9→1→0 (one stall-nudge fired, after the collapse began — the shepherd is exonerated) |
+| gemma4:e4b-it-qat | **0/42** | 5 @ t=90m | 2KB-artifact churn; never passed test_01 at any snapshot after t=90m |
+| ministral-3:8b | **0/42** | 0 | write_file-without-file_path dialect failures; artifact frozen at 754 bytes from t=4m |
+| lfm2.5 | **0/42** | — | no artifact created in the full window |
+
+**Peak-vs-final is the result.** The chat path's gap to the headless harness (ornith
+37/42, qwen 25/42 on the same build) is almost entirely LATE-RUN SELF-DESTRUCTION of
+verified work, not capability: continuously-live missions (the PR #204 dryness fix
+working as designed) push small models past their productive phase and they rewrite
+their own passing artifact from compressed context. The frozen-era 32/42 (below) is
+reinterpreted: those runs' turns died at the peak (planner starvation, fixed in #201)
+and the death accidentally PRESERVED the artifact. Counter-lever queued: the verified-
+work regression sweep run mid-mission (today it fires only at plan drain, which a live
+mission never reaches).
+
+The shakedown to get this series clean was itself the harvest — nine leg attempts
+surfaced and fixed, in order: legacy boot path ignoring `[llm]` (silent dead-model
+fall-through), a config-rewrite TOML corruption, the ornith:9b/ornith:latest tag
+split-brain double-loading one model, stale-session auto-resume starving context
+sizing, the summarizer loading a second 7.4 GB model at leg start, the per-process
+num_ctx latch poisoned by transient VRAM load (fixed in code: the env pin now wins both
+directions, #202), chat planner starvation (#201), false "dry" convergence with failing
+checks in hand (#204), and dreams consolidating a live mission's memories mid-step —
+deadlocking it (#207; the underlying fold-vs-step lock issue and the mid-mission sweep
+are chipped). Ledger + artifacts: session scratchpad `bench-ledger.txt`,
+`bench-artifacts/*.minidb`, run dirs under `D:/Development/nanna-bench/`.
+
 Still open: throughput on the local tier (14/42 primary features in 6 h — the middle-ladder
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
