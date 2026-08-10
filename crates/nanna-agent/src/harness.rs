@@ -173,6 +173,31 @@ impl AcceptanceCheck {
         }
     }
 
+    /// Could this check's verdict depend on `touched` — a path a write/edit
+    /// tool call just targeted? Matched on the path's FINAL COMPONENT so the
+    /// relative and absolute spellings of one file collide (the step may
+    /// write `D:\ws\notes.md` while the check says `notes.md`).
+    ///
+    /// Best effort by design, with asymmetric costs shaping the rule: a
+    /// false positive runs one bounded acceptance check for nothing, while a
+    /// false negative merely postpones detection to the periodic re-sweep —
+    /// so match loosely and never miss the obvious case.
+    #[must_use]
+    pub fn references_path(&self, touched: &str) -> bool {
+        let normalized = touched.replace('\\', "/");
+        let Some(file_name) = normalized.split('/').filter(|c| !c.is_empty()).next_back() else {
+            return false;
+        };
+        let mentions = |s: &str| s.replace('\\', "/").contains(file_name);
+        match self {
+            Self::Command { command, .. } => mentions(command),
+            Self::FileExists { path } => mentions(path),
+            Self::Regex { path, command, .. } => {
+                path.as_deref().is_some_and(mentions) || command.as_deref().is_some_and(mentions)
+            }
+        }
+    }
+
     fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
         let secs = timeout_secs
             .unwrap_or(ACCEPTANCE_TIMEOUT_SECS_DEFAULT)
@@ -571,6 +596,13 @@ pub struct StepOutcome {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub tool_calls: Vec<StepToolCall>,
+    /// Filesystem paths the step's write/edit tool calls targeted
+    /// (deduplicated, best effort — see [`touched_path_of`]; empty when the
+    /// step wrote nothing or the runner cannot tell, e.g. `exec` side
+    /// effects). The mid-run sweep uses these to re-check verified items
+    /// whose acceptance references a just-touched path IMMEDIATELY, instead
+    /// of waiting for the periodic cadence.
+    pub touched_paths: Vec<String>,
 }
 
 /// Runs one re-anchored step in a fresh context (a new `Agent` + empty
@@ -742,9 +774,11 @@ pub struct LongHorizonReport {
     /// verdict was corrected without spending a model step.
     #[serde(default)]
     pub items_revived: usize,
-    /// Verified completions the drain sweep reopened because their
-    /// acceptance fails again — later work un-did them, and "done" must not
-    /// outlive the evidence it was based on.
+    /// Verified completions a sweep reopened because their acceptance fails
+    /// again — later work un-did them, and "done" must not outlive the
+    /// evidence it was based on. Counted from BOTH sweep halves: the mid-run
+    /// sweep at step boundaries (write-touch triggered or periodic) and the
+    /// drain sweep at plan exhaustion.
     #[serde(default)]
     pub items_regressed_reopened: usize,
     /// The subset of `items_completed` closed by the acceptance PRE-CHECK:
@@ -1061,18 +1095,28 @@ impl LongHorizonRunner {
         let mut items_abandoned = 0usize;
         let mut items_revived = 0usize;
         let mut items_regressed_reopened = 0usize;
-        // Verdicts are per-moment; the drain sweep below re-asks the
-        // environment about every item this run closed with a check, so a
-        // later step that un-did verified work (or fixed abandoned work) is
-        // caught while there is still budget to act on it.
-        let mut verified_this_run: Vec<(i64, AcceptanceCheck)> = Vec::new();
+        // Verdicts are per-moment; the drain sweep below and the MID-RUN
+        // sweep at each step boundary re-ask the environment about items this
+        // run closed with a check, so a later step that un-did verified work
+        // (or fixed abandoned work) is caught while there is still budget to
+        // act on it.
+        let mut verified_this_run: Vec<(i64, String, AcceptanceCheck)> = Vec::new();
         let mut abandoned_this_run: Vec<(i64, String, AcceptanceCheck)> = Vec::new();
         // Rebuilt at every drain sweep; the FINAL sweep's state ships on the
         // report — an item revived later must not linger as "unmet".
         let mut abandoned_unmet: Vec<AbandonedUnmet> = Vec::new();
         // Each item may be reopened at most once per run — the bound that
-        // makes the drain sweep a fixpoint instead of a loop.
+        // makes BOTH sweeps (mid-run and drain) a fixpoint instead of a loop.
         let mut reopened_once: HashSet<i64> = HashSet::new();
+        // The mid-run sweep's spend ledger: verification time the run has
+        // paid (prechecks + post-step verdicts) funds re-verification time
+        // (see `resweep_due` — re-asking may never out-spend asking).
+        let mut check_cost_paid = Duration::ZERO;
+        let mut check_runs = 0u32;
+        let mut sweep_cost_paid = Duration::ZERO;
+        // Pending "you un-did verified work" notice, consumed by the NEXT
+        // execute step's prompt — whatever item that step serves.
+        let mut regression_notice: Option<String> = None;
         let mut precheck_ids: HashSet<i64> = cfg.precheck_acceptance_items.clone();
         let mut replans = 0usize;
         let mut false_success_claims = 0usize;
@@ -1146,8 +1190,7 @@ impl LongHorizonRunner {
                             // item's done-condition is still false, so the
                             // goal is provably unmet however dry the planner
                             // sounds. Bounded detail: one line is identity.
-                            let mut detail = verdict.detail.clone();
-                            detail.truncate(240);
+                            let detail = text_head(&verdict.detail, 240).to_string();
                             abandoned_unmet.push(AbandonedUnmet { id, title, detail });
                         }
                         if verdict.passed
@@ -1174,7 +1217,7 @@ impl LongHorizonRunner {
                                 .await;
                         }
                     }
-                    for (id, check) in verified_this_run.clone() {
+                    for (id, _title, check) in verified_this_run.clone() {
                         if reopened_once.contains(&id) {
                             continue;
                         }
@@ -1273,7 +1316,10 @@ impl LongHorizonRunner {
                 None
             };
             if let Some(check) = precheck {
+                let check_started = Instant::now();
                 let verdict = check.run(workdir).await;
+                check_cost_paid += check_started.elapsed();
+                check_runs += 1;
                 if verdict.passed {
                     let detail = serde_json::json!({
                         "verified": true,
@@ -1297,7 +1343,7 @@ impl LongHorizonRunner {
                             consecutive_errors = 0;
                             items_completed += 1;
                             items_already_satisfied += 1;
-                            verified_this_run.push((step.id, check.clone()));
+                            verified_this_run.push((step.id, step.title.clone(), check.clone()));
                             progress.remove(&step.id);
                             tracing::info!(
                                 item = step.id,
@@ -1345,8 +1391,19 @@ impl LongHorizonRunner {
                     started.elapsed(),
                     cfg.max_wall_clock,
                 );
+                // A pending regression notice rides in with the last result:
+                // the model must hear "you un-did verified work" on its very
+                // NEXT step, whatever item that step serves — waiting for the
+                // regressed item itself to be selected would let it wander
+                // further from the wreckage first. One-shot: taken here,
+                // durably recorded on the reopened tasks either way.
+                let last_result = match (item.last_result.as_deref(), regression_notice.take()) {
+                    (Some(prev), Some(notice)) => Some(format!("{prev}\n\n{notice}")),
+                    (None, Some(notice)) => Some(notice),
+                    (prev, None) => prev.map(str::to_string),
+                };
                 (
-                    build_step_prompt(goal, &step, item.last_result.as_deref(), &line),
+                    build_step_prompt(goal, &step, last_result.as_deref(), &line),
                     StepKind::Execute,
                 )
             };
@@ -1492,7 +1549,10 @@ impl LongHorizonRunner {
             // Verdict time. With a check, the environment is the only judge.
             match &step.acceptance {
                 Some(check) => {
+                    let check_started = Instant::now();
                     let verdict = check.run(workdir).await;
+                    check_cost_paid += check_started.elapsed();
+                    check_runs += 1;
                     let _ = source
                         .log(
                             step.id,
@@ -1513,7 +1573,11 @@ impl LongHorizonRunner {
                             Ok(()) => {
                                 consecutive_errors = 0;
                                 items_completed += 1;
-                                verified_this_run.push((step.id, check.clone()));
+                                verified_this_run.push((
+                                    step.id,
+                                    step.title.clone(),
+                                    check.clone(),
+                                ));
                                 progress.remove(&step.id);
                             }
                             Err(message) => {
@@ -1632,6 +1696,107 @@ impl LongHorizonRunner {
                         item.last_result =
                             Some(text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES));
                     }
+                }
+            }
+
+            // MID-RUN SWEEP — the drain sweep's live half. Waiting for
+            // AllTasksDone to re-ask the environment was proven insufficient
+            // on 2026-08-10: continuously-live missions (continuation keeps
+            // the plan non-empty for hours) destroyed their own verified work
+            // late in the run with nothing catching it — one leg held 22/42
+            // verified for three hours, then full-file rewrites collapsed it
+            // to 1/42 in the final hour. So re-ask at the step boundary too:
+            // IMMEDIATELY for items whose acceptance references a path this
+            // step just wrote, and periodically for everything else on a
+            // cadence derived from measured check cost (`resweep_due` — no
+            // fixed N). The current item is excluded: its own check just ran
+            // as this boundary's verdict. Reopens share `reopened_once` with
+            // the drain sweep, so each item is reopened at most once per run
+            // however it is caught.
+            let eligible: Vec<(i64, String, AcceptanceCheck)> = verified_this_run
+                .iter()
+                .filter(|(id, _, _)| *id != step.id && !reopened_once.contains(id))
+                .cloned()
+                .collect();
+            if !eligible.is_empty() {
+                let estimated = if check_runs > 0 {
+                    (check_cost_paid / check_runs) * eligible.len() as u32
+                } else {
+                    Duration::ZERO
+                };
+                let full_due = resweep_due(sweep_cost_paid, check_cost_paid, estimated);
+                let targets =
+                    select_resweep_targets(eligible, full_due, &outcome.touched_paths);
+                let mut regressions: Vec<(i64, String, String)> = Vec::new();
+                for (id, title, check) in targets {
+                    // A sweep is bookkeeping, not work — stop mid-sweep the
+                    // moment the user says stop; the loop head reports it.
+                    if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                        break;
+                    }
+                    let sweep_started = Instant::now();
+                    let verdict = check.run(workdir).await;
+                    sweep_cost_paid += sweep_started.elapsed();
+                    if verdict.passed {
+                        continue;
+                    }
+                    if source
+                        .reopen(
+                            id,
+                            &format!(
+                                "verified completion regressed mid-run — the acceptance \
+                                 check fails again: {}",
+                                verdict.detail
+                            ),
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        reopened_once.insert(id);
+                        progress.remove(&id);
+                        items_completed = items_completed.saturating_sub(1);
+                        items_regressed_reopened += 1;
+                        let detail = text_head(&verdict.detail, 240).to_string();
+                        tracing::warn!(
+                            item = id,
+                            title = %title,
+                            detail = %detail,
+                            "mid-run sweep: verified item regressed — reopening"
+                        );
+                        let _ = source
+                            .log(
+                                id,
+                                "regressed",
+                                serde_json::json!({
+                                    "detail": verdict.detail,
+                                    "mid_run": true,
+                                }),
+                            )
+                            .await;
+                        // Durable context for whenever the item is next
+                        // selected, independent of the one-shot notice below.
+                        let _ = source
+                            .add_note(
+                                id,
+                                &format!(
+                                    "REOPENED mid-run: later work un-did this verified \
+                                     item — {detail}. Disk is truth; restore it."
+                                ),
+                            )
+                            .await;
+                        regressions.push((id, title, detail));
+                    }
+                }
+                if !regressions.is_empty() {
+                    let notice = regression_notice_text(&regressions);
+                    // Merge with a still-pending notice (possible when the
+                    // steps in between were replans, which do not consume
+                    // it) rather than dropping either; both halves are
+                    // screenful-bounded and the next execute step takes all.
+                    regression_notice = Some(match regression_notice.take() {
+                        Some(prev) => format!("{prev}\n\n{notice}"),
+                        None => notice,
+                    });
                 }
             }
         };
@@ -1755,6 +1920,129 @@ fn text_tail(text: &str, max_bytes: usize) -> String {
         start += 1;
     }
     trimmed[start..].to_string()
+}
+
+/// First `max_bytes` of `text`, on a char boundary. The safe form of
+/// `String::truncate` for verdict details, which can embed file content and
+/// therefore multi-byte characters at any offset.
+fn text_head(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
+/// The filesystem path a tool call targeted, when the tool is one that
+/// writes a caller-named path (the write/edit family). `None` for everything
+/// else — including `exec`, whose side effects are opaque to the caller; the
+/// periodic re-sweep is the backstop for those.
+///
+/// Accepts both parameter spellings (`file_path` is canonical since the
+/// Claude Code alignment; `path` remains accepted) — the same tolerance the
+/// tools themselves apply.
+#[must_use]
+pub fn touched_path_of(name: &str, input: &serde_json::Value) -> Option<String> {
+    if !matches!(
+        name,
+        "write_file" | "write" | "Write" | "edit_file" | "edit" | "Edit" | "file_buffer"
+    ) {
+        return None;
+    }
+    input
+        .get("file_path")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| input.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+/// Is a FULL periodic re-sweep affordable at this step boundary?
+///
+/// The cadence is derived, not configured: **re-verification may spend at
+/// most what verification has spent.** The run already pays one acceptance
+/// check per verdict as the price of knowing anything; the sweep re-asks old
+/// verdicts, and re-asking may never out-spend asking. That caps sweep
+/// overhead at a doubling of check time — and since a check must already be
+/// cheaper than the step it verifies (see [`ACCEPTANCE_TIMEOUT_SECS_DEFAULT`]),
+/// the sweep can never dominate the loop. For the sub-second shell checks
+/// missions actually use this converges on sweeping every few steps; for a
+/// plan whose checks are minute-long test suites it backs off in exact
+/// proportion. No magic N.
+///
+/// `estimated_sweep_cost` is the measured average check duration times the
+/// eligible-item count. An estimate only — the ACTUAL cost of each sweep is
+/// then paid into `sweep_cost_paid`, so a low estimate self-corrects by
+/// pushing the next sweep further out.
+fn resweep_due(
+    sweep_cost_paid: Duration,
+    check_cost_paid: Duration,
+    estimated_sweep_cost: Duration,
+) -> bool {
+    sweep_cost_paid + estimated_sweep_cost <= check_cost_paid
+}
+
+/// Which verified items does this boundary's sweep re-check?
+///
+/// When the periodic budget covers a full sweep, all of them. Otherwise only
+/// the targeted set: items whose acceptance references a path the step just
+/// wrote — the full-file-rewrite regression shape, caught the moment it
+/// happens instead of a cadence later.
+fn select_resweep_targets(
+    eligible: Vec<(i64, String, AcceptanceCheck)>,
+    full_sweep_due: bool,
+    touched_paths: &[String],
+) -> Vec<(i64, String, AcceptanceCheck)> {
+    if full_sweep_due {
+        return eligible;
+    }
+    if touched_paths.is_empty() {
+        return Vec::new();
+    }
+    eligible
+        .into_iter()
+        .filter(|(_, _, check)| touched_paths.iter().any(|path| check.references_path(path)))
+        .collect()
+}
+
+/// The prompt-facing notice after the mid-run sweep reopened regressed items
+/// — rendered into the very next execute step's `== LAST RESULT ==` block so
+/// the model hears about the damage BEFORE wandering further from it.
+///
+/// Bounded to one screenful ([`STEP_RESULT_TAIL_MAX_BYTES`], the established
+/// prompt bound): the notice exists to redirect the next step, not to carry
+/// the ledger — every regression's full verdict is already durably recorded
+/// on the reopened task (reopen reason, `regressed` log entry, note).
+fn regression_notice_text(regressions: &[(i64, String, String)]) -> String {
+    let mut text = String::from(
+        "== VERIFIED WORK UN-DONE ==\n\
+         The harness re-ran done-conditions that had already PASSED. Your recent changes \
+         broke them:\n",
+    );
+    let footer = "Disk is truth: those items are reopened and their checks FAIL right now. \
+                  Restore them with the smallest edit that makes the checks pass again \
+                  before doing anything else — do not rewrite whole files.";
+    // Reserve room for the footer and a possible overflow line so the total
+    // stays one screenful however many items regressed at once.
+    let reserve = footer.len() + 80;
+    let mut omitted = 0usize;
+    for (id, title, detail) in regressions {
+        let line = format!("- you un-did verified work #{id} ({title}): {detail}\n");
+        if text.len() + line.len() + reserve > STEP_RESULT_TAIL_MAX_BYTES {
+            omitted += 1;
+            continue;
+        }
+        text.push_str(&line);
+    }
+    if omitted > 0 {
+        text.push_str(&format!(
+            "- …and {omitted} more (each reopened task carries its failing verdict)\n"
+        ));
+    }
+    text.push_str(footer);
+    text
 }
 
 #[cfg(test)]
@@ -1944,6 +2232,7 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 200,
             tool_calls: vec![],
+            touched_paths: vec![],
         }
     }
 
@@ -2591,6 +2880,7 @@ mod tests {
                         output_digest: String::new(),
                     })
                     .collect(),
+                touched_paths: vec![],
             })
         };
         let runner = ScriptedRunner::new(vec![
@@ -2902,6 +3192,7 @@ mod tests {
                     input_tokens: 1000,
                     output_tokens: 200,
                     tool_calls: vec![],
+                    touched_paths: vec![],
                 })
             }
         }
@@ -3040,6 +3331,296 @@ mod tests {
         assert_eq!(report.steps_taken, 3);
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
+    }
+
+    // -----------------------------------------------------------------
+    // Mid-run sweep: regressions caught at the step boundary, not at drain
+    // -----------------------------------------------------------------
+
+    /// The rewrite-erosion shape, mid-run: call 1 builds item 1's artifact
+    /// (verified), call 2 REWRITES it wholesale while working item 2 — the
+    /// live-mission failure the drain sweep can never catch in time (observed
+    /// 2026-08-10: 22/42 verified held for three hours, then full-file
+    /// rewrites collapsed it to 1/42 while the plan stayed non-empty). Call 3
+    /// restores it when item 1 comes back, call 4 finishes item 2.
+    struct MidRunUnderminer {
+        artifact: PathBuf,
+        /// Report `y.txt` in the destructive step's `touched_paths` (the
+        /// write/edit shape). False = the write is invisible to the runner
+        /// (the exec-side-effect shape) and only the periodic sweep can see
+        /// the damage.
+        report_touch: bool,
+        /// Clobber the artifact AGAIN on the final call — probing the
+        /// one-reopen-per-item-per-run bound.
+        final_clobber: bool,
+        requests: Mutex<Vec<StepRequest>>,
+        calls: Mutex<usize>,
+    }
+
+    impl MidRunUnderminer {
+        fn new(artifact: PathBuf, report_touch: bool, final_clobber: bool) -> Self {
+            Self {
+                artifact,
+                report_touch,
+                final_clobber,
+                requests: Mutex::new(Vec::new()),
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StepRunner for MidRunUnderminer {
+        async fn run_step(&self, request: StepRequest) -> Result<StepOutcome, String> {
+            self.requests.lock().await.push(request);
+            let mut calls = self.calls.lock().await;
+            *calls += 1;
+            let touched = vec!["y.txt".to_string()];
+            Ok(match *calls {
+                1 => {
+                    std::fs::write(&self.artifact, "MARKER v1").unwrap();
+                    let mut o = outcome("built it");
+                    o.touched_paths = touched;
+                    o
+                }
+                2 => {
+                    std::fs::write(&self.artifact, "full rewrite, marker gone").unwrap();
+                    let mut o = outcome("rewrote the doc");
+                    if self.report_touch {
+                        o.touched_paths = touched;
+                    }
+                    o
+                }
+                3 => {
+                    std::fs::write(&self.artifact, "MARKER restored").unwrap();
+                    let mut o = outcome("restored it");
+                    o.touched_paths = touched;
+                    o
+                }
+                _ => {
+                    if self.final_clobber {
+                        std::fs::write(&self.artifact, "clobbered again, marker gone").unwrap();
+                    }
+                    let mut o = outcome("all wrapped up\nTASK COMPLETE");
+                    if self.final_clobber {
+                        o.touched_paths = touched;
+                    }
+                    o
+                }
+            })
+        }
+    }
+
+    fn marker_check() -> AcceptanceCheck {
+        AcceptanceCheck::Regex {
+            pattern: "MARKER".to_string(),
+            path: Some("y.txt".to_string()),
+            command: None,
+            timeout_secs: None,
+        }
+    }
+
+    async fn assert_mid_run_regression_caught(source: &MemorySource, runner: &MidRunUnderminer) {
+        let requests = runner.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        // Caught MID-run: the reopened item is selected while item 2 is
+        // still open, and its prompt carries the notice — at drain none of
+        // this would exist.
+        assert_eq!(requests[1].item_id, 2);
+        assert_eq!(requests[2].item_id, 1, "reopened item comes back next");
+        assert!(
+            requests[2].prompt.contains("you un-did verified work #1"),
+            "the very next step must hear about the damage: {}",
+            requests[2].prompt
+        );
+        assert!(requests[2].prompt.contains("Disk is truth"));
+        assert!(
+            !requests[3].prompt.contains("un-did verified work"),
+            "the notice is one-shot"
+        );
+        let log = source.log_entries.lock().await;
+        assert!(log.iter().any(|(id, a)| *id == 1 && a == "regressed"));
+        assert!(log.iter().any(|(id, a)| *id == 1 && a == "reopened"));
+        let notes = source.notes.lock().await;
+        assert!(
+            notes
+                .iter()
+                .any(|(id, n)| *id == 1 && n.contains("REOPENED mid-run")),
+            "the reopened item carries durable context"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_run_sweep_reopens_a_verified_item_the_next_step_un_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "build artifact", Some(marker_check()))).await;
+        source.push(step(2, "destructive later work", None)).await;
+        // The destructive write REPORTS its touched path — the write/edit
+        // trigger fires at that very boundary.
+        let runner = MidRunUnderminer::new(dir.path().join("y.txt"), true, false);
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.items_regressed_reopened, 1, "{report:?}");
+        assert_eq!(report.items_completed, 2);
+        assert_eq!(report.steps_taken, 4);
+        assert_mid_run_regression_caught(&source, &runner).await;
+    }
+
+    #[tokio::test]
+    async fn mid_run_periodic_sweep_catches_a_regression_no_write_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "build artifact", Some(marker_check()))).await;
+        source.push(step(2, "destructive later work", None)).await;
+        // The destructive write is INVISIBLE (exec-side-effect shape): only
+        // the periodic cadence — funded by the check time already paid, so
+        // due immediately for sub-second checks — can catch it.
+        let runner = MidRunUnderminer::new(dir.path().join("y.txt"), false, false);
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.items_regressed_reopened, 1, "{report:?}");
+        assert_eq!(report.items_completed, 2);
+        assert_eq!(report.steps_taken, 4);
+        assert_mid_run_regression_caught(&source, &runner).await;
+    }
+
+    #[tokio::test]
+    async fn mid_run_sweep_reopens_each_item_at_most_once_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source.push(step(1, "build artifact", Some(marker_check()))).await;
+        source.push(step(2, "destructive later work", None)).await;
+        // The final step clobbers the artifact a SECOND time. The reopen
+        // bound must hold: item 1 was already reopened once this run, so
+        // neither the mid-run sweep nor the drain sweep may reopen it again
+        // — the fixpoint guarantee, mirrored from the drain sweep.
+        let runner = MidRunUnderminer::new(dir.path().join("y.txt"), true, true);
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.stop, StopReason::AllTasksDone);
+        assert_eq!(report.items_regressed_reopened, 1, "{report:?}");
+        assert_eq!(report.items_completed, 2);
+        assert_eq!(report.steps_taken, 4, "no reopen loop: {report:?}");
+        let log = source.log_entries.lock().await;
+        assert_eq!(
+            log.iter().filter(|(id, a)| *id == 1 && a == "regressed").count(),
+            1,
+            "one reopen per item per run"
+        );
+        // The second clobber stands on disk — proof the bound held rather
+        // than the sweep fighting the model forever.
+        let content = std::fs::read_to_string(dir.path().join("y.txt")).unwrap();
+        assert!(!content.contains("MARKER"));
+    }
+
+    #[test]
+    fn periodic_resweep_cadence_derives_from_check_cost() {
+        let ms = Duration::from_millis;
+        // Sub-second checks: the verification time already paid covers a
+        // full re-sweep — due immediately.
+        assert!(resweep_due(Duration::ZERO, ms(300), ms(300)));
+        // Expensive checks (minute-long test suites): a 60s estimated sweep
+        // against 10s of paid verification is not affordable — the cadence
+        // backs off in proportion, with no fixed N anywhere.
+        assert!(!resweep_due(Duration::ZERO, ms(10_000), ms(60_000)));
+        // The budget replenishes as further verification is paid for.
+        assert!(resweep_due(ms(60_000), ms(120_000), ms(60_000)));
+        assert!(!resweep_due(ms(60_000), ms(119_999), ms(60_000)));
+    }
+
+    #[test]
+    fn resweep_targets_are_full_when_due_and_touched_paths_otherwise() {
+        let check = |file: &str| AcceptanceCheck::Command {
+            command: format!("sh checks/{file}"),
+            timeout_secs: None,
+        };
+        let eligible = vec![
+            (1i64, "a".to_string(), check("test_01.sh")),
+            (2i64, "b".to_string(), check("test_02.sh")),
+        ];
+        // Full sweep due: everything, whatever was touched.
+        assert_eq!(select_resweep_targets(eligible.clone(), true, &[]).len(), 2);
+        // Not due, nothing touched: nothing to re-check.
+        assert!(select_resweep_targets(eligible.clone(), false, &[]).is_empty());
+        // Not due, one referenced path touched: exactly that item,
+        // immediately — absolute spelling still collides with the check's
+        // relative one.
+        let touched = vec!["D:\\ws\\checks\\test_02.sh".to_string()];
+        let targets = select_resweep_targets(eligible, false, &touched);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, 2);
+    }
+
+    #[test]
+    fn acceptance_path_references_match_by_final_component() {
+        let cmd = AcceptanceCheck::Command {
+            command: "sh checks/test_04.sh".to_string(),
+            timeout_secs: None,
+        };
+        assert!(cmd.references_path("checks/test_04.sh"));
+        assert!(cmd.references_path("D:\\ws\\checks\\test_04.sh"));
+        assert!(!cmd.references_path("notekeeper.sh"));
+        let file = AcceptanceCheck::FileExists {
+            path: "data/notes.md".to_string(),
+        };
+        assert!(file.references_path("notes.md"));
+        assert!(!file.references_path("other.md"));
+        let rx = AcceptanceCheck::Regex {
+            pattern: "x".to_string(),
+            path: Some("y.txt".to_string()),
+            command: None,
+            timeout_secs: None,
+        };
+        assert!(rx.references_path("./y.txt"));
+        assert!(!rx.references_path(""));
+    }
+
+    #[test]
+    fn touched_path_extraction_covers_write_and_edit_tools_only() {
+        let with_file_path = serde_json::json!({ "file_path": "notes.md", "content": "x" });
+        assert_eq!(
+            touched_path_of("write_file", &with_file_path).as_deref(),
+            Some("notes.md")
+        );
+        let with_path = serde_json::json!({ "path": "notes.md" });
+        assert_eq!(
+            touched_path_of("edit_file", &with_path).as_deref(),
+            Some("notes.md")
+        );
+        // exec is opaque — the periodic sweep is its backstop.
+        assert_eq!(
+            touched_path_of("exec", &serde_json::json!({ "command": "rm notes.md" })),
+            None
+        );
+        assert_eq!(touched_path_of("read_file", &with_file_path), None);
+    }
+
+    #[test]
+    fn regression_notice_stays_one_screenful_however_many_items_regressed() {
+        let regressions: Vec<(i64, String, String)> = (0..40)
+            .map(|i| {
+                (
+                    i,
+                    format!("feature {i}"),
+                    "pattern /MARKER/ did not match (2000 bytes searched)".to_string(),
+                )
+            })
+            .collect();
+        let notice = regression_notice_text(&regressions);
+        assert!(
+            notice.len() <= STEP_RESULT_TAIL_MAX_BYTES,
+            "{} bytes",
+            notice.len()
+        );
+        assert!(notice.contains("you un-did verified work #0"));
+        assert!(notice.contains("more"), "the overflow is announced");
+        assert!(notice.contains("Disk is truth"));
     }
 
     #[tokio::test]
@@ -3280,6 +3861,7 @@ mod tests {
                     input_digest: "same".to_string(),
                     output_digest: "same".to_string(),
                 }],
+                touched_paths: vec![],
             })
         };
         let runner = ScriptedRunner::new(vec![looped(), looped(), looped(), looped()]);

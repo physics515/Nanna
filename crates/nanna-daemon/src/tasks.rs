@@ -19,6 +19,7 @@ use crate::protocol::Event;
 use nanna_agent::harness::{
     AcceptanceCheck, Interjector, LongHorizonConfig, LongHorizonReport, LongHorizonRunner,
     StepOutcome, StepRequest, StepRunner, StepToolCall, StopReason, TaskSource, TaskStep,
+    touched_path_of,
 };
 use nanna_agent::planner::{Plan, build_plan_prompt, plan_or_fallback};
 use nanna_agent::CancelToken;
@@ -2634,11 +2635,24 @@ impl AgentStepRunner {
             })
             .collect();
 
+        // Paths the step's write/edit calls targeted, for the harness's
+        // mid-run sweep: a write that lands on a file some verified item's
+        // acceptance references triggers an immediate re-check of that item.
+        let mut touched_paths: Vec<String> = Vec::new();
+        for record in &result.tool_calls {
+            if let Some(path) = touched_path_of(&record.name, &record.input) {
+                if !touched_paths.contains(&path) {
+                    touched_paths.push(path);
+                }
+            }
+        }
+
         Ok(StepOutcome {
             text: result.text,
             input_tokens: u64::from(result.input_tokens),
             output_tokens: u64::from(result.output_tokens),
             tool_calls,
+            touched_paths,
         })
     }
 }
@@ -3665,6 +3679,7 @@ mod tests {
                     output_digest: String::new(),
                 })
                 .collect(),
+            touched_paths: Vec::new(),
         }
     }
 
@@ -5381,6 +5396,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 tool_calls: Vec::new(),
+                touched_paths: Vec::new(),
             })
         }
     }
