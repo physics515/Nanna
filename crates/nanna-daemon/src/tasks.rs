@@ -3451,14 +3451,28 @@ pub(crate) fn ollama_local_base() -> String {
     normalize_ollama_base(&raw)
 }
 
-/// Restart the local Ollama server: kill `ollama.exe` only (the tray
-/// supervisor respawns it) and wait for the API to come back.
+/// Restart the local Ollama server: tree-kill the server process AND its
+/// per-model runner children (the tray supervisor respawns the server), then
+/// wait for the API to come back.
 ///
 /// This is the cure for the sticky degraded-runner state (every generation
 /// aborted with `done:false`; model unloads do not clear it — verified live).
 /// Callers gate it: bouncing a shared local service is an operator decision.
 /// Refuses to act when `OLLAMA_HOST` points at a non-local server, and at
 /// most once per [`OLLAMA_RESTART_COOLDOWN_SECS`] process-wide.
+///
+/// REGRESSION (2026-08-09): the kill must take the whole runner tree, not
+/// just the server. This function originally ran `taskkill /F /IM
+/// ollama.exe`, which on Windows kills only the parent — each loaded model's
+/// `llama-server.exe` runner child (~6 GB VRAM for an 8B model) survived as
+/// an orphan that the respawned server cannot see, because `ollama ps`
+/// reports the new server's own runners, not what is actually on the card.
+/// Verified live: four orphans (parents dead) held ~12.5 GB of a 16 GB card,
+/// the num_ctx sizing probe honestly latched 4096 from the 1.5 GB that
+/// remained — below the ~4.2k min-viable floor — and two endurance attempts
+/// died in minutes on below-floor stops. Each restart heal leaks one runner
+/// per loaded model, so repeated heals (e.g. the 2026-08-08 ministral leg's
+/// two) starve the card cumulatively while looking like successful cures.
 pub async fn restart_ollama_server() -> bool {
     // Normalization maps bind-all addresses to loopback, so after it a
     // genuinely remote host is the only thing that won't look local.
@@ -3498,14 +3512,30 @@ pub async fn restart_ollama_server() -> bool {
     // Every model's runner dies with the server, so every fingerprint
     // describing one is now stale.
     forget_all_wedges();
+    // `/T` takes runners still parented to a live server; the follow-up
+    // image-name sweep takes orphans from EARLIER parent-only kills (this
+    // function pre-fix, or an external restart). The sweep cannot hit a live
+    // server's runner: with every `ollama.exe` dead, any surviving
+    // `llama-server.exe` is by definition an orphan, and the tray's respawned
+    // server loads models lazily so it has none of its own yet.
     #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "ollama.exe"])
-        .output();
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/IM", "ollama.exe"])
+            .output();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "llama-server.exe"])
+            .output();
+    }
     #[cfg(not(windows))]
-    let _ = std::process::Command::new("pkill")
-        .args(["-x", "ollama"])
-        .output();
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "ollama"])
+            .output();
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "llama-server"])
+            .output();
+    }
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let up = reqwest::Client::new()
