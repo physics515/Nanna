@@ -149,6 +149,17 @@ impl ChatRunRegistry {
         self.active.read().await.contains_key(session_id)
     }
 
+    /// Whether ANY harness run is live. The dream gate consults this: a
+    /// mission mid-flight is the opposite of idle however old the last user
+    /// message is, and a consolidation that rewrites the run's scoped
+    /// memories mid-step deadlocked a live mission (observed 2026-08-10:
+    /// dreams opened 16 minutes into a run because idleness was counted
+    /// from the unanswered user message, folded 316 of the run's tool-result
+    /// memories, and the step never returned).
+    pub async fn any_active(&self) -> bool {
+        !self.active.read().await.is_empty()
+    }
+
     /// Claim the run slot. Returns false when one is already live — the
     /// caller must then interject instead of starting a second run.
     pub async fn try_claim(&self, session_id: &str) -> bool {

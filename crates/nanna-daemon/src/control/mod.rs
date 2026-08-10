@@ -355,6 +355,13 @@ impl ControlPlane {
         self
     }
 
+    /// Share a run registry created by the caller — the daemon's dream gate
+    /// holds the same handle, so "a mission is live" is one fact, not two.
+    pub fn with_chat_runs(mut self, runs: Arc<chat_harness::ChatRunRegistry>) -> Self {
+        self.chat_runs = runs;
+        self
+    }
+
     /// Set storage and load persisted model stats and tool stats from it.
     pub async fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         match storage.load_model_stats().await {
