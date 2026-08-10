@@ -1640,6 +1640,15 @@ impl DaemonServer {
         // is the cron runner (the GUI scheduler only runs in embedded mode).
         // Loads persisted jobs and runs heartbeat + memory consolidation,
         // mirroring the GUI's embedded schedule.
+        // ONE run registry, created before the scheduler so the dream gate
+        // and the control plane hold the same handle: "a mission is live"
+        // must be one fact, not two.
+        let chat_runs = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+        // In-flight latch: the scheduler tick re-fired consolidation every
+        // 30s while the previous one was still folding (observed 2026-08-10:
+        // a fresh "Consolidation starting" per tick, none finishing) — one
+        // dream at a time.
+        let dream_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scheduler = {
             // These three come from `[scheduler]` in the user's config, not from
             // literals: the GUI's Scheduler tab writes them there and a config
@@ -1700,6 +1709,8 @@ impl DaemonServer {
                 }
             }
 
+            let chat_runs_for_tasks = chat_runs.clone();
+            let dream_in_flight_for_tasks = dream_in_flight.clone();
             let agent_for_tasks = agent.clone();
             let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
@@ -1727,12 +1738,33 @@ impl DaemonServer {
                 let storage = storage_for_tasks.clone();
                 let activity = activity_for_tasks.clone();
                 let summarization_models = summarization_models.clone();
+                let chat_runs = chat_runs_for_tasks.clone();
+                let dream_in_flight = dream_in_flight_for_tasks.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
                     let (success, output, error) = match task.name.as_str() {
                         "memory_consolidation" => {
                             if let Some(ref dreaming) = dreaming {
+                                if chat_runs.any_active().await {
+                                    // A live harness run is the opposite of
+                                    // idle, however old the last user message
+                                    // is: dreaming rewrites the very scoped
+                                    // memories the run is using, and doing so
+                                    // mid-step deadlocked a live mission
+                                    // (2026-08-10, 316 tool-result memories
+                                    // folded under a running step).
+                                    (true, Some("Skipped (mission live)".to_string()), None)
+                                } else if dream_in_flight
+                                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    (
+                                        true,
+                                        Some("Skipped (dream already in flight)".to_string()),
+                                        None,
+                                    )
+                                } else {
+                                let outcome = {
                                 // The idle gate AND the full dream cycle (feedback
                                 // flush -> FSRS testing-effect flush -> consolidate)
                                 // both live in the one `DreamingService`. The daemon
@@ -1805,6 +1837,11 @@ impl DaemonServer {
                                         error!("Scheduled consolidation failed: {e}");
                                         (false, None, Some(e.to_string()))
                                     }
+                                }
+                                };
+                                dream_in_flight
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                outcome
                                 }
                             } else {
                                 (
@@ -1940,6 +1977,7 @@ impl DaemonServer {
         .with_scheduler(scheduler)
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
+        .with_chat_runs(chat_runs.clone())
         .with_shutdown(self.shutdown_tx.clone());
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());

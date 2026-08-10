@@ -235,6 +235,36 @@ smoke (5/5 @ 11.0 k vs 4/5 @ 11.8 k) diverged to 37/42 vs 2/42 — the divider i
 discipline, not tool dialect or speed. ornith's 37/42 in 1.02 h also beats the frozen-era
 qwen 32/42 @ 4 h, with the same exit-semantics caveat as everywhere in this table.
 
+**ministral-3:8b post-heal rerun (2026-08-09, master `a46c6c66`).** Rerun of the ministral
+endurance leg with the two fixes that landed after the first leg: the unserved-tool heal
+(PR #200 — Mistral-family Ollama 500s `tool 'X' not found` on generated calls to unserved
+tools; the loop now activates the named tool and retries) and the progress-gated
+deterministic-failure breaker (PR #198). Build in a session-private `CARGO_TARGET_DIR`, heal
+string grep-verified in the test exe; fresh store, 4.5 h cap, `num_ctx` 16384, exclusive GPU.
+
+Result: **3/42 verified in 4.54 h** (features 01, 02, 04), single segment spanning the full
+window, **0 resumes, 0 server restarts**. 375 steps, 2 622 tool calls (1 285 side-effecting),
+29 replans, 2 false-success claims, 17.4 M tokens; 150 items from 42 seeded (108
+self-created), 20 completed + 10 abandoned in-segment, ~869 k tok/completed item. Feature 03
+was abandoned after 5 fruitless steps + 1 replan on a shell syntax error the model could not
+repair; nothing past feature 05 was reached. Exactly **2 unserved-tool heals** fired (`exec`
+t≈4 m, `list_dir` t≈21 m), both absorbed with no step retry burned and no recurrence after
+activation — the dialect/serving fault is fully eliminated as a variable. The score moving
+only 2→3 of 42 confirms the campaign's reading: decomposition discipline, not tool dialect,
+is the divider.
+
+Infrastructure postscript, and a retroactive correction. Two attempts before the valid leg
+died in minutes (1/42 @ 0.11 h, 0/42 @ 0.05 h) with `num_ctx` latched at 4096 — below the
+~4.2 k min-viable floor. The sizing probe was honest: four orphaned `llama-server.exe`
+runners (parents dead — killing/restarting the Ollama server orphans its loaded runner
+children on Windows, invisible to the new server's `ollama ps`) held ~12.5 GB of the 16 GB
+card, and a 28 h-old `nanna-daemon-bench.exe` kept re-warming ornith. Killing them took free
+VRAM 1.5 → 14.2 GB and sizing returned to 16384. Since each restart heal leaks the loaded
+runners, the first leg's "mid-response abort loop after 2 heals (t=37 m, t=141 m)" now reads
+as VRAM starvation from the heals' own leaks, not model-side degradation — and this rerun's
+zero-incident full window on a clean card is consistent with that. Bare desktop overhead is
+~1.8 GB, not the 5–6 GB previously assumed (that number was measured through leaked runners).
+
 Two cross-run cautions. (1) qwen's frozen-harness 32/42 above is not comparable: those runs
 were GUI-driven with no plan-drain early exit; on the current path qwen closed its entire
 plan in under half the window. (2) gemma's 6/42 against iteration 4's 15/42 on

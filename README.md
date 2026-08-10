@@ -214,6 +214,15 @@ measurement trail: [bench/BASELINE.md](bench/BASELINE.md).
 | ministral-3:8b | 6.0 GB | 4/5 @ 11.8 k tok/item | **2 / 42** | 3.20 h (early stop) | runaway decomposition (256 items from 42 seeded); stopped by the deterministic-failure detector after repeated Ollama mid-response aborts (2 heals first); the smoke miss was an Ollama-side 500, not a wrong call |
 | lfm2.5 | 5.2 GB | **2 / 5** @ 78 k tok/item | — (gate failed) | 124 s (smoke) | up from 0-for-tools in the prior campaign; now abandons cleanly via containment instead of wedging |
 
+**Post-heal rerun (2026-08-09, master `a46c6c66`).** With the unserved-tool heal (PR #200) and
+the progress-gated failure breaker (PR #198) merged, ministral-3:8b re-ran the endurance leg on
+a verified-clean GPU: **3 / 42 in 4.54 h** (full cap), 0 resumes, 0 restarts — the Ollama-side
+500s that plagued the first leg were fully absorbed (2 heals, activate-and-retry, no recurrence
+after activation). The verdict is unchanged: runaway decomposition (150 items from 42 seeded,
+~869 k tok/completed item) is the bottleneck, not tool dialect. The first leg's abort loop is
+now attributed to leaked `llama-server` orphans starving VRAM, not the model. Details in
+[bench/BASELINE.md](bench/BASELINE.md).
+
 The frozen-harness series below is a separate historical experiment — GUI-driven, no plan-drain
 early exit — so its qwen 32/42 is not directly comparable to the numbers above.
 
