@@ -58,28 +58,24 @@ impl Default for DaemonManagerConfig {
     }
 }
 
-/// Kill a process and its descendants by PID, best-effort. A current daemon's
-/// own kill-on-close Job Object (adopted at startup) already reaps its
-/// children when it dies; this is belt-and-braces for daemons where adoption
-/// failed or that predate it.
-fn kill_process_tree(pid: u32) {
+/// Kill the daemon sidecar's process tree by PID, best-effort. A current
+/// daemon's own kill-on-close Job Object (adopted at startup) already reaps
+/// its children when it dies; this is belt-and-braces for daemons where
+/// adoption failed or that predate it.
+///
+/// Windows delegates to the shared `taskkill /T` walk in `nanna_proc` (which
+/// suppresses the console window a windows-subsystem process like this one
+/// would otherwise flash). Unix is a deliberate no-op — tauri-plugin-shell
+/// owns the sidecar spawn, so the process_group(0)-at-spawn contract behind
+/// `nanna_proc`'s group kill does not hold here; the caller's
+/// `CommandChild::kill()` covers the direct child.
+// async for the Windows walk's await; the Unix no-op body has none.
+#[cfg_attr(not(windows), allow(clippy::unused_async))]
+async fn kill_sidecar_tree(pid: u32) {
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    nanna_proc::kill_process_tree(pid).await;
     #[cfg(not(windows))]
-    {
-        // Unix children run in their own process groups with kill_on_drop;
-        // the caller's CommandChild::kill() covers the direct child.
-        let _ = pid;
-    }
+    let _ = pid;
 }
 
 /// Manages the daemon sidecar process
@@ -239,7 +235,7 @@ impl DaemonManager {
                 // Tree-kill only a sidecar that is still alive: a dead one's
                 // PID may already belong to an unrelated process.
                 if !self.sidecar_exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    kill_process_tree(child.pid());
+                    kill_sidecar_tree(child.pid()).await;
                 }
                 if let Err(e) = child.kill() {
                     warn!("Failed to kill unresponsive daemon: {}", e);
@@ -320,7 +316,7 @@ impl DaemonManager {
                     // kill() orphans in-flight exec children on daemons whose
                     // Job Object never adopted (or that predate it).
                     warn!("Graceful daemon shutdown failed — tree-killing PID {pid}");
-                    kill_process_tree(pid);
+                    kill_sidecar_tree(pid).await;
                     if let Err(e) = child.kill() {
                         warn!("Failed to kill daemon process: {}", e);
                     }

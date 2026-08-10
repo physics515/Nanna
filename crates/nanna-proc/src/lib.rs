@@ -40,7 +40,7 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess};
 
 /// Kill a process and its descendants, best-effort.
 ///
@@ -61,6 +61,10 @@ pub async fn kill_process_tree(pid: u32) {
     {
         let _ = tokio::process::Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
+            // A windows-subsystem caller (the GUI tree-killing its daemon
+            // sidecar) must not flash a console for the walk; console
+            // callers can't tell — output is nulled either way.
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -280,10 +284,9 @@ mod tests {
     const SPAWN_DEADLINE: Duration = Duration::from_secs(20);
 
     // Mirrors the exec/acceptance spawn paths (bridge.rs / harness.rs).
+    // CREATE_NO_WINDOW comes from the crate-level windows-sys import.
     #[cfg(windows)]
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    #[cfg(windows)]
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     /// Liveness via `tasklist` — fine for a test; the daemon's runtime checks
     /// use Win32 directly (see nanna-daemon health.rs for why).
