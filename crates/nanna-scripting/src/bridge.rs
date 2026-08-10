@@ -3,6 +3,7 @@
 //! Exposes controlled Nanna functionality to JavaScript code.
 
 use crate::{Result, ScriptError, tool::ToolPermissions};
+use nanna_proc::{ChildJob, kill_process_tree};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -375,40 +376,6 @@ pub fn default_exec_timeout_secs(command: &str) -> u64 {
     }
 }
 
-/// Kill a process and its descendants, best-effort.
-///
-/// On Windows this shells out to `taskkill /T /F`, which walks the tree from
-/// `pid` — necessary because killing only the shell we spawned would leave a
-/// grandchild (`cargo`, `git`) running and holding a workspace/build lock. On
-/// Unix the child is its own process-group leader (`process_group(0)` at
-/// spawn), so signalling the *negative* pid reaps the shell and every
-/// descendant in one call — `kill_on_drop` alone only reached the direct
-/// child and left grandchildren running.
-async fn kill_process_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-    }
-    #[cfg(not(windows))]
-    {
-        // pid is a fresh process-group id from the kernel: it fits i32, and a
-        // failed signal (group already gone) is exactly the no-op we want.
-        #[allow(clippy::cast_possible_wrap)]
-        let pgid = -(pid as i32);
-        // SAFETY: kill(2) with a negative pgid signals a process group we
-        // created; `process_group(0)` at spawn put the child in its own
-        // group, so this can never reach our own.
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
-        }
-    }
-}
-
 impl NannaBridge {
     /// Create a new bridge with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
@@ -732,7 +699,8 @@ impl NannaBridge {
         let timeout = timeout_secs.unwrap_or_else(|| default_exec_timeout_secs(command));
 
         // Reap our direct child if this future is dropped (e.g. the outer script
-        // engine deadline fires) — a backstop for the explicit tree-kill below.
+        // engine deadline fires). The per-child Job Object below widens this
+        // backstop to the whole subtree on Windows.
         cmd.kill_on_drop(true);
 
         // Isolate the child from OUR process group.
@@ -769,19 +737,44 @@ impl NannaBridge {
         // Capture the pid *before* the wait future consumes the child, so a timeout
         // can kill the whole process tree rooted here (not just the shell).
         let pid = child.id();
+        // Windows: put the child in its OWN kill-on-close Job Object before it
+        // can fork. The taskkill walk below only reaches descendants of a pid
+        // it can still see — `foo &` leaves a grandchild holding our pipes
+        // after the shell died, invisible to the walk (2026-08-08: such a
+        // survivor pinned a blocking-pool pipe read and hung teardown 25+
+        // min). Job membership is inherited, so terminating the job reaps the
+        // whole subtree regardless; dropping this guard (future cancelled)
+        // does the same. Unix needs none of this: the process group IS the
+        // subtree, dead shell or not.
+        let mut job = ChildJob::assign(&child);
         let wait = child.wait_with_output();
         tokio::pin!(wait);
         let output = tokio::select! {
-            res = &mut wait => res
-                .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?,
+            res = &mut wait => {
+                let output = res
+                    .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
+                // Completed: pipes EOF'd, shell exited. Anything still running
+                // is a deliberately detached background process (output
+                // redirected — e.g. a server the agent started on purpose).
+                // Spare it; the daemon-wide Job Object still bounds it.
+                if let Some(job) = job.take() {
+                    job.disarm();
+                }
+                output
+            },
             () = tokio::time::sleep(std::time::Duration::from_secs(timeout)) => {
                 // Overran the deadline. Kill the entire tree — the shell *and* any
                 // long-running grandchild like cargo/git — so it can't outlive the
                 // tool call and hold a workspace/build lock (the failure mode that
-                // deadlocked repeated exec calls against each other). Do this while
-                // `wait` still owns the child, so the pid is still live.
+                // deadlocked repeated exec calls against each other). Walk first
+                // while `wait` still owns the child (covers a live tree, including
+                // anything spawned before the job assignment landed), then
+                // terminate the job to sweep descendants the walk can't see.
                 if let Some(pid) = pid {
                     kill_process_tree(pid).await;
+                }
+                if let Some(job) = job.take() {
+                    job.terminate();
                 }
                 return Err(ScriptError::Timeout(timeout * 1000));
             }
@@ -1227,77 +1220,16 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------
-    // Tree-kill: the timeout path must reap the shell AND its grandchildren
-    // (the failure mode was a wedged workload holding a workspace/build lock
-    // across exec calls; on daemon death the leaked children accumulated —
-    // 89 powershell.exe counted 2026-08-01).
+    // Tree-kill: the timeout path must reap the shell AND its grandchildren.
+    // The walk itself (`kill_process_tree`) and its unit tests live in
+    // nanna-proc; what belongs here is the exec-level contract — including
+    // the shape the walk alone cannot cover.
     // ---------------------------------------------------------------------
 
-    /// Reap bound: SIGKILL / taskkill is near-instant; 5s is a generous
-    /// ceiling for a loaded CI machine, polled at 50ms.
+    /// Reap bound: taskkill / `TerminateJobObject` is near-instant; 5s is a
+    /// generous ceiling for a loaded CI machine, polled at 50ms.
     #[allow(dead_code)] // used by the platform-specific test below
     const REAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// Grandchild-startup bound: powershell/sh must write its child's pid
-    /// file well within this; dominated by powershell cold-start on Windows.
-    #[allow(dead_code)]
-    const SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn kill_process_tree_reaps_shell_and_grandchild() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("grandchild.pid");
-
-        // PowerShell parent spawns a detached ping sleeper (grandchild),
-        // records its Windows pid, then sleeps — same shape as an exec'd
-        // build command that forks a worker.
-        let script = format!(
-            "$p = Start-Process -WindowStyle Hidden -PassThru cmd.exe -ArgumentList '/C','ping -n 60 127.0.0.1 >nul'; \
-             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 60",
-            pid_file.display()
-        );
-        // Same isolation flag the exec path uses.
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        let mut cmd = tokio::process::Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        let mut child = cmd.spawn().expect("spawn powershell parent");
-        let pid = child.id().expect("pid of live child");
-
-        let deadline = tokio::time::Instant::now() + SPAWN_DEADLINE;
-        let grandchild_pid = loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file)
-                && let Ok(gc) = text.trim().parse::<u32>()
-            {
-                break gc;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "grandchild never reported its pid"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        };
-
-        kill_process_tree(pid).await;
-
-        let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
-        loop {
-            let shell_dead = child.try_wait().expect("try_wait").is_some();
-            let grandchild_dead = !windows_pid_alive(grandchild_pid).await;
-            if shell_dead && grandchild_dead {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "tree survived kill_process_tree (shell_dead={shell_dead}, grandchild_dead={grandchild_dead})"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
 
     /// Liveness via `tasklist` — fine for a test; the daemon's runtime checks
     /// use Win32 directly (see nanna-daemon health.rs for why).
@@ -1310,59 +1242,75 @@ mod tests {
             .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_process_tree_reaps_process_group() {
+    /// REGRESSION (2026-08-08, ministral endurance teardown hang): `foo &` —
+    /// the shell exits immediately, the backgrounded grandchild inherits our
+    /// stdout/stderr write handles, `wait_with_output` never sees EOF, and
+    /// the timeout fires with the shell already DEAD. The parent-walk
+    /// tree-kill (`taskkill /T` from the dead pid) finds nothing, so pre-fix
+    /// the grandchild survived holding the pipe — and because tokio
+    /// child-pipe reads on Windows are synchronous reads on the blocking
+    /// pool, it pinned a blocking thread until process exit (25+ min hung
+    /// teardown). The per-child Job Object must reap the grandchild anyway,
+    /// EOFing the pipe so those reads complete and runtime shutdown is
+    /// prompt.
+    #[cfg(windows)]
+    #[test]
+    fn exec_timeout_reaps_detached_grandchild_and_frees_pipe_reads() {
+        if git_bash_path().is_none() {
+            eprintln!(
+                "skipping exec_timeout_reaps_detached_grandchild_and_frees_pipe_reads: Git Bash not installed"
+            );
+            return;
+        }
+        // A dedicated runtime so the test can measure its teardown — the
+        // production symptom was Runtime::drop joining the pinned read.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("grandchild.pid");
+        // Bash-native forward slashes: this path never goes through the
+        // model-facing drive normalization (that rewrites `D:\x` shapes).
+        let pid_path = pid_file.display().to_string().replace('\\', "/");
+        // Git Bash `$!` is an MSYS pid; /proc/<msys-pid>/winpid maps it to
+        // the real Windows pid so tasklist can probe it.
+        let command =
+            format!("ping -n 60 127.0.0.1 & cat /proc/$!/winpid > '{pid_path}'; exit 0");
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(format!(
-            "sleep 60 & echo $! > '{}'; sleep 60",
-            pid_file.display()
-        ));
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        // Same isolation the exec path uses — and what gives us a pgid to kill.
-        cmd.process_group(0);
-        let mut child = cmd.spawn().expect("spawn sh parent");
-        let pid = child.id().expect("pid of live child");
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
 
-        let deadline = tokio::time::Instant::now() + SPAWN_DEADLINE;
-        let grandchild_pid = loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file)
-                && let Ok(gc) = text.trim().parse::<i32>()
-            {
-                break gc;
+        let res = rt.block_on(bridge.exec_with_timeout(&command, None, Some(2)));
+        assert!(
+            matches!(res, Err(ScriptError::Timeout(_))),
+            "held pipes must force the timeout, got {res:?}"
+        );
+
+        // The shell wrote the pid file before exiting, well inside the 2s
+        // deadline — readable by the time the call returns.
+        let text = std::fs::read_to_string(&pid_file).expect("grandchild pid file");
+        let grandchild_pid: u32 = text.trim().parse().expect("windows pid");
+
+        rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
+            while windows_pid_alive(grandchild_pid).await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "detached grandchild survived the exec timeout"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "grandchild never reported its pid"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
+        });
 
-        kill_process_tree(pid).await;
-
-        // Reap the shell (a zombie would still answer kill(pid, 0)).
-        let status = child.wait().await.expect("wait");
-        assert!(!status.success(), "shell must have died by signal");
-
-        // The grandchild reparents to init and is reaped there; poll bounded.
-        let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
-        loop {
-            // SAFETY: signal 0 probes existence only.
-            let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
-            if !alive {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "grandchild survived process-group kill"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        // With the grandchild dead the inherited pipe EOF'd and the blocking
+        // reads finished, so teardown is prompt. Pre-fix this join waited out
+        // the sleeper's full 60s.
+        let teardown = std::time::Instant::now();
+        drop(rt);
+        assert!(
+            teardown.elapsed() < REAP_DEADLINE,
+            "runtime teardown pinned by a leaked pipe read: {:?}",
+            teardown.elapsed()
+        );
     }
 
     // ---------------------------------------------------------------------
