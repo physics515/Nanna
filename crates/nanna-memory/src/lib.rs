@@ -993,9 +993,42 @@ impl VectorStore {
         &self,
         id: &str,
         content: &str,
-        mut embedding: Vec<f32>,
+        embedding: Vec<f32>,
         model: Option<&str>,
     ) -> Result<(), MemoryError> {
+        self.update_content_and_embedding_if(id, None, content, embedding, model)
+            .await
+            .map(|applied| {
+                debug_assert!(applied, "an unguarded rewrite always applies");
+            })
+    }
+
+    /// [`Self::update_content_and_embedding`] guarded by a compare-and-swap on
+    /// the entry's CURRENT content. Returns `Ok(false)` — touching nothing —
+    /// when `expected_content` is `Some` and the entry's live content differs.
+    ///
+    /// This is the primitive that makes a dream-cycle rewrite safe against a
+    /// concurrent live write. The dream paths (dedup fold, expansion) decide
+    /// what to write from a SNAPSHOT taken seconds earlier — long enough for a
+    /// `remember` on the same memory to have folded new content in — and an
+    /// unguarded rewrite would replace that fresh content with a merge of the
+    /// stale snapshot: a silent lost update. The check runs INSIDE the entries
+    /// write lock, the same critical section as the mutation, so there is no
+    /// window between verify and write. On `false` the caller skips its fold
+    /// (the pair is simply re-examined by the next cycle — lossless), never
+    /// retries blindly.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::update_content_and_embedding`].
+    pub async fn update_content_and_embedding_if(
+        &self,
+        id: &str,
+        expected_content: Option<&str>,
+        content: &str,
+        mut embedding: Vec<f32>,
+        model: Option<&str>,
+    ) -> Result<bool, MemoryError> {
         debug_assert!(!id.is_empty(), "memory id must not be empty");
         debug_assert!(!content.is_empty(), "merged content must not be empty");
         if !embedding.is_empty() && embedding.len() != self.config.get_dimension() {
@@ -1014,6 +1047,11 @@ impl VectorStore {
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+        if let Some(expected) = expected_content {
+            if entry.content != expected {
+                return Ok(false);
+            }
+        }
         entry.content = content.to_string();
         entry.embeddings.clear();
         if embedding.is_empty() {
@@ -1059,7 +1097,75 @@ impl VectorStore {
         .await;
 
         debug_assert_eq!(snapshot.id, id, "merged entry id must be unchanged");
-        Ok(())
+        Ok(true)
+    }
+
+    /// Remove entries whose content STILL MATCHES the snapshot the caller
+    /// folded from, in one batch. `pairs` is `(id, expected_content)`.
+    ///
+    /// The destructive half of a dream fold: the survivor was rewritten to
+    /// contain each source's text, and then the sources are removed. But
+    /// removal decided from a snapshot is only safe while the source is
+    /// unchanged — a live `remember` may have folded NEW content into a
+    /// source between the snapshot and this batch, and unconditionally
+    /// removing it would delete text that exists nowhere else. A changed
+    /// source is simply kept (skipped), which leaves a transient
+    /// near-duplicate for the next cycle to re-fold — lossless, like every
+    /// other fold fallback.
+    ///
+    /// Returns the number of entries actually removed. Persistence is one
+    /// batched call for the removed set, matching [`Self::remove_many`].
+    pub async fn remove_many_matching(&self, pairs: &[(&str, &str)]) -> usize {
+        if pairs.is_empty() {
+            return 0;
+        }
+        let expected: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+
+        // Decide and remove inside ONE write-lock critical section, so no
+        // write can land between the content check and the removal.
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        let mut removed_ids: Vec<String> = Vec::with_capacity(pairs.len());
+        entries.retain(|e| {
+            let matches = expected
+                .get(e.id.as_str())
+                .is_some_and(|want| e.content == **want);
+            if matches {
+                removed_ids.push(e.id.clone());
+            }
+            !matches
+        });
+        let removed = before - entries.len();
+        drop(entries);
+
+        debug_assert_eq!(removed, removed_ids.len(), "one id per removed entry");
+        debug_assert!(removed <= pairs.len(), "cannot remove more than requested");
+
+        if removed < pairs.len() {
+            debug!(
+                requested = pairs.len(),
+                removed,
+                "matched removal skipped concurrently-rewritten entries; they \
+                 stay live for the next cycle"
+            );
+        }
+
+        // Write-through: one batched persistence call for the whole set.
+        if let Some(ref db) = self.db {
+            if !removed_ids.is_empty() {
+                let id_refs: Vec<&str> = removed_ids.iter().map(String::as_str).collect();
+                if let Err(e) = db.remove_entries(&id_refs).await {
+                    warn!(
+                        "Failed to batch-remove {} memory entries from persistence: {}",
+                        id_refs.len(),
+                        e
+                    );
+                    // Non-fatal
+                }
+            }
+        }
+
+        removed
     }
 
     /// Get all entries (for consolidation)
@@ -2249,5 +2355,103 @@ mod tests {
         assert!(queued.embedding.is_empty(), "queued for backfill");
         assert!(queued.embeddings.is_empty());
         assert_eq!(queued.embedding_model, None);
+    }
+
+    /// The compare-and-swap half of the fold-vs-live-write fix: a guarded
+    /// rewrite whose expectation went stale must decline and touch nothing —
+    /// applying a merge computed from a stale snapshot is a silent lost
+    /// update (the dream-cycle vs `remember` interleave, 2026-08-10 class).
+    #[tokio::test]
+    async fn guarded_rewrite_declines_when_the_content_moved() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        store.add(entry_dim8("m")).await.unwrap();
+        let snapshot = store.get("m").await.unwrap().content;
+
+        // A concurrent writer moves the content…
+        store
+            .update_content_and_embedding("m", "the live write", vec![1.0; 8], Some("prov:a"))
+            .await
+            .unwrap();
+
+        // …so a rewrite guarded by the OLD snapshot must decline whole.
+        let applied = store
+            .update_content_and_embedding_if(
+                "m",
+                Some(snapshot.as_str()),
+                "a merge of the stale snapshot",
+                vec![0.5; 8],
+                Some("prov:a"),
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "a stale expectation must decline the swap");
+        let live = store.get("m").await.unwrap();
+        assert_eq!(
+            live.content, "the live write",
+            "a declined swap must leave the live write intact"
+        );
+        assert_eq!(
+            live.embedding_model.as_deref(),
+            Some("prov:a"),
+            "a declined swap must not touch the binding either"
+        );
+
+        // A fresh expectation applies normally.
+        let applied = store
+            .update_content_and_embedding_if(
+                "m",
+                Some("the live write"),
+                "a merge of the live content",
+                vec![0.25; 8],
+                Some("prov:a"),
+            )
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            store.get("m").await.unwrap().content,
+            "a merge of the live content"
+        );
+    }
+
+    /// The matched-removal half: removal authorized against a snapshot must
+    /// only delete entries whose content is STILL that snapshot. A source a
+    /// live write rewrote after the fold decision keeps its fresh content.
+    #[tokio::test]
+    async fn matched_removal_keeps_a_rewritten_entry() {
+        let store = VectorStore::new(VectorStoreConfig {
+            dimension: std::sync::atomic::AtomicUsize::new(8),
+            chunk_max_chars: std::sync::atomic::AtomicUsize::new(0),
+            use_f16: false,
+        });
+        store.add(entry_dim8("stale")).await.unwrap();
+        store.add(entry_dim8("moved")).await.unwrap();
+        let stale_snapshot = store.get("stale").await.unwrap().content;
+        let moved_snapshot = store.get("moved").await.unwrap().content;
+
+        // "moved" is rewritten between the fold decision and the batch removal.
+        store
+            .update_content_and_embedding("moved", "fresh content the fold never saw", vec![1.0; 8], None)
+            .await
+            .unwrap();
+
+        let removed = store
+            .remove_many_matching(&[
+                ("stale", stale_snapshot.as_str()),
+                ("moved", moved_snapshot.as_str()),
+            ])
+            .await;
+
+        assert_eq!(removed, 1, "only the unchanged entry may be removed");
+        assert!(store.get("stale").await.is_none(), "the unchanged source is folded away");
+        let kept = store.get("moved").await.expect("the rewritten source must survive");
+        assert_eq!(kept.content, "fresh content the fold never saw");
+
+        // Negative space: an empty batch is a no-op.
+        assert_eq!(store.remove_many_matching(&[]).await, 0);
     }
 }
