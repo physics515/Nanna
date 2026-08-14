@@ -226,32 +226,37 @@ now attributed to leaked `llama-server` orphans starving VRAM, not the model. De
 The frozen-harness series below is a separate historical experiment — GUI-driven, no plan-drain
 early exit — so its qwen 32/42 is not directly comparable to the numbers above.
 
-### GUI-path series (2026-08-10) — the artifact-preservation finding
+### GUI-path series (2026-08-10) — peak-vs-final is the metric
 
 The same 42-feature ladder driven through the REAL chat path (mission sent to a live
 daemon session over IPC, the GUI attached as a viewer) — the code path an actual user
 exercises, on a build carrying the full benchmark-lessons fix wave (PRs #198–#207).
 Identical conditions per leg: fresh read-only workspace, `num_ctx=16384` pinned and
 gate-verified, quiesced daemon, 4-hour snapshot scored against pristine tests, 15-minute
-sampling. Full trail: [bench/BASELINE.md](bench/BASELINE.md).
+sampling. A six-agent forensic retrospective (2026-08-11) over every leg's daemon logs
+corrected the original record; the table below is the corrected one. Full trail:
+[bench/BASELINE.md](bench/BASELINE.md).
 
-| Model | 4 h official | Peak observed | Shape |
+| Model | 4 h official | Peak | Shape |
 |---|---|---|---|
-| ornith:9b | **5 / 42** | 16 @ t=211m | built fast, destroyed its own work late |
-| qwen3.5:9b | **1 / 42** | **22 @ t=15m** | held the peak three hours, then collapsed 22→0 |
-| gemma4:e4b-it-qat | **0 / 42** | 5 @ t=90m | small-rewrite churn, never held anything |
-| ministral-3:8b | **0 / 42** | 0 | tool-dialect failures froze it at 754 bytes |
-| lfm2.5 | **0 / 42** | — | never created the artifact in four hours |
+| ornith:9b | **5 / 42** | 16 @ t=211m | six short self-terminating runs with 2h37m of dead air between them; THREE peak→destruction cycles (12→10, 10→0, 16→5) |
+| qwen3.5:9b | **1 / 42** | **22 @ t=13m** | 22/42 in thirteen minutes; then 120 of 240 minutes lost to 600 s acceptance-check timeouts on its own hanging `mset`; abandoned as fruitless while its artifact was passing |
+| gemma4:e4b-it-qat | ~~0 / 42~~ **CONTAMINATED** | 5* @ t=90m | its `task` tool spawned a cloud 120B sub-agent (nemotron-3-super) that blocked the session 44 m, ignored its decompose-only brief, and produced both peak scores; the local model's own line ended 0/42 with a self-corrupted file |
+| ministral-3:8b | ~~0 / 42~~ **INVALID** | n/a | daemon hard-died 3m42s after mission start; the driver scored a dead process 14 times — the leg measured nothing about the model |
+| lfm2.5 | **0 / 42** | — | total tool-channel failure, not a failed attempt: 379 prose pseudo-tool-calls (300 to a nonexistent `list_files`), fabricated results it then believed; zero write intent in four hours |
 
-**The finding: capability is not the gap — artifact preservation is.** Every capable
-model peaked early (qwen passed 22 features in fifteen minutes) and then un-did its own
-verified work through full-file rewrites from compressed, stale context. The frozen-era
-GUI qwen 32/42 below is hereby reinterpreted: those turns DIED early (planner
-starvation) and accidentally parked the artifact at its peak — the very continuation
-fixes that now keep missions alive for the full window also keep pushing a small model
-past its productive phase. The counter-lever is landing next: the verified-work
-regression sweep running mid-mission, so a destructive rewrite reopens the items it
-broke with the failing verdict in the model's face.
+**The finding: peak-vs-final IS the metric.** Every model that produced work peaked early
+and finished far below its peak, and the cause is one chain, named independently by four
+of the six analysts: the hard 8-iteration step cap truncates work mid-flight → the
+truncated step is charged as "fruitless" → five of those abandon the item → the planner
+re-seeds "assess starting state" → the mass re-read blows the 16 k context → compression
+collapses the record of what was verified passing → the model's only remaining move is a
+from-scratch rewrite over passing work. This supersedes the earlier "artifact
+preservation" framing, which described the symptom (destroyed peaks), not the cause (the
+abandonment/truncation chain). The frozen-era GUI qwen 32/42 below still reads as before:
+those turns died early and accidentally parked the artifact at its peak. Fix track:
+ROADMAP P22 ("Keep the peak", PR #221); the first counter-levers are already merged
+(mid-mission verified-work sweep #218, fold-vs-write safety #219).
 
 ### Endurance (42 features)
 

@@ -69,6 +69,134 @@ pub fn plausible_summary(summary: &str, source_len: usize) -> bool {
     len >= 64 && len.saturating_mul(1_000) >= source_len
 }
 
+/// Decide whether Tier-1 proactive compression should fire, from MEASURED
+/// headroom rather than a fixed fraction of the threshold.
+///
+/// Fires when the run's own observed growth says the NEXT interval could
+/// cross `compression_threshold`: once `estimated_tokens +
+/// max_observed_growth` exceeds it, waiting one more interval risks entering
+/// the standard tier mid-step. Above the threshold the standard tier owns the
+/// problem, so this returns false there (the same band the ladder always
+/// gave Tier 1).
+///
+/// `max_observed_growth == 0` means no growth has been measured yet — there
+/// is no evidence to act on, and proactive compression stays quiet. The rule
+/// this replaces (fire past 40% of the threshold, tuned for 200k windows)
+/// fired 80× at 4,423 tokens on a 16,384-token window with ~3.7k tokens of
+/// real headroom still free, each firing shrinking live working context.
+#[must_use]
+pub fn proactive_compression_due(
+    estimated_tokens: usize,
+    max_observed_growth: usize,
+    compression_threshold: usize,
+) -> bool {
+    max_observed_growth > 0
+        && estimated_tokens <= compression_threshold
+        && estimated_tokens + max_observed_growth > compression_threshold
+}
+
+/// Live measurement of how fast a context grows between compression-ladder
+/// checks. [`proactive_compression_due`] derives the Tier-1 trigger from the
+/// largest growth ever observed, so the trigger scales with the actual
+/// workload and window instead of a constant tuned for one window size.
+///
+/// The baseline is recorded AFTER each ladder pass (post-compression) and
+/// the delta measured at the next ladder ENTRY, so one observation spans
+/// exactly one loop interval — the model response, its tool results, and any
+/// injected notices: the growth the next interval could plausibly repeat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextGrowthTracker {
+    /// Token estimate recorded at the end of the previous ladder pass.
+    pub last_observed_tokens: Option<usize>,
+    /// Largest single-interval growth observed so far this run.
+    pub max_observed_growth: usize,
+}
+
+impl ContextGrowthTracker {
+    /// Record the estimate at ladder entry. Returns the growth since the
+    /// previous baseline (0 before the first baseline exists — no evidence,
+    /// no trigger). Shrinkage never records: compression between baseline
+    /// and observation only makes the delta smaller, so the max is an
+    /// under-estimate of true growth, never an over-estimate.
+    pub fn observe(&mut self, estimated_tokens: usize) -> usize {
+        let growth = self
+            .last_observed_tokens
+            .map_or(0, |prev| estimated_tokens.saturating_sub(prev));
+        if growth > self.max_observed_growth {
+            self.max_observed_growth = growth;
+        }
+        growth
+    }
+
+    /// Re-baseline after the ladder ran (post-compression), so the next
+    /// observation measures only NEW material, not compression's effect.
+    pub const fn rebaseline(&mut self, estimated_tokens: usize) {
+        self.last_observed_tokens = Some(estimated_tokens);
+    }
+}
+
+/// One fact proven by execution: a command that ran to a definite exit
+/// status at a known time. Held in [`AgentContext::verified_outcomes`] — the
+/// never-compressed slot — because these are exactly the facts whose loss
+/// turns a model against its own passing work (observed live 2026-08-10: a
+/// summarization pass collapsed the record of ten just-verified commands and
+/// the model's next move was a from-scratch rewrite over them).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedOutcome {
+    /// What ran — the command line, verbatim.
+    pub subject: String,
+    /// The verdict the environment returned (e.g. "exit 0").
+    pub outcome: String,
+    /// Unix seconds of the LATEST execution asserting this outcome.
+    pub verified_at: i64,
+    /// How many executions have asserted this exact (subject, outcome).
+    pub times: u32,
+}
+
+/// Chars of a subject shown per verified-outcome line. Identification, not
+/// reproduction: the full command already lives in the transcript and tool
+/// records; a slot line only needs enough to name the fact unambiguously,
+/// and the elision marker carries the hidden length so nothing is silently
+/// truncated. 120 holds a full typical test invocation (a script path, a
+/// cargo test filter) with room to spare, in line with the preview widths
+/// the transcript already uses elsewhere (80–200 chars).
+const VERIFIED_SUBJECT_PREVIEW_CHARS: usize = 120;
+
+/// First line of `subject`, capped for display, with an elision marker
+/// naming how many chars are not shown ("one line per outcome" — the slot's
+/// unit is a line, so newlines never render).
+fn verified_subject_preview(subject: &str) -> String {
+    let first_line = subject.lines().next().unwrap_or("");
+    let end = first_line.floor_char_boundary(VERIFIED_SUBJECT_PREVIEW_CHARS.min(first_line.len()));
+    let shown = &first_line[..end];
+    let hidden = subject.len() - shown.len();
+    if hidden == 0 {
+        shown.to_string()
+    } else {
+        format!("{shown} …[+{hidden} chars]")
+    }
+}
+
+/// Compose the in-context announcement for a summarization failure that
+/// forced messages to be dropped un-summarized.
+///
+/// Rule: every truncation artifact must say WHAT was lost, WHY, and that the
+/// operations themselves SUCCEEDED — an unannounced gap reads as corruption
+/// and seeds restart-from-scratch spirals.
+#[must_use]
+pub fn summarization_failure_notice(dropped_messages: usize, reason: &str) -> String {
+    format!(
+        "[CONTEXT NOTICE — history shortened WITHOUT summarization]\n\
+         WHAT: {dropped_messages} older conversation message(s) were dropped \
+         from your in-memory context with no summary standing in for them.\n\
+         WHY: {reason}.\n\
+         Disk is unaffected: every file write and command in the dropped \
+         messages already ran and SUCCEEDED unless it said otherwise at the \
+         time. Files on disk are the ground truth — re-read them if unsure; \
+         do NOT restart or rewrite work just because history looks short."
+    )
+}
+
 /// How far [`AgentContext::enforce_limits_with_summarization`] should summarize.
 ///
 /// The loop used to test `exceeds_hard_limit()` unconditionally, which made it
@@ -193,6 +321,34 @@ pub struct AgentContext {
     /// This is prepended to messages when building API requests.
     #[serde(default)]
     pub consolidated_summary: Option<String>,
+    /// Rolling distilled-facts note (progressive distillation's output), in
+    /// its OWN slot so the distiller can replace it wholesale without
+    /// touching `consolidated_summary`. Distillation used to overwrite the
+    /// consolidated summary with ≤512 tokens of facts about the last ten
+    /// messages, destroying the only record of everything summarized before
+    /// it (observed live 2026-08-10: 2571→934 chars immediately before
+    /// verified-passing work was rewritten from scratch).
+    #[serde(default)]
+    pub distilled_facts: Option<String>,
+    /// Facts proven by execution (command, exit status, when) — the
+    /// never-compressed slot. Rendered into every request after the summary
+    /// (see [`Self::messages_for_request`]) and never handed to any
+    /// summarizer, so no summarization pass can drop one. Appended by
+    /// [`Self::record_verified_outcome`]; no code path removes entries.
+    /// Bound: one entry per distinct (subject, outcome) pair this run
+    /// actually executed — the slot grows strictly slower than the work
+    /// feeding it, since every entry costs at least one real command
+    /// execution.
+    #[serde(default)]
+    pub verified_outcomes: Vec<VerifiedOutcome>,
+    /// Live growth measurement feeding [`proactive_compression_due`].
+    #[serde(default)]
+    pub growth: ContextGrowthTracker,
+    /// In-context loss announcements, composed where the loss happens (deep
+    /// in summarization fallbacks) and drained by the agent loop AFTER its
+    /// compression ladder so compression cannot drop its own announcement.
+    #[serde(default)]
+    pending_loss_notices: Vec<String>,
     /// Hashes of content that has been summarized (for deduplication).
     /// If new messages contain content matching these hashes, we skip it
     /// since it's already represented in the consolidated_summary.
@@ -231,6 +387,10 @@ impl AgentContext {
             workspace_context: None,
             include_workspace_memory: true,
             consolidated_summary: None,
+            distilled_facts: None,
+            verified_outcomes: Vec::new(),
+            growth: ContextGrowthTracker::default(),
+            pending_loss_notices: Vec::new(),
             summarized_content_hashes: HashSet::new(),
         }
     }
@@ -250,40 +410,164 @@ impl AgentContext {
             self.deduplicate_messages()
         };
 
-        let raw = if let Some(ref summary) = self.consolidated_summary {
+        let raw = if let Some(preamble) = self.context_preamble() {
             let mut messages = Vec::with_capacity(deduped_messages.len() + 2);
-
-            // Inject summary as first user message with clear framing. The
-            // framing must state what a summary is NOT: the model has been
-            // observed reading compressed context as evidence that work was
-            // lost or files corrupted, then restarting from scratch.
-            let summary_message = format!(
-                "<previous_context>\nThe following is a COMPRESSED SUMMARY of earlier \
-                 conversation. WHY: the conversation grew longer than your context window \
-                 can hold, so older messages were condensed to make room to keep working. \
-                 Everything it describes already happened and SUCCEEDED unless it explicitly \
-                 says otherwise — no work was lost. It is lossy shorthand, not literal \
-                 messages: files on disk and recent tool results are the ground truth over \
-                 anything here.\n\n{}\n</previous_context>",
-                summary
-            );
-            messages.push(AnthropicMessage::user_text(summary_message));
+            messages.push(AnthropicMessage::user_text(preamble));
 
             // Add a placeholder assistant acknowledgment to maintain user/assistant alternation
             messages.push(AnthropicMessage::assistant_text(
-                "I understand the previous context. How can I help you continue?"
+                "I understand the previous context. How can I help you continue?",
             ));
 
             // Then add deduplicated current messages
             messages.extend(deduped_messages);
             messages
         } else {
-            // No summary, just return (possibly deduplicated) messages
+            // No preamble, just return (possibly deduplicated) messages
             deduped_messages
         };
 
         // Sanitize: remove empty text blocks and ensure every message has content
         Self::sanitize_messages(raw)
+    }
+
+    /// The injected first-message preamble: the consolidated summary and/or
+    /// distilled facts inside `<previous_context>` framing, then the
+    /// verified-outcomes slot OUTSIDE that framing — the summary framing
+    /// declares itself lossy shorthand, and the slot is exact fact that must
+    /// not inherit the disclaimer.
+    ///
+    /// The framing must state what a summary is NOT: the model has been
+    /// observed reading compressed context as evidence that work was lost or
+    /// files corrupted, then restarting from scratch.
+    fn context_preamble(&self) -> Option<String> {
+        let mut lossy = String::new();
+        if let Some(ref summary) = self.consolidated_summary {
+            lossy.push_str(summary);
+        }
+        if let Some(ref facts) = self.distilled_facts {
+            if !lossy.is_empty() {
+                lossy.push_str("\n\n");
+            }
+            lossy.push_str("[DISTILLED FACTS]\n");
+            lossy.push_str(facts);
+        }
+
+        let mut sections: Vec<String> = Vec::new();
+        if !lossy.is_empty() {
+            sections.push(format!(
+                "<previous_context>\nThe following is a COMPRESSED SUMMARY of earlier \
+                 conversation. WHY: the conversation grew longer than your context window \
+                 can hold, so older messages were condensed to make room to keep working. \
+                 Everything it describes already happened and SUCCEEDED unless it explicitly \
+                 says otherwise — no work was lost. It is lossy shorthand, not literal \
+                 messages: files on disk and recent tool results are the ground truth over \
+                 anything here.\n\n{lossy}\n</previous_context>"
+            ));
+        }
+        if let Some(block) = self.verified_outcomes_block() {
+            sections.push(block);
+        }
+
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
+    }
+
+    /// Render the verified-outcomes slot, one line per outcome.
+    ///
+    /// Losslessness: every recorded execution is represented — a new
+    /// (subject, outcome) pair appends a line; an identical re-execution
+    /// increments that line's count and refreshes its timestamp (a reword,
+    /// never a drop). No code path removes a line, so the asserted facts
+    /// only accumulate. Bound: lines ≤ distinct (subject, outcome) pairs ≤
+    /// executions this run actually performed — each line costs at least one
+    /// real command execution, so the slot grows strictly slower than the
+    /// work feeding it.
+    #[must_use]
+    pub fn verified_outcomes_block(&self) -> Option<String> {
+        if self.verified_outcomes.is_empty() {
+            return None;
+        }
+        let mut block = String::from(
+            "<verified_outcomes>\nFacts proven by EXECUTION during this session — each \
+             line is a command that actually ran and the exit status the environment \
+             returned. This list is exact (not a summary), is never compressed, and \
+             outlives every summarization pass. Trust it over any summary above; do NOT \
+             re-do or rewrite work these lines already prove.\n",
+        );
+        for outcome in &self.verified_outcomes {
+            block.push_str(&format!(
+                "- {} → {} (×{}, last verified {})\n",
+                verified_subject_preview(&outcome.subject),
+                outcome.outcome,
+                outcome.times,
+                chrono::DateTime::from_timestamp(outcome.verified_at, 0)
+                    .map_or_else(|| outcome.verified_at.to_string(), |t| t.to_rfc3339()),
+            ));
+        }
+        block.push_str("</verified_outcomes>");
+        Some(block)
+    }
+
+    /// Record a fact proven by execution into the never-compressed slot.
+    ///
+    /// The same (subject, outcome) collapses into its existing line (count
+    /// and latest timestamp refresh — a reword, never a drop); a different
+    /// outcome for the same subject appends its OWN line, so a later
+    /// regression never erases the record of an earlier pass.
+    pub fn record_verified_outcome(
+        &mut self,
+        subject: impl Into<String>,
+        outcome: impl Into<String>,
+    ) {
+        let subject = subject.into();
+        let outcome = outcome.into();
+        let now = chrono_timestamp();
+        if let Some(existing) = self
+            .verified_outcomes
+            .iter_mut()
+            .find(|o| o.subject == subject && o.outcome == outcome)
+        {
+            existing.times = existing.times.saturating_add(1);
+            existing.verified_at = now;
+        } else {
+            self.verified_outcomes.push(VerifiedOutcome {
+                subject,
+                outcome,
+                verified_at: now,
+                times: 1,
+            });
+        }
+    }
+
+    /// Replace the rolling distilled-facts note. Replacement is the
+    /// distiller's contract (it re-reads recent messages every round);
+    /// keeping the note OUT of `consolidated_summary` is what makes that
+    /// safe — summarization products and drop notes survive every
+    /// distillation round instead of being overwritten by it.
+    pub fn set_distilled_facts(&mut self, facts: impl Into<String>) {
+        self.distilled_facts = Some(facts.into());
+    }
+
+    /// Queue an in-context loss announcement (see
+    /// [`summarization_failure_notice`]). No-op when nothing was dropped —
+    /// an announcement of zero loss would be noise. Drained by the agent
+    /// loop AFTER its compression ladder so the announcement cannot itself
+    /// be compressed away in the same pass.
+    pub fn push_summarization_failure_notice(&mut self, dropped_messages: usize, reason: &str) {
+        if dropped_messages == 0 {
+            return;
+        }
+        self.pending_loss_notices
+            .push(summarization_failure_notice(dropped_messages, reason));
+    }
+
+    /// Take (and clear) the queued loss announcements.
+    pub fn take_pending_loss_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_loss_notices)
     }
 
     /// Remove empty text blocks from messages and ensure every message has at least one content block.
@@ -411,8 +695,17 @@ impl AgentContext {
             .as_ref()
             .map(|s| estimate_token_count(s.len()) + 100) // framing overhead
             .unwrap_or(0);
+        // The distilled-facts and verified-outcomes slots ride in the same
+        // injected preamble — unbudgeted tokens would overflow the window.
+        let distilled_tokens = self
+            .distilled_facts
+            .as_ref()
+            .map_or(0, |s| estimate_token_count(s.len()) + 10);
+        let verified_tokens = self
+            .verified_outcomes_block()
+            .map_or(0, |b| estimate_token_count(b.len()));
 
-        summary_tokens + self.estimate_tokens()
+        summary_tokens + distilled_tokens + verified_tokens + self.estimate_tokens()
     }
 
     /// Set the system prompt.
@@ -706,6 +999,7 @@ impl AgentContext {
                 ctx.system_prompt = self.system_prompt.clone();
                 ctx.messages = self.messages.clone();
                 ctx.summaries = self.summaries.clone();
+                ctx.verified_outcomes = self.verified_outcomes.clone();
             }
             ContextIsolation::SystemOnly => {
                 ctx.system_prompt = self.system_prompt.clone();
@@ -933,7 +1227,12 @@ impl AgentContext {
             // No summarization configured, fall back to truncation
             if self.exceeds_hard_limit() {
                 warn!("No summarization models configured, truncating context");
-                self.truncate_to_limit();
+                let dropped = self.truncate_to_limit();
+                self.push_summarization_failure_notice(
+                    dropped,
+                    "no summarization models are configured, so nothing could \
+                     stand in for the dropped messages",
+                );
             }
             return Ok(0);
         }
@@ -966,7 +1265,12 @@ impl AgentContext {
 
             if content_to_summarize.is_empty() {
                 warn!("No content available to summarize, truncating remaining");
-                self.truncate_to_limit();
+                let dropped = self.truncate_to_limit();
+                self.push_summarization_failure_notice(
+                    dropped,
+                    "the remaining history has no summarizable middle (only \
+                     the pinned request and the live tail)",
+                );
                 break;
             }
 
@@ -996,7 +1300,12 @@ impl AgentContext {
                             first_message_ends_at = covered_ends.first().copied().unwrap_or(0),
                             "summarizer window too small for a single message; truncating instead"
                         );
-                        self.truncate_to_limit();
+                        let dropped = self.truncate_to_limit();
+                        self.push_summarization_failure_notice(
+                            dropped,
+                            "the summarization model's window is too small to \
+                             read even one whole message",
+                        );
                         break;
                     }
 
@@ -1017,7 +1326,11 @@ impl AgentContext {
                 }
                 Err(e) => {
                     warn!(error = %e, "All summarization models failed, truncating");
-                    self.truncate_to_limit();
+                    let dropped = self.truncate_to_limit();
+                    self.push_summarization_failure_notice(
+                        dropped,
+                        &format!("every summarization model failed ({e})"),
+                    );
                     break;
                 }
             }
@@ -1028,7 +1341,14 @@ impl AgentContext {
                 iterations = iterations,
                 "Max summarization iterations reached, force truncating"
             );
-            self.truncate_to_limit();
+            let dropped = self.truncate_to_limit();
+            self.push_summarization_failure_notice(
+                dropped,
+                &format!(
+                    "summarization spent its whole {iterations}-pass budget \
+                     and the context still exceeded the hard input limit"
+                ),
+            );
         }
 
         Ok(iterations)
@@ -2134,5 +2454,240 @@ mod tests {
             &ctx.messages.first().expect("frame kept").content[0],
             ContentBlock::Text { text } if text == "the step frame"
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // P22 Tier 2 — the proactive trigger derives from measured headroom
+    // -----------------------------------------------------------------
+
+    /// The regression that forced the derivation: on a 16384-token window
+    /// the fixed 40%-of-threshold rule fired 80× at 4,423 tokens with ~3.7k
+    /// tokens of real headroom still free. With measured growth the trigger
+    /// stays quiet there and fires only when the next interval could
+    /// actually cross the threshold.
+    #[test]
+    fn proactive_trigger_derives_from_measured_headroom() {
+        // The ~60%-of-window threshold of a 16384 window; the old failure
+        // point was 4423 estimated with typical growth ~800/interval.
+        let threshold = 9_830;
+        assert!(
+            !proactive_compression_due(4_423, 800, threshold),
+            "must not fire with thousands of tokens of measured headroom"
+        );
+        // Near the ceiling the same growth says the next interval could cross.
+        assert!(proactive_compression_due(9_200, 800, threshold));
+        // Boundary: estimated + growth must EXCEED the threshold, not reach it.
+        assert!(!proactive_compression_due(9_030, 800, threshold));
+        assert!(proactive_compression_due(9_031, 800, threshold));
+    }
+
+    #[test]
+    fn proactive_trigger_needs_evidence_and_defers_above_threshold() {
+        // No growth measured yet → no evidence → never fires proactively.
+        assert!(!proactive_compression_due(9_800, 0, 9_830));
+        // Above the threshold the standard tier owns the problem.
+        assert!(!proactive_compression_due(9_831, 800, 9_830));
+    }
+
+    #[test]
+    fn growth_tracker_records_max_interval_growth_only_forward() {
+        let mut tracker = ContextGrowthTracker::default();
+        // First observation has no baseline: no growth, no evidence.
+        assert_eq!(tracker.observe(5_000), 0);
+        assert_eq!(tracker.max_observed_growth, 0);
+        tracker.rebaseline(5_000);
+        assert_eq!(tracker.observe(5_900), 900);
+        // Compression shrank the context below the old baseline; shrinkage
+        // never records as (negative) growth.
+        tracker.rebaseline(4_000);
+        assert_eq!(tracker.observe(4_200), 200);
+        assert_eq!(
+            tracker.max_observed_growth, 900,
+            "the max survives smaller intervals"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P22 Tier 2 — the verified-outcomes slot is monotone
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn identical_reverification_collapses_and_a_new_verdict_appends() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.record_verified_outcome("sh tests/test_1.sh", "exit 0");
+        ctx.record_verified_outcome("sh tests/test_1.sh", "exit 0");
+        assert_eq!(
+            ctx.verified_outcomes.len(),
+            1,
+            "identical assertions collapse"
+        );
+        assert_eq!(ctx.verified_outcomes[0].times, 2);
+        // A later regression appends its OWN line; the pass record survives.
+        ctx.record_verified_outcome("sh tests/test_1.sh", "exit 1");
+        assert_eq!(ctx.verified_outcomes.len(), 2);
+        assert_eq!(ctx.verified_outcomes[0].outcome, "exit 0");
+        assert_eq!(ctx.verified_outcomes[1].outcome, "exit 1");
+    }
+
+    /// The monotone guarantee: no compression path may drop a verified
+    /// outcome. Drives the slot through every destructive operation the
+    /// ladder can perform — summarization replacement, wholesale drops,
+    /// hard-limit truncation, and a distillation round — then checks the
+    /// facts still render in the assembled request.
+    #[test]
+    fn verified_outcomes_survive_every_compression_path() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.record_verified_outcome("./minidb mset a 1", "exit 0");
+        ctx.record_verified_outcome("sh tests/test_7.sh", "exit 0");
+        for i in 0..30 {
+            ctx.messages.push(AnthropicMessage::user_text(format!(
+                "filler {i}: {}",
+                "x".repeat(400)
+            )));
+        }
+
+        ctx.replace_with_summary(5, "a summary of early work");
+        ctx.drop_oldest(3);
+        ctx.hard_limit = 50; // force truncation to bite as hard as it can
+        ctx.truncate_to_limit();
+        ctx.set_distilled_facts("current_state: testing");
+
+        assert_eq!(
+            ctx.verified_outcomes.len(),
+            2,
+            "no compression path may drop a verified outcome"
+        );
+        let request = ctx.messages_for_request();
+        let ContentBlock::Text { text } = &request[0].content[0] else {
+            panic!("preamble must be a text block");
+        };
+        assert!(text.contains("<verified_outcomes>"));
+        assert!(text.contains("./minidb mset a 1"));
+        assert!(text.contains("sh tests/test_7.sh"));
+    }
+
+    /// The 2026-08-10 destroyer: distillation used to overwrite the whole
+    /// consolidated summary (2571→934 chars observed) with ≤512 tokens of
+    /// facts about the last ten messages. Distilled facts now live in their
+    /// own rolling slot; summarization products survive every round.
+    #[test]
+    fn distillation_no_longer_overwrites_the_consolidated_summary() {
+        let mut ctx = AgentContext::new("s1");
+        for i in 0..10 {
+            ctx.messages
+                .push(AnthropicMessage::user_text(format!("message {i}")));
+        }
+        ctx.replace_with_summary(4, "tests 1-10 verified passing; minidb built");
+        let before = ctx.consolidated_summary.clone().expect("summary exists");
+
+        ctx.set_distilled_facts("current_state: reading files");
+        ctx.set_distilled_facts("current_state: writing test 11");
+
+        assert_eq!(
+            ctx.consolidated_summary.as_deref(),
+            Some(before.as_str()),
+            "distillation must never touch summarization products"
+        );
+        let request = ctx.messages_for_request();
+        let ContentBlock::Text { text } = &request[0].content[0] else {
+            panic!("preamble must be a text block");
+        };
+        assert!(text.contains("tests 1-10 verified passing"));
+        assert!(text.contains("current_state: writing test 11"));
+        assert!(
+            !text.contains("reading files"),
+            "the distilled slot itself is a rolling replace"
+        );
+    }
+
+    #[test]
+    fn verified_subject_preview_identifies_without_reproducing() {
+        let heredoc = format!("python - <<'EOF'\n{}\nEOF", "x".repeat(5_000));
+        let preview = verified_subject_preview(&heredoc);
+        assert!(preview.starts_with("python - <<'EOF'"));
+        assert!(!preview.contains('\n'), "one line per outcome");
+        assert!(
+            preview.contains("chars]"),
+            "elision must announce the hidden length: {preview}"
+        );
+        let short = verified_subject_preview("cargo test -p nanna-agent");
+        assert_eq!(
+            short, "cargo test -p nanna-agent",
+            "short subjects render whole"
+        );
+    }
+
+    #[test]
+    fn slot_costs_are_counted_in_request_estimates() {
+        let mut ctx = AgentContext::new("s1");
+        let base = ctx.estimate_request_tokens();
+        ctx.record_verified_outcome("cargo test", "exit 0");
+        ctx.set_distilled_facts("k: v");
+        assert!(
+            ctx.estimate_request_tokens() > base,
+            "unbudgeted preamble tokens would overflow the window"
+        );
+    }
+
+    #[test]
+    fn old_serialized_contexts_deserialize_without_the_new_fields() {
+        let json = serde_json::json!({
+            "session_id": "s1",
+            "system_prompt": "",
+            "messages": [],
+            "metadata": {},
+            "max_messages": 100,
+        });
+        let ctx: AgentContext = serde_json::from_value(json).expect("pre-P22 contexts must load");
+        assert!(ctx.verified_outcomes.is_empty());
+        assert!(ctx.distilled_facts.is_none());
+        assert_eq!(ctx.growth.max_observed_growth, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // P22 Tier 2 — failed summarization announces itself
+    // -----------------------------------------------------------------
+
+    /// Model-free failure path: no summarization models configured and the
+    /// context over the hard limit — the fallback truncation must announce
+    /// WHAT was dropped, WHY, and that disk is unaffected, instead of
+    /// silently shrinking history.
+    #[tokio::test]
+    async fn unsummarized_truncation_announces_itself() {
+        let mut ctx = AgentContext::new("s1");
+        for i in 0..40 {
+            ctx.messages.push(AnthropicMessage::user_text(format!(
+                "filler {i}: {}",
+                "y".repeat(300)
+            )));
+        }
+        ctx.hard_limit = 200;
+        let config = ContextSummarizationConfig {
+            model_priority: vec![],
+            ..Default::default()
+        };
+        ctx.enforce_limits_with_summarization(&config, SummarizationTarget::HardLimit)
+            .await
+            .expect("the no-model path cannot fail");
+
+        let notices = ctx.take_pending_loss_notices();
+        assert_eq!(notices.len(), 1, "one loss event, one announcement");
+        assert!(notices[0].contains("WHAT:"), "{}", notices[0]);
+        assert!(notices[0].contains("WHY:"), "{}", notices[0]);
+        assert!(notices[0].contains("Disk is unaffected"), "{}", notices[0]);
+        assert!(
+            ctx.take_pending_loss_notices().is_empty(),
+            "taking drains the queue"
+        );
+    }
+
+    #[test]
+    fn no_loss_means_no_notice() {
+        let mut ctx = AgentContext::new("s1");
+        ctx.push_summarization_failure_notice(0, "anything");
+        assert!(
+            ctx.take_pending_loss_notices().is_empty(),
+            "announcing zero loss would be noise"
+        );
     }
 }

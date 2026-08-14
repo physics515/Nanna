@@ -280,23 +280,60 @@ fresh-daemon boot (per-process num_ctx latch), 16384 gate-verified, 4-hour snaps
 against pristine tests, 15-minute sampling, execution-based stall watchdog with
 interjection-style nudges.
 
-| Model | 4 h official | Peak observed | Trail |
+| Model | 4 h official | Peak | Trail |
 |---|---|---|---|
-| ornith:9b | **5/42** | 16 @ t=211m | 2→10→0→16→5; final rewrite discarded 12 features in the last half hour |
-| qwen3.5:9b | **1/42** | **22 @ t=15m** | 22 held for THREE HOURS untouched, then organic collapse 22→9→1→0 (one stall-nudge fired, after the collapse began — the shepherd is exonerated) |
-| gemma4:e4b-it-qat | **0/42** | 5 @ t=90m | 2KB-artifact churn; never passed test_01 at any snapshot after t=90m |
-| ministral-3:8b | **0/42** | 0 | write_file-without-file_path dialect failures; artifact frozen at 754 bytes from t=4m |
-| lfm2.5 | **0/42** | — | no artifact created in the full window |
+| ornith:9b | **5/42** | 16 @ t=211m | six short self-terminating runs, five dead zones totalling 2h37m; THREE peak→destruction cycles: 12→10, 10→0, 16→5 |
+| qwen3.5:9b | **1/42** | **22 @ t=13m** | 22/42 at t=13m; then 120 of 240 minutes in 600 s acceptance-check timeouts on its own hanging `mset`; item abandoned as fruitless while the artifact was passing; collapse 22→9→1 |
+| gemma4:e4b-it-qat | ~~0/42~~ **CONTAMINATED** | 5* @ t=90m | peak produced by a cloud 120B sub-agent, not the model under test (see correction below); gemma's own line ended 0/42, artifact self-corrupted at t≈124m and never repaired |
+| ministral-3:8b | ~~0/42~~ **INVALID (daemon died)** | n/a | daemon hard-died 3m42s after mission start; the driver scored a dead process 14 times |
+| lfm2.5 | **0/42** | — | tool channel never engaged: 379 prose pseudo-calls (300 to a nonexistent `list_files`), fabricated results it then believed; zero write intent |
 
-**Peak-vs-final is the result.** The chat path's gap to the headless harness (ornith
-37/42, qwen 25/42 on the same build) is almost entirely LATE-RUN SELF-DESTRUCTION of
-verified work, not capability: continuously-live missions (the PR #204 dryness fix
-working as designed) push small models past their productive phase and they rewrite
-their own passing artifact from compressed context. The frozen-era 32/42 (below) is
-reinterpreted: those runs' turns died at the peak (planner starvation, fixed in #201)
-and the death accidentally PRESERVED the artifact. Counter-lever queued: the verified-
-work regression sweep run mid-mission (today it fires only at plan drain, which a live
-mission never reaches).
+**Retrospective correction (2026-08-11).** A six-agent forensic review of every leg's
+daemon logs (one agent per leg plus a process-trail agent) invalidated two of the five
+official numbers and reframed a third:
+
+- **ministral-3:8b — INVALID.** The daemon hard-died at 2026-08-10T14:15:47Z, 3m42s
+  after mission start: the log ends mid-turn with no panic, no cancel, no shutdown
+  marker, and zero lines until the next daemon boots at 18:14Z. The driver's stall
+  detector fired at all 14 remaining polls, errored on every resume attempt, and still
+  published "4h MARK … 0/42" — it scored a dead process 14 times. The earlier
+  "write_file-without-file_path dialect failures" reading was wrong: five of the six
+  write_file calls succeeded; only the last failed. The leg measured nothing about the
+  model.
+- **gemma4:e4b — CONTAMINATED.** At 12:31:57Z its `task` tool spawned a "decompose
+  only, do not perform the work" sub-agent onto
+  `openrouter/nvidia/nemotron-3-super-120b-a12b:free` — a cloud 120B model. It blocked
+  the session for 44m41s, ignored the brief and implemented instead, and produced BOTH
+  of the leg's peak scores (4/42 at 12:52Z, 5/42 at 13:00Z). It also copied the
+  artifact into the read-only tests dir, and gemma then spent 11 minutes validating
+  against that frozen copy while editing the root file. The local model's own
+  contribution ended 0/42 with a self-corrupted artifact (a partial-overlap edit
+  duplicated `put()` and left a dangling `else`) whose syntax error it saw twice and
+  ignored.
+- **lfm2.5 — 0/42 stands, reframed.** Not an attempt that failed: the tool channel
+  never engaged. 379 of its 429 text items were pseudo-tool-calls emitted as prose, 300
+  of them to a `list_files` tool that does not exist, plus two fabricated `"result"`
+  blocks it then adopted as its world model ("we saw there is a minidb file (104k)") —
+  it spent four hours trying to READ a file it was supposed to WRITE, and the intent to
+  write appears zero times in 326 KB of reasoning.
+
+**Peak-vs-final IS the metric.** The chat path's gap to the headless harness (ornith
+37/42, qwen 25/42 on the same build) is not capability: every model that produced work
+peaked early and was then walked off its peak by one chain, named independently by four
+of the six analysts — the hard 8-iteration step cap truncates work mid-flight → the
+truncated step is charged as "fruitless" → five of those abandon the item → the planner
+re-seeds "assess starting state" → the mass re-read blows the 16 k context →
+compression collapses the record of what was verified passing → the model's only
+remaining move is a from-scratch rewrite over passing work. This supersedes the earlier
+"artifact preservation" framing, which described the symptom (destroyed peaks), not the
+cause. qwen is the sharpest exhibit: zero of its task items were ever credited on a
+step's own work, and the item "Build minidb CLI implementing all 42 tests" was
+abandoned as fruitless minutes after its artifact ran tests 01–20 clean. The frozen-era
+32/42 (below) is reinterpreted: those runs' turns died at the peak (planner starvation,
+fixed in #201) and the death accidentally PRESERVED the artifact. Fix track: ROADMAP
+P22 ("Keep the peak: the abandonment/truncation chain", PR #221); already merged from
+that campaign: the mid-mission verified-work sweep (PR #218) and the fold-vs-write
+safety fixes (PR #219).
 
 The shakedown to get this series clean was itself the harvest — nine leg attempts
 surfaced and fixed, in order: legacy boot path ignoring `[llm]` (silent dead-model
