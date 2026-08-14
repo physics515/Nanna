@@ -614,16 +614,29 @@ impl Storage {
     // =========================================================================
 
     /// Log a single tool call (time-series data for graphs).
+    ///
+    /// `short_circuited` (P22 Tier 4): the harness answered with a breaker
+    /// replay instead of dispatching. The row is still logged (with a
+    /// `[short_circuited]` error marker so it stays distinguishable in the
+    /// time series — the schema has no outcome column), but the hourly
+    /// aggregate counts it as neither success nor failure: the tool never
+    /// ran, and a wall of replays must not read as a broken tool.
     pub async fn log_tool_call(
         &self,
         tool_name: &str,
         success: bool,
+        short_circuited: bool,
         duration_ms: u64,
         output_size: usize,
         error_message: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<(), StorageError> {
         let conn = self.conn.lock().await;
+        let logged_error = if short_circuited {
+            "[short_circuited]"
+        } else {
+            error_message.unwrap_or("")
+        };
         conn.execute(
             "INSERT INTO tool_call_log (tool_name, success, duration_ms, output_size, error_message, session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -632,13 +645,15 @@ impl Storage {
                 success as i64,
                 duration_ms as i64,
                 output_size as i64,
-                error_message.unwrap_or(""),
+                logged_error,
                 session_id.unwrap_or("")
             ],
         ).await?;
 
         // Also update hourly aggregate
         let hour = chrono::Utc::now().format("%Y-%m-%dT%H:00:00").to_string();
+        let success_incr = (success && !short_circuited) as i64;
+        let failure_incr = (!success && !short_circuited) as i64;
         conn.execute(
             "INSERT INTO tool_stats_hourly (tool_name, hour, call_count, success_count, failure_count, total_duration_ms, avg_duration_ms, p95_duration_ms)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5, ?5)
@@ -652,8 +667,8 @@ impl Storage {
             turso::params![
                 tool_name,
                 hour,
-                success as i64,
-                (!success) as i64,
+                success_incr,
+                failure_incr,
                 duration_ms as i64
             ],
         ).await?;

@@ -3034,11 +3034,23 @@ from evidence, budgets stay budgets):
       log + IPC; a watchdogged stream so no loop path exits silently; a terminal reason
       file on daemon exit; `chat.send` delivery ack distinct from run completion.
       (Evidence: a dead daemon was polled 14× and scored.)
-- [ ] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
+- [x] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
       a call-shaped JSON object trips the detector; salvage through `resolve_tool()` + the
       alias layer (`list_files`→`list_dir`); fence self-authored "result" objects out of
       history as fabrications. (Evidence: lfm emitted 379 prose pseudo-calls, 300 to a tool
       that doesn't exist, then believed its own fabricated directory listing for 4 hours.)
+      **(2026-08-14, PR #230)** — shipped as: structural arm on every call shape
+      (`action`/`tool`/`tool_name`/`function`, OpenAI envelope, fence tokens) + a
+      conservative ≥2-distinct-calls stream abort; salvage executes through the NORMAL
+      pipeline (breakers/ledger/stats/memory/chips) with the synthesized `tool_use` blocks
+      stored pair-complete so history demonstrates the dialect; `resolve_tool()` gained an
+      unambiguous dialect-synonym step (`ls`/`dir`/`list_files`→`list_dir`, `cat`/`open`→
+      `read_file`, `run`/`shell`/`execute`→`exec`; ambiguous names surface, never guessed);
+      fences are insertion-only with a provenance corpus (real tool outputs + user text —
+      never the model's own turns) so quotation is left alone; plus two adjacent honesty
+      levers: consecutive byte-identical zero-call rounds announce themselves in the reply,
+      and breaker replays record a `short_circuited` stats outcome (tracker, daemon sink,
+      Turso hourly) instead of `success=0`.
 
 **Tier 5 — the bench measures itself (`bench/gui-leg/`, new)**
 - [ ] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
@@ -3055,6 +3067,8 @@ from evidence, budgets stay budgets):
 
 Full evidence: the six-agent retrospective (per-leg log forensics) in the 2026-08-11
 session; per-leg detail in `bench/BASELINE.md` and the campaign ledger/artifacts.
+
+---
 
 ---
 

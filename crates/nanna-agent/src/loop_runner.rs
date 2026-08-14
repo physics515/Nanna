@@ -1346,6 +1346,12 @@ fn discovery_pause_notice(
 /// 1. **Repeated intent phrases**: The model keeps saying "let me X" without doing X.
 /// 2. **Phantom completion**: The model claims to have read/written/verified files
 ///    without any tool calls — it hallucinated the entire workflow.
+///
+/// The failure's STRUCTURAL form — tool calls written as JSON in prose,
+/// which no phrase list can see — is handled by the P22 Tier 4 machinery
+/// below ([`scan_prose_dialect`] and the salvage branch in the run loop,
+/// which executes what the model meant instead of only scolding; and
+/// [`text_streams_prose_tool_calls`] at the streaming checkpoints).
 fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     let lower = text.to_lowercase();
 
@@ -1529,6 +1535,457 @@ fn detect_narration_loop(text: &str, has_tool_history: bool) -> bool {
     }
 
     false
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// P22 Tier 4 — the prose tool-call dialect (structural arm + salvage +
+// self-authored-result fences).
+//
+// The narration detector above is phrase-based; its structural sibling below
+// catches the failure's OTHER form, observed live 2026-08-12 (lfm leg,
+// 4-hour wedge): 379 of 429 text items were tool calls written as JSON in
+// prose (384 `"action":` strings, 300 of them to the non-existent
+// `list_files`), plus 28 orphan `</TOOL_CALL>` closers and 2 fabricated
+// `"result": {…}` blocks the model then believed for four hours. No phrase
+// list can see that — the evidence is structural: a step that emitted ZERO
+// structured tool calls whose text contains a balanced, call-shaped JSON
+// object (or tool-call fence tokens). And detection alone is a scold; the
+// counter-lever is SALVAGE: parse the call the model meant, resolve it
+// through the registry (exact → case → dialect synonym → fuzzy, the same
+// path a real call takes), execute it, and teach the correct dialect — while
+// fencing any result object the model authored itself so an invention can
+// never become its world.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Chat-template control markers that belong in a model's tool-call channel,
+/// never in its prose. Matched case-insensitively; ANY occurrence in a
+/// zero-structured-call step is dialect leakage (an orphan closer with no
+/// parseable call still proves the model tried to call a tool).
+const TOOL_CALL_FENCE_TOKENS: &[&str] = &[
+    "<tool_call>",
+    "</tool_call>",
+    "<|tool_call_start|>",
+    "<|tool_call_end|>",
+    "<|tool_call|>",
+    "[tool_calls]",
+];
+
+/// Count tool-call fence tokens in `text` (case-insensitive).
+fn tool_call_fence_token_count(text: &str) -> usize {
+    let lower = text.to_lowercase();
+    TOOL_CALL_FENCE_TOKENS
+        .iter()
+        .map(|t| lower.matches(t).count())
+        .sum()
+}
+
+/// Nesting budget for re-scanning the interior of an unparseable brace span.
+/// Derived from serde_json's own default recursion limit (128), not chosen:
+/// an object nested deeper than serde parses cannot yield a `Value`, so
+/// scanning deeper cannot find one.
+const JSON_SCAN_DEPTH_MAX: usize = 128;
+
+/// Collect every balanced `{…}` region of `text` that parses as a JSON
+/// object, outermost first, as `(start, end, parsed)` with absolute byte
+/// offsets (`base`-adjusted).
+///
+/// One string- and escape-aware pass finds the MAXIMAL (depth-zero) brace
+/// spans; each is parsed once, so parse cost is linear in the text (maximal
+/// spans are disjoint). A span that fails to parse — prose braces, broken
+/// JSON — has its interior re-scanned so clean objects inside survive, and a
+/// dangling opener (which would otherwise swallow the tail of the text) is
+/// skipped past the same way. Both re-scans strictly shrink the region and
+/// are bounded by [`JSON_SCAN_DEPTH_MAX`].
+///
+/// Quotes only toggle string state INSIDE a brace region: prose apostrophes
+/// and quotes outside any braces must not swallow later objects.
+fn collect_json_objects(
+    text: &str,
+    base: usize,
+    depth_budget: usize,
+    out: &mut Vec<(usize, usize, Value)>,
+) {
+    let bytes = text.as_bytes();
+    let mut rescan: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' if depth > 0 => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let slice = &text[start..=i];
+                    match serde_json::from_str::<Value>(slice) {
+                        Ok(v @ Value::Object(_)) => out.push((base + start, base + i + 1, v)),
+                        _ => rescan.push((start + 1, i)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // A dangling opener would swallow the rest of the text; scan past it so
+    // real objects later on are still found.
+    if depth > 0 && start + 1 < text.len() {
+        rescan.push((start + 1, text.len()));
+    }
+    if depth_budget > 0 {
+        for (s, e) in rescan {
+            collect_json_objects(&text[s..e], base + s, depth_budget - 1, out);
+        }
+    }
+}
+
+/// Keys whose string value names the tool in a call-shaped object. These are
+/// strong signals on their own: prose JSON does not say `"action": "ls"`.
+const PROSE_CALL_NAME_KEYS: &[&str] = &["tool_name", "tool", "action", "function"];
+
+/// Keys that carry an explicit argument payload in a call-shaped object.
+const PROSE_CALL_PARAM_KEYS: &[&str] = &["arguments", "parameters", "params", "args", "input"];
+
+/// Keys stripped when the LOOSE keys of a call object are its arguments
+/// (`{"action": "list_files", "path": "."}`): call-frame metadata and
+/// self-authored outcome fields are not arguments.
+const PROSE_CALL_FRAME_KEYS: &[&str] = &["type", "id", "result", "output", "stdout", "status"];
+
+/// Whether a string is plausibly a tool identifier. `"action": "The user
+/// wants a file list"` is prose, not a call — an identifier is short, starts
+/// with a letter, and has no spaces.
+fn looks_like_tool_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Recover the argument object for a recognized call shape. `name_key` is
+/// the key that carried the tool name (excluded from loose-key collection).
+///
+/// `Some(object)`: usable arguments. `None`: the shape declared explicit
+/// arguments that cannot be recovered losslessly (e.g. a non-JSON
+/// `"arguments"` string) — such a call is surfaced, never guessed at.
+fn prose_call_params(map: &serde_json::Map<String, Value>, name_key: &str) -> Option<Value> {
+    for key in PROSE_CALL_PARAM_KEYS {
+        match map.get(*key) {
+            None => {}
+            Some(Value::Object(args)) => return Some(Value::Object(args.clone())),
+            // Stringified arguments (OpenAI dialect): only a string that
+            // parses back to a JSON object is usable.
+            Some(Value::String(s)) => {
+                return match serde_json::from_str::<Value>(s) {
+                    Ok(Value::Object(args)) => Some(Value::Object(args)),
+                    _ => None,
+                };
+            }
+            Some(_) => return None,
+        }
+    }
+    // No explicit argument key: the loose keys ARE the arguments, minus the
+    // name key and call-frame/self-authored-outcome fields.
+    let loose: serde_json::Map<String, Value> = map
+        .iter()
+        .filter(|(k, _)| k.as_str() != name_key && !PROSE_CALL_FRAME_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Some(Value::Object(loose))
+}
+
+/// Recognize a call-shaped JSON object: `(written_name, arguments)`.
+///
+/// Shapes, in precedence order:
+/// 1. OpenAI envelope — `{"function": {"name": …, "arguments": …}}`;
+/// 2. strong name keys — `{"action"|"tool"|"tool_name"|"function": "x", …}`
+///    with either an explicit argument key or loose keys as arguments;
+/// 3. weak `name` key — `{"name": "x", …}` counts ONLY alongside an explicit
+///    argument key (`{"name": "Nanna", "role": "agent"}` is prose, not a
+///    call).
+fn prose_call_from_map(
+    map: &serde_json::Map<String, Value>,
+) -> Option<(String, Option<Value>)> {
+    if let Some(Value::Object(inner)) = map.get("function") {
+        if let Some(Value::String(name)) = inner.get("name") {
+            if looks_like_tool_name(name) {
+                return Some((name.clone(), prose_call_params(inner, "name")));
+            }
+        }
+    }
+    for key in PROSE_CALL_NAME_KEYS {
+        if let Some(Value::String(name)) = map.get(*key) {
+            if looks_like_tool_name(name) {
+                return Some((name.clone(), prose_call_params(map, key)));
+            }
+        }
+    }
+    if let Some(Value::String(name)) = map.get("name") {
+        if looks_like_tool_name(name)
+            && PROSE_CALL_PARAM_KEYS.iter().any(|k| map.contains_key(*k))
+        {
+            return Some((name.clone(), prose_call_params(map, "name")));
+        }
+    }
+    None
+}
+
+/// A tool call the model wrote as prose JSON instead of emitting structurally.
+#[derive(Debug, Clone)]
+struct ProseToolCall {
+    /// The tool name exactly as the model wrote it.
+    written_name: String,
+    /// Arguments; `None` when the shape was call-like but its arguments were
+    /// unusable — surfaced, never guessed (owner rule: lossless salvage).
+    params: Option<Value>,
+    /// Raw text of the maximal JSON span the call was found in — provenance
+    /// for the quotation check (a call copied verbatim from a real tool
+    /// output or the user's own text is quotation, not intent).
+    span_raw: String,
+}
+
+/// Walk a parsed JSON tree collecting call-shaped objects at any depth
+/// (`{"steps": [{"action": "read_file", …}]}` still counts — the model wrote
+/// what it wants done). Recursion is bounded by the parse itself
+/// (serde_json's recursion limit).
+fn collect_prose_calls(value: &Value, span_raw: &str, out: &mut Vec<ProseToolCall>) {
+    match value {
+        Value::Object(map) => {
+            if let Some((written_name, params)) = prose_call_from_map(map) {
+                out.push(ProseToolCall {
+                    written_name,
+                    params,
+                    span_raw: span_raw.to_string(),
+                });
+                // A recognized call's interior is its arguments — a nested
+                // `"action"` inside them is data, not a second call.
+                return;
+            }
+            for v in map.values() {
+                collect_prose_calls(v, span_raw, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_prose_calls(v, span_raw, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keys that mark an object as a self-authored RESULT: the model wrote what
+/// only a tool execution can produce.
+const SELF_AUTHORED_RESULT_KEYS: &[&str] = &["result", "output", "stdout"];
+
+/// Whether a parsed JSON tree carries a result-shaped object at any depth.
+fn value_contains_result_shape(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.iter().any(|(k, v)| {
+                SELF_AUTHORED_RESULT_KEYS.contains(&k.as_str()) && !v.is_null()
+            }) || map.values().any(value_contains_result_shape)
+        }
+        Value::Array(arr) => arr.iter().any(value_contains_result_shape),
+        _ => false,
+    }
+}
+
+/// Everything one structural pass over a step's text yields.
+struct ProseDialectScan {
+    /// Call-shaped objects, in text order.
+    calls: Vec<ProseToolCall>,
+    /// Maximal JSON spans whose tree carries a result-shaped object.
+    result_spans: Vec<(usize, usize)>,
+    /// Tool-call fence tokens seen.
+    fence_tokens: usize,
+}
+
+impl ProseDialectScan {
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty() && self.result_spans.is_empty() && self.fence_tokens == 0
+    }
+}
+
+/// Structural scan of a zero-structured-call step's text.
+fn scan_prose_dialect(text: &str) -> ProseDialectScan {
+    let mut objects = Vec::new();
+    collect_json_objects(text, 0, JSON_SCAN_DEPTH_MAX, &mut objects);
+    let mut calls = Vec::new();
+    let mut result_spans = Vec::new();
+    for (start, end, value) in &objects {
+        let raw = &text[*start..*end];
+        collect_prose_calls(value, raw, &mut calls);
+        if value_contains_result_shape(value) {
+            result_spans.push((*start, *end));
+        }
+    }
+    result_spans.sort_unstable();
+    ProseDialectScan {
+        calls,
+        result_spans,
+        fence_tokens: tool_call_fence_token_count(text),
+    }
+}
+
+/// Streaming-checkpoint variant of the structural arm, deliberately more
+/// conservative than the post-step scan: mid-stream, a single call-shaped
+/// object might be a quoted example ahead of a legitimate structured call
+/// still to come, and the provenance corpus is not consulted. TWO distinct
+/// written calls (or two fence tokens) with zero structured calls so far is
+/// the observed wedge signature — the lfm leg streamed hundreds per turn —
+/// and aborting there saves the rest of the doomed stream; the post-step
+/// salvage then executes what the model meant.
+fn text_streams_prose_tool_calls(text: &str) -> bool {
+    if tool_call_fence_token_count(text) >= 2 {
+        return true;
+    }
+    let scan = scan_prose_dialect(text);
+    let distinct: HashSet<String> = scan
+        .calls
+        .iter()
+        .map(|c| {
+            format!(
+                "{}\u{1}{}",
+                c.written_name.to_lowercase(),
+                c.params.as_ref().map(ToString::to_string).unwrap_or_default()
+            )
+        })
+        .collect();
+    distinct.len() >= 2
+}
+
+/// The fence stamped after every self-authored result-shaped object in a
+/// zero-tool-call step, so a fabrication cannot enter history as the model's
+/// world. Wording per the P22 spec: WHAT this is (the model's own text), WHY
+/// it cannot be trusted (no tool ran), and the honest state (unknown).
+pub const SELF_AUTHORED_RESULT_FENCE: &str =
+    "[you wrote this yourself — no tool ran; the real listing is unknown]";
+
+/// Stamp [`SELF_AUTHORED_RESULT_FENCE`] after each of `spans` (sorted,
+/// disjoint byte ranges of `text`). Insertion-only — every byte of the
+/// model's text survives (lossless; the fence ANNOTATES, it never redacts).
+fn fence_self_authored_results(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut fenced = String::with_capacity(
+        text.len() + spans.len() * (SELF_AUTHORED_RESULT_FENCE.len() + 2),
+    );
+    let mut cursor = 0usize;
+    for &(_, end) in spans {
+        if end <= cursor || end > text.len() {
+            continue;
+        }
+        fenced.push_str(&text[cursor..end]);
+        fenced.push('\n');
+        fenced.push_str(SELF_AUTHORED_RESULT_FENCE);
+        fenced.push('\n');
+        cursor = end;
+    }
+    fenced.push_str(&text[cursor..]);
+    fenced
+}
+
+/// Collapse whitespace runs so provenance checks survive re-wrapping.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whitespace-normalized corpus of text the model did NOT invent this run:
+/// real tool outputs and user-authored messages. The model's own prior
+/// assistant turns are deliberately excluded — its inventions must never
+/// vouch for themselves (round N's fabrication would otherwise legitimize
+/// round N+1's copy of it).
+struct PriorMaterial {
+    normalized: Vec<String>,
+}
+
+impl PriorMaterial {
+    /// Whether `raw` appears verbatim (modulo whitespace) in prior material —
+    /// quotation, not invention.
+    fn contains(&self, raw: &str) -> bool {
+        let needle = normalize_ws(raw);
+        if needle.is_empty() {
+            return false;
+        }
+        self.normalized.iter().any(|h| h.contains(&needle))
+    }
+}
+
+/// Render the prose-call notice: what the harness executed on the model's
+/// behalf (salvage), what could not be resolved (with the nearest real
+/// tools), and the dialect lesson. Announces itself per project rule — WHAT
+/// happened, WHY nothing the model wrote ran by itself, WHAT was done, and
+/// WHAT to do instead. Task-anchored like every injected steering text.
+fn prose_call_salvage_notice(
+    task_anchor: Option<&str>,
+    executed: &[(String, String)],
+    unresolved: &[(String, String)],
+    fence_tokens: usize,
+) -> String {
+    let mut body = String::new();
+    if executed.is_empty() {
+        body.push_str(
+            "[PROSE TOOL CALLS — NOT EXECUTED] Your last message wrote tool calls as \
+             JSON text (or tool-call tags) instead of emitting real tool calls. Text \
+             is NEVER executed: nothing you described ran, and any result or file \
+             listing you wrote yourself is invented, not real.",
+        );
+    } else {
+        body.push_str(
+            "[PROSE TOOL CALLS SALVAGED] Your last message wrote tool calls as JSON \
+             text instead of emitting real tool calls — text is NEVER executed, so \
+             none of them would have run. The harness parsed and executed them for \
+             you this once: ",
+        );
+        let ran: Vec<String> = executed
+            .iter()
+            .map(|(written, resolved)| {
+                if written.eq_ignore_ascii_case(resolved) {
+                    format!("`{resolved}`")
+                } else {
+                    format!("`{written}` → ran as `{resolved}`")
+                }
+            })
+            .collect();
+        body.push_str(&ran.join(", "));
+        body.push_str(
+            ". Their REAL results are in the tool results above — trust those over \
+             anything you wrote yourself.",
+        );
+    }
+    for (written, guidance) in unresolved {
+        body.push_str(&format!(" `{written}` {guidance}."));
+    }
+    if fence_tokens > 0 && executed.is_empty() && unresolved.is_empty() {
+        body.push_str(
+            " Your message contained tool-call fence tokens with no parseable call \
+             inside them.",
+        );
+    }
+    body.push_str(
+        " From now on, emit every call through the tool-call mechanism with the \
+         exact tool name — never write JSON calls, results, or tool tags in your \
+         text.",
+    );
+    format!(
+        "{header}{body} {STEERING_CONTINUATION}",
+        header = anchor_header(task_anchor)
+    )
 }
 
 /// Mission mode: consecutive auto-continuation rounds with ZERO tool calls
@@ -3317,7 +3774,7 @@ impl Agent {
                 other => other,
             };
 
-            let result = result?;
+            let mut result = result?;
 
             // Record model statistics
             let actual_model = request.model.clone();
@@ -3428,6 +3885,192 @@ impl Agent {
                 }
             }
 
+            // ── P22 Tier 4: prose tool-call dialect ──
+            // A step with ZERO structured tool calls whose text contains
+            // call-shaped JSON or tool-call fence tokens is the narration
+            // failure in structural form. Analyzed BEFORE the response is
+            // stored so (a) self-authored result objects are fenced before
+            // they can enter history as the model's world, and (b) the calls
+            // the model MEANT are synthesized into the assistant turn as real
+            // tool_use blocks — history then demonstrates the correct dialect
+            // (and stays pair-complete once the salvage branch below stores
+            // their tool results). Skipped when the step attempted structured
+            // calls that merely failed to parse (`error_tool_results`): that
+            // is a different fault with its own feedback path.
+            let mut salvaged_uses: Vec<(String, String, Value)> = Vec::new();
+            let mut salvage_executed: Vec<(String, String)> = Vec::new();
+            let mut salvage_unresolved: Vec<(String, String)> = Vec::new();
+            let mut salvage_fence_tokens = 0usize;
+            if result.tool_uses.is_empty()
+                && result.error_tool_results.is_empty()
+                && !result.text.is_empty()
+            {
+                let scan = scan_prose_dialect(&result.text);
+                if !scan.is_empty() {
+                    salvage_fence_tokens = scan.fence_tokens;
+                    // Provenance corpus: text the model did NOT invent this
+                    // run — real tool outputs and user-authored messages. A
+                    // call or result object found verbatim there is quotation
+                    // (e.g. summarizing a config it just read), not intent or
+                    // fabrication, and is left entirely alone.
+                    let prior = {
+                        let ctx = self.context.read().await;
+                        let mut normalized: Vec<String> = state
+                            .tool_records
+                            .iter()
+                            .map(|r| normalize_ws(&r.output))
+                            .collect();
+                        for msg in &ctx.messages {
+                            if msg.role != "user" {
+                                continue;
+                            }
+                            for block in &msg.content {
+                                match block {
+                                    ContentBlock::Text { text } => {
+                                        normalized.push(normalize_ws(text));
+                                    }
+                                    ContentBlock::ToolResult { content, .. } => {
+                                        normalized.push(normalize_ws(content));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        PriorMaterial { normalized }
+                    };
+
+                    // Fence self-authored results: a result-shaped object with
+                    // no provenance is the model writing its own world (the
+                    // lfm leg believed its invented directory listing for four
+                    // hours). Insertion-only annotation, applied before any
+                    // store so every copy in history carries it.
+                    let fabricated: Vec<(usize, usize)> = scan
+                        .result_spans
+                        .iter()
+                        .filter(|(s, e)| !prior.contains(&result.text[*s..*e]))
+                        .copied()
+                        .collect();
+                    if !fabricated.is_empty() {
+                        warn!(
+                            count = fabricated.len(),
+                            iteration = state.iterations,
+                            "🧯 Self-authored result object(s) in a zero-tool-call \
+                             step — fencing before they enter history"
+                        );
+                        result.text =
+                            fence_self_authored_results(&result.text, &fabricated);
+                        for block in &mut result.content_blocks {
+                            if let ContentBlock::Text { text } = block {
+                                let block_scan = scan_prose_dialect(text);
+                                let block_fabricated: Vec<(usize, usize)> = block_scan
+                                    .result_spans
+                                    .iter()
+                                    .filter(|(s, e)| !prior.contains(&text[*s..*e]))
+                                    .copied()
+                                    .collect();
+                                if !block_fabricated.is_empty() {
+                                    *text = fence_self_authored_results(
+                                        text,
+                                        &block_fabricated,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Salvage: resolve each distinct written call through the
+                    // registry — exact → case-insensitive → dialect synonym →
+                    // fuzzy, the same path a real call takes — and synthesize
+                    // the structured calls the model meant. Lossless by rule:
+                    // unusable arguments or an unresolvable name are surfaced
+                    // in the notice, never guessed at.
+                    let mut seen_calls: HashSet<String> = HashSet::new();
+                    let mut seen_unresolved: HashSet<String> = HashSet::new();
+                    for call in &scan.calls {
+                        if prior.contains(&call.span_raw) {
+                            continue;
+                        }
+                        let Some(params) = call.params.clone() else {
+                            if seen_unresolved.insert(call.written_name.to_lowercase()) {
+                                salvage_unresolved.push((
+                                    call.written_name.clone(),
+                                    "was recognized but its arguments could not be \
+                                     recovered — re-issue it as a real tool call with \
+                                     explicit arguments"
+                                        .to_string(),
+                                ));
+                            }
+                            continue;
+                        };
+                        // Byte-identical repeats within one step collapse to
+                        // one execution: the same call in the same instant
+                        // cannot yield different information (the lfm leg
+                        // wrote the same `list_files` 300 times).
+                        let key = format!(
+                            "{}\u{1}{}",
+                            call.written_name.to_lowercase(),
+                            params
+                        );
+                        if !seen_calls.insert(key) {
+                            continue;
+                        }
+                        match self.tools.resolve_tool(&call.written_name).await {
+                            Some((resolved, _)) => {
+                                let id = format!(
+                                    "salvage-{}-{}",
+                                    state.iterations,
+                                    salvaged_uses.len()
+                                );
+                                salvage_executed
+                                    .push((call.written_name.clone(), resolved.clone()));
+                                salvaged_uses.push((id, resolved, params));
+                            }
+                            None => {
+                                if seen_unresolved
+                                    .insert(call.written_name.to_lowercase())
+                                {
+                                    let hits = self
+                                        .tools
+                                        .search_tools(&call.written_name, 3)
+                                        .await;
+                                    let guidance = if hits.is_empty() {
+                                        "matches no real tool — call `discover_tools` \
+                                         to find the right one"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "matches no real tool — closest real \
+                                             tools: {}",
+                                            hits.iter()
+                                                .map(|h| h.name.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )
+                                    };
+                                    salvage_unresolved
+                                        .push((call.written_name.clone(), guidance));
+                                }
+                            }
+                        }
+                    }
+                    if !salvaged_uses.is_empty() {
+                        info!(
+                            count = salvaged_uses.len(),
+                            iteration = state.iterations,
+                            "🛟 Prose tool call(s) salvaged — synthesizing the \
+                             structured calls the model meant"
+                        );
+                        for (id, name, input) in &salvaged_uses {
+                            result.content_blocks.push(ContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
             // Store assistant response
             self.store_assistant_response(&result.content_blocks).await;
 
@@ -3457,6 +4100,112 @@ impl Agent {
                 // detector, which measures it as "this block", trips on the
                 // concatenated volume of several unrelated rounds.
                 state.finalize_reasoning_block(None);
+
+                // P22 Tier 4 cross-turn honesty bookkeeping: a zero-call
+                // round whose text is byte-identical to the previous
+                // zero-call round did nothing between them. Tracked here —
+                // before any continuation branch — so every zero-call round
+                // counts; any real tool execution resets the streak (the
+                // reset lives on the tool path below). Consumed at the
+                // normal exit, where the reply says so plainly.
+                let reply_hash = result_content_hash(&state.final_text);
+                if !state.final_text.is_empty()
+                    && state.last_zero_call_reply_hash == Some(reply_hash)
+                {
+                    state.identical_zero_call_replies += 1;
+                } else {
+                    state.identical_zero_call_replies = 0;
+                    state.last_zero_call_reply_hash = Some(reply_hash);
+                }
+
+                // P22 Tier 4 salvage: the structured calls synthesized from
+                // the model's prose run through the NORMAL pipeline —
+                // breakers, ledger, stats, records, memory, UI chips — so a
+                // salvaged call is a real call in every way (identical spam
+                // hits the zero-info breaker exactly like structured spam
+                // would). The corrective notice then teaches the dialect.
+                if !salvaged_uses.is_empty() {
+                    let records_before = state.tool_records.len();
+                    let tool_results = self
+                        .execute_tools(
+                            &salvaged_uses,
+                            &mut state,
+                            &options,
+                            routed_model.as_deref(),
+                        )
+                        .await;
+                    self.store_tool_results(tool_results).await;
+                    let notice = prose_call_salvage_notice(
+                        state.task_anchor.as_deref(),
+                        &salvage_executed,
+                        &salvage_unresolved,
+                        salvage_fence_tokens,
+                    );
+                    {
+                        let mut ctx = self.context.write().await;
+                        ctx.messages.push(AnthropicMessage::user_text(notice));
+                    }
+                    // A salvage round that SUCCEEDED at something advanced
+                    // the run — same bookkeeping as the structured-call
+                    // path, then straight back to the model with the real
+                    // results. A round of nothing but breaker replays and
+                    // failures added no information, so it falls THROUGH to
+                    // the stall/repetition machinery below instead — salvage
+                    // must never become an unbounded grind lane that bypasses
+                    // the bounds the structured path answers to.
+                    let advanced = state.tool_records[records_before..]
+                        .iter()
+                        .any(|r| r.success);
+                    warn!(
+                        executed = salvage_executed.len(),
+                        unresolved = salvage_unresolved.len(),
+                        advanced,
+                        iteration = state.iterations,
+                        "🛟 Prose tool calls executed via salvage — dialect \
+                         notice injected"
+                    );
+                    if advanced {
+                        state.mission_stall_rounds = 0;
+                        state.mission_verified_since_claim = true;
+                        state.identical_zero_call_replies = 0;
+                        state.last_zero_call_reply_hash = None;
+                        continue;
+                    }
+                }
+
+                // Structural evidence with nothing executable (unresolvable
+                // names, unusable arguments, or orphan fence tokens): the
+                // corrective notice replaces the generic narration scold —
+                // same one-shot rung on the ladder (re-armed per mission
+                // round), naming the nearest real tools instead of scolding
+                // blind. Gated on the salvage branch NOT having run — a
+                // salvage round that fell through already injected this
+                // notice and must reach the stall machinery below.
+                if salvaged_uses.is_empty()
+                    && (!salvage_unresolved.is_empty() || salvage_fence_tokens > 0)
+                    && !state.narration_nudged
+                {
+                    state.narration_nudged = true;
+                    warn!(
+                        unresolved = salvage_unresolved.len(),
+                        fence_tokens = salvage_fence_tokens,
+                        iteration = state.iterations,
+                        "🔄 Prose tool calls with nothing salvageable — \
+                         corrective notice injected"
+                    );
+                    let notice = prose_call_salvage_notice(
+                        state.task_anchor.as_deref(),
+                        &salvage_executed,
+                        &salvage_unresolved,
+                        salvage_fence_tokens,
+                    );
+                    {
+                        let mut ctx = self.context.write().await;
+                        ctx.messages.push(AnthropicMessage::user_text(notice));
+                    }
+                    continue;
+                }
+
                 // Detect narration loop: model talked about using tools but never called them
                 let has_tool_history = !state.tool_records.is_empty();
                 if detect_narration_loop(&state.final_text, has_tool_history)
@@ -3663,6 +4412,24 @@ impl Agent {
                     );
                 }
 
+                // P22 Tier 4 cross-turn honesty: consecutive rounds that
+                // ended byte-identical with zero structured tool calls did
+                // nothing between them — the reply must say so plainly
+                // instead of presenting the repetition as fresh work.
+                if state.identical_zero_call_replies >= 1 {
+                    let n = state.identical_zero_call_replies + 1;
+                    warn!(
+                        identical_rounds = n,
+                        "🪞 Run ended on identical zero-tool-call rounds — \
+                         appending the honesty note to the reply"
+                    );
+                    state.final_text.push_str(&format!(
+                        "\n\n[{n} consecutive replies in this run were identical and \
+                         emitted zero tool calls — nothing new was done between them, \
+                         and no tool has verified the claims above.]"
+                    ));
+                }
+
                 // Normal exit: no tool calls and not a narration loop
                 // Analyze uncertainty if enabled
                 if options.track_uncertainty {
@@ -3693,9 +4460,14 @@ impl Agent {
                 state.finalize_reasoning_block(first_tool);
                 // Real tool activity resets the mission stall counter — the
                 // bound is on grinding, never on productive work. It also
-                // marks a pending completion claim as verified-in-progress.
+                // marks a pending completion claim as verified-in-progress,
+                // and restarts the identical-zero-call-reply honesty streak
+                // (work happened, so the next identical reply is not "still
+                // nothing").
                 state.mission_stall_rounds = 0;
                 state.mission_verified_since_claim = true;
+                state.identical_zero_call_replies = 0;
+                state.last_zero_call_reply_hash = None;
             }
 
             // Execute tools and continue loop
@@ -4129,6 +4901,24 @@ impl Agent {
                             asm.text.push_str(notice);
                             break;
                         }
+                        // P22 Tier 4 structural arm at the checkpoint: the
+                        // model is streaming tool calls as TEXT (the lfm leg
+                        // streamed hundreds per turn) — the rest of the
+                        // stream is doomed, so stop paying for it. The main
+                        // loop's salvage then executes what it meant.
+                        if asm.tool_uses.is_empty()
+                            && text_streams_prose_tool_calls(&asm.text)
+                        {
+                            warn!(
+                                text_len = asm.text.len(),
+                                "🛟 Prose tool calls detected in streaming response — \
+                                 aborting stream for salvage"
+                            );
+                            let notice = "\n\n[I wrote tool calls as text instead of executing them. Stopping to run them properly.]";
+                            on_text(notice);
+                            asm.text.push_str(notice);
+                            break;
+                        }
                     }
                 }
                 StreamEvent::ThinkingDelta { thinking, .. } => {
@@ -4490,10 +5280,17 @@ impl Agent {
                     // structured notice is RETURNED instantly (never thrown);
                     // the tool is not dispatched at all — zero seconds spent.
                     if let Some(notice) = breaker_notice {
+                        let mut result = ToolResult::error(notice);
+                        // Machine-readable outcome marker: stats sinks (the
+                        // daemon's on_tool_end recorder) read this to log
+                        // `short_circuited` instead of a tool failure — a
+                        // replay describes the harness, not the tool.
+                        result.data =
+                            Some(serde_json::json!({ "short_circuited": true }));
                         let response = ToolResponse {
                             id: call.id.clone(),
                             name: name.clone(),
-                            result: ToolResult::error(notice),
+                            result,
                             // Context: the notice must reach the model
                             // verbatim, never stubbed behind a memory handle.
                             output_target: OutputTarget::Context,
@@ -4573,9 +5370,10 @@ impl Agent {
                 debug!(tool = %name, duration_ms, "Tool completed");
             }
 
-            // Record tool stats
+            // Record tool stats. A short-circuited call gets its own outcome:
+            // the breaker replay is harness behavior, not a tool failure.
             if let Some(ref tracker) = self.tool_stats {
-                let error_msg = if !response.result.success {
+                let error_msg = if !response.result.success && !short_circuited {
                     response.result.error.clone()
                 } else {
                     None
@@ -4584,6 +5382,7 @@ impl Agent {
                     .record(crate::tool_stats::ToolObservation {
                         tool_name: name.clone(),
                         success: response.result.success,
+                        short_circuited,
                         duration_ms,
                         output_size: response.result.content.len(),
                         error: error_msg,
@@ -6483,6 +7282,15 @@ struct RunState {
     /// in prose that never matches the completion contract — and the stall
     /// counter resets every round. This counter bounds THAT loop.
     mission_repeat_rounds: usize,
+    /// P22 Tier 4 cross-turn honesty: hash of the last zero-structured-call
+    /// round's text. Identical consecutive zero-call rounds increment the
+    /// streak below; any executed tool work clears both.
+    last_zero_call_reply_hash: Option<u64>,
+    /// Consecutive zero-structured-call rounds whose text was byte-identical
+    /// to the previous one. `>= 1` at run end means the reply repeated with
+    /// nothing done between — the exit path appends a plain honesty note so
+    /// the repetition is never presented as fresh work.
+    identical_zero_call_replies: usize,
 }
 
 impl RunState {
@@ -6522,6 +7330,8 @@ impl RunState {
             mission_verified_since_claim: false,
             mission_last_digest: String::new(),
             mission_repeat_rounds: 0,
+            last_zero_call_reply_hash: None,
+            identical_zero_call_replies: 0,
         }
     }
 
@@ -9769,6 +10579,255 @@ mod discovery_pause_tests {
 /// task-anchor header when step context exists, each closes with the
 /// explicit continuation command, and none contains greeting-bait phrasing.
 #[cfg(test)]
+mod prose_dialect_tests {
+    use super::*;
+
+    fn calls(text: &str) -> Vec<ProseToolCall> {
+        scan_prose_dialect(text).calls
+    }
+
+    // ── structural arm: call-shaped objects ──
+
+    #[test]
+    fn action_shape_with_loose_keys_extracts_name_and_arguments() {
+        // The observed lfm dialect: 384 `"action":` strings in one leg.
+        let text = r#"I will list the directory now: {"action": "list_files", "path": "."}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "list_files");
+        assert_eq!(
+            found[0].params,
+            Some(serde_json::json!({ "path": "." })),
+            "loose keys are the arguments, minus the name key"
+        );
+    }
+
+    #[test]
+    fn tool_and_tool_name_shapes_extract() {
+        for key in ["tool", "tool_name"] {
+            let text = format!(r#"{{"{key}": "read_file", "params": {{"path": "a.txt"}}}}"#);
+            let found = calls(&text);
+            assert_eq!(found.len(), 1, "`{key}` shape must extract");
+            assert_eq!(found[0].written_name, "read_file");
+            assert_eq!(found[0].params, Some(serde_json::json!({ "path": "a.txt" })));
+        }
+    }
+
+    #[test]
+    fn openai_envelope_with_stringified_arguments_extracts() {
+        let text = r#"{"type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"x.rs\"}"}}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "read_file");
+        assert_eq!(found[0].params, Some(serde_json::json!({ "path": "x.rs" })));
+    }
+
+    #[test]
+    fn unusable_arguments_surface_as_none_never_guessed() {
+        // A stringified argument payload that is not JSON: the call is
+        // recognized but its arguments are NOT invented (lossless rule).
+        let text = r#"{"tool": "exec", "arguments": "just run ls for me"}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "exec");
+        assert_eq!(found[0].params, None);
+    }
+
+    #[test]
+    fn nested_calls_inside_arrays_extract() {
+        let text = r#"My plan: {"steps": [{"action": "read_file", "path": "a"}, {"action": "exec", "command": "ls"}]}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].written_name, "read_file");
+        assert_eq!(found[1].written_name, "exec");
+    }
+
+    #[test]
+    fn a_clean_object_inside_broken_json_is_still_found() {
+        // The maximal span fails to parse; the interior re-scan recovers the
+        // clean call inside it.
+        let text = r#"{oops broken {"action": "list_files", "path": "."} trailing"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "list_files");
+    }
+
+    // ── negative cases: prose ABOUT tools must not trip ──
+
+    #[test]
+    fn prose_about_tools_without_json_does_not_trip() {
+        let text = "You should call the list_files tool with a path argument. \
+                    The `action` key selects the verb, and the result comes back \
+                    as JSON. Let me explain how tool calls work.";
+        let scan = scan_prose_dialect(text);
+        assert!(scan.calls.is_empty());
+        assert!(scan.result_spans.is_empty());
+        assert_eq!(scan.fence_tokens, 0);
+        assert!(!text_streams_prose_tool_calls(text));
+    }
+
+    #[test]
+    fn json_without_call_shape_does_not_trip() {
+        let text = r#"Config: {"count": 3, "path": ".", "verbose": true}"#;
+        assert!(calls(text).is_empty());
+    }
+
+    #[test]
+    fn name_key_alone_is_prose_not_a_call() {
+        // `{"name": …}` counts only alongside an explicit argument key.
+        let text = r#"{"name": "Nanna", "role": "agent"}"#;
+        assert!(calls(text).is_empty());
+        let with_args = r#"{"name": "list_files", "arguments": {"path": "."}}"#;
+        assert_eq!(calls(with_args).len(), 1);
+    }
+
+    #[test]
+    fn a_sentence_in_the_action_key_is_not_a_tool_name() {
+        let text = r#"{"action": "list the files in the directory"}"#;
+        assert!(calls(text).is_empty());
+    }
+
+    // ── fence tokens ──
+
+    #[test]
+    fn fence_tokens_are_counted_case_insensitively() {
+        // The observed leg: 28 orphan </TOOL_CALL> closers, 2 <|tool_call_end|>.
+        let text = "…</TOOL_CALL> and later <|tool_call_end|> and <tool_call>";
+        assert_eq!(tool_call_fence_token_count(text), 3);
+        assert!(text_streams_prose_tool_calls(text));
+    }
+
+    // ── self-authored results ──
+
+    #[test]
+    fn result_shaped_objects_are_detected_and_null_results_are_not() {
+        let scan = scan_prose_dialect(r#"{"result": {"files": ["minidb", "104k"]}}"#);
+        assert_eq!(scan.result_spans.len(), 1);
+        for benign in [r#"{"result": null}"#, r#"{"code": 3}"#, "no json at all"] {
+            assert!(
+                scan_prose_dialect(benign).result_spans.is_empty(),
+                "{benign} must not read as a self-authored result"
+            );
+        }
+    }
+
+    #[test]
+    fn fencing_is_insertion_only_and_lossless() {
+        let text = r#"Ran it. {"result": {"files": ["minidb"]}} All good."#;
+        let scan = scan_prose_dialect(text);
+        let fenced = fence_self_authored_results(text, &scan.result_spans);
+        assert!(fenced.contains(SELF_AUTHORED_RESULT_FENCE));
+        // The fence lands directly after the fabricated object.
+        assert!(fenced.contains(&format!(
+            "{}\n{}",
+            r#"{"result": {"files": ["minidb"]}}"#,
+            SELF_AUTHORED_RESULT_FENCE
+        )));
+        // Lossless: removing the inserted marker lines reconstructs the
+        // original byte-for-byte.
+        let reconstructed: String = fenced
+            .replace(&format!("\n{SELF_AUTHORED_RESULT_FENCE}\n"), "");
+        assert_eq!(reconstructed, text);
+    }
+
+    // ── provenance (quotation vs invention) ──
+
+    #[test]
+    fn quoted_material_is_recognized_across_rewrapping() {
+        let prior = PriorMaterial {
+            normalized: vec![normalize_ws(
+                "{\"action\": \"deploy\",\n    \"target\": \"prod\"}",
+            )],
+        };
+        // Same object, different whitespace: still quotation.
+        assert!(prior.contains("{\"action\": \"deploy\", \"target\": \"prod\"}"));
+        // A different object is invention.
+        assert!(!prior.contains("{\"action\": \"deploy\", \"target\": \"staging\"}"));
+    }
+
+    // ── streaming checkpoint variant ──
+
+    #[test]
+    fn one_call_shaped_object_does_not_abort_a_stream_but_two_do() {
+        // One object might be a quoted example ahead of a real structured
+        // call — the conservative stream check needs two distinct calls.
+        let one = r#"For example: {"action": "list_files", "path": "."}"#;
+        assert!(!text_streams_prose_tool_calls(one));
+        let two = r#"{"action": "list_files", "path": "."} then
+                     {"action": "read_file", "path": "a.txt"}"#;
+        assert!(text_streams_prose_tool_calls(two));
+        // The SAME call repeated is one distinct call — still below the bar
+        // (the post-step salvage handles it; a stream abort needs stronger
+        // evidence).
+        let same = r#"{"action": "list_files", "path": "."} and again
+                      {"action": "list_files", "path": "."}"#;
+        assert!(!text_streams_prose_tool_calls(same));
+    }
+
+    // ── scanner robustness ──
+
+    #[test]
+    fn prose_quotes_outside_braces_do_not_swallow_later_objects() {
+        let text = r#"It's a "simple" step — {"action": "exec", "command": "ls"}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].written_name, "exec");
+    }
+
+    #[test]
+    fn a_dangling_opener_does_not_hide_later_objects() {
+        let text = r#"fn main() { loop { … and then {"action": "list_files", "path": "."}"#;
+        let found = calls(text);
+        assert_eq!(found.len(), 1, "the re-scan must skip past dangling braces");
+        assert_eq!(found[0].written_name, "list_files");
+    }
+
+    #[test]
+    fn frame_and_outcome_keys_are_stripped_from_loose_arguments() {
+        // A call object with an embedded self-authored outcome: the outcome
+        // fields are fabrications, not arguments.
+        let text = r#"{"action": "list_files", "path": ".", "result": {"files": []}, "status": "done"}"#;
+        let scan = scan_prose_dialect(text);
+        assert_eq!(scan.calls.len(), 1);
+        assert_eq!(
+            scan.calls[0].params,
+            Some(serde_json::json!({ "path": "." }))
+        );
+        // …and the same span is ALSO flagged as a self-authored result.
+        assert_eq!(scan.result_spans.len(), 1);
+    }
+
+    // ── the notice ──
+
+    #[test]
+    fn the_salvage_notice_names_the_mapping_and_the_results_location() {
+        let note = prose_call_salvage_notice(
+            None,
+            &[("list_files".to_string(), "list_dir".to_string())],
+            &[(
+                "frobnicate".to_string(),
+                "matches no real tool — closest real tools: exec, read_file".to_string(),
+            )],
+            0,
+        );
+        assert!(note.contains("`list_files` → ran as `list_dir`"), "{note}");
+        assert!(note.contains("REAL results are in the tool results above"), "{note}");
+        assert!(note.contains("`frobnicate` matches no real tool"), "{note}");
+        assert!(note.contains("exec, read_file"), "{note}");
+        assert!(note.ends_with(STEERING_CONTINUATION), "{note}");
+    }
+
+    #[test]
+    fn the_not_executed_notice_says_nothing_ran() {
+        let note = prose_call_salvage_notice(None, &[], &[], 2);
+        assert!(note.contains("NOT EXECUTED"), "{note}");
+        assert!(note.contains("nothing you described ran"), "{note}");
+        assert!(note.contains("fence tokens"), "{note}");
+        assert!(note.ends_with(STEERING_CONTINUATION), "{note}");
+    }
+}
+
+#[cfg(test)]
 mod anchored_steering_tests {
     use super::*;
 
@@ -9842,6 +10901,22 @@ mod anchored_steering_tests {
                     &["code_search".to_string(), "web_fetch".to_string()],
                     anchor,
                 ),
+            ),
+            (
+                "prose_call_salvage",
+                prose_call_salvage_notice(
+                    anchor,
+                    &[("list_files".to_string(), "list_dir".to_string())],
+                    &[(
+                        "frobnicate".to_string(),
+                        "matches no real tool — closest real tools: exec".to_string(),
+                    )],
+                    0,
+                ),
+            ),
+            (
+                "prose_call_not_executed",
+                prose_call_salvage_notice(anchor, &[], &[], 2),
             ),
         ]
     }
