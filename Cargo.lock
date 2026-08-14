@@ -6843,9 +6843,9 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "playwright-rs"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60aa6dc029f71f66d58c6681ae6ff3229416af160c1fbbe70ff46993128915b1"
+checksum = "5494109d443fafc48515b6c0442c1ab48e2631a111b2b68551dcdb7ef7fb72cf"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6873,13 +6873,13 @@ dependencies = [
 
 [[package]]
 name = "playwright-rs-macros"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dacee5a7346e793f1a4ca72db4b1c0e698c1e21626cdef409e6ec295629c4cd"
+checksum = "98c99f415553cb835d9c492c217207bda0fa56e229a863eb8ab79f5d6a8774f1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -10342,7 +10342,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.19",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
