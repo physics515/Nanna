@@ -410,6 +410,7 @@ impl ControlPlane {
                     memory: None,
                     workspace_id: None,
                     gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    degradations: self.degradations.clone(),
                 };
                 let mut config = LongHorizonConfig::default();
                 if let Some(secs) = max_wall_clock_secs {

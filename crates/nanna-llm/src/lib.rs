@@ -670,6 +670,28 @@ impl LlmError {
             || matches!(self, LlmError::Api { status: 429, .. })
     }
 
+    /// An input-level rejection: this request's INPUT was too long for the
+    /// model, stated deterministically by the provider ("input length N
+    /// exceeds model maximum M", 400/413/422-shaped).
+    ///
+    /// The distinction is load-bearing for callers that bench providers on
+    /// deterministic errors: a provider that rejected one oversized input is
+    /// perfectly healthy for every other call, so this class must never bench
+    /// it — the CALLER owns the fault, and the fix is to shrink the input,
+    /// not to wait out a cooldown. (Observed 2026-08-10: one over-long input
+    /// classified as a provider fault benched the only local embedder for
+    /// 240s while a mission was trying to write memories through it.)
+    #[must_use]
+    pub fn is_input_overflow(&self) -> bool {
+        match self {
+            Self::Api {
+                status: 400 | 413 | 422,
+                message,
+            } => input_overflow_limits(message).is_some(),
+            _ => false,
+        }
+    }
+
     /// Check if this error should trigger a fallback to another model
     #[must_use]
     pub fn should_fallback(&self) -> bool {
@@ -769,6 +791,50 @@ impl LlmError {
             .or(from_retry_after)
             .filter(|secs| *secs > 0 && *secs <= MAX_PLAUSIBLE_WAIT_SECS)
     }
+}
+
+/// Parse "(input) length N exceeds (model) maximum M" out of a provider error
+/// body, returning `(sent, limit)` in the provider's own unit (tokens).
+///
+/// Deliberately liberal about the words between the numbers — Ollama says
+/// "input length exceeds maximum context length", OpenAI-compatible servers
+/// vary the nouns — and strict about the shape: the message must carry the
+/// overflow vocabulary AND two integers where a larger one is followed by a
+/// smaller one. The pair is found as the first adjacent *descending* pair in
+/// order of appearance, which steps over version fragments in model names
+/// ("v1.5" yields the ascending 1, 5) and lands on `sent > limit` every time
+/// the provider states both.
+fn input_overflow_limits(message: &str) -> Option<(usize, usize)> {
+    let lowered = message.to_lowercase();
+    let overflow_shape = lowered.contains("exceed")
+        && (lowered.contains("length") || lowered.contains("token"))
+        && (lowered.contains("maximum") || lowered.contains("context") || lowered.contains("limit"));
+    if !overflow_shape {
+        return None;
+    }
+
+    let mut numbers: Vec<usize> = Vec::new();
+    let mut digits = String::new();
+    for c in lowered.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            if let Ok(n) = digits.parse() {
+                numbers.push(n);
+            }
+            digits.clear();
+        }
+    }
+    if !digits.is_empty()
+        && let Ok(n) = digits.parse()
+    {
+        numbers.push(n);
+    }
+
+    numbers
+        .windows(2)
+        .find(|pair| pair[0] > pair[1] && pair[1] >= 1)
+        .map(|pair| (pair[0], pair[1]))
 }
 
 // =============================================================================
@@ -3837,13 +3903,22 @@ impl EmbeddingClient {
     /// Create `Ollama` embedding client (local, no API key needed)
     pub fn ollama(base_url: impl Into<String>) -> Self {
         Self {
-            http: Client::builder()
-                .timeout(std::time::Duration::from_secs(60)) // Ollama can be slower
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            // The exact client the 2026-08-02 chat-stream fix built — SHARED,
+            // not mirrored, so the two Ollama paths cannot drift apart again:
+            // a read stall deadline instead of a whole-request one (a cold
+            // embedding model can take most of a minute to load, but "no
+            // bytes for 120s" is a dead connection), a connect timeout, and
+            // no idle pooling — a pooled loopback socket Windows quietly
+            // reset is a hang on the next request, and reconnecting to
+            // loopback costs nothing.
+            http: LlmClient::build_ollama_http_client(),
             provider: EmbeddingProvider::Ollama,
             api_key: String::new(),
-            base_url: base_url.into(),
+            // The same IPv4 pin as the chat path: "localhost" resolves to
+            // ::1 first on Windows, and v6 loopback is where streams were
+            // observed cut mid-transfer. The 2026-08-10 embed storm ran over
+            // ::1 while every healthy component used 127.0.0.1.
+            base_url: LlmClient::normalize_ollama_url(base_url.into()),
             model: "nomic-embed-text".to_string(), // Good default for Ollama
         }
     }
@@ -3863,7 +3938,12 @@ impl EmbeddingClient {
     /// Override the base URL (e.g. for OpenRouter-compatible embedding endpoints).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        self.base_url = match self.provider {
+            // Keep the v4 loopback pin even when the URL arrives after
+            // construction — same rationale as [`Self::ollama`].
+            EmbeddingProvider::Ollama => LlmClient::normalize_ollama_url(url.into()),
+            EmbeddingProvider::OpenAI => url.into(),
+        };
         self
     }
 
@@ -4021,16 +4101,46 @@ impl EmbeddingClient {
 
     /// Get embedding for a single text.
     ///
+    /// A deterministic input-overflow rejection ("input length N exceeds
+    /// model maximum M") is healed HERE, not surfaced: the text is cut to the
+    /// proportional prefix that fits M and retried. This embeds the longest
+    /// prefix the model accepts — the same prefix semantics every backend
+    /// applies silently when it truncates (see [`Self::context_window`]) —
+    /// where returning the error let a fallback router bench a perfectly
+    /// healthy provider for 240s over the caller's own oversized input
+    /// (observed 2026-08-10). The stored memory keeps its full text either
+    /// way; only the vector is built from the prefix.
+    ///
     /// # Errors
     ///
     /// Returns `LlmError::Api` if the API returns an error or no embedding is returned.
     /// Returns `LlmError::Network` if the request fails.
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, LlmError> {
-        let mut results = self.embed(&[text]).await?;
-        results.pop().ok_or_else(|| LlmError::Api {
-            status: 500,
-            message: "No embedding returned".to_string(),
-        })
+        let mut shrunk: Option<String> = None;
+        loop {
+            let attempt = shrunk.as_deref().unwrap_or(text);
+            let err = match self.embed(&[attempt]).await {
+                Ok(mut results) => {
+                    return results.pop().ok_or_else(|| LlmError::Api {
+                        status: 500,
+                        message: "No embedding returned".to_string(),
+                    });
+                }
+                Err(e) => e,
+            };
+            // No retry cap, and none needed: each pass keeps strictly fewer
+            // chars than the last (limit < sent), so the walk terminates —
+            // geometrically, in practice in one or two passes.
+            let Some(shorter) = shrink_to_input_limit(&err, attempt) else {
+                return Err(err);
+            };
+            debug!(
+                from_chars = attempt.chars().count(),
+                to_chars = shorter.chars().count(),
+                "embedding input exceeded the model's window — retrying with the fitting prefix"
+            );
+            shrunk = Some(shorter);
+        }
     }
 
     /// The maximum sequence length this embedding model accepts, in tokens.
@@ -4068,6 +4178,34 @@ impl EmbeddingClient {
         let show: OllamaShowResponse = response.json().await.ok()?;
         gguf_metadata_usize(&show.model_info?, "context_length")
     }
+}
+
+/// The strictly-shorter prefix of `text` that should fit the limit named by an
+/// input-overflow error, or `None` when `err` is not that fault or no shorter
+/// prefix exists.
+///
+/// The provider reports its unit (tokens); the cut happens in chars. The
+/// proportional cut `limit/sent` maps one to the other well enough because the
+/// caller LOOPS: a residual overflow produces a fresh, smaller report, the
+/// char count strictly decreases every pass, and the walk terminates without
+/// needing a retry cap.
+fn shrink_to_input_limit(err: &LlmError, text: &str) -> Option<String> {
+    if !err.is_input_overflow() {
+        return None;
+    }
+    let LlmError::Api { message, .. } = err else {
+        return None;
+    };
+    let (sent, limit) = input_overflow_limits(message)?;
+    debug_assert!(sent > limit, "input_overflow_limits guarantees sent > limit");
+    let total_chars = text.chars().count();
+    let target_chars = total_chars.saturating_mul(limit) / sent;
+    if target_chars == 0 || target_chars >= total_chars {
+        // Nothing left to cut (or the ratio math degenerated) — this fault
+        // cannot be healed by shrinking, so let the caller surface the error.
+        return None;
+    }
+    Some(text.chars().take(target_chars).collect())
 }
 
 // ============================================================================
@@ -7655,5 +7793,251 @@ mod gemma_sentinel_tests {
             state.required_wait(now, Duration::from_secs(3)),
             Duration::from_secs(1)
         );
+    }
+}
+
+#[cfg(test)]
+mod input_overflow_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ------------------------------------------------------------------
+    // Classification: only the overflow shape, on input-fault statuses
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn overflow_limits_parse_the_ollama_message() {
+        let parsed =
+            input_overflow_limits("input length 1234 exceeds maximum context length 512");
+        assert_eq!(parsed, Some((1234, 512)), "sent and limit, in that order");
+    }
+
+    /// Version digits inside a model name must not be mistaken for the pair —
+    /// the pair is the first adjacent DESCENDING pair, and "v1.5" ascends.
+    #[test]
+    fn overflow_limits_step_over_model_version_digits() {
+        let parsed = input_overflow_limits(
+            "model 'nomic-embed-text-v1.5': input length 8000 exceeds the maximum of 2048 tokens",
+        );
+        assert_eq!(parsed, Some((8000, 2048)));
+    }
+
+    #[test]
+    fn overflow_limits_reject_other_vocabulary_and_shapes() {
+        // Right words, no numbers.
+        assert_eq!(
+            input_overflow_limits("input length exceeds maximum context length"),
+            None
+        );
+        // Numbers, wrong vocabulary — a quota message is not an input fault.
+        assert_eq!(
+            input_overflow_limits("quota of 200 requests used, 50 remaining"),
+            None
+        );
+        // Ascending numbers only — nothing states sent > limit.
+        assert_eq!(
+            input_overflow_limits("length 10 exceeds nothing; maximum is 512"),
+            None
+        );
+    }
+
+    #[test]
+    fn input_overflow_is_scoped_to_input_fault_statuses() {
+        let message = "input length 1000 exceeds maximum context length 500".to_string();
+        for status in [400_u16, 413, 422] {
+            let e = LlmError::Api {
+                status,
+                message: message.clone(),
+            };
+            assert!(e.is_input_overflow(), "{status} with the shape classifies");
+        }
+        // A 500 with the same words is a provider fault; benching stays correct.
+        assert!(
+            !LlmError::Api {
+                status: 500,
+                message: message.clone()
+            }
+            .is_input_overflow()
+        );
+        // Rate limits never classify as input overflow, whatever they say.
+        assert!(
+            !LlmError::RateLimit {
+                message,
+                retry_after: None
+            }
+            .is_input_overflow()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Shrinking: strictly shorter, proportional, refuses the degenerate
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn shrink_cuts_proportionally_and_strictly_shorter() {
+        let err = LlmError::Api {
+            status: 422,
+            message: "input length 100 exceeds maximum context length 50".into(),
+        };
+        let text = "x".repeat(200);
+        let cut = shrink_to_input_limit(&err, &text).expect("a healable overflow shrinks");
+        assert_eq!(cut.chars().count(), 100, "200 chars x 50/100 = 100");
+        assert!(
+            cut.chars().count() < text.chars().count(),
+            "strictly shorter - termination"
+        );
+    }
+
+    #[test]
+    fn shrink_refuses_when_nothing_is_left_to_cut() {
+        let err = LlmError::Api {
+            status: 422,
+            message: "input length 1000 exceeds maximum context length 1".into(),
+        };
+        // 1 char x 1/1000 floors to zero — unhealable, surface the error.
+        assert_eq!(shrink_to_input_limit(&err, "x"), None);
+        // Not the fault at all → untouched.
+        let other = LlmError::Api {
+            status: 500,
+            message: "boom".into(),
+        };
+        assert_eq!(shrink_to_input_limit(&other, "some text"), None);
+    }
+
+    #[test]
+    fn shrink_respects_char_boundaries() {
+        let err = LlmError::Api {
+            status: 422,
+            message: "input length 4 exceeds maximum context length 2".into(),
+        };
+        // Multi-byte chars: a byte-indexed cut would panic or split a char.
+        let cut = shrink_to_input_limit(&err, "éééé").expect("shrinks");
+        assert_eq!(cut, "éé");
+    }
+
+    // ------------------------------------------------------------------
+    // The healing loop, end to end against a live socket
+    // ------------------------------------------------------------------
+
+    /// Serve scripted (status, body) responses in order, then repeat the last
+    /// one; `Connection: close` makes the accept count the request count.
+    async fn spawn_scripted_server(
+        script: Vec<(u16, String)>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<usize>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let body_lens = Arc::new(Mutex::new(Vec::new()));
+        let counter = hits.clone();
+        let lens = body_lens.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0_u8; 65536];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                lens.lock().expect("lens lock").push(read);
+                let (status, body) = script
+                    .get(n)
+                    .unwrap_or_else(|| script.last().expect("script is non-empty"));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits, body_lens)
+    }
+
+    /// The incident's fix: one overflow report, one shrink, one clean retry —
+    /// the caller gets a vector and the provider never looks unhealthy.
+    #[tokio::test]
+    async fn embed_one_shrinks_and_retries_after_an_overflow_report() {
+        let (url, hits, body_lens) = spawn_scripted_server(vec![
+            (
+                422,
+                r#"{"error":{"message":"input length 100 exceeds maximum context length 50"}}"#
+                    .to_string(),
+            ),
+            (200, r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#.to_string()),
+        ])
+        .await;
+        let client = EmbeddingClient::openai("test-key")
+            .with_model("test-embed")
+            .with_base_url(&url);
+
+        let text = "word ".repeat(100);
+        let vector = client.embed_one(&text).await.expect("healed by shrinking");
+        assert_eq!(vector.len(), 3, "the retry's vector comes through");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one shrink retry");
+        let lens = body_lens.lock().expect("lens lock");
+        assert!(
+            lens[1] < lens[0],
+            "the retry carried a strictly smaller request ({} then {})",
+            lens[0],
+            lens[1]
+        );
+    }
+
+    /// A provider that keeps reporting overflow whatever we send: the strict
+    /// shrink guarantees termination — the loop bottoms out and surfaces the
+    /// error instead of spinning forever.
+    #[tokio::test]
+    async fn embed_one_terminates_against_a_provider_that_always_overflows() {
+        let (url, hits, _lens) = spawn_scripted_server(vec![(
+            422,
+            r#"{"error":{"message":"input length 100 exceeds maximum context length 50"}}"#
+                .to_string(),
+        )])
+        .await;
+        let client = EmbeddingClient::openai("test-key")
+            .with_model("test-embed")
+            .with_base_url(&url);
+
+        let text = "x".repeat(64);
+        let err = client
+            .embed_one(&text)
+            .await
+            .expect_err("an unhealable overflow surfaces");
+        assert!(
+            err.is_input_overflow(),
+            "the surfaced error keeps its class: {err}"
+        );
+        // Halving 64 chars bottoms out in ~7 passes; the point is that the
+        // count is small and finite, not any particular number.
+        let n = hits.load(Ordering::SeqCst);
+        assert!((2..=8).contains(&n), "strictly-shrinking retries, got {n}");
+    }
+
+    // ------------------------------------------------------------------
+    // The 2026-08-02 treatment applied to the embedding client
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ollama_embedding_client_pins_v4_loopback() {
+        let client = EmbeddingClient::ollama("http://localhost:11434");
+        assert_eq!(client.base_url, "http://127.0.0.1:11434");
+        // The pin survives a post-construction URL override…
+        let client = client.with_base_url("http://localhost:9999");
+        assert_eq!(client.base_url, "http://127.0.0.1:9999");
+        // …and remote hosts pass through untouched.
+        let client = EmbeddingClient::ollama("http://gpu-box:11434");
+        assert_eq!(client.base_url, "http://gpu-box:11434");
+    }
+
+    #[test]
+    fn openai_embedding_client_urls_are_not_rewritten() {
+        // "localhost" in an OpenAI-compatible URL is someone's proxy, not our
+        // Ollama — the pin is an Ollama-path decision only.
+        let client = EmbeddingClient::openai("k").with_base_url("http://localhost:8080");
+        assert_eq!(client.base_url, "http://localhost:8080");
     }
 }

@@ -1201,18 +1201,65 @@ fn scheduled_consolidation_config(
     .with_summarizer_context_window(summarizer_context_window_tokens)
 }
 
-/// Fill `model`'s missing embeddings in bounded batches until the store is
-/// complete for it, the provider stalls, or the binding moves on — the service
-/// refuses to fill a bucket that is not the active binding, so a stale drain
-/// exits on its next pass instead of poisoning a dead provider's bucket.
-async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
-    // 64 per pass: small enough that a provider switch mid-drain is noticed
-    // within one batch, large enough to amortize the per-pass pending scan.
-    const BATCH: usize = 64;
+/// One provider request per backfill pass.
+///
+/// Bound justification: the drain's contention discipline is expressed PER
+/// REQUEST — the admission gate must be able to interpose between any two
+/// provider calls, and the repayment window is measured from one call's RTT.
+/// A batch would put a live chat turn behind the whole batch (the 2026-08-10
+/// storm was exactly three 64-entry batches: 201 POSTs in one minute) and
+/// would average the RTT signal the pacing derives its bound from. The cost —
+/// one pending-scan query per entry against local Turso — is microseconds
+/// next to the network round-trip it now paces.
+const DRAIN_STEP: usize = 1;
+
+/// Fill `model`'s missing embeddings until the store is complete for it, the
+/// provider stalls, or the binding moves on — the service refuses to fill a
+/// bucket that is not the active binding, so a stale drain exits on its next
+/// pass instead of poisoning a dead provider's bucket.
+///
+/// Contention discipline (P22 Tier 4; evidence: an embedding rebind fired 201
+/// `POST /api/embed` in one minute while a mission's opening turn queued
+/// behind them):
+///
+/// - **One drain process-wide** (`drain_serial`): the rebind path, the
+///   startup bind, and the dimension-probe correction all spawn drains, and
+///   concurrent drains would multiply the very request rate the pacing below
+///   bounds. Queued drains re-check the binding and no-op fast when stale.
+/// - **The drain yields to a live chat turn**: when the embedding provider is
+///   the local one, every pass first waits until no harness run is live.
+///   Priority, not a quota — it resumes the moment the turn releases, and a
+///   turn arriving mid-pass waits at most one in-flight embed. Remote
+///   embedding providers share nothing with a local generation slot, so they
+///   skip the gate (their writes contend with nobody's GPU).
+/// - **Each request repays its cost**: a pass that consulted the provider is
+///   followed by an idle window equal to the time the provider spent serving
+///   it. That caps the drain at half of the provider's wall-clock in ANY
+///   window, with no fixed rate constant: the bound is derived from the
+///   observed round-trip itself, so a loaded provider answering slowly earns
+///   proportionally longer gaps — the brake tightens exactly when contention
+///   rises, and a fast idle provider drains near full speed. In-flight stays
+///   at one for the same reason: the ceiling is expressed in time, and a
+///   second in-flight request would breach it by construction.
+async fn drain_backfill(
+    mem: &Arc<MemoryService>,
+    model: &str,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    drain_serial: &Arc<tokio::sync::Mutex<()>>,
+) {
+    let _one_drain = drain_serial.lock().await;
+    // "provider:model" is the router's spec shape; the local provider is the
+    // one that shares its single generation slot with chat.
+    let local = model.starts_with("ollama:");
+
     loop {
-        match mem.backfill_embeddings(model, BATCH).await {
+        if local {
+            chat_runs.wait_idle().await;
+        }
+        let pass_started = std::time::Instant::now();
+        match mem.backfill_embeddings(model, DRAIN_STEP).await {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(_) => tokio::time::sleep(pass_started.elapsed()).await,
             Err(e) => {
                 warn!("Backfill for '{model}' halted: {e}");
                 break;
@@ -1229,15 +1276,119 @@ async fn drain_backfill(mem: &Arc<MemoryService>, model: &str) {
     // backfill would put the embed latency of a whole memory inside the first
     // recall that happened to touch it.
     loop {
-        match mem.backfill_chunks(model, BATCH).await {
+        if local {
+            chat_runs.wait_idle().await;
+        }
+        let pass_started = std::time::Instant::now();
+        match mem.backfill_chunks(model, DRAIN_STEP).await {
             Ok((0, 0)) => break,
-            Ok(_) => {}
+            Ok((embedded, _chunked)) => {
+                // Chunking alone is local CPU — only a pass that actually
+                // consulted the provider owes it an idle window.
+                if embedded > 0 {
+                    tokio::time::sleep(pass_started.elapsed()).await;
+                }
+            }
             Err(e) => {
                 warn!("Chunk backfill for '{model}' halted: {e}");
                 break;
             }
         }
     }
+}
+
+/// Run one scheduled agent prompt (heartbeat / cron), YIELDING the local
+/// provider to a user turn that arrives mid-run (P22 Tier 4).
+///
+/// The evidence for existing at all: at one mission's start the daemon's own
+/// heartbeat held the single local generation slot for 157 seconds while the
+/// turn's planner timed out behind it. The tick-time gate cannot catch that
+/// ordering — the heartbeat was already running when the user typed — so the
+/// run itself must stand aside. Priority, not a quota: the user turn takes
+/// the slot within one abortive cancel, and the yielded work is resumed by
+/// the caller once the turn releases.
+///
+/// Mechanics: the agent run is SPAWNED, then raced against the registry's
+/// became-active edge. Spawning matters — select-dropping the chat future
+/// would skip its cleanup tail and leave the session registered as active
+/// forever; instead, preemption cancels through the same abortive token the
+/// Stop button uses (dropping the in-flight stream immediately) and then
+/// AWAITS the run so it exits through its own tail.
+///
+/// Preemption is armed only when the agent's model is served by the local
+/// single-slot provider: on a cloud provider a heartbeat and a chat coexist,
+/// and cancelling one buys the other nothing.
+///
+/// Returns `None` when the run yielded (the caller owns resumption);
+/// `Some(outcome)` when it finished on its own.
+async fn run_scheduled_prompt_yielding(
+    agent: &Arc<AgentService>,
+    chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+    session_id: &str,
+    payload: &str,
+) -> Option<Result<crate::agent_service::ChatResult, crate::agent_service::ChatError>> {
+    let run_agent = agent.clone();
+    let run_session = session_id.to_string();
+    let run_payload = payload.to_string();
+    let mut run = tokio::spawn(async move {
+        // Session-scoped tools resolve their scope from this task-local
+        // binding; carried by the run's own future so a chat starting during
+        // this run cannot see the scheduled session (and vice versa).
+        // Boxed: the chat future is ~23KB and would otherwise sit inline in
+        // the spawned task's state machine.
+        Box::pin(ToolRegistry::with_run_session(
+            run_session.clone(),
+            run_agent.chat(&run_session, &run_payload, None, &[]),
+        ))
+        .await
+    });
+
+    let local = crate::llm_router::ProviderId::from_model(&agent.agent_config().await.model)
+        == crate::llm_router::ProviderId::Ollama;
+    if !local {
+        return Some(flatten_scheduled_join(run.await));
+    }
+
+    tokio::select! {
+        joined = &mut run => Some(flatten_scheduled_join(joined)),
+        () = chat_runs.wait_active() => {
+            let yielding = std::time::Instant::now();
+            info!(session_id, "Scheduled run yielding the local provider to a live chat turn");
+            // The spawned run may not have registered its cancel token yet
+            // (a turn can claim in the gap between spawn and registration),
+            // and a cancel that lands on nothing would leave this arm
+            // blocked behind the full run. Keep asking until the cancel
+            // lands or the run ends on its own; `yield_now`, not a sleep —
+            // registration is one task-poll away, so this converges in
+            // microseconds and carries no tuned interval.
+            while !agent.cancel(session_id).await && !run.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            // Orderly exit through the run's own cancel tail — never drop it.
+            let _ = run.await;
+            debug!(
+                session_id,
+                yield_secs = yielding.elapsed().as_secs_f64(),
+                "Scheduled run yielded"
+            );
+            None
+        }
+    }
+}
+
+/// A panicked scheduled-run task is an error outcome, not a daemon crash.
+fn flatten_scheduled_join(
+    joined: Result<
+        Result<crate::agent_service::ChatResult, crate::agent_service::ChatError>,
+        tokio::task::JoinError,
+    >,
+) -> Result<crate::agent_service::ChatResult, crate::agent_service::ChatError> {
+    joined.unwrap_or_else(|join_err| {
+        Err(crate::agent_service::ChatError {
+            message: format!("scheduled run task failed: {join_err}"),
+            partial_result: None,
+        })
+    })
 }
 
 /// The main daemon server
@@ -1563,6 +1714,14 @@ impl DaemonServer {
             info!("Created default session: {}", default_session.id);
         }
 
+        // ONE run registry, created before the services so the embedding
+        // drain, the dream gate, the scheduler and the control plane all hold
+        // the same handle: "a mission is live" must be one fact, not two.
+        let chat_runs = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+        // ONE capability-transition ledger for the same reason — the provider
+        // plumbing records into the very ledger the step runners drain.
+        let degradations = Arc::new(nanna_agent::DegradationLedger::new());
+
         // Initialize services
         let (
             tools,
@@ -1573,7 +1732,7 @@ impl DaemonServer {
             workspace_id_for_services,
             turn_baselines,
             model_stats,
-        ) = self.init_services().await?;
+        ) = self.init_services(&chat_runs, &degradations).await?;
 
         // Recover any orphaned checkpoints from the database.
         if let Some(ref storage) = self.storage {
@@ -1705,11 +1864,8 @@ impl DaemonServer {
         // Scheduler: with daemon-first startup the daemon owns nanna.db, so it
         // is the cron runner (the GUI scheduler only runs in embedded mode).
         // Loads persisted jobs and runs heartbeat + memory consolidation,
-        // mirroring the GUI's embedded schedule.
-        // ONE run registry, created before the scheduler so the dream gate
-        // and the control plane hold the same handle: "a mission is live"
-        // must be one fact, not two.
-        let chat_runs = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+        // mirroring the GUI's embedded schedule. (`chat_runs` was created
+        // before the services above, and is the same handle everywhere.)
         // In-flight latch: the scheduler tick re-fired consolidation every
         // 30s while the previous one was still folding (observed 2026-08-10:
         // a fresh "Consolidation starting" per tick, none finishing) — one
@@ -1777,6 +1933,12 @@ impl DaemonServer {
 
             let chat_runs_for_tasks = chat_runs.clone();
             let dream_in_flight_for_tasks = dream_in_flight.clone();
+            // At most one yielded scheduled run waiting to resume. Not a
+            // quota — a dedup: reality already serializes scheduled runs (a
+            // live one makes every other tick skip), so a second waiter could
+            // only arise from an exotic interleaving, and dropping it costs
+            // one schedule period, which the log names.
+            let scheduled_resume_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let agent_for_tasks = agent.clone();
             let dreaming_for_tasks = dreaming.clone();
             let router_for_tasks = router.clone();
@@ -1806,6 +1968,7 @@ impl DaemonServer {
                 let summarization_models = summarization_models.clone();
                 let chat_runs = chat_runs_for_tasks.clone();
                 let dream_in_flight = dream_in_flight_for_tasks.clone();
+                let scheduled_resume_parked = scheduled_resume_parked.clone();
                 Box::pin(async move {
                     let start = std::time::Instant::now();
                     let started_at = chrono::Utc::now();
@@ -1856,10 +2019,32 @@ impl DaemonServer {
                                     consolidation_min_remaining,
                                     window_tokens,
                                 );
-                                let summarize = crate::dream_summarizer::summarize_with_failover(
-                                    router.clone(),
-                                    summarization_models.clone(),
-                                );
+                                // The any_active skip above gates the dream's
+                                // START; this gates its MIDDLE (P22 Tier 4): a
+                                // chat turn arriving mid-dream pauses the NEXT
+                                // cluster's summarization until the turn
+                                // releases, instead of contending with it for
+                                // the model. Cluster boundaries are the natural
+                                // yield points — a fold already in flight
+                                // completes (the CAS guards own staleness),
+                                // only new provider work waits. Dreaming is
+                                // idle-time work by definition, so it pauses
+                                // for a live turn whatever provider it
+                                // summarizes on.
+                                let inner_summarize =
+                                    crate::dream_summarizer::summarize_with_failover(
+                                        router.clone(),
+                                        summarization_models.clone(),
+                                    );
+                                let summarize_gate = chat_runs.clone();
+                                let summarize = move |prompt: String| {
+                                    let pending = inner_summarize(prompt);
+                                    let gate = summarize_gate.clone();
+                                    async move {
+                                        gate.wait_idle().await;
+                                        pending.await
+                                    }
+                                };
                                 match dreaming
                                     .dream_if_triggered(idle, &consolidation_config, summarize)
                                     .await
@@ -1964,24 +2149,21 @@ impl DaemonServer {
                             // vs the 5-min idle threshold, and memory pressure
                             // still overrides, so dreaming is not starved.
                             activity.record();
-                            // Session-scoped tools resolve their scope from the
-                            // registry, not from the prompt: without this every
-                            // `todo` call in a scheduled run failed with
-                            // "session scope requires session_id" (35 logged
-                            // failures, all of them heartbeats). The scope is
-                            // carried by the run's own future rather than
-                            // written into the shared binding — the idle gate
-                            // above stops a scheduled run STARTING during a
-                            // live run, but a chat can still start during THIS
-                            // one, and the two must not see each other's
-                            // session.
-                            let outcome = ToolRegistry::with_run_session(
-                                session_id.clone(),
-                                agent.chat(&session_id, &task.payload, None, &[]),
+                            // Session scoping (the `with_run_session` binding
+                            // that fixed 35 failed `todo` calls) now lives
+                            // inside `run_scheduled_prompt_yielding`, carried
+                            // by the run's own spawned future — a chat that
+                            // starts during this run cannot see the scheduled
+                            // session, nor vice versa.
+                            let outcome = run_scheduled_prompt_yielding(
+                                &agent,
+                                &chat_runs,
+                                &session_id,
+                                &task.payload,
                             )
                             .await;
                             match outcome {
-                                Ok(result) => {
+                                Some(Ok(result)) => {
                                     let heartbeat_ok = task.name == "heartbeat"
                                         && result.content.trim().contains("HEARTBEAT_OK");
                                     if heartbeat_ok {
@@ -2002,9 +2184,131 @@ impl DaemonServer {
                                     }
                                     (true, Some(result.content), None)
                                 }
-                                Err(e) => {
+                                Some(Err(e)) => {
                                     error!("Scheduled task '{}' failed: {}", task.name, e.message);
                                     (false, None, Some(e.message))
+                                }
+                                None => {
+                                    // The run yielded the local provider to a
+                                    // live chat turn (P22 Tier 4). Resume on
+                                    // release: ONE detached waiter re-runs the
+                                    // prompt when the registry goes idle —
+                                    // promptly, not at the next tick — and if
+                                    // a fresh user turn preempts the resumed
+                                    // run too, it parks again. That loop is
+                                    // bounded by user activity itself, not by
+                                    // a counter: every extra lap requires a
+                                    // new turn to have claimed the provider.
+                                    // The executor returns NOW because the
+                                    // heartbeat arm of the scheduler loop
+                                    // awaits it inline — parking here would
+                                    // stall every other scheduled task for as
+                                    // long as the chat runs.
+                                    if scheduled_resume_parked
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                    {
+                                        let resume_agent = agent.clone();
+                                        let resume_runs = chat_runs.clone();
+                                        let resume_activity = activity.clone();
+                                        let resume_parked = scheduled_resume_parked.clone();
+                                        let resume_session = session_id.clone();
+                                        let resume_payload = task.payload.clone();
+                                        let resume_name = task.name.clone();
+                                        tokio::spawn(async move {
+                                            loop {
+                                                resume_runs.wait_idle().await;
+                                                // The release tail unregisters
+                                                // the finished chat BEFORE
+                                                // releasing the registry, so an
+                                                // active run here is a NEW
+                                                // claimant — the slot is taken
+                                                // and the schedule covers the
+                                                // rest.
+                                                if resume_agent.any_run_active().await {
+                                                    debug!(
+                                                        task = %resume_name,
+                                                        "Yielded run superseded — the slot is \
+                                                         taken; the next tick owns the work"
+                                                    );
+                                                    break;
+                                                }
+                                                resume_activity.record();
+                                                match run_scheduled_prompt_yielding(
+                                                    &resume_agent,
+                                                    &resume_runs,
+                                                    &resume_session,
+                                                    &resume_payload,
+                                                )
+                                                .await
+                                                {
+                                                    Some(Ok(result)) => {
+                                                        let heartbeat_ok = resume_name
+                                                            == "heartbeat"
+                                                            && result
+                                                                .content
+                                                                .trim()
+                                                                .contains("HEARTBEAT_OK");
+                                                        if heartbeat_ok {
+                                                            debug!(
+                                                                "Heartbeat (resumed): OK \
+                                                                 (nothing to do)"
+                                                            );
+                                                        } else {
+                                                            info!(
+                                                                "Scheduled task '{}' completed \
+                                                                 after yielding: {}",
+                                                                resume_name,
+                                                                result
+                                                                    .content
+                                                                    .chars()
+                                                                    .take(200)
+                                                                    .collect::<String>()
+                                                            );
+                                                        }
+                                                        break;
+                                                    }
+                                                    Some(Err(e)) => {
+                                                        error!(
+                                                            "Scheduled task '{}' failed after \
+                                                             yielding: {}",
+                                                            resume_name, e.message
+                                                        );
+                                                        break;
+                                                    }
+                                                    None => {
+                                                        // Preempted again — user
+                                                        // turns keep priority.
+                                                    }
+                                                }
+                                            }
+                                            resume_parked
+                                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                                        });
+                                        (
+                                            true,
+                                            Some(
+                                                "Yielded to a live chat turn; resuming on release"
+                                                    .to_string(),
+                                            ),
+                                            None,
+                                        )
+                                    } else {
+                                        (
+                                            true,
+                                            Some(
+                                                "Yielded to a live chat turn; a resume is \
+                                                 already parked, the next tick covers this one"
+                                                    .to_string(),
+                                            ),
+                                            None,
+                                        )
+                                    }
                                 }
                             }
                             }
@@ -2044,6 +2348,7 @@ impl DaemonServer {
         .with_task_runs(Arc::new(crate::tasks::TaskRunManager::new()))
         .with_memory_recovery(self.memory_recovery.clone())
         .with_chat_runs(chat_runs.clone())
+        .with_degradations(degradations.clone())
         .with_shutdown(self.shutdown_tx.clone());
         if let Some(ref buf) = self.log_buffer {
             control = control.with_log_buffer(buf.clone());
@@ -2508,8 +2813,15 @@ impl DaemonServer {
     }
 
     /// Initialize all services
+    ///
+    /// `chat_runs` is THE liveness source for background-vs-user contention
+    /// (P22 Tier 4): the embedding drain pauses on it. `degradations` is the
+    /// capability-transition ledger the embed path records into and every
+    /// step runner drains.
     async fn init_services(
         &self,
+        chat_runs: &Arc<crate::control::chat_harness::ChatRunRegistry>,
+        degradations: &Arc<nanna_agent::DegradationLedger>,
     ) -> Result<
         (
             Arc<ToolRegistry>,
@@ -2659,13 +2971,54 @@ impl DaemonServer {
                     let memory_for_reembed: Arc<tokio::sync::OnceCell<Arc<MemoryService>>> =
                         Arc::new(tokio::sync::OnceCell::new());
                     let mem_cell_for_fn = memory_for_reembed.clone();
+                    // One drain at a time, process-wide — see `drain_backfill`.
+                    let drain_serial = Arc::new(tokio::sync::Mutex::new(()));
+                    let drain_serial_for_fn = drain_serial.clone();
+                    let chat_runs_for_fn = chat_runs.clone();
+                    let ledger_for_fn = degradations.clone();
 
                     let embed_fn: nanna_memory::EmbedFn = Arc::new(move |text: &str| {
                         let router = router_for_fn.clone();
                         let text = text.to_string();
                         let mem_cell = mem_cell_for_fn.clone();
+                        let drain_serial = drain_serial_for_fn.clone();
+                        let chat_runs = chat_runs_for_fn.clone();
+                        let ledger = ledger_for_fn.clone();
                         Box::pin(async move {
-                            let (embedding, switched_to) = router.embed_one(&text).await?;
+                            let attempted = router.embed_one(&text).await;
+
+                            // Capability transitions reach the model once, in
+                            // its next tool result (P22 Tier 4). The seam is
+                            // HERE — the one place every embed outcome passes —
+                            // because "no provider answered" is the moment
+                            // memory writes start landing vectorless, and the
+                            // first success afterwards is the moment they stop.
+                            // The ledger dedups by state, so the steady flow of
+                            // successes (and repeated failures) records nothing.
+                            match &attempted {
+                                Err(reason) => ledger.set(
+                                    "memory-embeddings",
+                                    "degraded",
+                                    format!(
+                                        "[capability notice — memory embeddings DEGRADED: no \
+                                         embedding provider is answering ({reason}). Memory and \
+                                         tool-result writes still SUCCEED and are stored in full — \
+                                         the Turso store remains the source of truth — but new \
+                                         entries are queued for embedding backfill, so semantic \
+                                         recall may miss them until a provider recovers. This \
+                                         notice will not repeat unless the state changes.]"
+                                    ),
+                                ),
+                                Ok(_) => ledger.set(
+                                    "memory-embeddings",
+                                    "healthy",
+                                    "[capability notice — memory embeddings RESTORED: an \
+                                     embedding provider is answering again; queued entries are \
+                                     backfilling and new writes are searchable normally.]",
+                                ),
+                            }
+
+                            let (embedding, switched_to) = attempted?;
 
                             // Provider switched — realign the store BEFORE this
                             // write is allowed to land, so it validates against
@@ -2727,8 +3080,11 @@ impl DaemonServer {
                                 // partway leaves exactly that state.
                                 let _ = missing;
                                 let mem = mem.clone();
+                                let chat_runs = chat_runs.clone();
+                                let drain_serial = drain_serial.clone();
                                 tokio::spawn(async move {
-                                    drain_backfill(&mem, &model).await;
+                                    drain_backfill(&mem, &model, &chat_runs, &drain_serial)
+                                        .await;
                                 });
                             }
 
@@ -2901,6 +3257,8 @@ impl DaemonServer {
                         let bind_model = bind_provider.to_string();
                         let memory_for_bind = memory_arc.clone();
                         let router_for_bind = embed_router.clone();
+                        let chat_runs_for_bind = chat_runs.clone();
+                        let drain_serial_for_bind = drain_serial.clone();
                         tokio::spawn(async move {
                             // The probed (or seeded) dimension and the model's
                             // input window travel WITH the model — the binding
@@ -2921,8 +3279,16 @@ impl DaemonServer {
                             // drains no-op immediately when their queue is
                             // empty, so the unconditional call costs one query
                             // each on a store that is already complete.
-                            drain_backfill(&memory_for_bind, &bind_model).await;
+                            drain_backfill(
+                                &memory_for_bind,
+                                &bind_model,
+                                &chat_runs_for_bind,
+                                &drain_serial_for_bind,
+                            )
+                            .await;
                         });
+                        let chat_runs_for_probe = chat_runs.clone();
+                        let drain_serial_for_probe = drain_serial.clone();
                         tokio::spawn(async move {
                             match memory_for_probe.probe_and_align_dimension().await {
                                 Ok(actual_dim) => {
@@ -2941,7 +3307,13 @@ impl DaemonServer {
                                         if let Some(model) =
                                             memory_for_probe.active_embedding_model().await
                                         {
-                                            drain_backfill(&memory_for_probe, &model).await;
+                                            drain_backfill(
+                                                &memory_for_probe,
+                                                &model,
+                                                &chat_runs_for_probe,
+                                                &drain_serial_for_probe,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -2976,6 +3348,17 @@ impl DaemonServer {
                         "No embedding provider available — memory runs WITHOUT vectors: writes \
                          persist and queue for backfill, recall is unavailable until an \
                          embedding provider is configured"
+                    );
+                    // The model finds out the same way the operator does —
+                    // once, in its first tool result, not on every write.
+                    degradations.set(
+                        "memory-embeddings",
+                        "degraded",
+                        "[capability notice — memory embeddings are OFF: no embedding provider \
+                         is configured. Memory and tool-result writes still SUCCEED and persist \
+                         in full — the Turso store is the source of truth — but they carry no \
+                         vectors, so semantic recall is unavailable until a provider is \
+                         configured. This notice will not repeat unless the state changes.]",
                     );
                     let config = nanna_memory::MemoryServiceConfig::default();
                     let memory_service = if let Some(ref storage) = self.storage {
@@ -3166,7 +3549,8 @@ impl DaemonServer {
             Some(self.config.data_dir.clone()),
         )
         .with_session_history(session_history)
-        .with_stats(model_stats.clone());
+        .with_stats(model_stats.clone())
+        .with_degradations(degradations.clone());
         if let Some(ref storage) = self.storage {
             agent_service = agent_service.with_storage(storage.clone());
         }
@@ -4208,5 +4592,96 @@ mod tests {
         assert!(!core.enabled);
         assert!(!core.heartbeat_enabled);
         assert_eq!(core.heartbeat_interval, std::time::Duration::from_secs(600));
+    }
+
+    /// A fake Ollama that answers everything EXCEPT a generation instantly,
+    /// and holds `/api/chat` / `/api/generate` open forever — the shape of a
+    /// generation occupying the single local slot.
+    async fn spawn_stalling_ollama() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read back the bound addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0_u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    if head.contains("/api/chat") || head.contains("/api/generate") {
+                        // Hold the slot forever: the test's preemption must be
+                        // what ends this, never a server response.
+                        std::future::pending::<()>().await;
+                    }
+                    let body = "{}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The P22 Tier 4 admission gate, end to end: a scheduled run whose
+    /// generation is parked inside the local provider yields within moments
+    /// of a user turn claiming the registry. Without the gate this test
+    /// cannot pass — the stalled generation never returns on its own, which
+    /// is exactly the 157-second slot squat the forensics measured (there it
+    /// eventually finished; here it provably never would).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_run_yields_the_local_provider_to_a_live_chat_turn() {
+        let base = spawn_stalling_ollama().await;
+        let router = Arc::new(LlmRouter::new().with_ollama(&base));
+        let config = AgentServiceConfig {
+            // The `ollama/` prefix is what arms preemption — from_model
+            // resolves it to the local single-slot provider.
+            model: "ollama/stall-model".to_string(),
+            ..AgentServiceConfig::default()
+        };
+        let (event_tx, _keep_events_alive) =
+            tokio::sync::broadcast::channel::<crate::protocol::Event>(16);
+        let tools = Arc::new(ToolRegistry::new());
+        let agent = Arc::new(AgentService::new(config, router, tools, None, event_tx));
+        let registry = Arc::new(crate::control::chat_harness::ChatRunRegistry::new());
+
+        let helper_agent = agent.clone();
+        let helper_registry = registry.clone();
+        let helper = tokio::spawn(async move {
+            run_scheduled_prompt_yielding(
+                &helper_agent,
+                &helper_registry,
+                "scheduled-yield-test",
+                "heartbeat check-in",
+            )
+            .await
+        });
+
+        // Let the scheduled run get genuinely in flight (request parked in
+        // the stalled generation), then a user turn arrives. The gate is
+        // correct even if the claim lands earlier — the cancel loop waits
+        // for the run's registration — so this sleep widens coverage, it
+        // does not carry the test.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            registry.try_claim("user-session").await,
+            "the user turn claims the run slot"
+        );
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), helper)
+            .await
+            .expect("the yield completes in moments, never after the stalled generation")
+            .expect("the helper task must not panic");
+        assert!(
+            outcome.is_none(),
+            "a preempted run reports a yield, not a result"
+        );
+        registry.release("user-session").await;
     }
 }

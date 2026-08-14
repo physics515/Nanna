@@ -261,3 +261,77 @@ async fn enable_disable_reconciles_live_registry() {
         "re-enabled tool must be registered again"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ChatRunRegistry admission gate (P22 Tier 4)
+// ---------------------------------------------------------------------------
+
+/// With nothing live, background work is admitted immediately — the gate
+/// must never add latency to an idle system.
+#[tokio::test]
+async fn gate_wait_idle_returns_immediately_when_nothing_runs() {
+    let registry = chat_harness::ChatRunRegistry::new();
+    tokio::time::timeout(std::time::Duration::from_secs(1), registry.wait_idle())
+        .await
+        .expect("an idle registry admits background work without waiting");
+}
+
+/// The admission edge: background work parks while a run is live and is
+/// released the moment the LAST run releases — priority, not a quota.
+#[tokio::test]
+async fn gate_wait_idle_parks_until_the_last_run_releases() {
+    let registry = Arc::new(chat_harness::ChatRunRegistry::new());
+    assert!(registry.try_claim("turn-a").await);
+    assert!(registry.try_claim("turn-b").await);
+
+    let gate = registry.clone();
+    let waiter = tokio::spawn(async move { gate.wait_idle().await });
+
+    // Still parked while ANY run is live.
+    registry.release("turn-a").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "one live run must keep the gate shut");
+
+    registry.release("turn-b").await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("the last release must wake the waiter")
+        .expect("waiter must not panic");
+}
+
+/// The preemption edge: a parked watcher fires the moment a run claims.
+#[tokio::test]
+async fn gate_wait_active_fires_on_claim() {
+    let registry = Arc::new(chat_harness::ChatRunRegistry::new());
+
+    let gate = registry.clone();
+    let watcher = tokio::spawn(async move { gate.wait_active().await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!watcher.is_finished(), "an idle registry must keep the preemption watcher parked");
+
+    assert!(registry.try_claim("user-turn").await);
+    tokio::time::timeout(std::time::Duration::from_secs(1), watcher)
+        .await
+        .expect("a claim must wake the preemption watcher")
+        .expect("watcher must not panic");
+}
+
+/// Wakeup-loss stress: edges fired in a tight loop while waiters park and
+/// re-park. Interest is registered before the condition check (`enable`), so
+/// no ordering of claim/release against a parking waiter may strand it.
+#[tokio::test(flavor = "multi_thread")]
+async fn gate_edges_are_never_lost_under_racing_claims() {
+    for _ in 0..100 {
+        let registry = Arc::new(chat_harness::ChatRunRegistry::new());
+        assert!(registry.try_claim("racer").await);
+        let gate = registry.clone();
+        let waiter = tokio::spawn(async move { gate.wait_idle().await });
+        // Release immediately — sometimes before the waiter first parks,
+        // sometimes after; both orderings must wake it.
+        registry.release("racer").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("no interleaving of claim/release may strand a waiter")
+            .expect("waiter must not panic");
+    }
+}

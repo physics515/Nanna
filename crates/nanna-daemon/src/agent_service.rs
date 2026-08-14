@@ -367,6 +367,10 @@ pub struct AgentService {
     /// per-model request stats here so the control plane persists them and
     /// the router reads them for health-aware routing. `None` = don't record.
     model_stats: Option<nanna_agent::ModelStatsTracker>,
+    /// Capability-transition notices, shared with the daemon's provider
+    /// plumbing (P22 Tier 4). Every run delivers pending transitions once,
+    /// in its next tool result — see [`nanna_agent::DegradationLedger`].
+    degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 impl AgentService {
@@ -418,6 +422,7 @@ impl AgentService {
             session_history: None,
             storage: None,
             model_stats: None,
+            degradations: None,
         }
     }
 
@@ -439,6 +444,14 @@ impl AgentService {
     #[must_use]
     pub fn with_stats(mut self, stats: nanna_agent::ModelStatsTracker) -> Self {
         self.model_stats = Some(stats);
+        self
+    }
+
+    /// Share the capability-transition ledger with this service's runs — see
+    /// [`nanna_agent::DegradationLedger`] for the announce-once contract.
+    #[must_use]
+    pub fn with_degradations(mut self, ledger: Arc<nanna_agent::DegradationLedger>) -> Self {
+        self.degradations = Some(ledger);
         self
     }
 
@@ -1047,6 +1060,9 @@ impl AgentService {
                 attachments: attachments.clone(),
                 is_sub_agent,
                 all_tools_active: is_sub_agent,
+                // Capability transitions (provider benched, writes queued)
+                // reach the model once, in its next tool result.
+                degradations: self.degradations.clone(),
                 // "One path": a chat whose message opens with MISSION runs
                 // long-horizon — the loop auto-continues the model (visible
                 // as mission_control tool chips) until it declares MISSION
