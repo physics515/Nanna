@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Core tools always sent to the LLM. Everything else is discoverable via `discover_tools`.
@@ -4023,6 +4023,23 @@ impl Agent {
         // finalized tool calls) must not fire recovery on a healthy later round.
         state.thinking_spiral_detected = false;
 
+        // Stream watchdog. The bound is DERIVED, not chosen: the transport
+        // already declares its silence tolerance (`STREAM_READ_TIMEOUT_SECS`
+        // of quiet between chunks kills the connection with an error), so on
+        // any truly silent socket the transport fires first and the error
+        // takes the normal retry path below. A wait of 2× that bound can
+        // therefore only be reached when the transport still believes the
+        // stream healthy while no event arrives — a wedged future (lost
+        // waker, swallowed pipeline stage), the class that held a session
+        // silent for 50+ minutes on 2026-08-10 with zero log output. 2 is
+        // the smallest multiple that cannot race the transport's own timer.
+        // The timeout is re-armed on every event: it bounds SILENCE, never
+        // total stream length, mirroring the transport's own semantics.
+        const STREAM_WATCHDOG_MULTIPLE: u64 = 2;
+        let watchdog = std::time::Duration::from_secs(
+            nanna_llm::STREAM_READ_TIMEOUT_SECS * STREAM_WATCHDOG_MULTIPLE,
+        );
+
         loop {
             // Race the stream read against cancellation. A poll at batch
             // arrival alone is not enough: a model deep in a silent
@@ -4030,6 +4047,7 @@ impl Agent {
             // arrives to carry the check — the request stayed live for
             // minutes after Stop (observed 2026-07-31). Breaking here
             // drops `stream`, which closes the in-flight HTTP response.
+            let next = tokio::time::timeout(watchdog, stream.next());
             let event = if let Some(token) = cancel {
                 tokio::select! {
                     biased;
@@ -4039,10 +4057,30 @@ impl Agent {
                         // already accumulated survive in the partial result.
                         break;
                     }
-                    event = stream.next() => event,
+                    event = next => event,
                 }
             } else {
-                stream.next().await
+                next.await
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(_elapsed) => {
+                    let silent_secs = watchdog.as_secs();
+                    error!(
+                        model = %request.model,
+                        silent_secs,
+                        read_timeout_secs = nanna_llm::STREAM_READ_TIMEOUT_SECS,
+                        "⏱️ STREAM WATCHDOG: no token, no block, no error for {silent_secs}s — \
+                         the transport's own read timeout never fired, so the stream future is \
+                         wedged; abandoning the call loudly instead of hanging the turn"
+                    );
+                    return Err(AgentError::StreamWatchdog {
+                        silent_secs,
+                        read_timeout_secs: nanna_llm::STREAM_READ_TIMEOUT_SECS,
+                        multiple: STREAM_WATCHDOG_MULTIPLE,
+                        model: request.model.clone(),
+                    });
+                }
             };
             let Some(event) = event else { break };
             match event? {
@@ -6619,11 +6657,13 @@ fn is_write_tool(name: &str) -> bool {
 /// succeed forever without changing anything outside the context window,
 /// so they are never claim evidence.
 ///
-/// Crate-visible because the harness asks the same question one rung up: a
-/// continuation round that made no work-evidence call changed nothing in the
-/// world, which is the structural half of the mission's convergence signal.
-/// One classification, two rungs — a second list would drift.
-pub(crate) fn is_work_evidence_tool(name: &str) -> bool {
+/// Public because every rung of the stack asks the same question: the
+/// completion-claim gate here, the harness one rung up (a continuation round
+/// that made no work-evidence call changed nothing in the world), and the
+/// daemon's session-liveness ledger one rung above that ("when did this
+/// session last change the world?", the wedged-vs-working discriminator).
+/// One classification, three rungs — a second list would drift.
+pub fn is_work_evidence_tool(name: &str) -> bool {
     is_write_tool(name)
         || matches!(
             name,

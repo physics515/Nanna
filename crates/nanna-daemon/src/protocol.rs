@@ -262,6 +262,12 @@ pub enum SessionAction {
         #[serde(default)]
         light: bool,
     },
+    /// Session-scoped liveness: is this session working, wedged, or finished
+    /// — answered from the daemon's own ledger (current phase, what the turn
+    /// awaits, last step, last tool call, last side-effecting call, stop
+    /// state) instead of a client grepping logs or proxying on log bytes.
+    /// Constant-size response, safe to poll.
+    Liveness { id: String },
     /// Set/change the workspace for a session (None = make global)
     SetWorkspace {
         id: String,
@@ -701,6 +707,33 @@ pub enum Event {
         duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
+    },
+
+    /// Low-frequency liveness beat while a chat turn is in flight. Lets any
+    /// watcher — GUI spinner, a script, a bench driver — distinguish "the
+    /// model is thinking" from "the process is gone" without reading logs:
+    /// beats continue while the daemon is alive and the turn is live; beats
+    /// stopping without a `message_end` means wedged or dead. Cadence is
+    /// derived from the silence budgets (`liveness::beat_interval_secs`),
+    /// ~30s today.
+    LivenessBeat {
+        session_id: String,
+        /// Seconds since this turn started.
+        elapsed_s: u64,
+        /// Coarse phase: planning | step_pending | streaming | thinking | tool.
+        phase: String,
+        /// What the turn is waiting on right now, human-readable
+        /// (e.g. "model output (ollama/qwen3.5:9b): last token 41s ago").
+        awaiting: String,
+        /// Seconds since the last observed event in this turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quiet_s: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_tool: Option<String>,
+        /// Monotone beat counter within the turn (gap detection).
+        beat: u64,
     },
 
     // Session events

@@ -227,7 +227,7 @@ impl ChannelManager {
     ///
     /// This is `pub` so the webhook event processor in `server.rs` can call it
     /// directly after converting a `WebhookEvent` into an `IncomingMessage`.
-    pub async fn process_message(msg: IncomingMessage, control: &ControlPlane, router: &MessageRouter) {
+    pub async fn process_message(msg: IncomingMessage, control: &Arc<ControlPlane>, router: &MessageRouter) {
         let text = match &msg.content {
             MessageContent::Text { text } => text.clone(),
             _ => {

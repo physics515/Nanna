@@ -189,13 +189,9 @@ impl ControlPlane {
     /// Returns `Ok(None)` when a run is already live for the session: the
     /// message was admitted to that run instead.
     pub(super) async fn run_chat_turn(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         content: &str,
-        system_prompt: String,
-        conversation: Option<String>,
-        workspace_root: Option<PathBuf>,
-        workspace_context: Option<String>,
     ) -> Result<Option<String>, String> {
         let (Some(agent), Some(router), Some(tools), Some(storage), Some(event_tx)) = (
             self.agent.clone(),
@@ -232,6 +228,24 @@ impl ControlPlane {
         // persistence work exactly as for the in-service chat path.
         let run_handle = agent.register_external_run(session_id).await;
 
+        // P22 liveness: one ledger per session, stamped by the sink below,
+        // read by the beat task and the `session.liveness` verb. The entry
+        // outlives the turn so cross-turn state (last stop, the repeat-
+        // completion streak) survives between turns.
+        //
+        // The turn opens HERE, before the spawn: the beat task quits the
+        // moment it sees a non-running ledger, so opening inside the spawned
+        // task would let a delayed first poll of that task kill the beat for
+        // the whole turn. Prep (recall over possibly-benched embedders,
+        // workspace reload, memory writes) runs inside the spawn and is
+        // exactly the silent stretch the beat must cover — the ministral
+        // mission's first tool call came 2m28s after send, all of it
+        // pre-model. The fingerprint keys the repeat-completion escalation
+        // to THIS request; the model is attached once the runner config
+        // exists.
+        let live = self.liveness.handle(session_id);
+        live.begin_turn(None, crate::liveness::content_fingerprint(content));
+
         let sink = ChatSink {
             session_id: session_id.to_string(),
             message_id: message_id.clone(),
@@ -241,65 +255,19 @@ impl ControlPlane {
             // stats tracker and the Turso time-series.
             tool_stats: Some(self.tool_stats.clone()),
             storage: Some(storage.clone()),
+            liveness: Some(live.clone()),
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
         };
         // The finalizer needs the sink after the step runner takes ownership;
         // ChatSink is a bundle of shared handles, so a clone IS the same sink.
         let final_sink = sink.clone();
 
-        // The active workspace scopes stored memories, so a run's observations
-        // belong to the workspace they happened in. `services_workspace_id` is
-        // the same handle the tool services use, so tools and memory agree.
-        let active_workspace_id = match &self.services_workspace_id {
-            Some(ws) => ws.read().await.clone(),
-            None => None,
-        };
-
-        let step_runner = AgentStepRunner {
-            discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
-            // One ledger for the whole turn: the breakers' streaks must
-            // outlive the step boundary that discards every other RunState
-            // field, or their thresholds are unreachable.
-            repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
-            router: router.clone(),
-            tools: tools.clone(),
-            agent_config: agent.agent_config().await,
-            system_prompt,
-            workspace_root: workspace_root.clone(),
-            workspace_context,
-            stats: Some(self.model_stats.clone()),
-            chat_sink: Some(sink),
-            // Tool results go to memory, a stub goes to context.
-            memory: self.memory.clone(),
-            workspace_id: active_workspace_id,
-            gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        };
-        // The planner shares the step runner's provider handling but must not
-        // stream its JSON into the transcript — planning is not work to show.
-        let planner_runner = AgentStepRunner {
-            discovered_tools: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
-            chat_sink: None,
-            router: step_runner.router.clone(),
-            tools: step_runner.tools.clone(),
-            agent_config: step_runner.agent_config.clone(),
-            system_prompt: step_runner.system_prompt.clone(),
-            workspace_root: step_runner.workspace_root.clone(),
-            // The planner sees the same bounded reference: acting on ROADMAP
-            // items nobody asked for is precisely a planning failure.
-            workspace_context: step_runner.workspace_context.clone(),
-            stats: step_runner.stats.clone(),
-            // Planning calls no tools, so it has nothing to remember.
-            memory: None,
-            workspace_id: None,
-            // One run, one fault tally: a GPU fault seen while planning and
-            // one seen while stepping are the same repeat evidence. The
-            // breaker ledger is shared for the same reason — planning calls
-            // no tools today, so this costs nothing and cannot drift if that
-            // ever changes.
-            gpu_fault_count: step_runner.gpu_fault_count.clone(),
-            repeat_ledger: Arc::clone(&step_runner.repeat_ledger),
-        };
-        let planner = Arc::new(AgentPlanner::new(Arc::new(planner_runner)));
+        // P22: the step runner and planner are built INSIDE the spawned turn,
+        // after `prepare_chat_turn` — their system prompt and workspace come
+        // out of that prep, and nothing before the spawn may block the
+        // delivery ack. `this` is the owned control-plane handle the spawned
+        // task preps through.
+        let this = Arc::clone(self);
 
         // Opt-in assistant auto-remember, matching the user-message side of
         // the Send handler.
@@ -324,35 +292,143 @@ impl ControlPlane {
         let watcher_baselines = turn_baselines.clone();
         let watcher_session = session_id.to_string();
         let watcher_message_id = message_id.clone();
+        let watcher_live = live.clone();
+
+        // Handles for the liveness beat task below; `live` itself moves into
+        // the turn task, which owns begin/finish.
+        let beat_live = live.clone();
+        let beat_event_tx = event_tx.clone();
+        let beat_session = session_id.to_string();
 
         let turn = tokio::spawn(async move {
             let scope = "session".to_string();
             let scope_id = Some(session_id_owned.clone());
 
-            // Deterministic fail-fast: the planner and every harness step
-            // resolve the provider the same way, so a model no provider
-            // serves has already decided the whole turn. Without this check
-            // the turn still "runs": the planner falls back to a single-task
-            // plan, both step attempts fail identically, poison containment
-            // cancels the item, and the run exits AllTasksDone with zero
-            // steps and nothing streamed — the user sees their prompt struck
-            // through as a cancelled task and no reply at all (observed live
-            // 2026-07-31, priority set to bare "claude-fable-5" with only
-            // OpenRouter configured). Say why instead, and seed no task that
-            // is born dead.
-            let model = step_runner.agent_config.model.clone();
-            if step_runner.router.client_for_model(&model).is_none() {
-                tracing::warn!(
-                    %model,
-                    "chat turn cannot run: no provider serves the configured model"
-                );
-                final_sink.delta(&format!(
-                    "_could not run: no provider is configured for model '{model}'. \
-                     Add the provider's credential in Settings — it registers \
-                     live, no restart needed — or pick a model from an \
-                     available provider in Settings → Models._"
-                ));
-            } else {
+            // The liveness ledger was opened before this task was spawned
+            // (see the `begin_turn` call above). How this turn ended, for
+            // the ledger: overwritten wherever a more precise verdict
+            // exists; `no_run` covers the paths that never reach the
+            // harness (prep failure, seed failure).
+            let mut turn_stop_kind = "no_run".to_string();
+
+            // Prep, then build the runners. `None` = the turn cannot run at
+            // all — the reason is already announced in the transcript, and
+            // the release tail below still runs.
+            let runners = match this
+                .prepare_chat_turn(&session_id_owned, &content_owned)
+                .await
+            {
+                Err(message) => {
+                    tracing::warn!(%message, "chat turn preparation failed — nothing was run");
+                    final_sink.delta(&format!("_could not start the run: {message}_"));
+                    None
+                }
+                Ok(prep) => {
+                    let super::chat::ChatTurnPrep {
+                        system_prompt,
+                        conversation,
+                        workspace_root,
+                        workspace_context,
+                    } = prep;
+
+                    // The active workspace scopes stored memories, so a run's
+                    // observations belong to the workspace they happened in.
+                    // `services_workspace_id` is the same handle the tool
+                    // services use (prep just updated it), so tools and
+                    // memory agree.
+                    let active_workspace_id = match &this.services_workspace_id {
+                        Some(ws) => ws.read().await.clone(),
+                        None => None,
+                    };
+
+                    let step_runner = AgentStepRunner {
+                        discovered_tools: Arc::new(tokio::sync::RwLock::new(
+                            std::collections::HashSet::new(),
+                        )),
+                        // One ledger for the whole turn: the breakers' streaks
+                        // must outlive the step boundary that discards every
+                        // other RunState field, or their thresholds are
+                        // unreachable.
+                        repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
+                        router: router.clone(),
+                        tools: tools.clone(),
+                        agent_config: agent.agent_config().await,
+                        system_prompt,
+                        workspace_root: workspace_root.clone(),
+                        workspace_context,
+                        stats: Some(this.model_stats.clone()),
+                        chat_sink: Some(sink),
+                        // Tool results go to memory, a stub goes to context.
+                        memory: this.memory.clone(),
+                        workspace_id: active_workspace_id,
+                        gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    };
+                    // The planner shares the step runner's provider handling
+                    // but must not stream its JSON into the transcript —
+                    // planning is not work to show.
+                    let planner_runner = AgentStepRunner {
+                        discovered_tools: Arc::new(tokio::sync::RwLock::new(
+                            std::collections::HashSet::new(),
+                        )),
+                        chat_sink: None,
+                        router: step_runner.router.clone(),
+                        tools: step_runner.tools.clone(),
+                        agent_config: step_runner.agent_config.clone(),
+                        system_prompt: step_runner.system_prompt.clone(),
+                        workspace_root: step_runner.workspace_root.clone(),
+                        // The planner sees the same bounded reference: acting
+                        // on ROADMAP items nobody asked for is precisely a
+                        // planning failure.
+                        workspace_context: step_runner.workspace_context.clone(),
+                        stats: step_runner.stats.clone(),
+                        // Planning calls no tools, so it has nothing to remember.
+                        memory: None,
+                        workspace_id: None,
+                        // One run, one fault tally: a GPU fault seen while
+                        // planning and one seen while stepping are the same
+                        // repeat evidence. The breaker ledger is shared for
+                        // the same reason — planning calls no tools today, so
+                        // this costs nothing and cannot drift if that ever
+                        // changes.
+                        gpu_fault_count: step_runner.gpu_fault_count.clone(),
+                        repeat_ledger: Arc::clone(&step_runner.repeat_ledger),
+                    };
+                    let planner = Arc::new(AgentPlanner::new(Arc::new(planner_runner)));
+
+                    // Deterministic fail-fast: the planner and every harness
+                    // step resolve the provider the same way, so a model no
+                    // provider serves has already decided the whole turn.
+                    // Without this check the turn still "runs": the planner
+                    // falls back to a single-task plan, both step attempts
+                    // fail identically, poison containment cancels the item,
+                    // and the run exits AllTasksDone with zero steps and
+                    // nothing streamed — the user sees their prompt struck
+                    // through as a cancelled task and no reply at all
+                    // (observed live 2026-07-31, priority set to bare
+                    // "claude-fable-5" with only OpenRouter configured). Say
+                    // why instead, and seed no task that is born dead.
+                    let model = step_runner.agent_config.model.clone();
+                    live.set_model(&model);
+                    if step_runner.router.client_for_model(&model).is_none() {
+                        turn_stop_kind = "no_provider".to_string();
+                        tracing::warn!(
+                            %model,
+                            "chat turn cannot run: no provider serves the configured model"
+                        );
+                        final_sink.delta(&format!(
+                            "_could not run: no provider is configured for model '{model}'. \
+                             Add the provider's credential in Settings — it registers \
+                             live, no restart needed — or pick a model from an \
+                             available provider in Settings → Models._"
+                        ));
+                        None
+                    } else {
+                        Some((step_runner, planner, conversation, workspace_root))
+                    }
+                }
+            };
+
+            if let Some((step_runner, planner, conversation, workspace_root)) = runners {
                 // Unfinished work from an earlier turn is INFORMATION FOR THE
                 // MODEL, not an instruction to the harness. Owner directive
                 // (2026-07-25): *"the model should decide to resume or answer
@@ -394,6 +470,7 @@ impl ControlPlane {
                         .await;
                 }
 
+                live.on_planning();
                 let plan = planner
                     .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
                     .await;
@@ -850,6 +927,10 @@ impl ControlPlane {
                             report.stop = more.stop;
                         }
 
+                        // The ledger records the FINAL round's verdict — the
+                        // stop the user actually experienced.
+                        turn_stop_kind = stop_kind(&report.stop);
+
                         // A run that failed must SAY it failed. Poison
                         // containment can drain the whole plan through
                         // abandonment and exit `AllTasksDone` having streamed
@@ -896,6 +977,34 @@ impl ControlPlane {
                         }
                     }
                 }
+            }
+
+            // P22: close the liveness ledger. When this exit is a REPEAT —
+            // the same request ending `all_tasks_done` again with zero
+            // side-effecting work in between — the repeat is STATED in the
+            // transcript instead of completing silently. The lfm leg
+            // declared itself done 28 times over four hours with nothing on
+            // disk, and every declaration looked identical to a genuine
+            // finish; a confident "done" repeated after every nudge with
+            // nothing to show for it is the most corrosive shape the product
+            // has. This delta runs before the transcript is persisted below,
+            // so the escalation is part of the assistant message itself.
+            if let Some(repeats) = live.finish_turn(&turn_stop_kind) {
+                tracing::warn!(
+                    session_id = %session_id_owned,
+                    repeats,
+                    "run ended all_tasks_done again for the same request with zero new \
+                     side effects — stating the repeat in the transcript"
+                );
+                final_sink.delta(&format!(
+                    "\n\n_⚠️ repeat completion #{repeats}: this same request has now ended \
+                     \"all tasks done\" {} times in a row with no side-effecting work in \
+                     between — nothing was written, edited, or executed, so the world is \
+                     exactly as it was. If you expected something to exist by now, it does \
+                     not. Name the missing outcome (a file, a command, a change) and I \
+                     will target it directly instead of re-verifying._",
+                    repeats + 1,
+                ));
             }
 
             // The turn is over and the chat is back to waiting on input, so it
@@ -1024,6 +1133,50 @@ impl ControlPlane {
             if let Some(baselines) = watcher_baselines {
                 baselines.close_turn("session", Some(&watcher_session)).await;
             }
+            // Close the liveness ledger too, or the beat task would keep
+            // beating for a turn that no longer exists. `crashed` also gives
+            // the `session.liveness` verb an honest stop state.
+            let _ = watcher_live.finish_turn("crashed");
+        });
+
+        // P22 liveness beat: while this turn is in flight, say so — in the
+        // log AND over IPC — at the derived cadence (`beat_interval_secs`,
+        // ~30s today; see its doc for the derivation from the silence
+        // budgets). A dead daemon and a slow model look identical from
+        // outside: the 2026-08-10 ministral leg was 3h59m of silence scored
+        // as a model result, and the GUI spinner asks the same question every
+        // session. The beat makes "alive and lawfully waiting" a positive
+        // signal, so the ABSENCE of beats finally means something. The task
+        // exits by itself: `beat()` returns None once the release tail or the
+        // death watcher closes the ledger's turn.
+        tokio::spawn(async move {
+            let period =
+                std::time::Duration::from_secs(crate::liveness::beat_interval_secs());
+            loop {
+                tokio::time::sleep(period).await;
+                let Some(snap) = beat_live.beat() else { break };
+                tracing::info!(
+                    session_id = %beat_session,
+                    elapsed_s = snap.elapsed_s,
+                    quiet_s = snap.quiet_s,
+                    phase = snap.phase.as_str(),
+                    awaiting = %snap.awaiting,
+                    step_index = ?snap.step_index,
+                    last_tool = snap.last_tool.as_ref().map(|t| t.name.as_str()),
+                    beat = snap.beats,
+                    "liveness beat"
+                );
+                let _ = beat_event_tx.send(crate::protocol::Event::LivenessBeat {
+                    session_id: beat_session.clone(),
+                    elapsed_s: snap.elapsed_s,
+                    phase: snap.phase.as_str().to_string(),
+                    awaiting: snap.awaiting.clone(),
+                    quiet_s: snap.quiet_s,
+                    step_index: snap.step_index,
+                    last_tool: snap.last_tool.map(|t| t.name),
+                    beat: snap.beats,
+                });
+            }
         });
 
         Ok(Some(message_id))
@@ -1041,7 +1194,40 @@ pub fn interjected_response(session_id: &str, depth: usize) -> Value {
         "pending": depth,
         "content": "",
         "message": "admitted to the run in progress at the next step boundary",
+        // P22 delivery contract — see `started_response`.
+        "delivery": "accepted",
+        "accepted_at": chrono::Utc::now().to_rfc3339(),
     })
+}
+
+/// Shape the chat handler returns the moment a NEW run is admitted: the
+/// DELIVERY ack (P22). `delivery: "accepted"` + `accepted_at` are the
+/// explicit contract that this response certifies delivery only — the user
+/// message is persisted and a run owns it. Run completion arrives as events
+/// (`message_end`), never in this response, and nothing slower than the
+/// claim decision may run before it: the bench driver twice reported a
+/// mission as un-sent after a 120s `chat.send` timeout while the daemon had
+/// in fact accepted it and was grinding through recall (2026-08-10), and the
+/// GUI has the same ambiguity for any first turn slow to produce a token.
+#[must_use]
+pub fn started_response(message_id: &str) -> Value {
+    json!({
+        "status": "started",
+        "message_id": message_id,
+        "content": "",
+        "delivery": "accepted",
+        "accepted_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Snake-case wire kind of a stop reason, extracted from the enum's own serde
+/// tag (`#[serde(tag = "reason", rename_all = "snake_case")]`) so the
+/// liveness ledger's spelling can never drift from the enum.
+fn stop_kind(stop: &nanna_agent::harness::StopReason) -> String {
+    serde_json::to_value(stop)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str().map(str::to_string)))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The user-visible line for a run that ended in failure, or `None` when the
@@ -1306,6 +1492,48 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use nanna_agent::harness::{LongHorizonReport, StopReason};
+
+    /// P22 delivery-ack contract: both admission shapes certify delivery
+    /// explicitly and are distinguishable from any run-completion payload.
+    /// A client that sees `delivery: "accepted"` knows the message is
+    /// persisted and owned by a run — anything else is "not delivered".
+    #[test]
+    fn started_ack_certifies_delivery_not_completion() {
+        let ack = started_response("msg-1");
+        assert_eq!(ack["status"], "started");
+        assert_eq!(ack["message_id"], "msg-1");
+        assert_eq!(ack["delivery"], "accepted");
+        assert!(ack["accepted_at"].as_str().is_some_and(|t| !t.is_empty()));
+        // Empty content: the transcript is driven by events, never by this ack.
+        assert_eq!(ack["content"], "");
+    }
+
+    #[test]
+    fn interjected_ack_carries_the_same_delivery_contract() {
+        let ack = interjected_response("session-9", 3);
+        assert_eq!(ack["status"], "interjected");
+        assert_eq!(ack["pending"], 3);
+        assert_eq!(ack["delivery"], "accepted");
+        assert!(ack["accepted_at"].as_str().is_some_and(|t| !t.is_empty()));
+    }
+
+    /// `stop_kind` reads the enum's own serde tag, so the liveness ledger's
+    /// spelling tracks the enum by construction.
+    #[test]
+    fn stop_kind_matches_the_serde_tag() {
+        assert_eq!(stop_kind(&StopReason::AllTasksDone), "all_tasks_done");
+        assert_eq!(stop_kind(&StopReason::Cancelled), "cancelled");
+        assert_eq!(
+            stop_kind(&StopReason::RunnerErrors { message: "x".into() }),
+            "runner_errors"
+        );
+        assert_eq!(
+            stop_kind(&StopReason::SourceError { message: "x".into() }),
+            "source_error"
+        );
+        assert_eq!(stop_kind(&StopReason::WallClockExhausted), "wall_clock_exhausted");
+        assert_eq!(stop_kind(&StopReason::TokenBudgetExhausted), "token_budget_exhausted");
+    }
 
     fn msg(role: MessageRole, content: &str) -> SessionMessage {
         SessionMessage {

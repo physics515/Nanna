@@ -241,33 +241,45 @@ fn run_daemon(cli: &Cli) -> Result<(), String> {
         
         // Setup signal handlers
         let shutdown_tx = daemon.shutdown_handle();
-        
+        // Record the signal in the terminal reason file BEFORE requesting the
+        // drain: if the process is killed mid-drain the record says `signal`,
+        // and if the drain completes it is overwritten with `clean_shutdown`.
+        // Either way the file never reads `running` for a signal-initiated
+        // death. (No-op until the daemon arms the file at startup, so a
+        // duplicate instance Ctrl-C'd while losing the PID race cannot
+        // clobber the live daemon's record.)
+        let exit_reason = daemon.exit_reason_handle();
+
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
             let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
-            
+
             let shutdown = shutdown_tx.clone();
             tokio::spawn(async move {
-                tokio::select! {
+                let name = tokio::select! {
                     _ = sigterm.recv() => {
                         info!("Received SIGTERM");
+                        "SIGTERM"
                     }
                     _ = sigint.recv() => {
                         info!("Received SIGINT");
+                        "SIGINT"
                     }
-                }
+                };
+                exit_reason.record_exit("signal", Some(name));
                 let _ = shutdown.send(());
             });
         }
-        
+
         #[cfg(windows)]
         {
             let shutdown = shutdown_tx.clone();
             tokio::spawn(async move {
                 tokio::signal::ctrl_c().await.ok();
                 info!("Received Ctrl+C");
+                exit_reason.record_exit("signal", Some("ctrl_c"));
                 let _ = shutdown.send(());
             });
         }
