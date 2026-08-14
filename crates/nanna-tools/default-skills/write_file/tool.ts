@@ -1,8 +1,8 @@
 export default {
   name: "write_file",
-  version: "0.1.14",
+  version: "0.1.15",
   output: "memory",
-  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: blocked if new content is under 30% of the largest size the file has held (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy.",
+  description: "Write content to a file. BOTH parameters are REQUIRED on every call: file_path AND content (the complete file text). A call without content does nothing and fails. Creates the file if it doesn't exist, overwrites if it does. For files too long to write in one call, use file_buffer (append chunks, then commit) instead. SAFETY: a shrinking rewrite of a file that changed since you last read it returns the file's CURRENT content to merge (not a refusal); blocked if new content is under 30% of the last known-good size (likely truncation), if a .py file would not parse, or if the filename looks like a versioned copy. After each write the cheapest structural check (sh -n / node --check / JSON.parse) runs and its verdict is appended; a full overwrite parks the previous version at <file>.__prev__ for recovery.",
   parameters: {
     type: "object",
     properties: {
@@ -17,6 +17,15 @@ export default {
     // models read as corruption and spiral on.
     function fail(message) {
       return { content: message, success: false };
+    }
+
+    // Guard events are logged at INFO so they can be audited from the daemon
+    // log after a run. P22 evidence: `grep 'rewrite REMOVED'` over a 4-hour
+    // leg returned 0 hits with no way to tell "never fired" from "fired,
+    // unlogged" — tool results reach the log only as a ~25-char memory
+    // prefix. A safety net you cannot audit is not a safety net. Best-effort.
+    function glog(msg) {
+      try { Nanna.log("info", msg); } catch (e) { /* logging is optional */ }
     }
 
     // A refusal the model keeps re-earning has stopped being information.
@@ -39,15 +48,6 @@ export default {
     var REFUSAL_STATE = ".nanna/write_refusals.json";
     var REFUSAL_ESCALATE_AT = 2;
     var REFUSAL_MAX_ENTRIES = 200;
-    function refusalCount(key) {
-      try {
-        var map = JSON.parse(Nanna.readFile(REFUSAL_STATE));
-        var n = map && map[key];
-        return typeof n === "number" && isFinite(n) && n > 0 ? n : 0;
-      } catch (e) {
-        return 0;
-      }
-    }
     function refusalBump(key) {
       try {
         var map;
@@ -71,57 +71,92 @@ export default {
     // per-tool counter would let it spend the full quota twice over.
     function failEscalating(pathKey, normal, blunt) {
       var n = refusalBump("fork:" + pathKey);
-      return fail(n > REFUSAL_ESCALATE_AT ? blunt : normal);
+      var msg = n > REFUSAL_ESCALATE_AT ? blunt : normal;
+      glog("write_file guard refused (fork, attempt " + n + "): " + pathKey);
+      return fail(msg);
     }
 
     // Anti-erosion ratchet (round-17 lesson): the 30% shrink floor used to be
     // relative to the CURRENT size, so repeated 60-80% rewrites during fault
     // storms compounded (0.7^n) and slowly hollowed files out without ever
-    // tripping the guard. The floor is now 30% of the LARGEST size the file
-    // has held, tracked per workspace in .nanna/write_hiwater.json (.nanna/
-    // is the non-markdown local-state dir — never beside user files, so no
-    // sidecar clutter). Each entry stores {hi, last, at}: `hi` is the
-    // high-water mark, `last` is the size write_file ITSELF last left on
-    // disk. While the file EXISTS, `hi` is MONOTONE: an out-of-band change
-    // (edit_file, file_buffer, exec, the user) is more evidence of held
-    // mass, folded in as max(hi, disk) — never a license to restart the
-    // history downward. The 2026-08-08 ornith endurance log showed why the
-    // old rule (out-of-band change re-bases hi to disk truth) was a
-    // laundering hole: an exec append re-shaped the file, the next write
-    // re-based hi 3794→1566, and an 875-byte rewrite that the true history
-    // would have refused sailed through — the final artifact kept 8 of 37
-    // verified commands. Grow-writes are never refused regardless (the
-    // refusal requires bytes < current disk size), so the verify-round
-    // blocker this rule replaced (grow-writes after an out-of-band shrink
-    // looped forever) cannot recur; a deliberate whole-file re-shape has
-    // honest doors: delete + recreate (creation re-arms from the new size)
-    // or force. Every state operation fails OPEN: a missing or corrupt
-    // state file degrades to the old current-size behavior, never blocks a
-    // write.
+    // tripping the guard. The floor base is tracked per workspace in
+    // .nanna/write_hiwater.json (.nanna/ is the non-markdown local-state dir —
+    // never beside user files, so no sidecar clutter). Each entry stores
+    // {hi, last, at, good?, goodAt?, chk?}: `hi` is the high-water mark,
+    // `last` is the size write_file ITSELF last left on disk, `good` is the
+    // size of the newest version that passed a structural check and `chk` the
+    // latest check verdict. While the file EXISTS, `hi` is MONOTONE: an
+    // out-of-band change (edit_file, file_buffer, exec, the user) is more
+    // evidence of held mass, folded in as max(hi, disk) — never a license to
+    // restart the history downward. The 2026-08-08 ornith endurance log
+    // showed why the old rule (out-of-band change re-bases hi to disk truth)
+    // was a laundering hole: an exec append re-shaped the file, the next
+    // write re-based hi 3794→1566, and an 875-byte rewrite that the true
+    // history would have refused sailed through — the final artifact kept 8
+    // of 37 verified commands.
+    //
+    // The SHRINK FLOOR, however, anchors on `good` — the LAST EVIDENCED-GOOD
+    // size — not on `hi` (P22 Tier 3). Size is not quality: in a long session
+    // the largest byte count is usually the most bloated, least-correct
+    // draft. Observed 2026-08-10 (ornith leg): a 9768-byte draft that scored
+    // 2/42 latched the high-water, and the 30% floor it set (2930 B) refused
+    // a legitimate 2830-byte version and left the leg's eventual 16/42 peak
+    // (3335 B = 34%) one small edit away from being refused — while the
+    // 2952-byte write that actually cost two tests cleared it by 22 bytes.
+    // When no structural check has ever passed (no checker applies), the
+    // floor falls back to the old hi anchor, so nothing loses protection.
+    //
+    // Grow-writes are never refused regardless (the refusal requires bytes <
+    // current disk size); a deliberate whole-file re-shape has honest doors:
+    // delete + recreate (creation re-arms from the new size) or force. Every
+    // state operation fails OPEN: a missing or corrupt state file degrades to
+    // the old current-size behavior, never blocks a write.
     var HIWATER_STATE = ".nanna/write_hiwater.json";
     // Bound: the state file must stay trivially small over an unbounded
     // daemon lifetime; missions touch tens of files, so 200 entries with
     // least-recently-updated eviction loses nothing real.
     var HIWATER_MAX_ENTRIES = 200;
-    function hiwaterKey(path) {
-      // Slash/case normalization plus "./" stripping only. Deliberately NO
-      // workspace-root resolution (that lives on the Rust side): an aliased
-      // spelling of the same file gets an independent entry that observes
-      // only the writes sent under that spelling — each entry is monotone
-      // on its own evidence, so aliasing costs a little ratchet strength,
-      // never a false refusal. Lowercase is correct here because this
-      // daemon targets Windows paths.
+    // Slash/case normalization plus "./" stripping. Lowercase is correct
+    // here because this daemon targets Windows paths.
+    function hiwaterNormKey(path) {
       var k = path.split("\\").join("/").toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
       return k;
     }
-    // Transient park buffers must never be judged by (or recorded in)
-    // cross-call history — they are rewritten wholesale every park cycle —
-    // and the ratchet's own state file guards itself specially (below).
+    // Canonical ledger key (P22 Tier 3): one file, ONE entry. The old key
+    // kept relative and absolute spellings of the same file as separate
+    // entries, and the split-brain was observed live (2026-08-10 ornith:
+    // 'minidb' hi=9768 next to 'd:/development/.../minidb' hi=3195 — one
+    // absolute-path edit silently cut the effective floor from 2930 to 958
+    // bytes). Absolute spellings under the workspace root now collapse to
+    // the relative form; hiwaterEntryFor still consults the old spelling so
+    // pre-existing entries are found and folded forward (healed on the next
+    // save). Fails open: no workdir → the old per-spelling behavior.
+    function hiwaterKey(path) {
+      var k = hiwaterNormKey(path);
+      try {
+        var wd = Nanna.workdir();
+        if (wd) {
+          var w = hiwaterNormKey(String(wd));
+          if (w.charAt(w.length - 1) !== "/") w += "/";
+          if (k.indexOf(w) === 0 && k.length > w.length) k = k.substring(w.length);
+        }
+      } catch (e) {
+        // No workdir — spellings keep their own entries, as before.
+      }
+      return k;
+    }
+    // Transient park buffers and recovery copies must never be judged by (or
+    // recorded in) cross-call history — they are rewritten wholesale — and
+    // the ratchet's own state file guards itself specially (below).
     function hiwaterIsBuffer(key) {
       var buf = ".__buffer__";
       return key.length >= buf.length && key.lastIndexOf(buf) === key.length - buf.length;
+    }
+    function hiwaterIsPrev(key) {
+      var p = ".__prev__";
+      return key.length >= p.length && key.lastIndexOf(p) === key.length - p.length;
     }
     // Exact path only (root or any /.nanna/ dir), so a real work file with a
     // similar name keeps full ratchet protection.
@@ -131,7 +166,7 @@ export default {
       return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
     }
     function hiwaterExempt(key) {
-      return hiwaterIsBuffer(key) || hiwaterIsState(key);
+      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsState(key);
     }
     function hiwaterLoad() {
       try {
@@ -149,9 +184,9 @@ export default {
       if (entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > 0) return entry.hi;
       return 0;
     }
-    function hiwaterLast(entry) {
-      if (entry && typeof entry.last === "number" && isFinite(entry.last) && entry.last >= 0) return entry.last;
-      return -1;
+    function hiwaterGood(entry) {
+      if (entry && typeof entry.good === "number" && isFinite(entry.good) && entry.good > 0) return entry.good;
+      return 0;
     }
     function hiwaterSave(map) {
       try {
@@ -168,6 +203,92 @@ export default {
         // State persistence is best-effort.
       }
     }
+    // The entry for a path under BOTH its canonical and its legacy spelling,
+    // folded into one: hi takes the max (monotone evidence), everything else
+    // follows the fresher entry. When the map is later saved through, the
+    // alias entry is dropped — the split-brain heals on first touch.
+    function hiwaterEntryFor(map, path) {
+      var canon = hiwaterKey(path);
+      var alias = hiwaterNormKey(path);
+      var a = map[canon] || null;
+      var b = alias !== canon ? (map[alias] || null) : null;
+      if (b) {
+        var merged;
+        if (!a) {
+          merged = b;
+        } else {
+          merged = ((b.at || 0) > (a.at || 0)) ? b : a;
+          var other = merged === a ? b : a;
+          var hiM = hiwaterHi(merged);
+          var hiO = hiwaterHi(other);
+          if (hiO > hiM) merged.hi = hiO;
+          if (hiwaterGood(merged) === 0 && hiwaterGood(other) > 0) {
+            merged.good = other.good;
+            merged.goodAt = other.goodAt || 0;
+            if (merged.chk !== "ok" && merged.chk !== "bad") merged.chk = other.chk;
+          }
+        }
+        delete map[alias];
+        map[canon] = merged;
+        return merged;
+      }
+      return a;
+    }
+
+    // Read-recency marks (P22 Tier 3): when did this session last SEE this
+    // file's content? Recorded by read_file, by a successful whole-file
+    // write here (at that instant the file holds exactly what the model
+    // sent), and by the stale-shrink echo below (the echo IS a read). The
+    // mark is compared against the file's mtime: any mutation — edit_file,
+    // exec redirect, the user — moves mtime past the mark and invalidates
+    // it. All I/O fails OPEN.
+    var READMARK_STATE = ".nanna/read_marks.json";
+    var READMARK_MAX_ENTRIES = 200;
+    function readmarkLoad() {
+      try {
+        var raw = Nanna.readFile(READMARK_STATE);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+        }
+      } catch (e) {
+        // Missing or corrupt state: start fresh.
+      }
+      return {};
+    }
+    function readmarkPut(path) {
+      try {
+        var map = readmarkLoad();
+        map[hiwaterKey(path)] = { at: Date.now() };
+        var keys = Object.keys(map);
+        if (keys.length > READMARK_MAX_ENTRIES) {
+          keys.sort(function(a, b) {
+            return ((map[a] && map[a].at) || 0) - ((map[b] && map[b].at) || 0);
+          });
+          var evict = keys.length - READMARK_MAX_ENTRIES;
+          for (var i = 0; i < evict; i++) delete map[keys[i]];
+        }
+        Nanna.writeFile(READMARK_STATE, JSON.stringify(map));
+      } catch (e) {
+        // Best-effort.
+      }
+    }
+    // True when the file's content has NOT changed since the session last
+    // saw it. Unknown → true (fail open). stat.modified is whole seconds
+    // and truncates, which biases sub-second races toward "seen" — the open
+    // direction.
+    function seenSinceLastChange(path) {
+      try {
+        var st = Nanna.stat(path);
+        if (!st || typeof st.modified !== "number" || !isFinite(st.modified)) return true;
+        var entry = readmarkLoad()[hiwaterKey(path)];
+        var at = entry && typeof entry.at === "number" && isFinite(entry.at) ? entry.at : 0;
+        if (at === 0) return false; // never recorded as seen
+        return at >= st.modified * 1000;
+      } catch (e) {
+        return true;
+      }
+    }
 
     // Refuse ANY .py content that does not parse — new file or overwrite.
     // Round-6 lesson: gating only valid->invalid transitions let the model
@@ -175,10 +296,13 @@ export default {
     // content forever. Invalid Python on disk is never useful; the error
     // names the line so the write call becomes a fast syntax feedback
     // loop. force=true overrides; ANY checker failure fails OPEN (a
-    // missing python interpreter must never block writes).
-    function pythonSyntaxRefusal(path, nextText) {
+    // missing python interpreter must never block writes). Returns
+    // {ran, ok, detail} — `ran` distinguishes a real verdict from a
+    // fail-open non-answer, so only genuine passes feed the evidenced-good
+    // anchor below.
+    function pythonSyntaxCheck(path, nextText) {
       var lower = path.toLowerCase();
-      if (lower.length < 3 || lower.lastIndexOf(".py") !== lower.length - 3) return null;
+      if (lower.length < 3 || lower.lastIndexOf(".py") !== lower.length - 3) return { ran: false, ok: false, detail: "" };
       try {
         var chk = path + ".__chk.py";
         var newTmp = path + ".__chk_new.py";
@@ -199,12 +323,103 @@ export default {
           var nl = detail.indexOf("\n");
           if (nl !== -1) detail = detail.substring(0, nl);
           if (detail.length > 160) detail = detail.substring(0, 160);
-          return detail;
+          return { ran: true, ok: false, detail: detail };
         }
-        return null;
+        if (out.indexOf("NEW_OK") !== -1) return { ran: true, ok: true, detail: "" };
+        return { ran: false, ok: false, detail: "" };
       } catch (e) {
+        return { ran: false, ok: false, detail: "" };
+      }
+    }
+
+    // Post-mutation structural check (P22 Tier 3): after any write, the
+    // cheapest applicable check runs on what actually landed and its verdict
+    // is appended to the result AS A SENTENCE — never a gate. Evidence
+    // (gemma, 2026-08-10): a partial-overlap edit left a dangling `else`;
+    // the broken file exits 2, which is exactly what the first test asserts,
+    // so the surviving failure said "should print usage" and the model spent
+    // 31 minutes editing help text on a file that had not parsed for any of
+    // them. The truth was one `sh -n` away. A pass also records the size as
+    // the ratchet's evidenced-good anchor. Every failure path (no checker,
+    // checker missing, timeout) yields NO verdict at all — fail OPEN.
+    function structuralCheckKind(path, contentText) {
+      var p = path.split("\\").join("/").toLowerCase();
+      var base = p.split("/").pop();
+      function hasExt(e) { return base.length > e.length && base.lastIndexOf(e) === base.length - e.length; }
+      if (hasExt(".json") || hasExt(".geojson")) return "json";
+      // .bash (and bash shebangs below) route to bash -n: on hosts where
+      // /bin/sh is dash, valid bash ([[ ]], arrays, process substitution)
+      // fails sh -n and the verdict would cry wolf on a correct file
+      // (ultrareview on PR #224).
+      if (hasExt(".bash")) return "bash";
+      if (hasExt(".sh")) return "sh";
+      if (hasExt(".js") || hasExt(".mjs") || hasExt(".cjs")) return "node";
+      if (hasExt(".py")) return "py";
+      // Extensionless artifacts (./minidb) are the common mission shape:
+      // classify by shebang instead of the name. "sh" must not match fish/
+      // pwsh/zsh/csh — those are not POSIX sh and sh -n would cry wolf.
+      if (base.indexOf(".") === -1 && typeof contentText === "string" && contentText.indexOf("#!") === 0) {
+        var nl = contentText.indexOf("\n");
+        var line1 = nl === -1 ? contentText : contentText.substring(0, nl);
+        if (line1.indexOf("python") !== -1) return "py";
+        if (line1.indexOf("node") !== -1) return "node";
+        if (line1.indexOf("bash") !== -1) return "bash";
+        if (line1.indexOf("fish") === -1 && line1.indexOf("pwsh") === -1 &&
+            line1.indexOf("zsh") === -1 && line1.indexOf("csh") === -1 &&
+            line1.indexOf("sh") !== -1) return "sh";
+      }
+      return null;
+    }
+    // Runs the check. Returns {ok, tool, detail} or null for no verdict.
+    // 15s cap: these checks parse without executing, so they are near-
+    // instant; the cap only bounds interpreter cold start and must stay far
+    // under exec's 180s engine deadline so a check can never orphan a child.
+    function runStructuralCheck(kind, path, contentText) {
+      if (kind === "json") {
+        if (typeof contentText !== "string") return null;
+        try {
+          JSON.parse(contentText);
+          return { ok: true, tool: "JSON.parse", detail: "" };
+        } catch (eJ) {
+          var jd = String(eJ && eJ.message ? eJ.message : eJ);
+          if (jd.length > 160) jd = jd.substring(0, 160);
+          return { ok: false, tool: "JSON.parse", detail: jd };
+        }
+      }
+      if (path.indexOf("'") !== -1) return null; // unquotable — no verdict
+      var cmd = null;
+      var toolName = null;
+      if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
+      else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
+      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
+      if (!cmd) return null;
+      try {
+        var r = Nanna.exec(cmd, null, 15);
+        if (!r) return null;
+        if (r.success) return { ok: true, tool: toolName, detail: "" };
+        var err = (r.stderr || r.stdout || "");
+        if (r.code === 127 || err.indexOf("command not found") !== -1) return null; // checker absent
+        err = err.split("\r").join("").split("\n").join(" ");
+        while (err.indexOf("  ") !== -1) err = err.split("  ").join(" ");
+        if (err.length > 200) err = err.substring(0, 200);
+        if (err === "" || err === " ") err = "exit code " + r.code;
+        return { ok: false, tool: toolName, detail: err };
+      } catch (eX) {
         return null;
       }
+    }
+    function structSentence(path, verdict, prevChk) {
+      if (!verdict) return "";
+      if (verdict.ok) {
+        if (prevChk === "bad") return " STRUCTURE: " + path + " parses again (" + verdict.tool + ") — the earlier syntax break is fixed.";
+        return " STRUCTURE: the file parses (" + verdict.tool + ").";
+      }
+      var history = "";
+      if (prevChk === "ok") history = " It parsed BEFORE this write — this write introduced the break.";
+      else if (prevChk === "bad") history = " It did not parse before this write either.";
+      return " STRUCTURE: " + path + " does NOT parse (" + verdict.tool + "): " + verdict.detail + "." + history +
+        " This is information, not a block — the file holds exactly what you sent. Fix that line with edit_file.";
     }
 
     // Accept multiple parameter name variants from different models
@@ -272,22 +487,19 @@ export default {
 
     var bytes = fileContent.length;
 
-    // Safety check BEFORE writing: block if new content is drastically smaller
-    // than the file has ever been WHILE write_file was its only mutator. This
-    // prevents the model from overwriting a large file with truncated content
-    // when it lost context, AND (via the high-water base) from eroding it
-    // across many individually-"acceptable" shrinks. Three invariants from
-    // the adversarial verify round: a write that does not shrink the CURRENT
-    // disk file can never erode it, so it is never refused; a file that was
-    // changed out-of-band since our last write re-bases to disk truth; a file
-    // that no longer exists has nothing left to protect — creation is always
-    // allowed and re-arms the ratchet from the new size.
+    // Safety checks BEFORE writing. Three invariants from the adversarial
+    // verify round still hold: a write that does not shrink the CURRENT
+    // disk file can never erode it, so it is never refused; a file that no
+    // longer exists has nothing left to protect — creation is always allowed
+    // and re-arms the ratchet from the new size; and every state failure
+    // degrades to the old behavior, never to a block.
     var existingSize = 0;
     var fileExists = false;
     var existsUnknown = false;
+    var existing;
     if (!input.force) {
       try {
-        var existing = Nanna.readFile(filePath);
+        existing = Nanna.readFile(filePath);
         if (existing !== undefined && existing !== null) {
           fileExists = true;
           existingSize = existing.length;
@@ -308,9 +520,58 @@ export default {
       }
 
       var hwKeyGuard = hiwaterKey(filePath);
+
+      // P22 Tier 3: you cannot shrink what you have not seen. A shrinking
+      // whole-file write over a file whose content CHANGED since the session
+      // last read it is a rewrite from a stale context copy — the commonest
+      // way an assistant destroys a file: it saw the file twenty messages
+      // ago, the history got compacted, and it confidently rewrites from
+      // memory (2026-08-10 qwen: a fresh step wrote 2449 bytes over a
+      // 5598-byte artifact with 22 checks passing, zero reads in the step;
+      // the score fell to 1/42). Not a refusal: the reply carries the file's
+      // CURRENT content to merge against, counts itself as the read, and the
+      // next attempt proceeds. One bounce, with the missing information.
+      if (fileExists && !hiwaterExempt(hwKeyGuard) && bytes < existingSize &&
+          typeof existing === "string" && !seenSinceLastChange(filePath)) {
+        // Echo bound (ultrareview on PR #224): the echo is MERGE MATERIAL,
+        // and merge material the model cannot hold is not material — 64 KiB
+        // is a small local model's entire 16k-token window, so anything
+        // bigger only burns the context this guard exists to respect. Under
+        // the bound the full content ships and counts as the read; over it,
+        // a head ships with a loud truncation notice (WHAT dropped, WHY,
+        // disk unaffected), the mark is NOT recorded, and the next attempt
+        // still bounces — into an explicit ranged read_file, never into a
+        // merge against a partial view.
+        var ECHO_MAX = 65536;
+        if (existingSize <= ECHO_MAX) {
+          readmarkPut(filePath);
+          glog("write_file guard: stale-shrink echo for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; file changed since last recorded read)");
+          return fail(
+            "WRITE HELD — nothing was written and nothing is lost. You are shrinking " + filePath +
+            " from " + existingSize + " to " + bytes + " bytes, but the file has CHANGED since you last read it — " +
+            "your context copy is stale, so this rewrite would silently destroy parts of the current file. " +
+            "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
+            "\n\nMerge your change INTO this current text and call write_file again with the full merged content " +
+            "(or use edit_file for a targeted change). This reply counts as your read — the file will not be held for this reason again."
+          );
+        }
+        glog("write_file guard: stale-shrink hold (truncated echo) for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes)");
+        return fail(
+          "WRITE HELD — nothing was written and nothing is lost. You are shrinking " + filePath +
+          " from " + existingSize + " to " + bytes + " bytes, but the file has CHANGED since you last read it — " +
+          "your context copy is stale, so this rewrite would silently destroy parts of the current file. " +
+          "The file is too large (" + existingSize + " bytes) to echo here; its first lines are:\n\n" + existing.substring(0, 4096) +
+          "\n\n[TRUNCATED — only the first 4096 of " + existingSize + " bytes shown; the file on disk is complete and unaffected.] " +
+          "This truncated preview does NOT count as reading the file. Call read_file(\"" + filePath + "\") " +
+          "(with offset/limit for ranges) to see the current content, then merge your change into it — " +
+          "after a real read this write will be accepted, or use edit_file for a targeted change."
+        );
+      }
+
       var hwBase = existingSize;
+      var hwGoodBase = 0;
       if (fileExists && !hiwaterExempt(hwKeyGuard)) {
-        var hwEntry = hiwaterLoad()[hwKeyGuard];
+        var hwEntry = hiwaterEntryFor(hiwaterLoad(), filePath);
         var hwHi = hiwaterHi(hwEntry);
         // Monotone while the file exists: an out-of-band change since our
         // last write is folded in as evidence, never a reason to forget the
@@ -319,18 +580,28 @@ export default {
         if (hwHi > hwBase) {
           hwBase = hwHi;
         }
+        hwGoodBase = hiwaterGood(hwEntry);
       }
 
-      if (!hiwaterExempt(hwKeyGuard) && hwBase > 500 && bytes < existingSize && bytes < hwBase * 0.3) {
-        var sizeStory = "currently holds " + existingSize + " bytes";
-        if (hwBase > existingSize) {
+      // Shrink floor, anchored on the last evidenced-good size when one
+      // exists (see the ratchet design comment above).
+      var floorBase = hwGoodBase > 0 ? hwGoodBase : hwBase;
+      var floorAnchor = hwGoodBase > 0 ? "good" : "hi";
+      if (!hiwaterExempt(hwKeyGuard) && floorBase > 500 && bytes < existingSize && bytes < floorBase * 0.3) {
+        var sizeStory;
+        if (floorAnchor === "good") {
+          sizeStory = "holds " + existingSize + " bytes now, and its last version that passed a structural check held " + floorBase + " bytes";
+        } else if (hwBase > existingSize) {
           sizeStory = "holds " + existingSize + " bytes now and has held " + hwBase + " bytes before";
+        } else {
+          sizeStory = "currently holds " + existingSize + " bytes";
         }
+        glog("write_file guard: WRITE REFUSED (shrink floor) " + filePath + " attempted=" + bytes + " existing=" + existingSize + " floorBase=" + floorBase + " anchor=" + floorAnchor);
         return {
           content: "WRITE REFUSED — the file was NOT modified and is fully intact. " +
             "You tried to write only " + bytes + " bytes over " + filePath +
             " which " + sizeStory + " (" +
-            Math.round(bytes / hwBase * 100) + "% of that). That usually means " +
+            Math.round(bytes / floorBase * 100) + "% of that). That usually means " +
             "you sent a fragment instead of the whole file. For a small change, use " +
             "edit_file instead: edit_file(file_path=\"" + filePath + "\", old_string=<the exact current text>, " +
             "new_string=<your replacement>) — it changes just that snippet and leaves the rest untouched. " +
@@ -342,6 +613,7 @@ export default {
       }
     }
 
+    var pyGate = { ran: false, ok: false, detail: "" };
     if (!input.force) {
       // Versioned-copy REFUSAL (observed live: models fork foo.py.new2,
       // new_foo.py, foo_fixed_v1.txt instead of fixing the real file, then
@@ -359,6 +631,7 @@ export default {
         }
       }
       if (copyHit) {
+        glog("write_file guard: WRITE REFUSED (versioned copy '" + copyHit + "') " + filePath);
         return fail("WRITE REFUSED — '" + filePath + "' looks like a versioned copy ('" + copyHit + "'). Nothing was written. Keep ONE real file: change the ORIGINAL in place with edit_file, or write the full corrected content directly to the original path (a complete valid rewrite at or above the file's current size is always accepted).");
       }
 
@@ -411,7 +684,8 @@ export default {
       // validity FIRST; a parsing .py write is accepted outright and any
       // stale draft/markers are swept; only INVALID content meets the
       // park/rail machinery.
-      var syntaxDetail = pythonSyntaxRefusal(filePath, fileContent);
+      pyGate = pythonSyntaxCheck(filePath, fileContent);
+      var syntaxDetail = pyGate.ran && !pyGate.ok ? pyGate.detail : null;
       if (syntaxDetail === null) {
         var sweepBufPath = filePath + ".__buffer__";
         try {
@@ -430,6 +704,7 @@ export default {
           // No parked draft.
         }
         if (railParked !== null && railParked !== undefined && railParked !== "") {
+          glog("write_file guard: WRITE BLOCKED (invalid .py over parked draft) " + filePath);
           return fail("WRITE BLOCKED — this content has a SYNTAX ERROR (" + syntaxDetail + ") and a parked draft for " + filePath + " already exists at " + railBufPath + " (" + railParked.length + " chars). Repair THAT draft: edit_file(file_path=\"" + railBufPath + "\", old_string=<the broken line>, new_string=<the fix>), then file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). A fully VALID rewrite of " + filePath + " at or above its current size would also be accepted.");
         }
       }
@@ -469,9 +744,29 @@ export default {
               }
             }
           }
+          glog("write_file guard: WRITE PARKED (invalid .py) " + filePath + " draft=" + bytes + " bytes");
           return fail("WRITE PARKED — your content for " + filePath + " has a SYNTAX ERROR (" + syntaxDetail + "), so the file was NOT changed. Nothing was lost: the draft IS SAVED at " + parkPath + "." + lineQuote + " Your NEXT call must be edit_file(file_path=\"" + parkPath + "\", old_string=<the broken line>, new_string=<the fixed line>), then file_buffer(action=\"commit\", file_path=\"" + filePath + "\"). Do NOT call write_file again for this file and do NOT regenerate it.");
         }
         return fail("WRITE REFUSED — the content you sent for " + filePath + " is NOT valid Python (" + syntaxDetail + "). The file is UNCHANGED. Fix the syntax and call write_file again with the corrected COMPLETE text.");
+      }
+    }
+
+    // P22 Tier 3: displaced content stays recoverable. A full overwrite
+    // parks the outgoing version at <file>.__prev__ (one slot, overwritten
+    // each time) so a destructive rewrite is one read_file away from
+    // recovery instead of gone — three bench legs ended with their peak
+    // artifact overwritten and nothing to restore. Best-effort, never
+    // blocks the write. Skipped under force (the pre-image was never read;
+    // force is an explicit re-shape) and for managed sidecars.
+    var prevPath = filePath + ".__prev__";
+    var prevParked = false;
+    if (fileExists && !input.force && typeof existing === "string" &&
+        existing !== fileContent && !hiwaterExempt(hiwaterKey(filePath))) {
+      try {
+        Nanna.writeFile(prevPath, existing);
+        prevParked = true;
+      } catch (ePrev) {
+        // Recovery copy is best-effort.
       }
     }
 
@@ -483,75 +778,218 @@ export default {
       return fail("write_file failed writing " + filePath + " (" + writeErr + "). Retry the same call; if it fails again, read_file to verify the file state.");
     }
 
+    // Structural verdict on what landed. The .py gate above already ran the
+    // real check — adopt its answer instead of spawning the interpreter a
+    // second time; under force (gate skipped) the generic check runs.
+    var hwKeyPost = hiwaterKey(filePath);
+    var verdict = null;
+    var prevChk = null;
+    if (!hiwaterExempt(hwKeyPost)) {
+      try {
+        var peek = hiwaterEntryFor(hiwaterLoad(), filePath);
+        if (peek && (peek.chk === "ok" || peek.chk === "bad")) prevChk = peek.chk;
+      } catch (ePeek) {
+        // No history — the sentence just has no before/after clause.
+      }
+      var checkKind = structuralCheckKind(filePath, fileContent);
+      if (checkKind === "py" && pyGate.ran) {
+        verdict = { ok: pyGate.ok, tool: "python ast", detail: pyGate.detail };
+      } else if (checkKind) {
+        verdict = runStructuralCheck(checkKind, filePath, fileContent);
+      }
+    }
+    if (input.force || !fileExists) prevChk = null;
+
     // Ratchet update AFTER a successful write. While the file exists, the
     // high-water mark only ever RISES — max of the previous mark, the disk
     // size we just observed, and this write — so fluctuating rewrites stay
     // pinned to the peak and out-of-band changes fold in as evidence
     // instead of restarting the history (the old re-base-on-mismatch rule
     // was the laundering hole documented in the ratchet design comment).
-    // Force and creation-over-missing RESET it: both are deliberate
-    // re-shapes with nothing stale worth protecting. When the pre-write
-    // read failed for unknown reasons, the state is left completely alone.
+    // Force and creation-over-missing RESET it — both are deliberate
+    // re-shapes with nothing stale worth protecting, and that includes the
+    // evidenced-good anchor. A passing structural check records this
+    // write's size as the new good anchor. When the pre-write read failed
+    // for unknown reasons, the state is left completely alone.
     if (!existsUnknown) {
       try {
         var hwMap = hiwaterLoad();
         var hwKey = hiwaterKey(filePath);
         if (!hiwaterExempt(hwKey)) {
-          var hwPrevEntry = hwMap[hwKey];
+          var hwPrevEntry = hiwaterEntryFor(hwMap, filePath);
           var hwNext = bytes > existingSize ? bytes : existingSize;
           if (!input.force && fileExists) {
             var hwPrevHi = hiwaterHi(hwPrevEntry);
             if (hwPrevHi > hwNext) hwNext = hwPrevHi;
           }
           if (input.force || !fileExists) hwNext = bytes;
-          hwMap[hwKey] = { hi: hwNext, last: bytes, at: Date.now() };
+          var hwNew = { hi: hwNext, last: bytes, at: Date.now() };
+          if (!input.force && fileExists && hwPrevEntry) {
+            if (hiwaterGood(hwPrevEntry) > 0) {
+              hwNew.good = hwPrevEntry.good;
+              hwNew.goodAt = hwPrevEntry.goodAt || 0;
+            }
+            if (hwPrevEntry.chk === "ok" || hwPrevEntry.chk === "bad") hwNew.chk = hwPrevEntry.chk;
+          }
+          if (verdict) {
+            hwNew.chk = verdict.ok ? "ok" : "bad";
+            if (verdict.ok) {
+              hwNew.good = bytes;
+              hwNew.goodAt = Date.now();
+            }
+          }
+          hwMap[hwKey] = hwNew;
           hiwaterSave(hwMap);
         }
       } catch (eHw) {
         // Best-effort; the user's write already succeeded.
       }
+      // The file now holds exactly what the model sent — its knowledge of
+      // the content is perfect at this instant, so the write counts as a
+      // read for the stale-shrink guard.
+      if (!hiwaterExempt(hwKeyPost)) readmarkPut(filePath);
     }
 
-    // Rewrite-loss announcement (2026-08-08 ornith endurance lesson):
-    // full-file rewrites from a stale in-context copy silently deleted
-    // working sections all run long — the final artifact kept 8 of 37
-    // verified commands while every write reported plain success, and the
-    // model later filed "re-add X" tasks proving it never intended the
-    // deletions. Refusing is wrong (a complete rewrite is the model's one
-    // reliable move and may shrink legitimately); instead the result
-    // ANNOUNCES what the rewrite removed — the same announce-the-loss
-    // principle as the clobber guard. Detection is a single whole-string
+    var structNote = structSentence(filePath, verdict, prevChk);
+    if (verdict && !verdict.ok) {
+      glog("write_file structure: " + filePath + " does NOT parse after write (" + verdict.tool + "): " + verdict.detail);
+    } else if (verdict && verdict.ok && prevChk === "bad") {
+      glog("write_file structure: " + filePath + " parses again after write (" + verdict.tool + ")");
+    }
+
+    // Rewrite-delta announcement (P22 Tier 3, bidirectional). The original
+    // 2026-08-08 ornith lesson: full-file rewrites from a stale in-context
+    // copy silently deleted working sections all run long — every write
+    // reported plain success while the artifact kept 8 of 37 verified
+    // commands. The 2026-08-10 follow-up showed the symmetric hole: BOTH
+    // destructive writes that leg GREW the file (3333→6986 bytes, a
+    // superset of function names with rewritten bodies) and the removal-
+    // only note was structurally blind to them. The note now announces
+    // (a) sections REMOVED, (b) pre-existing sections whose BODIES changed
+    // (cheap per-symbol content hash), and (c) a rewrite that more than
+    // doubled the file — i.e. added more new mass than the whole file
+    // previously held. Refusing is still wrong (a complete rewrite is the
+    // model's one reliable move); the note informs, is logged at INFO, and
+    // names the .__prev__ recovery copy. Detection is a single whole-string
     // regex pass per side (no per-line split — the Boa split cost lesson):
     // shell functions `name() {`, case arms `name)`, and def/class/function
     // declarations at line starts. Informational only; never blocks.
-    function topSymbols(text) {
-      var names = {};
+    function topSymbolSpans(text) {
+      var out = [];
       var re = /^[ \t]*(?:([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(\)[ \t]*\{?[ \t]*$|(?:def|class|function)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)|([A-Za-z_][A-Za-z0-9_-]*)\)[ \t]*$)/gm;
       var m;
       while ((m = re.exec(text)) !== null) {
         var n = m[1] || m[2] || m[3];
-        if (n) names[n] = true;
+        if (n) out.push({ name: n, at: m.index });
         if (m.index === re.lastIndex) re.lastIndex++;
       }
-      return names;
+      return out;
+    }
+    function collapseWs(s) {
+      var out = "";
+      var pend = false;
+      for (var ci = 0; ci < s.length; ci++) {
+        var c = s.charAt(ci);
+        if (c === " " || c === "\t" || c === "\r" || c === "\n") { pend = true; continue; }
+        if (pend && out !== "") out += " ";
+        pend = false;
+        out += c;
+      }
+      return out;
+    }
+    function hashStr(s) {
+      var h = 5381;
+      for (var hi2 = 0; hi2 < s.length; hi2++) h = (((h << 5) + h) ^ s.charCodeAt(hi2)) >>> 0;
+      return h;
+    }
+    // Where a symbol's body ends. The span is bounded by the next
+    // declaration, then trimmed back past trailing TOP-LEVEL code — a bare
+    // `usage` call after the closing brace must not leak into the hash, or
+    // appending anything after the LAST function marks that function
+    // "changed": a false positive that teaches the model to ignore the
+    // note (caught by the P22 harness). A brace declaration runs through
+    // its first column-0 closer regardless of body indentation (small
+    // models write unindented shell); anything else (def/class, case arms)
+    // follows the indentation rule.
+    function symbolBodyEnd(text, declStart, limit) {
+      var nl = text.indexOf("\n", declStart);
+      var declEnd = (nl === -1 || nl > limit) ? limit : nl;
+      var braced = text.substring(declStart, declEnd).indexOf("{") !== -1;
+      var end = declEnd;
+      var lineStart = declEnd + 1;
+      while (lineStart < limit) {
+        nl = text.indexOf("\n", lineStart);
+        var lineEnd = (nl === -1 || nl > limit) ? limit : nl;
+        var raw = text.substring(lineStart, lineEnd);
+        var ti = 0;
+        while (ti < raw.length && (raw.charAt(ti) === " " || raw.charAt(ti) === "\t")) ti++;
+        var trimmed = raw.substring(ti);
+        if (trimmed.charAt(trimmed.length - 1) === "\r") trimmed = trimmed.substring(0, trimmed.length - 1);
+        var isCloser = trimmed === "}" || trimmed === "};" || trimmed === "fi" ||
+          trimmed === "esac" || trimmed === "done" || trimmed === "end" || trimmed === ";;";
+        if (braced) {
+          end = lineEnd;
+          if (ti === 0 && isCloser) break;
+        } else {
+          if (trimmed === "" || ti > 0 || isCloser) { end = lineEnd; }
+          else break;
+        }
+        if (nl === -1 || nl >= limit) break;
+        lineStart = nl + 1;
+      }
+      return end;
+    }
+    // Each symbol's body hash (whitespace-insensitive). First occurrence of
+    // a duplicated name wins.
+    function symbolBodies(text) {
+      var spans = topSymbolSpans(text);
+      var map = {};
+      for (var si = 0; si < spans.length; si++) {
+        if (map[spans[si].name] !== undefined) continue;
+        var limit = si + 1 < spans.length ? spans[si + 1].at : text.length;
+        var end = symbolBodyEnd(text, spans[si].at, limit);
+        map[spans[si].name] = hashStr(collapseWs(text.substring(spans[si].at, end)));
+      }
+      return map;
+    }
+    function nameList(arr) {
+      var shown = arr.slice(0, 10);
+      var more = arr.length - shown.length;
+      return "`" + shown.join("`, `") + "`" + (more > 0 ? " (+" + more + " more)" : "");
     }
     var lossNote = "";
-    if (fileExists && !input.force && typeof existing === "string") {
+    if (fileExists && !input.force && typeof existing === "string" && existing !== fileContent) {
       try {
-        var oldSyms = topSymbols(existing);
-        var newSyms = topSymbols(fileContent);
+        var oldBodies = symbolBodies(existing);
+        var newBodies = symbolBodies(fileContent);
         var dropped = [];
-        for (var sName in oldSyms) {
-          if (!newSyms[sName]) dropped.push(sName);
+        var changed = [];
+        for (var sName in oldBodies) {
+          if (newBodies[sName] === undefined) dropped.push(sName);
+          else if (newBodies[sName] !== oldBodies[sName]) changed.push(sName);
         }
-        if (dropped.length > 0) {
-          var shown = dropped.slice(0, 10);
-          var moreCount = dropped.length - shown.length;
-          lossNote = " NOTE: this rewrite REMOVED sections that existed on disk before: `" +
-            shown.join("`, `") + "`" + (moreCount > 0 ? " (+" + moreCount + " more)" : "") +
-            ". The write SUCCEEDED and the file now holds exactly what you sent. If those " +
-            "sections were supposed to stay, they are gone — re-add them (read_file first " +
-            "to see the current state). If the removal was intentional, ignore this note.";
+        // "More than doubled" = this rewrite added more new mass than the
+        // entire previous file held — a from-scratch superset, the shape of
+        // both destructive ornith writes. The 500-byte gate matches the
+        // ratchet's own smallness line.
+        var grewPastDouble = existingSize > 500 && bytes > existingSize * 2;
+        if (dropped.length > 0 || changed.length > 0 || grewPastDouble) {
+          var parts = "";
+          if (dropped.length > 0) {
+            parts += " It REMOVED sections that existed on disk before: " + nameList(dropped) + ".";
+          }
+          if (changed.length > 0) {
+            parts += " It CHANGED the bodies of pre-existing sections: " + nameList(changed) + ".";
+          }
+          if (grewPastDouble) {
+            parts += dropped.length === 0 && changed.length === 0
+              ? " It more than doubled the file while keeping every pre-existing section's body intact — the growth is purely additive."
+              : " It also more than doubled the file — most of what is on disk now is new text.";
+          }
+          lossNote = " NOTE: this whole-file rewrite replaced " + filePath + " (" + existingSize + " → " + bytes + " bytes)." + parts +
+            " The write SUCCEEDED — the file holds exactly what you sent. If any of those sections were verified working, re-verify them now" +
+            (prevParked ? "; the previous version is preserved at " + prevPath + " (read_file it to recover anything)" : "") + ".";
+          glog("write_file rewrite-note for " + filePath + " (" + existingSize + "->" + bytes + " bytes): removed=[" + dropped.join(",") + "] changed=[" + changed.join(",") + "]" + (grewPastDouble ? " grew>2x" : ""));
         }
       } catch (eLoss) {
         // Informational only — never affects the write.
@@ -573,6 +1011,6 @@ export default {
         " they were converted to real newlines before writing. The write SUCCEEDED and the file is correct —" +
         " nothing to redo. Send real line breaks next time and this note goes away.";
     }
-    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + repairNote + lossNote };
+    return { content: "Wrote " + bytes + " bytes to " + filePath + ". The file on disk now holds exactly this content." + structNote + repairNote + lossNote };
   }
 }
