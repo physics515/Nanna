@@ -225,7 +225,9 @@ log_since() {
 hist_dir() {
   local mm
   mm=$(printf '%04d' "$mins")
-  [ -e "$HIST/$mm/verdict.txt" ] || [ -e "$HIST/$mm/probe.txt" ] && mm="$mm-p$polls"
+  if [ -e "$HIST/$mm/verdict.txt" ] || [ -e "$HIST/$mm/probe.txt" ]; then
+    mm="$mm-p$polls"
+  fi
   printf '%s' "$HIST/$mm"
 }
 
