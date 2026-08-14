@@ -540,6 +540,105 @@ pub type CheckpointCallback = Box<dyn Fn(&[AnthropicMessage], usize) + Send + Sy
 /// they are the live "context in use" signal.
 pub type UsageCallback = Box<dyn Fn(u32, u32, u64) + Send + Sync>;
 
+/// One-shot capability-transition notices for the model (P22 Tier 4).
+///
+/// When a capability degrades UNDER a run — the embedding provider stops
+/// answering and memory writes start landing vectorless, say — the model has
+/// no way to know unless something tells it, and telling it on every tool
+/// call turns one fact into wallpaper it learns to ignore. This ledger is the
+/// middle path the roadmap asks for: producers (the daemon's provider
+/// plumbing) record state transitions as they observe them; the agent loop
+/// delivers each transition ONCE, appended to the next tool result, and then
+/// stays quiet until the state changes again.
+///
+/// The message contract follows the truncation-artifact rule ("summaries must
+/// announce themselves"): WHAT is off, WHY, that the operation itself still
+/// SUCCEEDED, and what is now the source of truth.
+///
+/// Both sides touch the ledger for microseconds and never across an await, so
+/// a `std::sync::Mutex` is the right lock. Bounds: at most one pending
+/// message per capability key — a capability that flaps a hundred times
+/// between two tool calls still delivers ONE line, its latest state, because
+/// the model only ever needs the current truth (the log keeps the flaps).
+#[derive(Debug, Default)]
+pub struct DegradationLedger {
+    inner: std::sync::Mutex<DegradationState>,
+}
+
+#[derive(Debug, Default)]
+struct DegradationState {
+    /// capability → the state the model was last TOLD about. Missing keys are
+    /// implicitly "healthy", so reporting a healthy capability at boot
+    /// announces nothing.
+    announced: std::collections::HashMap<String, String>,
+    /// capability → (current state, the transition message not yet delivered).
+    pending: std::collections::HashMap<String, (String, String)>,
+}
+
+/// The implicit baseline state: capabilities are presumed working until a
+/// producer says otherwise, so the first "healthy" report is not news.
+const DEGRADATION_BASELINE: &str = "healthy";
+
+impl DegradationLedger {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `capability` is now in `state`, with the message to show
+    /// the model if this is genuinely news.
+    ///
+    /// News means: `state` differs from what was last ANNOUNCED for this key.
+    /// A repeat of the announced state is dropped (stay quiet until it
+    /// changes); a flap that returns to the announced state before delivery
+    /// CANCELS the pending message (net-zero transition — the model never
+    /// needed to know); a second distinct transition before delivery replaces
+    /// the pending message (latest state wins).
+    pub fn set(&self, capability: &str, state: &str, message: impl Into<String>) {
+        // A poisoned ledger (a panic under the lock elsewhere) must not take
+        // the agent loop down over a notice — the state map stays coherent
+        // because every mutation below is a single insert/remove.
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let announced = inner
+            .announced
+            .get(capability)
+            .map_or(DEGRADATION_BASELINE, String::as_str);
+        if announced == state {
+            inner.pending.remove(capability);
+        } else {
+            inner
+                .pending
+                .insert(capability.to_string(), (state.to_string(), message.into()));
+        }
+    }
+
+    /// The undelivered transition messages, oldest key order unspecified —
+    /// delivering marks their states as announced. Returns `None` when there
+    /// is nothing to say, which is the steady state.
+    pub fn drain(&self) -> Option<String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut inner.pending);
+        let mut messages: Vec<String> = Vec::with_capacity(pending.len());
+        for (capability, (state, message)) in pending {
+            inner.announced.insert(capability, state);
+            messages.push(message);
+        }
+        drop(inner);
+        // Deterministic order for tests and for the reader.
+        messages.sort();
+        Some(messages.join("\n"))
+    }
+}
+
 /// Options for running the agent
 #[derive(Default)]
 pub struct RunOptions {
@@ -641,6 +740,10 @@ pub struct RunOptions {
     /// times per step (see [`RepeatLedger`]). `None` — a plain, single-step
     /// run — makes its own, which is exactly the previous behavior.
     pub repeat_ledger: Option<SharedRepeatLedger>,
+    /// Capability-transition notices to deliver with tool results — see
+    /// [`DegradationLedger`]. Shared with the daemon's provider plumbing
+    /// (the producers); `None` — no producers — costs nothing.
+    pub degradations: Option<std::sync::Arc<DegradationLedger>>,
 }
 
 /// What kind of work a harness-driven step is doing (P14).
@@ -4972,6 +5075,20 @@ impl Agent {
             });
         }
 
+        // Capability transitions ride the NEXT tool result after they happen
+        // (P22 Tier 4): once, attached to work the model is already reading,
+        // then silence until the state changes again. Drained only when there
+        // is a result to attach to — a drain with nowhere to deliver would
+        // silently eat the notice.
+        if let Some(ledger) = options.degradations.as_deref()
+            && let Some(first) = tool_results.first_mut()
+            && let Some(notice) = ledger.drain()
+            && let ContentBlock::ToolResult { content, .. } = first
+        {
+            content.push_str("\n\n");
+            content.push_str(&notice);
+        }
+
         tool_results
     }
 
@@ -7334,6 +7451,66 @@ mod preview_snippet_tests {
             let kept = cut.strip_suffix("...").unwrap_or(&cut);
             assert!(text.starts_with(kept));
         }
+    }
+}
+
+#[cfg(test)]
+mod degradation_ledger_tests {
+    use super::DegradationLedger;
+
+    /// The contract: a transition is delivered once, then silence until the
+    /// state changes again — repeats of a delivered state are not news.
+    #[test]
+    fn a_transition_is_announced_once_then_quiet() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "degraded", "embeddings are down");
+        assert_eq!(ledger.drain().as_deref(), Some("embeddings are down"));
+        // Same state re-reported (every subsequent failing embed) — quiet.
+        ledger.set("memory-embeddings", "degraded", "embeddings are still down");
+        assert_eq!(ledger.drain(), None, "a delivered state does not repeat");
+        // The state CHANGES — that is news again.
+        ledger.set("memory-embeddings", "healthy", "embeddings restored");
+        assert_eq!(ledger.drain().as_deref(), Some("embeddings restored"));
+    }
+
+    /// Capabilities are presumed healthy at boot: reporting the baseline is
+    /// not a transition, so the first tool result of a healthy session
+    /// carries no notice at all.
+    #[test]
+    fn the_healthy_baseline_is_not_news() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "healthy", "all fine");
+        assert_eq!(ledger.drain(), None, "healthy at boot is the presumption");
+    }
+
+    /// A flap that lands back on the announced state before delivery is a
+    /// net-zero transition: the model never needed to know, so the pending
+    /// notice is cancelled rather than delivered stale.
+    #[test]
+    fn a_net_zero_flap_cancels_the_pending_notice() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "degraded", "down");
+        ledger.set("memory-embeddings", "healthy", "back up");
+        assert_eq!(
+            ledger.drain(),
+            None,
+            "degraded-and-recovered between two tool calls is not news"
+        );
+    }
+
+    /// Distinct capabilities travel independently and one drain delivers
+    /// both, deterministically ordered.
+    #[test]
+    fn capabilities_are_independent() {
+        let ledger = DegradationLedger::new();
+        ledger.set("memory-embeddings", "degraded", "b: embeddings down");
+        ledger.set("memory-writes", "degraded", "a: writes queued");
+        assert_eq!(
+            ledger.drain().as_deref(),
+            Some("a: writes queued\nb: embeddings down"),
+            "both pending notices deliver in one drain, sorted"
+        );
+        assert_eq!(ledger.drain(), None, "a drain empties the ledger");
     }
 }
 

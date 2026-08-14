@@ -1463,6 +1463,10 @@ pub struct AgentStepRunner {
     /// runners) share one counter, so the two faults that prove a repeat do
     /// not have to land on the same runner object.
     pub gpu_fault_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Capability-transition notices (P22 Tier 4), shared with the daemon's
+    /// provider plumbing. Each pending transition reaches the model once, in
+    /// the next tool result — see [`nanna_agent::DegradationLedger`].
+    pub degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
@@ -2592,6 +2596,9 @@ impl AgentStepRunner {
             on_tool_end,
             // Tool results land in memory; context keeps only the stub.
             on_memory: self.memory_sink(),
+            // Capability transitions (provider benched, writes queued) reach
+            // the model once, in its next tool result.
+            degradations: self.degradations.clone(),
             ..Default::default()
         };
 

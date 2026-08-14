@@ -271,6 +271,23 @@ impl EmbeddingRouter {
                         debug!("Embedding provider {} is congested", entry.info);
                         last_error = e.to_string();
                     }
+                    Err(e) if e.is_input_overflow() => {
+                        // The CALLER's fault, not the provider's: an oversized
+                        // input is rejected deterministically, but the provider
+                        // is healthy for every other call — benching it would
+                        // take the whole capability down for the full cooldown
+                        // over one bad input (observed 2026-08-10). The client
+                        // already shrinks-and-retries internally, so reaching
+                        // here means the report carried no usable limit; the
+                        // sweep continues because a fallback with a larger
+                        // window may simply accept the input as-is.
+                        warn!(
+                            "Embedding provider {} rejected the input as too long \
+                             (provider stays available): {}",
+                            entry.info, e
+                        );
+                        last_error = e.to_string();
+                    }
                     Err(e) => {
                         // Genuinely unavailable — no key, no credit, wrong
                         // model, unprocessable payload. Waiting will not fix
@@ -426,6 +443,41 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "the dead provider is hit once, then benched — never once per call"
+        );
+    }
+
+    /// An input-overflow rejection is the CALLER's fault: the provider stays
+    /// available — never benched — so the next call reaches the network again
+    /// instead of being short-circuited by a cooldown. (Contrast with the
+    /// generic-422 test above, where the second call must NOT hit the wire.)
+    ///
+    /// The one-char input makes the client's own shrink-and-retry bottom out
+    /// immediately, which is the only way an overflow report still reaches
+    /// the router.
+    #[tokio::test]
+    async fn an_input_overflow_never_benches_the_provider() {
+        let (url, hits) = spawn_counting_server(
+            422,
+            r#"{"error":{"message":"input length 100 exceeds maximum context length 50"}}"#,
+        )
+        .await;
+        let (info, client) = openai_provider("openrouter", &url);
+        let router = EmbeddingRouter::new(info, client);
+
+        for _ in 0..2 {
+            let err = router
+                .embed_one("x")
+                .await
+                .expect_err("an unhealable overflow surfaces");
+            assert!(
+                !err.contains("benched"),
+                "the failure is reported without a bench: {err}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the provider is consulted on every call — an input fault never benches it"
         );
     }
 
