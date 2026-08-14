@@ -2988,15 +2988,25 @@ from evidence, budgets stay budgets):
 - [ ] Resume = **continue, not restart**: a driver/user re-send after self-termination seeds
       the new turn with closed items, verified outcomes, and current artifact state.
 
-**Tier 2 — context & compression (`nanna-agent/src/loop_runner.rs`)**
-- [ ] Derive the proactive-compression trigger from **measured headroom** (estimated +
+**Tier 2 — context & compression (`nanna-agent/src/loop_runner.rs`)** — shipped in PR #223 (2026-08-13)
+- [x] Derive the proactive-compression trigger from **measured headroom** (estimated +
       observed max step growth vs threshold), not 40%-of-threshold tuned for 200k windows.
       (Evidence: fired 80× at 4423 tokens on a 16384 window with ~3.7k headroom free.)
-- [ ] Make the consolidated summary **monotone in asserted facts**: verified outcomes
+      *(PR #223: `ContextGrowthTracker` + `proactive_compression_due` — baseline re-taken
+      post-ladder so compression never pollutes the measurement; no growth measured → no
+      evidence → the proactive tier stays quiet; the 4423/16384 case is a unit test.)*
+- [x] Make the consolidated summary **monotone in asserted facts**: verified outcomes
       (command, exit status, when) live in a never-compressed slot; a pass may reword,
       never drop. (Evidence: 2571→934-char summary pass immediately preceded the 16→5 crash.)
-- [ ] When summarization fails, never silently truncate — announce WHAT dropped and that
+      *(PR #223: `AgentContext::verified_outcomes`, fed by completed exec calls — definite
+      exit status required, identical re-verifications collapse to ×N, a changed verdict
+      appends rather than replaces; also found and fixed the 2571→934 mechanism itself:
+      progressive distillation overwrote `consolidated_summary` wholesale, and now writes
+      its own rolling `distilled_facts` slot.)*
+- [x] When summarization fails, never silently truncate — announce WHAT dropped and that
       disk is unaffected.
+      *(PR #223: every unsummarized-drop fallback queues a WHAT/WHY/disk-unaffected
+      notice, drained AFTER the ladder so compression cannot eat its own announcement.)*
 
 **Tier 3 — write-path honesty (`nanna-tools/default-skills/*`)**
 - [ ] A shrinking whole-file write over a file the model has NOT read since its last
