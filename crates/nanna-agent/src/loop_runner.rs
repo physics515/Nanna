@@ -3448,8 +3448,15 @@ impl Agent {
                 return self.finish_cancelled(state, &options).await;
             }
 
-            // If no tool calls, check for narration loop before exiting
-            if result.tool_uses.is_empty() {
+            // If no tool calls, check for narration loop before exiting.
+            // A round whose structured calls ALL had malformed JSON
+            // (`tool_uses` empty but `error_tool_results` present) is NOT
+            // tool-free: it falls through to the tool path below so the
+            // synthesized error results get stored paired with the assistant
+            // turn's placeholder tool_use blocks. Exiting here dropped them —
+            // the model never learned its call was unparseable, and the
+            // stored turn kept tool_use blocks with no tool_result.
+            if result.tool_uses.is_empty() && result.error_tool_results.is_empty() {
                 // This round is over regardless of which path below it takes —
                 // normal exit, or one of the continuation `continue`s (mission
                 // stall, narration, repetition). Close its reasoning block here
@@ -3469,10 +3476,9 @@ impl Agent {
                     );
                     state.narration_nudged = true;
 
-                    // Store the broken response so the model sees what it did
-                    self.store_assistant_response(&result.content_blocks).await;
-
-                    // Inject a user-role nudge to break the pattern
+                    // The broken response is already in context (stored
+                    // unconditionally above) — inject only the user-role
+                    // nudge after it to break the pattern
                     let nudge = AnthropicMessage::user_text(narration_nudge_message(
                         state.task_anchor.as_deref(),
                     ));
@@ -3495,9 +3501,8 @@ impl Agent {
                     );
                     state.repetition_nudged = true;
 
-                    // Store the broken response so the model sees what it did
-                    self.store_assistant_response(&result.content_blocks).await;
-
+                    // The broken response is already in context (stored
+                    // unconditionally above); only the nudge is added here
                     let nudge = AnthropicMessage::user_text(repetition_nudge_message(
                         state.task_anchor.as_deref(),
                     ));
@@ -3589,10 +3594,9 @@ impl Agent {
                     state.repetition_nudged = false;
                     state.thinking_spiral_nudged = false;
 
-                    // Keep the model's partial answer in context so it builds
-                    // on its own progress instead of restarting.
-                    self.store_assistant_response(&result.content_blocks).await;
-
+                    // The model's partial answer is already in context (stored
+                    // unconditionally above), so it builds on its own progress
+                    // instead of restarting.
                     let prod = if claim_unverified {
                         mission_verify_message()
                     } else if state.mission_repeat_rounds >= MISSION_REPEAT_ROUNDS_ESCALATE {
@@ -3688,7 +3692,14 @@ impl Agent {
             }
 
             // Finalize any reasoning that occurred before tool calls (interleaved reasoning)
-            if !result.tool_uses.is_empty() {
+            if result.tool_uses.is_empty() {
+                // Only the all-calls-malformed round reaches here without
+                // tool_uses (the genuinely tool-free round exited or continued
+                // above). Close its reasoning block, but leave the mission
+                // stall counter alone — an unparseable call is not verified
+                // work.
+                state.finalize_reasoning_block(None);
+            } else {
                 let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
                 state.finalize_reasoning_block(first_tool);
                 // Real tool activity resets the mission stall counter — the
