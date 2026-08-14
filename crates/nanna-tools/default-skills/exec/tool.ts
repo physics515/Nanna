@@ -1,6 +1,6 @@
 export default {
   name: "exec",
-  version: "0.1.4",
+  version: "0.1.5",
   output: "memory",
   // Script-engine deadline (seconds). This is only a backstop for a hung script:
   // the shell bridge owns the real per-command timeout — the `timeout` parameter
@@ -9,7 +9,7 @@ export default {
   // build/VCS command is never preempted by the engine (which would orphan the
   // child). A larger explicit `timeout` extends this deadline automatically.
   timeout: 180,
-  description: "Execute a shell command in a POSIX bash shell (Git Bash on Windows, sh on Unix) and return its output. ALWAYS bash syntax: pipes, &&, ||, [ -f x ] / [ -d x ], ls, cat/grep/tail, mkdir -p, 2>/dev/null, forward-slash paths. NEVER cmd.exe syntax — 'if exist', '2>nul', 'cd /d', 'errorlevel' all FAIL here. To search code, use the code_search tool — rg/ripgrep is not guaranteed on PATH. Use for build commands, scripts, git operations, etc.",
+  description: "Execute a shell command in a POSIX bash shell (Git Bash on Windows, sh on Unix) and return its output. ALWAYS bash syntax: pipes, &&, ||, [ -f x ] / [ -d x ], ls, cat/grep/tail, mkdir -p, 2>/dev/null, forward-slash paths. NEVER cmd.exe syntax — 'if exist', '2>nul', 'cd /d', 'errorlevel' all FAIL here. To search code, use the code_search tool — rg/ripgrep is not guaranteed on PATH. Use for build commands, scripts, git operations, etc. After a command that redirects into a script or JSON file, the cheapest structural check runs on that file and its verdict is appended to the output.",
   parameters: {
     type: "object",
     properties: {
@@ -28,16 +28,40 @@ export default {
       return { content: "Error: Missing required parameter: command", success: false };
     }
 
+    // Guard events are logged at INFO so they can be audited from the
+    // daemon log after a run (P22). Best-effort, never blocks.
+    function glog(msg) {
+      try { Nanna.log("info", msg); } catch (e) { /* logging is optional */ }
+    }
+
     // --- anti-erosion: shell redirection over a ratchet-protected file ---
     //
     // Mirrors write_file/edit_file's key normalization exactly, or the
     // lookup misses and the guard silently does nothing. (The ratchet keys
     // on "./minidb" and "minidb" as the same file; so must this.)
     var HIWATER_STATE = ".nanna/write_hiwater.json";
-    function hiwaterKey(path) {
+    function hiwaterNormKey(path) {
       var k = path.split("\\").join("/").toLowerCase();
       while (k.indexOf("./") === 0) k = k.substring(2);
       while (k.indexOf("//") !== -1) k = k.split("//").join("/");
+      return k;
+    }
+    // Canonical key (P22): absolute spellings under the workspace root
+    // collapse to the relative form — one file, one entry (the observed
+    // split-brain let an absolute-path mutation dodge the guard). The
+    // legacy spelling is still consulted at lookup so old entries protect.
+    function hiwaterKey(path) {
+      var k = hiwaterNormKey(path);
+      try {
+        var wd = Nanna.workdir();
+        if (wd) {
+          var w = hiwaterNormKey(String(wd));
+          if (w.charAt(w.length - 1) !== "/") w += "/";
+          if (k.indexOf(w) === 0 && k.length > w.length) k = k.substring(w.length);
+        }
+      } catch (e) {
+        // No workdir — spellings keep their own entries, as before.
+      }
       return k;
     }
     function hiwaterMap() {
@@ -50,19 +74,38 @@ export default {
       }
       return {};
     }
+    // The entry under the canonical key, folded with the legacy spelling
+    // (hi = max of both) so neither spelling escapes the guard.
+    function hiwaterEntryFor(map, path) {
+      var canon = hiwaterKey(path);
+      var alias = hiwaterNormKey(path);
+      var a = map[canon] || null;
+      var b = alias !== canon ? (map[alias] || null) : null;
+      if (!a) return b;
+      if (b) {
+        var hiA = typeof a.hi === "number" && isFinite(a.hi) ? a.hi : 0;
+        var hiB = typeof b.hi === "number" && isFinite(b.hi) ? b.hi : 0;
+        if (hiB > hiA) a.hi = hiB;
+      }
+      return a;
+    }
+    function hiwaterEntryHi(entry) {
+      return entry && typeof entry.hi === "number" && isFinite(entry.hi) ? entry.hi : 0;
+    }
 
-    // Collect targets of CLOBBERING redirects only. `>>` appends and is
-    // safe; `>` and `>|` truncate, and `tee` without -a truncates.
-    function clobberTargets(command) {
+    // Every redirection target in the command, with whether it appends.
+    // `>>` appends (safe from clobbering, still a mutation); `>` and `>|`
+    // truncate; `tee` truncates without -a/--append.
+    function redirectTargets(command) {
       var targets = [];
       var i = 0;
       while (i < command.length) {
         var ch = command.charAt(i);
         if (ch === ">") {
-          // Skip `>>` (append) entirely, both characters.
-          if (command.charAt(i + 1) === ">") { i += 2; continue; }
+          var append = false;
           var j = i + 1;
-          if (command.charAt(j) === "|") j++;          // `>|` force-clobber
+          if (command.charAt(j) === ">") { append = true; j++; }
+          if (!append && command.charAt(j) === "|") j++;   // `>|` force-clobber
           while (j < command.length && (command.charAt(j) === " " || command.charAt(j) === "\t")) j++;
           var tok = "";
           while (j < command.length) {
@@ -77,22 +120,34 @@ export default {
             var f = tok.charAt(0), l = tok.charAt(tok.length - 1);
             if ((f === '"' && l === '"') || (f === "'" && l === "'")) tok = tok.substring(1, tok.length - 1);
           }
-          if (tok.length > 0) targets.push(tok);
+          if (tok.length > 0) targets.push({ path: tok, append: append });
           i = j;
           continue;
         }
         i++;
       }
-      // `tee FILE` (no -a/--append) truncates just like `>`.
+      // `tee FILE` truncates just like `>`; `tee -a FILE` appends.
       var teeAt = command.indexOf("tee ");
       if (teeAt !== -1) {
         var rest = command.substring(teeAt + 4);
-        if (rest.indexOf("-a") !== 0 && rest.indexOf("--append") !== 0) {
-          var tok2 = rest.split(" ")[0].split("|")[0].split(";")[0].trim();
-          if (tok2.length > 0 && tok2.charAt(0) !== "-") targets.push(tok2);
-        }
+        var teeAppend = false;
+        if (rest.indexOf("-a ") === 0) { teeAppend = true; rest = rest.substring(3); }
+        else if (rest.indexOf("--append ") === 0) { teeAppend = true; rest = rest.substring(9); }
+        while (rest.charAt(0) === " ") rest = rest.substring(1);
+        var tok2 = rest.split(" ")[0].split("|")[0].split(";")[0].trim();
+        if (tok2.length > 0 && tok2.charAt(0) !== "-") targets.push({ path: tok2, append: teeAppend });
       }
       return targets;
+    }
+
+    // Targets of CLOBBERING redirects only (append cannot clobber).
+    function clobberTargets(command) {
+      var all = redirectTargets(command);
+      var out = [];
+      for (var i = 0; i < all.length; i++) {
+        if (!all[i].append) out.push(all[i].path);
+      }
+      return out;
     }
 
     // Deletion/rename of a ratchet-protected file is the OTHER laundering
@@ -146,9 +201,9 @@ export default {
         // A redirect into a variable or process substitution is not a path
         // we can reason about; leave it alone.
         if (raw.indexOf("$") !== -1 || raw.indexOf("/dev/") === 0) continue;
-        var entry = map[hiwaterKey(raw)];
-        var hi = entry && typeof entry.hi === "number" && isFinite(entry.hi) ? entry.hi : 0;
+        var hi = hiwaterEntryHi(hiwaterEntryFor(map, raw));
         if (hi > 500) {
+          glog("exec guard: NOT EXECUTED (clobber/delete of ratchet-protected " + raw + ", hi=" + hi + "): " + (command.length > 160 ? command.substring(0, 160) + "..." : command));
           return "NOT EXECUTED — the file was NOT modified and is fully intact. " +
             "This command would replace or delete " + raw + ", which is a file you built with " +
             "write_file/edit_file and which has held " + hi + " bytes. Redirecting over it, " +
@@ -283,6 +338,147 @@ export default {
 
     if (!result.success) {
       output = "Command failed (exit code " + result.code + ")\n" + output;
+    }
+
+    // Post-mutation structural check (P22 Tier 3): a redirect is a write
+    // path, so it gets the same honesty as write_file/edit_file — the
+    // cheapest applicable check runs on each redirected-into file and the
+    // verdict is appended AS A SENTENCE, never a gate. Appends included:
+    // `echo ... >> ./minidb` bypasses the byte ratchet by construction (it
+    // only grows the file) yet can render it unparseable, and did, unremarked
+    // (2026-08-10 ministral workspace). Only the first 3 targets are checked
+    // so the checks (15s cap each) can never crowd the 180s engine deadline
+    // and orphan the child process. Fail OPEN on every path.
+    function structuralCheckKindForDisk(path, contentText) {
+      var pp = path.split("\\").join("/").toLowerCase();
+      var base = pp.split("/").pop();
+      function hasExt(e) { return base.length > e.length && base.lastIndexOf(e) === base.length - e.length; }
+      if (hasExt(".json") || hasExt(".geojson")) return "json";
+      if (hasExt(".sh") || hasExt(".bash")) return "sh";
+      if (hasExt(".js") || hasExt(".mjs") || hasExt(".cjs")) return "node";
+      if (hasExt(".py")) return "py";
+      if (base.indexOf(".") === -1 && typeof contentText === "string" && contentText.indexOf("#!") === 0) {
+        var nl = contentText.indexOf("\n");
+        var line1 = nl === -1 ? contentText : contentText.substring(0, nl);
+        if (line1.indexOf("python") !== -1) return "py";
+        if (line1.indexOf("node") !== -1) return "node";
+        if (line1.indexOf("fish") === -1 && line1.indexOf("pwsh") === -1 &&
+            line1.indexOf("zsh") === -1 && line1.indexOf("csh") === -1 &&
+            line1.indexOf("sh") !== -1) return "sh";
+      }
+      return null;
+    }
+    function runStructuralCheck(kind, path, contentText) {
+      if (kind === "json") {
+        if (typeof contentText !== "string") return null;
+        try {
+          JSON.parse(contentText);
+          return { ok: true, tool: "JSON.parse", detail: "" };
+        } catch (eJ) {
+          var jd = String(eJ && eJ.message ? eJ.message : eJ);
+          if (jd.length > 160) jd = jd.substring(0, 160);
+          return { ok: false, tool: "JSON.parse", detail: jd };
+        }
+      }
+      if (path.indexOf("'") !== -1) return null;
+      var cmd = null;
+      var toolName = null;
+      if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
+      else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
+      else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
+      if (!cmd) return null;
+      try {
+        var r = Nanna.exec(cmd, null, 15);
+        if (!r) return null;
+        if (r.success) return { ok: true, tool: toolName, detail: "" };
+        var err = (r.stderr || r.stdout || "");
+        if (r.code === 127 || err.indexOf("command not found") !== -1) return null;
+        err = err.split("\r").join("").split("\n").join(" ");
+        while (err.indexOf("  ") !== -1) err = err.split("  ").join(" ");
+        if (err.length > 200) err = err.substring(0, 200);
+        if (err === "" || err === " ") err = "exit code " + r.code;
+        return { ok: false, tool: toolName, detail: err };
+      } catch (eX) {
+        return null;
+      }
+    }
+    try {
+      var rTargets = redirectTargets(input.command);
+      var seenTargets = {};
+      var checked = 0;
+      for (var rt = 0; rt < rTargets.length && checked < 3; rt++) {
+        var tPath = rTargets[rt].path;
+        if (seenTargets[tPath]) continue;
+        seenTargets[tPath] = true;
+        if (tPath.indexOf("$") !== -1 || tPath.indexOf("/dev/") === 0) continue;
+        var tKey = hiwaterKey(tPath);
+        // Managed sidecars and the ledger itself are not checkable work files.
+        if (tKey.lastIndexOf(".__buffer__") === tKey.length - 11 && tKey.length >= 11) continue;
+        if (tKey.lastIndexOf(".__prev__") === tKey.length - 9 && tKey.length >= 9) continue;
+        if (tKey.lastIndexOf("write_hiwater.json") !== -1) continue;
+        var tStat = null;
+        try { tStat = Nanna.stat(tPath); } catch (eSt) { tStat = null; }
+        if (!tStat || !tStat.is_file) continue;
+        var tContent = null;
+        var kind = structuralCheckKindForDisk(tPath, null);
+        if (kind === null) {
+          // Extensionless: classify by shebang. The read is bounded — a
+          // structural check exists for human-scale source files, and
+          // anything bigger is data (read_file's own cap is 10MB; 512KB is
+          // far past any source file these checks understand).
+          var baseT = tPath.split("\\").join("/").split("/").pop();
+          if (baseT.indexOf(".") === -1 && tStat.size <= 524288) {
+            try { tContent = Nanna.readFile(tPath); } catch (eRd) { tContent = null; }
+            if (tContent !== null) kind = structuralCheckKindForDisk(tPath, tContent);
+          }
+        } else if (kind === "json") {
+          // Engine-side parse needs the bytes; same scope bound as above.
+          if (tStat.size > 1048576) { kind = null; }
+          else {
+            try { tContent = Nanna.readFile(tPath); } catch (eRd2) { kind = null; }
+          }
+        }
+        if (!kind) continue;
+        var v = runStructuralCheck(kind, tPath, tContent);
+        if (!v) continue;
+        checked++;
+        // Before/after clause from the ratchet's recorded verdict, when the
+        // file has one; a pass also refreshes the evidenced-good anchor for
+        // files the ratchet already tracks (never creates new entries —
+        // exec is not an in-band author).
+        var prevChk = null;
+        try {
+          var ledger = hiwaterMap();
+          var lEntry = hiwaterEntryFor(ledger, tPath);
+          if (lEntry && (lEntry.chk === "ok" || lEntry.chk === "bad")) prevChk = lEntry.chk;
+          if (lEntry) {
+            lEntry.chk = v.ok ? "ok" : "bad";
+            if (v.ok) {
+              lEntry.good = tStat.size;
+              lEntry.goodAt = Date.now();
+            }
+            ledger[hiwaterKey(tPath)] = lEntry;
+            var alias2 = hiwaterNormKey(tPath);
+            if (alias2 !== hiwaterKey(tPath)) delete ledger[alias2];
+            Nanna.writeFile(HIWATER_STATE, JSON.stringify(ledger));
+          }
+        } catch (eLg) {
+          // Ledger sync is best-effort.
+        }
+        if (v.ok) {
+          output += "\n\nSTRUCTURE: " + tPath + " parses (" + v.tool + ")" +
+            (prevChk === "bad" ? " — the earlier syntax break is fixed." : ".");
+        } else {
+          var hist = "";
+          if (prevChk === "ok") hist = " It parsed BEFORE this command — this command introduced the break.";
+          else if (prevChk === "bad") hist = " It did not parse before this command either.";
+          output += "\n\nSTRUCTURE: " + tPath + " does NOT parse after this command (" + v.tool + "): " + v.detail + "." + hist +
+            " This is information, not a block — the command's output landed as shown above.";
+          glog("exec structure: " + tPath + " does NOT parse after redirect (" + v.tool + "): " + v.detail);
+        }
+      }
+    } catch (eStruct) {
+      // The verdict is informational only — never affects the result.
     }
 
     return { content: output || "(no output)", success: result.success };
