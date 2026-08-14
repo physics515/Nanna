@@ -3062,18 +3062,38 @@ from evidence, budgets stay budgets):
       and breaker replays record a `short_circuited` stats outcome (tracker, daemon sink,
       Turso hourly) instead of `success=0`.
 
-**Tier 5 — the bench measures itself (`bench/gui-leg/`, new)**
-- [ ] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
+**Tier 5 — the bench measures itself (`bench/gui-leg/`) ✅ (landed 2026-08-13, PR #225)**
+- [x] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
       the repo; each leg runs from an immutable self-copy with hashes in the ledger header.
-- [ ] Gate every ledger score on a **daemon liveness probe**; 3 consecutive failures →
+      *(2026-08-13 — `nanna-ipc.mjs` had already vanished from disk and was reconstructed
+      from `protocol.rs`; the ladder's 42 tests are tracked as data with a combined hash
+      in every ledger header; daemon stdout/stderr captured per leg into `run/daemon.out|err`.)*
+- [x] Gate every ledger score on a **daemon liveness probe**; 3 consecutive failures →
       INVALID(daemon-unreachable), never a score. Record a work denominator per poll.
-- [ ] Snapshot artifact + score per poll; report **peak, time-of-peak, and final**.
-- [ ] Worker/supervisor split with a staleness-failing heartbeat; resume contract in the
+      *(Probe = `system.status` before every recorded poll; failed probe → poll marked
+      UNREACHABLE with nothing else recorded; the summary additionally REFUSES a score when
+      unreachable polls exceed a cap. Denominator = tool calls / side-effecting calls /
+      tokens / queue via `get_run_state {light}` + anchored log greps for steps and `stop=`
+      reasons — the fallback until Tier 4's session-liveness verb lands. Preflight
+      (exclusive GPU, pinned num_ctx with hard abort on demotion, embedding-store health)
+      asserted at start AND per poll.)*
+- [x] Snapshot artifact + score per poll; report **peak, time-of-peak, and final**
+      *(`run/history/<minutes>/` gets artifact copy + scored verdict + denominator each poll).*
+- [x] Worker/supervisor split with a staleness-failing heartbeat; resume contract in the
       driver: interjection-only, liveness-gated, effectiveness-checked.
+      *(Worker heartbeats + appends machine-readable `status.jsonl` every 60s tick; the
+      separate supervisor fails the leg loudly on stale heartbeat, persistent
+      unreachability, dead worker without a terminal verdict, or lifetime overrun. Each
+      resume records whether the next poll changed; repeated no-effect resumes are
+      suppressed. CI self-tests (`gui-leg-selftest.yml`, ubuntu+windows, no GPU): 42/42
+      reference oracle, 0/42 stub with every ladder test individually failing it,
+      supervisor units, dry-run legs vs a fake IPC daemon proving dead-daemon → INVALID
+      with the score refused. AGENT_EVAL "Updating scores" now requires the validity
+      verdict + work denominator beside every numerator.)*
 - [ ] **Correct the published GUI-path table**: ministral leg INVALID (daemon died at
       t=3m42s; scored a corpse), gemma leg CONTAMINATED (a `task` sub-agent on a cloud
       120B produced its peak), lfm reframed as tool-channel failure. Peak-vs-final becomes
-      the headline metric.
+      the headline metric. *(In flight separately as PR #222.)*
 
 Full evidence: the six-agent retrospective (per-leg log forensics) in the 2026-08-11
 session; per-leg detail in `bench/BASELINE.md` and the campaign ledger/artifacts.

@@ -1,0 +1,5 @@
+# The gui-leg bench drivers are executed by sh/bash directly from the checkout
+# (and staged byte-for-byte into immutable per-run copies whose hashes are
+# ledgered) — CRLF would both break `sh` and change the recorded hashes
+# between checkouts. Pin the whole tree to LF regardless of core.autocrlf.
+bench/gui-leg/** text eol=lf
