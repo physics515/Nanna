@@ -347,7 +347,12 @@ export default {
       var base = p.split("/").pop();
       function hasExt(e) { return base.length > e.length && base.lastIndexOf(e) === base.length - e.length; }
       if (hasExt(".json") || hasExt(".geojson")) return "json";
-      if (hasExt(".sh") || hasExt(".bash")) return "sh";
+      // .bash (and bash shebangs below) route to bash -n: on hosts where
+      // /bin/sh is dash, valid bash ([[ ]], arrays, process substitution)
+      // fails sh -n and the verdict would cry wolf on a correct file
+      // (ultrareview on PR #224).
+      if (hasExt(".bash")) return "bash";
+      if (hasExt(".sh")) return "sh";
       if (hasExt(".js") || hasExt(".mjs") || hasExt(".cjs")) return "node";
       if (hasExt(".py")) return "py";
       // Extensionless artifacts (./minidb) are the common mission shape:
@@ -358,6 +363,7 @@ export default {
         var line1 = nl === -1 ? contentText : contentText.substring(0, nl);
         if (line1.indexOf("python") !== -1) return "py";
         if (line1.indexOf("node") !== -1) return "node";
+        if (line1.indexOf("bash") !== -1) return "bash";
         if (line1.indexOf("fish") === -1 && line1.indexOf("pwsh") === -1 &&
             line1.indexOf("zsh") === -1 && line1.indexOf("csh") === -1 &&
             line1.indexOf("sh") !== -1) return "sh";
@@ -384,6 +390,7 @@ export default {
       var cmd = null;
       var toolName = null;
       if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
       else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
       else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
       if (!cmd) return null;
@@ -526,15 +533,38 @@ export default {
       // next attempt proceeds. One bounce, with the missing information.
       if (fileExists && !hiwaterExempt(hwKeyGuard) && bytes < existingSize &&
           typeof existing === "string" && !seenSinceLastChange(filePath)) {
-        readmarkPut(filePath);
-        glog("write_file guard: stale-shrink echo for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; file changed since last recorded read)");
+        // Echo bound (ultrareview on PR #224): the echo is MERGE MATERIAL,
+        // and merge material the model cannot hold is not material — 64 KiB
+        // is a small local model's entire 16k-token window, so anything
+        // bigger only burns the context this guard exists to respect. Under
+        // the bound the full content ships and counts as the read; over it,
+        // a head ships with a loud truncation notice (WHAT dropped, WHY,
+        // disk unaffected), the mark is NOT recorded, and the next attempt
+        // still bounces — into an explicit ranged read_file, never into a
+        // merge against a partial view.
+        var ECHO_MAX = 65536;
+        if (existingSize <= ECHO_MAX) {
+          readmarkPut(filePath);
+          glog("write_file guard: stale-shrink echo for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes; file changed since last recorded read)");
+          return fail(
+            "WRITE HELD — nothing was written and nothing is lost. You are shrinking " + filePath +
+            " from " + existingSize + " to " + bytes + " bytes, but the file has CHANGED since you last read it — " +
+            "your context copy is stale, so this rewrite would silently destroy parts of the current file. " +
+            "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
+            "\n\nMerge your change INTO this current text and call write_file again with the full merged content " +
+            "(or use edit_file for a targeted change). This reply counts as your read — the file will not be held for this reason again."
+          );
+        }
+        glog("write_file guard: stale-shrink hold (truncated echo) for " + filePath + " (attempted " + bytes + " over " + existingSize + " bytes)");
         return fail(
           "WRITE HELD — nothing was written and nothing is lost. You are shrinking " + filePath +
           " from " + existingSize + " to " + bytes + " bytes, but the file has CHANGED since you last read it — " +
           "your context copy is stale, so this rewrite would silently destroy parts of the current file. " +
-          "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
-          "\n\nMerge your change INTO this current text and call write_file again with the full merged content " +
-          "(or use edit_file for a targeted change). This reply counts as your read — the file will not be held for this reason again."
+          "The file is too large (" + existingSize + " bytes) to echo here; its first lines are:\n\n" + existing.substring(0, 4096) +
+          "\n\n[TRUNCATED — only the first 4096 of " + existingSize + " bytes shown; the file on disk is complete and unaffected.] " +
+          "This truncated preview does NOT count as reading the file. Call read_file(\"" + filePath + "\") " +
+          "(with offset/limit for ranges) to see the current content, then merge your change into it — " +
+          "after a real read this write will be accepted, or use edit_file for a targeted change."
         );
       }
 

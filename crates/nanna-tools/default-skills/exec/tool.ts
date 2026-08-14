@@ -126,15 +126,31 @@ export default {
         }
         i++;
       }
-      // `tee FILE` truncates just like `>`; `tee -a FILE` appends.
-      var teeAt = command.indexOf("tee ");
-      if (teeAt !== -1) {
+      // `tee FILE` truncates just like `>`; `tee -a FILE` appends. Matched
+      // as a standalone token, every occurrence: the old bare indexOf
+      // false-fired on any word ENDING in "tee " (committee, guarantee,
+      // employee), pushing the NEXT word as a phantom target — which could
+      // refuse an innocent `echo "committee minidb" > log.txt` outright and,
+      // worse, feed the post-command structural check a file the command
+      // never touched, silently rewriting its evidenced-good anchor
+      // (ultrareview on PR #224). A real tee sits in command position after
+      // a pipe or separator, so the boundary set is exactly those.
+      var teeScan = 0;
+      while (true) {
+        var teeAt = command.indexOf("tee ", teeScan);
+        if (teeAt === -1) break;
+        teeScan = teeAt + 4;
+        if (teeAt > 0) {
+          var teeBefore = command.charAt(teeAt - 1);
+          if (teeBefore !== " " && teeBefore !== "\t" && teeBefore !== "\n" &&
+              teeBefore !== "|" && teeBefore !== ";" && teeBefore !== "&" && teeBefore !== "(") continue;
+        }
         var rest = command.substring(teeAt + 4);
         var teeAppend = false;
         if (rest.indexOf("-a ") === 0) { teeAppend = true; rest = rest.substring(3); }
         else if (rest.indexOf("--append ") === 0) { teeAppend = true; rest = rest.substring(9); }
         while (rest.charAt(0) === " ") rest = rest.substring(1);
-        var tok2 = rest.split(" ")[0].split("|")[0].split(";")[0].trim();
+        var tok2 = rest.split(" ")[0].split("\n")[0].split("|")[0].split(";")[0].trim();
         if (tok2.length > 0 && tok2.charAt(0) !== "-") targets.push({ path: tok2, append: teeAppend });
       }
       return targets;
@@ -354,7 +370,12 @@ export default {
       var base = pp.split("/").pop();
       function hasExt(e) { return base.length > e.length && base.lastIndexOf(e) === base.length - e.length; }
       if (hasExt(".json") || hasExt(".geojson")) return "json";
-      if (hasExt(".sh") || hasExt(".bash")) return "sh";
+      // .bash (and bash shebangs below) route to bash -n: on hosts where
+      // /bin/sh is dash, valid bash ([[ ]], arrays, process substitution)
+      // fails sh -n and the verdict would cry wolf on a correct file
+      // (ultrareview on PR #224).
+      if (hasExt(".bash")) return "bash";
+      if (hasExt(".sh")) return "sh";
       if (hasExt(".js") || hasExt(".mjs") || hasExt(".cjs")) return "node";
       if (hasExt(".py")) return "py";
       if (base.indexOf(".") === -1 && typeof contentText === "string" && contentText.indexOf("#!") === 0) {
@@ -362,6 +383,7 @@ export default {
         var line1 = nl === -1 ? contentText : contentText.substring(0, nl);
         if (line1.indexOf("python") !== -1) return "py";
         if (line1.indexOf("node") !== -1) return "node";
+        if (line1.indexOf("bash") !== -1) return "bash";
         if (line1.indexOf("fish") === -1 && line1.indexOf("pwsh") === -1 &&
             line1.indexOf("zsh") === -1 && line1.indexOf("csh") === -1 &&
             line1.indexOf("sh") !== -1) return "sh";
@@ -384,6 +406,7 @@ export default {
       var cmd = null;
       var toolName = null;
       if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
       else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
       else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
       if (!cmd) return null;

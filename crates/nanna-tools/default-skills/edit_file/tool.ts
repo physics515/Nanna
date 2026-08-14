@@ -384,7 +384,12 @@ export default {
       var base = pp.split("/").pop();
       function hasExt(e) { return base.length > e.length && base.lastIndexOf(e) === base.length - e.length; }
       if (hasExt(".json") || hasExt(".geojson")) return "json";
-      if (hasExt(".sh") || hasExt(".bash")) return "sh";
+      // .bash (and bash shebangs below) route to bash -n: on hosts where
+      // /bin/sh is dash, valid bash ([[ ]], arrays, process substitution)
+      // fails sh -n and the verdict would cry wolf on a correct file
+      // (ultrareview on PR #224).
+      if (hasExt(".bash")) return "bash";
+      if (hasExt(".sh")) return "sh";
       if (hasExt(".js") || hasExt(".mjs") || hasExt(".cjs")) return "node";
       if (hasExt(".py")) return "py";
       if (base.indexOf(".") === -1 && typeof contentText === "string" && contentText.indexOf("#!") === 0) {
@@ -392,6 +397,7 @@ export default {
         var line1 = nl === -1 ? contentText : contentText.substring(0, nl);
         if (line1.indexOf("python") !== -1) return "py";
         if (line1.indexOf("node") !== -1) return "node";
+        if (line1.indexOf("bash") !== -1) return "bash";
         if (line1.indexOf("fish") === -1 && line1.indexOf("pwsh") === -1 &&
             line1.indexOf("zsh") === -1 && line1.indexOf("csh") === -1 &&
             line1.indexOf("sh") !== -1) return "sh";
@@ -414,6 +420,7 @@ export default {
       var cmd = null;
       var toolName = null;
       if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
       else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
       else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
       if (!cmd) return null;

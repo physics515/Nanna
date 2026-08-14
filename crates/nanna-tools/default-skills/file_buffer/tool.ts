@@ -272,7 +272,12 @@ export default {
       var base = pp.split("/").pop();
       function hasExt(e) { return base.length > e.length && base.lastIndexOf(e) === base.length - e.length; }
       if (hasExt(".json") || hasExt(".geojson")) return "json";
-      if (hasExt(".sh") || hasExt(".bash")) return "sh";
+      // .bash (and bash shebangs below) route to bash -n: on hosts where
+      // /bin/sh is dash, valid bash ([[ ]], arrays, process substitution)
+      // fails sh -n and the verdict would cry wolf on a correct file
+      // (ultrareview on PR #224).
+      if (hasExt(".bash")) return "bash";
+      if (hasExt(".sh")) return "sh";
       if (hasExt(".js") || hasExt(".mjs") || hasExt(".cjs")) return "node";
       if (hasExt(".py")) return "py";
       if (base.indexOf(".") === -1 && typeof contentText === "string" && contentText.indexOf("#!") === 0) {
@@ -280,6 +285,7 @@ export default {
         var line1 = nl === -1 ? contentText : contentText.substring(0, nl);
         if (line1.indexOf("python") !== -1) return "py";
         if (line1.indexOf("node") !== -1) return "node";
+        if (line1.indexOf("bash") !== -1) return "bash";
         if (line1.indexOf("fish") === -1 && line1.indexOf("pwsh") === -1 &&
             line1.indexOf("zsh") === -1 && line1.indexOf("csh") === -1 &&
             line1.indexOf("sh") !== -1) return "sh";
@@ -302,6 +308,7 @@ export default {
       var cmd = null;
       var toolName = null;
       if (kind === "sh") { cmd = "sh -n '" + path + "'"; toolName = "sh -n"; }
+      else if (kind === "bash") { cmd = "bash -n '" + path + "'"; toolName = "bash -n"; }
       else if (kind === "node") { cmd = "node --check '" + path + "'"; toolName = "node --check"; }
       else if (kind === "py") { cmd = "python -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding=\"utf-8\").read())' '" + path + "'"; toolName = "python ast"; }
       if (!cmd) return null;
@@ -530,15 +537,34 @@ export default {
         // read, so the next commit proceeds.
         if (fileExists && !hiwaterExempt(hwKeyC) && buffered.length < existingLen &&
             typeof existing === "string" && !seenSinceLastChange(filePath)) {
-          readmarkPut(filePath);
-          glog("file_buffer guard: stale-shrink echo for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes; file changed since last recorded read)");
+          // Echo bound, same rule as write_file (design comment there):
+          // under 64 KiB the full content ships and counts as the read;
+          // over it, a loudly-truncated head ships, the mark is NOT
+          // recorded, and the next commit bounces into an explicit
+          // ranged read_file rather than a merge against a partial view.
+          var ECHO_MAX = 65536;
+          if (existingLen <= ECHO_MAX) {
+            readmarkPut(filePath);
+            glog("file_buffer guard: stale-shrink echo for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes; file changed since last recorded read)");
+            return fail(
+              "COMMIT HELD — the real file is UNCHANGED and the buffer is KEPT. Committing would shrink " + filePath +
+              " from " + existingLen + " to " + buffered.length + " bytes, but the file has CHANGED since you last read it — " +
+              "your buffer was built from a stale copy, so parts of the current file would be silently destroyed. " +
+              "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
+              "\n\nCompare it with your buffer (file_buffer action=\"show\"), fold anything missing into the buffer with " +
+              "edit_file(file_path=\"" + bufPath + "\", ...), then commit again. This reply counts as your read — the commit will not be held for this reason again."
+            );
+          }
+          glog("file_buffer guard: stale-shrink hold (truncated echo) for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes)");
           return fail(
             "COMMIT HELD — the real file is UNCHANGED and the buffer is KEPT. Committing would shrink " + filePath +
             " from " + existingLen + " to " + buffered.length + " bytes, but the file has CHANGED since you last read it — " +
             "your buffer was built from a stale copy, so parts of the current file would be silently destroyed. " +
-            "Here is the CURRENT content of " + filePath + ":\n\n" + existing +
-            "\n\nCompare it with your buffer (file_buffer action=\"show\"), fold anything missing into the buffer with " +
-            "edit_file(file_path=\"" + bufPath + "\", ...), then commit again. This reply counts as your read — the commit will not be held for this reason again."
+            "The file is too large (" + existingLen + " bytes) to echo here; its first lines are:\n\n" + existing.substring(0, 4096) +
+            "\n\n[TRUNCATED — only the first 4096 of " + existingLen + " bytes shown; the file on disk is complete and unaffected.] " +
+            "This truncated preview does NOT count as reading the file. Call read_file(\"" + filePath + "\") " +
+            "(with offset/limit for ranges) to see the current content, fold anything missing into the buffer with " +
+            "edit_file(file_path=\"" + bufPath + "\", ...), then commit again — after a real read the commit will be accepted."
           );
         }
 
