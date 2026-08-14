@@ -109,6 +109,11 @@ pub struct ControlPlane {
     /// hard kill). `None` in minimal test constructions — the handler then
     /// reports the request as unsupported instead of pretending to stop.
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Capability-transition notices (P22 Tier 4), shared with the daemon's
+    /// provider plumbing; every step runner this plane builds delivers
+    /// pending transitions once, in the model's next tool result. `None` in
+    /// minimal test constructions.
+    degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 impl ControlPlane {
@@ -143,6 +148,7 @@ impl ControlPlane {
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
             shutdown_tx: None,
+            degradations: None,
         }
     }
 
@@ -201,6 +207,7 @@ impl ControlPlane {
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
             shutdown_tx: None,
+            degradations: None,
         }
     }
 
@@ -261,6 +268,7 @@ impl ControlPlane {
             memory_recovery: None,
             chat_runs: Arc::new(chat_harness::ChatRunRegistry::new()),
             shutdown_tx: None,
+            degradations: None,
         }
     }
 
@@ -269,6 +277,15 @@ impl ControlPlane {
     #[must_use]
     pub fn with_shutdown(mut self, tx: tokio::sync::broadcast::Sender<()>) -> Self {
         self.shutdown_tx = Some(tx);
+        self
+    }
+
+    /// Share the capability-transition ledger (P22 Tier 4) with every step
+    /// runner this plane builds. Must be the SAME `Arc` the provider plumbing
+    /// records into — a second ledger would announce nothing.
+    #[must_use]
+    pub fn with_degradations(mut self, ledger: Arc<nanna_agent::DegradationLedger>) -> Self {
+        self.degradations = Some(ledger);
         self
     }
 

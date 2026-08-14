@@ -39,7 +39,7 @@ pub use registry::{
 };
 pub use loop_runner::{
     Agent, AgentConfig, AgentResponse, CLAIM_NUDGE_REPEAT_AFTER_ITERATIONS, CLAIM_NUDGES_MAX,
-    EmotionalContext, ExtractedMemory, MemoryCallback,
+    DegradationLedger, EmotionalContext, ExtractedMemory, MemoryCallback,
     MemoryProvenance, ModelTier, NudgeLevel, ReasoningBlock, ReasoningContent, RepeatLedger,
     RunOptions, STEERING_CONTINUATION, SharedRepeatLedger, StepKind, StreamCallback,
     TASK_ANCHOR_MAX_BYTES, TaskComplexity,

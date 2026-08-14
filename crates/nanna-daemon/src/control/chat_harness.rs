@@ -124,6 +124,12 @@ fn round_made_progress(round: &nanna_agent::harness::LongHorizonReport) -> bool 
 pub struct ChatRunRegistry {
     pending: RwLock<HashMap<String, Arc<PendingMessages>>>,
     active: RwLock<HashMap<String, ()>>,
+    /// Wakes admission-gate waiters ([`Self::wait_idle`] / [`Self::wait_active`])
+    /// on every claim AND release. One channel for both edges — waiters
+    /// re-check their own condition on wake, so a spurious wake costs a read
+    /// and a missed edge cannot happen (interest is registered before the
+    /// condition is checked).
+    changed: tokio::sync::Notify,
 }
 
 impl ChatRunRegistry {
@@ -163,17 +169,71 @@ impl ChatRunRegistry {
     /// Claim the run slot. Returns false when one is already live — the
     /// caller must then interject instead of starting a second run.
     pub async fn try_claim(&self, session_id: &str) -> bool {
-        let mut active = self.active.write().await;
-        if active.contains_key(session_id) {
-            return false;
+        let claimed = {
+            let mut active = self.active.write().await;
+            if active.contains_key(session_id) {
+                false
+            } else {
+                active.insert(session_id.to_string(), ());
+                true
+            }
+        };
+        if claimed {
+            // A claim is the "yield NOW" edge for background work holding the
+            // local provider — see [`Self::wait_active`].
+            self.changed.notify_waiters();
         }
-        active.insert(session_id.to_string(), ());
-        true
+        claimed
     }
 
     /// Release the slot. Must run on every exit path, including errors.
     pub async fn release(&self, session_id: &str) {
         self.active.write().await.remove(session_id);
+        // The "resume" edge for admission-gate waiters parked in
+        // [`Self::wait_idle`].
+        self.changed.notify_waiters();
+    }
+
+    /// Park until NO harness run is live.
+    ///
+    /// The admission gate for background work on the shared local provider
+    /// (P22 Tier 4): the embedding backfill takes its next slot, a yielded
+    /// heartbeat resumes, and dream summarization proceeds only through
+    /// here. Event-driven — wakes on every claim/release edge, no polling
+    /// interval to tune — and PRIORITY, not a quota: the moment the last run
+    /// releases, waiters proceed.
+    ///
+    /// Wakeup-loss safety: interest in the next edge is registered (`enable`)
+    /// BEFORE the condition is read, so a release landing between the read
+    /// and the await still wakes the waiter.
+    pub async fn wait_idle(&self) {
+        loop {
+            let waiter = self.changed.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+            if !self.any_active().await {
+                return;
+            }
+            waiter.await;
+        }
+    }
+
+    /// Park until SOME harness run is live — the preemption signal for
+    /// background work already running on the local provider: a scheduled
+    /// heartbeat/cron run select-races its own agent turn against this and
+    /// yields the generation slot when a user turn arrives (P22 Tier 4;
+    /// evidence: a heartbeat held the single GPU slot 157s into a mission's
+    /// opening turn while the planner timed out behind it).
+    pub async fn wait_active(&self) {
+        loop {
+            let waiter = self.changed.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+            if self.any_active().await {
+                return;
+            }
+            waiter.await;
+        }
     }
 }
 
@@ -273,6 +333,9 @@ impl ControlPlane {
             memory: self.memory.clone(),
             workspace_id: active_workspace_id,
             gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            // Capability transitions reach the model once, in the next tool
+            // result (P22 Tier 4).
+            degradations: self.degradations.clone(),
         };
         // The planner shares the step runner's provider handling but must not
         // stream its JSON into the transcript — planning is not work to show.
@@ -298,6 +361,7 @@ impl ControlPlane {
             // ever changes.
             gpu_fault_count: step_runner.gpu_fault_count.clone(),
             repeat_ledger: Arc::clone(&step_runner.repeat_ledger),
+            degradations: step_runner.degradations.clone(),
         };
         let planner = Arc::new(AgentPlanner::new(Arc::new(planner_runner)));
 

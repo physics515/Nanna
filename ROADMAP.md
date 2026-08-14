@@ -3025,11 +3025,21 @@ from evidence, budgets stay budgets):
       mutations that landed in between (regression attribution, the #218 sweep's voice).
 
 **Tier 4 — contention, liveness, dialect (`nanna-daemon`)**
-- [ ] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
+- [x] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
       to an in-flight user turn; priority, not a quota. (Evidence: ministral's opening was
       strangled by the daemon's own heartbeat + 201 embed POSTs in one minute.)
-- [ ] Embedding client gets the IPv4-pin/no-idle-pool/read-timeout treatment; classify
+      *(PR #229: ChatRunRegistry claim/release edges gate everything — a scheduled run
+      select-races the became-active edge and yields mid-generation (abortive cancel,
+      orderly join, resume-on-release); the backfill drains one RTT-repaid request at a
+      time and pauses entirely for live turns; dream summarization pauses at cluster
+      boundaries. Plus the announce-once DegradationLedger: a capability that degrades
+      under the model is stated once in its next tool result, then quiet.)*
+- [x] Embedding client gets the IPv4-pin/no-idle-pool/read-timeout treatment; classify
       deterministic 422 "input too long" as shrink-and-retry, not a 240s bench.
+      *(PR #229: the embed client now SHARES the chat client's 2026-08-02 builder, and
+      `embed_one` heals "input length N exceeds maximum M" by cutting to the fitting
+      prefix — strictly decreasing, no retry cap needed; the router never benches a
+      provider for an input-level fault.)*
 - [ ] **Liveness beat**: a low-frequency in-flight line (session, elapsed, waiting-on) in
       log + IPC; a watchdogged stream so no loop path exits silently; a terminal reason
       file on daemon exit; `chat.send` delivery ack distinct from run completion.
