@@ -2816,22 +2816,32 @@ impl Agent {
                 let estimated = ctx.estimate_tokens();
                 let compression_threshold = ctx.compression_threshold;
                 let hard_limit = ctx.hard_limit;
-                let proactive_threshold = compression_threshold * 40 / 100; // ~64K for 160K threshold
+                // Measured headroom: growth since the previous ladder pass,
+                // max'd over the run ([`crate::context::ContextGrowthTracker`]).
+                // The Tier-1 trigger derives from it instead of a fixed
+                // 40%-of-threshold tuned for 200k windows — on a 16384-token
+                // window that constant fired 80× at 4423 tokens with ~3.7k
+                // tokens of real headroom still free.
+                let growth_since_last = ctx.growth.observe(estimated);
 
-                // Tier 1 (proactive): Every 5 iterations, if >40% of compression_threshold.
-                // Prefer selective older-tool-result compression (LLMLingua via the
-                // summarization-model settings) before dropping messages wholesale.
-                // Keep at least 20 recent messages so the agent retains working context.
-                if state.iterations > 1
-                    && state.iterations % 5 == 0
-                    && estimated > proactive_threshold
-                    && estimated <= compression_threshold
-                {
+                // Tier 1 (proactive): fire only when the run's own measured
+                // growth says the NEXT interval could cross the compression
+                // threshold. Prefer selective older-tool-result compression
+                // (LLMLingua via the summarization-model settings) before
+                // dropping messages wholesale. Keep at least 20 recent
+                // messages so the agent retains working context.
+                if crate::context::proactive_compression_due(
+                    estimated,
+                    ctx.growth.max_observed_growth,
+                    compression_threshold,
+                ) {
                     info!(
                         estimated_tokens = estimated,
-                        proactive_threshold = proactive_threshold,
+                        max_observed_growth = ctx.growth.max_observed_growth,
+                        growth_since_last = growth_since_last,
+                        compression_threshold = compression_threshold,
                         tier = "proactive",
-                        "Tier 1: proactive compression triggered"
+                        "Tier 1: proactive compression triggered (measured headroom)"
                     );
 
                     let compressed_results =
@@ -2843,6 +2853,12 @@ impl Agent {
                             info!(
                                 dropped_messages = dropped,
                                 "Tier 1 compression complete (drop fallback)"
+                            );
+                            ctx.push_summarization_failure_notice(
+                                dropped,
+                                "proactive compression found no tool results \
+                                 to shrink, and measured growth says the next \
+                                 step could overflow the context window",
                             );
                         }
                     } else {
@@ -2887,7 +2903,11 @@ impl Agent {
                             Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Tier 2 summarization failed, dropping oldest");
-                                ctx.drop_oldest(16);
+                                let dropped = ctx.drop_oldest(16);
+                                ctx.push_summarization_failure_notice(
+                                    dropped,
+                                    &format!("summarization failed ({e})"),
+                                );
                             }
                         }
                     } else {
@@ -2897,7 +2917,11 @@ impl Agent {
                             tier = "standard",
                             "Tier 2: no summarization models, dropping oldest"
                         );
-                        ctx.drop_oldest(16);
+                        let dropped = ctx.drop_oldest(16);
+                        ctx.push_summarization_failure_notice(
+                            dropped,
+                            "no summarization models are configured",
+                        );
                     }
                 }
 
@@ -2936,7 +2960,14 @@ impl Agent {
                             Ok(_) => {}
                             Err(e) => {
                                 warn!(error = %e, "Tier 3 summarization failed, truncating");
-                                ctx.truncate_to_limit();
+                                let dropped = ctx.truncate_to_limit();
+                                ctx.push_summarization_failure_notice(
+                                    dropped,
+                                    &format!(
+                                        "summarization failed at the hard \
+                                         input limit ({e})"
+                                    ),
+                                );
                             }
                         }
                     } else {
@@ -2946,7 +2977,12 @@ impl Agent {
                             tier = "hard_cap",
                             "Tier 3: hard limit exceeded, truncating"
                         );
-                        ctx.truncate_to_limit();
+                        let dropped = ctx.truncate_to_limit();
+                        ctx.push_summarization_failure_notice(
+                            dropped,
+                            "no summarization models are configured and the \
+                             context exceeded the hard input limit",
+                        );
                     }
                 }
             }
@@ -2966,6 +3002,22 @@ impl Agent {
             if let Some(note) = tool_pressure_note.take() {
                 let mut ctx = self.context.write().await;
                 ctx.messages.push(AnthropicMessage::user_text(&note));
+            }
+            // Loss announcements composed inside the ladder (summarization
+            // failures, un-summarized drops) land AFTER it for the same
+            // reason as the notes above: compression must never drop its own
+            // announcement. Then re-baseline the growth tracker so the next
+            // ladder entry measures only NEW material — the model response
+            // and tool results of one interval — never compression's effect
+            // or these notices.
+            {
+                let mut ctx = self.context.write().await;
+                let notices = ctx.take_pending_loss_notices();
+                for notice in notices {
+                    ctx.messages.push(AnthropicMessage::user_text(&notice));
+                }
+                let post_ladder = ctx.estimate_tokens();
+                ctx.growth.rebaseline(post_ladder);
             }
 
             // Model routing: classify complexity and pick cheapest capable model
@@ -4718,6 +4770,25 @@ impl Agent {
                 drop(ledger);
             }
 
+            // A completed exec is a fact proven by execution: the command ran
+            // to a definite exit status at a known time. Record it in the
+            // context's never-compressed slot so no later summarization pass
+            // can collapse the record of what was proven — the P22 chain's
+            // final link was exactly that collapse, followed by a rewrite
+            // over ten just-verified commands.
+            if !short_circuited {
+                if let Some((subject, outcome)) = exec_verified_outcome(
+                    &name,
+                    &input,
+                    response.result.success,
+                    &response.result.content,
+                    response.result.error.as_deref(),
+                ) {
+                    let mut ctx = self.context.write().await;
+                    ctx.record_verified_outcome(subject, outcome);
+                }
+            }
+
             let result_content = if response.result.success {
                 response.result.content
             } else {
@@ -5309,8 +5380,14 @@ impl Agent {
                     .collect();
                 if !facts.is_empty() {
                     let mut ctx = self.context.write().await;
-                    // Update consolidated summary with latest facts
-                    ctx.consolidated_summary = Some(format!("[DISTILLED FACTS]\n{facts}"));
+                    // Rolling replace of the distilled-facts slot ONLY. This
+                    // used to overwrite `consolidated_summary` wholesale,
+                    // which destroyed every earlier summarization product —
+                    // including the record of verified-passing work — with
+                    // ≤512 tokens about the last ten messages (observed live
+                    // 2026-08-10: 2571→934 chars right before a from-scratch
+                    // rewrite over passing work).
+                    ctx.set_distilled_facts(facts.as_str());
                     info!(
                         facts_len = facts.len(),
                         "🧬 Progressive distillation complete"
@@ -6629,6 +6706,62 @@ pub(crate) fn is_work_evidence_tool(name: &str) -> bool {
             name,
             "edit_file" | "edit" | "Edit" | "exec" | "bash" | "Bash"
         )
+}
+
+/// Extract the (command, verdict) pair a completed exec-family call proved,
+/// destined for the context's never-compressed verified-outcomes slot.
+///
+/// An outcome requires a DEFINITE exit status: success means exit 0 (both
+/// the builtin exec and the exec skill return success only then); a failure
+/// is recorded only when an exit code is present in the result's own
+/// prefix. A spawn failure, timeout, or refusal produced no verdict and
+/// records nothing — a fabricated verdict in a slot the model is told to
+/// trust absolutely would be worse than a missing one.
+fn exec_verified_outcome(
+    tool_name: &str,
+    input: &Value,
+    success: bool,
+    content: &str,
+    error: Option<&str>,
+) -> Option<(String, String)> {
+    if !matches!(tool_name, "exec" | "bash" | "Bash") {
+        return None;
+    }
+    let command = input.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    if success {
+        return Some((command.to_string(), "exit 0".to_string()));
+    }
+    // The two shapes a real exit status arrives in: the exec skill prefixes
+    // the CONTENT with "Command failed (exit code N)"; the builtin puts
+    // "Command failed with exit code: Some(N)" in the error field. Anything
+    // else (stderr text, bridge errors) carries no verdict. Matched as
+    // prefixes only, so a command whose own OUTPUT mentions exit codes can
+    // never fabricate a verdict.
+    let code = error
+        .and_then(parse_exit_code_prefix)
+        .or_else(|| content.lines().next().and_then(parse_exit_code_prefix))?;
+    Some((command.to_string(), format!("exit {code}")))
+}
+
+/// Parse the exit code out of an exec failure prefix ("Command failed
+/// (exit code 2)" / "Command failed with exit code: Some(2)"). Returns
+/// `None` for any other text — including "Some(None)"-shaped kills, where
+/// the process died without an exit status.
+fn parse_exit_code_prefix(text: &str) -> Option<i64> {
+    let rest = text
+        .strip_prefix("Command failed (exit code ")
+        .or_else(|| text.strip_prefix("Command failed with exit code: Some("))?;
+    let digits_len = rest
+        .char_indices()
+        .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && *c == '-'))
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+    rest[..digits_len].parse().ok()
 }
 
 #[cfg(test)]
@@ -9050,6 +9183,86 @@ mod claim_nudge_tests {
         ] {
             assert!(!is_work_evidence_tool(name), "{name} must NOT count as work evidence");
         }
+    }
+
+    /// P22 Tier 2: a verified outcome requires a DEFINITE exit status — the
+    /// slot the model is told to trust absolutely must never hold a
+    /// fabricated verdict, so spawn failures, timeouts, and refusals record
+    /// nothing.
+    #[test]
+    fn exec_outcomes_require_a_definite_exit_status() {
+        let input = serde_json::json!({"command": "sh tests/test_1.sh"});
+        // Success means exit 0 on both exec implementations.
+        assert_eq!(
+            exec_verified_outcome("exec", &input, true, "all ok", None),
+            Some(("sh tests/test_1.sh".to_string(), "exit 0".to_string()))
+        );
+        // Skill-shaped failure: the exit code prefixes the content.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "Command failed (exit code 2)\nboom",
+                None
+            ),
+            Some(("sh tests/test_1.sh".to_string(), "exit 2".to_string()))
+        );
+        // Builtin-shaped failure: the exit code lives in the error field.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "",
+                Some("Command failed with exit code: Some(3)")
+            ),
+            Some(("sh tests/test_1.sh".to_string(), "exit 3".to_string()))
+        );
+        // No exit status (bridge failure / timeout / refusal): no verdict.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "",
+                Some("exec could not start the command (os error 267)")
+            ),
+            None
+        );
+        // Killed without an exit status is not a verdict either.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "",
+                Some("Command failed with exit code: None")
+            ),
+            None
+        );
+        // A command whose own OUTPUT mentions exit codes cannot fabricate a
+        // verdict — only the known failure prefixes parse.
+        assert_eq!(
+            exec_verified_outcome(
+                "exec",
+                &input,
+                false,
+                "stdout says: Command failed (exit code 9) somewhere",
+                Some("stderr text")
+            ),
+            None
+        );
+        // Not an exec-family tool.
+        assert_eq!(
+            exec_verified_outcome("read_file", &input, true, "", None),
+            None
+        );
+        // No command in the input: nothing to assert.
+        assert_eq!(
+            exec_verified_outcome("exec", &serde_json::json!({}), true, "", None),
+            None
+        );
     }
 
     #[test]
