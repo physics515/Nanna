@@ -792,8 +792,16 @@ pub struct AgentResponse {
     ///
     /// Returned so a CALLER that drives many runs — the long-horizon harness
     /// drives one per step — can carry activation forward. Without it every
-    /// step starts blind and re-pays discovery out of its 8-iteration budget.
+    /// step starts blind and re-pays discovery.
     pub active_tools: Vec<String>,
+    /// The run ended in a degenerate generation loop with ZERO tool calls:
+    /// a narration/repetition/thinking-spiral detector fired, its one-shot
+    /// recovery nudge did not change the behavior, and the run exited having
+    /// never acted. Carried out-of-band so the harness can route the step to
+    /// its steering ladder instead of the fruitless budget (P22: those
+    /// aborts were charged like genuine no-ops and burned items' lives).
+    #[serde(default)]
+    pub degenerate_loop: bool,
 }
 
 /// Reasoning content from thinking mode
@@ -955,6 +963,133 @@ const REPEAT_FAILURE_BREAKER_AFTER: usize = 3;
 /// delivered at zero cost; a poll that must keep running has to vary its
 /// arguments (e.g. a cursor or attempt counter) or use a different mechanism.
 const ZERO_INFO_BREAKER_AFTER: usize = 3;
+
+/// Consecutive tool-calling iterations with ZERO new information before a
+/// harness step stops spinning and its reserved wrap-up iteration engages.
+///
+/// This replaces the fixed `step_iterations: 8` cap, which cut steps by the
+/// clock instead of by their yield (P22: 99 truncations in one leg, 88 with
+/// a tool call in flight, 84 ending with under 200 chars of text — each then
+/// charged as "fruitless", including the step that wrote the leg's all-time
+/// peak). A step in flow — every iteration surfacing a novel result, a
+/// mutation, or new text — now runs as long as the run's wall-clock and
+/// token budgets allow; a step that has stopped yielding ends promptly.
+///
+/// Derivation — the same 2 + 1 ladder as the sibling breakers, one level up:
+/// two zero-information iterations are what arms the in-step steering
+/// (loop nudge at 2 identical results, claim nudge one rung above), and the
+/// third is the one full post-nudge attempt every rung on the ladder grants.
+/// An iteration that is still zero-information after all of that has nothing
+/// left to spend its budget on but the wrap-up report.
+pub const STEP_EXHAUSTION_AFTER: usize = ZERO_INFO_BREAKER_AFTER;
+
+/// Fold one iteration's yield into the run's information ledger; returns
+/// whether ANYTHING was new. The three currencies mirror the P22 definition
+/// of progress exhaustion ("no novel tool result, no mutation, no new
+/// text"):
+///
+/// - a SUCCESSFUL tool result identifies by name + input + full output, so a
+///   mutation (whose result confirms new bytes written) and a read that
+///   surfaced new content both count, while the byte-identical repeat the
+///   zero-information breaker fields does not;
+/// - a FAILED tool result identifies by name + input + its first non-empty
+///   line (the same normalization as the harness's `failure_signature`) — a
+///   NEW error teaches the model something, but a breaker notice re-counting
+///   the same failure must not mint fresh "information" every repeat;
+/// - assistant text identifies by its trimmed whole — a model saying
+///   something it has not said before is information, verbatim re-narration
+///   is not.
+fn iteration_produced_information(
+    seen: &mut HashSet<u64>,
+    new_records: &[ToolCallRecord],
+    iteration_text: &str,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut novel = false;
+    for record in new_records {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        record.name.hash(&mut hasher);
+        record.input.to_string().hash(&mut hasher);
+        record.success.hash(&mut hasher);
+        if record.success {
+            record.output.hash(&mut hasher);
+        } else {
+            let first_line = record
+                .output
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let normalized: String =
+                first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+            normalized.hash(&mut hasher);
+        }
+        novel |= seen.insert(hasher.finish());
+    }
+    let text = iteration_text.trim();
+    if !text.is_empty() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        novel |= seen.insert(hasher.finish());
+    }
+    novel
+}
+
+/// The reserved final iteration's instruction: tools are off, the report is
+/// due. Injected as a user-role message (the PR #145 out-of-band pattern) so
+/// the model's ANSWER to it — not the instruction — becomes the step's final
+/// text. Exists so no step ever ends `final_text_len=0`: the cross-step
+/// carryover is only what the model says, so a silent step contributes
+/// nothing to what the next step knows (P22: 79 of 108 capped steps ended
+/// with zero final text, and the claim nudge kept firing on the last
+/// iteration with no iteration left to answer it).
+pub fn step_wrapup_message(task_anchor: Option<&str>, reason: &str) -> String {
+    format!(
+        "{}Tool use for this step is over ({reason}). Reply in plain text NOW — this is \
+         your report to the next step, which starts with a fresh context and knows only \
+         what you write here:\n\
+         1. What you did: files touched, commands run.\n\
+         2. What is VERIFIED: each command whose result you saw, and what it proved.\n\
+         3. What remains, and what is blocking it.\n\
+         If the task's done-condition is met, also write TASK COMPLETE on its own line. \
+         Do not call tools. Do not describe planned work as if it were done.",
+        anchor_header(task_anchor)
+    )
+}
+
+/// Mechanical last-resort step report, synthesized from the tool record when
+/// even the reserved wrap-up iteration produced no text (model emitted
+/// nothing, or the wrap-up call itself failed). Honest and announced — the
+/// next step must never receive silence. Bounded to the same one-screenful
+/// budget the harness feeds forward
+/// ([`crate::harness::STEP_RESULT_TAIL_MAX_BYTES`]), newest calls kept.
+pub fn step_activity_digest(records: &[ToolCallRecord]) -> String {
+    const HEADER: &str =
+        "[step report synthesized from the tool record — the model emitted no final text]";
+    if records.is_empty() {
+        return "[step ended with no tool calls and no final text]".to_string();
+    }
+    let budget = crate::harness::STEP_RESULT_TAIL_MAX_BYTES;
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = HEADER.len();
+    for record in records.iter().rev() {
+        let flat: String = record.output.split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = format!(
+            "- {} {} ({})",
+            record.name,
+            if record.success { "ok" } else { "FAILED" },
+            preview_snippet(&flat, 80),
+        );
+        if used + line.len() + 1 > budget {
+            lines.push(format!("- …and {} earlier calls", records.len() - lines.len()));
+            break;
+        }
+        used += line.len() + 1;
+        lines.push(line);
+    }
+    lines.reverse();
+    format!("{HEADER}\n{}", lines.join("\n"))
+}
 
 /// Byte bound on the text replayed inside a breaker notice — the last error
 /// (repeat-failure breaker) or the last identical result (zero-information
@@ -3182,7 +3317,23 @@ impl Agent {
 
             state.iterations += 1;
             if let Some(max) = max_iterations {
-                if state.iterations > max {
+                if state.iterations > max
+                    && !state.wrap_up_engaged
+                    && state.final_text.trim().is_empty()
+                    && !state.tool_records.is_empty()
+                {
+                    // Reserve ONE tools-off iteration past the cap instead of
+                    // returning silence: the run did real work and never got
+                    // to say so, and a silent step contributes nothing to
+                    // what the next step (or the user) knows. The engaged
+                    // flag makes this branch unreachable a second time.
+                    self.engage_wrap_up(
+                        &mut state,
+                        "the step's iteration budget is spent",
+                        true,
+                    )
+                    .await;
+                } else if state.iterations > max {
                     // Extract memories before bailing — don't lose a long run's knowledge
                     if options.auto_extract_memories {
                         if let Some(ref on_memory) = options.on_memory {
@@ -3199,6 +3350,9 @@ impl Agent {
                         final_text_len = state.final_text.len(),
                         "Agent hit max iterations limit, returning truncated response"
                     );
+                    if state.final_text.trim().is_empty() {
+                        state.final_text = step_activity_digest(&state.tool_records);
+                    }
                     return Ok(state.into_response(true));
                 }
             }
@@ -3602,6 +3756,12 @@ impl Agent {
             if matches!(options.step_kind, Some(crate::harness::StepKind::Plan)) {
                 request.tools = None;
             }
+            // The reserved wrap-up iteration is text-only by construction:
+            // with no definitions served, the model cannot spend its final
+            // say on another tool call.
+            if state.wrap_up_engaged {
+                request.tools = None;
+            }
             if let Some(ref routed) = routed_model {
                 // Strip provider prefix for the API request model field
                 // but keep the full spec for client routing
@@ -3877,7 +4037,23 @@ impl Agent {
                 other => other,
             };
 
-            let mut result = result?;
+            // The reserved wrap-up iteration must not turn a report into an
+            // error: if its one LLM call fails, synthesize the report from
+            // the tool record and end the step the way it was going to end.
+            let mut result = match result {
+                Err(e) if state.wrap_up_engaged => {
+                    warn!(
+                        error = %e,
+                        "wrap-up iteration failed — synthesizing the step report"
+                    );
+                    if state.final_text.trim().is_empty() {
+                        state.final_text = step_activity_digest(&state.tool_records);
+                    }
+                    let truncated = state.wrap_up_truncated;
+                    return Ok(state.into_response(truncated));
+                }
+                other => other?,
+            };
 
             // Record model statistics
             let actual_model = request.model.clone();
@@ -4203,6 +4379,30 @@ impl Agent {
                 // detector, which measures it as "this block", trips on the
                 // concatenated volume of several unrelated rounds.
                 state.finalize_reasoning_block(None);
+                // The wrap-up iteration's answer IS the step's report — no
+                // detector, prod, nudge, or salvage may spend iterations
+                // that no longer exist (tools were off; call-shaped prose in
+                // the report is quotation, not intent). Guarantee the report
+                // is never silence.
+                if state.wrap_up_engaged {
+                    if state.final_text.trim().is_empty() {
+                        state.final_text = step_activity_digest(&state.tool_records);
+                    }
+                    if options.track_uncertainty {
+                        state.confidence = self.analyze_confidence(&state.final_text).await;
+                    }
+                    if options.auto_extract_memories {
+                        if let Some(ref on_memory) = options.on_memory {
+                            if let Ok(memories) = self.extract_memories().await {
+                                for memory in memories {
+                                    on_memory(memory).await;
+                                }
+                            }
+                        }
+                    }
+                    let truncated = state.wrap_up_truncated;
+                    return Ok(state.into_response(truncated));
+                }
 
                 // P22 Tier 4 cross-turn honesty bookkeeping: a zero-call
                 // round whose text is byte-identical to the previous
@@ -4557,6 +4757,23 @@ impl Agent {
                 return Ok(state.into_response(false));
             }
 
+            // Tools are off on the wrap-up iteration; a model that emits
+            // call-shaped output anyway (some providers echo tool JSON as
+            // content) gets its report synthesized rather than executed —
+            // the step is over.
+            if state.wrap_up_engaged {
+                warn!(
+                    attempted_calls = result.tool_uses.len(),
+                    "wrap-up iteration attempted tool calls — ending the step with a \
+                     synthesized report instead"
+                );
+                if state.final_text.trim().is_empty() {
+                    state.final_text = step_activity_digest(&state.tool_records);
+                }
+                let truncated = state.wrap_up_truncated;
+                    return Ok(state.into_response(truncated));
+            }
+
             // Finalize any reasoning that occurred before tool calls (interleaved reasoning)
             if !result.tool_uses.is_empty() {
                 let first_tool = result.tool_uses.first().map(|(_, name, _)| name.clone());
@@ -4574,6 +4791,7 @@ impl Agent {
             }
 
             // Execute tools and continue loop
+            let records_before = state.tool_records.len();
             let mut tool_results = self
                 .execute_tools(
                     &result.tool_uses,
@@ -4606,6 +4824,42 @@ impl Agent {
                         cap
                     );
                     return Ok(state.into_response(true));
+                }
+            }
+
+            // Progress exhaustion (P22) — the step-level rung of the same
+            // ladder, harness steps only: fold this iteration's yield into
+            // the information ledger; STEP_EXHAUSTION_AFTER consecutive
+            // tool-calling iterations that taught the run NOTHING end the
+            // step through the reserved wrap-up instead of spinning until an
+            // arbitrary count cuts it mid-flight. Mission mode is excluded —
+            // its continuation machinery owns those bounds.
+            if options.step_kind.is_some() && !options.mission_mode {
+                // `final_text` is this iteration's text when the model spoke
+                // (assigned above) and a previous iteration's — hence already
+                // in the ledger, correctly non-novel — when it did not.
+                let novel = {
+                    let (seen, records, text) = (
+                        &mut state.seen_information,
+                        &state.tool_records[records_before..],
+                        state.final_text.clone(),
+                    );
+                    iteration_produced_information(seen, records, &text)
+                };
+                if novel {
+                    state.no_information_iterations = 0;
+                } else {
+                    state.no_information_iterations += 1;
+                    if state.no_information_iterations >= STEP_EXHAUSTION_AFTER {
+                        let reason = format!(
+                            "the last {} iterations produced no new information",
+                            state.no_information_iterations
+                        );
+                        self.engage_wrap_up(&mut state, &reason, false).await;
+                        // Straight to the wrap-up call — the steering rungs
+                        // below spend iterations that no longer exist.
+                        continue;
+                    }
                 }
             }
 
@@ -4743,6 +4997,25 @@ impl Agent {
         let mut ctx = self.context.write().await;
         ctx.messages.push(nudge);
         true
+    }
+
+    /// Engage the reserved tools-off wrap-up iteration: inject the report
+    /// instruction and mark the run so the next request carries no tool
+    /// definitions and its text ends the step. `truncated` records WHY the
+    /// step is ending (hard budget vs progress exhaustion) for the response's
+    /// `truncated` flag.
+    async fn engage_wrap_up(&self, state: &mut RunState, reason: &str, truncated: bool) {
+        state.wrap_up_engaged = true;
+        state.wrap_up_truncated = truncated;
+        warn!(
+            iteration = state.iterations,
+            reason,
+            tool_calls = state.tool_records.len(),
+            "⛳ Reserved wrap-up iteration — tools off, step report due"
+        );
+        let message = step_wrapup_message(state.task_anchor.as_deref(), reason);
+        let mut ctx = self.context.write().await;
+        ctx.messages.push(AnthropicMessage::user_text(&message));
     }
 
     async fn add_user_message_with_budget(&self, message: &str, options: &RunOptions) {
@@ -7399,6 +7672,23 @@ struct RunState {
     /// in prose that never matches the completion contract — and the stall
     /// counter resets every round. This counter bounds THAT loop.
     mission_repeat_rounds: usize,
+    /// Everything this run has learned, as digests: successful tool results
+    /// (name + input + output), failure identities (name + input + first
+    /// line), and per-iteration assistant text. The step-exhaustion rule
+    /// reads novelty against this set — see
+    /// [`iteration_produced_information`].
+    seen_information: HashSet<u64>,
+    /// Consecutive tool-calling iterations that added NOTHING to
+    /// `seen_information`. At [`STEP_EXHAUSTION_AFTER`] the step stops
+    /// spinning and the reserved wrap-up iteration is engaged.
+    no_information_iterations: usize,
+    /// The reserved tools-off wrap-up iteration is in flight: the next LLM
+    /// call carries no tool definitions and its text ends the run.
+    wrap_up_engaged: bool,
+    /// Whether the wrap-up was engaged by a hard budget (report `truncated =
+    /// true`, the historical meaning) rather than by progress exhaustion
+    /// (`false` — the step ENDED; nothing was cut mid-flight).
+    wrap_up_truncated: bool,
     /// P22 Tier 4 cross-turn honesty: hash of the last zero-structured-call
     /// round's text. Identical consecutive zero-call rounds increment the
     /// streak below; any executed tool work clears both.
@@ -7447,6 +7737,10 @@ impl RunState {
             mission_verified_since_claim: false,
             mission_last_digest: String::new(),
             mission_repeat_rounds: 0,
+            seen_information: HashSet::new(),
+            no_information_iterations: 0,
+            wrap_up_engaged: false,
+            wrap_up_truncated: false,
             last_zero_call_reply_hash: None,
             identical_zero_call_replies: 0,
         }
@@ -7471,6 +7765,13 @@ impl RunState {
         // `reasoning.content` only when `blocks` is empty, so it did not
         // recover it either. Idempotent: a no-op when the buffer is empty.
         self.finalize_reasoning_block(None);
+        // A degenerate exit: a generation-loop detector fired, its nudge did
+        // not recover the model, and the run never called a tool. Reported
+        // out-of-band so the harness can steer instead of charging.
+        let degenerate_loop = (self.narration_nudged
+            || self.repetition_nudged
+            || self.thinking_spiral_nudged)
+            && self.tool_records.is_empty();
         let reasoning = if self.reasoning_content.is_empty() && self.reasoning_blocks.is_empty() {
             None
         } else {
@@ -7495,6 +7796,7 @@ impl RunState {
             cumulative_input_tokens: u64::from(self.input_tokens),
             cumulative_output_tokens: u64::from(self.output_tokens),
             model_stats: self.model_stats,
+            degenerate_loop,
         }
     }
 }
@@ -11574,5 +11876,137 @@ mod thinking_always_on_tests {
             raised.thinking.as_ref().and_then(nanna_llm::ThinkingConfig::budget_tokens),
             Some(MIN_THINKING_BUDGET_TOKENS)
         );
+    }
+}
+
+#[cfg(test)]
+mod step_exhaustion_tests {
+    use super::*;
+
+    fn record(name: &str, input: &str, output: &str, success: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            id: "t".to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({ "arg": input }),
+            output: output.to_string(),
+            success,
+            duration_ms: 1,
+        }
+    }
+
+    /// The exhaustion window is the breakers' own 2 + 1 ladder, one level up
+    /// — never a separately tuned count.
+    #[test]
+    fn exhaustion_window_is_the_breaker_ladder() {
+        assert_eq!(STEP_EXHAUSTION_AFTER, ZERO_INFO_BREAKER_AFTER);
+    }
+
+    #[test]
+    fn successful_results_identify_by_full_output() {
+        let mut seen = HashSet::new();
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("read_file", "a", "content v1", true)],
+            "",
+        ));
+        // Byte-identical repeat: nothing new.
+        assert!(!iteration_produced_information(
+            &mut seen,
+            &[record("read_file", "a", "content v1", true)],
+            "",
+        ));
+        // Same call, NEW output — the world changed; that is information.
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("read_file", "a", "content v2", true)],
+            "",
+        ));
+    }
+
+    /// Failures identify by their first line (the harness's
+    /// failure-signature normalization): a breaker notice whose embedded
+    /// counter ticks up must not mint fresh "information" every repeat.
+    #[test]
+    fn failures_identify_by_first_line_only() {
+        let mut seen = HashSet::new();
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("exec", "x", "compile error: missing brace
+context 1", false)],
+            "",
+        ));
+        assert!(!iteration_produced_information(
+            &mut seen,
+            &[record("exec", "x", "compile error: missing brace
+context 2 (attempt 4)", false)],
+            "",
+        ));
+        // A DIFFERENT failure teaches something.
+        assert!(iteration_produced_information(
+            &mut seen,
+            &[record("exec", "x", "compile error: type mismatch
+...", false)],
+            "",
+        ));
+    }
+
+    #[test]
+    fn text_counts_once_and_empty_never_counts() {
+        let mut seen = HashSet::new();
+        assert!(iteration_produced_information(&mut seen, &[], "I found the bug."));
+        assert!(!iteration_produced_information(&mut seen, &[], "I found the bug."));
+        assert!(!iteration_produced_information(&mut seen, &[], "   "));
+        assert!(iteration_produced_information(&mut seen, &[], "Now fixing it."));
+    }
+
+    /// The synthesized report announces itself, keeps newest calls, and stays
+    /// inside the harness's one-screenful feed-forward bound.
+    #[test]
+    fn step_activity_digest_is_bounded_and_announces() {
+        assert!(step_activity_digest(&[]).contains("no tool calls"));
+        let records: Vec<ToolCallRecord> = (0..200)
+            .map(|i| record("write_file", &format!("f{i}"), &format!("wrote {i} bytes"), i % 3 != 0))
+            .collect();
+        let digest = step_activity_digest(&records);
+        assert!(digest.starts_with("[step report synthesized"));
+        assert!(digest.contains("write_file"));
+        assert!(digest.contains("FAILED"), "failures must be visible");
+        assert!(digest.contains("earlier calls"), "the cut must announce itself");
+        assert!(
+            digest.len() <= crate::harness::STEP_RESULT_TAIL_MAX_BYTES + 120,
+            "digest must stay one screenful, got {}",
+            digest.len()
+        );
+        // Newest call survives the cut.
+        assert!(digest.contains("wrote 199 bytes"));
+    }
+
+    /// The wrap-up instruction demands the report and forbids more tools —
+    /// and only PROMPTS the completion claim, never asserts it.
+    #[test]
+    fn wrapup_message_states_the_contract() {
+        let msg = step_wrapup_message(Some("build minidb"), "the last 3 iterations produced no new information");
+        assert!(msg.contains("build minidb"), "anchored to the task");
+        assert!(msg.contains("Tool use for this step is over"));
+        assert!(msg.contains("Do not call tools"));
+        assert!(msg.contains("If the task's done-condition is met"));
+        assert!(msg.contains("TASK COMPLETE"));
+    }
+
+    /// A degenerate exit is reported out-of-band on the response — nudge
+    /// fired, zero tool calls — and never when the run acted.
+    #[test]
+    fn degenerate_loop_flag_requires_nudge_and_zero_tools() {
+        let mut state = RunState::new();
+        state.narration_nudged = true;
+        assert!(state.into_response(false).degenerate_loop);
+
+        let mut state = RunState::new();
+        state.narration_nudged = true;
+        state.tool_records.push(record("exec", "x", "ok", true));
+        assert!(!state.into_response(false).degenerate_loop);
+
+        let state = RunState::new();
+        assert!(!state.into_response(false).degenerate_loop);
     }
 }

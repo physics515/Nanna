@@ -2657,6 +2657,7 @@ impl AgentStepRunner {
                 name: record.name.clone(),
                 input_digest: digest(&record.input.to_string()),
                 output_digest: digest(&record.output),
+                success: record.success,
             })
             .collect();
 
@@ -2678,6 +2679,7 @@ impl AgentStepRunner {
             output_tokens: u64::from(result.output_tokens),
             tool_calls,
             touched_paths,
+            degenerate_loop: result.degenerate_loop,
         })
     }
 }
@@ -3682,6 +3684,8 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
         wall_clock_secs: 0,
         tokens_per_completed_item: None,
         interjected_items: 0,
+        verified_outcomes: Vec::new(),
+        acceptance_unknown: 0,
     });
     folded.steps_taken = segments.iter().map(|r| r.steps_taken).sum();
     folded.tool_calls = segments.iter().map(|r| r.tool_calls).sum();
@@ -3700,6 +3704,15 @@ fn fold_reports(segments: &[LongHorizonReport]) -> LongHorizonReport {
     folded.output_tokens = segments.iter().map(|r| r.output_tokens).sum();
     folded.wall_clock_secs = segments.iter().map(|r| r.wall_clock_secs).sum();
     folded.interjected_items = segments.iter().map(|r| r.interjected_items).sum();
+    folded.acceptance_unknown = segments.iter().map(|r| r.acceptance_unknown).sum();
+    // Union by id, newest verdict wins — same rule as the chat harness fold.
+    folded.verified_outcomes = Vec::new();
+    for segment in segments {
+        for v in &segment.verified_outcomes {
+            folded.verified_outcomes.retain(|p: &nanna_agent::harness::VerifiedOutcome| p.id != v.id);
+            folded.verified_outcomes.push(v.clone());
+        }
+    }
     // Like the stop reason, the newest recorded error is the one that
     // describes where the run ended up.
     folded.last_runner_error = segments
@@ -3732,9 +3745,11 @@ mod tests {
                     name: format!("tool_{i}"),
                     input_digest: String::new(),
                     output_digest: String::new(),
+                    success: true,
                 })
                 .collect(),
             touched_paths: Vec::new(),
+            degenerate_loop: false,
         }
     }
 
@@ -4235,6 +4250,8 @@ mod tests {
         stop: StopReason,
     ) -> LongHorizonReport {
         LongHorizonReport {
+            verified_outcomes: Vec::new(),
+            acceptance_unknown: 0,
             tool_calls: 0,
             side_effect_tool_calls: 0,
             stop,
@@ -5452,6 +5469,7 @@ mod tests {
                 output_tokens: 0,
                 tool_calls: Vec::new(),
                 touched_paths: Vec::new(),
+                degenerate_loop: false,
             })
         }
     }

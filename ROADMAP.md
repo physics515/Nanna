@@ -2968,25 +2968,64 @@ generalize to any chat workflow (owner rule), none may introduce a hard cap (bou
 from evidence, budgets stay budgets):
 
 **Tier 1 — step & budget semantics (`nanna-agent/src/harness.rs`, `loop_runner.rs`)**
-- [ ] End a step on **progress exhaustion, not a fixed iteration count**: close when the
+**(2026-08-13: Tier 1 landed complete.)**
+- [x] End a step on **progress exhaustion, not a fixed iteration count**: close when the
       last K iterations produced no new information (no novel tool result, no mutation, no
       new text); reserve a final tools-off iteration so no step ever ends `final_text_len=0`.
       (Evidence: 99 truncations in one ornith leg; 88 with work in flight; the 16/42 peak
       write itself was truncated and its item abandoned 41s later.)
-- [ ] **Replenish the fruitless budget on any verified environment change** — a check that
+      **(2026-08-13: `step_iterations: 8` retired — the harness passes no per-step cap;
+      `loop_runner` ends a step after `STEP_EXHAUSTION_AFTER` (= the breakers' 2+1 ladder)
+      consecutive zero-information iterations, judged against a run-wide ledger of
+      successful-result/failure-identity/text digests, then engages a reserved tools-off
+      wrap-up iteration; even a silent or failed wrap-up synthesizes a bounded report from
+      the tool record, so `final_text_len=0` is unreachable. Fixed-cap callers keep their
+      cap and gain the same reserved wrap-up.)**
+- [x] **Replenish the fruitless budget on any verified environment change** — a check that
       flipped fail→pass is progress even while another still fails identically; a step's own
       successful subject-touching evidence counts too (symmetric with the novel-failure rule).
-- [ ] **A timed-out acceptance check is "unknown," not "failed"** — it produced no verdict;
+      **(2026-08-13: run-wide check-outcome ledger keyed by canonical check identity; a
+      fail→pass flip observed anywhere — pre-check, post-step verdict, or the mid-run sweep,
+      which now also re-checks ABANDONED items and revives them live — resets every open
+      item's `steps_without_progress`. A step's own novel successful side-effectful digests
+      replenish symmetrically; byte-identical repeats earn nothing, so the rewrite treadmill
+      still converges.)**
+- [x] **A timed-out acceptance check is "unknown," not "failed"** — it produced no verdict;
       never charge it to the fruitless budget. Surface a hanging artifact command as a
       first-class finding ("./minidb mset blocks and never exits"), carried across steps.
       (Evidence: qwen spent 120 of 240 minutes in 600s check timeouts, abandoned while
       its artifact was passing.)
-- [ ] Never charge a **zero-tool-call narration/spiral abort** against the fruitless budget —
+      **(2026-08-13, corrected 2026-08-14: `AcceptanceVerdict.timed_out` — the timeout
+      itself charges nothing: no failure signature, no refuted-claim count, no sweep
+      reopen/revive on a hang, and unknowns are never counted into any escalation (an
+      earlier draft routed N consecutive timeouts to the replan rung — that just fabricates
+      a failure from things that said nothing, and was removed). While the check is silent
+      the step beside it is judged purely by its OWN evidence, exactly like a step with no
+      check at all: novel successful work replenishes, a degenerate loop rides the steering
+      ladder, an empty-handed step charges as an empty-handed step — so convergence is the
+      normal ladder and the hang is named in the finding, the replan prompt, and the
+      abandonment reason. The wall-clock bleed is closed separately: once a check has
+      consumed its ENTIRE ceiling without answering, re-runs are capped at the run's
+      measured work cost — max(longest step, longest decided check), both measured, floored
+      at 1s (`run_with_timeout_cap`) — and the first decided verdict lifts the cap. The
+      finding still rides the next prompt AND a durable note.)**
+- [x] Never charge a **zero-tool-call narration/spiral abort** against the fruitless budget —
       route those to the existing nudge escalation and count them separately.
-- [ ] Treat "acceptance already passed before any step" as **knowledge, not a dry round**:
+      **(2026-08-13: `AgentResponse.degenerate_loop` (detector fired + zero tool calls)
+      rides `StepOutcome`; the harness gives such steps `NARRATION_LADDER_STEPS` (= the
+      gentle→firm→urgent ladder) escalating steers, counted apart in `narration_steps` and
+      logged `narration_step`, charging only past the ladder.)**
+- [x] Treat "acceptance already passed before any step" as **knowledge, not a dry round**:
       record closed-by-evidence, feed the fact to the continuation planner.
-- [ ] Resume = **continue, not restart**: a driver/user re-send after self-termination seeds
+      **(2026-08-13: every check-passing completion rides `LongHorizonReport::
+      verified_outcomes`; the chat harness renders them as an ESTABLISHED block in the
+      continuation planner's context, and an already-satisfied round no longer counts dry —
+      an informed planner that still seeds nothing is what dry means now.)**
+- [x] Resume = **continue, not restart**: a driver/user re-send after self-termination seeds
       the new turn with closed items, verified outcomes, and current artifact state.
+      **(2026-08-13: `established_work_context` reads closed items + their completion
+      verdicts (command, result, when — the artifact state the environment last confirmed)
+      back from the store at turn start and hands them to the planner beside open work.)**
 
 **Tier 2 — context & compression (`nanna-agent/src/loop_runner.rs`)** — shipped in PR #223 (2026-08-13)
 - [x] Derive the proactive-compression trigger from **measured headroom** (estimated +
