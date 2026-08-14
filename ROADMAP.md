@@ -2947,6 +2947,105 @@ Sources: [Chutes / SN64 overview](https://simplytao.ai/blog/subnet-64-chutes-you
 [dTAO + alpha tokens](https://www.coingecko.com/learn/top-bittensor-subnets-dtao) ·
 [Bittensor SDK docs](https://docs.learnbittensor.org/python-api/html/autoapi/bittensor/core/subtensor/)
 
+### P22 — Keep the peak: the abandonment/truncation chain 🌱 (new — 2026-08-11, retrospective-driven)
+
+The 2026-08-08→10 GUI-path campaign (bench/BASELINE.md, "GUI-path series") ended with a
+six-agent forensic review of every leg's daemon logs. The verdict: **capability is not the
+gap — the harness destroys its own models' peaks.** qwen passed 22/42 in 13 minutes and was
+abandoned four hours later at 1/42 with zero items ever credited to its own work; ornith
+peaked three separate times (12, 10, 16) and every peak died the same way. The chain, named
+independently by four analysts:
+
+> hard 8-iteration step cap truncates work mid-flight → the truncated step is charged as
+> "fruitless" → five of those abandon the item → the planner re-seeds "assess starting
+> state" → mass re-read blows the 16k context → compression collapses the record of what
+> was verified passing → the model's only remaining move is a from-scratch rewrite over
+> passing work.
+
+Two campaign counter-levers already landed (mid-run verified sweep, PR #218; fold-vs-write
+safety + silent-wedge fixes, PR #219). The rest, tiered by convergence — every item must
+generalize to any chat workflow (owner rule), none may introduce a hard cap (bounds derive
+from evidence, budgets stay budgets):
+
+**Tier 1 — step & budget semantics (`nanna-agent/src/harness.rs`, `loop_runner.rs`)**
+- [ ] End a step on **progress exhaustion, not a fixed iteration count**: close when the
+      last K iterations produced no new information (no novel tool result, no mutation, no
+      new text); reserve a final tools-off iteration so no step ever ends `final_text_len=0`.
+      (Evidence: 99 truncations in one ornith leg; 88 with work in flight; the 16/42 peak
+      write itself was truncated and its item abandoned 41s later.)
+- [ ] **Replenish the fruitless budget on any verified environment change** — a check that
+      flipped fail→pass is progress even while another still fails identically; a step's own
+      successful subject-touching evidence counts too (symmetric with the novel-failure rule).
+- [ ] **A timed-out acceptance check is "unknown," not "failed"** — it produced no verdict;
+      never charge it to the fruitless budget. Surface a hanging artifact command as a
+      first-class finding ("./minidb mset blocks and never exits"), carried across steps.
+      (Evidence: qwen spent 120 of 240 minutes in 600s check timeouts, abandoned while
+      its artifact was passing.)
+- [ ] Never charge a **zero-tool-call narration/spiral abort** against the fruitless budget —
+      route those to the existing nudge escalation and count them separately.
+- [ ] Treat "acceptance already passed before any step" as **knowledge, not a dry round**:
+      record closed-by-evidence, feed the fact to the continuation planner.
+- [ ] Resume = **continue, not restart**: a driver/user re-send after self-termination seeds
+      the new turn with closed items, verified outcomes, and current artifact state.
+
+**Tier 2 — context & compression (`nanna-agent/src/loop_runner.rs`)**
+- [ ] Derive the proactive-compression trigger from **measured headroom** (estimated +
+      observed max step growth vs threshold), not 40%-of-threshold tuned for 200k windows.
+      (Evidence: fired 80× at 4423 tokens on a 16384 window with ~3.7k headroom free.)
+- [ ] Make the consolidated summary **monotone in asserted facts**: verified outcomes
+      (command, exit status, when) live in a never-compressed slot; a pass may reword,
+      never drop. (Evidence: 2571→934-char summary pass immediately preceded the 16→5 crash.)
+- [ ] When summarization fails, never silently truncate — announce WHAT dropped and that
+      disk is unaffected.
+
+**Tier 3 — write-path honesty (`nanna-tools/default-skills/*`)**
+- [ ] A shrinking whole-file write over a file the model has NOT read since its last
+      mutation returns the file's current content in the tool result (not a refusal).
+- [ ] Rewrite-loss note goes **bidirectional** (expansion rewrites that change existing
+      symbol bodies) and is **logged at INFO** so guards are auditable. (Both destructive
+      ornith writes GREW the file; the note never fired, and never logs.)
+- [ ] **Post-mutation structural check** appended as a sentence, never a gate: `sh -n`,
+      `node --check`, `json.loads` on the result of any mutation, incl. append-redirects.
+      (Evidence: gemma corrupted its file with a partial-overlap edit — dangling `else` —
+      and edited the wreck for 30 minutes.)
+- [ ] Ratchet anchor = **last evidenced-good version**, not largest-ever byte count;
+      canonicalize the ledger key (one file, one entry — relative/absolute split observed);
+      keep displaced content recoverable; give `file_buffer` commit the same guards.
+- [ ] When a check that previously passed now fails, the next step's context names the
+      mutations that landed in between (regression attribution, the #218 sweep's voice).
+
+**Tier 4 — contention, liveness, dialect (`nanna-daemon`)**
+- [ ] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
+      to an in-flight user turn; priority, not a quota. (Evidence: ministral's opening was
+      strangled by the daemon's own heartbeat + 201 embed POSTs in one minute.)
+- [ ] Embedding client gets the IPv4-pin/no-idle-pool/read-timeout treatment; classify
+      deterministic 422 "input too long" as shrink-and-retry, not a 240s bench.
+- [ ] **Liveness beat**: a low-frequency in-flight line (session, elapsed, waiting-on) in
+      log + IPC; a watchdogged stream so no loop path exits silently; a terminal reason
+      file on daemon exit; `chat.send` delivery ack distinct from run completion.
+      (Evidence: a dead daemon was polled 14× and scored.)
+- [ ] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
+      a call-shaped JSON object trips the detector; salvage through `resolve_tool()` + the
+      alias layer (`list_files`→`list_dir`); fence self-authored "result" objects out of
+      history as fabrications. (Evidence: lfm emitted 379 prose pseudo-calls, 300 to a tool
+      that doesn't exist, then believed its own fabricated directory listing for 4 hours.)
+
+**Tier 5 — the bench measures itself (`bench/gui-leg/`, new)**
+- [ ] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
+      the repo; each leg runs from an immutable self-copy with hashes in the ledger header.
+- [ ] Gate every ledger score on a **daemon liveness probe**; 3 consecutive failures →
+      INVALID(daemon-unreachable), never a score. Record a work denominator per poll.
+- [ ] Snapshot artifact + score per poll; report **peak, time-of-peak, and final**.
+- [ ] Worker/supervisor split with a staleness-failing heartbeat; resume contract in the
+      driver: interjection-only, liveness-gated, effectiveness-checked.
+- [ ] **Correct the published GUI-path table**: ministral leg INVALID (daemon died at
+      t=3m42s; scored a corpse), gemma leg CONTAMINATED (a `task` sub-agent on a cloud
+      120B produced its peak), lfm reframed as tool-channel failure. Peak-vs-final becomes
+      the headline metric.
+
+Full evidence: the six-agent retrospective (per-leg log forensics) in the 2026-08-11
+session; per-leg detail in `bench/BASELINE.md` and the campaign ledger/artifacts.
+
 ---
 
 ### P22 — Benchmark instrument hardening: the GUI-path leg driver 🚧 (2026-08-13, audit-driven)
