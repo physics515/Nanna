@@ -83,6 +83,46 @@ pub struct AcceptanceVerdict {
     pub passed: bool,
     /// Human/model-readable evidence (exit code, missing path, match info).
     pub detail: String,
+    /// The check was killed at its timeout without producing a verdict.
+    ///
+    /// `passed` stays `false` — a hung check can never CLOSE an item — but a
+    /// timeout is **unknown, not failed**: the command said nothing about the
+    /// work, so nothing downstream may treat it as evidence the work is bad.
+    /// Concretely: it never charges the fruitless budget, never mints a
+    /// failure signature, never reopens a verified item, and never counts as
+    /// a refuted completion claim. What it IS evidence of is a hang — the
+    /// artifact (or the check) blocks forever — and that finding is carried
+    /// forward first-class. (Observed 2026-08-10: one leg spent 120 of 240
+    /// minutes inside 600s check timeouts and was abandoned as "fruitless"
+    /// ten minutes after proving 20 of its checks passing.)
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+impl AcceptanceVerdict {
+    const fn pass(detail: String) -> Self {
+        Self {
+            passed: true,
+            detail,
+            timed_out: false,
+        }
+    }
+
+    const fn fail(detail: String) -> Self {
+        Self {
+            passed: false,
+            detail,
+            timed_out: false,
+        }
+    }
+
+    const fn timeout(detail: String) -> Self {
+        Self {
+            passed: false,
+            detail,
+            timed_out: true,
+        }
+    }
 }
 
 /// An abandoned item whose acceptance still fails — carried on the report
@@ -93,6 +133,25 @@ pub struct AbandonedUnmet {
     pub title: String,
     /// The failing verdict's detail at the drain sweep (bounded at capture).
     pub detail: String,
+}
+
+/// An item this run closed on the environment's own evidence — the check
+/// passed, whether after a step or before any ran.
+///
+/// Carried on the report so the continuation planner (and a resumed turn)
+/// can build on what is KNOWN instead of re-deriving it. Discovering "this
+/// is already done" is knowledge, not a dry round: throwing it away is what
+/// made one leg re-seed "assess starting state" four times and close 11 of
+/// 26 items as already-satisfied without the planner ever hearing why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedOutcome {
+    pub id: i64,
+    pub title: String,
+    /// The passing verdict's detail (bounded at capture) — names the command
+    /// and what it said, i.e. the artifact state the environment confirmed.
+    pub detail: String,
+    /// Closed by the pre-check, with zero steps run this turn.
+    pub already_satisfied: bool,
 }
 
 // Every canonical acceptance shape, quoted verbatim in every parse error.
@@ -216,15 +275,9 @@ impl AcceptanceCheck {
             Self::FileExists { path } => {
                 let resolved = resolve_in_workdir(workdir, path);
                 if resolved.exists() {
-                    AcceptanceVerdict {
-                        passed: true,
-                        detail: format!("file exists: {}", resolved.display()),
-                    }
+                    AcceptanceVerdict::pass(format!("file exists: {}", resolved.display()))
                 } else {
-                    AcceptanceVerdict {
-                        passed: false,
-                        detail: format!("file does not exist: {}", resolved.display()),
-                    }
+                    AcceptanceVerdict::fail(format!("file does not exist: {}", resolved.display()))
                 }
             }
             Self::Regex {
@@ -236,10 +289,7 @@ impl AcceptanceCheck {
                 let regex = match regex::Regex::new(pattern) {
                     Ok(r) => r,
                     Err(e) => {
-                        return AcceptanceVerdict {
-                            passed: false,
-                            detail: format!("invalid regex /{pattern}/: {e}"),
-                        };
+                        return AcceptanceVerdict::fail(format!("invalid regex /{pattern}/: {e}"));
                     }
                 };
                 let haystack = if let Some(path) = path {
@@ -247,10 +297,10 @@ impl AcceptanceCheck {
                     match read_bounded(&resolved) {
                         Ok(content) => content,
                         Err(e) => {
-                            return AcceptanceVerdict {
-                                passed: false,
-                                detail: format!("cannot read {}: {e}", resolved.display()),
-                            };
+                            return AcceptanceVerdict::fail(format!(
+                                "cannot read {}: {e}",
+                                resolved.display()
+                            ));
                         }
                     }
                 } else if let Some(command) = command {
@@ -258,32 +308,28 @@ impl AcceptanceCheck {
                         run_shell(command, workdir, Self::effective_timeout(*timeout_secs)).await;
                     match output {
                         Ok((_, combined)) => combined,
-                        Err(e) => {
-                            return AcceptanceVerdict {
-                                passed: false,
-                                detail: format!("command failed: {e}"),
-                            };
+                        Err(ShellRunError::Timeout { secs }) => {
+                            return AcceptanceVerdict::timeout(format!(
+                                "`{command}` ran {secs}s without finishing and was killed — \
+                                 no verdict"
+                            ));
+                        }
+                        Err(ShellRunError::Other(e)) => {
+                            return AcceptanceVerdict::fail(format!("command failed: {e}"));
                         }
                     }
                 } else {
-                    return AcceptanceVerdict {
-                        passed: false,
-                        detail: "regex check has neither path nor command".to_string(),
-                    };
+                    return AcceptanceVerdict::fail(
+                        "regex check has neither path nor command".to_string(),
+                    );
                 };
                 if regex.is_match(&haystack) {
-                    AcceptanceVerdict {
-                        passed: true,
-                        detail: format!("pattern /{pattern}/ matched"),
-                    }
+                    AcceptanceVerdict::pass(format!("pattern /{pattern}/ matched"))
                 } else {
-                    AcceptanceVerdict {
-                        passed: false,
-                        detail: format!(
-                            "pattern /{pattern}/ did not match ({} bytes searched)",
-                            haystack.len()
-                        ),
-                    }
+                    AcceptanceVerdict::fail(format!(
+                        "pattern /{pattern}/ did not match ({} bytes searched)",
+                        haystack.len()
+                    ))
                 }
             }
         }
@@ -322,19 +368,42 @@ async fn run_command_check(command: &str, workdir: &Path, timeout: Duration) -> 
                 .chars()
                 .rev()
                 .collect();
-            AcceptanceVerdict {
-                passed,
-                detail: format!(
-                    "`{command}` exited {} — {}",
-                    code.map_or_else(|| "signal".to_string(), |c| c.to_string()),
-                    tail.trim()
-                ),
+            let detail = format!(
+                "`{command}` exited {} — {}",
+                code.map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                tail.trim()
+            );
+            if passed {
+                AcceptanceVerdict::pass(detail)
+            } else {
+                AcceptanceVerdict::fail(detail)
             }
         }
-        Err(e) => AcceptanceVerdict {
-            passed: false,
-            detail: format!("`{command}` failed to run: {e}"),
-        },
+        Err(ShellRunError::Timeout { secs }) => AcceptanceVerdict::timeout(format!(
+            "`{command}` ran {secs}s without finishing and was killed — no verdict"
+        )),
+        Err(ShellRunError::Other(e)) => {
+            AcceptanceVerdict::fail(format!("`{command}` failed to run: {e}"))
+        }
+    }
+}
+
+/// Why [`run_shell`] could not produce an exit code. `Timeout` is a distinct
+/// arm because the two failures mean OPPOSITE things to the caller: a spawn
+/// failure is a verdict about the command ("this cannot run"), while a
+/// timeout is the absence of one ("this never answered") — and the fruitless
+/// accounting downstream must never confuse the two.
+enum ShellRunError {
+    Timeout { secs: u64 },
+    Other(String),
+}
+
+impl std::fmt::Display for ShellRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout { secs } => write!(f, "timed out after {secs}s"),
+            Self::Other(message) => write!(f, "{message}"),
+        }
     }
 }
 
@@ -353,7 +422,7 @@ async fn run_shell(
     command: &str,
     workdir: &Path,
     timeout: Duration,
-) -> Result<(Option<i32>, String), String> {
+) -> Result<(Option<i32>, String), ShellRunError> {
     let mut cmd = shell_command(command);
     cmd.current_dir(workdir)
         .stdin(std::process::Stdio::null())
@@ -373,7 +442,9 @@ async fn run_shell(
         // path a pgid to kill.
         cmd.process_group(0);
     }
-    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| ShellRunError::Other(e.to_string()))?;
     // Capture the pid before the wait future consumes the child, so a timeout
     // can kill the whole tree rooted here (not just the shell).
     let pid = child.id();
@@ -385,7 +456,7 @@ async fn run_shell(
     tokio::pin!(wait);
     let output = tokio::select! {
         res = &mut wait => {
-            let output = res.map_err(|e| e.to_string())?;
+            let output = res.map_err(|e| ShellRunError::Other(e.to_string()))?;
             // Completed: spare deliberate background survivors (the
             // daemon-wide Job Object still bounds them).
             if let Some(job) = job.take() {
@@ -402,7 +473,7 @@ async fn run_shell(
             if let Some(job) = job.take() {
                 job.terminate();
             }
-            return Err(format!("timed out after {}s", timeout.as_secs()));
+            return Err(ShellRunError::Timeout { secs: timeout.as_secs() });
         }
     };
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -587,6 +658,10 @@ pub struct StepToolCall {
     pub name: String,
     pub input_digest: String,
     pub output_digest: String,
+    /// Whether the tool itself reported success. Carried so the harness can
+    /// recognize a step's own successful work as progress evidence (the
+    /// replenish rule) without ever seeing the payloads.
+    pub success: bool,
 }
 
 /// What came back from one step.
@@ -603,6 +678,17 @@ pub struct StepOutcome {
     /// whose acceptance references a just-touched path IMMEDIATELY, instead
     /// of waiting for the periodic cadence.
     pub touched_paths: Vec<String>,
+    /// The step ended in a degenerate generation loop with ZERO tool calls:
+    /// the in-step detectors (narration loop, repetitive output, thinking
+    /// spiral) fired, their one-shot nudges did not recover the model, and
+    /// the run exited having never acted on the world. That is a steering
+    /// problem with the GENERATION, not evidence the task is unachievable —
+    /// the harness routes it to its own escalation ladder instead of the
+    /// fruitless budget. (Observed 2026-08-10: an item's last two steps
+    /// before abandonment were pure narration; ~30 of one leg's 100 active
+    /// minutes were discarded prose, each abort also burning one of the
+    /// item's five lives.)
+    pub degenerate_loop: bool,
 }
 
 /// Runs one re-anchored step in a fresh context (a new `Agent` + empty
@@ -654,16 +740,23 @@ pub struct LongHorizonConfig {
     pub max_steps_per_item: usize,
     /// Replans per item before the harness abandons it and moves on.
     pub max_replans_per_item: usize,
-    /// Loop-iteration bound inside one step. The harness re-anchors every
-    /// step, so iterations past the re-anchor window only grow context —
-    /// which is exactly what P14 exists to prevent.
-    pub step_iterations: usize,
-    /// Optional token budget per step. None by default: the re-anchor
-    /// cadence is already enforced by `step_iterations`, and a token cap
+    /// Optional token budget per step. None by default: a token cap
     /// proved to truncate PRODUCTIVE steps mid-work once the artifact under
     /// construction grew (observed live: steps dying at exactly the budget on
     /// later features, feeding stall → replan pressure). Set it only when a
     /// hard per-step spend ceiling matters more than step completion.
+    ///
+    /// There is deliberately NO per-step iteration cap to go with it. A fixed
+    /// `step_iterations: 8` was the first domino of the P22 destruction
+    /// chain: 99 truncations in one leg, 88 with a tool call in flight, 84
+    /// with under 200 chars of final text — each charged as "fruitless", five
+    /// of those abandoning the item, once 41 seconds after the run's all-time
+    /// peak write. A step now ends the way the loop level always has (the
+    /// "no hard cap" rule, applied one level down): on progress exhaustion —
+    /// the runner closes the step when its recent iterations produced no new
+    /// information, and reserves a final tools-off iteration so the step
+    /// always ends with the model saying what it did. The run's wall-clock
+    /// and token budgets remain the true bounds.
     pub step_token_budget: Option<u64>,
     /// Consecutive runner errors before the run stops (circuit breaker for a
     /// dead model endpoint).
@@ -711,7 +804,6 @@ impl Default for LongHorizonConfig {
             max_total_tokens: None,
             max_steps_per_item: 5,
             max_replans_per_item: 2,
-            step_iterations: 8,
             step_token_budget: None,
             max_consecutive_errors: 3,
             precheck_acceptance_items: HashSet::new(),
@@ -802,6 +894,18 @@ pub struct LongHorizonReport {
     /// the evidence existed and was discarded).
     #[serde(default)]
     pub abandoned_unmet: Vec<AbandonedUnmet>,
+    /// Every item this run closed on a PASSING check (post-step or
+    /// pre-check), with the verdict that closed it. The knowledge half of the
+    /// report: `abandoned_unmet` says where the goal is provably unmet, this
+    /// says what is provably done — the continuation planner needs both to
+    /// plan forward instead of re-litigating the past.
+    #[serde(default)]
+    pub verified_outcomes: Vec<VerifiedOutcome>,
+    /// Acceptance runs that TIMED OUT this run — checks that produced no
+    /// verdict. Unknown is not failure: none of these charged a fruitless
+    /// budget, but each is a first-class hang finding carried on the item.
+    #[serde(default)]
+    pub acceptance_unknown: usize,
     /// The most recent step-runner error seen during the run, kept so a
     /// caller can say WHY when the plan drained through abandonment rather
     /// than completion. Poison containment turns a deterministic runner
@@ -1014,6 +1118,33 @@ pub fn steps_repeat(previous: &[StepToolCall], current: &[StepToolCall]) -> bool
 /// trips the run-level breaker, whose counter spans items.
 pub const ITEM_RUNNER_ERRORS_MAX: usize = 2;
 
+/// Consecutive TIMED-OUT acceptance runs on one item before the harness
+/// stops re-running the question and routes the item to its replan rung.
+///
+/// Derivation — the codebase's steering ladder, not a magic cap: the first
+/// timeout surfaces the hang finding to the model, the second proves the
+/// finding was surfaced and not acted on, and the third is the one full
+/// post-notice attempt every other rung grants (the same 2 + 1 shape as the
+/// sibling breakers and the loop nudge). None of the three charge the
+/// fruitless budget — a timeout is unknown, not failure — but three
+/// consecutive unknowns mean grinding steps against a question the
+/// environment will not answer, and the replan rung (decompose: "fix the
+/// hang first") is the existing mechanism for exactly that. Convergence
+/// stays with `max_replans_per_item`.
+pub const CHECK_TIMEOUTS_REPLAN_AFTER: usize = 3;
+
+/// Consecutive zero-tool-call degenerate-loop steps on one item that ride
+/// the harness's steering ladder before they start charging the fruitless
+/// budget.
+///
+/// Derivation: the ladder IS the bound — one rung per escalation level of
+/// the existing wrap-up nudge ladder (gentle → firm → urgent,
+/// [`crate::loop_runner::NudgeLevel`]). A generation loop is a steering
+/// problem, so each such step gets one escalating steer; once the model has
+/// ignored all three levels, further prose-only steps are evidence the item
+/// cannot proceed here and charge normally so abandonment still converges.
+pub const NARRATION_LADDER_STEPS: usize = 3;
+
 /// Per-item progress bookkeeping.
 #[derive(Debug, Default, Clone)]
 struct ItemProgress {
@@ -1023,6 +1154,25 @@ struct ItemProgress {
     last_result: Option<String>,
     last_tool_calls: Vec<StepToolCall>,
     runner_errors: usize,
+    /// Consecutive acceptance runs that timed out (reset by any DECIDED
+    /// verdict, pass or fail). At [`CHECK_TIMEOUTS_REPLAN_AFTER`] the item
+    /// replans instead of grinding against a question the environment will
+    /// not answer. Never charges `steps_without_progress`.
+    consecutive_check_timeouts: usize,
+    /// Routed to the replan rung out-of-band (hang escalation) — consumed by
+    /// the next selection exactly like a fruitless-budget exhaustion, without
+    /// pretending the budget was spent.
+    replan_due: bool,
+    /// Zero-tool-call degenerate-loop steps this item has absorbed (the
+    /// harness-level steering ladder, see [`NARRATION_LADDER_STEPS`]).
+    narration_steps: usize,
+    /// Digests of SUCCESSFUL side-effectful tool calls this item's steps have
+    /// produced ([`crate::loop_runner::is_work_evidence_tool`]). A digest
+    /// never seen before is the success mirror of the novel-failure rule: the
+    /// step verifiably did NEW work on the world, which replenishes the
+    /// fruitless budget by the environment's own evidence. Repeats (the
+    /// byte-identical rewrite treadmill) earn nothing.
+    seen_success_digests: std::collections::HashSet<u64>,
     /// Normalized signatures ([`failure_signature`]) of every acceptance
     /// failure this item has seen. A failure whose signature was NEVER seen
     /// before is evidence the work moved — the check now fails differently —
@@ -1118,6 +1268,18 @@ impl LongHorizonRunner {
         // execute step's prompt — whatever item that step serves.
         let mut regression_notice: Option<String> = None;
         let mut precheck_ids: HashSet<i64> = cfg.precheck_acceptance_items.clone();
+        // Run-wide ledger of DECIDED check outcomes by check identity. A
+        // fail→pass flip anywhere (a pre-check on a re-proposed item, a
+        // post-step verdict, a sweep revival) is a verified environment
+        // change and replenishes every open item's fruitless budget — a
+        // check that flipped is progress even while another keeps failing
+        // identically (P22: one leg climbed 12→16 passing while its selected
+        // item's own check failed "the same way", earned zero credit, and was
+        // abandoned one minute after ten passes were proven).
+        let mut check_outcomes: HashMap<u64, bool> = HashMap::new();
+        // The knowledge half of the report (see `LongHorizonReport`).
+        let mut verified_outcomes: Vec<VerifiedOutcome> = Vec::new();
+        let mut acceptance_unknown = 0usize;
         let mut replans = 0usize;
         let mut false_success_claims = 0usize;
         let mut input_tokens = 0u64;
@@ -1185,6 +1347,19 @@ impl LongHorizonRunner {
                             continue;
                         }
                         let verdict = check.run(workdir).await;
+                        if verdict.timed_out {
+                            // Unknown: not proof the goal is unmet, but it
+                            // still blocks "done" — carry the HANG as the
+                            // finding rather than a false failure verdict.
+                            acceptance_unknown += 1;
+                            let detail = format!(
+                                "check produced no verdict — {}",
+                                text_head(&verdict.detail, 200)
+                            );
+                            abandoned_unmet.push(AbandonedUnmet { id, title, detail });
+                            continue;
+                        }
+                        note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                         if !verdict.passed {
                             // Evidence for the mission loop: this walked-away
                             // item's done-condition is still false, so the
@@ -1222,6 +1397,14 @@ impl LongHorizonRunner {
                             continue;
                         }
                         let verdict = check.run(workdir).await;
+                        if verdict.timed_out {
+                            // Unknown: a hung re-check is not evidence the
+                            // verified work regressed — reopening on it would
+                            // charge the model for a wedged command.
+                            acceptance_unknown += 1;
+                            continue;
+                        }
+                        note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                         if !verdict.passed
                             && source
                                 .reopen(
@@ -1258,23 +1441,35 @@ impl LongHorizonRunner {
             };
             // Scoped so the pre-check below (which may `progress.remove`) is
             // not fighting a live borrow of the same map.
-            let (is_replan, fruitless_steps, item_replans, precheck_due) = {
+            let (is_replan, fruitless_steps, item_replans, precheck_due, hang_timeouts) = {
                 let item = progress.entry(step.id).or_default();
                 let precheck_due = !item.acceptance_prechecked;
                 item.acceptance_prechecked = true;
                 (
-                    item.steps_without_progress >= cfg.max_steps_per_item,
+                    // `replan_due` is the hang escalation's out-of-band route
+                    // to this same rung: consecutive check timeouts never
+                    // charge the fruitless budget, but they must still reach
+                    // the decompose-or-abandon ladder or a permanently
+                    // hanging check would grind until wall clock.
+                    item.steps_without_progress >= cfg.max_steps_per_item || item.replan_due,
                     item.steps_without_progress,
                     item.replans,
                     precheck_due,
+                    item.consecutive_check_timeouts,
                 )
             };
 
             if is_replan && item_replans >= cfg.max_replans_per_item {
                 // Grinding AND replanning failed — close the item and move on.
-                let reason = format!(
+                let mut reason = format!(
                     "abandoned after {fruitless_steps} fruitless steps and {item_replans} replans"
                 );
+                if hang_timeouts > 0 {
+                    reason.push_str(&format!(
+                        "; its acceptance check hung {hang_timeouts} consecutive time(s) with \
+                         no verdict — see the hang finding in its notes"
+                    ));
+                }
                 // Loud on purpose: abandonment used to reach only the store's
                 // activity log, and a run that silently gave up its one item
                 // read as "converged" in the daemon log (2026-08-08 forensics
@@ -1320,6 +1515,51 @@ impl LongHorizonRunner {
                 let verdict = check.run(workdir).await;
                 check_cost_paid += check_started.elapsed();
                 check_runs += 1;
+                if verdict.timed_out {
+                    // Unknown, not failure: the item runs its step normally,
+                    // but it starts KNOWING the check hangs — the finding is
+                    // the most useful thing the step could possibly hear.
+                    acceptance_unknown += 1;
+                    let item = progress.entry(step.id).or_default();
+                    item.consecutive_check_timeouts += 1;
+                    let finding =
+                        hanging_check_finding(check, &verdict, item.consecutive_check_timeouts);
+                    item.last_result = Some(finding.clone());
+                    tracing::warn!(
+                        item = step.id,
+                        title = %step.title,
+                        detail = %text_head(&verdict.detail, 240),
+                        "acceptance pre-check timed out — no verdict; carrying the hang \
+                         finding into the step"
+                    );
+                    let _ = source.add_note(step.id, &finding).await;
+                    let _ = source
+                        .log(
+                            step.id,
+                            "acceptance_timeout",
+                            serde_json::json!({
+                                "detail": verdict.detail,
+                                "check": check.describe(),
+                                "precheck": true,
+                            }),
+                        )
+                        .await;
+                } else if note_check_outcome(&mut check_outcomes, check, verdict.passed) {
+                    // Re-proposed work whose condition NOW passes after
+                    // failing earlier this run: the environment moved.
+                    // Every open item's fruitless budget replenishes below
+                    // (the completion path also runs — flip and completion
+                    // are the same event seen at two granularities).
+                    for open_item in progress.values_mut() {
+                        open_item.steps_without_progress = 0;
+                    }
+                    tracing::info!(
+                        item = step.id,
+                        check = %check.describe(),
+                        "check flipped fail→pass — verified environment change; \
+                         replenishing every open item's fruitless budget"
+                    );
+                }
                 if verdict.passed {
                     let detail = serde_json::json!({
                         "verified": true,
@@ -1344,6 +1584,16 @@ impl LongHorizonRunner {
                             items_completed += 1;
                             items_already_satisfied += 1;
                             verified_this_run.push((step.id, step.title.clone(), check.clone()));
+                            // Knowledge, not a dry round: the passing verdict
+                            // rides the report so the continuation planner
+                            // hears WHAT is established instead of re-seeding
+                            // "assess starting state".
+                            verified_outcomes.push(VerifiedOutcome {
+                                id: step.id,
+                                title: step.title.clone(),
+                                detail: text_head(&verdict.detail, 240).to_string(),
+                                already_satisfied: true,
+                            });
                             progress.remove(&step.id);
                             tracing::info!(
                                 item = step.id,
@@ -1374,10 +1624,20 @@ impl LongHorizonRunner {
             let item = progress.entry(step.id).or_default();
 
             let (prompt, step_kind) = if is_replan {
-                let stall_summary = format!(
-                    "{} steps without the done-condition flipping",
-                    item.steps_without_progress
-                );
+                let stall_summary = if item.consecutive_check_timeouts >= CHECK_TIMEOUTS_REPLAN_AFTER
+                {
+                    format!(
+                        "the done-condition check has HUNG {} consecutive times (killed at \
+                         its timeout, no verdict). The artifact blocks forever on something \
+                         this check runs — decompose so fixing the hang comes first",
+                        item.consecutive_check_timeouts
+                    )
+                } else {
+                    format!(
+                        "{} steps without the done-condition flipping",
+                        item.steps_without_progress
+                    )
+                };
                 (
                     build_replan_prompt(goal, &step, &stall_summary),
                     StepKind::Plan,
@@ -1427,7 +1687,11 @@ impl LongHorizonRunner {
                 prompt,
                 tool_scope: step.tool_scope.clone(),
                 token_budget: cfg.step_token_budget,
-                max_iterations: Some(cfg.step_iterations),
+                // No fixed iteration cap: the runner ends the step on
+                // progress exhaustion (see `step_token_budget`'s docs for the
+                // P22 evidence against a hard 8) and the run's wall clock
+                // rides in below as the real bound.
+                max_iterations: None,
                 max_wall_clock: Some(remaining_wall),
                 cancel: cancel.clone(),
             };
@@ -1469,6 +1733,11 @@ impl LongHorizonRunner {
 
             let item = progress.entry(step.id).or_default();
             item.tokens_spent += outcome.input_tokens + outcome.output_tokens;
+            if !outcome.tool_calls.is_empty() {
+                // The narration ladder counts CONSECUTIVE prose-only steps; a
+                // step that acted re-arms all three rungs.
+                item.narration_steps = 0;
+            }
 
             if is_replan {
                 // The replan step adds subtasks through the store; the next
@@ -1492,6 +1761,10 @@ impl LongHorizonRunner {
                     _ => true,
                 };
                 item.replans += 1;
+                // The hang escalation's ticket is consumed by this replan; a
+                // still-hanging check re-earns it one timeout at a time and
+                // `max_replans_per_item` keeps convergence.
+                item.replan_due = false;
                 if produced_work {
                     item.steps_without_progress = 0;
                     item.last_result = None;
@@ -1560,10 +1833,72 @@ impl LongHorizonRunner {
                             serde_json::json!({
                                 "passed": verdict.passed,
                                 "detail": verdict.detail,
+                                "unknown": verdict.timed_out,
                             }),
                         )
                         .await;
-                    if verdict.passed {
+                    if verdict.timed_out {
+                        // UNKNOWN, not failed. The check said nothing about
+                        // the work, so nothing here may read as failure: no
+                        // fruitless charge, no failure signature, no refuted
+                        // claim. What the run DID learn is that something
+                        // hangs — surface that as a first-class finding, and
+                        // let the step's own successful novel evidence stand
+                        // in for the verdict the environment refused to give
+                        // (the P22 leg this rule comes from proved tests
+                        // 01–20 passing inside the very step whose check then
+                        // hung, and was abandoned "fruitless" while passing).
+                        acceptance_unknown += 1;
+                        item.consecutive_check_timeouts += 1;
+                        if novel_success_evidence(item, &outcome.tool_calls) {
+                            item.steps_without_progress = 0;
+                        }
+                        let finding = hanging_check_finding(
+                            check,
+                            &verdict,
+                            item.consecutive_check_timeouts,
+                        );
+                        tracing::warn!(
+                            item = step.id,
+                            title = %step.title,
+                            consecutive = item.consecutive_check_timeouts,
+                            detail = %text_head(&verdict.detail, 240),
+                            "acceptance check timed out — unknown verdict, not charged; \
+                             carrying the hang finding forward"
+                        );
+                        let _ = source.add_note(step.id, &finding).await;
+                        let _ = source
+                            .log(
+                                step.id,
+                                "acceptance_timeout",
+                                serde_json::json!({
+                                    "detail": verdict.detail,
+                                    "consecutive": item.consecutive_check_timeouts,
+                                }),
+                            )
+                            .await;
+                        item.last_result = Some(finding);
+                        if item.consecutive_check_timeouts >= CHECK_TIMEOUTS_REPLAN_AFTER {
+                            // Route to the replan rung, never the fruitless
+                            // budget: the item must converge even when its
+                            // question is unanswerable, and "decompose so the
+                            // hang is fixed first" is the productive framing.
+                            item.replan_due = true;
+                        }
+                    } else if verdict.passed {
+                        item.consecutive_check_timeouts = 0;
+                        if note_check_outcome(&mut check_outcomes, check, true) {
+                            for open_item in progress.values_mut() {
+                                open_item.steps_without_progress = 0;
+                            }
+                            tracing::info!(
+                                item = step.id,
+                                check = %check.describe(),
+                                "check flipped fail→pass — verified environment change; \
+                                 replenishing every open item's fruitless budget"
+                            );
+                        }
+                        let item = progress.entry(step.id).or_default();
                         let detail = serde_json::json!({
                             "verified": true,
                             "verdict": verdict.detail,
@@ -1578,6 +1913,12 @@ impl LongHorizonRunner {
                                     step.title.clone(),
                                     check.clone(),
                                 ));
+                                verified_outcomes.push(VerifiedOutcome {
+                                    id: step.id,
+                                    title: step.title.clone(),
+                                    detail: text_head(&verdict.detail, 240).to_string(),
+                                    already_satisfied: false,
+                                });
                                 progress.remove(&step.id);
                             }
                             Err(message) => {
@@ -1598,6 +1939,8 @@ impl LongHorizonRunner {
                             }
                         }
                     } else {
+                        item.consecutive_check_timeouts = 0;
+                        note_check_outcome(&mut check_outcomes, check, false);
                         if step_claims_completion(&outcome.text) {
                             // The model said done; the environment disagrees.
                             false_success_claims += 1;
@@ -1611,6 +1954,11 @@ impl LongHorizonRunner {
                         }
                         let signature = failure_signature(&verdict.detail);
                         let novel = item.seen_failure_signatures.insert(signature);
+                        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+                        let degenerate =
+                            outcome.degenerate_loop && outcome.tool_calls.is_empty();
+                        let steered = degenerate
+                            && item.narration_steps < NARRATION_LADDER_STEPS;
                         if novel && item.seen_failure_signatures.len() > 1 {
                             // The check fails DIFFERENTLY than every earlier
                             // attempt: the work moved the failure, which is
@@ -1621,6 +1969,22 @@ impl LongHorizonRunner {
                             // baseline, not progress; a revisited signature
                             // is oscillation and charges normally.
                             item.steps_without_progress = 0;
+                        } else if fresh_success {
+                            // The success mirror of the rule above: the step
+                            // verifiably did NEW work on the world (a
+                            // successful side-effectful call this item has
+                            // never seen), so the environment's own evidence
+                            // says the item is moving even though its check
+                            // still fails the same way. Byte-identical
+                            // repeats never take this arm, so the rewrite
+                            // treadmill still converges on abandonment.
+                            item.steps_without_progress = 0;
+                        } else if steered {
+                            // A zero-tool degenerate loop is a steering
+                            // problem, not task evidence — route it to the
+                            // harness's escalation ladder (bounded by
+                            // NARRATION_LADDER_STEPS) and count it apart.
+                            item.narration_steps += 1;
                         } else {
                             item.steps_without_progress += 1;
                             if repeated {
@@ -1629,6 +1993,21 @@ impl LongHorizonRunner {
                         }
                         let mut step_result =
                             failed_acceptance_result(check, &verdict, repeated);
+                        if degenerate {
+                            step_result.push_str("\n\n");
+                            step_result
+                                .push_str(&narration_steering_text(item.narration_steps.max(1)));
+                            let _ = source
+                                .log(
+                                    step.id,
+                                    "narration_step",
+                                    serde_json::json!({
+                                        "narration_steps": item.narration_steps,
+                                        "charged": !steered,
+                                    }),
+                                )
+                                .await;
+                        }
                         let cluster = failure_owners.entry(signature).or_default();
                         cluster.insert(step.id);
                         if cluster.len() > 1 {
@@ -1689,12 +2068,47 @@ impl LongHorizonRunner {
                             }
                         }
                     } else {
-                        item.steps_without_progress += 1;
-                        if repeated {
+                        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+                        let degenerate =
+                            outcome.degenerate_loop && outcome.tool_calls.is_empty();
+                        let steered = degenerate
+                            && item.narration_steps < NARRATION_LADDER_STEPS;
+                        if fresh_success {
+                            // No check exists, but the environment's evidence
+                            // still counts: the step did NEW successful work,
+                            // so the item is moving even without a claim.
+                            item.steps_without_progress = 0;
+                        } else if steered {
+                            // Zero-tool degenerate loop: steer, count apart,
+                            // charge only past the ladder (same routing as
+                            // the checked arm above).
+                            item.narration_steps += 1;
+                        } else {
                             item.steps_without_progress += 1;
+                            if repeated {
+                                item.steps_without_progress += 1;
+                            }
                         }
-                        item.last_result =
-                            Some(text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES));
+                        let mut step_result =
+                            text_tail(&outcome.text, STEP_RESULT_TAIL_MAX_BYTES);
+                        if degenerate {
+                            if !step_result.is_empty() {
+                                step_result.push_str("\n\n");
+                            }
+                            step_result
+                                .push_str(&narration_steering_text(item.narration_steps.max(1)));
+                            let _ = source
+                                .log(
+                                    step.id,
+                                    "narration_step",
+                                    serde_json::json!({
+                                        "narration_steps": item.narration_steps,
+                                        "charged": !steered,
+                                    }),
+                                )
+                                .await;
+                        }
+                        item.last_result = Some(step_result);
                     }
                 }
             }
@@ -1718,16 +2132,90 @@ impl LongHorizonRunner {
                 .filter(|(id, _, _)| *id != step.id && !reopened_once.contains(id))
                 .cloned()
                 .collect();
-            if !eligible.is_empty() {
+            // The drain sweep's OTHER half, also run live: an abandoned item
+            // whose check now passes was fixed by later work, and waiting for
+            // plan exhaustion to notice both wasted the fix and hid the
+            // strongest replenishment signal the run has (a fail→pass flip).
+            let eligible_abandoned: Vec<(i64, String, AcceptanceCheck)> = abandoned_this_run
+                .iter()
+                .filter(|(id, _, _)| *id != step.id && !reopened_once.contains(id))
+                .cloned()
+                .collect();
+            if !eligible.is_empty() || !eligible_abandoned.is_empty() {
                 let estimated = if check_runs > 0 {
-                    (check_cost_paid / check_runs) * eligible.len() as u32
+                    (check_cost_paid / check_runs)
+                        * (eligible.len() + eligible_abandoned.len()) as u32
                 } else {
                     Duration::ZERO
                 };
                 let full_due = resweep_due(sweep_cost_paid, check_cost_paid, estimated);
                 let targets =
                     select_resweep_targets(eligible, full_due, &outcome.touched_paths);
+                let abandoned_targets = select_resweep_targets(
+                    eligible_abandoned,
+                    full_due,
+                    &outcome.touched_paths,
+                );
                 let mut regressions: Vec<(i64, String, String)> = Vec::new();
+                for (id, title, check) in abandoned_targets {
+                    if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                        break;
+                    }
+                    let sweep_started = Instant::now();
+                    let verdict = check.run(workdir).await;
+                    sweep_cost_paid += sweep_started.elapsed();
+                    if verdict.timed_out {
+                        acceptance_unknown += 1;
+                        continue;
+                    }
+                    let flipped = note_check_outcome(&mut check_outcomes, &check, verdict.passed);
+                    if flipped {
+                        // Verified environment change — replenish regardless
+                        // of whether the reopen below succeeds; the evidence
+                        // is the environment's, not the store's.
+                        for open_item in progress.values_mut() {
+                            open_item.steps_without_progress = 0;
+                        }
+                        tracing::info!(
+                            item = id,
+                            check = %check.describe(),
+                            "mid-run sweep: check flipped fail→pass — verified \
+                             environment change; replenishing every open item's \
+                             fruitless budget"
+                        );
+                    }
+                    if !verdict.passed {
+                        continue;
+                    }
+                    if source
+                        .reopen(id, "acceptance now passes — reviving abandoned item")
+                        .await
+                        .is_ok()
+                    {
+                        reopened_once.insert(id);
+                        // Route through the precheck door: it completes
+                        // verified on its next selection without a step.
+                        precheck_ids.insert(id);
+                        progress.remove(&id);
+                        items_revived += 1;
+                        items_abandoned = items_abandoned.saturating_sub(1);
+                        tracing::info!(
+                            item = id,
+                            title = %title,
+                            "mid-run sweep: abandoned item's check now passes — reviving"
+                        );
+                        let _ = source
+                            .log(
+                                id,
+                                "revived",
+                                serde_json::json!({
+                                    "detail": verdict.detail,
+                                    "mid_run": true,
+                                }),
+                            )
+                            .await;
+                    }
+                }
                 for (id, title, check) in targets {
                     // A sweep is bookkeeping, not work — stop mid-sweep the
                     // moment the user says stop; the loop head reports it.
@@ -1737,6 +2225,13 @@ impl LongHorizonRunner {
                     let sweep_started = Instant::now();
                     let verdict = check.run(workdir).await;
                     sweep_cost_paid += sweep_started.elapsed();
+                    if verdict.timed_out {
+                        // Unknown — a hung re-check must not reopen verified
+                        // work as "regressed".
+                        acceptance_unknown += 1;
+                        continue;
+                    }
+                    note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                     if verdict.passed {
                         continue;
                     }
@@ -1812,6 +2307,8 @@ impl LongHorizonRunner {
             items_revived,
             items_regressed_reopened,
             abandoned_unmet,
+            verified_outcomes,
+            acceptance_unknown,
             items_already_satisfied,
             items_abandoned,
             last_runner_error,
@@ -1876,6 +2373,112 @@ fn failure_signature(detail: &str) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     normalized.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Stable identity of a check across items and rounds: the canonical JSON of
+/// the typed check. Two items proposing the same done-condition (a
+/// re-proposal after abandonment is exactly this) share one identity, which
+/// is what lets a later observation of the SAME question flip the ledger.
+fn check_identity(check: &AcceptanceCheck) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let canonical = serde_json::to_string(check).unwrap_or_default();
+    let mut hasher = std::hash::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Record a DECIDED verdict in the run-wide check ledger. Returns true when
+/// this exact check was last seen failing and now passes — a **verified
+/// environment change**, the run-level mirror of the per-item novel-failure
+/// rule: the world moved toward the goal by the environment's own evidence,
+/// so every still-open item's fruitless budget replenishes. Timeouts never
+/// reach here (unknown teaches the ledger nothing).
+fn note_check_outcome(
+    outcomes: &mut HashMap<u64, bool>,
+    check: &AcceptanceCheck,
+    passed: bool,
+) -> bool {
+    let previous = outcomes.insert(check_identity(check), passed);
+    passed && previous == Some(false)
+}
+
+/// The SUCCESS mirror of the novel-failure signature rule: digests of this
+/// step's successful side-effectful tool calls that this item has never seen
+/// before. New evidence of real work replenishes the fruitless budget; a
+/// byte-identical repeat (the rewrite treadmill) earns nothing, so oscillation
+/// still converges on the abandonment rung.
+fn novel_success_evidence(item: &mut ItemProgress, calls: &[StepToolCall]) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut novel = false;
+    for call in calls {
+        if !call.success || !crate::loop_runner::is_work_evidence_tool(&call.name) {
+            continue;
+        }
+        let mut hasher = std::hash::DefaultHasher::new();
+        call.name.hash(&mut hasher);
+        call.input_digest.hash(&mut hasher);
+        call.output_digest.hash(&mut hasher);
+        novel |= item.seen_success_digests.insert(hasher.finish());
+    }
+    novel
+}
+
+/// The carried-forward hang finding: a timed-out acceptance run reframed as
+/// what it actually is — a diagnosis about the artifact, not a transport
+/// error and not a failed verdict. Rendered into `== LAST RESULT ==` AND
+/// recorded as a durable note so it survives step boundaries, compression,
+/// and even abandonment. (Observed 2026-08-10: 24 exec timeouts on one
+/// non-terminating `mset` path and the model never registered "my
+/// implementation hangs" as a fact — it kept re-running the command and the
+/// hang then poisoned every acceptance check that touched it.)
+fn hanging_check_finding(
+    check: &AcceptanceCheck,
+    verdict: &AcceptanceVerdict,
+    consecutive: usize,
+) -> String {
+    let mut finding = format!(
+        "ACCEPTANCE CHECK HUNG (no verdict — this does NOT mean the work failed): {}",
+        verdict.detail
+    );
+    if consecutive > 1 {
+        finding.push_str(&format!(
+            "\nThat is {consecutive} consecutive hangs of this same check."
+        ));
+    }
+    finding.push_str(
+        "\nTreat the hang itself as a FINDING about the artifact: something this command \
+         runs blocks forever and never exits. Do not just re-run it — reproduce the hang \
+         with a short timeout, find the blocking code path, fix it, and only then re-run \
+         the check.",
+    );
+    if let Some(command) = check.self_check_command() {
+        finding.push_str(&format!(
+            "\nThe hanging command is: `{command}` (wrap it, e.g. `timeout 10 {command}`, \
+             to see where it sticks)."
+        ));
+    }
+    finding
+}
+
+/// Escalating steer for a zero-tool-call degenerate-loop step — the
+/// harness-level rung of the same gentle → firm → urgent ladder the in-step
+/// wrap-up nudges use. Level is the 1-based count of such steps this item
+/// has absorbed.
+fn narration_steering_text(level: usize) -> String {
+    match level {
+        1 => "NOTE: your previous step produced only narration — it described work but \
+              called no tool, so nothing happened. Start this step with a tool call."
+            .to_string(),
+        2 => "IMPORTANT: two steps in a row have produced prose and ZERO tool calls. \
+              Text does not change the world. Do not describe what you would do — \
+              CALL A TOOL as your very first action."
+            .to_string(),
+        _ => "STOP NARRATING. Every step that emits only text is discarded. Your first \
+              output this step MUST be a tool call (read_file, exec, write_file — \
+              whichever the task needs). If you cannot decide, run the task's check \
+              command with exec and act on its output."
+            .to_string(),
+    }
 }
 
 fn failed_acceptance_result(
@@ -2233,6 +2836,7 @@ mod tests {
             output_tokens: 200,
             tool_calls: vec![],
             touched_paths: vec![],
+            degenerate_loop: false,
         }
     }
 
@@ -2485,7 +3089,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = run_shell(command, dir.path(), Duration::from_secs(1)).await;
         let err = result.expect_err("a 30s sleeper must time out at 1s");
-        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
         // Bound: 1s timeout + tree-kill (taskkill subprocess on Windows).
         // 10s is a generous ceiling for a loaded CI machine; the pre-fix
         // hang mode was the full 30s sleeper duration.
@@ -2519,7 +3123,7 @@ mod tests {
 
         let result = run_shell(&command, dir.path(), Duration::from_secs(2)).await;
         let err = result.expect_err("held pipes must force the timeout");
-        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
 
         let text = std::fs::read_to_string(&pid_file).expect("grandchild pid file");
         let grandchild_pid: u32 = text.trim().parse().expect("windows pid");
@@ -2657,6 +3261,7 @@ mod tests {
             name: "exec".to_string(),
             input_digest: "a".to_string(),
             output_digest: "b".to_string(),
+            success: true,
         };
         assert!(steps_repeat(
             std::slice::from_ref(&call),
@@ -2703,6 +3308,7 @@ mod tests {
         let verdict = AcceptanceVerdict {
             passed: false,
             detail: "FAIL(test_04): exit code should be 1, got 0".to_string(),
+            timed_out: false,
         };
         let result = failed_acceptance_result(&check, &verdict, false);
         assert!(
@@ -2733,6 +3339,7 @@ mod tests {
         let verdict = AcceptanceVerdict {
             passed: false,
             detail: "`sh run_tests.sh` exited 1 — 3 failures".to_string(),
+            timed_out: false,
         };
         let result = failed_acceptance_result(&check, &verdict, true);
         assert!(
@@ -2754,6 +3361,7 @@ mod tests {
         let verdict = AcceptanceVerdict {
             passed: false,
             detail: "file does not exist: out.txt".to_string(),
+            timed_out: false,
         };
         let result = failed_acceptance_result(&check, &verdict, false);
         assert!(result.starts_with("Done-condition NOT met:"), "{result}");
@@ -2776,6 +3384,7 @@ mod tests {
         let verdict = AcceptanceVerdict {
             passed: false,
             detail: format!("{}NEWEST-EVIDENCE", "x".repeat(STEP_RESULT_TAIL_MAX_BYTES * 10)),
+            timed_out: false,
         };
         let result = failed_acceptance_result(&check, &verdict, true);
         assert!(
@@ -2804,6 +3413,7 @@ mod tests {
         let verdict = AcceptanceVerdict {
             passed: false,
             detail: "file does not exist: a.txt".to_string(),
+            timed_out: false,
         };
         let result = failed_acceptance_result(&check, &verdict, false);
         assert_eq!(result, "Done-condition NOT met: file does not exist: a.txt");
@@ -2878,9 +3488,11 @@ mod tests {
                         name: (*name).to_string(),
                         input_digest: (*name).to_string(),
                         output_digest: String::new(),
+                        success: true,
                     })
                     .collect(),
                 touched_paths: vec![],
+                degenerate_loop: false,
             })
         };
         let runner = ScriptedRunner::new(vec![
@@ -3193,6 +3805,7 @@ mod tests {
                     output_tokens: 200,
                     tool_calls: vec![],
                     touched_paths: vec![],
+                    degenerate_loop: false,
                 })
             }
         }
@@ -3727,7 +4340,10 @@ mod tests {
             .find(|r| r.step_kind == StepKind::Execute)
             .unwrap();
         assert_eq!(exec.tool_scope, vec!["exec".to_string()]);
-        assert_eq!(exec.max_iterations, Some(fast_config().step_iterations));
+        // P22: no fixed per-step iteration cap — the runner ends the step on
+        // progress exhaustion; wall clock is the bound that rides along.
+        assert_eq!(exec.max_iterations, None);
+        assert!(exec.max_wall_clock.is_some());
     }
 
     /// Build a stalled item whose acceptance can never pass, with an
@@ -3860,8 +4476,10 @@ mod tests {
                     name: "exec".to_string(),
                     input_digest: "same".to_string(),
                     output_digest: "same".to_string(),
+                    success: true,
                 }],
                 touched_paths: vec![],
+                degenerate_loop: false,
             })
         };
         let runner = ScriptedRunner::new(vec![looped(), looped(), looped(), looped()]);
@@ -4352,5 +4970,290 @@ TASK COMPLETE"))]);
         assert_eq!(report.stop, StopReason::AllTasksDone);
         assert_eq!(report.items_completed, 1);
         assert_eq!(report.interjected_items, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // P22 Tier 1: step & budget semantics
+    // -----------------------------------------------------------------
+
+    /// A timed-out acceptance check is UNKNOWN, not failed: it never charges
+    /// the fruitless budget (the item outlives its 2-step allowance), the
+    /// hang is surfaced as a carried-forward finding in notes AND the next
+    /// step's prompt, and after [`CHECK_TIMEOUTS_REPLAN_AFTER`] consecutive
+    /// hangs the item routes to the replan rung — here straight to
+    /// abandonment (max_replans 0) with the hang named in the drain sweep's
+    /// unmet detail rather than a false failure verdict.
+    #[tokio::test]
+    async fn timed_out_acceptance_is_unknown_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        #[cfg(windows)]
+        let hang = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        let hang = "sleep 30";
+        source
+            .push(step(
+                1,
+                "hang victim",
+                Some(AcceptanceCheck::Command {
+                    command: hang.to_string(),
+                    timeout_secs: Some(1),
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![
+            Ok(outcome("worked")),
+            Ok(outcome("worked more")),
+            Ok(outcome("worked again")),
+        ]);
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 0,
+            ..LongHorizonConfig::default()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // Three steps ran — MORE than the 2-step fruitless allowance, which
+        // proves no timeout was charged; the item still converged through
+        // the replan rung (replan_due) into abandonment.
+        assert_eq!(report.steps_taken, 3, "{report:?}");
+        assert_eq!(report.items_abandoned, 1);
+        // 3 post-step timeouts + 1 at the drain sweep.
+        assert_eq!(report.acceptance_unknown, 4);
+        // The hang is a first-class finding: durable note…
+        let notes = source.notes.lock().await;
+        assert!(
+            notes.iter().any(|(_, n)| n.contains("ACCEPTANCE CHECK HUNG")),
+            "hang finding must be recorded as a note"
+        );
+        drop(notes);
+        // …and in the NEXT step's prompt (carried via last_result).
+        let requests = runner.requests.lock().await;
+        assert!(
+            requests[1].prompt.contains("ACCEPTANCE CHECK HUNG"),
+            "the step after a hang must hear about it: {}",
+            requests[1].prompt
+        );
+        drop(requests);
+        // The drain sweep reports UNKNOWN, not a fabricated failure.
+        assert_eq!(report.abandoned_unmet.len(), 1);
+        assert!(
+            report.abandoned_unmet[0].detail.contains("no verdict"),
+            "unmet detail must carry the hang framing: {}",
+            report.abandoned_unmet[0].detail
+        );
+        let log = source.log_entries.lock().await;
+        assert!(log.iter().any(|(_, a)| a == "acceptance_timeout"));
+    }
+
+    /// Writes `flip.txt` (the abandoned sibling's done-condition) on its 4th
+    /// step and reports the touch, while its own check never passes.
+    struct FlipRunner {
+        dir: PathBuf,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StepRunner for FlipRunner {
+        async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+            let mut calls = self.calls.lock().await;
+            *calls += 1;
+            let mut out = outcome("kept working");
+            if *calls == 4 {
+                std::fs::write(self.dir.join("flip.txt"), b"now exists").unwrap();
+                out.touched_paths = vec!["flip.txt".to_string()];
+            }
+            Ok(out)
+        }
+    }
+
+    /// A check flipping fail→pass ANYWHERE is a verified environment change:
+    /// the mid-run sweep revives the abandoned sibling whose condition now
+    /// passes, and the flip replenishes the grinding item's fruitless budget
+    /// — even though that item's own check keeps failing identically.
+    #[tokio::test]
+    async fn check_flip_replenishes_open_items_and_revives_mid_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "first",
+                Some(AcceptanceCheck::FileExists {
+                    path: "flip.txt".to_string(),
+                }),
+            ))
+            .await;
+        source
+            .push(step(
+                2,
+                "second",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner = FlipRunner {
+            dir: dir.path().to_path_buf(),
+            calls: Mutex::new(0),
+        };
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 0,
+            ..LongHorizonConfig::default()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // Item 1: 2 fruitless steps → abandoned. Item 2: 2 charged steps,
+        // then its 4th call writes flip.txt → the sweep revives item 1
+        // (completing it verified through the precheck door, no step spent)
+        // and the flip resets item 2's counter, buying 2 more steps before
+        // it abandons: 6 steps total, versus 4 without the replenish.
+        assert_eq!(report.steps_taken, 6, "{report:?}");
+        assert_eq!(report.items_revived, 1);
+        assert_eq!(report.items_completed, 1);
+        assert_eq!(report.items_already_satisfied, 1);
+        assert_eq!(report.items_abandoned, 1);
+        // The revival's verdict is knowledge on the report.
+        assert_eq!(report.verified_outcomes.len(), 1);
+        assert_eq!(report.verified_outcomes[0].id, 1);
+        assert!(report.verified_outcomes[0].already_satisfied);
+    }
+
+    /// The success mirror of the novel-failure rule: a step whose successful
+    /// side-effectful tool evidence is NEW replenishes the budget even while
+    /// the check fails identically — the item grinds only when it stops
+    /// producing new evidence, not after a fixed count.
+    #[tokio::test]
+    async fn novel_success_evidence_replenishes_the_fruitless_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "climbing item",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+        let working = |i: usize| {
+            let mut out = outcome("attempt");
+            out.tool_calls = vec![StepToolCall {
+                name: "exec".to_string(),
+                input_digest: format!("cmd-{i}"),
+                output_digest: format!("result-{i}"),
+                success: true,
+            }];
+            Ok(out)
+        };
+        let runner =
+            ScriptedRunner::new((0..6).map(working).collect());
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 0,
+            ..LongHorizonConfig::default()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // All 6 scripted steps ran (vs 2 without replenishment); the item
+        // only died when the script ran dry (runner-error containment).
+        assert_eq!(report.steps_taken, 6, "{report:?}");
+        assert_eq!(report.items_abandoned, 1);
+    }
+
+    /// Zero-tool-call degenerate-loop steps ride the harness steering ladder
+    /// (three escalating rungs, charged nothing) and only start consuming
+    /// the fruitless budget once the ladder is exhausted.
+    #[tokio::test]
+    async fn degenerate_loop_steps_ride_the_ladder_before_charging() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "narrator",
+                Some(AcceptanceCheck::FileExists {
+                    path: "never.txt".to_string(),
+                }),
+            ))
+            .await;
+        let narration = || {
+            let mut out = outcome("I would now call read_file and then fix things.");
+            out.degenerate_loop = true;
+            Ok(out)
+        };
+        let runner = ScriptedRunner::new((0..6).map(|_| narration()).collect());
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 0,
+            ..LongHorizonConfig::default()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // 3 ladder steps (uncharged) + 2 charged = 5 steps, then abandonment
+        // — versus 2 steps if aborts were charged like genuine no-ops.
+        assert_eq!(report.steps_taken, 5, "{report:?}");
+        assert_eq!(report.items_abandoned, 1);
+        let requests = runner.requests.lock().await;
+        assert!(
+            requests[1].prompt.contains("produced only narration"),
+            "first rung must steer gently: {}",
+            requests[1].prompt
+        );
+        assert!(
+            requests[3].prompt.contains("STOP NARRATING"),
+            "third rung must be urgent: {}",
+            requests[3].prompt
+        );
+        drop(requests);
+        let log = source.log_entries.lock().await;
+        assert!(log.iter().any(|(_, a)| a == "narration_step"));
+    }
+
+    /// An already-satisfied pre-check completion is knowledge: the passing
+    /// verdict rides the report's `verified_outcomes` for the continuation
+    /// planner, flagged as closed-by-evidence with zero steps run.
+    #[tokio::test]
+    async fn already_satisfied_precheck_records_a_verified_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("done.txt"), b"present").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                7,
+                "already done",
+                Some(AcceptanceCheck::FileExists {
+                    path: "done.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![]);
+        let config = LongHorizonConfig {
+            precheck_acceptance_items: [7].into_iter().collect(),
+            ..fast_config()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(report.items_already_satisfied, 1);
+        assert_eq!(report.verified_outcomes.len(), 1);
+        let outcome = &report.verified_outcomes[0];
+        assert_eq!(outcome.id, 7);
+        assert!(outcome.already_satisfied);
+        assert!(
+            outcome.detail.contains("file exists"),
+            "the verdict detail is the knowledge: {}",
+            outcome.detail
+        );
     }
 }

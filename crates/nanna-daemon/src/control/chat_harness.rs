@@ -362,11 +362,30 @@ impl ControlPlane {
                 // fresh question waited behind stale work nobody re-confirmed.
                 // Now the planner is shown what is outstanding and chooses.
                 let outstanding = open_work_context(&storage, &scope, scope_id.as_deref()).await;
-                let context = match (conversation.as_deref(), outstanding.as_deref()) {
-                    (Some(convo), Some(work)) => Some(format!("{convo}\n\n{work}")),
-                    (Some(convo), None) => Some(convo.to_string()),
-                    (None, Some(work)) => Some(work.to_string()),
-                    (None, None) => None,
+                // Resume = continue, not restart (P22): a re-send after a
+                // run self-terminated must seed the new turn with what the
+                // previous one PROVED — closed items and their verified
+                // verdicts (which name the commands run and the artifact
+                // state they confirmed). The store carries them across the
+                // turn boundary; without this block the new planner started
+                // from zero and re-seeded the mission's opening sentence
+                // verbatim (observed twice in one leg, with six state
+                // re-assessments in four hours and zero items ever completed
+                // by work).
+                let established =
+                    established_work_context(&storage, &scope, scope_id.as_deref()).await;
+                let context = {
+                    let joined = [
+                        conversation.as_deref(),
+                        outstanding.as_deref(),
+                        established.as_deref(),
+                    ]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                    Some(joined).filter(|c| !c.is_empty())
                 };
 
                 // The turn-start boundary for continuation dedup: tasks
@@ -517,6 +536,11 @@ impl ControlPlane {
                             report.items_already_satisfied += extra.items_already_satisfied;
                             report.items_abandoned += extra.items_abandoned;
                             report.interjected_items += admitted + extra.interjected_items;
+                            for v in &extra.verified_outcomes {
+                                report.verified_outcomes.retain(|p| p.id != v.id);
+                            }
+                            report.verified_outcomes.extend(extra.verified_outcomes.clone());
+                            report.acceptance_unknown += extra.acceptance_unknown;
                             if extra.last_runner_error.is_some() {
                                 report.last_runner_error = extra.last_runner_error;
                             }
@@ -652,9 +676,19 @@ impl ControlPlane {
                                 }
                                 Some(lines.join("\n"))
                             };
+                            // The knowledge half, same shape as the unmet
+                            // half: what this turn VERIFIED done, in the
+                            // environment's own words. Without it the planner
+                            // re-plans blind and re-proposes finished work —
+                            // each re-proposal closing as "already satisfied"
+                            // and, before P22, counting the mission DRY for
+                            // discovering its own progress.
+                            let established_block =
+                                established_block(&report.verified_outcomes);
                             let ctx = [
                                 conversation.as_deref(),
                                 outstanding.as_deref(),
+                                established_block.as_deref(),
                                 unmet_block.as_deref(),
                             ]
                             .iter()
@@ -803,7 +837,27 @@ impl ControlPlane {
                                 // continuation budget (ROUNDS_MAX) instead of
                                 // the two-strike dry budget. Dryness may only
                                 // conclude a mission the evidence permits.
-                                if more.abandoned_unmet.is_empty()
+                                if more.items_already_satisfied > 0 {
+                                    // Knowledge, not a dry round (P22): the
+                                    // round PROVED work is done — that fact
+                                    // now rides `verified_outcomes` into the
+                                    // next planning context, so an informed
+                                    // planner either proposes genuinely new
+                                    // work or seeds nothing, and THAT round
+                                    // counts dry. Discovering "already done"
+                                    // must make the mission faster, never
+                                    // push it toward giving up (observed:
+                                    // three runs died at dry_rounds=2 with
+                                    // already_satisfied closures on the
+                                    // books). Bounded by ROUNDS_MAX and by
+                                    // the closed-title dedup either way.
+                                    tracing::info!(
+                                        continuations,
+                                        already_satisfied = more.items_already_satisfied,
+                                        "round closed items by evidence — knowledge, \
+                                         not a dry round; feeding facts to the planner"
+                                    );
+                                } else if more.abandoned_unmet.is_empty()
                                     && report.abandoned_unmet.is_empty()
                                 {
                                     dry_rounds += 1;
@@ -811,7 +865,6 @@ impl ControlPlane {
                                         continuations,
                                         dry_rounds,
                                         steps = more.steps_taken,
-                                        already_satisfied = more.items_already_satisfied,
                                         "mission continuation changed nothing and closed nothing"
                                     );
                                 } else {
@@ -844,6 +897,14 @@ impl ControlPlane {
                                 report.abandoned_unmet.retain(|p| p.id != u.id);
                             }
                             report.abandoned_unmet.extend(more.abandoned_unmet.clone());
+                            // Same union for the knowledge half: newest
+                            // verdict per id wins, earlier rounds' facts
+                            // persist so the planner context accumulates.
+                            for v in &more.verified_outcomes {
+                                report.verified_outcomes.retain(|p| p.id != v.id);
+                            }
+                            report.verified_outcomes.extend(more.verified_outcomes.clone());
+                            report.acceptance_unknown += more.acceptance_unknown;
                             if more.last_runner_error.is_some() {
                                 report.last_runner_error = more.last_runner_error;
                             }
@@ -1094,6 +1155,104 @@ fn failure_notice(report: &nanna_agent::harness::LongHorizonReport) -> Option<St
 /// Bounded like every other injected context: at most
 /// [`OPEN_WORK_MAX`] items, titles clamped, so a scope with a runaway plan
 /// cannot crowd out the request itself.
+/// Render this turn's verified outcomes for the continuation planner — the
+/// knowledge mirror of the `UNMET WORK` block. Bounded like
+/// [`open_work_context`]: enough to inform, never to displace the request.
+fn established_block(verified: &[nanna_agent::harness::VerifiedOutcome]) -> Option<String> {
+    /// Same bound and rationale as `OPEN_WORK_MAX`: convey what is known
+    /// without displacing the request; newest facts win.
+    const ESTABLISHED_MAX: usize = 10;
+
+    if verified.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "ESTABLISHED — these done-conditions already PASS, verified by running them this \
+         turn. Do NOT re-propose or re-assess this work; plan only what builds beyond it:"
+            .to_string(),
+    ];
+    for v in verified.iter().rev().take(ESTABLISHED_MAX) {
+        lines.push(format!("- #{} {}: {}", v.id, v.title, v.detail));
+    }
+    if verified.len() > ESTABLISHED_MAX {
+        lines.push(format!("- …and {} more", verified.len() - ESTABLISHED_MAX));
+    }
+    Some(lines.join("\n"))
+}
+
+/// What earlier turns in this scope PROVED done — closed items with their
+/// completion verdicts, read back from the store at turn start. This is the
+/// continuation context that makes a driver/user re-send after a
+/// self-terminated run CONTINUE the mission instead of restarting it: the
+/// verdicts name the commands that passed and when, i.e. the artifact state
+/// the environment last confirmed.
+async fn established_work_context(
+    storage: &Arc<Storage>,
+    scope: &str,
+    scope_id: Option<&str>,
+) -> Option<String> {
+    /// Same bound and rationale as `OPEN_WORK_MAX` below.
+    const ESTABLISHED_MAX: usize = 10;
+
+    let all = storage.tasks().list(scope, scope_id, true).await.ok()?;
+    let mut done: Vec<_> = all.iter().filter(|t| t.status == "done").collect();
+    if done.is_empty() {
+        return None;
+    }
+    // Newest completions first: the freshest verdicts describe the current
+    // artifact best.
+    done.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+    let mut out = String::from(
+        "## Verified done in earlier work this session\n\
+         These closed with their done-condition PASSING (the verdict shows what the \
+         environment confirmed, and when). Do not redo or re-assess them — continue \
+         from this state:\n",
+    );
+    let mut shown = 0usize;
+    for task in done.iter().take(ESTABLISHED_MAX) {
+        // The completion verdict lives in the task's activity log (action
+        // "completed", detail {verified, verdict}). One bounded query per
+        // shown task, at most ESTABLISHED_MAX per turn start.
+        let verdict = match storage.tasks().activity(task.id, 25).await {
+            Ok(entries) => entries
+                .iter()
+                .rev()
+                .find(|e| e.action == "completed")
+                .and_then(|e| e.detail.as_ref())
+                .and_then(|d| {
+                    d.get("verdict")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                }),
+            Err(_) => None,
+        };
+        let title = if task.title.len() > 120 {
+            let end = task.title.floor_char_boundary(120);
+            format!("{}…", &task.title[..end])
+        } else {
+            task.title.clone()
+        };
+        let when = task.completed_at.as_deref().unwrap_or("");
+        match verdict {
+            Some(v) => {
+                let v = if v.len() > 200 {
+                    format!("{}…", &v[..v.floor_char_boundary(200)])
+                } else {
+                    v
+                };
+                out.push_str(&format!("- #{} {title} — verified {when}: {v}\n", task.id));
+            }
+            // Unverified completions are still state, marked as such.
+            None => out.push_str(&format!("- #{} {title} — closed {when} (unverified)\n", task.id)),
+        }
+        shown += 1;
+    }
+    if done.len() > shown {
+        out.push_str(&format!("- …and {} more closed earlier\n", done.len() - shown));
+    }
+    Some(out)
+}
+
 async fn open_work_context(
     storage: &Arc<Storage>,
     scope: &str,
@@ -1329,6 +1488,8 @@ mod tests {
         last_err: Option<&str>,
     ) -> LongHorizonReport {
         LongHorizonReport {
+            verified_outcomes: Vec::new(),
+            acceptance_unknown: 0,
             stop,
             steps_taken: steps,
             tool_calls: 0,
@@ -1349,6 +1510,91 @@ mod tests {
             tokens_per_completed_item: None,
             interjected_items: 0,
         }
+    }
+
+    /// P22: verified outcomes render as the planner's ESTABLISHED block —
+    /// each fact with its id, title and the environment's verdict — bounded
+    /// with an announced overflow, newest first.
+    #[test]
+    fn established_block_renders_verified_facts_bounded() {
+        assert!(established_block(&[]).is_none(), "no facts, no block");
+        let outcomes: Vec<nanna_agent::harness::VerifiedOutcome> = (0..13)
+            .map(|i| nanna_agent::harness::VerifiedOutcome {
+                id: i,
+                title: format!("feature {i}"),
+                detail: format!("`test_{i}.sh` exited 0"),
+                already_satisfied: i % 2 == 0,
+            })
+            .collect();
+        let block = established_block(&outcomes).expect("facts must render");
+        assert!(block.starts_with("ESTABLISHED"));
+        assert!(block.contains("do NOT re-propose") || block.contains("Do NOT re-propose"));
+        // Newest facts win the bounded slots…
+        assert!(block.contains("#12 feature 12: `test_12.sh` exited 0"));
+        assert!(!block.contains("#0 feature 0"), "oldest must yield: {block}");
+        // …and the cut announces itself.
+        assert!(block.contains("…and 3 more"), "{block}");
+    }
+
+    /// P22 resume-as-continue: a NEW turn's planner context carries what
+    /// earlier turns PROVED — closed items with their completion verdicts,
+    /// read back from the store — so a re-send after self-termination builds
+    /// on the artifact state instead of re-seeding the mission from zero.
+    #[tokio::test]
+    async fn established_work_context_reads_verdicts_back_from_the_store() {
+        let storage = Arc::new(Storage::in_memory().await.unwrap());
+        assert!(
+            established_work_context(&storage, "session", Some("s1"))
+                .await
+                .is_none(),
+            "nothing closed, no block"
+        );
+        let task = storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                scope: "session".to_string(),
+                scope_id: Some("s1".to_string()),
+                title: "Implement SET and GET".to_string(),
+                priority: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .tasks()
+            .complete(
+                task.id,
+                Some("chat"),
+                Some(serde_json::json!({
+                    "verified": true,
+                    "verdict": "`sh tests/test_02.sh` exited 0 — ok",
+                })),
+            )
+            .await
+            .unwrap();
+        // An open sibling must not leak into the established block.
+        storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                scope: "session".to_string(),
+                scope_id: Some("s1".to_string()),
+                title: "Implement DEL".to_string(),
+                priority: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let block = established_work_context(&storage, "session", Some("s1"))
+            .await
+            .expect("a verified completion must render");
+        assert!(block.contains("Verified done in earlier work"));
+        assert!(block.contains("Implement SET and GET"));
+        assert!(
+            block.contains("`sh tests/test_02.sh` exited 0"),
+            "the verdict IS the artifact state: {block}"
+        );
+        assert!(!block.contains("Implement DEL"), "open work stays out: {block}");
     }
 
     #[test]
