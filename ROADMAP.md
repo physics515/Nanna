@@ -3020,10 +3020,41 @@ from evidence, budgets stay budgets):
       strangled by the daemon's own heartbeat + 201 embed POSTs in one minute.)
 - [ ] Embedding client gets the IPv4-pin/no-idle-pool/read-timeout treatment; classify
       deterministic 422 "input too long" as shrink-and-retry, not a 240s bench.
-- [ ] **Liveness beat**: a low-frequency in-flight line (session, elapsed, waiting-on) in
-      log + IPC; a watchdogged stream so no loop path exits silently; a terminal reason
-      file on daemon exit; `chat.send` delivery ack distinct from run completion.
-      (Evidence: a dead daemon was polled 14× and scored.)
+- [x] **Liveness beat & the whole "dead daemon vs slow model" cluster** *(landed 2026-08-13,
+      PR #226)* — six surfaces, all chat-first:
+      **(a)** liveness beat: while a turn is in flight, a `liveness beat` log line AND a
+      `liveness_beat` IPC event (session, elapsed, phase, "what it awaits", quiet-seconds,
+      step, last tool, beat counter); cadence DERIVED (`liveness::beat_interval_secs`) =
+      min(stream read timeout 120s, acceptance default 120s) / 4 = 30s — ≥3 beats inside any
+      legally-silent stretch, no independent constant to go stale.
+      **(b)** stream watchdog (`call_llm_streaming`): every stream wait bounded at 2× the
+      transport's declared read timeout (`nanna_llm::STREAM_READ_TIMEOUT_SECS`, now
+      exported); reaching it means the stream FUTURE wedged while the transport thought the
+      socket healthy — fails loudly as `AgentError::StreamWatchdog`, healed by the step
+      ladder (classified transient), announced via the failure-notice chain when persistent.
+      No loop path returns without output or an announced failure.
+      **(c)** terminal reason file (`exit_reason.rs`, `nanna-daemon.exit.json`): `running`
+      marker at startup (after the PID race — a losing duplicate can never clobber the live
+      record), terminal reason on clean drain / panic hook (file first, log second:
+      `panic = "abort"`) / signal / IPC hard exit; `running` + dead PID **is** the
+      unclean-exit verdict, logged at next boot. 8 tests.
+      **(d)** `chat.send` fast delivery ack: only persist + claim-or-interject before the
+      response; recall/workspace/memory prep moved into the spawned turn
+      (`prepare_chat_turn`, phase `preparing`, covered by the beat); both admission shapes
+      carry `delivery: "accepted"` + `accepted_at` — the response certifies delivery ONLY.
+      (`ControlPlane::handle` now takes an `Arc` receiver.) Ack shapes pinned by tests.
+      **(e)** `session.liveness` IPC verb: working/wedged/finished from the daemon's own
+      ledger — phase, awaiting, last step, last tool, last **side-effecting** call
+      (`is_work_evidence_tool` now `pub`: one classification, three rungs), stop state,
+      pending interjections. Constant-size, safe to poll; what Tier 5's liveness probe and
+      work denominator read.
+      **(f)** repeat-completion escalation: a turn ending `AllTasksDone` for the *same
+      request* (content fingerprint) with zero side effects since the previous identical
+      exit is stated in the transcript ("repeat completion #N"), never a silent completion
+      (lfm declared itself done 28× with nothing on disk); different questions answered
+      read-only never trip it. 7 ledger tests.
+      *Deferred:* GUI consumes beat + verb for the spinner/empty-bubble states;
+      task-run/scheduler sinks get a ledger (the `ChatSink.liveness` slot exists).
 - [ ] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
       a call-shaped JSON object trips the detector; salvage through `resolve_tool()` + the
       alias layer (`list_files`→`list_dir`); fence self-authored "result" objects out of
@@ -3045,70 +3076,6 @@ from evidence, budgets stay budgets):
 
 Full evidence: the six-agent retrospective (per-leg log forensics) in the 2026-08-11
 session; per-leg detail in `bench/BASELINE.md` and the campaign ledger/artifacts.
-
----
-
-### P22 — Liveness: a dead daemon and a slow model must never look alike ✅ (Tier 4 slice landed 2026-08-13, forensics-driven)
-
-Driving force (2026-08-10 GUI-path bench forensics): the ministral leg's daemon hard-died mid-turn at
-14:15:47Z with **zero diagnostic output** — no panic line, no cancel, no shutdown marker; the log simply
-ends and resumes 3h59m later when the next leg boots. The bench driver polled the corpse 14 times,
-logged a websocket error each time, and still published "0/42, impl archived, cuda faults: 0" as a
-model capability result. A second session queued interjections for 50+ minutes against a wedged turn
-with no log output. The same ambiguity is the GUI's spinner problem: a user staring at a quiet bubble
-cannot tell "model is thinking" from "process is gone", and neither could we. Every lever below makes
-absence-of-signal mean something by making presence-of-signal cheap and unconditional. Generalizes to
-chat by construction — no benchmark-shaped behavior anywhere.
-
-- [x] **Terminal reason file** (`exit_reason.rs`, `nanna-daemon.exit.json` in the data dir) — a dirty
-      bit for the whole process. Startup (after the PID race is won, so a losing duplicate can never
-      clobber the live daemon's record) logs the previous record and overwrites it with
-      `state: running`; every deliberate exit path — clean shutdown drain, panic hook (file first,
-      log second: with `panic = "abort"` the hook is the last code that runs), signal/ctrl-c handlers,
-      the IPC-server hard exit — records `state: exited` + reason. A file still saying `running` for a
-      dead PID **is** the unclean-exit verdict, and the next boot says so in its log. Writers are
-      disarmed until the startup marker lands. 8 tests.
-- [x] **Liveness beat** — while a chat turn is in flight, a low-frequency `liveness beat` log line AND
-      a `liveness_beat` IPC event: session id, elapsed, phase, "what it awaits" (e.g. `LLM request in
-      flight (ollama/x): 41s, no output yet this step`), quiet-seconds, step index, last tool, beat
-      counter. Cadence is **derived, not chosen** (`liveness::beat_interval_secs`): the tighter of the
-      transport's declared stream silence tolerance (`nanna_llm::STREAM_READ_TIMEOUT_SECS`, 120s) and
-      the default acceptance budget (`ACCEPTANCE_TIMEOUT_SECS_DEFAULT`, 120s) divided by 4 — ≥3 beats
-      inside any legally-silent stretch, so "beats stopped" can never mean "lawful quiet". 30s today;
-      if either budget moves, the cadence follows.
-- [x] **Stream watchdog** (`loop_runner::call_llm_streaming`) — the stream loop had no time awareness
-      at all: it raced only cancellation against `stream.next()`. Now every wait is bounded at 2× the
-      transport's declared read timeout: on a truly silent socket the transport fires first (normal
-      retry path); reaching 2× means the stream **future** is wedged while the transport thinks it
-      healthy — the exact silent-wedge class. Fails loudly as `AgentError::StreamWatchdog` (step retry
-      → harness circuit breaker → `failure_notice` in the transcript), so no loop path returns without
-      either output or an announced failure.
-- [x] **`chat.send` fast delivery ack** — the ack existed but paid for recall/workspace/memory prep
-      first, over embedding providers that stall for minutes when benched: the driver twice recorded
-      "start-run failed: timeout" for missions the daemon had accepted (then treated the leg as
-      un-started). Now only persist-message + claim-or-interject run before the response; all heavy
-      prep (`prepare_chat_turn`) happens inside the spawned turn, covered by the beat (phase
-      `preparing`). Both admission shapes carry an explicit `delivery: "accepted"` + `accepted_at` —
-      the contract that this response certifies **delivery only**; completion arrives as events. Ack
-      shape pinned by tests.
-- [x] **`session.liveness` IPC verb** — "working, wedged, or finished" from the daemon's own ledger
-      (`liveness.rs`, stamped by the chat sink): running/phase/awaiting, last step index+kind+label,
-      last tool call, last **side-effecting** call (single classification: `is_work_evidence_tool`,
-      now `pub` — one list, three rungs), turn stream chars, stop state, pending interjections, beat
-      count. Constant-size, safe to poll; replaces log-byte and tool-count proxies that were blind for
-      3h54m (leg 7) and credited housekeeping to dead missions.
-- [x] **Repeat-completion escalation** — a turn that ends `AllTasksDone` for the *same request*
-      (content fingerprint) with **zero** side-effecting calls since the previous identical exit is an
-      escalation **stated in the transcript** ("repeat completion #N … nothing was written, edited, or
-      executed"), not a silent completion. The lfm leg declared itself done 28 times over four hours
-      with no `./minidb` ever created, each declaration indistinguishable from a real finish. Two
-      different questions both answered read-only stay silent completions — the fingerprint keys the
-      streak to a re-sent request, so ordinary Q&A never trips it. 7 ledger tests.
-
-**Deferred (next slices):** GUI consumes `liveness_beat` + `session.liveness` for the spinner and the
-empty-bubble states; scheduler/task-run paths get the same beat (the sink hook exists — wire
-`TaskRunManager`'s sink with a ledger); bench driver gates every ledger poll on `session.liveness`
-and writes `INVALID(daemon-unreachable)` instead of a score (harness-driver side, see bench notes).
 
 ---
 
