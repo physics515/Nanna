@@ -3034,11 +3034,23 @@ from evidence, budgets stay budgets):
       log + IPC; a watchdogged stream so no loop path exits silently; a terminal reason
       file on daemon exit; `chat.send` delivery ack distinct from run completion.
       (Evidence: a dead daemon was polled 14× and scored.)
-- [ ] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
+- [x] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
       a call-shaped JSON object trips the detector; salvage through `resolve_tool()` + the
       alias layer (`list_files`→`list_dir`); fence self-authored "result" objects out of
       history as fabrications. (Evidence: lfm emitted 379 prose pseudo-calls, 300 to a tool
       that doesn't exist, then believed its own fabricated directory listing for 4 hours.)
+      **(2026-08-14, PR #230)** — shipped as: structural arm on every call shape
+      (`action`/`tool`/`tool_name`/`function`, OpenAI envelope, fence tokens) + a
+      conservative ≥2-distinct-calls stream abort; salvage executes through the NORMAL
+      pipeline (breakers/ledger/stats/memory/chips) with the synthesized `tool_use` blocks
+      stored pair-complete so history demonstrates the dialect; `resolve_tool()` gained an
+      unambiguous dialect-synonym step (`ls`/`dir`/`list_files`→`list_dir`, `cat`/`open`→
+      `read_file`, `run`/`shell`/`execute`→`exec`; ambiguous names surface, never guessed);
+      fences are insertion-only with a provenance corpus (real tool outputs + user text —
+      never the model's own turns) so quotation is left alone; plus two adjacent honesty
+      levers: consecutive byte-identical zero-call rounds announce themselves in the reply,
+      and breaker replays record a `short_circuited` stats outcome (tracker, daemon sink,
+      Turso hourly) instead of `success=0`.
 
 **Tier 5 — the bench measures itself (`bench/gui-leg/`, new)**
 - [ ] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
@@ -3057,39 +3069,6 @@ Full evidence: the six-agent retrospective (per-leg log forensics) in the 2026-0
 session; per-leg detail in `bench/BASELINE.md` and the campaign ledger/artifacts.
 
 ---
-
-### P22 — Carry the weakest dialects (2026-08-13, from the lfm forensic read)
-
-The lfm bench leg proved a failure class no phrase list can see: 379 of 429 text items in one leg were
-**tool calls written as JSON in prose** (384 `"action":` strings, 300 to the non-existent `list_files`;
-28 orphan `</TOOL_CALL>` closers), plus 2 fabricated `"result": {…}` blocks the model then **believed
-for four hours** — it invented a directory listing and navigated by it. The model was capable; the
-dialect was not (the standing P20 lesson). None of these levers are bench-shaped: they fire on any
-weak-model chat that writes a call as text.
-
-**Tier 4 — dialect salvage** ✅ (2026-08-13, this branch)
-- [x] **Structural arm on narration detection** (`loop_runner.rs`): a step emitting ZERO structured
-      tool calls whose text contains a balanced call-shaped JSON object (`action`/`tool`/`tool_name`/
-      `function`, or `name`+`params`/`arguments`) or tool-call fence tokens is the narration failure in
-      structural form — caught regardless of the phrase list. A conservative variant
-      (`text_streams_prose_tool_calls`, ≥2 distinct calls) aborts a stream that is provably narrating.
-- [x] **Salvage, not just scold**: the prose call is parsed, routed through `resolve_tool()` — now
-      exact → case-insensitive → **dialect synonym** (`list_files`/`ls`/`dir`→`list_dir`,
-      `cat`/`open`→`read_file`, `run`/`shell`→`exec`; unambiguous entries only, ambiguous names surface
-      instead of being guessed) → fuzzy — and **executed through the normal pipeline** (breakers,
-      ledger, stats, memory, UI chips), with the structured calls synthesized into the assistant turn
-      so history demonstrates the correct dialect. The corrective notice names what ran, what could not
-      be resolved, and the nearest real tools.
-- [x] **Fence self-authored results**: a zero-tool-call step's result-shaped object (`result`/`output`/
-      `stdout`) with no provenance in real tool outputs or user text is stamped
-      `[you wrote this yourself — no tool ran; the real listing is unknown]` BEFORE it enters history —
-      a fabrication can never become the model's world. Insertion-only (lossless); quotation of real
-      outputs is recognized and left alone.
-- [x] **Cross-turn honesty**: consecutive rounds ending byte-identical with zero structured calls
-      append a plain note to the reply — the repetition is never presented as fresh work.
-- [x] **Honest bookkeeping**: breaker replays (repeat-failure / zero-info / discovery-pause) now carry
-      a `short_circuited` outcome through tool stats (tracker, daemon sink, Turso hourly aggregate)
-      instead of `success=0` — hours of replays no longer read as a broken tool.
 
 ---
 
