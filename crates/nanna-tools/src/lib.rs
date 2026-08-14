@@ -24,7 +24,7 @@ pub mod skills;
 pub use builtin::*;
 pub use output::{format_tool_output, schemas as output_schemas, wants_json_output};
 pub use policy::{DenyReason, ToolPolicy};
-pub use registry::ToolRegistry;
+pub use registry::{ToolRegistry, dialect_synonym};
 pub use search::{SearchDoc, ToolSearchHit};
 pub use schema::{ParameterType, ToolDefinition, ToolParameter, ToolResult};
 pub use skills::{DiscoveredSkill, SkillSource, discover_skills, load_skill, load_skills_from_dir};

@@ -2949,6 +2949,41 @@ Sources: [Chutes / SN64 overview](https://simplytao.ai/blog/subnet-64-chutes-you
 
 ---
 
+### P22 — Carry the weakest dialects (2026-08-13, from the lfm forensic read)
+
+The lfm bench leg proved a failure class no phrase list can see: 379 of 429 text items in one leg were
+**tool calls written as JSON in prose** (384 `"action":` strings, 300 to the non-existent `list_files`;
+28 orphan `</TOOL_CALL>` closers), plus 2 fabricated `"result": {…}` blocks the model then **believed
+for four hours** — it invented a directory listing and navigated by it. The model was capable; the
+dialect was not (the standing P20 lesson). None of these levers are bench-shaped: they fire on any
+weak-model chat that writes a call as text.
+
+**Tier 4 — dialect salvage** ✅ (2026-08-13, this branch)
+- [x] **Structural arm on narration detection** (`loop_runner.rs`): a step emitting ZERO structured
+      tool calls whose text contains a balanced call-shaped JSON object (`action`/`tool`/`tool_name`/
+      `function`, or `name`+`params`/`arguments`) or tool-call fence tokens is the narration failure in
+      structural form — caught regardless of the phrase list. A conservative variant
+      (`text_streams_prose_tool_calls`, ≥2 distinct calls) aborts a stream that is provably narrating.
+- [x] **Salvage, not just scold**: the prose call is parsed, routed through `resolve_tool()` — now
+      exact → case-insensitive → **dialect synonym** (`list_files`/`ls`/`dir`→`list_dir`,
+      `cat`/`open`→`read_file`, `run`/`shell`→`exec`; unambiguous entries only, ambiguous names surface
+      instead of being guessed) → fuzzy — and **executed through the normal pipeline** (breakers,
+      ledger, stats, memory, UI chips), with the structured calls synthesized into the assistant turn
+      so history demonstrates the correct dialect. The corrective notice names what ran, what could not
+      be resolved, and the nearest real tools.
+- [x] **Fence self-authored results**: a zero-tool-call step's result-shaped object (`result`/`output`/
+      `stdout`) with no provenance in real tool outputs or user text is stamped
+      `[you wrote this yourself — no tool ran; the real listing is unknown]` BEFORE it enters history —
+      a fabrication can never become the model's world. Insertion-only (lossless); quotation of real
+      outputs is recognized and left alone.
+- [x] **Cross-turn honesty**: consecutive rounds ending byte-identical with zero structured calls
+      append a plain note to the reply — the repetition is never presented as fresh work.
+- [x] **Honest bookkeeping**: breaker replays (repeat-failure / zero-info / discovery-pause) now carry
+      a `short_circuited` outcome through tool stats (tracker, daemon sink, Turso hourly aggregate)
+      instead of `success=0` — hours of replays no longer read as a broken tool.
+
+---
+
 ## Feature backlog (grouped — lower priority, pull as capacity allows)
 
 These are aspirational per-subsystem enhancements distilled from the old planning docs. Grouped to
