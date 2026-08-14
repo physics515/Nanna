@@ -145,6 +145,8 @@ async fn build_env(workdir: &Path) -> EvalEnv {
         // stream into — step output is judged by acceptance checks, not read.
         chat_sink: None,
         gpu_fault_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        // No daemon provider plumbing in the eval — no transitions to report.
+        degradations: None,
     };
     EvalEnv { storage, runner }
 }

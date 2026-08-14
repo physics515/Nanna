@@ -178,9 +178,17 @@ for a Suite 4 task-success number when claiming agent capability.
 ## Updating scores
 
 1. Run the eval on the named tier (release tools, pinned model id, noted
-   `num_ctx` / harness flags).
+   `num_ctx` / harness flags). GUI-path endurance legs run **only** through the
+   committed [`bench/gui-leg/`](./gui-leg/) driver — a leg whose ledger lacks
+   the driver-hash header is not a result.
 2. Record **verified seeded / total seeded**, tokens/item, wall-clock,
-   false-success admitted, model id, tier, commit.
+   false-success admitted, model id, tier, commit — **and, for GUI-path legs,
+   the leg's validity verdict plus its work denominator** (tool calls /
+   side-effecting calls / tokens from the leg summary). Only `VALID` /
+   `VALID_WITH_CAVEATS(...)` legs may contribute a numerator; an
+   `INVALID(reason)` leg is recorded as exactly that, never as 0/42 (the
+   ministral lesson: a plausible number from a dead system reads like a real
+   one and confirms whatever you already believed).
 3. Update the matching table in [`BASELINE.md`](./BASELINE.md) **only** on a
    legitimate measured change; never hand-edit a live row "to match expectations".
 4. If the number is a budget (not just a datapoint), mirror it in

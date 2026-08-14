@@ -315,7 +315,8 @@ impl ToolRegistry {
             .unwrap_or_else(|| name.to_string())
     }
 
-    /// Multi-step tool resolution: exact → case-insensitive → fuzzy.
+    /// Multi-step tool resolution: exact → case-insensitive → dialect synonym
+    /// → fuzzy.
     ///
     /// Returns `(resolved_name, tool)` if found. The resolved name is the
     /// key the tool was registered under (may differ in case from `name`).
@@ -338,6 +339,25 @@ impl ToolRegistry {
                     "Tool resolved"
                 );
                 return Some((key.clone(), tool.clone()));
+            }
+        }
+
+        // Step 2.5: Dialect synonym — the verb/noun another tool universe
+        // taught the model ("ls", "cat", "run", …) mapped to the one tool it
+        // can mean here. Runs BEFORE fuzzy so an unambiguous synonym never
+        // depends on edit distance ("ls" vs "list_dir" scores 0.25 — fuzzy
+        // could never save it). Only fires when nothing registered matched
+        // above, and only resolves when the target actually exists in this
+        // registry, so a synonym can never shadow a real tool or invent one.
+        if let Some(target) = dialect_synonym(&lower) {
+            if let Some(tool) = tools.get(target) {
+                info!(
+                    requested = name,
+                    resolved = target,
+                    step = "synonym",
+                    "Tool resolved via dialect synonym"
+                );
+                return Some((target.to_string(), tool.clone()));
             }
         }
 
@@ -786,6 +806,53 @@ impl Default for ToolRegistry {
     }
 }
 
+/// Dialect synonyms: names other tool universes taught weak models, each
+/// mapped to the ONE canonical nanna tool it can mean (P22 Tier 4 — observed
+/// live 2026-08-12: an lfm leg wrote 300 prose calls to the non-existent
+/// `list_files` over four hours; the model was capable, the dialect was not).
+///
+/// Losslessness rule (owner): only unambiguous entries. A verb that could
+/// mean two registered tools ("delete" — a file? a memory?; "search" — the
+/// web? memory? file contents?) is deliberately ABSENT: an ambiguous name
+/// must surface as unresolved so the caller can say so, never be guessed.
+/// The table is consulted after exact and case-insensitive matching, so a
+/// registered tool or alias by one of these names always wins, and an entry
+/// resolves only when its target is actually registered.
+const DIALECT_SYNONYMS: &[(&str, &str)] = &[
+    // directory listing
+    ("list_files", "list_dir"),
+    ("list_directory", "list_dir"),
+    ("ls", "list_dir"),
+    ("dir", "list_dir"),
+    // file reading
+    ("cat", "read_file"),
+    ("open", "read_file"),
+    ("open_file", "read_file"),
+    // file writing
+    ("create_file", "write_file"),
+    ("save_file", "write_file"),
+    // shell execution
+    ("run", "exec"),
+    ("shell", "exec"),
+    ("sh", "exec"),
+    ("bash", "exec"),
+    ("run_command", "exec"),
+    ("run_shell_command", "exec"),
+    ("execute", "exec"),
+    ("execute_command", "exec"),
+];
+
+/// Look up the canonical target for a dialect synonym (`name` must already be
+/// lowercased). Public so the agent loop's prose-call salvage can explain a
+/// mapping ("`list_files` → `list_dir`") in its corrective notice.
+#[must_use]
+pub fn dialect_synonym(name: &str) -> Option<&'static str> {
+    DIALECT_SYNONYMS
+        .iter()
+        .find(|(from, _)| *from == name)
+        .map(|(_, to)| *to)
+}
+
 /// Classic Levenshtein edit distance (single-row DP).
 fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -1010,6 +1077,98 @@ mod tests {
 
         let result = reg.resolve_tool("completely_unrelated_tool").await;
         assert!(result.is_none());
+    }
+
+    // --- dialect synonyms (P22 Tier 4) ---
+
+    /// A tool registered under the synonym's target name so the synonym has
+    /// something real to land on.
+    struct NamedEchoTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedEchoTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new(self.0, "test tool")
+        }
+
+        async fn execute(
+            &self,
+            _params: HashMap<String, Value>,
+        ) -> Result<ToolResult, crate::ToolError> {
+            Ok(ToolResult::success("named-ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn synonym_resolves_when_target_is_registered() {
+        let reg = ToolRegistry::new();
+        reg.register(NamedEchoTool("list_dir")).await;
+
+        for written in ["list_files", "ls", "dir", "list_directory"] {
+            let (resolved, _) = reg
+                .resolve_tool(written)
+                .await
+                .unwrap_or_else(|| panic!("`{written}` must resolve via synonym"));
+            assert_eq!(resolved, "list_dir", "`{written}` → list_dir");
+        }
+    }
+
+    #[tokio::test]
+    async fn synonym_is_case_insensitive_via_the_lowercase_step() {
+        let reg = ToolRegistry::new();
+        reg.register(NamedEchoTool("exec")).await;
+
+        // resolve_tool lowercases before the synonym step, so shouting works.
+        let (resolved, _) = reg.resolve_tool("RUN").await.expect("RUN must resolve");
+        assert_eq!(resolved, "exec");
+    }
+
+    #[tokio::test]
+    async fn synonym_without_registered_target_does_not_resolve() {
+        // `cat` → `read_file`, but no `read_file` is registered here: a
+        // synonym must never invent a tool.
+        let reg = ToolRegistry::new();
+        reg.register(EchoTool).await;
+
+        assert!(reg.resolve_tool("cat").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_name_shadows_the_synonym_table() {
+        // A REAL tool registered as `run` must win over the `run` → `exec`
+        // synonym: the table only speaks when the registry has no answer.
+        let reg = ToolRegistry::new();
+        reg.register(NamedEchoTool("run")).await;
+        reg.register(NamedEchoTool("exec")).await;
+
+        let (resolved, _) = reg.resolve_tool("run").await.expect("run is registered");
+        assert_eq!(resolved, "run", "exact match must beat the synonym table");
+    }
+
+    #[test]
+    fn ambiguous_verbs_are_deliberately_absent_from_the_synonym_table() {
+        // Losslessness: a name that could mean more than one registered tool
+        // must surface as unresolved, never be guessed.
+        for ambiguous in ["delete", "remove", "search", "find", "list", "get"] {
+            assert!(
+                dialect_synonym(ambiguous).is_none(),
+                "`{ambiguous}` is ambiguous and must not be in the synonym table"
+            );
+        }
+    }
+
+    #[test]
+    fn every_synonym_entry_has_one_target_and_no_chains() {
+        // The table maps each name to exactly one target, and no target is
+        // itself a synonym source (no chains — resolution is single-step).
+        let mut seen = std::collections::HashSet::new();
+        for (from, to) in DIALECT_SYNONYMS {
+            assert!(seen.insert(*from), "duplicate synonym source `{from}`");
+            assert!(
+                dialect_synonym(to).is_none(),
+                "synonym target `{to}` must not itself be a synonym source"
+            );
+        }
     }
 
     #[tokio::test]

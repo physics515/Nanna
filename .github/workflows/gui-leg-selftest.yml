@@ -1,0 +1,48 @@
+# Self-tests for the gui-leg bench instrument (bench/gui-leg/) — scorer oracle,
+# supervisor units, and dry-run legs against a fake IPC daemon. No GPU, no
+# model, no Rust build: these protect the INSTRUMENT, not the score. The two
+# most expensive failures of the 2026-08 GUI-path campaign (a published 0/42
+# from a daemon four hours dead; a hand-written leg summary) were properties of
+# driver control flow, fully reachable in CI. See ROADMAP P22.
+name: gui-leg-selftest
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "bench/gui-leg/**"
+      - ".github/workflows/gui-leg-selftest.yml"
+  pull_request:
+    paths:
+      - "bench/gui-leg/**"
+      - ".github/workflows/gui-leg-selftest.yml"
+
+concurrency:
+  group: gui-leg-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows = platform of record (Git Bash, same as the bench machine);
+        # ubuntu additionally proves the reference minidb + ladder are POSIX-sh
+        # (dash) clean, not just Git-Bash clean.
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    # The dry-run legs are wall-clock bounded (~2 min each) but Windows process
+    # spawn makes the 42-test scoring passes slow; generous headroom.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The IPC helpers use node's global WebSocket client (node >= 21).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: gui-leg self-tests
+        shell: bash
+        run: bash bench/gui-leg/self-test/run-self-tests.sh

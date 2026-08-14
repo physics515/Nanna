@@ -1463,6 +1463,10 @@ pub struct AgentStepRunner {
     /// runners) share one counter, so the two faults that prove a repeat do
     /// not have to land on the same runner object.
     pub gpu_fault_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Capability-transition notices (P22 Tier 4), shared with the daemon's
+    /// provider plumbing. Each pending transition reaches the model once, in
+    /// the next tool result — see [`nanna_agent::DegradationLedger`].
+    pub degradations: Option<Arc<nanna_agent::DegradationLedger>>,
 }
 
 /// Streams a harness step into a chat session using the *existing* chat event
@@ -1586,14 +1590,29 @@ impl ChatSink {
         }
     }
 
-    fn tool_end(&self, call_id: &str, name: &str, output: &str, success: bool, duration_ms: u64) {
+    fn tool_end(
+        &self,
+        call_id: &str,
+        name: &str,
+        output: &str,
+        success: bool,
+        duration_ms: u64,
+        data: Option<&Value>,
+    ) {
+        // P22 Tier 4: a breaker replay carries a machine-readable marker in
+        // its structured data — recorded as its own outcome so a wall of
+        // short-circuits never reads as tool failures in the stats.
+        let short_circuited = data
+            .and_then(|d| d.get("short_circuited"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let _ = self.event_tx.send(Event::ToolEnd {
             session_id: self.session_id.clone(),
             call_id: call_id.to_string(),
             output: output.to_string(),
             success,
             duration_ms,
-            data: None,
+            data: data.cloned(),
         });
         if let Some(run) = &self.run {
             if let Ok(mut active) = run.active_tool_calls.try_write() {
@@ -1628,9 +1647,11 @@ impl ChatSink {
             let observation = nanna_agent::ToolObservation {
                 tool_name: name.to_string(),
                 success,
+                short_circuited,
                 duration_ms,
                 output_size: output.len(),
-                error: (!success).then(|| output.to_string()),
+                // A replay notice is harness steering, not a tool error.
+                error: (!success && !short_circuited).then(|| output.to_string()),
                 session_id: Some(self.session_id.clone()),
             };
             let stats = stats.clone();
@@ -1643,6 +1664,7 @@ impl ChatSink {
                         .log_tool_call(
                             &observation.tool_name,
                             observation.success,
+                            observation.short_circuited,
                             observation.duration_ms,
                             observation.output_size,
                             observation.error.as_deref(),
@@ -2547,8 +2569,8 @@ impl AgentStepRunner {
                               output: &str,
                               success: bool,
                               duration_ms: u64,
-                              _data: Option<&Value>| {
-                            end_sink.tool_end(call_id, name, output, success, duration_ms);
+                              data: Option<&Value>| {
+                            end_sink.tool_end(call_id, name, output, success, duration_ms, data);
                         },
                     )
                         as Box<
@@ -2592,6 +2614,9 @@ impl AgentStepRunner {
             on_tool_end,
             // Tool results land in memory; context keeps only the stub.
             on_memory: self.memory_sink(),
+            // Capability transitions (provider benched, writes queued) reach
+            // the model once, in its next tool result.
+            degradations: self.degradations.clone(),
             ..Default::default()
         };
 
@@ -5503,7 +5528,7 @@ mod tests {
         sink.delta("running ls ");
         sink.thinking("what files exist?");
         sink.tool_start("c1", "exec", &json!({"cmd": "ls"}), None);
-        sink.tool_end("c1", "exec", "file.txt", true, 12);
+        sink.tool_end("c1", "exec", "file.txt", true, 12, None);
         sink.delta("done");
 
         // What get_run_state serves after navigating away and back:
@@ -5615,7 +5640,7 @@ mod tests {
         let mut sink = chat_sink(external_run_handle());
         sink.tool_stats = Some(stats.clone());
 
-        sink.tool_end("c1", "exec", "ok", true, 5);
+        sink.tool_end("c1", "exec", "ok", true, 5, None);
 
         for _ in 0..200 {
             if stats.export_json().await.to_string().contains("exec") {
@@ -5624,6 +5649,37 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("tool call was never recorded to stats");
+    }
+
+    /// P22 Tier 4: a breaker replay (marked `short_circuited` in the tool
+    /// result's structured data) is recorded as its own outcome, never as a
+    /// tool failure — hours of replays must not read as a broken tool.
+    #[tokio::test]
+    async fn short_circuited_replays_are_not_recorded_as_failures() {
+        let stats = nanna_agent::ToolStatsTracker::new();
+        let mut sink = chat_sink(external_run_handle());
+        sink.tool_stats = Some(stats.clone());
+
+        let marker = serde_json::json!({ "short_circuited": true });
+        sink.tool_end(
+            "c1",
+            "list_dir",
+            "[ZERO-INFORMATION BREAKER] This call was NOT executed. …",
+            false,
+            0,
+            Some(&marker),
+        );
+
+        for _ in 0..200 {
+            if let Some(s) = stats.summary("list_dir").await {
+                assert_eq!(s.short_circuit_count, 1);
+                assert_eq!(s.failure_count, 0, "a replay is not a tool failure");
+                assert!(s.top_errors.is_empty(), "the notice is not a tool error");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("short-circuited call was never recorded to stats");
     }
 }
 

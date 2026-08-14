@@ -3027,15 +3027,25 @@ from evidence, budgets stay budgets):
       verdicts (command, result, when — the artifact state the environment last confirmed)
       back from the store at turn start and hands them to the planner beside open work.)**
 
-**Tier 2 — context & compression (`nanna-agent/src/loop_runner.rs`)**
-- [ ] Derive the proactive-compression trigger from **measured headroom** (estimated +
+**Tier 2 — context & compression (`nanna-agent/src/loop_runner.rs`)** — shipped in PR #223 (2026-08-13)
+- [x] Derive the proactive-compression trigger from **measured headroom** (estimated +
       observed max step growth vs threshold), not 40%-of-threshold tuned for 200k windows.
       (Evidence: fired 80× at 4423 tokens on a 16384 window with ~3.7k headroom free.)
-- [ ] Make the consolidated summary **monotone in asserted facts**: verified outcomes
+      *(PR #223: `ContextGrowthTracker` + `proactive_compression_due` — baseline re-taken
+      post-ladder so compression never pollutes the measurement; no growth measured → no
+      evidence → the proactive tier stays quiet; the 4423/16384 case is a unit test.)*
+- [x] Make the consolidated summary **monotone in asserted facts**: verified outcomes
       (command, exit status, when) live in a never-compressed slot; a pass may reword,
       never drop. (Evidence: 2571→934-char summary pass immediately preceded the 16→5 crash.)
-- [ ] When summarization fails, never silently truncate — announce WHAT dropped and that
+      *(PR #223: `AgentContext::verified_outcomes`, fed by completed exec calls — definite
+      exit status required, identical re-verifications collapse to ×N, a changed verdict
+      appends rather than replaces; also found and fixed the 2571→934 mechanism itself:
+      progressive distillation overwrote `consolidated_summary` wholesale, and now writes
+      its own rolling `distilled_facts` slot.)*
+- [x] When summarization fails, never silently truncate — announce WHAT dropped and that
       disk is unaffected.
+      *(PR #223: every unsummarized-drop fallback queues a WHAT/WHY/disk-unaffected
+      notice, drained AFTER the ladder so compression cannot eat its own announcement.)*
 
 **Tier 3 — write-path honesty (`nanna-tools/default-skills/*`)**
 - [ ] A shrinking whole-file write over a file the model has NOT read since its last
@@ -3054,36 +3064,80 @@ from evidence, budgets stay budgets):
       mutations that landed in between (regression attribution, the #218 sweep's voice).
 
 **Tier 4 — contention, liveness, dialect (`nanna-daemon`)**
-- [ ] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
+- [x] **Admission gate on the local model**: heartbeat, dreaming, embedding backfill YIELD
       to an in-flight user turn; priority, not a quota. (Evidence: ministral's opening was
       strangled by the daemon's own heartbeat + 201 embed POSTs in one minute.)
-- [ ] Embedding client gets the IPv4-pin/no-idle-pool/read-timeout treatment; classify
+      *(PR #229: ChatRunRegistry claim/release edges gate everything — a scheduled run
+      select-races the became-active edge and yields mid-generation (abortive cancel,
+      orderly join, resume-on-release); the backfill drains one RTT-repaid request at a
+      time and pauses entirely for live turns; dream summarization pauses at cluster
+      boundaries. Plus the announce-once DegradationLedger: a capability that degrades
+      under the model is stated once in its next tool result, then quiet.)*
+- [x] Embedding client gets the IPv4-pin/no-idle-pool/read-timeout treatment; classify
       deterministic 422 "input too long" as shrink-and-retry, not a 240s bench.
+      *(PR #229: the embed client now SHARES the chat client's 2026-08-02 builder, and
+      `embed_one` heals "input length N exceeds maximum M" by cutting to the fitting
+      prefix — strictly decreasing, no retry cap needed; the router never benches a
+      provider for an input-level fault.)*
 - [ ] **Liveness beat**: a low-frequency in-flight line (session, elapsed, waiting-on) in
       log + IPC; a watchdogged stream so no loop path exits silently; a terminal reason
       file on daemon exit; `chat.send` delivery ack distinct from run completion.
       (Evidence: a dead daemon was polled 14× and scored.)
-- [ ] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
+- [x] **Structural narration-loop arm + salvage**: a zero-tool-call step whose text contains
       a call-shaped JSON object trips the detector; salvage through `resolve_tool()` + the
       alias layer (`list_files`→`list_dir`); fence self-authored "result" objects out of
       history as fabrications. (Evidence: lfm emitted 379 prose pseudo-calls, 300 to a tool
       that doesn't exist, then believed its own fabricated directory listing for 4 hours.)
+      **(2026-08-14, PR #230)** — shipped as: structural arm on every call shape
+      (`action`/`tool`/`tool_name`/`function`, OpenAI envelope, fence tokens) + a
+      conservative ≥2-distinct-calls stream abort; salvage executes through the NORMAL
+      pipeline (breakers/ledger/stats/memory/chips) with the synthesized `tool_use` blocks
+      stored pair-complete so history demonstrates the dialect; `resolve_tool()` gained an
+      unambiguous dialect-synonym step (`ls`/`dir`/`list_files`→`list_dir`, `cat`/`open`→
+      `read_file`, `run`/`shell`/`execute`→`exec`; ambiguous names surface, never guessed);
+      fences are insertion-only with a provenance corpus (real tool outputs + user text —
+      never the model's own turns) so quotation is left alone; plus two adjacent honesty
+      levers: consecutive byte-identical zero-call rounds announce themselves in the reply,
+      and breaker replays record a `short_circuited` stats outcome (tracker, daemon sink,
+      Turso hourly) instead of `success=0`.
 
-**Tier 5 — the bench measures itself (`bench/gui-leg/`, new)**
-- [ ] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
+**Tier 5 — the bench measures itself (`bench/gui-leg/`) ✅ (landed 2026-08-13, PR #225)**
+- [x] Commit the GUI-path driver (leg.sh, ipc/start/resume .mjs, score.sh, ladder-42) to
       the repo; each leg runs from an immutable self-copy with hashes in the ledger header.
-- [ ] Gate every ledger score on a **daemon liveness probe**; 3 consecutive failures →
+      *(2026-08-13 — `nanna-ipc.mjs` had already vanished from disk and was reconstructed
+      from `protocol.rs`; the ladder's 42 tests are tracked as data with a combined hash
+      in every ledger header; daemon stdout/stderr captured per leg into `run/daemon.out|err`.)*
+- [x] Gate every ledger score on a **daemon liveness probe**; 3 consecutive failures →
       INVALID(daemon-unreachable), never a score. Record a work denominator per poll.
-- [ ] Snapshot artifact + score per poll; report **peak, time-of-peak, and final**.
-- [ ] Worker/supervisor split with a staleness-failing heartbeat; resume contract in the
+      *(Probe = `system.status` before every recorded poll; failed probe → poll marked
+      UNREACHABLE with nothing else recorded; the summary additionally REFUSES a score when
+      unreachable polls exceed a cap. Denominator = tool calls / side-effecting calls /
+      tokens / queue via `get_run_state {light}` + anchored log greps for steps and `stop=`
+      reasons — the fallback until Tier 4's session-liveness verb lands. Preflight
+      (exclusive GPU, pinned num_ctx with hard abort on demotion, embedding-store health)
+      asserted at start AND per poll.)*
+- [x] Snapshot artifact + score per poll; report **peak, time-of-peak, and final**
+      *(`run/history/<minutes>/` gets artifact copy + scored verdict + denominator each poll).*
+- [x] Worker/supervisor split with a staleness-failing heartbeat; resume contract in the
       driver: interjection-only, liveness-gated, effectiveness-checked.
+      *(Worker heartbeats + appends machine-readable `status.jsonl` every 60s tick; the
+      separate supervisor fails the leg loudly on stale heartbeat, persistent
+      unreachability, dead worker without a terminal verdict, or lifetime overrun. Each
+      resume records whether the next poll changed; repeated no-effect resumes are
+      suppressed. CI self-tests (`gui-leg-selftest.yml`, ubuntu+windows, no GPU): 42/42
+      reference oracle, 0/42 stub with every ladder test individually failing it,
+      supervisor units, dry-run legs vs a fake IPC daemon proving dead-daemon → INVALID
+      with the score refused. AGENT_EVAL "Updating scores" now requires the validity
+      verdict + work denominator beside every numerator.)*
 - [ ] **Correct the published GUI-path table**: ministral leg INVALID (daemon died at
       t=3m42s; scored a corpse), gemma leg CONTAMINATED (a `task` sub-agent on a cloud
       120B produced its peak), lfm reframed as tool-channel failure. Peak-vs-final becomes
-      the headline metric.
+      the headline metric. *(In flight separately as PR #222.)*
 
 Full evidence: the six-agent retrospective (per-leg log forensics) in the 2026-08-11
 session; per-leg detail in `bench/BASELINE.md` and the campaign ledger/artifacts.
+
+---
 
 ---
 
