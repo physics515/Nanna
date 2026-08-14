@@ -1497,12 +1497,20 @@ pub struct ChatSink {
     /// Shared (not per-clone) state: the finalizer sets it after seeding,
     /// and the step runner's clone must see it.
     pub quiet_item: Arc<std::sync::Mutex<Option<i64>>>,
+    /// Session liveness ledger (P22): every sink event also stamps the
+    /// per-session ledger the liveness beat and `session.liveness` verb read,
+    /// so "working, wedged, or finished" is answerable without log greps.
+    /// `None` on paths that have no beat (task-run manager, tests).
+    pub liveness: Option<Arc<crate::liveness::SessionLiveness>>,
 }
 
 impl ChatSink {
     pub(crate) fn delta(&self, text: &str) {
         if text.is_empty() {
             return;
+        }
+        if let Some(live) = &self.liveness {
+            live.on_stream_delta(text.len());
         }
         let _ = self.event_tx.send(Event::MessageDelta {
             session_id: self.session_id.clone(),
@@ -1534,6 +1542,9 @@ impl ChatSink {
         if text.is_empty() {
             return;
         }
+        if let Some(live) = &self.liveness {
+            live.on_thinking(text.len());
+        }
         let _ = self.event_tx.send(Event::ThinkingDelta {
             session_id: self.session_id.clone(),
             delta: text.to_string(),
@@ -1556,6 +1567,9 @@ impl ChatSink {
     }
 
     fn tool_start(&self, call_id: &str, name: &str, input: &Value, model: Option<&str>) {
+        if let Some(live) = &self.liveness {
+            live.on_tool_start(name);
+        }
         let _ = self.event_tx.send(Event::ToolStart {
             session_id: self.session_id.clone(),
             call_id: call_id.to_string(),
@@ -1606,6 +1620,13 @@ impl ChatSink {
             .and_then(|d| d.get("short_circuited"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if let Some(live) = &self.liveness {
+            // A short-circuited replay did NOT run the tool: it must not
+            // count as side-effect evidence in the liveness ledger, or a
+            // wall of replays would read as "the world changed" to the
+            // repeat-completion escalation.
+            live.on_tool_end(name, success && !short_circuited);
+        }
         let _ = self.event_tx.send(Event::ToolEnd {
             session_id: self.session_id.clone(),
             call_id: call_id.to_string(),
@@ -1686,6 +1707,17 @@ impl ChatSink {
     /// writes `Task #id: title`); if that line is ever absent the header
     /// degrades to the bare item id rather than failing.
     fn step_header(&self, request: &StepRequest) {
+        // The liveness ledger tracks EVERY step, including banner-free quiet
+        // items — a wedge inside a conversation-shaped turn must still be
+        // visible to the beat and the `session.liveness` verb.
+        if let Some(live) = &self.liveness {
+            let kind = match request.step_kind {
+                nanna_agent::harness::StepKind::Plan => "planning",
+                nanna_agent::harness::StepKind::Verify => "verifying",
+                nanna_agent::harness::StepKind::Execute => "working",
+            };
+            live.on_step(request.step_index, kind, &request.item_title);
+        }
         // Conversation-shaped turns (one-task plans) stay banner-free so the
         // transcript feels like chat — see the `quiet_item` field.
         if self
@@ -1748,14 +1780,19 @@ const STEP_RETRY_BACKOFF_SECS: [u64; 3] = [2, 5, 10];
 /// Transient provider faults worth retrying in place: 5xx (including the
 /// synthesized 502 for aborted Ollama generations), client timeouts and
 /// connection failures ("error sending request" is reqwest's send-phase
-/// failure), and mid-stream drops ("Stream error:"). Shared by the step
-/// runner and the chat path — both heal with the same ladder.
+/// failure), mid-stream drops ("Stream error:"), and stream-watchdog trips
+/// (`AgentError::StreamWatchdog` — the stream FUTURE wedged while the
+/// transport thought it healthy; a fresh request builds a fresh future, so
+/// the ladder's retry-plus-runner-reset is exactly the right medicine, and a
+/// persistent wedge still surfaces through the circuit breaker). Shared by
+/// the step runner and the chat path — both heal with the same ladder.
 pub(crate) fn is_transient_llm_error(message: &str) -> bool {
     message.contains("API error: 5")
         || message.contains("timed out")
         || message.contains("connection")
         || message.contains("error sending request")
         || message.contains("Stream error:")
+        || message.contains("stream watchdog:")
 }
 
 /// Forensics: append the exact prompt of an empty-completion step to a temp
@@ -4237,6 +4274,11 @@ mod tests {
             "API error: 502 - Ollama stream ended without completion (no done=true)"
         ));
         assert!(is_transient_llm_error("request timed out"));
+        // P22 stream watchdog: a wedged stream future gets a fresh request
+        // through the same ladder (persistent wedges still hit the breaker).
+        assert!(is_transient_llm_error(
+            "step error: stream watchdog: no stream event from ollama/x for 240s"
+        ));
         // Non-transient failures must fall through to the next model.
         assert!(!is_transient_llm_error("API error: 401 - invalid api key"));
         assert!(!is_transient_llm_error("API error: 400 - context length exceeded"));
@@ -5511,6 +5553,7 @@ mod tests {
             run: Some(run),
             tool_stats: None,
             storage: None,
+            liveness: None,
             quiet_item: Arc::new(std::sync::Mutex::new(None)),
         }
     }

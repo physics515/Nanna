@@ -100,6 +100,35 @@ impl ControlPlane {
                     json!({ "is_running": false })
                 }
             }
+            SessionAction::Liveness { id } => {
+                // "Working, wedged, or finished" from the daemon's own ledger
+                // (P22) — constant-size, safe to poll, no log greps. A session
+                // no turn has ever touched gets an honest idle default rather
+                // than an error: "never ran" IS its liveness. The pending
+                // count rides along so a poller can also see queued
+                // interjections that no live run is consuming — the 50-minute
+                // wedge signature from 2026-08-10.
+                let snapshot = match self.liveness.get(&id) {
+                    Some(live) => serde_json::to_value(live.snapshot())
+                        .unwrap_or(json!({ "running": false })),
+                    None => json!({
+                        "running": false,
+                        "phase": "idle",
+                        "awaiting": "idle — no turn this daemon lifetime",
+                    }),
+                };
+                let pending = self.chat_runs.pending_for(&id).await.len().await;
+                let mut body = snapshot;
+                if let Some(map) = body.as_object_mut() {
+                    map.insert("session_id".to_string(), json!(id));
+                    map.insert("pending_interjections".to_string(), json!(pending));
+                    map.insert(
+                        "beat_interval_secs".to_string(),
+                        json!(crate::liveness::beat_interval_secs()),
+                    );
+                }
+                body
+            }
             SessionAction::SetWorkspace { id, workspace_id } => {
                 if self.sessions.set_workspace(&id, workspace_id.clone()).await {
                     json!({ "ok": true, "session_id": id, "workspace_id": workspace_id })

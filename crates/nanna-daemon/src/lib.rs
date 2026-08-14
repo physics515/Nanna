@@ -20,7 +20,9 @@ pub mod channels;
 pub mod control;
 pub mod dream_summarizer;
 pub mod embedding_router;
+pub mod exit_reason;
 pub mod health;
+pub mod liveness;
 pub mod ipc;
 #[cfg(windows)]
 pub mod job;

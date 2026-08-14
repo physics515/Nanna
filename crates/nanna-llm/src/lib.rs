@@ -452,6 +452,21 @@ pub const NUM_CTX_CEILING: u32 = 32_768;
 /// call sites that have no agent state to measure.
 pub const DEFAULT_MIN_VIABLE_NUM_CTX: u32 = 4_608;
 
+/// The provider clients' declared silence tolerance: how long a stream may go
+/// without delivering a single byte before the transport itself calls it dead
+/// (`reqwest`'s `read_timeout` on both the remote and the Ollama client — see
+/// `build_http_client` / `build_ollama_http_client`). This is deliberately the
+/// ONLY time bound on a stream: there is no total-request deadline, because a
+/// healthy long generation never pauses between chunks for anywhere near this
+/// long, while it routinely exceeds any total cap.
+///
+/// Public so watchers can DERIVE their cadence from the declared bound instead
+/// of inventing a second constant that drifts: the agent loop's stream
+/// watchdog fires at a multiple of this (transport must get first claim on a
+/// truly silent socket), and the daemon's liveness beat at a fraction of it
+/// (several beats must land inside any legal silence window).
+pub const STREAM_READ_TIMEOUT_SECS: u64 = 120;
+
 /// Conservative model info when the provider has not (yet) told us limits.
 ///
 /// Supports tools optimistically — capability misses are softer than overrunning
@@ -1893,7 +1908,7 @@ impl LlmClient {
     /// default to a 10-minute total for the same reason.
     fn build_http_client() -> Client {
         Client::builder()
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new())
@@ -2359,7 +2374,7 @@ fn is_gemma_stop_sentinel(content: &str) -> bool {
 
     fn build_ollama_http_client() -> Client {
         Client::builder()
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(0)
             .build()

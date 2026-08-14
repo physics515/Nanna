@@ -1416,6 +1416,10 @@ pub struct DaemonServer {
     /// store WAS repaired and does persist. Surfaced on status so the state is
     /// observable rather than inferred from a log line at boot.
     storage_error: Option<String>,
+    /// Terminal reason file: a durable record of WHY this process stopped, so
+    /// the next boot can tell a clean shutdown from a hard death whose only
+    /// other evidence is a log that simply ends (2026-08-10 ministral leg).
+    exit_reason: crate::exit_reason::ExitReasonFile,
 }
 
 impl DaemonServer {
@@ -1536,6 +1540,8 @@ impl DaemonServer {
             None
         };
 
+        let exit_reason = crate::exit_reason::ExitReasonFile::new(&config.data_dir);
+
         Self {
             config,
             embedding,
@@ -1551,6 +1557,7 @@ impl DaemonServer {
             storage: None,
             memory_recovery: None,
             storage_error: None,
+            exit_reason,
         }
     }
 
@@ -1574,6 +1581,14 @@ impl DaemonServer {
         self.shutdown_tx.clone()
     }
 
+    /// Handle to the terminal reason file, for exit paths that live outside
+    /// `run()` (the signal / ctrl-c handlers in `main`). Clones share the
+    /// armed flag, so recording stays a no-op until `run()` has claimed the
+    /// file by writing its startup marker.
+    pub fn exit_reason_handle(&self) -> crate::exit_reason::ExitReasonFile {
+        self.exit_reason.clone()
+    }
+
     /// Get the IPC server address
     pub fn ipc_address(&self) -> String {
         self.ipc.address()
@@ -1592,6 +1607,7 @@ impl DaemonServer {
         // undiagnosable from the log alone. Chains to the previous hook so
         // stderr output, where it exists, is preserved.
         let previous_hook = std::panic::take_hook();
+        let panic_exit_reason = self.exit_reason.clone();
         std::panic::set_hook(Box::new(move |info| {
             let payload = info
                 .payload()
@@ -1603,6 +1619,13 @@ impl DaemonServer {
                 .location()
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
                 .unwrap_or_else(|| "<unknown location>".to_string());
+            // File first, log second: with panic=abort (the release profile)
+            // this hook is the last code that runs, and the non-blocking log
+            // writer may never flush — the reason file is the record that
+            // survives. In debug a task panic doesn't kill the process; a
+            // later clean shutdown overwrites this record, so last-writer-
+            // wins keeps the file truthful either way.
+            panic_exit_reason.record_exit("panic", Some(&format!("{payload} at {location}")));
             tracing::error!(%location, "PANIC: {payload}");
             previous_hook(info);
         }));
@@ -1637,6 +1660,26 @@ impl DaemonServer {
                     warn!("Failed to acquire PID file: {}. Continuing anyway.", e);
                 }
             }
+        }
+
+        // Terminal reason file: report how the PREVIOUS daemon died, then
+        // claim the file for this process. Runs after the PID acquire so a
+        // duplicate instance that loses the race can never touch the live
+        // daemon's record. A previous record still saying `running` is the
+        // unclean-exit verdict — the process died through a path no hook
+        // could see, which is exactly the 2026-08-10 log-just-ends death.
+        {
+            let previous = self.exit_reason.read_previous();
+            if previous.is_unclean() {
+                warn!("Previous exit was UNCLEAN: {}", previous.describe());
+            } else {
+                info!("Previous exit: {}", previous.describe());
+            }
+            self.exit_reason.mark_running();
+            info!(
+                "Exit reason file armed at {:?} — every exit path now records why it fired",
+                self.exit_reason.path()
+            );
         }
 
         // Load sessions from Turso database
@@ -2410,6 +2453,7 @@ impl DaemonServer {
         // Spawn IPC server
         let ipc_server = self.ipc.clone();
         let ipc_shutdown = self.shutdown_tx.clone();
+        let ipc_exit_reason = self.exit_reason.clone();
         let ipc_handle = tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
                 // An IPC-less daemon is unreachable (no control plane) but
@@ -2420,6 +2464,12 @@ impl DaemonServer {
                     "IPC server error: {} — shutting down (a daemon without IPC is unreachable)",
                     e
                 );
+                // Record the cause before either exit route. If the clean
+                // drain completes it overwrites this with `clean_shutdown`;
+                // if the hard exit below fires, this record is the terminal
+                // one — and process::exit skips every Drop, so nothing else
+                // would have written it.
+                ipc_exit_reason.record_exit("ipc_server_error", Some(&e.to_string()));
                 if ipc_shutdown.send(()).is_err() {
                     // No shutdown listener yet — exit hard rather than linger.
                     std::process::exit(1);
@@ -2752,6 +2802,11 @@ impl DaemonServer {
         if let Some(ref pid_file) = self.pid_file {
             pid_file.release();
         }
+
+        // The clean-exit record supersedes the startup `running` marker (and
+        // any earlier cause record, e.g. a survived debug-mode panic or the
+        // signal that initiated this drain — the log carries those details).
+        self.exit_reason.record_exit("clean_shutdown", None);
 
         info!("Daemon stopped");
         Ok(())

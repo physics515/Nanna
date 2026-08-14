@@ -22,6 +22,7 @@ async fn channel_status_reports_registered_state() {
     sm.register("telegram", "Telegram", true, true).await;
     sm.set_state("telegram", ConnectionState::Connected, None).await;
     cp.set_status_manager(Arc::clone(&sm));
+    let cp = Arc::new(cp);
 
     // Single-channel query
     let one = cp
@@ -61,7 +62,7 @@ async fn channel_status_reports_registered_state() {
 
 #[tokio::test]
 async fn channel_status_unavailable_without_manager() {
-    let cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
     let resp = cp
         .handle(
             "test",
@@ -116,6 +117,7 @@ async fn config_set_rebuilds_llm_router_providers() {
     let router = Arc::new(crate::llm_router::LlmRouter::new());
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.router = Some(Arc::clone(&router));
+    let cp = Arc::new(cp);
 
     assert!(
         !router.has_provider(crate::llm_router::ProviderId::OpenRouter),
@@ -160,7 +162,7 @@ async fn config_set_rebuilds_llm_router_providers() {
 /// missing store rather than reaching the dreaming gate.
 #[tokio::test]
 async fn consolidate_without_memory_reports_unavailable() {
-    let cp = ControlPlane::new(Arc::new(SessionManager::new()));
+    let cp = Arc::new(ControlPlane::new(Arc::new(SessionManager::new())));
     let resp = cp
         .handle("test", Action::Memory(MemoryAction::Consolidate))
         .await;
@@ -177,6 +179,7 @@ async fn consolidate_without_dreaming_falls_back_and_stops_at_the_llm() {
     cp.memory = Some(Arc::new(nanna_memory::MemoryService::new(
         nanna_memory::MemoryServiceConfig::default(),
     )));
+    let cp = Arc::new(cp);
     // No router either — the fallback must carry consolidation past the
     // (absent) orchestrator to the LLM precondition, never report a fault.
     let resp = cp
@@ -205,6 +208,7 @@ async fn consolidate_with_dreaming_passes_the_gate_and_stops_at_the_llm() {
     let mut cp = ControlPlane::new(Arc::new(SessionManager::new()));
     cp.memory = Some(memory);
     cp.set_dreaming(dreaming);
+    let cp = Arc::new(cp);
 
     let resp = cp
         .handle("test", Action::Memory(MemoryAction::Consolidate))
