@@ -2995,12 +2995,20 @@ from evidence, budgets stay budgets):
       first-class finding ("./minidb mset blocks and never exits"), carried across steps.
       (Evidence: qwen spent 120 of 240 minutes in 600s check timeouts, abandoned while
       its artifact was passing.)
-      **(2026-08-13: `AcceptanceVerdict.timed_out` — no fruitless charge, no failure
-      signature, no refuted-claim count, no sweep reopen/revive on a hang; the finding is
-      rendered into the next prompt AND a durable note. Convergence stays: after
-      `CHECK_TIMEOUTS_REPLAN_AFTER` (ladder-derived 3) consecutive hangs the item routes to
-      the replan rung — "decompose so the hang is fixed first" — and abandonment names the
-      hang instead of fabricating fruitlessness.)**
+      **(2026-08-13, corrected 2026-08-14: `AcceptanceVerdict.timed_out` — the timeout
+      itself charges nothing: no failure signature, no refuted-claim count, no sweep
+      reopen/revive on a hang, and unknowns are never counted into any escalation (an
+      earlier draft routed N consecutive timeouts to the replan rung — that just fabricates
+      a failure from things that said nothing, and was removed). While the check is silent
+      the step beside it is judged purely by its OWN evidence, exactly like a step with no
+      check at all: novel successful work replenishes, a degenerate loop rides the steering
+      ladder, an empty-handed step charges as an empty-handed step — so convergence is the
+      normal ladder and the hang is named in the finding, the replan prompt, and the
+      abandonment reason. The wall-clock bleed is closed separately: once a check has
+      consumed its ENTIRE ceiling without answering, re-runs are capped at the run's
+      measured work cost — max(longest step, longest decided check), both measured, floored
+      at 1s (`run_with_timeout_cap`) — and the first decided verdict lifts the cap. The
+      finding still rides the next prompt AND a durable note.)**
 - [x] Never charge a **zero-tool-call narration/spiral abort** against the fruitless budget —
       route those to the existing nudge escalation and count them separately.
       **(2026-08-13: `AgentResponse.degenerate_loop` (detector fired + zero tool calls)

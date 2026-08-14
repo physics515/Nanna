@@ -87,14 +87,20 @@ pub struct AcceptanceVerdict {
     ///
     /// `passed` stays `false` — a hung check can never CLOSE an item — but a
     /// timeout is **unknown, not failed**: the command said nothing about the
-    /// work, so nothing downstream may treat it as evidence the work is bad.
-    /// Concretely: it never charges the fruitless budget, never mints a
-    /// failure signature, never reopens a verified item, and never counts as
-    /// a refuted completion claim. What it IS evidence of is a hang — the
-    /// artifact (or the check) blocks forever — and that finding is carried
-    /// forward first-class. (Observed 2026-08-10: one leg spent 120 of 240
-    /// minutes inside 600s check timeouts and was abandoned as "fruitless"
-    /// ten minutes after proving 20 of its checks passing.)
+    /// work, so nothing downstream may treat the timeout as evidence the
+    /// work is bad. Concretely: it mints no failure signature, never reopens
+    /// a verified item, never counts as a refuted completion claim, and is
+    /// never itself charged or counted into any verdict — accumulating
+    /// unknowns into an escalation would just fabricate a failure from
+    /// things that said nothing. While the check is silent, the step beside
+    /// it is judged purely by its OWN evidence, exactly like a step with no
+    /// check at all. What a timeout IS evidence of is a hang — the artifact
+    /// (or the check) blocks forever — so the finding is carried forward
+    /// first-class and the check's next run is cost-capped at this run's
+    /// measured work cost (see `run_with_timeout_cap`). (Observed
+    /// 2026-08-10: one leg spent 120 of 240 minutes inside 600s check
+    /// timeouts and was abandoned as "fruitless" ten minutes after proving
+    /// 20 of its checks passing.)
     #[serde(default)]
     pub timed_out: bool,
 }
@@ -267,11 +273,44 @@ impl AcceptanceCheck {
     /// Run the check against real environment state. This is deliberately the
     /// only place a "task is done" signal can originate when a check exists.
     pub async fn run(&self, workdir: &Path) -> AcceptanceVerdict {
+        self.run_with_timeout_cap(workdir, None).await
+    }
+
+    /// [`Self::run`] with the harness's hang re-stake cap.
+    ///
+    /// `cap` is the largest cost the CALLER has measured for real work or a
+    /// real answer this run; when set, the command timeout is
+    /// `min(configured, max(cap, 1s))`. The harness passes it only for
+    /// re-runs of a check whose previous run TIMED OUT: the loop's own docs
+    /// say a check must be cheaper than the step it verifies
+    /// ([`ACCEPTANCE_TIMEOUT_SECS_DEFAULT`]), and once a check has consumed
+    /// its entire ceiling without answering, staking another full ceiling on
+    /// the same unanswered question is how one leg burned 120 of 240 minutes
+    /// in 600s timeouts. Both cap terms are measured, never configured; the
+    /// first decided verdict lifts the cap. A capped timeout still yields
+    /// UNKNOWN — never failure — and the verdict says the cap was applied.
+    pub async fn run_with_timeout_cap(
+        &self,
+        workdir: &Path,
+        cap: Option<Duration>,
+    ) -> AcceptanceVerdict {
+        let capped_timeout = |configured: Duration| -> (Duration, bool) {
+            match cap {
+                Some(cap) => {
+                    let floored = cap.max(Duration::from_secs(1));
+                    (configured.min(floored), floored < configured)
+                }
+                None => (configured, false),
+            }
+        };
         match self {
             Self::Command {
                 command,
                 timeout_secs,
-            } => run_command_check(command, workdir, Self::effective_timeout(*timeout_secs)).await,
+            } => {
+                let (timeout, capped) = capped_timeout(Self::effective_timeout(*timeout_secs));
+                run_command_check(command, workdir, timeout, capped).await
+            }
             Self::FileExists { path } => {
                 let resolved = resolve_in_workdir(workdir, path);
                 if resolved.exists() {
@@ -304,14 +343,14 @@ impl AcceptanceCheck {
                         }
                     }
                 } else if let Some(command) = command {
-                    let output =
-                        run_shell(command, workdir, Self::effective_timeout(*timeout_secs)).await;
+                    let (timeout, capped) =
+                        capped_timeout(Self::effective_timeout(*timeout_secs));
+                    let output = run_shell(command, workdir, timeout).await;
                     match output {
                         Ok((_, combined)) => combined,
                         Err(ShellRunError::Timeout { secs }) => {
-                            return AcceptanceVerdict::timeout(format!(
-                                "`{command}` ran {secs}s without finishing and was killed — \
-                                 no verdict"
+                            return AcceptanceVerdict::timeout(timeout_detail(
+                                command, secs, capped,
                             ));
                         }
                         Err(ShellRunError::Other(e)) => {
@@ -356,7 +395,28 @@ fn read_bounded(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-async fn run_command_check(command: &str, workdir: &Path, timeout: Duration) -> AcceptanceVerdict {
+/// The timeout verdict's detail line. When the run was `capped`, the cut
+/// announces itself (a shortened leash must never read as the command's
+/// configured allowance).
+fn timeout_detail(command: &str, secs: u64, capped: bool) -> String {
+    let mut detail = format!(
+        "`{command}` ran {secs}s without finishing and was killed — no verdict"
+    );
+    if capped {
+        detail.push_str(
+            " (re-run capped at this run's measured work cost — the full ceiling was \
+             already spent once on this check without an answer)",
+        );
+    }
+    detail
+}
+
+async fn run_command_check(
+    command: &str,
+    workdir: &Path,
+    timeout: Duration,
+    capped: bool,
+) -> AcceptanceVerdict {
     match run_shell(command, workdir, timeout).await {
         Ok((code, combined)) => {
             let passed = code == Some(0);
@@ -379,9 +439,9 @@ async fn run_command_check(command: &str, workdir: &Path, timeout: Duration) -> 
                 AcceptanceVerdict::fail(detail)
             }
         }
-        Err(ShellRunError::Timeout { secs }) => AcceptanceVerdict::timeout(format!(
-            "`{command}` ran {secs}s without finishing and was killed — no verdict"
-        )),
+        Err(ShellRunError::Timeout { secs }) => {
+            AcceptanceVerdict::timeout(timeout_detail(command, secs, capped))
+        }
         Err(ShellRunError::Other(e)) => {
             AcceptanceVerdict::fail(format!("`{command}` failed to run: {e}"))
         }
@@ -1118,21 +1178,6 @@ pub fn steps_repeat(previous: &[StepToolCall], current: &[StepToolCall]) -> bool
 /// trips the run-level breaker, whose counter spans items.
 pub const ITEM_RUNNER_ERRORS_MAX: usize = 2;
 
-/// Consecutive TIMED-OUT acceptance runs on one item before the harness
-/// stops re-running the question and routes the item to its replan rung.
-///
-/// Derivation — the codebase's steering ladder, not a magic cap: the first
-/// timeout surfaces the hang finding to the model, the second proves the
-/// finding was surfaced and not acted on, and the third is the one full
-/// post-notice attempt every other rung grants (the same 2 + 1 shape as the
-/// sibling breakers and the loop nudge). None of the three charge the
-/// fruitless budget — a timeout is unknown, not failure — but three
-/// consecutive unknowns mean grinding steps against a question the
-/// environment will not answer, and the replan rung (decompose: "fix the
-/// hang first") is the existing mechanism for exactly that. Convergence
-/// stays with `max_replans_per_item`.
-pub const CHECK_TIMEOUTS_REPLAN_AFTER: usize = 3;
-
 /// Consecutive zero-tool-call degenerate-loop steps on one item that ride
 /// the harness's steering ladder before they start charging the fruitless
 /// budget.
@@ -1155,14 +1200,12 @@ struct ItemProgress {
     last_tool_calls: Vec<StepToolCall>,
     runner_errors: usize,
     /// Consecutive acceptance runs that timed out (reset by any DECIDED
-    /// verdict, pass or fail). At [`CHECK_TIMEOUTS_REPLAN_AFTER`] the item
-    /// replans instead of grinding against a question the environment will
-    /// not answer. Never charges `steps_without_progress`.
+    /// verdict, pass or fail). Reporting and framing only — it sizes the
+    /// hang finding, flavors the replan prompt and the abandonment reason.
+    /// It is never a trigger: unknowns are not counted into any verdict;
+    /// while the check is silent the step beside it is judged purely by its
+    /// own evidence, exactly like a step with no check at all.
     consecutive_check_timeouts: usize,
-    /// Routed to the replan rung out-of-band (hang escalation) — consumed by
-    /// the next selection exactly like a fruitless-budget exhaustion, without
-    /// pretending the budget was spent.
-    replan_due: bool,
     /// Zero-tool-call degenerate-loop steps this item has absorbed (the
     /// harness-level steering ladder, see [`NARRATION_LADDER_STEPS`]).
     narration_steps: usize,
@@ -1280,6 +1323,18 @@ impl LongHorizonRunner {
         // The knowledge half of the report (see `LongHorizonReport`).
         let mut verified_outcomes: Vec<VerifiedOutcome> = Vec::new();
         let mut acceptance_unknown = 0usize;
+        // Checks whose MOST RECENT run timed out, by identity. A member's
+        // next run gets the hang re-stake cap (see `run_with_timeout_cap`):
+        // the full ceiling was already spent once without an answer, so
+        // further runs may stake at most what this run has MEASURED real
+        // work (its longest step) or a real answer (its longest decided
+        // check) to cost — both measured terms, no constant, and the first
+        // decided verdict removes the member and lifts the cap. This is what
+        // keeps a hanging check from eating the run 600s at a time (the
+        // qwen leg lost 120 of 240 minutes exactly that way).
+        let mut hung_checks: HashSet<u64> = HashSet::new();
+        let mut longest_step = Duration::ZERO;
+        let mut longest_decided_check = Duration::ZERO;
         let mut replans = 0usize;
         let mut false_success_claims = 0usize;
         let mut input_tokens = 0u64;
@@ -1346,11 +1401,16 @@ impl LongHorizonRunner {
                         if reopened_once.contains(&id) {
                             continue;
                         }
-                        let verdict = check.run(workdir).await;
+                        let run_started = Instant::now();
+                        let hang_cap = hung_checks
+                            .contains(&check_identity(&check))
+                            .then(|| longest_step.max(longest_decided_check));
+                        let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
                         if verdict.timed_out {
                             // Unknown: not proof the goal is unmet, but it
                             // still blocks "done" — carry the HANG as the
                             // finding rather than a false failure verdict.
+                            hung_checks.insert(check_identity(&check));
                             acceptance_unknown += 1;
                             let detail = format!(
                                 "check produced no verdict — {}",
@@ -1359,6 +1419,9 @@ impl LongHorizonRunner {
                             abandoned_unmet.push(AbandonedUnmet { id, title, detail });
                             continue;
                         }
+                        hung_checks.remove(&check_identity(&check));
+                        longest_decided_check =
+                            longest_decided_check.max(run_started.elapsed());
                         note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                         if !verdict.passed {
                             // Evidence for the mission loop: this walked-away
@@ -1396,14 +1459,22 @@ impl LongHorizonRunner {
                         if reopened_once.contains(&id) {
                             continue;
                         }
-                        let verdict = check.run(workdir).await;
+                        let run_started = Instant::now();
+                        let hang_cap = hung_checks
+                            .contains(&check_identity(&check))
+                            .then(|| longest_step.max(longest_decided_check));
+                        let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
                         if verdict.timed_out {
                             // Unknown: a hung re-check is not evidence the
                             // verified work regressed — reopening on it would
                             // charge the model for a wedged command.
+                            hung_checks.insert(check_identity(&check));
                             acceptance_unknown += 1;
                             continue;
                         }
+                        hung_checks.remove(&check_identity(&check));
+                        longest_decided_check =
+                            longest_decided_check.max(run_started.elapsed());
                         note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                         if !verdict.passed
                             && source
@@ -1446,12 +1517,7 @@ impl LongHorizonRunner {
                 let precheck_due = !item.acceptance_prechecked;
                 item.acceptance_prechecked = true;
                 (
-                    // `replan_due` is the hang escalation's out-of-band route
-                    // to this same rung: consecutive check timeouts never
-                    // charge the fruitless budget, but they must still reach
-                    // the decompose-or-abandon ladder or a permanently
-                    // hanging check would grind until wall clock.
-                    item.steps_without_progress >= cfg.max_steps_per_item || item.replan_due,
+                    item.steps_without_progress >= cfg.max_steps_per_item,
                     item.steps_without_progress,
                     item.replans,
                     precheck_due,
@@ -1512,10 +1578,14 @@ impl LongHorizonRunner {
             };
             if let Some(check) = precheck {
                 let check_started = Instant::now();
-                let verdict = check.run(workdir).await;
+                let hang_cap = hung_checks
+                    .contains(&check_identity(check))
+                    .then(|| longest_step.max(longest_decided_check));
+                let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
                 check_cost_paid += check_started.elapsed();
                 check_runs += 1;
                 if verdict.timed_out {
+                    hung_checks.insert(check_identity(check));
                     // Unknown, not failure: the item runs its step normally,
                     // but it starts KNOWING the check hangs — the finding is
                     // the most useful thing the step could possibly hear.
@@ -1544,21 +1614,25 @@ impl LongHorizonRunner {
                             }),
                         )
                         .await;
-                } else if note_check_outcome(&mut check_outcomes, check, verdict.passed) {
-                    // Re-proposed work whose condition NOW passes after
-                    // failing earlier this run: the environment moved.
-                    // Every open item's fruitless budget replenishes below
-                    // (the completion path also runs — flip and completion
-                    // are the same event seen at two granularities).
-                    for open_item in progress.values_mut() {
-                        open_item.steps_without_progress = 0;
+                } else {
+                    hung_checks.remove(&check_identity(check));
+                    longest_decided_check = longest_decided_check.max(check_started.elapsed());
+                    if note_check_outcome(&mut check_outcomes, check, verdict.passed) {
+                        // Re-proposed work whose condition NOW passes after
+                        // failing earlier this run: the environment moved.
+                        // Every open item's fruitless budget replenishes below
+                        // (the completion path also runs — flip and completion
+                        // are the same event seen at two granularities).
+                        for open_item in progress.values_mut() {
+                            open_item.steps_without_progress = 0;
+                        }
+                        tracing::info!(
+                            item = step.id,
+                            check = %check.describe(),
+                            "check flipped fail→pass — verified environment change; \
+                             replenishing every open item's fruitless budget"
+                        );
                     }
-                    tracing::info!(
-                        item = step.id,
-                        check = %check.describe(),
-                        "check flipped fail→pass — verified environment change; \
-                         replenishing every open item's fruitless budget"
-                    );
                 }
                 if verdict.passed {
                     let detail = serde_json::json!({
@@ -1624,10 +1698,12 @@ impl LongHorizonRunner {
             let item = progress.entry(step.id).or_default();
 
             let (prompt, step_kind) = if is_replan {
-                let stall_summary = if item.consecutive_check_timeouts >= CHECK_TIMEOUTS_REPLAN_AFTER
-                {
+                // A replan reached with the check currently hanging must aim
+                // the decomposition at the hang first — it is the standing
+                // reason no verdict can arrive.
+                let stall_summary = if item.consecutive_check_timeouts > 0 {
                     format!(
-                        "the done-condition check has HUNG {} consecutive times (killed at \
+                        "the done-condition check has HUNG {} consecutive time(s) (killed at \
                          its timeout, no verdict). The artifact blocks forever on something \
                          this check runs — decompose so fixing the hang comes first",
                         item.consecutive_check_timeouts
@@ -1696,9 +1772,13 @@ impl LongHorizonRunner {
                 cancel: cancel.clone(),
             };
 
+            let step_started = Instant::now();
             let outcome = match runner.run_step(request).await {
                 Ok(outcome) => {
                     consecutive_errors = 0;
+                    // One term of the hang re-stake cap: the largest cost
+                    // this run has measured for real work.
+                    longest_step = longest_step.max(step_started.elapsed());
                     outcome
                 }
                 Err(message) => {
@@ -1761,10 +1841,6 @@ impl LongHorizonRunner {
                     _ => true,
                 };
                 item.replans += 1;
-                // The hang escalation's ticket is consumed by this replan; a
-                // still-hanging check re-earns it one timeout at a time and
-                // `max_replans_per_item` keeps convergence.
-                item.replan_due = false;
                 if produced_work {
                     item.steps_without_progress = 0;
                     item.last_result = None;
@@ -1823,9 +1899,17 @@ impl LongHorizonRunner {
             match &step.acceptance {
                 Some(check) => {
                     let check_started = Instant::now();
-                    let verdict = check.run(workdir).await;
+                    let hang_cap = hung_checks
+                        .contains(&check_identity(check))
+                        .then(|| longest_step.max(longest_decided_check));
+                    let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
                     check_cost_paid += check_started.elapsed();
                     check_runs += 1;
+                    if !verdict.timed_out {
+                        hung_checks.remove(&check_identity(check));
+                        longest_decided_check =
+                            longest_decided_check.max(check_started.elapsed());
+                    }
                     let _ = source
                         .log(
                             step.id,
@@ -1839,32 +1923,65 @@ impl LongHorizonRunner {
                         .await;
                     if verdict.timed_out {
                         // UNKNOWN, not failed. The check said nothing about
-                        // the work, so nothing here may read as failure: no
-                        // fruitless charge, no failure signature, no refuted
-                        // claim. What the run DID learn is that something
-                        // hangs — surface that as a first-class finding, and
-                        // let the step's own successful novel evidence stand
-                        // in for the verdict the environment refused to give
-                        // (the P22 leg this rule comes from proved tests
-                        // 01–20 passing inside the very step whose check then
-                        // hung, and was abandoned "fruitless" while passing).
+                        // the work, so nothing about the TIMEOUT may read as
+                        // failure: no failure signature, no refuted claim,
+                        // and never a charge for the hang itself. What the
+                        // run DID learn is that something hangs — surfaced as
+                        // a first-class carried finding — and the next run of
+                        // this check is cost-capped (`hung_checks`).
+                        //
+                        // The STEP beside the silent check is still a step,
+                        // and it is judged exactly like a step with no check
+                        // at all (the `None` arm below is the precedent):
+                        // novel successful evidence replenishes, a degenerate
+                        // loop rides the steering ladder, and an empty-handed
+                        // step charges as an empty-handed step. That is what
+                        // keeps the item converging on the NORMAL ladder
+                        // without ever counting unknowns into a verdict —
+                        // counting them (an earlier draft routed N
+                        // consecutive timeouts to the replan rung) is just
+                        // fabricating a failure from things that said
+                        // nothing. (P22 evidence both ways: qwen proved
+                        // tests 01–20 passing inside the very step whose
+                        // check then hung — novel evidence, replenishes; and
+                        // it burned 120 of 240 minutes re-staking 600s on
+                        // the same silent check — the cap's job.)
+                        hung_checks.insert(check_identity(check));
                         acceptance_unknown += 1;
                         item.consecutive_check_timeouts += 1;
-                        if novel_success_evidence(item, &outcome.tool_calls) {
+                        let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
+                        let degenerate =
+                            outcome.degenerate_loop && outcome.tool_calls.is_empty();
+                        let steered = degenerate
+                            && item.narration_steps < NARRATION_LADDER_STEPS;
+                        if fresh_success {
                             item.steps_without_progress = 0;
+                        } else if steered {
+                            item.narration_steps += 1;
+                        } else {
+                            item.steps_without_progress += 1;
+                            if repeated {
+                                item.steps_without_progress += 1;
+                            }
                         }
-                        let finding = hanging_check_finding(
+                        let mut finding = hanging_check_finding(
                             check,
                             &verdict,
                             item.consecutive_check_timeouts,
                         );
+                        if degenerate {
+                            finding.push_str("\n\n");
+                            finding
+                                .push_str(&narration_steering_text(item.narration_steps.max(1)));
+                        }
                         tracing::warn!(
                             item = step.id,
                             title = %step.title,
                             consecutive = item.consecutive_check_timeouts,
+                            step_charged = !fresh_success && !steered,
                             detail = %text_head(&verdict.detail, 240),
-                            "acceptance check timed out — unknown verdict, not charged; \
-                             carrying the hang finding forward"
+                            "acceptance check timed out — unknown verdict; carrying the \
+                             hang finding forward and judging the step on its own evidence"
                         );
                         let _ = source.add_note(step.id, &finding).await;
                         let _ = source
@@ -1878,13 +1995,6 @@ impl LongHorizonRunner {
                             )
                             .await;
                         item.last_result = Some(finding);
-                        if item.consecutive_check_timeouts >= CHECK_TIMEOUTS_REPLAN_AFTER {
-                            // Route to the replan rung, never the fruitless
-                            // budget: the item must converge even when its
-                            // question is unanswerable, and "decompose so the
-                            // hang is fixed first" is the productive framing.
-                            item.replan_due = true;
-                        }
                     } else if verdict.passed {
                         item.consecutive_check_timeouts = 0;
                         if note_check_outcome(&mut check_outcomes, check, true) {
@@ -2162,12 +2272,18 @@ impl LongHorizonRunner {
                         break;
                     }
                     let sweep_started = Instant::now();
-                    let verdict = check.run(workdir).await;
+                    let hang_cap = hung_checks
+                        .contains(&check_identity(&check))
+                        .then(|| longest_step.max(longest_decided_check));
+                    let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
                     sweep_cost_paid += sweep_started.elapsed();
                     if verdict.timed_out {
+                        hung_checks.insert(check_identity(&check));
                         acceptance_unknown += 1;
                         continue;
                     }
+                    hung_checks.remove(&check_identity(&check));
+                    longest_decided_check = longest_decided_check.max(sweep_started.elapsed());
                     let flipped = note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                     if flipped {
                         // Verified environment change — replenish regardless
@@ -2223,14 +2339,20 @@ impl LongHorizonRunner {
                         break;
                     }
                     let sweep_started = Instant::now();
-                    let verdict = check.run(workdir).await;
+                    let hang_cap = hung_checks
+                        .contains(&check_identity(&check))
+                        .then(|| longest_step.max(longest_decided_check));
+                    let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
                     sweep_cost_paid += sweep_started.elapsed();
                     if verdict.timed_out {
                         // Unknown — a hung re-check must not reopen verified
                         // work as "regressed".
+                        hung_checks.insert(check_identity(&check));
                         acceptance_unknown += 1;
                         continue;
                     }
+                    hung_checks.remove(&check_identity(&check));
+                    longest_decided_check = longest_decided_check.max(sweep_started.elapsed());
                     note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                     if verdict.passed {
                         continue;
@@ -2672,6 +2794,7 @@ mod tests {
         completions: Mutex<Vec<(i64, serde_json::Value)>>,
         notes: Mutex<Vec<(i64, String)>>,
         log_entries: Mutex<Vec<(i64, String)>>,
+        abandon_reasons: Mutex<Vec<(i64, String)>>,
         fail_next: Mutex<bool>,
         /// Open-children ledger. `None` (the default) means "this source
         /// cannot report", which is the pre-existing path every other test
@@ -2727,11 +2850,15 @@ mod tests {
             self.log_entries.lock().await.push((id, action.to_string()));
             Ok(())
         }
-        async fn abandon(&self, id: i64, _reason: &str) -> Result<(), String> {
+        async fn abandon(&self, id: i64, reason: &str) -> Result<(), String> {
             let mut items = self.items.lock().await;
             if let Some(item) = items.iter_mut().find(|i| i.step.id == id) {
                 item.abandoned = true;
             }
+            self.abandon_reasons
+                .lock()
+                .await
+                .push((id, reason.to_string()));
             Ok(())
         }
         async fn reopen(&self, id: i64, _reason: &str) -> Result<(), String> {
@@ -4976,13 +5103,14 @@ TASK COMPLETE"))]);
     // P22 Tier 1: step & budget semantics
     // -----------------------------------------------------------------
 
-    /// A timed-out acceptance check is UNKNOWN, not failed: it never charges
-    /// the fruitless budget (the item outlives its 2-step allowance), the
-    /// hang is surfaced as a carried-forward finding in notes AND the next
-    /// step's prompt, and after [`CHECK_TIMEOUTS_REPLAN_AFTER`] consecutive
-    /// hangs the item routes to the replan rung — here straight to
-    /// abandonment (max_replans 0) with the hang named in the drain sweep's
-    /// unmet detail rather than a false failure verdict.
+    /// A timed-out acceptance check is UNKNOWN, not failed — and unknowns
+    /// are never counted into a verdict. The TIMEOUT itself charges nothing
+    /// (no failure signature, no refuted claim); the step beside the silent
+    /// check is judged purely by its own evidence, like a step with no check
+    /// at all — here the steps are empty-handed, so they charge as
+    /// empty-handed steps and the item converges on the NORMAL ladder, with
+    /// the hang carried as a finding in notes, the next prompt, the
+    /// abandonment reason, and the drain sweep's unmet detail.
     #[tokio::test]
     async fn timed_out_acceptance_is_unknown_not_failed() {
         let dir = tempfile::tempdir().unwrap();
@@ -5002,9 +5130,8 @@ TASK COMPLETE"))]);
             ))
             .await;
         let runner = ScriptedRunner::new(vec![
-            Ok(outcome("worked")),
-            Ok(outcome("worked more")),
-            Ok(outcome("worked again")),
+            Ok(outcome("looked around")),
+            Ok(outcome("looked around more")),
         ]);
         let config = LongHorizonConfig {
             max_steps_per_item: 2,
@@ -5015,13 +5142,13 @@ TASK COMPLETE"))]);
             .run("goal", &source, &runner, dir.path(), None)
             .await;
 
-        // Three steps ran — MORE than the 2-step fruitless allowance, which
-        // proves no timeout was charged; the item still converged through
-        // the replan rung (replan_due) into abandonment.
-        assert_eq!(report.steps_taken, 3, "{report:?}");
+        // Two empty-handed steps spend the 2-step allowance exactly as they
+        // would under any silent verdict — the timeouts added nothing on
+        // top, and no unknown-counter shortened the road either.
+        assert_eq!(report.steps_taken, 2, "{report:?}");
         assert_eq!(report.items_abandoned, 1);
-        // 3 post-step timeouts + 1 at the drain sweep.
-        assert_eq!(report.acceptance_unknown, 4);
+        // 2 post-step timeouts + 1 at the drain sweep.
+        assert_eq!(report.acceptance_unknown, 3);
         // The hang is a first-class finding: durable note…
         let notes = source.notes.lock().await;
         assert!(
@@ -5029,7 +5156,7 @@ TASK COMPLETE"))]);
             "hang finding must be recorded as a note"
         );
         drop(notes);
-        // …and in the NEXT step's prompt (carried via last_result).
+        // …in the NEXT step's prompt (carried via last_result)…
         let requests = runner.requests.lock().await;
         assert!(
             requests[1].prompt.contains("ACCEPTANCE CHECK HUNG"),
@@ -5037,6 +5164,14 @@ TASK COMPLETE"))]);
             requests[1].prompt
         );
         drop(requests);
+        // …and in the abandonment reason — named, not laundered into
+        // generic fruitlessness.
+        let reasons = source.abandon_reasons.lock().await;
+        assert!(
+            reasons.iter().any(|(_, r)| r.contains("hung")),
+            "abandonment must name the hang: {reasons:?}"
+        );
+        drop(reasons);
         // The drain sweep reports UNKNOWN, not a fabricated failure.
         assert_eq!(report.abandoned_unmet.len(), 1);
         assert!(
@@ -5046,6 +5181,115 @@ TASK COMPLETE"))]);
         );
         let log = source.log_entries.lock().await;
         assert!(log.iter().any(|(_, a)| a == "acceptance_timeout"));
+    }
+
+    /// The other half of "judged by its own evidence": while the check
+    /// hangs, steps that keep producing NOVEL successful side-effect
+    /// evidence never charge at all — the item outlives its fruitless
+    /// allowance for as long as the work is really moving, which is exactly
+    /// the qwen shape (proved tests passing inside the very step whose
+    /// check hung, then abandoned "fruitless" while passing).
+    #[tokio::test]
+    async fn a_hanging_check_never_outweighs_novel_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        #[cfg(windows)]
+        let hang = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        let hang = "sleep 30";
+        source
+            .push(step(
+                1,
+                "passing but unverifiable",
+                Some(AcceptanceCheck::Command {
+                    command: hang.to_string(),
+                    timeout_secs: Some(1),
+                }),
+            ))
+            .await;
+        let working = |i: usize| {
+            let mut out = outcome("ran another test");
+            out.tool_calls = vec![StepToolCall {
+                name: "exec".to_string(),
+                input_digest: format!("test-{i}"),
+                output_digest: format!("exit 0 #{i}"),
+                success: true,
+            }];
+            Ok(out)
+        };
+        let runner = ScriptedRunner::new((0..3).map(working).collect());
+        let config = LongHorizonConfig {
+            max_steps_per_item: 2,
+            max_replans_per_item: 0,
+            ..LongHorizonConfig::default()
+        };
+        let report = LongHorizonRunner::new(config)
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        // All 3 scripted steps ran (> the 2-step allowance): novel evidence
+        // kept replenishing under the silent check; the item only died when
+        // the script ran dry (runner-error containment), not as fruitless.
+        assert_eq!(report.steps_taken, 3, "{report:?}");
+        // 3 post-step timeouts; a runner-error abandonment carries no check
+        // to the drain sweep, so nothing re-runs there.
+        assert_eq!(report.acceptance_unknown, 3);
+        assert_eq!(report.items_abandoned, 1);
+        let reasons = source.abandon_reasons.lock().await;
+        assert!(
+            reasons.iter().all(|(_, r)| r.contains("runner errors")),
+            "must die of script exhaustion, never of fruitlessness: {reasons:?}"
+        );
+    }
+
+    /// Once a check has consumed its ENTIRE ceiling without answering,
+    /// re-runs are capped at the run's measured work cost — the cap is
+    /// floored at 1s, honors the configured ceiling as an upper bound, and
+    /// the verdict announces that the leash was shortened.
+    #[tokio::test]
+    async fn hang_restake_cap_shortens_the_timeout_and_announces() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let hang = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        let hang = "sleep 30";
+        // Configured allowance is the 120s default — a re-stake at the
+        // measured cost (here ~zero, floored to 1s) must come back in
+        // seconds, not minutes.
+        let check = AcceptanceCheck::Command {
+            command: hang.to_string(),
+            timeout_secs: None,
+        };
+        let started = std::time::Instant::now();
+        let verdict = check
+            .run_with_timeout_cap(dir.path(), Some(Duration::ZERO))
+            .await;
+        assert!(verdict.timed_out);
+        assert!(!verdict.passed);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the cap must bound the run: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            verdict.detail.contains("re-run capped"),
+            "a shortened leash must announce itself: {}",
+            verdict.detail
+        );
+        // Without a cap the configured/default ceiling stands — the detail
+        // then carries no cap marker (checked via the fast 1s-configured
+        // path so the test stays quick).
+        let quick = AcceptanceCheck::Command {
+            command: hang.to_string(),
+            timeout_secs: Some(1),
+        };
+        let verdict = quick.run(dir.path()).await;
+        assert!(verdict.timed_out);
+        assert!(
+            !verdict.detail.contains("re-run capped"),
+            "an uncapped timeout must not claim it was capped: {}",
+            verdict.detail
+        );
     }
 
     /// Writes `flip.txt` (the abandoned sibling's done-condition) on its 4th
