@@ -1,0 +1,233 @@
+#!/bin/sh
+# Known-good minidb: the oracle for the gui-leg scorer self-test. Implements
+# every feature the 42-test ladder specifies, in POSIX sh (dash-clean), so a
+# ladder or scorer change that breaks a legitimately perfect implementation is
+# caught in CI. This is TEST FIXTURE, not benchmark material — never show it
+# to a model under test.
+#
+# Exit codes (fixed by the ladder): 0 ok, 1 missing key, 2 usage/non-numeric,
+# 3 corrupt db (validate), 4 readonly write refused.
+
+DB="${MINIDB_FILE:-./minidb_data}"
+TAB="$(printf '\t')"
+
+usage() { echo "usage: sh ./minidb <command> [args...]  (try: sh ./minidb help)"; exit 2; }
+need_write() {
+  if [ -n "${MINIDB_READONLY:-}" ]; then echo "minidb: readonly mode" >&2; exit 4; fi
+}
+
+# get_val <key>: value on stdout, rc 0; rc 1 when absent.
+get_val() {
+  [ -f "$DB" ] || return 1
+  awk -F "$TAB" -v k="$1" '$1==k{v=$2;f=1} END{if(f)print v; exit f?0:1}' "$DB"
+}
+
+# put <key> <value>: dedup + append (last write wins, exactly one record kept).
+put() {
+  if [ -f "$DB" ]; then
+    awk -F "$TAB" -v k="$1" '$1!=k' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+  fi
+  printf '%s\t%s\n' "$1" "$2" >> "$DB"
+}
+
+drop() { # drop <key>: rc 1 when absent
+  get_val "$1" >/dev/null || return 1
+  awk -F "$TAB" -v k="$1" '$1!=k' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+}
+
+count_keys() { if [ -f "$DB" ]; then awk 'END{print NR}' "$DB"; else echo 0; fi; }
+
+# numeric <s>: rc 0 iff s is an optionally-negative integer
+numeric() {
+  case "$1" in
+    ''|-) return 1 ;;
+    -*) case "${1#-}" in *[!0-9]*|'') return 1 ;; esac ;;
+    *)  case "$1" in *[!0-9]*) return 1 ;; esac ;;
+  esac
+  return 0
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || usage
+shift
+
+case "$cmd" in
+  help)
+    echo "minidb - tiny tab-separated key-value store"
+    echo "commands: set get del exists count list clear append incr decr mset"
+    echo "          mget rename copy search vgrep export import sum top delp"
+    echo "          stats backup restore validate repair nset nget nlist jexport"
+    ;;
+  set)
+    [ $# -eq 2 ] || usage
+    need_write
+    put "$1" "$2"
+    ;;
+  get)
+    [ $# -eq 1 ] || usage
+    get_val "$1" || exit 1
+    ;;
+  del)
+    [ $# -eq 1 ] || usage
+    need_write
+    drop "$1" || exit 1
+    ;;
+  exists)
+    [ $# -eq 1 ] || usage
+    get_val "$1" >/dev/null || exit 1
+    ;;
+  count)
+    count_keys
+    ;;
+  list)
+    [ -f "$DB" ] && awk -F "$TAB" '{print $1}' "$DB" | sort
+    ;;
+  clear)
+    need_write
+    : > "$DB"
+    ;;
+  append)
+    [ $# -eq 2 ] || usage
+    need_write
+    old=$(get_val "$1") || old=""
+    put "$1" "$old$2"
+    ;;
+  incr|decr)
+    [ $# -eq 1 ] || usage
+    need_write
+    if cur=$(get_val "$1"); then
+      numeric "$cur" || { echo "minidb: not a number: $cur" >&2; exit 2; }
+    else
+      cur=0
+    fi
+    if [ "$cmd" = incr ]; then new=$((cur + 1)); else new=$((cur - 1)); fi
+    put "$1" "$new"
+    echo "$new"
+    ;;
+  mset)
+    [ $# -ge 2 ] && [ $(($# % 2)) -eq 0 ] || usage
+    need_write
+    while [ $# -ge 2 ]; do
+      put "$1" "$2"
+      shift 2
+    done
+    ;;
+  mget)
+    [ $# -ge 1 ] || usage
+    for k in "$@"; do
+      get_val "$k" || true
+    done
+    ;;
+  rename)
+    [ $# -eq 2 ] || usage
+    need_write
+    v=$(get_val "$1") || exit 1
+    drop "$1"
+    put "$2" "$v"
+    ;;
+  copy)
+    [ $# -eq 2 ] || usage
+    need_write
+    v=$(get_val "$1") || exit 1
+    put "$2" "$v"
+    ;;
+  search)
+    [ $# -eq 1 ] || usage
+    [ -f "$DB" ] && awk -F "$TAB" -v p="$1" 'index($1,p)==1{print $1}' "$DB" | sort
+    ;;
+  vgrep)
+    [ $# -eq 1 ] || usage
+    [ -f "$DB" ] && awk -F "$TAB" -v s="$1" 'index($2,s)>0{print $1}' "$DB" | sort
+    ;;
+  export)
+    [ -f "$DB" ] && sort "$DB"
+    ;;
+  import)
+    [ $# -eq 1 ] || usage
+    need_write
+    [ -f "$1" ] || exit 1
+    while IFS="$TAB" read -r k v; do
+      [ -n "$k" ] && put "$k" "$v"
+    done < "$1"
+    ;;
+  sum)
+    if [ -f "$DB" ]; then
+      awk -F "$TAB" '$2 ~ /^-?[0-9]+$/ {s += $2} END {print s + 0}' "$DB"
+    else
+      echo 0
+    fi
+    ;;
+  top)
+    [ $# -eq 1 ] || usage
+    numeric "$1" || usage
+    [ -f "$DB" ] && awk -F "$TAB" '$2 ~ /^-?[0-9]+$/ {print $2 "\t" $1}' "$DB" \
+      | sort -rn | head -n "$1" | awk -F "$TAB" '{print $2 " " $1}'
+    ;;
+  delp)
+    [ $# -eq 1 ] || usage
+    need_write
+    if [ -f "$DB" ]; then
+      n=$(awk -F "$TAB" -v p="$1" 'index($1,p)==1{n++} END{print n+0}' "$DB")
+      awk -F "$TAB" -v p="$1" 'index($1,p)!=1' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+      echo "$n"
+    else
+      echo 0
+    fi
+    ;;
+  stats)
+    echo "keys=$(count_keys)"
+    echo "file=$DB"
+    ;;
+  backup)
+    [ $# -eq 1 ] || usage
+    if [ -f "$DB" ]; then cp "$DB" "$1"; else : > "$1"; fi
+    ;;
+  restore)
+    [ $# -eq 1 ] || usage
+    need_write
+    [ -f "$1" ] || exit 1
+    cp "$1" "$DB"
+    ;;
+  validate)
+    [ -f "$DB" ] || exit 0
+    awk -F "$TAB" 'NF < 2 || $1 == "" {bad = 1} END {exit bad ? 3 : 0}' "$DB" || exit 3
+    ;;
+  repair)
+    need_write
+    if [ -f "$DB" ]; then
+      awk -F "$TAB" 'NF >= 2 && $1 != ""' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+    fi
+    ;;
+  nset)
+    [ $# -eq 3 ] || usage
+    need_write
+    put "$1:$2" "$3"
+    ;;
+  nget)
+    [ $# -eq 2 ] || usage
+    get_val "$1:$2" || exit 1
+    ;;
+  nlist)
+    [ $# -eq 1 ] || usage
+    [ -f "$DB" ] && awk -F "$TAB" -v p="$1:" 'index($1,p)==1{print substr($1, length(p)+1)}' "$DB" | sort
+    ;;
+  jexport)
+    if [ -f "$DB" ] && [ -s "$DB" ]; then
+      sort "$DB" | awk -F "$TAB" '
+        BEGIN {printf "{"}
+        {
+          k = $1; v = $2
+          gsub(/\\/, "\\\\", k); gsub(/"/, "\\\"", k)
+          gsub(/\\/, "\\\\", v); gsub(/"/, "\\\"", v)
+          printf "%s\"%s\":\"%s\"", (n++ ? "," : ""), k, v
+        }
+        END {print "}"}'
+    else
+      echo "{}"
+    fi
+    ;;
+  *)
+    usage
+    ;;
+esac
+exit 0

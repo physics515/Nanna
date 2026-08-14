@@ -1,0 +1,5 @@
+#!/bin/sh
+# Deliberately empty minidb stub: does nothing, exits 0. The scorer self-test
+# asserts this scores 0/42 AND that every individual ladder test fails against
+# it — a ladder test an empty program can pass is a broken test.
+exit 0
