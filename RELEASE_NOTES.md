@@ -26,14 +26,14 @@
 
 - [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope
 - [x] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases
-- [ ] Publish signed Windows .msi/.exe installer with bundled daemon sidecar
-- [ ] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon)
-- [ ] Publish Linux AppImage and/or .deb/.rpm
-- [ ] App launches without terminal; daemon starts automatically
-- [ ] Add Start Menu / tray / launch-at-login support
-- [ ] WebView2 handling on Windows
-- [ ] Document uninstall process
-- [ ] Add "check for updates" or auto-update mechanism
+- [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar (signing pending)
+- [~] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon) (notarization pending)
+- [x] Publish Linux AppImage and/or .deb/.rpm
+- [x] App launches without terminal; daemon starts automatically
+- [x] Add Start Menu / tray / launch-at-login support
+- [x] WebView2 handling on Windows
+- [x] Document uninstall process
+- [x] Add "check for updates" or auto-update mechanism
 
 ## Known Issues
 

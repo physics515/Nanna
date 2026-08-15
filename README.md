@@ -50,6 +50,22 @@ never on its own, so a running mission is never interrupted. Headless users can 
 Optional cloud keys (Anthropic / OpenAI / OpenRouter) go in **Settings → Models** — a fully-local
 run needs none.
 
+### Uninstall
+
+**Windows:**
+1. Open **Settings → Apps → Installed apps**
+2. Find **Nanna** and click **Uninstall**
+3. To remove all data: delete `%APPDATA%\nanna\` (config, database, credentials)
+
+**macOS:**
+1. Drag **Nanna.app** from `/Applications` to Trash
+2. To remove all data: delete `~/Library/Application Support/nanna/`
+
+**Linux:**
+- **AppImage:** Delete the `.AppImage` file
+- **deb:** `sudo apt remove nanna` or `sudo dpkg -r nanna`
+- To remove all data: delete `~/.config/nanna/` and `~/.local/share/nanna/`
+
 ---
 
 ## What works today
