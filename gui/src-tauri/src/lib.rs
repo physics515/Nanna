@@ -235,6 +235,7 @@ pub fn run() {
             commands::memory::apply_memory_updates,
             // Memory & scheduling settings
             commands::memory::set_dreaming_enabled,
+            commands::memory::set_auto_remember_messages,
             commands::memory::set_max_compression_ratio,
             commands::memory::set_min_remaining_memories,
             commands::scheduler::set_scheduler_enabled,

@@ -258,10 +258,10 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
       the sidecar + built frontend before `nanna-gui` compiles — the fixed logic itself is in the
       unit-tested `nanna-config` helper).*
 - [ ] Ollama detection (is server running? is a model pulled?).
-- [~] Memory/privacy explanation with opt-in toggle for auto-remembering.
+- [x] Memory/privacy explanation with opt-in toggle for auto-remembering.
       *(2026-08-15)* **Config exists** — `auto_remember_messages` in `[memory]` config (default true).
-      **No GUI toggle yet** — needs Settings → Memory switch to control the opt-in. `PRIVACY.md`
-      documents the feature and how to disable via config.
+      *(2026-08-15)* **GUI toggle added** — Settings → Memory now has "Auto-Remember Messages" switch
+      that persists to config and pushes to daemon. `PRIVACY.md` documents the feature.
 - [ ] Tool permission setup: ask before enabling shell/browser/file-write.
 - [x] Daemon/embedded backend auto-start.
       *(2026-08-15)* The daemon launches as a managed sidecar via `tauri-plugin-shell` on app start.
@@ -270,10 +270,11 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 - [x] Health check screen with helpful, non-technical error messages (API key invalid, Ollama not running, port conflict, etc.).
       *(2026-08-15)* Step 3 of onboarding wizard: calls `get_backend_status`, shows friendly
       "Backend ready" or soft error with option to continue and fix in Settings.
-- [~] Emergency stop / pause-memory button visible in main UI.
+- [x] Emergency stop / pause-memory button visible in main UI.
       *(2026-08-15)* **Stop button implemented** — `ChatInput.vue` shows a red "Stop" button during
-      streaming that emits `stop` event. Keyboard shortcut `Mod+.` also triggers stop. **Pause-memory
-      button not yet implemented** — auto_remember_messages config exists but no GUI toggle.
+      streaming that emits `stop` event. Keyboard shortcut `Mod+.` also triggers stop.
+      *(2026-08-15)* **Pause-memory implemented** — Settings → Memory "Auto-Remember Messages" toggle
+      controls `auto_remember_messages` config, persisted and pushed to daemon.
 
 #### P0.2 - Documentation
 - [ ] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
