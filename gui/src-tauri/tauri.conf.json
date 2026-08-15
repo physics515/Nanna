@@ -62,9 +62,7 @@
         "silent": true
       },
       "nsis": {
-        "startMenuFolder": "Nanna",
-        "shortcutName": "Nanna",
-        "runAfterInstall": true
+        "startMenuFolder": "Nanna"
       }
     },
     "macOS": {
