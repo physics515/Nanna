@@ -221,6 +221,7 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 ## Phases
 
 ### P0 - Public Preview Release
+<<<<<<< HEAD
 - [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope.
       *(2026-08-15)* `RELEASE_NOTES.md` shipped at repo root with feature summary and release checklist.
 - [x] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases.
@@ -248,14 +249,32 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 - [x] Add "check for updates" or auto-update mechanism
       *(2026-08-15)* `tauri-plugin-updater` configured with GitHub-hosted endpoint. GUI shows update
       notification; user-initiated install (passive mode).
+=======
+- [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope. *(2026-08-15)*
+- [x] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases. *(2026-08-15)*
+- [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar. *(signing deferred to P0.3)*
+- [~] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon). *(notarization deferred to P0.3)*
+- [x] Publish Linux AppImage and/or .deb/.rpm. *(2026-08-15)*
+- [x] App launches without terminal; daemon starts automatically. *(2026-08-15)*
+- [x] Add Start Menu / tray / launch-at-login support. *(2026-08-15 — launch-at-login deferred to P0.3)*
+- [x] WebView2 handling on Windows. *(2026-08-15 — downloadBootstrapper with silent install)*
+- [x] Document uninstall process. *(2026-08-15 — README.md Installation section)*
+- [x] Add "check for updates" or auto-update mechanism. *(2026-08-15 — tauri-plugin-updater)*
+>>>>>>> origin/master
 
 #### P0.1 - First Run UX
 - [ ] Create public facing website / Github Pages
-- [ ] Build GUI onboarding wizard (replaces CLI-centric onboarding).
-- [ ] Plain-language intro screen explaining what Nanna is.
+- [x] Build GUI onboarding wizard (replaces CLI-centric onboarding).
+      *(2026-08-15)* 3-step `OnboardingWizard.vue`: intro → backend/key → health check → chat.
+      Triggered on first run when no API key is set; persists `nanna.onboarding.done` to localStorage.
+- [x] Plain-language intro screen explaining what Nanna is.
+      *(2026-08-15)* Step 1 of wizard: "Nanna is a calm personal agent — chat, tools, and memory
+      that stay on your machine."
 - [ ] Data storage location selection.
-- [ ] Backend chooser: Anthropic / OpenAI / OpenRouter / Ollama — with clear "native local model coming soon" if not implemented.
-- [ ] API key entry with validation; ~~fix has_api_key to check all provider keys, not only Anthropic~~
+- [x] Backend chooser: Anthropic / OpenAI / OpenRouter / Ollama — with clear "native local model coming soon" if not implemented.
+      *(2026-08-15)* Step 2 of wizard: provider dropdown with all four options; Ollama shows
+      "runs locally — no API key needed" message.
+- [~] API key entry with validation; ~~fix has_api_key to check all provider keys, not only Anthropic~~
       **(the provider check is fixed, 2026-07-25)**: the GUI `get_config` command's `api_key_set` looked
       only at `config.llm.api_key` (the Anthropic slot) + the `ANTHROPIC_API_KEY` env var, so a user with
       only an OpenAI/OpenRouter/GitHub-Models key, or Anthropic OAuth, was wrongly told they had no key and
@@ -269,11 +288,22 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
       the sidecar + built frontend before `nanna-gui` compiles — the fixed logic itself is in the
       unit-tested `nanna-config` helper).*
 - [ ] Ollama detection (is server running? is a model pulled?).
-- [ ] Memory/privacy explanation with opt-in toggle for auto-remembering.
+- [~] Memory/privacy explanation with opt-in toggle for auto-remembering.
+      *(2026-08-15)* **Config exists** — `auto_remember_messages` in `[memory]` config (default true).
+      **No GUI toggle yet** — needs Settings → Memory switch to control the opt-in. `PRIVACY.md`
+      documents the feature and how to disable via config.
 - [ ] Tool permission setup: ask before enabling shell/browser/file-write.
-- [ ] Daemon/embedded backend auto-start.
-- [ ] Health check screen with helpful, non-technical error messages (API key invalid, Ollama not running, port conflict, etc.).
-- [ ] Emergency stop / pause-memory button visible in main UI.
+- [x] Daemon/embedded backend auto-start.
+      *(2026-08-15)* The daemon launches as a managed sidecar via `tauri-plugin-shell` on app start.
+      `daemon_manager.rs` spawns `nanna-daemon` automatically; reconnection loop handles transient
+      disconnects. No manual start required.
+- [x] Health check screen with helpful, non-technical error messages (API key invalid, Ollama not running, port conflict, etc.).
+      *(2026-08-15)* Step 3 of onboarding wizard: calls `get_backend_status`, shows friendly
+      "Backend ready" or soft error with option to continue and fix in Settings.
+- [~] Emergency stop / pause-memory button visible in main UI.
+      *(2026-08-15)* **Stop button implemented** — `ChatInput.vue` shows a red "Stop" button during
+      streaming that emits `stop` event. Keyboard shortcut `Mod+.` also triggers stop. **Pause-memory
+      button not yet implemented** — auto_remember_messages config exists but no GUI toggle.
 
 #### P0.2 - Documentation
 - [ ] Rewrite README top half for users: pitch, Download buttons, system requirements, 5 screenshots, "first 5 minutes" checklist, uninstall.
