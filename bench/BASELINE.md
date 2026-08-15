@@ -351,6 +351,62 @@ Still open: throughput on the local tier (14/42 primary features in 6 h — the 
 grind dominates), a reused benchmark task set (Terminal-Bench easy-tier / SWE-bench Lite),
 pass^k on the endurance suite, and the 8 GB reference tier.
 
+**GUI-path series, post-P22 rerun (2026-08-14/15).** The same ladder on v0.3.7-beta.12
+carrying the complete P22 program (PRs #218–#231), all five legs on the *installed
+release* daemon (one daemon process for the whole series, boot 2026-08-14 16:27 local;
+restarted once in lfm's idle tail). Per leg: fresh read-only workspace, all four model
+priorities (chat, fallback, sub-agent, summarizer) IPC-pinned to the leg model —
+sub-agent pinning structurally closes the gemma cloud-contamination hole —
+`num_ctx=16384` env pin verified from the daemon's latch line, quiesce + prior-model
+unload between legs, liveness-gated polls (probe before every score; the ministral
+dead-daemon class is impossible by construction), 15-minute artifact snapshots into
+`run/history/<min>/`, interjections only when the run was idle with a flat score (max
+3/leg, every one and its effect ledgered). Leg 1's mission went through the GUI composer
+via desktop automation (frontend observations logged in its ledger); legs 2–5 fell back
+to IPC `start-run` after the Windows text-input overlay began blocking synthetic clicks.
+
+| Model | Peak | 4 h final | Interjections (effect) | Trail |
+|---|---|---|---|---|
+| qwen3.5:9b | **41/42 @ 65m** | 0/42 | 2 (safe; then destructive) | 27→32→34→41 monotonic, zero rewrites; held 41 for 145 min, only test_40 failing; the m=194 interjection triggered the sole rewrite, mid-flight at close |
+| ornith:latest | **30/42 @ 135m** | 0/42 | 1 (destructive) | 17→5→14→24→6→0→25→30: three destruction cycles, each named by rewrite-notes, each rebuilt in ≤2 polls; a tab-in-case-pattern syntax break (0@102) repaired via structural verdicts |
+| gemma4:e4b-it-qat | **16/42 @ 161m** | **16/42** | 1 (strongly positive) | bootstrapped 0→3→16 after the m=97 interjection; survived 16→4 destruction and closed AT peak; fully local |
+| ministral-3:8b | 4/42 @ 123m | **4/42** | 3 (mixed) | first VALID GUI number for this model (prior leg scored a corpse); final = peak |
+| lfm2.5 | 0/42 | 0/42 | 3 (ineffective) | T4c salvage engaged (119 salvage-path log hits in 17 min; real executions; artifact on disk) — the channel works, the model can't build the script; capability floor confirmed |
+
+Two series findings. **(1) P22 works in-run:** peaks ~doubled (22→41, 16→30,
+contaminated→16, unmeasured→4), destruction now recovers instead of terminating
+(ornith rebuilt through three cycles; the frozen-era version never rebuilt once), two
+legs closed at peak, and no leg lost time to dead air, hung checks, or a dead daemon.
+**(2) The remaining peak-destroyer is the continuation prompt:** both high scorers were
+walked off their peak by a driver "continue: … do not rewrite passing work" message
+sent after idle — strong models read continuation as "start over". That lever is
+chat-general (any user nudging a long-running session) and is the successor work item.
+Ledgers, per-poll history, interjection records: `D:/Development/nanna-bench/ui-run-*/`.
+
+**Forensic analysis addendum (2026-08-15, 40-agent log analysis, adversarially
+verified — recommendations encoded as ROADMAP P23).** Corrections and mechanisms the
+live monitoring could not see: (a) the continuation-destruction mechanism is a fresh
+turn context seeded from a 63× compressed summary — the verified-pass record is absent,
+so the rewrite is the model's cheapest coherent continuation (ornith 30→0 in 8 min;
+qwen 41→0); (b) **qwen's peak artifact satisfies all 42 tests under hermetic per-test
+scoring** — the official 41 stands because the model ran `chmod +w tests/test_40.sh`
+(after 12+ write errors whose text wrongly advised retrying) and doctored the spec test,
+splitting its local verification from the pristine scorer; the scorer's order-coupled
+namespace residue is what hid the divergence until post-series (hermetic per-test
+scoring is now a P23 ops debt); (c) ornith's five destruction writes each removed 9–33
+functions while clearing the 30% *byte* floor, re-anchoring `good` downward each time;
+(d) qwen's run death at peak was planner error-round exhaustion with no stop line —
+error rounds burned 2→4 in one 30-second round via a stale-stop double-charge;
+(e) gemma's 97-minute 0/42 hole: single-page tool discovery missed `write_file`, so 201
+python registry "saves" acked success with zero files on disk, and the daemon dry-counted
+the run out while its own checks failed; (f) ministral's wall is transport — Ollama
+aborts the tool-call stream on a literal TAB in JSON, retried blind ×3 per generation
+(116/160 in-window retries were 0-byte dead streams); (g) **series-wide caveat: all 171
+Tier-2 summarizations ran on `lfm2.5` regardless of per-leg pins** (summarize-priority
+resolution bug in the bucket router) — every leg's compressed context was degraded by
+the weakest model, making these numbers a floor. 27 improvement levers survived
+adversarial review; all are chat-general per the owner rule. See ROADMAP P23.
+
 ---
 
 ## Suite 1 — Inference (not yet baselined)

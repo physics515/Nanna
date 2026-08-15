@@ -169,6 +169,7 @@ pub struct ExtendedSettings {
 
     // Memory & Scheduling
     pub dreaming_enabled: bool,
+    pub auto_remember_messages: bool,
     pub max_compression_ratio: f32,
     pub min_remaining_memories: usize,
     pub scheduler_enabled: bool,
@@ -219,6 +220,7 @@ pub async fn get_extended_settings(
     // Dreaming has no daemon control action yet; its setter is still a no-op, so
     // report the enabled default.
     let dreaming_enabled = true;
+    let auto_remember_messages = state_guard.config.memory.auto_remember_messages;
     // Scheduler toggles are real settings now — read them back from the config
     // the daemon also reads, so the switches reflect what the daemon is doing
     // instead of hardcoded `true`s that never moved.
@@ -327,6 +329,7 @@ pub async fn get_extended_settings(
 
         // Memory & Scheduling settings
         dreaming_enabled,
+        auto_remember_messages,
         max_compression_ratio: state_guard.config.memory.max_compression_ratio,
         min_remaining_memories: state_guard.config.memory.min_remaining_memories,
         scheduler_enabled,

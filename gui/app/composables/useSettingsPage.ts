@@ -40,6 +40,7 @@ export interface ExtendedSettings {
   ollama_api_key: string
   tools: ToolInfo[]
   dreaming_enabled: boolean
+  auto_remember_messages: boolean
   max_compression_ratio: number
   min_remaining_memories: number
   scheduler_enabled: boolean
