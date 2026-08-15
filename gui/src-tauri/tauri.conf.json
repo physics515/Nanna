@@ -62,7 +62,8 @@
         "silent": true
       },
       "nsis": {
-        "startMenuFolder": "Nanna"
+        "startMenuFolder": "Nanna",
+        "installMode": "currentUser"
       }
     },
     "macOS": {
