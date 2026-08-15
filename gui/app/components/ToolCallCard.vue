@@ -17,8 +17,9 @@
       <span v-if="dayStamp" class="tool-timestamp" :title="preciseTime">{{ dayStamp }}</span>
       <span v-if="tokenStamp" class="tool-tokens" title="tokens on this action / run total">{{ tokenStamp }}</span>
       <span v-if="toolCall.duration_ms" class="tool-duration">{{ formatDuration(toolCall.duration_ms) }}</span>
+      <span v-if="status === 'steering'" class="tool-steering-tag">steering</span>
       <span :class="['tool-status', `tool-status--${status}`]">
-        {{ status === 'started' ? '⟳' : status === 'completed' ? '✓' : '✗' }}
+        {{ statusGlyph }}
       </span>
       <svg class="tool-chevron" :class="{ 'tool-chevron--open': expanded }" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
         <path d="M3 2l3 3-3 3" />
@@ -35,7 +36,11 @@
         </div>
         <!-- Output -->
         <div v-if="toolCall.output || status === 'started'" class="tool-section">
-          <div class="tool-section-label">📤 Output</div>
+          <div class="tool-section-label">{{ status === 'steering' ? '⇄ Steering notice' : '📤 Output' }}</div>
+          <p v-if="status === 'steering'" class="tool-steering-why">
+            This call was answered by the harness, not executed — the tool never ran, so
+            nothing failed and nothing changed on disk.
+          </p>
           <pre v-if="toolCall.output" class="tool-code" :class="{ 'tool-code--error': status === 'error' }">{{ truncateOutput(toolCall.output) }}</pre>
           <div v-else class="tool-code tool-code--waiting">Waiting for result...</div>
         </div>
@@ -66,7 +71,10 @@ interface ToolCallInfo {
 
 const props = defineProps<{
   toolCall: ToolCallInfo
-  status: 'started' | 'completed' | 'error'
+  /** `steering` is a P22 Tier 4 breaker replay: the harness answered the call
+   *  and the tool never ran. Distinct from `error` on purpose — a wall of
+   *  replays reading as failures is what made steering look like breakage. */
+  status: 'started' | 'completed' | 'error' | 'steering'
   /** ISO timestamp of when the call started; shown next to the duration. */
   timestamp?: string
   /** Tokens spent by the LLM request that issued this call. */
@@ -82,7 +90,17 @@ const statusColors = computed<[string, string, string]>(() => {
   switch (props.status) {
     case 'started': return ['251,191,36', '234,179,8', '245,158,11'] // amber
     case 'error': return ['239,68,68', '220,38,38', '248,113,113'] // red
+    case 'steering': return ['56,189,248', '14,165,233', '125,211,252'] // sky (info)
     default: return ['139,92,246', '99,102,241', '167,139,250'] // violet/indigo
+  }
+})
+
+const statusGlyph = computed(() => {
+  switch (props.status) {
+    case 'started': return '⟳'
+    case 'completed': return '✓'
+    case 'steering': return '⇄'
+    default: return '✗'
   }
 })
 
@@ -153,6 +171,7 @@ const modelBadge = computed(() => {
 const statusClass = computed(() => ({
   'tool-card--running': props.status === 'started',
   'tool-card--error': props.status === 'error',
+  'tool-card--steering': props.status === 'steering',
 }))
 
 function formatDuration(ms: number): string {
@@ -300,7 +319,26 @@ function truncateOutput(output: string): string {
 }
 .tool-status--completed { color: #34d399; }
 .tool-status--error { color: #fb7185; }
+.tool-status--steering { color: #38bdf8; }
 .tool-status--started { color: #fbbf24; animation: tool-spin 1s linear infinite; }
+
+.tool-steering-tag {
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  color: rgba(56, 189, 248, 0.85);
+  background: rgba(56, 189, 248, 0.12);
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.tool-steering-why {
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(125, 211, 252, 0.75);
+  margin-bottom: 4px;
+}
 
 @keyframes tool-spin {
   from { transform: rotate(0deg); }

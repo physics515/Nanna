@@ -1,6 +1,6 @@
 export default {
   name: "list_dir",
-  version: "0.2.0",
+  version: "0.2.1",
   output: "memory",
   description: "List files and directories in a path. Supports recursive listing.",
   parameters: {
@@ -48,8 +48,19 @@ export default {
       // One over the budget: an overflow-length return proves more exist.
       entries = Nanna.listDir(dirPath, recursive, MAX_ENTRIES + 1);
     } catch (e) {
-      // Structured, never thrown — a thrown script error reaches the model
-      // under an "Execution failed:" prefix and reads as breakage.
+      // The commonest reason a listing fails is that the path is a FILE, and
+      // the os error for that ("The directory name is invalid", ENOTDIR)
+      // teaches nothing — it reads as a broken tool rather than as a wrong
+      // call. One stat, on a call that has ALREADY failed, turns it into the
+      // correction. Structured, never thrown — a thrown script error reaches
+      // the model under an "Execution failed:" prefix and reads as breakage.
+      if (pathIsFile(dirPath)) {
+        return {
+          content: "list_dir: \"" + dirPath + "\" exists but is a FILE, not a directory — " +
+            "use read_file to see its contents (or search_file to search it). Nothing was listed.",
+          success: false
+        };
+      }
       return {
         content: "list_dir failed: cannot list \"" + dirPath + "\": " + String(e) +
           ". Check that the path exists, is a directory, and is readable.",
@@ -63,6 +74,18 @@ export default {
     }
 
     if (entries.length === 0) {
+      // A recursive walk over a FILE does not throw — walkdir yields the file
+      // itself at depth 0 and the bridge skips the root, so the listing comes
+      // back empty and "Empty directory: notes.md" is a flat falsehood about a
+      // file that has contents. Same one stat, same teaching sentence, and it
+      // only runs when a listing came back with nothing in it.
+      if (pathIsFile(dirPath)) {
+        return {
+          content: "list_dir: \"" + dirPath + "\" exists but is a FILE, not a directory — " +
+            "use read_file to see its contents (or search_file to search it). Nothing was listed.",
+          success: false
+        };
+      }
       return { content: "Empty directory: " + dirPath, success: true };
     }
 
@@ -115,6 +138,19 @@ export default {
       body += "\n\n" + notes.join("\n");
     }
     return { content: body, success: true };
+  }
+}
+
+// Is this path a file? Asked only on a path that already failed (or answered
+// nothing) as a directory, so it costs one metadata call on a path the tool
+// was going to give up on anyway. The stat sits in its OWN try: an error path
+// that throws is worse than the error it was explaining.
+function pathIsFile(path) {
+  try {
+    var st = Nanna.stat(path);
+    return !!(st && st.is_file);
+  } catch (e) {
+    return false;
   }
 }
 

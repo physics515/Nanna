@@ -370,6 +370,17 @@ fn nanna_exec(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
             obj.set(js_string!("code"), response.code.map_or(JsValue::null(), |c| JsValue::from(c)), false, context)?;
             obj.set(js_string!("stdout"), JsValue::from(js_string!(response.stdout.as_str())), false, context)?;
             obj.set(js_string!("stderr"), JsValue::from(js_string!(response.stderr.as_str())), false, context)?;
+            // A deadline kill still ran the command: the tool layer needs both
+            // facts to say so instead of "nothing ran".
+            obj.set(js_string!("timed_out"), JsValue::from(response.timed_out), false, context)?;
+            // JS numbers are f64: every integer below 2^53 is exact, and an exec
+            // elapsed time cannot reach that (the deadline bounds it to minutes).
+            obj.set(
+                js_string!("elapsed_ms"),
+                JsValue::from(response.elapsed_ms as f64),
+                false,
+                context,
+            )?;
             Ok(obj.into())
         }
         Err(e) => {

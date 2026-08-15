@@ -83,6 +83,15 @@ impl ToolMark {
 struct StopMark {
     /// Snake-case stop kind (`all_tasks_done`, `cancelled`, ...).
     kind: String,
+    /// Why the TURN ended, which is not the same question as how the last
+    /// harness run stopped. A mission that gave up because its planner
+    /// starved, or because the error budget is spent, still carries the last
+    /// round's `all_tasks_done` as `kind` — so a watcher reading `kind`
+    /// alone cannot tell a converged mission from an abandoned one. The chat
+    /// harness sets this to its own exit cause (`planner_starvation`,
+    /// `error_rounds_exhausted`, `dry_rounds_exhausted`, ...); `None` for
+    /// callers that have no continuation loop to report on.
+    exit_cause: Option<String>,
     at: String,
     /// Fingerprint of the user content that opened the finished turn, so the
     /// escalation only fires on a REPEATED REQUEST: two different questions
@@ -239,6 +248,10 @@ pub struct ToolMarkSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct StopSnapshot {
     pub reason: String,
+    /// The TURN's exit cause when the caller had one (see
+    /// [`StopMark::exit_cause`]) — absent rather than guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_cause: Option<String>,
     pub at: String,
 }
 
@@ -342,7 +355,9 @@ impl SessionLiveness {
         }
     }
 
-    /// The turn finished. `stop_kind` is the snake-case stop reason.
+    /// The turn finished. `stop_kind` is the snake-case stop reason;
+    /// `exit_cause` is the caller's own reason for ending the TURN (the chat
+    /// harness's mission-exit cause), or `None` when the caller has none.
     ///
     /// Returns `Some(n)` when this exit is the n-th consecutive REPEAT of an
     /// `all_tasks_done` exit for the SAME user content with zero side effects
@@ -351,8 +366,13 @@ impl SessionLiveness {
     /// reason, or different user content resets the streak (two different
     /// questions both answered read-only are two honest completions; only the
     /// same request re-completed against an unchanged world escalates).
+    ///
+    /// The repeat verdict deliberately keys off `stop_kind` alone: the
+    /// escalation is about a REQUEST that keeps completing against an
+    /// unchanged world, and `exit_cause` is a finer description of the same
+    /// exit, not a different one.
     #[must_use = "a Some(n) repeat verdict must be surfaced in the transcript, not dropped"]
-    pub fn finish_turn(&self, stop_kind: &str) -> Option<u32> {
+    pub fn finish_turn(&self, stop_kind: &str, exit_cause: Option<&str>) -> Option<u32> {
         let mut s = self.lock();
         s.running = false;
         s.phase = Phase::Idle;
@@ -379,6 +399,7 @@ impl SessionLiveness {
 
         s.last_stop = Some(StopMark {
             kind: stop_kind.to_string(),
+            exit_cause: exit_cause.map(str::to_string),
             at: now_rfc3339(),
             content_fingerprint: s.turn_fingerprint,
         });
@@ -411,7 +432,15 @@ impl SessionLiveness {
 
         let awaiting = if !s.running {
             match &s.last_stop {
-                Some(stop) => format!("idle — last turn ended {} at {}", stop.kind, stop.at),
+                // The exit cause, when the caller supplied one, is the more
+                // honest half of "how did that end" — say it beside the stop.
+                Some(stop) => match &stop.exit_cause {
+                    Some(cause) => format!(
+                        "idle — last turn ended {} ({cause}) at {}",
+                        stop.kind, stop.at
+                    ),
+                    None => format!("idle — last turn ended {} at {}", stop.kind, stop.at),
+                },
                 None => "idle — no turn this daemon lifetime".to_string(),
             }
         } else if let Some(tool) = &s.tool_in_flight {
@@ -457,6 +486,7 @@ impl SessionLiveness {
             beats: s.beats,
             last_stop: s.last_stop.as_ref().map(|stop| StopSnapshot {
                 reason: stop.kind.clone(),
+                exit_cause: stop.exit_cause.clone(),
                 at: stop.at.clone(),
             }),
             unchanged_done_repeats: s.unchanged_done_repeats,
@@ -595,10 +625,40 @@ mod tests {
         live.on_tool_end("exec", false);
         assert_eq!(live.snapshot().turn_side_effects, 1);
 
-        assert_eq!(live.finish_turn("all_tasks_done"), None);
+        assert_eq!(live.finish_turn("all_tasks_done", None), None);
         let snap = live.snapshot();
         assert!(!snap.running);
         assert_eq!(snap.last_stop.as_ref().map(|s| s.reason.as_str()), Some("all_tasks_done"));
+    }
+
+    /// A mission that GAVE UP still stops on the last round's `all_tasks_done`,
+    /// so the stop kind alone cannot tell a converged mission from an
+    /// abandoned one. The exit cause is the half that can, and it must reach
+    /// both the readout and the `session.liveness` payload.
+    #[test]
+    fn exit_cause_rides_beside_the_stop_kind() {
+        let live = SessionLiveness::new();
+        live.begin_turn(None, content_fingerprint("build the thing"));
+        assert_eq!(
+            live.finish_turn("all_tasks_done", Some("planner_starvation")),
+            None,
+            "a starved mission is not a repeat completion"
+        );
+        let snap = live.snapshot();
+        let stop = snap.last_stop.as_ref().expect("a stop was recorded");
+        assert_eq!(stop.reason, "all_tasks_done");
+        assert_eq!(stop.exit_cause.as_deref(), Some("planner_starvation"));
+        assert!(snap.awaiting.contains("planner_starvation"), "{}", snap.awaiting);
+        let wire = serde_json::to_value(&snap).expect("snapshot serializes");
+        assert_eq!(wire["last_stop"]["exit_cause"], "planner_starvation");
+
+        // No cause supplied: the field is absent, never guessed.
+        live.begin_turn(None, content_fingerprint("build the thing"));
+        let _ = live.finish_turn("cancelled", None);
+        let snap = live.snapshot();
+        assert!(snap.last_stop.as_ref().is_some_and(|s| s.exit_cause.is_none()));
+        let wire = serde_json::to_value(&snap).expect("snapshot serializes");
+        assert!(wire["last_stop"].get("exit_cause").is_none());
     }
 
     #[test]
@@ -611,24 +671,24 @@ mod tests {
         live.begin_turn(None, mission);
         live.on_tool_start("write_file");
         live.on_tool_end("write_file", true);
-        assert_eq!(live.finish_turn("all_tasks_done"), None, "first exit, with work");
+        assert_eq!(live.finish_turn("all_tasks_done", None), None, "first exit, with work");
 
         live.begin_turn(None, mission);
         assert_eq!(
-            live.finish_turn("all_tasks_done"),
+            live.finish_turn("all_tasks_done", None),
             Some(1),
             "same request re-completed with no new side effects is repeat #1"
         );
 
         live.begin_turn(None, mission);
-        assert_eq!(live.finish_turn("all_tasks_done"), Some(2));
+        assert_eq!(live.finish_turn("all_tasks_done", None), Some(2));
         assert_eq!(live.snapshot().unchanged_done_repeats, 2);
 
         // A side effect breaks the streak: the world changed.
         live.begin_turn(None, mission);
         live.on_tool_start("exec");
         live.on_tool_end("exec", true);
-        assert_eq!(live.finish_turn("all_tasks_done"), None);
+        assert_eq!(live.finish_turn("all_tasks_done", None), None);
         assert_eq!(live.snapshot().unchanged_done_repeats, 0);
     }
 
@@ -638,9 +698,9 @@ mod tests {
         // the escalation is for a REPEATED request, not for answering twice.
         let live = SessionLiveness::new();
         live.begin_turn(None, content_fingerprint("what is in src/main.rs?"));
-        assert_eq!(live.finish_turn("all_tasks_done"), None);
+        assert_eq!(live.finish_turn("all_tasks_done", None), None);
         live.begin_turn(None, content_fingerprint("and in src/lib.rs?"));
-        assert_eq!(live.finish_turn("all_tasks_done"), None);
+        assert_eq!(live.finish_turn("all_tasks_done", None), None);
         assert_eq!(live.snapshot().unchanged_done_repeats, 0);
     }
 
@@ -655,17 +715,17 @@ mod tests {
         let live = SessionLiveness::new();
         let same = content_fingerprint("run the mission");
         live.begin_turn(None, same);
-        assert_eq!(live.finish_turn("all_tasks_done"), None);
+        assert_eq!(live.finish_turn("all_tasks_done", None), None);
         live.begin_turn(None, same);
-        assert_eq!(live.finish_turn("all_tasks_done"), Some(1));
+        assert_eq!(live.finish_turn("all_tasks_done", None), Some(1));
 
         live.begin_turn(None, same);
-        assert_eq!(live.finish_turn("cancelled"), None);
+        assert_eq!(live.finish_turn("cancelled", None), None);
         assert_eq!(live.snapshot().unchanged_done_repeats, 0);
 
         // After a cancel, a fresh all_tasks_done is a FIRST exit again.
         live.begin_turn(None, same);
-        assert_eq!(live.finish_turn("all_tasks_done"), None);
+        assert_eq!(live.finish_turn("all_tasks_done", None), None);
     }
 
     #[test]
@@ -679,7 +739,7 @@ mod tests {
         assert!(live.beat().is_some());
         assert_eq!(live.snapshot().beats, 2);
 
-        let _ = live.finish_turn("cancelled");
+        let _ = live.finish_turn("cancelled", None);
         assert!(live.beat().is_none(), "beats stop at turn end");
     }
 
@@ -690,10 +750,10 @@ mod tests {
         let same = content_fingerprint("the mission");
         let a = registry.handle("s1");
         a.begin_turn(None, same);
-        let _ = a.finish_turn("all_tasks_done");
+        let _ = a.finish_turn("all_tasks_done", None);
         // Same Arc on re-fetch: cross-turn state (the streak) survives.
         let b = registry.handle("s1");
         b.begin_turn(None, same);
-        assert_eq!(b.finish_turn("all_tasks_done"), Some(1));
+        assert_eq!(b.finish_turn("all_tasks_done", None), Some(1));
     }
 }

@@ -376,6 +376,56 @@ pub fn default_exec_timeout_secs(command: &str) -> u64 {
     }
 }
 
+/// One incremental read from a live child pipe into `sink`. Returns `true`
+/// once that pipe is finished — EOF, an unreadable pipe, or no pipe at all.
+///
+/// `read_buf` appends to `sink` and grows it itself, so the in-flight buffering
+/// is exactly what `wait_with_output` did: no cap is imposed here and none is
+/// needed — the exec deadline bounds the time, and the tool-result
+/// summarize/truncate routing bounds the size. It is also cancel-safe, so the
+/// deadline branch winning a `select!` race cannot swallow bytes that had
+/// already been read.
+async fn read_chunk<R>(reader: Option<&mut R>, sink: &mut Vec<u8>) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    match reader {
+        Some(reader) => !matches!(reader.read_buf(sink).await, Ok(n) if n > 0),
+        None => true,
+    }
+}
+
+/// Collect whatever a killed command's pipe can hand over WITHOUT waiting.
+///
+/// Called only after the tree has been reaped, to pick up the last bytes it
+/// wrote: on Windows the in-flight read completes on the blocking pool while
+/// `taskkill` runs, on Unix the bytes simply sit in the pipe. The `ready`
+/// branch ends the loop at the first read that would block, so this never
+/// waits for a byte that has not already arrived — a writer that somehow
+/// survived BOTH the tree walk and the Job Object cannot turn "killed at the
+/// deadline" into a hang, which is why the drain is not joined to EOF here.
+async fn drain_ready<R>(reader: Option<&mut R>, sink: &mut Vec<u8>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(reader) = reader else {
+        return;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            res = reader.read_buf(sink) => {
+                if !matches!(res, Ok(n) if n > 0) {
+                    return;
+                }
+            }
+            () = std::future::ready(()) => return,
+        }
+    }
+}
+
 impl NannaBridge {
     /// Create a new bridge with the given permissions
     pub fn new(permissions: ToolPermissions) -> Self {
@@ -731,7 +781,13 @@ impl NannaBridge {
             cmd.process_group(0);
         }
 
-        let child = cmd
+        // Wall clock for the result's `elapsed_ms`. Started before the spawn so
+        // it measures what the command actually cost the caller, and reported on
+        // BOTH exits — a run that finished and a run that was killed are then
+        // directly comparable.
+        let started = std::time::Instant::now();
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
         // Capture the pid *before* the wait future consumes the child, so a timeout
@@ -747,47 +803,102 @@ impl NannaBridge {
         // does the same. Unix needs none of this: the process group IS the
         // subtree, dead shell or not.
         let mut job = ChildJob::assign(&child);
-        let wait = child.wait_with_output();
+
+        // Drain the pipes ourselves instead of `wait_with_output()`. The
+        // buffering is identical — the reads grow these two vectors exactly as
+        // `wait_with_output` grew its own, no cap is introduced (the deadline
+        // is still the time bound, and the tool-result summarize/truncate
+        // routing is still the size bound) — but the bytes accumulate in OUR
+        // hands. `wait_with_output` owns its buffers *inside* the future and
+        // drops them when the deadline cancels it, which is why every overrun
+        // used to reach the model as "nothing ran" while its side effects sat
+        // on disk.
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let mut out_done = out_pipe.is_none();
+        let mut err_done = err_pipe.is_none();
+        let mut stdout_bytes: Vec<u8> = Vec::new();
+        let mut stderr_bytes: Vec<u8> = Vec::new();
+        let wait = child.wait();
         tokio::pin!(wait);
-        let output = tokio::select! {
-            res = &mut wait => {
-                let output = res
-                    .map_err(|e| ScriptError::Bridge(format!("Failed to execute command: {e}")))?;
-                // Completed: pipes EOF'd, shell exited. Anything still running
-                // is a deliberately detached background process (output
-                // redirected — e.g. a server the agent started on purpose).
-                // Spare it; the daemon-wide Job Object still bounds it.
-                if let Some(job) = job.take() {
-                    job.disarm();
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout));
+        tokio::pin!(deadline);
+        let mut status = None;
+
+        // "Completed" means exactly what `wait_with_output` meant: the child
+        // exited AND both pipes hit EOF. A backgrounded grandchild still
+        // holding our write handles therefore still runs the deadline out —
+        // that is the `foo &` shape the tree-kill and the Job Object exist for.
+        let exit = loop {
+            if out_done && err_done && status.is_some() {
+                break status;
+            }
+            tokio::select! {
+                done = read_chunk(out_pipe.as_mut(), &mut stdout_bytes), if !out_done => {
+                    out_done = done;
                 }
-                output
-            },
-            () = tokio::time::sleep(std::time::Duration::from_secs(timeout)) => {
-                // Overran the deadline. Kill the entire tree — the shell *and* any
-                // long-running grandchild like cargo/git — so it can't outlive the
-                // tool call and hold a workspace/build lock (the failure mode that
-                // deadlocked repeated exec calls against each other). Walk first
-                // while `wait` still owns the child (covers a live tree, including
-                // anything spawned before the job assignment landed), then
-                // terminate the job to sweep descendants the walk can't see.
-                if let Some(pid) = pid {
-                    kill_process_tree(pid).await;
+                done = read_chunk(err_pipe.as_mut(), &mut stderr_bytes), if !err_done => {
+                    err_done = done;
                 }
-                if let Some(job) = job.take() {
-                    job.terminate();
+                res = &mut wait, if status.is_none() => {
+                    status = Some(res.map_err(|e| {
+                        ScriptError::Bridge(format!("Failed to execute command: {e}"))
+                    })?);
                 }
-                return Err(ScriptError::Timeout(timeout * 1000));
+                () = &mut deadline => break None,
             }
         };
 
-        let stdout = strip_ansi_escapes(&String::from_utf8_lossy(&output.stdout));
-        let stderr = strip_ansi_escapes(&String::from_utf8_lossy(&output.stderr));
+        let Some(exit_status) = exit else {
+            // Overran the deadline. Kill the entire tree — the shell *and* any
+            // long-running grandchild like cargo/git — so it can't outlive the
+            // tool call and hold a workspace/build lock (the failure mode that
+            // deadlocked repeated exec calls against each other). Walk first
+            // while `wait` still owns the child (covers a live tree, including
+            // anything spawned before the job assignment landed), then
+            // terminate the job to sweep descendants the walk can't see.
+            if let Some(pid) = pid {
+                kill_process_tree(pid).await;
+            }
+            if let Some(job) = job.take() {
+                job.terminate();
+            }
+            // Then tell the truth. This used to return `Err(Timeout)`, which the
+            // exec tool rendered as "Nothing ran" — so the model retried a
+            // command that HAD run, re-doing side effects already on disk. The
+            // kill is unchanged; only the report is honest now: a result that
+            // says it was killed, how long it lived, and what it printed first.
+            // Tool errors return, they never throw.
+            drain_ready(out_pipe.as_mut(), &mut stdout_bytes).await;
+            drain_ready(err_pipe.as_mut(), &mut stderr_bytes).await;
+            return Ok(ExecResponse {
+                success: false,
+                code: None,
+                stdout: strip_ansi_escapes(&String::from_utf8_lossy(&stdout_bytes)),
+                stderr: strip_ansi_escapes(&String::from_utf8_lossy(&stderr_bytes)),
+                timed_out: true,
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        };
+
+        // Completed: pipes EOF'd, shell exited. Anything still running is a
+        // deliberately detached background process (output redirected — e.g. a
+        // server the agent started on purpose). Spare it; the daemon-wide Job
+        // Object still bounds it.
+        if let Some(job) = job.take() {
+            job.disarm();
+        }
+
+        let stdout = strip_ansi_escapes(&String::from_utf8_lossy(&stdout_bytes));
+        let stderr = strip_ansi_escapes(&String::from_utf8_lossy(&stderr_bytes));
 
         Ok(ExecResponse {
-            success: output.status.success(),
-            code: output.status.code(),
+            success: exit_status.success(),
+            code: exit_status.code(),
             stdout,
             stderr,
+            timed_out: false,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
     }
 
@@ -924,9 +1035,19 @@ impl NannaBridge {
             }
         }
 
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| ScriptError::Bridge(format!("Failed to write '{}': {e}", path.display())))
+        // Name the cause machine-readably. The OS message alone is localized
+        // prose ("Access is denied." / "Permission denied"), so a caller that
+        // wants to tell a NON-RETRYABLE failure (a write-protected file) from a
+        // transient one (Interrupted, WouldBlock, a sharing violation) has
+        // nothing stable to match on. `io::ErrorKind`'s Debug name is stable
+        // and locale-independent; the OS message still follows it verbatim.
+        tokio::fs::write(&path, content).await.map_err(|e| {
+            ScriptError::Bridge(format!(
+                "Failed to write '{}' (kind={:?}): {e}",
+                path.display(),
+                e.kind()
+            ))
+        })
     }
 
     /// Log a message
@@ -1100,6 +1221,15 @@ pub struct ExecResponse {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// The command overran its deadline and was killed. `stdout`/`stderr` then
+    /// carry what it had already printed: it RAN, and whatever side effects it
+    /// reached are on disk — disk is truth. Never true for a command that
+    /// finished on its own, and never true for a command that failed to start
+    /// (that is still an `Err`, because then genuinely nothing ran).
+    pub timed_out: bool,
+    /// Wall-clock milliseconds the command was alive. Measured on both exits,
+    /// so a killed command can say how long it ran before the deadline.
+    pub elapsed_ms: u64,
 }
 
 /// Fetch request options
@@ -1244,7 +1374,7 @@ mod tests {
 
     /// REGRESSION (2026-08-08, ministral endurance teardown hang): `foo &` —
     /// the shell exits immediately, the backgrounded grandchild inherits our
-    /// stdout/stderr write handles, `wait_with_output` never sees EOF, and
+    /// stdout/stderr write handles, the pipe drains never see EOF, and
     /// the timeout fires with the shell already DEAD. The parent-walk
     /// tree-kill (`taskkill /T` from the dead pid) finds nothing, so pre-fix
     /// the grandchild survived holding the pipe — and because tokio
@@ -1281,8 +1411,8 @@ mod tests {
 
         let res = rt.block_on(bridge.exec_with_timeout(&command, None, Some(2)));
         assert!(
-            matches!(res, Err(ScriptError::Timeout(_))),
-            "held pipes must force the timeout, got {res:?}"
+            res.as_ref().is_ok_and(|r| r.timed_out),
+            "held pipes must force the deadline kill, got {res:?}"
         );
 
         // The shell wrote the pid file before exiting, well inside the 2s
@@ -1595,9 +1725,10 @@ mod tests {
         }
     }
 
-    /// A command that overruns its (explicit) timeout must return `Timeout`
-    /// promptly — not run to completion. Regression guard for the exec timeout
-    /// actually being honored and the select-based deadline firing.
+    /// A command that overruns its (explicit) timeout must be killed promptly —
+    /// not run to completion — and must say so in the RESULT, not by throwing.
+    /// Regression guard for the exec timeout actually being honored and the
+    /// select-based deadline firing.
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_times_out_and_returns_promptly() {
@@ -1609,7 +1740,7 @@ mod tests {
         let res = bridge.exec_with_timeout("sleep 10", None, Some(1)).await;
         let elapsed = start.elapsed();
 
-        assert!(matches!(res, Err(ScriptError::Timeout(_))), "got {res:?}");
+        assert!(res.as_ref().is_ok_and(|r| r.timed_out), "got {res:?}");
         // Must fire near the 1s deadline, well before the 10s sleep would end.
         assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
     }
@@ -1630,8 +1761,109 @@ mod tests {
         let res = bridge.exec_with_timeout("sleep 10", None, Some(1)).await;
         let elapsed = start.elapsed();
 
-        assert!(matches!(res, Err(ScriptError::Timeout(_))), "got {res:?}");
+        assert!(res.as_ref().is_ok_and(|r| r.timed_out), "got {res:?}");
         assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// REGRESSION (P23): an overrun used to return `Err(Timeout)`, which the
+    /// exec tool rendered to the model as "Nothing ran" — so the model retried
+    /// a command that HAD run, re-doing side effects already on disk. The kill
+    /// is unchanged; the report must now carry the truth: it was killed, it
+    /// lived this long, and this is what it printed before it died.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_timeout_carries_partial_output_and_elapsed() {
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let res = bridge
+            .exec_with_timeout("echo partial_before_deadline; sleep 10", None, Some(1))
+            .await
+            .expect("a deadline kill must RETURN a result, never throw");
+
+        assert!(res.timed_out, "the result must admit the kill: {res:?}");
+        assert!(!res.success, "a killed command did not succeed: {res:?}");
+        assert!(res.code.is_none(), "there is no exit status: {res:?}");
+        assert!(
+            res.stdout.contains("partial_before_deadline"),
+            "the output it managed to print must survive: {res:?}"
+        );
+        assert!(res.elapsed_ms > 0, "elapsed must be real: {res:?}");
+
+        // The completed path is untouched: no kill, no timed_out flag.
+        let done = bridge
+            .exec_with_timeout("echo finished_cleanly", None, Some(20))
+            .await
+            .expect("a completed command still returns Ok");
+        assert!(!done.timed_out, "nothing killed this one: {done:?}");
+        assert!(done.success, "{done:?}");
+        assert!(done.stdout.contains("finished_cleanly"), "{done:?}");
+    }
+
+    /// Same contract on Windows, routed through Git Bash (skipped if absent).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exec_timeout_carries_partial_output_and_elapsed() {
+        if git_bash_path().is_none() {
+            eprintln!(
+                "skipping exec_timeout_carries_partial_output_and_elapsed: Git Bash not installed"
+            );
+            return;
+        }
+        let mut perms = ToolPermissions::none();
+        perms.run = true;
+        let bridge = NannaBridge::new(perms);
+
+        let res = bridge
+            .exec_with_timeout("echo partial_before_deadline; sleep 10", None, Some(1))
+            .await
+            .expect("a deadline kill must RETURN a result, never throw");
+
+        assert!(res.timed_out, "the result must admit the kill: {res:?}");
+        assert!(!res.success, "a killed command did not succeed: {res:?}");
+        assert!(res.code.is_none(), "there is no exit status: {res:?}");
+        assert!(
+            res.stdout.contains("partial_before_deadline"),
+            "the output it managed to print must survive: {res:?}"
+        );
+        assert!(res.elapsed_ms > 0, "elapsed must be real: {res:?}");
+
+        // The completed path is untouched: no kill, no timed_out flag.
+        let done = bridge
+            .exec_with_timeout("echo finished_cleanly", None, Some(20))
+            .await
+            .expect("a completed command still returns Ok");
+        assert!(!done.timed_out, "nothing killed this one: {done:?}");
+        assert!(done.success, "{done:?}");
+        assert!(done.stdout.contains("finished_cleanly"), "{done:?}");
+    }
+
+    /// A write that fails must name the cause in a form a caller can MATCH on:
+    /// the OS message is localized prose, the `io::ErrorKind` name is not. The
+    /// tool layer keys its "this is not retryable" copy off that name.
+    #[tokio::test]
+    async fn write_failure_names_the_error_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = NannaBridge::new(ToolPermissions::none().with_write([dir.path()]));
+
+        // Writing a directory AS A FILE is the portable way to provoke a real
+        // `io::Error` through the same path a permission failure takes (the
+        // kind itself differs per platform, which is exactly why the assertion
+        // is on the shape, not on one kind).
+        let err = bridge
+            .write_file(&dir.path().to_string_lossy(), "x")
+            .await
+            .expect_err("writing a directory as a file must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("(kind="),
+            "the failure must name the io::ErrorKind: {msg}"
+        );
+        assert!(
+            msg.contains(&*dir.path().to_string_lossy()),
+            "the failure must still name the path: {msg}"
+        );
     }
 
     /// End-to-end: a POSIX/bash command with a pipe + `tail` (which used to fail in

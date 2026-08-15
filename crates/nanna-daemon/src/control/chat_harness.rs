@@ -115,15 +115,132 @@ fn round_made_progress(round: &nanna_agent::harness::LongHorizonReport) -> bool 
     round.side_effect_tool_calls > 0 || round.items_completed > round.items_already_satisfied
 }
 
+/// WHY a chat turn's mission ended — one closed enum, set at every exit of
+/// the continuation loop and carried to all three places an ending is
+/// reported: the terminal log line, the liveness [`crate::liveness::StopMark`]
+/// (so `session.liveness` can tell a converged mission from an abandoned
+/// one), and the user-visible mission-end sentence.
+///
+/// Before this, every continuation exit was silent. The `chat harness run
+/// finished` line fired BEFORE the loop, so a mission that ran twenty rounds
+/// logged the first round's numbers and nothing else; and the planner-
+/// starvation give-up left `report.stop` reading `AllTasksDone`, so the
+/// failure notice found nothing to announce and the user saw a run simply
+/// stop. Recovering why took a database query; it should take a grep, and
+/// the user should not have to grep at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MissionEnd {
+    /// The continuation loop never ran — an ordinary conversational turn.
+    SingleRun,
+    /// The run's own stop is terminal and was asked for (a budget stop, a
+    /// cancel the harness itself recorded). Carries the stop's wire kind.
+    DeliberateStop(String),
+    /// Stop was pressed.
+    Cancelled,
+    /// Re-planning found nothing new to do, twice running
+    /// ([`CONTINUATION_DRY_ROUNDS`]).
+    DryRoundsExhausted,
+    /// The mission hit [`CONTINUATION_ROUNDS_MAX`] rounds of genuinely new work.
+    RoundsMaxExhausted,
+    /// Runs kept failing past [`CONTINUATION_ERROR_ROUNDS`].
+    ErrorRoundsExhausted,
+    /// The planner kept falling back and seeding nothing past
+    /// [`CONTINUATION_ERROR_ROUNDS`] — planning starved, which is NOT the
+    /// same ending as "the goal is done" even though `report.stop` still
+    /// reads `AllTasksDone`.
+    PlannerStarvation,
+    /// A transient provider outage ended the turn, and the work is PARKED
+    /// rather than given up on. Carries the provider-facing reason.
+    ParkedTransient(String),
+}
+
+impl MissionEnd {
+    /// Snake-case wire spelling for the log field and the liveness ledger.
+    /// `deliberate_stop:<kind>` keeps the underlying stop greppable without a
+    /// second field.
+    fn cause(&self) -> String {
+        match self {
+            Self::SingleRun => "single_run".to_string(),
+            Self::DeliberateStop(kind) => format!("deliberate_stop:{kind}"),
+            Self::Cancelled => "cancelled".to_string(),
+            Self::DryRoundsExhausted => "dry_rounds_exhausted".to_string(),
+            Self::RoundsMaxExhausted => "rounds_max_exhausted".to_string(),
+            Self::ErrorRoundsExhausted => "error_rounds_exhausted".to_string(),
+            Self::PlannerStarvation => "planner_starvation".to_string(),
+            Self::ParkedTransient(_) => "parked_transient".to_string(),
+        }
+    }
+
+    /// Did the mission end because it RAN OUT of something, rather than
+    /// because it finished? These endings are always announced: the goal is
+    /// not verified complete and the user is the only one who can decide what
+    /// to do next.
+    fn gave_up(&self) -> bool {
+        matches!(
+            self,
+            Self::ErrorRoundsExhausted
+                | Self::PlannerStarvation
+                | Self::RoundsMaxExhausted
+                | Self::ParkedTransient(_)
+                | Self::DeliberateStop(_)
+        )
+    }
+}
+
 /// Per-session interjection intake, shared between the chat handler (which
 /// pushes) and the live run's [`SessionInterjector`] (which drains).
 ///
 /// Keyed by session id. An entry outlives its run so a message that lands in
 /// the gap between two turns is not dropped.
+/// A turn that ended because the PROVIDER was down, not because the work was
+/// finished or hopeless.
+///
+/// A transient outage is the one give-up that is a lie: the mission did not
+/// fail, the daemon simply could not reach the model. Parking records what
+/// the resumed turn needs — which scope's work is unfinished, which provider
+/// it was waiting on, and how much of the error budget was already spent —
+/// so a resume continues the SAME budget rather than handing a flapping
+/// provider a fresh one. Resume is evidence-driven (the next successful
+/// completion on that model), never a timer.
+#[derive(Debug, Clone)]
+pub struct ParkedTurn {
+    pub scope: String,
+    pub scope_id: Option<String>,
+    /// The model whose recovery is the resume trigger.
+    pub model: String,
+    /// The user's own words, so a resumed turn re-plans the same goal.
+    pub goal: String,
+    /// Error rounds already spent — carried, never reset, so
+    /// `CONTINUATION_ERROR_ROUNDS` stays the single terminal brake.
+    pub error_rounds: usize,
+    /// How many times this work has already been resumed from a park.
+    ///
+    /// A flapping provider can park the same goal repeatedly; each resume
+    /// carries the count forward so the SAME terminal brake that bounds
+    /// error rounds also bounds park/resume cycles. Nothing new to tune.
+    pub resumes: usize,
+    /// The provider-facing reason, as told to the user.
+    pub reason: String,
+    pub parked_at: String,
+}
+
 #[derive(Debug, Default)]
 pub struct ChatRunRegistry {
     pending: RwLock<HashMap<String, Arc<PendingMessages>>>,
     active: RwLock<HashMap<String, ()>>,
+    /// Sessions whose turn ended PARKED on a transient provider outage.
+    ///
+    /// At most one park per session — a second park replaces the first,
+    /// because the newer one describes the same unfinished work with fresher
+    /// evidence. The bound is therefore the session count, which already
+    /// bounds `pending` and `active`; no cap of its own.
+    parked: RwLock<HashMap<String, ParkedTurn>>,
+    /// Resume counts handed from a park waiter to the turn it is starting.
+    ///
+    /// Bounded by the parked-session count for the same reason `parked` is:
+    /// an entry exists only between a resume decision and the turn that
+    /// consumes it, and the turn always consumes it.
+    resumed: RwLock<HashMap<String, usize>>,
     /// Wakes admission-gate waiters ([`Self::wait_idle`] / [`Self::wait_active`])
     /// on every claim AND release. One channel for both edges — waiters
     /// re-check their own condition on wake, so a spurious wake costs a read
@@ -192,6 +309,60 @@ impl ChatRunRegistry {
         // The "resume" edge for admission-gate waiters parked in
         // [`Self::wait_idle`].
         self.changed.notify_waiters();
+    }
+
+    /// Record that this session's turn ended PARKED on a provider outage.
+    pub async fn park(&self, session_id: &str, park: ParkedTurn) {
+        tracing::warn!(
+            session_id,
+            model = %park.model,
+            error_rounds = park.error_rounds,
+            "turn parked on a provider outage — waiting for the provider to answer again"
+        );
+        self.parked.write().await.insert(session_id.to_string(), park);
+    }
+
+    /// Drop a session's park without resuming it — what a NEW user turn does:
+    /// that turn already carries the pending items and the established
+    /// context, so resuming behind it would duplicate the work.
+    pub async fn clear_park(&self, session_id: &str) -> Option<ParkedTurn> {
+        self.parked.write().await.remove(session_id)
+    }
+
+    /// Whether a session is still waiting on a provider to come back.
+    pub async fn is_parked(&self, session_id: &str) -> bool {
+        self.parked.read().await.contains_key(session_id)
+    }
+
+    /// Remember how many times this session's parked work has been resumed, so
+    /// the count survives into the turn that is about to run (and back into
+    /// its park, if the provider drops again).
+    pub async fn note_resume(&self, session_id: &str, resumes: usize) {
+        self.resumed.write().await.insert(session_id.to_string(), resumes);
+    }
+
+    /// The resume count a starting turn inherits, and clears as it takes it.
+    pub async fn take_resume_count(&self, session_id: &str) -> usize {
+        self.resumed.write().await.remove(session_id).unwrap_or(0)
+    }
+
+    /// Every session parked on `model`, claimed for resume.
+    ///
+    /// The resume TRIGGER is recovery evidence — a later successful
+    /// completion on the same model — never a timer, so the caller is
+    /// whatever observed that success. Claiming removes the park, so two
+    /// observers cannot resume the same turn twice.
+    pub async fn claim_parked_for_model(&self, model: &str) -> Vec<(String, ParkedTurn)> {
+        let mut parked = self.parked.write().await;
+        let ready: Vec<String> = parked
+            .iter()
+            .filter(|(_, park)| park.model == model)
+            .map(|(session, _)| session.clone())
+            .collect();
+        ready
+            .into_iter()
+            .filter_map(|session| parked.remove(&session).map(|park| (session, park)))
+            .collect()
     }
 
     /// Park until NO harness run is live.
@@ -278,6 +449,18 @@ impl ControlPlane {
             return Ok(None);
         }
 
+        // A live user turn supersedes any park: this turn seeds the pending
+        // items and rebuilds the established context by itself, so resuming
+        // the parked one behind it would do the same work twice.
+        if let Some(park) = registry.clear_park(session_id).await {
+            tracing::info!(
+                session_id,
+                model = %park.model,
+                parked_at = %park.parked_at,
+                "a new user turn supersedes the parked turn — dropping the park"
+            );
+        }
+
         let message_id = uuid::Uuid::new_v4().to_string();
         let _ = event_tx.send(crate::protocol::Event::MessageStart {
             session_id: session_id.to_string(),
@@ -341,6 +524,10 @@ impl ControlPlane {
         let session_id_owned = session_id.to_string();
         let content_owned = content.to_string();
         let message_id_for_run = message_id.clone();
+        // Zero for an ordinary turn; carried forward when a park waiter
+        // started this one, so repeated provider outages spend a single
+        // budget instead of a fresh one each time.
+        let resumed_from_park = registry.take_resume_count(session_id).await;
 
         // Handles for the death watcher below — the originals move into the
         // turn task, and the watcher must be able to run the release tail
@@ -370,6 +557,10 @@ impl ControlPlane {
             // exists; `no_run` covers the paths that never reach the
             // harness (prep failure, seed failure).
             let mut turn_stop_kind = "no_run".to_string();
+            // …and WHY the turn itself ended, which is a different question
+            // once the continuation loop exists (see [`MissionEnd`]). `None`
+            // for the paths that never reach the loop.
+            let mut turn_exit_cause: Option<String> = None;
 
             // Prep, then build the runners. `None` = the turn cannot run at
             // all — the reason is already announced in the transcript, and
@@ -492,7 +683,11 @@ impl ControlPlane {
                 }
             };
 
-            if let Some((step_runner, planner, conversation, workspace_root)) = runners {
+            if let Some((mut step_runner, planner, conversation, workspace_root)) = runners {
+                // Kept beside the runner because `workspace_root` itself is
+                // consumed into the harness workdir below, and the reseed
+                // path has to re-read the artifact ledger from the same root.
+                let artifact_root = workspace_root.clone();
                 // Unfinished work from an earlier turn is INFORMATION FOR THE
                 // MODEL, not an instruction to the harness. Owner directive
                 // (2026-07-25): *"the model should decide to resume or answer
@@ -512,19 +707,52 @@ impl ControlPlane {
                 // verbatim (observed twice in one leg, with six state
                 // re-assessments in four hours and zero items ever completed
                 // by work).
-                let established =
-                    established_work_context(&storage, &scope, scope_id.as_deref()).await;
+                let established_state =
+                    established_rows(&storage, &scope, scope_id.as_deref()).await;
+                let established = established_work_context(&established_state);
+
+                // Ground truth about the ARTIFACT, re-read from disk right
+                // now — never from prose, never from the model's memory of
+                // what it wrote. See [`artifact_state_block`]: continuation
+                // turns kept reconstructing files they had already built
+                // because nothing in the context said "this file exists and
+                // holds verified work".
+                let artifact_state =
+                    artifact_state_block(artifact_root.as_deref(), &established_state).await;
+
+                // The user says something is broken that this session
+                // VERIFIED working. Two pieces of evidence disagree, and the
+                // one thing that must not happen is rewriting the artifact on
+                // the strength of whichever was heard last.
+                let conflicts = claim_conflicts(&content_owned, &established_state);
+                let conflict_block = claim_conflict_block(&conflicts);
+                if !conflicts.is_empty() {
+                    tracing::warn!(
+                        session_id = %session_id_owned,
+                        conflicts = conflicts.len(),
+                        subjects = ?conflicts.iter().map(|c| c.subject.as_str())
+                            .collect::<Vec<_>>(),
+                        "the message contradicts a verified pass — reconciling before mutating"
+                    );
+                }
+
+                // The turn-start facts every planning call in this turn
+                // carries. Rebuilt (never appended to) on a reseed, so the
+                // block is an idempotent snapshot rather than a growing log.
+                let mut standing_context: Vec<String> = [
+                    conversation.clone(),
+                    artifact_state,
+                    conflict_block.clone(),
+                    established,
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 let context = {
-                    let joined = [
-                        conversation.as_deref(),
-                        outstanding.as_deref(),
-                        established.as_deref(),
-                    ]
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                    let mut parts: Vec<&str> =
+                        standing_context.iter().map(String::as_str).collect();
+                    parts.extend(outstanding.as_deref());
+                    let joined = parts.join("\n\n");
                     Some(joined).filter(|c| !c.is_empty())
                 };
 
@@ -535,7 +763,7 @@ impl ControlPlane {
                 // degrades to empty, which OVER-filters — continuation rounds
                 // then dedup against all of history and the mission ends
                 // early rather than treadmilling.
-                let closed_before_turn = closed_task_ids(&storage, &scope, scope_id.as_deref())
+                let mut closed_before_turn = closed_task_ids(&storage, &scope, scope_id.as_deref())
                     .await
                     .unwrap_or_default();
 
@@ -554,13 +782,21 @@ impl ControlPlane {
                 }
 
                 live.on_planning();
-                let plan = planner
+                let mut plan = planner
                     .plan(&content_owned, context.as_deref(), Some(&run_handle.cancel))
                     .await;
+                // Reconcile BEFORE mutating: one task per contradicted
+                // outcome, at the head of the plan (seeding is in plan order
+                // and sorts strictly below every existing item, so the head
+                // is genuinely first). Whatever the planner proposed to
+                // change about that subject now runs after the verdict that
+                // says which side's evidence holds.
+                prepend_reconciliation_tasks(&mut plan, &conflicts);
                 tracing::info!(
                     session_id = %session_id_owned,
                     tasks = plan.tasks.len(),
                     origin = ?plan.origin,
+                    reconciliations = conflicts.len(),
                     "planned a chat turn"
                 );
 
@@ -736,55 +972,251 @@ impl ControlPlane {
                         // and if it did, the loop below is allowed to ask whether
                         // more remains. It is a cheap question — the dry-round
                         // counter closes it out after two empty rounds.
-                        // Say how the run ended, always. Every exit produces a report
-                        // and it was simply discarded, so recovering WHY a run stopped
-                        // took a database query. It should take a grep.
+                        // Say how the FIRST run ended, always. Every exit
+                        // produces a report and it was simply discarded, so
+                        // recovering why took a database query. It should
+                        // take a grep. This line is deliberately NOT the
+                        // turn's terminal line — it fires before the
+                        // continuation loop, so a mission that ran twenty
+                        // rounds would otherwise be described by round one's
+                        // numbers. The cumulative terminal line is
+                        // `chat harness mission finished`, emitted once at
+                        // loop exit below; exactly one line per turn says the
+                        // MISSION finished.
                         tracing::info!(
                             stop = ?report.stop,
                             steps = report.steps_taken,
                             tool_calls = report.tool_calls,
                             items = report.items_completed,
                             false_success = report.false_success_claims,
-                            "chat harness run finished"
+                            "chat harness first run finished"
                         );
 
-                        let is_mission =
+                        // Run evidence: did this run ACT? See the reasoning
+                        // above — a conversational turn answers from the
+                        // model's head and calls no tools.
+                        let run_evidence =
                             ids.len() > 1 || report.steps_taken > 1 || report.tool_calls > 0;
                         let mut error_rounds = 0usize;
                         let mut dry_rounds = 0usize;
                         let mut continuations = 0usize;
-                        while is_mission
-                            && {
+                        // The loop's own verdict, set wherever the loop
+                        // DECIDES to stop. `None` means one of the plain
+                        // conjuncts below ended it, and the tail derives the
+                        // cause from the counters.
+                        let mut mission_end: Option<MissionEnd> = None;
+                        // A stop is charged to the error budget EXACTLY ONCE.
+                        // `report.stop` is only replaced when a round runs; the
+                        // planner-fallback path `continue`s without running one,
+                        // so the same stop was re-matched and re-charged on the
+                        // next iteration — observed live, error_rounds jumping
+                        // 2→4 across one 30-second round, halving a budget that
+                        // is supposed to buy three real retries.
+                        let mut stop_charged = false;
+                        // The newest provider-health verdict, so the ending can
+                        // say "the provider is unreachable" instead of "the run
+                        // keeps failing" when those are different facts.
+                        let mut last_probe: Option<ProviderProbe> = None;
+                        // A round cut short by a provider fault leaves its tool
+                        // effects on disk while the transcript shows none of
+                        // them. The next round plans against that gap unless it
+                        // is told — the same re-anchor the step ladder appends
+                        // on its own retries ([`crate::tasks::transient_retry_note`]),
+                        // carried one round forward and dropped the moment a
+                        // round completes cleanly.
+                        let mut transient_note: Option<String> = None;
+                        // The verified state the last reseed was armed against
+                        // — a later reseed needs CHANGED evidence, which is
+                        // what makes one reseed per distinct wall terminate.
+                        let mut reseed_fingerprint: Option<u64> = None;
+                        while {
                                 use nanna_agent::harness::StopReason;
                                 match report.stop {
-                                    StopReason::AllTasksDone => true,
+                                    // A completed plan continues only on RUN
+                                    // evidence: a conversational turn the
+                                    // turn-start planner deliberately answered
+                                    // without touching anything must not
+                                    // auto-resume work it chose to defer.
+                                    StopReason::AllTasksDone => run_evidence,
                                     // Transient: the store hiccuped or the model
                                     // failed a few times in a row. Worth another
                                     // round, but bounded so a hard fault cannot spin.
                                     StopReason::SourceError { .. } | StopReason::RunnerErrors { .. } => {
-                                        error_rounds += 1;
-                                        if error_rounds <= CONTINUATION_ERROR_ROUNDS {
-                                            tracing::warn!(
-                                                stop = ?report.stop,
-                                                round = error_rounds,
-                                                "run ended on an error — retrying rather than                                              abandoning the mission"
-                                            );
+                                        // A CRASHED run proves nothing about
+                                        // whether a mission exists: it may have
+                                        // died before its first step. So the
+                                        // mission test here also consults the
+                                        // store — open items in this scope are
+                                        // work someone planned and nobody
+                                        // finished, which is exactly what the
+                                        // error budget exists to get back to.
+                                        let open_items = storage
+                                            .tasks()
+                                            .counts(&scope, scope_id.as_deref())
+                                            .await
+                                            .map_or(0, |(open, _closed)| open);
+                                        let mission = run_evidence || open_items > 0;
+                                        tracing::info!(
+                                            run_evidence,
+                                            open_items,
+                                            mission,
+                                            stop = ?report.stop,
+                                            "error-stop mission test"
+                                        );
+                                        if !mission {
+                                            false
+                                        } else if stop_charged {
+                                            // Already paid for; the loop is
+                                            // simply coming back around.
                                             true
                                         } else {
-                                            tracing::error!(
-                                                stop = ?report.stop,
-                                                "run keeps failing — giving up after {} error rounds",
-                                                CONTINUATION_ERROR_ROUNDS
-                                            );
-                                            false
+                                            // An error round is the budget for
+                                            // "the run keeps failing while the
+                                            // provider is up". Spending it on a
+                                            // provider that is DOWN buys the
+                                            // mission nothing but a faster
+                                            // give-up: three rounds of 30-second
+                                            // planner timeouts burned the whole
+                                            // budget in a minute. So charge it
+                                            // against evidence, not the clock.
+                                            let health = provider_answers(
+                                                &step_runner.router,
+                                                &step_runner.agent_config.model,
+                                            )
+                                            .await;
+                                            error_rounds += 1;
+                                            stop_charged = true;
+                                            last_probe = Some(health.clone());
+                                            // Transient faults are the ones that
+                                            // cut a step mid-flight; a run that
+                                            // failed for any other reason has no
+                                            // orphaned effects to warn about.
+                                            if let Some(msg) = stop_message(&report.stop)
+                                                && crate::tasks::is_transient_llm_error(&msg)
+                                            {
+                                                transient_note =
+                                                    Some(crate::tasks::transient_retry_note(
+                                                        error_rounds,
+                                                        crate::tasks::transient_fault_kind(&msg),
+                                                    ));
+                                            }
+                                            if error_rounds <= CONTINUATION_ERROR_ROUNDS {
+                                                tracing::warn!(
+                                                    stop = ?report.stop,
+                                                    round = error_rounds,
+                                                    provider_answered = health.answered,
+                                                    probe_secs = health.elapsed_secs,
+                                                    "run ended on an error — retrying rather \
+                                                     than abandoning the mission"
+                                                );
+                                                true
+                                            } else {
+                                                tracing::error!(
+                                                    stop = ?report.stop,
+                                                    error_rounds,
+                                                    budget = CONTINUATION_ERROR_ROUNDS,
+                                                    provider_answered = health.answered,
+                                                    "the error budget is spent — giving up"
+                                                );
+                                                mission_end = Some(giveup_end(
+                                                    &report,
+                                                    Some(&health),
+                                                    MissionEnd::ErrorRoundsExhausted,
+                                                ));
+                                                false
+                                            }
                                         }
                                     }
                                     // Deliberate: the user stopped it, or the budget
                                     // is genuinely spent. Do not paper over these.
+                                    // The tail names the cause from the stop
+                                    // itself, so nothing is set here.
                                     _ => false,
                                 }
                             }
-                            && dry_rounds < CONTINUATION_DRY_ROUNDS
+                            && (dry_rounds < CONTINUATION_DRY_ROUNDS || {
+                                // ONE fresh-context reseed before a dry ending
+                                // that would walk away from checks the
+                                // environment says still FAIL.
+                                //
+                                // "Dry" means re-planning found nothing left to
+                                // do. When walked-away done-conditions are
+                                // still failing, that is not what happened:
+                                // the run went blind. The verified wedge was a
+                                // run-scoped byte-identity breaker
+                                // short-circuiting the run's own reads of its
+                                // own artifact, so the model could no longer
+                                // SEE what it had built and re-planning had
+                                // nothing to plan against. A fresh runner
+                                // (clean breaker ledger, clean tool
+                                // discovery), a re-read of the artifact and a
+                                // re-based dedup baseline restore turn-start
+                                // conditions inside the same run — while
+                                // verified outcomes and cumulative accounting
+                                // are KEPT, because the knowledge is not what
+                                // went stale.
+                                //
+                                // Armed at most once per DISTINCT verified
+                                // state: reaching the dry terminal again with
+                                // the same failing checks and the same verdicts
+                                // ends the run exactly as today. Total rounds
+                                // stay bounded by CONTINUATION_ROUNDS_MAX; no
+                                // new constant exists.
+                                let fingerprint = verified_state_fingerprint(&report);
+                                if report.abandoned_unmet.is_empty()
+                                    || reseed_fingerprint == Some(fingerprint)
+                                {
+                                    false
+                                } else {
+                                    reseed_fingerprint = Some(fingerprint);
+                                    step_runner = fresh_step_runner(&step_runner);
+                                    closed_before_turn =
+                                        closed_task_ids(&storage, &scope, scope_id.as_deref())
+                                            .await
+                                            .unwrap_or_default();
+                                    if let Some(ref baselines) = turn_baselines {
+                                        baselines
+                                            .open_turn(
+                                                &scope,
+                                                scope_id.as_deref(),
+                                                closed_before_turn.clone(),
+                                            )
+                                            .await;
+                                    }
+                                    let rows =
+                                        established_rows(&storage, &scope, scope_id.as_deref())
+                                            .await;
+                                    let artifact =
+                                        artifact_state_block(artifact_root.as_deref(), &rows).await;
+                                    standing_context = [
+                                        conversation.clone(),
+                                        artifact,
+                                        conflict_block.clone(),
+                                        established_work_context(&rows),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    .collect();
+                                    dry_rounds = 0;
+                                    tracing::warn!(
+                                        continuations,
+                                        unmet = report.abandoned_unmet.len(),
+                                        "re-planning came up empty while done-conditions still \
+                                         FAIL — reseeding the run from a fresh context instead \
+                                         of ending dry"
+                                    );
+                                    final_sink.delta(&format!(
+                                        "\n\n_re-planning came up empty, but {} done-condition{} \
+                                         still FAIL, so this is not a finish. Starting over from \
+                                         a fresh context — clean tool discovery and a re-read of \
+                                         the artifact on disk — while keeping everything already \
+                                         verified. Nothing was undone; disk is truth._\n\n",
+                                        report.abandoned_unmet.len(),
+                                        if report.abandoned_unmet.len() == 1 { "" } else { "s" },
+                                    ));
+                                    true
+                                }
+                            })
                             && continuations < CONTINUATION_ROUNDS_MAX
                             && !run_handle.cancel.is_cancelled()
                         {
@@ -809,7 +1241,7 @@ impl ControlPlane {
                                      plan a different approach to each):"
                                         .to_string(),
                                 ];
-                                for u in report.abandoned_unmet.iter().take(5) {
+                                for u in report.abandoned_unmet.iter().take(UNMET_SHOWN_MAX) {
                                     lines.push(format!(
                                         "- #{} {}: {}",
                                         u.id, u.title, u.detail
@@ -826,17 +1258,21 @@ impl ControlPlane {
                             // discovering its own progress.
                             let established_block =
                                 established_block(&report.verified_outcomes);
-                            let ctx = [
-                                conversation.as_deref(),
-                                outstanding.as_deref(),
-                                established_block.as_deref(),
-                                unmet_block.as_deref(),
-                            ]
-                            .iter()
-                            .flatten()
-                            .copied()
-                            .collect::<Vec<_>>()
-                            .join("\n\n");
+                            // The turn-start facts (conversation, ARTIFACT
+                            // STATE, any claim conflict, what earlier turns
+                            // proved) ride EVERY planning call in the turn,
+                            // not just the first — a continuation planner that
+                            // cannot see the artifact plans as if it were not
+                            // there.
+                            let ctx = {
+                                let mut parts: Vec<&str> =
+                                    standing_context.iter().map(String::as_str).collect();
+                                parts.extend(outstanding.as_deref());
+                                parts.extend(established_block.as_deref());
+                                parts.extend(unmet_block.as_deref());
+                                parts.extend(transient_note.as_deref());
+                                parts.join("\n\n")
+                            };
                             let ctx = Some(ctx).filter(|c| !c.is_empty());
                             let next_plan = planner
                                 .plan(&content_owned, ctx.as_deref(), Some(&run_handle.cancel))
@@ -883,27 +1319,86 @@ impl ControlPlane {
                                 // an ERROR round: bounded by the error budget,
                                 // never proof the goal is done.
                                 if next_plan.origin == nanna_agent::planner::PlanOrigin::Fallback {
+                                    // Charge it against the same evidence the
+                                    // stop-match charge uses: a planner that
+                                    // cannot speak because the provider is
+                                    // unreachable is not a planner that keeps
+                                    // failing, and the ending must be able to
+                                    // tell the user which one happened.
+                                    let health = provider_answers(
+                                        &step_runner.router,
+                                        &step_runner.agent_config.model,
+                                    )
+                                    .await;
                                     error_rounds += 1;
+                                    last_probe = Some(health.clone());
                                     tracing::warn!(
                                         continuations,
                                         error_rounds,
+                                        provider_answered = health.answered,
+                                        probe_secs = health.elapsed_secs,
                                         "continuation planner fell back and seeded nothing — \
                                          counting an error round, not a dry one"
                                     );
                                     if error_rounds > CONTINUATION_ERROR_ROUNDS {
                                         tracing::error!(
-                                            "continuation planner keeps falling back — giving up \
-                                             after {} error rounds",
-                                            CONTINUATION_ERROR_ROUNDS
+                                            continuations,
+                                            error_rounds,
+                                            budget = CONTINUATION_ERROR_ROUNDS,
+                                            provider_answered = health.answered,
+                                            "continuation planner keeps falling back — planning \
+                                             starved, giving up"
                                         );
+                                        mission_end = Some(giveup_end(
+                                            &report,
+                                            Some(&health),
+                                            MissionEnd::PlannerStarvation,
+                                        ));
                                         break;
                                     }
+                                    continue;
+                                }
+                                // A round that planned nothing is only DRY when
+                                // the environment agrees the goal is met. Its
+                                // sibling below has always known this; this
+                                // branch did not, so a mission whose walked-away
+                                // done-conditions were still FAILING could end
+                                // "dry" — declaring victory over its own
+                                // evidence. Reopening the standing wall is the
+                                // action the invariant implies: the item goes
+                                // back to pending BY ID (never re-seeded by
+                                // title — the closed-title dedup eats that) so
+                                // the next round targets the stored failing
+                                // verdict instead of re-planning blind.
+                                //
+                                // The round is then charged to ROUNDS_MAX, not
+                                // to the two-strike dry budget, exactly as the
+                                // post-round unmet branch charges it. Once every
+                                // unmet item is ALREADY open, reopening changes
+                                // nothing and the round falls through to dry
+                                // accounting below — which is what makes this
+                                // terminate.
+                                let reopened = reopen_top_unmet(
+                                    &storage,
+                                    &report.abandoned_unmet,
+                                )
+                                .await;
+                                if let Some((id, title)) = reopened {
+                                    tracing::warn!(
+                                        continuations,
+                                        item = id,
+                                        %title,
+                                        "round planned nothing but this item's done-condition \
+                                         still FAILS — reopening it rather than calling the \
+                                         mission dry"
+                                    );
                                     continue;
                                 }
                                 dry_rounds += 1;
                                 tracing::info!(
                                     continuations,
                                     dry_rounds,
+                                    unmet = report.abandoned_unmet.len(),
                                     "mission continuation planned no new work"
                                 );
                                 continue;
@@ -933,8 +1428,22 @@ impl ControlPlane {
                             // and replan subtasks are outside the set for the same
                             // reason: the pre-check may only skip what the
                             // continuation planner just re-proposed.
+                            //
+                            // And while a claim conflict is UNRESOLVED, the
+                            // pre-check is suspended entirely for the turn: a
+                            // disputed pass is not established knowledge, so
+                            // "the done-condition already passes" is exactly
+                            // the sentence the user just contradicted. Closing
+                            // on it would settle the argument in favour of the
+                            // side nobody re-checked. Suspension costs one
+                            // step per re-proposal and only on turns where the
+                            // user reported something broken.
                             let round_config = LongHorizonConfig {
-                                precheck_acceptance_items: seeded.iter().copied().collect(),
+                                precheck_acceptance_items: if conflicts.is_empty() {
+                                    seeded.iter().copied().collect()
+                                } else {
+                                    std::collections::HashSet::new()
+                                },
                                 ..config.clone()
                             };
                             let runner = nanna_agent::harness::LongHorizonRunner::new(round_config);
@@ -1050,11 +1559,95 @@ impl ControlPlane {
                                 report.last_runner_error = more.last_runner_error;
                             }
                             report.stop = more.stop;
+                            // A NEW run failure is a new charge; the guard only
+                            // exists to stop one failure being billed twice.
+                            stop_charged = false;
+                            // The round that just ran saw the re-anchor; whatever
+                            // it did is in the transcript now, so the warning has
+                            // done its job and must not repeat.
+                            transient_note = None;
                         }
 
+                        // ONE cumulative terminal line per user turn, at the
+                        // single site every exit path crosses. Non-mission
+                        // turns cross it too (continuations = 0, cause =
+                        // single_run), so "how did that turn end" is always
+                        // exactly one grep — `mission finished` — and never a
+                        // database query.
+                        let mission_end = mission_end.unwrap_or_else(|| {
+                            if !run_evidence {
+                                MissionEnd::SingleRun
+                            } else if run_handle.cancel.is_cancelled() {
+                                MissionEnd::Cancelled
+                            } else if dry_rounds >= CONTINUATION_DRY_ROUNDS {
+                                MissionEnd::DryRoundsExhausted
+                            } else if continuations >= CONTINUATION_ROUNDS_MAX {
+                                MissionEnd::RoundsMaxExhausted
+                            } else {
+                                MissionEnd::DeliberateStop(stop_kind(&report.stop))
+                            }
+                        });
+                        let exit_cause = mission_end.cause();
+                        tracing::info!(
+                            session_id = %session_id_owned,
+                            exit_cause = %exit_cause,
+                            stop = ?report.stop,
+                            continuations,
+                            dry_rounds,
+                            error_rounds,
+                            steps = report.steps_taken,
+                            tool_calls = report.tool_calls,
+                            side_effect_tool_calls = report.side_effect_tool_calls,
+                            items_completed = report.items_completed,
+                            items_abandoned = report.items_abandoned,
+                            interjected_items = report.interjected_items,
+                            unmet = report.abandoned_unmet.len(),
+                            acceptance_unknown = report.acceptance_unknown,
+                            "chat harness mission finished"
+                        );
+                        turn_exit_cause = Some(exit_cause);
+
                         // The ledger records the FINAL round's verdict — the
-                        // stop the user actually experienced.
+                        // stop the user actually experienced. The turn's own
+                        // exit cause rides beside it (see `MissionEnd`), so a
+                        // starved mission is no longer indistinguishable from
+                        // a converged one.
                         turn_stop_kind = stop_kind(&report.stop);
+
+                        // Park a transient outage rather than demoting the
+                        // session's work to "gave up": the run is registered
+                        // with the shared registry so a later recovery can
+                        // pick it back up, and the ending SAYS so.
+                        if let MissionEnd::ParkedTransient(ref why) = mission_end {
+                            registry
+                                .park(
+                                    &session_id_owned,
+                                    ParkedTurn {
+                                        scope: scope.clone(),
+                                        scope_id: scope_id.clone(),
+                                        model: step_runner.agent_config.model.clone(),
+                                        goal: content_owned.clone(),
+                                        error_rounds,
+                                        resumes: resumed_from_park,
+                                        reason: why.clone(),
+                                        parked_at: chrono::Utc::now().to_rfc3339(),
+                                    },
+                                )
+                                .await;
+                            // The park is only half a promise until something
+                            // watches for the recovery it names. One waiter per
+                            // park, and the waiting IS the probe: a provider
+                            // that is down cannot answer inside the transport's
+                            // own silence window, so the probe's latency is the
+                            // retry cadence — no polling interval to pick.
+                            spawn_park_waiter(
+                                Arc::clone(&this),
+                                Arc::clone(&registry),
+                                session_id_owned.clone(),
+                                step_runner.router.clone(),
+                                step_runner.agent_config.model.clone(),
+                            );
+                        }
 
                         // A run that failed must SAY it failed. Poison
                         // containment can drain the whole plan through
@@ -1070,6 +1663,18 @@ impl ControlPlane {
                                 last_runner_error = report.last_runner_error.as_deref(),
                                 "chat run failed — surfacing the reason in the transcript"
                             );
+                            final_sink.delta(&notice);
+                        }
+
+                        // …and a MISSION that ended without finishing must say
+                        // WHY, with the evidence it already holds. The
+                        // failure notice above only fires on an error-shaped
+                        // stop, so the planner-starvation give-up — whose
+                        // `report.stop` still reads `AllTasksDone` — used to
+                        // surface nothing at all: the run simply stopped.
+                        if let Some(notice) =
+                            mission_end_notice(&report, &mission_end, last_probe.as_ref())
+                        {
                             final_sink.delta(&notice);
                         }
 
@@ -1114,7 +1719,7 @@ impl ControlPlane {
             // nothing to show for it is the most corrosive shape the product
             // has. This delta runs before the transcript is persisted below,
             // so the escalation is part of the assistant message itself.
-            if let Some(repeats) = live.finish_turn(&turn_stop_kind) {
+            if let Some(repeats) = live.finish_turn(&turn_stop_kind, turn_exit_cause.as_deref()) {
                 tracing::warn!(
                     session_id = %session_id_owned,
                     repeats,
@@ -1261,7 +1866,9 @@ impl ControlPlane {
             // Close the liveness ledger too, or the beat task would keep
             // beating for a turn that no longer exists. `crashed` also gives
             // the `session.liveness` verb an honest stop state.
-            let _ = watcher_live.finish_turn("crashed");
+            // No exit cause: the turn never reached the continuation loop's
+            // exit, and `crashed` already says everything known.
+            let _ = watcher_live.finish_turn("crashed", None);
         });
 
         // P22 liveness beat: while this turn is in flight, say so — in the
@@ -1355,6 +1962,317 @@ fn stop_kind(stop: &nanna_agent::harness::StopReason) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The message an ERROR stop carries, if any. Deliberate stops carry none.
+fn stop_message(stop: &nanna_agent::harness::StopReason) -> Option<&str> {
+    use nanna_agent::harness::StopReason;
+    match stop {
+        StopReason::RunnerErrors { message } | StopReason::SourceError { message } => {
+            Some(message.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// What one probe of the run's provider found.
+#[derive(Debug, Clone)]
+struct ProviderProbe {
+    model: String,
+    /// The provider produced a completion — it is up, whatever the run did.
+    answered: bool,
+    elapsed_secs: u64,
+    error: Option<String>,
+}
+
+/// Ask the run's own model for the smallest possible completion: is the
+/// provider ANSWERING right now?
+///
+/// An error round is the budget for "the run keeps failing while the provider
+/// is up". Spending it on a provider that is DOWN buys the mission nothing —
+/// observed live, three fallback rounds of planner timeouts consumed the whole
+/// budget inside a minute and the turn gave up on a mission whose only problem
+/// was an unreachable endpoint. So each round is charged against evidence:
+/// the probe says which of "the provider is unreachable" and "the run keeps
+/// failing" actually happened, and the ending says the right one.
+///
+/// Bounds — both existing, neither new:
+/// - the deadline is [`nanna_llm::STREAM_READ_TIMEOUT_SECS`], the transport's
+///   OWN declared silence tolerance. A provider that cannot deliver a single
+///   token inside the window the transport already refuses to wait past is
+///   not answering by the daemon's existing definition. It also paces the
+///   give-up honestly: an outage now costs a full transport window per error
+///   round instead of a 30-second planner timeout, so the budget is spent
+///   over minutes of demonstrated silence rather than seconds.
+/// - `max_tokens: 1` — the question is "does it answer", not "what does it
+///   say", and one token is the smallest answer that exists.
+///
+/// Side benefit: a successful probe re-warms a model that a runner reset
+/// unloaded (`keep_alive = 0`), so the next planning call is not spent on a
+/// cold load — part of the observed fallback cascade was self-inflicted.
+///
+/// Never returns an error: a probe that cannot run IS the "not answering"
+/// verdict.
+/// Watch one parked turn until its provider answers again, then resume it.
+///
+/// The park's own promise ("this resumes when the provider is back") is only
+/// true if something is waiting, and the wait must cost what the evidence
+/// costs: [`provider_answers`] returns in about a second when the provider is
+/// up and holds for the transport's own silence window when it is down, so the
+/// probe IS the retry cadence — there is no interval to invent, and a healthy
+/// provider is never polled after the first answer.
+///
+/// A resume re-enters through the ordinary turn path, so the resumed work sees
+/// exactly what a user-sent continuation would: established context, the
+/// artifact-state preamble, and the scope's still-open items. The park's
+/// `resumes` count rides along and is bounded by the same
+/// [`CONTINUATION_ERROR_ROUNDS`] brake that bounds error rounds, so a flapping
+/// provider cannot loop forever.
+fn spawn_park_waiter(
+    control: Arc<super::ControlPlane>,
+    registry: Arc<ChatRunRegistry>,
+    session_id: String,
+    router: Arc<crate::llm_router::LlmRouter>,
+    model: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            // The park may have been claimed by a user message in the
+            // meantime — that turn already carries the work forward.
+            if !registry.is_parked(&session_id).await {
+                return;
+            }
+            let probe = provider_answers(&router, &model).await;
+            if !probe.answered {
+                continue;
+            }
+            let Some(park) = registry.clear_park(&session_id).await else {
+                return;
+            };
+            if park.resumes >= CONTINUATION_ERROR_ROUNDS {
+                tracing::warn!(
+                    session_id = %session_id,
+                    model = %model,
+                    resumes = park.resumes,
+                    "parked turn has already been resumed as often as the error \
+                     budget allows — leaving it for the user"
+                );
+                return;
+            }
+            tracing::info!(
+                session_id = %session_id,
+                model = %model,
+                resumes = park.resumes + 1,
+                probe_secs = probe.elapsed_secs,
+                "provider answered again — resuming the parked turn"
+            );
+            registry.note_resume(&session_id, park.resumes + 1).await;
+            if let Err(e) = control.run_chat_turn(&session_id, &park.goal).await {
+                tracing::warn!(session_id = %session_id, error = %e, "parked turn could not resume");
+            }
+            return;
+        }
+    });
+}
+
+async fn provider_answers(
+    router: &Arc<crate::llm_router::LlmRouter>,
+    model: &str,
+) -> ProviderProbe {
+    let started = std::time::Instant::now();
+    let mut probe = ProviderProbe {
+        model: model.to_string(),
+        answered: false,
+        elapsed_secs: 0,
+        error: None,
+    };
+    let Some(client) = router.client_for_model(model) else {
+        probe.error = Some(format!("no provider serves model '{model}'"));
+        return probe;
+    };
+    let request = nanna_llm::CompletionRequest {
+        model: crate::llm_router::LlmRouter::strip_model_prefix(model),
+        messages: vec![nanna_llm::Message::user("ok")],
+        max_tokens: Some(1),
+        ..Default::default()
+    };
+    let deadline = std::time::Duration::from_secs(nanna_llm::STREAM_READ_TIMEOUT_SECS);
+    match tokio::time::timeout(deadline, client.complete(&request)).await {
+        Ok(Ok(_)) => probe.answered = true,
+        Ok(Err(error)) => probe.error = Some(error.to_string()),
+        Err(_) => {
+            probe.error = Some(format!(
+                "no answer within the transport's {}s silence tolerance",
+                nanna_llm::STREAM_READ_TIMEOUT_SECS
+            ));
+        }
+    }
+    probe.elapsed_secs = started.elapsed().as_secs();
+    probe
+}
+
+/// Terminal give-up, or a PARK?
+///
+/// A mission whose budget ran out against a provider that is demonstrably
+/// down has not failed — it is waiting, and calling that "gave up" is the one
+/// give-up that is a lie. The evidence is the same classification the step
+/// runner heals on ([`crate::tasks::is_transient_llm_error`]) plus the health
+/// probe: either the recorded fault is a transient transport class, or the
+/// probe found the provider unreachable. Anything else keeps today's terminal
+/// give-up unchanged.
+fn giveup_end(
+    report: &nanna_agent::harness::LongHorizonReport,
+    probe: Option<&ProviderProbe>,
+    terminal: MissionEnd,
+) -> MissionEnd {
+    let recorded = stop_message(&report.stop)
+        .map(str::to_string)
+        .or_else(|| report.last_runner_error.clone())
+        .unwrap_or_default();
+    let transient_fault = crate::tasks::is_transient_llm_error(&recorded);
+    let provider_down = probe.is_some_and(|p| !p.answered);
+    if !transient_fault && !provider_down {
+        return terminal;
+    }
+    let model = probe.map_or("the configured model", |p| p.model.as_str());
+    let detail = probe
+        .and_then(|p| p.error.clone())
+        .or(Some(recorded))
+        .filter(|d| !d.is_empty())
+        .map(|d| format!(" ({d})"))
+        .unwrap_or_default();
+    MissionEnd::ParkedTransient(format!("{model} stopped answering{detail}"))
+}
+
+/// Put the top standing wall back on the board.
+///
+/// Returns the reopened item when one actually MOVED (it was closed and is
+/// now pending). An item already open is not reopened — nothing changed, and
+/// reporting a change that did not happen is how a loop stops terminating.
+/// Reopening is by ID on purpose: re-seeding the title would be swallowed by
+/// the closed-title dedup, which is exactly why the failing verdict went
+/// unread in the first place.
+async fn reopen_top_unmet(
+    storage: &Arc<Storage>,
+    unmet: &[nanna_agent::harness::AbandonedUnmet],
+) -> Option<(i64, String)> {
+    for item in unmet {
+        let Ok(task) = storage.tasks().get(item.id).await else {
+            continue;
+        };
+        if task.status != "done" && task.status != "cancelled" {
+            continue;
+        }
+        match storage.tasks().reopen(item.id, Some("chat")).await {
+            Ok(reopened) => return Some((reopened.id, reopened.title)),
+            Err(message) => {
+                tracing::warn!(
+                    item = item.id,
+                    %message,
+                    "could not reopen a standing unmet item"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Standing walls, rendered for a human: at most [`UNMET_SHOWN_MAX`] of them,
+/// with the environment's own verdict.
+const UNMET_SHOWN_MAX: usize = 5;
+
+/// One sentence saying HOW a mission ended and on what evidence — the
+/// user-visible sibling of [`failure_notice`].
+///
+/// `failure_notice` only fires on an error-shaped stop, so the endings that
+/// most need explaining surfaced nothing: the planner-starvation give-up
+/// keeps `report.stop == AllTasksDone`, and a dry ending that left failing
+/// checks behind read as a clean finish. Both are the same product failure —
+/// a run that stops and does not say why.
+///
+/// Deliberately quiet for the two endings that need no sentence:
+/// - a CANCEL was asked for;
+/// - a mission that converged with nothing failing, nothing unknown and
+///   nothing abandoned has an honest ending already (the run-stats line), and
+///   a "stopping:" banner on every ordinary chat turn that happened to read a
+///   file would be noise, not honesty.
+fn mission_end_notice(
+    report: &nanna_agent::harness::LongHorizonReport,
+    end: &MissionEnd,
+    probe: Option<&ProviderProbe>,
+) -> Option<String> {
+    let unresolved = !report.abandoned_unmet.is_empty()
+        || report.acceptance_unknown > 0
+        || report.items_abandoned > 0;
+    // A give-up always speaks. Anything else speaks only when it left
+    // something unresolved behind — a converged mission is already described
+    // by the run-stats line, and a "stopping:" banner on every ordinary chat
+    // turn that happened to read a file would be noise, not honesty.
+    if !end.gave_up() && !unresolved {
+        return None;
+    }
+    let why = match end {
+        MissionEnd::SingleRun | MissionEnd::Cancelled => return None,
+        MissionEnd::DryRoundsExhausted => {
+            "re-planning found no new work, but the evidence below is still unmet".to_string()
+        }
+        MissionEnd::RoundsMaxExhausted => format!(
+            "the mission ran its full budget of {CONTINUATION_ROUNDS_MAX} planning rounds"
+        ),
+        MissionEnd::ErrorRoundsExhausted => {
+            // Two different facts, and the ending must not conflate them.
+            match probe {
+                Some(p) if !p.answered => format!(
+                    "the provider stopped answering — '{}' produced nothing in {}s",
+                    p.model, p.elapsed_secs
+                ),
+                _ => format!(
+                    "runs kept failing across {CONTINUATION_ERROR_ROUNDS} error rounds while \
+                     the provider was answering"
+                ),
+            }
+        }
+        MissionEnd::PlannerStarvation => format!(
+            "planning starved — the planner fell back and proposed nothing for \
+             {CONTINUATION_ERROR_ROUNDS} rounds, so the goal is NOT verified complete"
+        ),
+        MissionEnd::ParkedTransient(reason) => format!(
+            "{reason}. The work is PARKED, not abandoned: it resumes when that provider \
+             answers again, or the moment you send another message"
+        ),
+        MissionEnd::DeliberateStop(kind) => format!("the run stopped: {kind}"),
+    };
+
+    let mut out = format!(
+        "\n\n_stopping — {why}. {} item{} verified done, {} check{} still failing",
+        report.items_completed,
+        if report.items_completed == 1 { "" } else { "s" },
+        report.abandoned_unmet.len(),
+        if report.abandoned_unmet.len() == 1 { "" } else { "s" },
+    );
+    if report.acceptance_unknown > 0 {
+        out.push_str(&format!(
+            ", {} check{} timed out without a verdict (UNKNOWN, not failed)",
+            report.acceptance_unknown,
+            if report.acceptance_unknown == 1 { "" } else { "s" },
+        ));
+    }
+    // Verified work is on disk and stays there — say so, so a stopped
+    // mission is never mistaken for a rolled-back one.
+    out.push_str(". The work already verified stands — disk is truth._");
+    if !report.abandoned_unmet.is_empty() {
+        out.push_str("\n\n_Still unmet:_");
+        for item in report.abandoned_unmet.iter().take(UNMET_SHOWN_MAX) {
+            out.push_str(&format!("\n_· #{} {}: {}_", item.id, item.title, item.detail));
+        }
+        if report.abandoned_unmet.len() > UNMET_SHOWN_MAX {
+            out.push_str(&format!(
+                "\n_· …and {} more_",
+                report.abandoned_unmet.len() - UNMET_SHOWN_MAX
+            ));
+        }
+    }
+    Some(out)
+}
+
 /// The user-visible line for a run that ended in failure, or `None` when the
 /// ending needs no announcement (success, or a deliberate stop like Cancelled
 /// or an exhausted budget — those were asked for).
@@ -1409,10 +2327,6 @@ fn failure_notice(report: &nanna_agent::harness::LongHorizonReport) -> Option<St
 /// knowledge mirror of the `UNMET WORK` block. Bounded like
 /// [`open_work_context`]: enough to inform, never to displace the request.
 fn established_block(verified: &[nanna_agent::harness::VerifiedOutcome]) -> Option<String> {
-    /// Same bound and rationale as `OPEN_WORK_MAX`: convey what is known
-    /// without displacing the request; newest facts win.
-    const ESTABLISHED_MAX: usize = 10;
-
     if verified.is_empty() {
         return None;
     }
@@ -1430,35 +2344,53 @@ fn established_block(verified: &[nanna_agent::harness::VerifiedOutcome]) -> Opti
     Some(lines.join("\n"))
 }
 
+/// Bound for every block this module injects into the planner's context.
+///
+/// Same rationale wherever it is used: convey what is known without
+/// displacing the request itself. The planner clamps its WHOLE context slot
+/// to [`PLAN_GOAL_MAX_BYTES`] and the clamp cuts the tail, so an unbounded
+/// block does not add information — it deletes whatever came after it.
+/// Newest facts win the bounded slots and every cut announces itself.
+const ESTABLISHED_MAX: usize = 10;
+
+/// One closed item's verdict, read back from the store.
+///
+/// The rows are read ONCE per turn and consumed by every block that needs
+/// them ([`established_work_context`], [`artifact_state_block`],
+/// [`claim_conflicts`]) — three readers, one query set.
+#[derive(Debug, Clone)]
+pub(crate) struct EstablishedRow {
+    pub id: i64,
+    pub title: String,
+    /// The completion verdict's text, when the completion was verified.
+    pub verdict: Option<String>,
+    /// RFC3339 completion time, empty when the store recorded none.
+    pub when: String,
+    /// The machine-checkable done-condition the item closed on, verbatim —
+    /// the check a disputed claim has to be reconciled against.
+    pub acceptance: Option<Value>,
+}
+
 /// What earlier turns in this scope PROVED done — closed items with their
-/// completion verdicts, read back from the store at turn start. This is the
-/// continuation context that makes a driver/user re-send after a
-/// self-terminated run CONTINUE the mission instead of restarting it: the
-/// verdicts name the commands that passed and when, i.e. the artifact state
-/// the environment last confirmed.
-async fn established_work_context(
+/// completion verdicts, read back from the store at turn start.
+///
+/// Newest completions first: the freshest verdicts describe the current
+/// artifact best. Bounded by [`ESTABLISHED_MAX`], with one bounded activity
+/// query per shown row.
+pub(crate) async fn established_rows(
     storage: &Arc<Storage>,
     scope: &str,
     scope_id: Option<&str>,
-) -> Option<String> {
-    /// Same bound and rationale as `OPEN_WORK_MAX` below.
-    const ESTABLISHED_MAX: usize = 10;
-
-    let all = storage.tasks().list(scope, scope_id, true).await.ok()?;
+) -> Vec<EstablishedRow> {
+    let Ok(all) = storage.tasks().list(scope, scope_id, true).await else {
+        return Vec::new();
+    };
     let mut done: Vec<_> = all.iter().filter(|t| t.status == "done").collect();
     if done.is_empty() {
-        return None;
+        return Vec::new();
     }
-    // Newest completions first: the freshest verdicts describe the current
-    // artifact best.
     done.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
-    let mut out = String::from(
-        "## Verified done in earlier work this session\n\
-         These closed with their done-condition PASSING (the verdict shows what the \
-         environment confirmed, and when). Do not redo or re-assess them — continue \
-         from this state:\n",
-    );
-    let mut shown = 0usize;
+    let mut rows = Vec::with_capacity(done.len().min(ESTABLISHED_MAX));
     for task in done.iter().take(ESTABLISHED_MAX) {
         // The completion verdict lives in the task's activity log (action
         // "completed", detail {verified, verdict}). One bounded query per
@@ -1476,31 +2408,442 @@ async fn established_work_context(
                 }),
             Err(_) => None,
         };
-        let title = if task.title.len() > 120 {
-            let end = task.title.floor_char_boundary(120);
-            format!("{}…", &task.title[..end])
-        } else {
-            task.title.clone()
-        };
-        let when = task.completed_at.as_deref().unwrap_or("");
-        match verdict {
-            Some(v) => {
-                let v = if v.len() > 200 {
-                    format!("{}…", &v[..v.floor_char_boundary(200)])
-                } else {
-                    v
-                };
-                out.push_str(&format!("- #{} {title} — verified {when}: {v}\n", task.id));
-            }
-            // Unverified completions are still state, marked as such.
-            None => out.push_str(&format!("- #{} {title} — closed {when} (unverified)\n", task.id)),
-        }
-        shown += 1;
+        rows.push(EstablishedRow {
+            id: task.id,
+            title: clamp_display(&task.title, 120),
+            verdict: verdict.map(|v| clamp_display(&v, 200)),
+            when: task.completed_at.clone().unwrap_or_default(),
+            acceptance: task.acceptance.clone(),
+        });
     }
-    if done.len() > shown {
-        out.push_str(&format!("- …and {} more closed earlier\n", done.len() - shown));
+    rows
+}
+
+/// Clamp a stored string for display, announcing the cut.
+fn clamp_display(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    format!("{}…", &text[..text.floor_char_boundary(max)])
+}
+
+/// Render [`established_rows`] as the turn-start knowledge block. This is the
+/// continuation context that makes a driver/user re-send after a
+/// self-terminated run CONTINUE the mission instead of restarting it: the
+/// verdicts name the commands that passed and when, i.e. the artifact state
+/// the environment last confirmed.
+fn established_work_context(rows: &[EstablishedRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "## Verified done in earlier work this session\n\
+         These closed with their done-condition PASSING (the verdict shows what the \
+         environment confirmed, and when). Do not redo or re-assess them — continue \
+         from this state:\n",
+    );
+    for row in rows {
+        let title = &row.title;
+        let when = &row.when;
+        match &row.verdict {
+            Some(v) => out.push_str(&format!("- #{} {title} — verified {when}: {v}\n", row.id)),
+            // Unverified completions are still state, marked as such.
+            None => out.push_str(&format!("- #{} {title} — closed {when} (unverified)\n", row.id)),
+        }
     }
     Some(out)
+}
+
+/// The workspace-local ledger every write tool ratchets against
+/// (`write_file`, `edit_file`, `file_buffer`, `exec`). Its entries are
+/// `{hi, last, at, good?, goodAt?, chk?}` keyed by the canonical
+/// workspace-relative path — one file, one entry (P22 Tier 3).
+const HIWATER_LEDGER: &str = ".nanna/write_hiwater.json";
+
+/// ARTIFACT STATE — what exists on disk RIGHT NOW, re-read at turn start.
+///
+/// The failure this closes: a continuation turn's planner was told what had
+/// been *done* (verdicts) but never what *existed*, so the model planned as
+/// if the workspace were empty and rebuilt files it had already built —
+/// losing the parts it did not remember. Prose about past work is not a
+/// substitute for the artifact, and the model's own memory of what it wrote
+/// is exactly the thing under suspicion.
+///
+/// Two halves, both ground truth, both rebuilt (never appended to) per turn:
+/// 1. every file the write ratchet is tracking, with a FRESH `stat` (the
+///    ledger records what a write left; only the stat says what is there
+///    now) plus the ledger's own high-water and last structurally-good
+///    sizes;
+/// 2. the scope's verified verdicts — the same rows
+///    [`established_work_context`] renders, so one store read serves both.
+///
+/// Bounds: [`ESTABLISHED_MAX`] entries, newest-written first, with the cut
+/// announced. Every entry cost a real write and every verdict cost a real
+/// execution, so the block's size is evidence-derived; the cap exists only
+/// because the planner's context slot is itself clamped and an unbounded
+/// block would silently delete the request.
+///
+/// Fails open at every step: no workspace, no ledger, unreadable ledger, or
+/// a file that has since been deleted each degrade to less content, never to
+/// an error.
+pub(crate) async fn artifact_state_block(
+    workspace_root: Option<&std::path::Path>,
+    established: &[EstablishedRow],
+) -> Option<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut tracked = 0usize;
+    if let Some(root) = workspace_root {
+        let raw = tokio::fs::read_to_string(root.join(HIWATER_LEDGER))
+            .await
+            .unwrap_or_default();
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) {
+            // Newest-written first: the freshest entries describe the work
+            // this turn is continuing.
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| {
+                let at = |v: &Value| v.get("at").and_then(Value::as_i64).unwrap_or(0);
+                at(b.1).cmp(&at(a.1))
+            });
+            tracked = entries.len();
+            for (key, entry) in entries.iter().take(ESTABLISHED_MAX) {
+                let path = root.join(key.as_str());
+                let (size, modified) = match tokio::fs::metadata(&path).await {
+                    Ok(meta) => (
+                        Some(meta.len()),
+                        meta.modified().ok().map(|t| {
+                            chrono::DateTime::<chrono::Utc>::from(t)
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        }),
+                    ),
+                    Err(_) => (None, None),
+                };
+                let mut line = match size {
+                    Some(bytes) => format!("- {key} — {bytes} bytes on disk"),
+                    // Tracked but gone: that IS the state, and saying it is
+                    // how a rebuild becomes a decision instead of an accident.
+                    None => format!("- {key} — NOT PRESENT on disk right now"),
+                };
+                if let Some(when) = modified {
+                    line.push_str(&format!(", last modified {when}"));
+                }
+                if let Some(hi) = entry.get("hi").and_then(Value::as_u64) {
+                    line.push_str(&format!("; largest version this session {hi} bytes"));
+                }
+                if let Some(good) = entry.get("good").and_then(Value::as_u64) {
+                    line.push_str(&format!(
+                        "; last version that passed a structural check {good} bytes"
+                    ));
+                    if let Some(at) = entry.get("goodAt").and_then(Value::as_i64) {
+                        line.push_str(&format!(" (at {at})"));
+                    }
+                }
+                if let Some(chk) = entry.get("chk").and_then(Value::as_str) {
+                    line.push_str(&format!("; latest check verdict: {chk}"));
+                }
+                files.push(line);
+            }
+        }
+    }
+
+    let verified: Vec<String> = established
+        .iter()
+        .filter_map(|row| {
+            row.verdict
+                .as_ref()
+                .map(|v| format!("- #{} {} — verified {}: {v}", row.id, row.title, row.when))
+        })
+        .collect();
+
+    if files.is_empty() && verified.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("## ARTIFACT STATE (re-read from disk at the start of this turn)\n");
+    if !files.is_empty() {
+        out.push_str(
+            "These files hold verified work: read before writing; extend, do not reconstruct.\n",
+        );
+        out.push_str(&files.join("\n"));
+        out.push('\n');
+        if tracked > files.len() {
+            out.push_str(&format!(
+                "- …and {} more tracked file(s) not shown\n",
+                tracked - files.len()
+            ));
+        }
+    }
+    if !verified.is_empty() {
+        out.push_str(
+            "These done-conditions were VERIFIED by execution — the outcome and when it was \
+             last confirmed:\n",
+        );
+        out.push_str(&verified.join("\n"));
+        out.push('\n');
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Claim conflict: the user says it is broken, the environment said it passed
+// ---------------------------------------------------------------------------
+
+/// Phrases in which a user ASSERTS that something is failing.
+///
+/// Deliberately small and literal: this list only decides whether to LOOK for
+/// a contradiction, and a message that does not assert failure changes
+/// nothing at all. Substring matching on the lowercased message covers the
+/// inflections ("fail" covers fails/failed/failing) without a stemmer.
+const FAILURE_ASSERTIONS: &[&str] = &[
+    "fail",
+    "broken",
+    "broke",
+    "doesn't work",
+    "does not work",
+    "not working",
+    "no longer works",
+    "stopped working",
+    "regress",
+    "crash",
+];
+
+/// A user claim that CONTRADICTS a verdict the environment already rendered.
+#[derive(Debug, Clone)]
+pub(crate) struct ClaimConflict {
+    pub task_id: i64,
+    pub title: String,
+    pub verdict: String,
+    pub when: String,
+    /// The identity in the user's message that named the disputed subject —
+    /// a file or path the verified check itself referenced.
+    pub subject: String,
+    /// The disputed done-condition, so the reconciliation task re-runs the
+    /// SAME check under the existing acceptance ceiling.
+    pub acceptance: Option<Value>,
+}
+
+/// Keep only path-like identities: a token that names a FILE or a path.
+///
+/// Bare words are not identities — matching "test" or "build" against a
+/// user's sentence would fire on half of English, and a false conflict costs
+/// a real reproduction step. A dot or a slash is the cheap, conservative
+/// evidence that a token names something on disk.
+fn push_identity(out: &mut Vec<String>, raw: &str) {
+    let keep = |c: char| c.is_alphanumeric() || matches!(c, '.' | '/' | '_' | '-');
+    let token = raw.trim_matches(|c: char| !keep(c)).to_ascii_lowercase();
+    if token.len() < 4 || !(token.contains('.') || token.contains('/')) {
+        return;
+    }
+    if !token.chars().any(char::is_alphanumeric) {
+        return;
+    }
+    if !out.contains(&token) {
+        out.push(token);
+    }
+}
+
+/// Every on-disk identity a closed item's evidence names: from its verdict
+/// text, from the done-condition it closed on, and from its title.
+fn identity_tokens(row: &EstablishedRow) -> Vec<String> {
+    fn scan(text: &str, out: &mut Vec<String>) {
+        let split = |c: char| {
+            c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | ',' | ';' | ':' | '|')
+        };
+        for part in text.split(split) {
+            push_identity(out, part);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(verdict) = &row.verdict {
+        scan(verdict, &mut out);
+    }
+    if let Some(acceptance) = &row.acceptance {
+        for field in ["command", "path"] {
+            if let Some(text) = acceptance.get(field).and_then(Value::as_str) {
+                scan(text, &mut out);
+            }
+        }
+    }
+    scan(&row.title, &mut out);
+    out
+}
+
+/// Does this message assert the failure of something the environment already
+/// verified passing?
+///
+/// Conservative by construction, in both directions: the message must assert
+/// a failure AND name an identity the verified check itself referenced. No
+/// match means today's behaviour, unchanged — this is not a filter on
+/// ordinary chat, it is a detector for the one case where two pieces of
+/// evidence disagree.
+///
+/// At most one conflict per SUBJECT: the same file named by two closed items
+/// is one argument, not two, and the bound is therefore the evidence held —
+/// no cap of its own.
+fn claim_conflicts(message: &str, rows: &[EstablishedRow]) -> Vec<ClaimConflict> {
+    let lower = message.to_ascii_lowercase();
+    if !FAILURE_ASSERTIONS.iter().any(|a| lower.contains(a)) {
+        return Vec::new();
+    }
+    let mut out: Vec<ClaimConflict> = Vec::new();
+    for row in rows {
+        let Some(verdict) = row.verdict.as_deref() else {
+            continue;
+        };
+        let Some(subject) = identity_tokens(row)
+            .into_iter()
+            .find(|token| lower.contains(token.as_str()))
+        else {
+            continue;
+        };
+        if out.iter().any(|c| c.subject == subject) {
+            continue;
+        }
+        out.push(ClaimConflict {
+            task_id: row.id,
+            title: row.title.clone(),
+            verdict: verdict.to_string(),
+            when: row.when.clone(),
+            subject,
+            acceptance: row.acceptance.clone(),
+        });
+    }
+    out
+}
+
+/// The planner-facing rendering of a claim conflict: BOTH sides, named, with
+/// neither presumed right.
+fn claim_conflict_block(conflicts: &[ClaimConflict]) -> Option<String> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "## CLAIM-CONFLICT — two pieces of evidence disagree\n\
+         The message reports a failure of work this session VERIFIED passing. Neither side \
+         is assumed right. Reproduce first, then reconcile: plan the reproduction BEFORE any \
+         task that changes the subject, and do not rewrite the artifact on the strength of \
+         whichever account was heard last.\n",
+    );
+    for conflict in conflicts {
+        out.push_str(&format!(
+            "- `{}`: the message reports it failing. Verified PASSING {} by #{} {} — {}\n",
+            conflict.subject, conflict.when, conflict.task_id, conflict.title, conflict.verdict,
+        ));
+    }
+    Some(out)
+}
+
+/// Put one reproduction/reconciliation task at the HEAD of the plan for each
+/// contradicted outcome.
+///
+/// Seeding is in plan order and sorts strictly below every existing item, so
+/// the head really is first: whatever the planner proposed to change about
+/// that subject now runs after the verdict that says which side's evidence
+/// holds. The task carries the DISPUTED check as its own acceptance, so the
+/// re-run happens through the shipped acceptance machinery and its existing
+/// timeout ceiling — no new runner, no new bound.
+fn prepend_reconciliation_tasks(
+    plan: &mut nanna_agent::planner::Plan,
+    conflicts: &[ClaimConflict],
+) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let mut head: Vec<nanna_agent::planner::PlannedTask> = Vec::with_capacity(conflicts.len());
+    for conflict in conflicts {
+        let description = format!(
+            "The message reports that `{subject}` is FAILING. A check run in this session \
+             recorded it PASSING: {verdict} (verified {when}, item #{id} \"{title}\").\n\n\
+             Do NOT change `{subject}` or anything it depends on in this task. This task's \
+             only product is a VERDICT about which piece of evidence holds, and WHY they \
+             differ.\n\n\
+             1. Re-run the disputed check exactly as recorded, in a fresh scratch directory \
+             under the workspace — follow the described steps and order when any were given, \
+             otherwise the check's own command.\n\
+             2. Note the provenance of each file the check references that resolves on disk: \
+             its current size and modification time, whether it changed since {when}, and \
+             (when a `.__prev__` copy sits beside it) how it differs. Note the working \
+             directory and any environment the check depends on.\n\
+             3. Say plainly which side reproduced. If the failure reproduces, that is the \
+             standing verdict and the fix proceeds from it. If it does NOT reproduce, report \
+             BOTH pieces of evidence and ask ONE clarifying question — rewriting an artifact \
+             on an unreproduced report is how verified work gets destroyed.",
+            subject = conflict.subject,
+            verdict = conflict.verdict,
+            when = conflict.when,
+            id = conflict.task_id,
+            title = conflict.title,
+        );
+        head.push(nanna_agent::planner::PlannedTask {
+            title: format!(
+                "Reproduce the reported failure of {} before changing it",
+                conflict.subject
+            ),
+            description: Some(nanna_agent::planner::clamp_bytes(
+                &description,
+                PLAN_DESCRIPTION_MAX_BYTES,
+            )),
+            acceptance: conflict.acceptance.clone(),
+            tool_scope: Vec::new(),
+        });
+    }
+    head.append(&mut plan.tasks);
+    plan.tasks = head;
+}
+
+/// The run's verified state, as one order-stable value: which checks are
+/// standing walls and what every verdict currently says.
+///
+/// The reseed rung arms once per DISTINCT value. If a reseed produces no
+/// change in what the environment says, the next dry terminal ends the run
+/// exactly as today — which is what keeps "do not end dry while your checks
+/// still fail" terminating rather than looping.
+fn verified_state_fingerprint(report: &nanna_agent::harness::LongHorizonReport) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    let mut unmet: Vec<(i64, &str)> = report
+        .abandoned_unmet
+        .iter()
+        .map(|u| (u.id, u.detail.as_str()))
+        .collect();
+    unmet.sort_unstable();
+    unmet.hash(&mut hasher);
+    let mut verified: Vec<(i64, &str)> = report
+        .verified_outcomes
+        .iter()
+        .map(|v| (v.id, v.detail.as_str()))
+        .collect();
+    verified.sort_unstable();
+    verified.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A step runner with the SAME configuration and RESET run-scoped state.
+///
+/// What resets is what went stale: the byte-identity breaker ledger (which
+/// had been short-circuiting the run's own re-reads of its own artifact, so
+/// the model could no longer see what it had built) and tool discovery. What
+/// carries is what is still true: the provider, the tools, the prompt, the
+/// workspace, the transcript sink, the memory sink, and the GPU fault tally —
+/// a hardware fault is a fact about the machine, not about the context.
+fn fresh_step_runner(previous: &AgentStepRunner) -> AgentStepRunner {
+    AgentStepRunner {
+        discovered_tools: Arc::new(tokio::sync::RwLock::new(
+            std::collections::HashSet::new(),
+        )),
+        repeat_ledger: Arc::new(nanna_agent::RepeatLedger::new()),
+        router: previous.router.clone(),
+        tools: previous.tools.clone(),
+        agent_config: previous.agent_config.clone(),
+        system_prompt: previous.system_prompt.clone(),
+        workspace_root: previous.workspace_root.clone(),
+        workspace_context: previous.workspace_context.clone(),
+        stats: previous.stats.clone(),
+        chat_sink: previous.chat_sink.clone(),
+        memory: previous.memory.clone(),
+        workspace_id: previous.workspace_id.clone(),
+        gpu_fault_count: previous.gpu_fault_count.clone(),
+        degradations: previous.degradations.clone(),
+    }
 }
 
 async fn open_work_context(
@@ -1804,6 +3147,433 @@ mod tests {
         }
     }
 
+    fn unmet(id: i64, detail: &str) -> nanna_agent::harness::AbandonedUnmet {
+        nanna_agent::harness::AbandonedUnmet {
+            id,
+            title: format!("feature {id}"),
+            detail: detail.to_string(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Exit honesty: one cause, one line, one sentence
+    // ------------------------------------------------------------------
+
+    /// Every exit cause has a distinct, greppable wire spelling, and the
+    /// underlying stop stays visible on the deliberate one.
+    #[test]
+    fn mission_end_causes_are_distinct_and_greppable() {
+        let causes = [
+            MissionEnd::SingleRun.cause(),
+            MissionEnd::Cancelled.cause(),
+            MissionEnd::DryRoundsExhausted.cause(),
+            MissionEnd::RoundsMaxExhausted.cause(),
+            MissionEnd::ErrorRoundsExhausted.cause(),
+            MissionEnd::PlannerStarvation.cause(),
+            MissionEnd::ParkedTransient("ollama down".into()).cause(),
+            MissionEnd::DeliberateStop("wall_clock_exhausted".into()).cause(),
+        ];
+        let unique: std::collections::HashSet<&String> = causes.iter().collect();
+        assert_eq!(unique.len(), causes.len(), "{causes:?}");
+        assert_eq!(causes[7], "deliberate_stop:wall_clock_exhausted");
+        // A give-up is never silently indistinguishable from a finish.
+        assert!(MissionEnd::PlannerStarvation.gave_up());
+        assert!(MissionEnd::ErrorRoundsExhausted.gave_up());
+        assert!(!MissionEnd::SingleRun.gave_up());
+        assert!(!MissionEnd::DryRoundsExhausted.gave_up());
+    }
+
+    /// The planner-starvation ending is the one `failure_notice` cannot see:
+    /// `report.stop` still reads `AllTasksDone`, so today it surfaced nothing
+    /// at all. It must now say the goal is NOT complete, name the standing
+    /// walls, and keep the verified work standing.
+    #[test]
+    fn planner_starvation_announces_itself_with_its_evidence() {
+        let mut r = report(StopReason::AllTasksDone, 12, 4, 2, None);
+        r.abandoned_unmet = vec![unmet(7, "`sh tests/test_07.sh` exited 1")];
+        r.acceptance_unknown = 2;
+        assert!(
+            failure_notice(&r).is_none(),
+            "this is exactly the ending the failure notice cannot see"
+        );
+        let notice = mission_end_notice(&r, &MissionEnd::PlannerStarvation, None)
+            .expect("a starved mission must say so");
+        assert!(notice.contains("planning starved"), "{notice}");
+        assert!(notice.contains("NOT verified complete"), "{notice}");
+        assert!(notice.contains("4 items verified done"), "{notice}");
+        assert!(notice.contains("1 check still failing"), "{notice}");
+        assert!(notice.contains("2 checks timed out"), "{notice}");
+        assert!(notice.contains("disk is truth"), "{notice}");
+        assert!(notice.contains("#7 feature 7: `sh tests/test_07.sh` exited 1"), "{notice}");
+    }
+
+    /// Chat generality: an ordinary turn that happened to call a tool and then
+    /// converged must NOT grow a "stopping:" banner. The sentence is for
+    /// endings that left something unresolved or gave up.
+    #[test]
+    fn a_clean_ending_stays_a_plain_reply() {
+        let clean = report(StopReason::AllTasksDone, 2, 1, 0, None);
+        assert!(mission_end_notice(&clean, &MissionEnd::SingleRun, None).is_none());
+        assert!(mission_end_notice(&clean, &MissionEnd::DryRoundsExhausted, None).is_none());
+        // A cancel was asked for — never dressed up as a fault.
+        let mut cancelled = report(StopReason::Cancelled, 3, 0, 1, None);
+        cancelled.abandoned_unmet = vec![unmet(1, "exit 1")];
+        assert!(mission_end_notice(&cancelled, &MissionEnd::Cancelled, None).is_none());
+        // …but a dry ending that walked away from a failing check speaks up.
+        let mut dry = report(StopReason::AllTasksDone, 5, 2, 1, None);
+        dry.abandoned_unmet = vec![unmet(3, "`cargo test` exited 101")];
+        let notice = mission_end_notice(&dry, &MissionEnd::DryRoundsExhausted, None)
+            .expect("failing checks make an ending loud");
+        assert!(notice.contains("still unmet") || notice.contains("still failing"), "{notice}");
+    }
+
+    /// "The provider is unreachable" and "the run keeps failing" are different
+    /// facts, and the ending must not conflate them.
+    #[test]
+    fn error_round_ending_distinguishes_outage_from_a_failing_run() {
+        let r = report(
+            StopReason::RunnerErrors { message: "API error: 500".into() },
+            3,
+            0,
+            1,
+            Some("API error: 500"),
+        );
+        let down = ProviderProbe {
+            model: "ollama/qwen3.5:9b".to_string(),
+            answered: false,
+            elapsed_secs: 120,
+            error: Some("no answer".to_string()),
+        };
+        let notice = mission_end_notice(&r, &MissionEnd::ErrorRoundsExhausted, Some(&down))
+            .expect("an exhausted error budget announces itself");
+        assert!(notice.contains("provider stopped answering"), "{notice}");
+        assert!(notice.contains("ollama/qwen3.5:9b"), "{notice}");
+
+        let up = ProviderProbe { answered: true, ..down.clone() };
+        let notice = mission_end_notice(&r, &MissionEnd::ErrorRoundsExhausted, Some(&up))
+            .expect("still announces itself");
+        assert!(notice.contains("while the provider was answering"), "{notice}");
+    }
+
+    /// A transient fault is a PARK, not a give-up; a deterministic one keeps
+    /// today's terminal ending.
+    #[test]
+    fn transient_giveups_park_and_hard_ones_do_not() {
+        let transient = report(
+            StopReason::RunnerErrors { message: "API error: 502 bad gateway".into() },
+            2,
+            0,
+            1,
+            None,
+        );
+        let end = giveup_end(&transient, None, MissionEnd::ErrorRoundsExhausted);
+        assert!(matches!(end, MissionEnd::ParkedTransient(_)), "{end:?}");
+        let notice = mission_end_notice(&transient, &end, None).expect("a park announces itself");
+        assert!(notice.contains("PARKED, not abandoned"), "{notice}");
+        assert!(notice.contains("resumes when that provider answers"), "{notice}");
+
+        let hard = report(
+            StopReason::RunnerErrors { message: "API error: 400 - context length exceeded".into() },
+            2,
+            0,
+            1,
+            None,
+        );
+        assert_eq!(
+            giveup_end(&hard, None, MissionEnd::ErrorRoundsExhausted),
+            MissionEnd::ErrorRoundsExhausted,
+            "a deterministic fault is not a park"
+        );
+
+        // An unreachable provider parks even when the recorded fault is not
+        // itself transport-shaped: the probe is the newer evidence.
+        let probe = ProviderProbe {
+            model: "ollama/qwen3.5:9b".to_string(),
+            answered: false,
+            elapsed_secs: 120,
+            error: Some("no answer within the transport's 120s silence tolerance".to_string()),
+        };
+        assert!(matches!(
+            giveup_end(&hard, Some(&probe), MissionEnd::ErrorRoundsExhausted),
+            MissionEnd::ParkedTransient(_)
+        ));
+    }
+
+    /// A crashed run proves nothing about whether a mission exists. Store
+    /// evidence — open items nobody finished — grants the error rounds; an
+    /// empty store forfeits them.
+    #[tokio::test]
+    async fn error_rounds_follow_session_state_not_just_run_evidence() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let open_items = |storage: Arc<Storage>| async move {
+            storage
+                .tasks()
+                .counts("session", Some("s1"))
+                .await
+                .map_or(0, |(open, _closed)| open)
+        };
+        // RunnerErrors with steps=0, tool_calls=0 and an empty store: no
+        // mission, no rounds.
+        let run_evidence = false;
+        assert_eq!(open_items(storage.clone()).await, 0);
+        assert!(
+            !(run_evidence || open_items(storage.clone()).await > 0),
+            "a run that seeded nothing still gets zero rounds"
+        );
+
+        storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                scope: "session".to_string(),
+                scope_id: Some("s1".to_string()),
+                title: "Implement DEL".to_string(),
+                priority: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("seed");
+        assert_eq!(open_items(storage.clone()).await, 1);
+        assert!(
+            run_evidence || open_items(storage.clone()).await > 0,
+            "a crashed run that seeded work it never touched still holds a mission"
+        );
+    }
+
+    /// The dry branch that seeded nothing must consult the failing evidence
+    /// exactly like its sibling: reopen the standing wall by ID (a re-seeded
+    /// title is eaten by the closed-title dedup), and stop reopening once
+    /// nothing moves — which is what makes the guard terminate.
+    #[tokio::test]
+    async fn a_standing_unmet_item_is_reopened_by_id_exactly_once() {
+        let storage = Arc::new(Storage::in_memory().await.expect("storage"));
+        let task = storage
+            .tasks()
+            .create(nanna_storage::NewTask {
+                scope: "session".to_string(),
+                scope_id: Some("s1".to_string()),
+                title: "Implement test_07".to_string(),
+                priority: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("seed");
+        storage
+            .tasks()
+            .complete(task.id, Some("test"), None)
+            .await
+            .expect("close");
+
+        let walls = vec![unmet(task.id, "`sh tests/test_07.sh` exited 1")];
+        let first = reopen_top_unmet(&storage, &walls).await;
+        assert_eq!(first.as_ref().map(|(id, _)| *id), Some(task.id));
+        assert_eq!(
+            storage.tasks().get(task.id).await.expect("read back").status,
+            "pending"
+        );
+        assert!(
+            reopen_top_unmet(&storage, &walls).await.is_none(),
+            "an already-open item is not reopened again — the loop must terminate"
+        );
+        // Nothing to reopen at all is also quiet.
+        assert!(reopen_top_unmet(&storage, &[]).await.is_none());
+    }
+
+    /// One reseed per DISTINCT verified state: the fingerprint changes when
+    /// the environment's verdicts change, and only then.
+    #[test]
+    fn reseed_fingerprint_tracks_the_environments_verdicts() {
+        let mut a = report(StopReason::AllTasksDone, 1, 0, 1, None);
+        a.abandoned_unmet = vec![unmet(1, "exit 1"), unmet(2, "exit 2")];
+        let mut reordered = a.clone();
+        reordered.abandoned_unmet.reverse();
+        assert_eq!(
+            verified_state_fingerprint(&a),
+            verified_state_fingerprint(&reordered),
+            "order is not evidence"
+        );
+        let mut moved = a.clone();
+        moved.abandoned_unmet[0].detail = "exit 0".to_string();
+        assert_ne!(
+            verified_state_fingerprint(&a),
+            verified_state_fingerprint(&moved),
+            "a changed verdict is changed evidence — a later reseed is armed"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Claim conflict
+    // ------------------------------------------------------------------
+
+    fn verified_row(id: i64, title: &str, verdict: &str, command: &str) -> EstablishedRow {
+        EstablishedRow {
+            id,
+            title: title.to_string(),
+            verdict: Some(verdict.to_string()),
+            when: "2026-08-14T10:00:00Z".to_string(),
+            acceptance: Some(json!({ "kind": "command", "command": command })),
+        }
+    }
+
+    #[test]
+    fn a_contradicted_pass_is_detected_and_only_a_contradicted_one() {
+        let rows = vec![verified_row(
+            12,
+            "Implement SET and GET",
+            "`sh tests/test_02.sh` exited 0 — ok",
+            "sh tests/test_02.sh",
+        )];
+        // Asserts failure AND names the verified subject.
+        let hit = claim_conflicts("tests/test_02.sh is failing again", &rows);
+        assert_eq!(hit.len(), 1, "{hit:?}");
+        assert_eq!(hit[0].subject, "tests/test_02.sh");
+        assert_eq!(hit[0].task_id, 12);
+
+        // Names the subject but asserts nothing — ordinary chat.
+        assert!(claim_conflicts("what does tests/test_02.sh cover?", &rows).is_empty());
+        // Asserts failure about something else entirely.
+        assert!(claim_conflicts("the deploy script is broken", &rows).is_empty());
+        // No verdict on the row: nothing to contradict.
+        let unverified = vec![EstablishedRow {
+            verdict: None,
+            ..rows[0].clone()
+        }];
+        assert!(claim_conflicts("tests/test_02.sh is failing", &unverified).is_empty());
+    }
+
+    /// Bare words are not identities: "test" or "build" would fire on half of
+    /// English, and a false conflict costs a real reproduction step.
+    #[test]
+    fn only_path_like_identities_can_collide() {
+        let rows = vec![verified_row(3, "Build it", "`cargo build` exited 0", "cargo build")];
+        assert!(
+            claim_conflicts("the build is broken", &rows).is_empty(),
+            "a bare word must never be treated as an on-disk identity"
+        );
+        let rows = vec![verified_row(
+            4,
+            "Write the config",
+            "`src/config.rs` exists",
+            "test -f src/config.rs",
+        )];
+        assert_eq!(claim_conflicts("src/config.rs is broken", &rows).len(), 1);
+    }
+
+    /// The conflict renders BOTH sides, and the reconciliation task lands at
+    /// the HEAD of the plan carrying the disputed check as its own acceptance.
+    #[test]
+    fn reconciliation_is_planned_before_any_mutation() {
+        use nanna_agent::planner::{Plan, PlannedTask};
+
+        let rows = vec![verified_row(
+            12,
+            "Implement SET and GET",
+            "`sh tests/test_02.sh` exited 0 — ok",
+            "sh tests/test_02.sh",
+        )];
+        let conflicts = claim_conflicts("tests/test_02.sh fails now", &rows);
+        let block = claim_conflict_block(&conflicts).expect("a conflict renders");
+        assert!(block.contains("CLAIM-CONFLICT"), "{block}");
+        assert!(block.contains("tests/test_02.sh"), "{block}");
+        assert!(block.contains("`sh tests/test_02.sh` exited 0"), "{block}");
+        assert!(block.contains("Reproduce first"), "{block}");
+
+        let mut plan = Plan {
+            tasks: vec![PlannedTask {
+                title: "Rewrite tests/test_02.sh handling in the parser".to_string(),
+                description: None,
+                acceptance: None,
+                tool_scope: Vec::new(),
+            }],
+            origin: nanna_agent::planner::PlanOrigin::Model,
+        };
+        prepend_reconciliation_tasks(&mut plan, &conflicts);
+        assert_eq!(plan.tasks.len(), 2);
+        assert!(plan.tasks[0].title.starts_with("Reproduce the reported failure"));
+        assert_eq!(
+            plan.tasks[0].acceptance,
+            Some(json!({ "kind": "command", "command": "sh tests/test_02.sh" })),
+            "the reconciliation re-runs the DISPUTED check through the shipped machinery"
+        );
+        let description = plan.tasks[0].description.as_deref().expect("a protocol");
+        assert!(description.contains("Do NOT change"), "{description}");
+        assert!(description.contains("ask ONE clarifying question"), "{description}");
+        assert!(plan.tasks[1].title.starts_with("Rewrite"), "the mutation still runs, second");
+
+        // No conflict, no change at all.
+        let mut untouched = plan.clone();
+        let before = untouched.clone();
+        prepend_reconciliation_tasks(&mut untouched, &[]);
+        assert_eq!(untouched, before);
+    }
+
+    // ------------------------------------------------------------------
+    // Artifact state
+    // ------------------------------------------------------------------
+
+    /// The headline block: ground truth re-read from disk, under the contract
+    /// sentence, with the ledger's own evidence beside a FRESH stat.
+    #[tokio::test]
+    async fn artifact_state_reads_the_ledger_and_stats_the_files() {
+        let root = std::env::temp_dir().join(format!("nanna-artifact-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join(".nanna")).await.expect("mkdir");
+        tokio::fs::write(root.join("minidb.sh"), "echo hi\n").await.expect("write");
+        tokio::fs::write(
+            root.join(HIWATER_LEDGER),
+            serde_json::to_string(&json!({
+                "minidb.sh": {
+                    "hi": 4096, "last": 8, "at": 200,
+                    "good": 3335, "goodAt": 190, "chk": "ok",
+                },
+                "gone.sh": { "hi": 12, "last": 12, "at": 100 },
+            }))
+            .expect("json"),
+        )
+        .await
+        .expect("write ledger");
+
+        let rows = vec![verified_row(
+            5,
+            "Implement SET",
+            "`sh tests/test_02.sh` exited 0",
+            "sh tests/test_02.sh",
+        )];
+        let block = artifact_state_block(Some(root.as_path()), &rows)
+            .await
+            .expect("a tracked workspace renders");
+        assert!(block.contains("ARTIFACT STATE"), "{block}");
+        assert!(
+            block.contains("read before writing; extend, do not reconstruct"),
+            "the contract sentence IS the point: {block}"
+        );
+        // Fresh stat, not the ledger's `last`.
+        assert!(block.contains("minidb.sh — 8 bytes on disk"), "{block}");
+        assert!(block.contains("last modified"), "{block}");
+        assert!(block.contains("largest version this session 4096 bytes"), "{block}");
+        assert!(block.contains("structural check 3335 bytes"), "{block}");
+        assert!(block.contains("latest check verdict: ok"), "{block}");
+        // Newest-written first, and a tracked file that is gone says so.
+        assert!(
+            block.find("minidb.sh").unwrap() < block.find("gone.sh").unwrap(),
+            "{block}"
+        );
+        assert!(block.contains("gone.sh — NOT PRESENT on disk"), "{block}");
+        // The verdict half rides along.
+        assert!(block.contains("#5 Implement SET — verified"), "{block}");
+
+        // Fails open everywhere: no workspace, no ledger, no evidence.
+        assert!(artifact_state_block(None, &[]).await.is_none());
+        assert!(
+            artifact_state_block(Some(root.join("nope").as_path()), &[])
+                .await
+                .is_none(),
+            "an unreadable ledger degrades to no block, never to an error"
+        );
+        // …but stored verdicts alone still render.
+        assert!(artifact_state_block(None, &rows).await.is_some());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     /// P22: verified outcomes render as the planner's ESTABLISHED block —
     /// each fact with its id, title and the environment's verdict — bounded
     /// with an announced overflow, newest first.
@@ -1836,8 +3606,7 @@ mod tests {
     async fn established_work_context_reads_verdicts_back_from_the_store() {
         let storage = Arc::new(Storage::in_memory().await.unwrap());
         assert!(
-            established_work_context(&storage, "session", Some("s1"))
-                .await
+            established_work_context(&established_rows(&storage, "session", Some("s1")).await)
                 .is_none(),
             "nothing closed, no block"
         );
@@ -1877,9 +3646,9 @@ mod tests {
             .await
             .unwrap();
 
-        let block = established_work_context(&storage, "session", Some("s1"))
-            .await
-            .expect("a verified completion must render");
+        let rows = established_rows(&storage, "session", Some("s1")).await;
+        let block =
+            established_work_context(&rows).expect("a verified completion must render");
         assert!(block.contains("Verified done in earlier work"));
         assert!(block.contains("Implement SET and GET"));
         assert!(

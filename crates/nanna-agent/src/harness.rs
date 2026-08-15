@@ -48,6 +48,18 @@ pub const ACCEPTANCE_READ_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// memory, not the window.
 pub const STEP_RESULT_TAIL_MAX_BYTES: usize = 2000;
 
+/// Chars of an acceptance command's own output kept on the verdict, at each
+/// end.
+///
+/// Bound justification: this is the width the verdict detail has always used
+/// for its output tail — one paragraph, enough to identify what the command
+/// said without reproducing it (the full output is the command's to print
+/// again, and re-running it is one `exec`). The HEAD is kept as well because
+/// the two ends answer different questions: a test harness names WHAT it ran
+/// first and WHETHER it passed last, and a completion record that carries
+/// only the last line cannot say which artifact was verified.
+pub const ACCEPTANCE_OUTPUT_EXCERPT_CHARS: usize = 400;
+
 // ---------------------------------------------------------------------------
 // Acceptance checks
 // ---------------------------------------------------------------------------
@@ -103,6 +115,24 @@ pub struct AcceptanceVerdict {
     /// 20 of its checks passing.)
     #[serde(default)]
     pub timed_out: bool,
+    /// The verdict was DEMOTED to unknown because the evidence it reads
+    /// changed since this check was last baselined.
+    ///
+    /// Semantically identical to [`Self::timed_out`] everywhere a budget, a
+    /// completion, or a fail→pass flip is decided — the check answered a
+    /// question about inputs that are no longer the inputs it was verified
+    /// against, so it says nothing about the work. It is emphatically NOT a
+    /// hang: no hang finding is minted, the re-stake cap is not armed, and the
+    /// next run of the check (against the re-baselined evidence) decides
+    /// normally. See [`EvidenceGuard`].
+    #[serde(default)]
+    pub evidence_changed: bool,
+    /// First [`ACCEPTANCE_OUTPUT_EXCERPT_CHARS`] of what the check's command
+    /// actually printed, when it ran one. `detail` carries the TAIL; this is
+    /// the head, so a stored completion record names the artifact the command
+    /// was talking about and not just its last line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_head: Option<String>,
 }
 
 impl AcceptanceVerdict {
@@ -111,6 +141,8 @@ impl AcceptanceVerdict {
             passed: true,
             detail,
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         }
     }
 
@@ -119,6 +151,8 @@ impl AcceptanceVerdict {
             passed: false,
             detail,
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         }
     }
 
@@ -127,7 +161,45 @@ impl AcceptanceVerdict {
             passed: false,
             detail,
             timed_out: true,
+            evidence_changed: false,
+            output_head: None,
         }
+    }
+
+    /// Attach the head of the command's own output.
+    fn with_output_head(mut self, combined: &str) -> Self {
+        let head = text_head(combined.trim_start(), ACCEPTANCE_OUTPUT_EXCERPT_CHARS).trim();
+        if !head.is_empty() {
+            self.output_head = Some(head.to_string());
+        }
+        self
+    }
+
+    /// Did the check fail to say anything about the work — because it hung, or
+    /// because its evidence moved under it?
+    ///
+    /// Unknown is not failure. Every caller that must not treat a silent check
+    /// as a verdict tests THIS, so a new way of being silent can never be
+    /// mistaken for a failing verdict by a site that only knew about hangs.
+    #[must_use]
+    pub const fn is_unknown(&self) -> bool {
+        self.timed_out || self.evidence_changed
+    }
+
+    /// Fold an evidence-drift finding into this verdict: the sentence is
+    /// appended to the detail, and a PASSING verdict is demoted to unknown.
+    ///
+    /// A failing verdict keeps its verdict — a fail is never made softer by
+    /// noticing that the evidence moved; the drift sentence just tells the
+    /// model which file changed under the check.
+    fn with_evidence_drift(mut self, sentence: &str) -> Self {
+        self.detail.push('\n');
+        self.detail.push_str(sentence);
+        if self.passed {
+            self.passed = false;
+            self.evidence_changed = true;
+        }
+        self
     }
 }
 
@@ -263,6 +335,34 @@ impl AcceptanceCheck {
         }
     }
 
+    /// Every workspace path this check NAMES — the subject it observes plus
+    /// anything its command reads.
+    ///
+    /// The inverse view of [`Self::references_path`], over the same three
+    /// arms: that answers "could a write to X change this verdict?", this
+    /// answers "which files IS this verdict about?". Extraction itself lives
+    /// at the store's write boundary
+    /// ([`nanna_storage::acceptance_referenced_paths`]) so the writer and
+    /// every reader agree on what a check names, exactly as they already
+    /// agree on what a check looks like.
+    #[must_use]
+    pub fn referenced_paths(&self) -> Vec<String> {
+        let canonical = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        nanna_storage::acceptance_referenced_paths(&canonical)
+    }
+
+    /// The subset of [`Self::referenced_paths`] that is this check's
+    /// INSTRUMENT rather than its subject — the files its command reads.
+    ///
+    /// Empty for `FileExists` and a path-flavored `Regex`: those observe the
+    /// deliverable directly, so the file they name is the WORK, not the judge
+    /// (see [`nanna_storage::acceptance_evidence_paths`]).
+    #[must_use]
+    pub fn evidence_paths(&self) -> Vec<String> {
+        let canonical = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        nanna_storage::acceptance_evidence_paths(&canonical)
+    }
+
     fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
         let secs = timeout_secs
             .unwrap_or(ACCEPTANCE_TIMEOUT_SECS_DEFAULT)
@@ -364,11 +464,13 @@ impl AcceptanceCheck {
                 };
                 if regex.is_match(&haystack) {
                     AcceptanceVerdict::pass(format!("pattern /{pattern}/ matched"))
+                        .with_output_head(&haystack)
                 } else {
                     AcceptanceVerdict::fail(format!(
                         "pattern /{pattern}/ did not match ({} bytes searched)",
                         haystack.len()
                     ))
+                    .with_output_head(&haystack)
                 }
             }
         }
@@ -393,6 +495,340 @@ fn read_bounded(path: &Path) -> std::io::Result<String> {
     // Lossy: a log truncated mid-char (or with stray binary) must still be
     // matchable — an acceptance check failing on encoding would wedge runs.
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Evidence drift: a verdict is only as trustworthy as its inputs
+// ---------------------------------------------------------------------------
+
+/// One evidence input of an acceptance check as the environment holds it right
+/// now: the file the check reads, a hash of its content, and the identity
+/// (size + modification time) naming WHICH version was seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvidenceFile {
+    /// The path exactly as the check spells it — the identity the model can
+    /// act on with no translation step.
+    path: String,
+    /// Hash of the bytes the check would read.
+    hash: u64,
+    len: u64,
+    /// RFC3339 modification time; empty when the platform reported none.
+    modified: String,
+}
+
+impl EvidenceFile {
+    /// Short, stable rendering of the content hash. Identification only — the
+    /// model never has to reproduce it, only to see that it differs.
+    fn short_hash(&self) -> String {
+        format!("{:016x}", self.hash)
+    }
+}
+
+/// Fingerprint `paths` as the environment holds them right now, sorted by path.
+///
+/// Cost bound: the path set is what the acceptance text names, and each file is
+/// read under [`read_bounded`] — the SAME bound the check's own read obeys.
+/// Guarding a verdict therefore never costs more than reaching it. Anything
+/// that does not resolve to a file is skipped: a check that names a directory,
+/// a flag, or a path that does not exist has nothing to fingerprint.
+fn fingerprint_paths(paths: Vec<String>, workdir: &Path) -> Vec<EvidenceFile> {
+    use std::hash::{Hash, Hasher};
+    let mut files: Vec<EvidenceFile> = Vec::new();
+    for path in paths {
+        let resolved = resolve_in_workdir(workdir, &path);
+        let Ok(meta) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(content) = read_bounded(&resolved) else {
+            continue;
+        };
+        let mut hasher = std::hash::DefaultHasher::new();
+        content.hash(&mut hasher);
+        files.push(EvidenceFile {
+            path,
+            hash: hasher.finish(),
+            len: meta.len(),
+            modified: meta.modified().ok().map_or_else(String::new, |t| {
+                chrono::DateTime::<chrono::Utc>::from(t)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            }),
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// Final path component, matched the way [`AcceptanceCheck::references_path`]
+/// matches: relative and absolute spellings of one file must collide.
+fn final_component(path: &str) -> String {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .next_back()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Did the INSTRUMENT a verdict is rendered through change since that check
+/// was last baselined?
+///
+/// A passing check proves the work is good only if the check is still asking
+/// the question it was verified against. When a step edits the test the test
+/// is judged by, the pass says nothing — and the shape that motivates this is
+/// not malice but the ordinary one: a rewrite spiral repairs the *evidence*
+/// and closes the item in the same breath as the mutation.
+///
+/// Two narrowings keep the guard from firing on the WORK, and both are
+/// derived, not tuned:
+/// 1. Only a command check has an instrument
+///    ([`AcceptanceCheck::evidence_paths`]). A `file_exists` or path-`regex`
+///    check observes its deliverable directly, so the file it names is
+///    precisely what the step is supposed to produce.
+/// 2. Only a CONTENT CHANGE to a file that was already present counts. A file
+///    appearing is the work creating something; a file vanishing makes the
+///    check fail on its own evidence and needs no demotion to be heard.
+///
+/// The detector is a content hash rather than the write ledger because `exec`
+/// mutations (a `sed -i`, a `chmod` then an append) never reach the ledger.
+/// The ledger is used only for ATTRIBUTION: "modified by this session" is a
+/// claim about authorship, and a claim needs a record.
+///
+/// Bounds: hashed set = the files the acceptance command names; hash cost ≤
+/// what the check itself reads; re-baselining at every verdict means one
+/// demotion per (path, modification) — never a standing veto, and a legitimate
+/// test edit costs exactly one named re-verification.
+#[derive(Debug, Default)]
+struct EvidenceGuard {
+    /// Last observation of each check's evidence inputs, by check identity.
+    baselines: HashMap<u64, Vec<EvidenceFile>>,
+    /// Final components of every path this run's write/edit tool calls
+    /// targeted, for attribution only.
+    session_touched: HashSet<String>,
+}
+
+impl EvidenceGuard {
+    /// Record the paths a step's write/edit calls targeted.
+    fn note_touched(&mut self, paths: &[String]) {
+        for path in paths {
+            let component = final_component(path);
+            if !component.is_empty() {
+                self.session_touched.insert(component);
+            }
+        }
+    }
+
+    /// Take the FIRST baseline for a check, if it has none yet.
+    ///
+    /// Called when the harness selects the item — before its step runs — so
+    /// the baseline predates the work that could modify the evidence. (The
+    /// truly first moment is the acceptance's canonicalization at write time,
+    /// but the store has no workspace root to resolve paths against; this is
+    /// the earliest point that holds both the canonical check and the
+    /// workdir.)
+    fn ensure_baseline(&mut self, check: &AcceptanceCheck, workdir: &Path) {
+        let id = check_identity(check);
+        if self.baselines.contains_key(&id) {
+            return;
+        }
+        self.baselines
+            .insert(id, fingerprint_paths(check.evidence_paths(), workdir));
+    }
+
+    /// Re-hash the check's evidence BEFORE it runs, compare against the
+    /// baseline, and re-baseline so exactly the next verdict decides.
+    ///
+    /// Returns the structural sentence naming the transition, or `None` when
+    /// the evidence is stable (the overwhelmingly common case, and the only
+    /// one in which a fail→pass flip may replenish a fruitless budget).
+    fn observe(&mut self, check: &AcceptanceCheck, workdir: &Path) -> Option<String> {
+        let id = check_identity(check);
+        let current = fingerprint_paths(check.evidence_paths(), workdir);
+        let previous = self.baselines.insert(id, current.clone());
+        let previous = previous?;
+        let mut clauses: Vec<String> = Vec::new();
+        // Authorship is a CLAIM, so it is made only against a record: the
+        // write/edit ledger this run kept. Everything else is reported as a
+        // modification time, with no author named.
+        let touched = &self.session_touched;
+        let attribution = |file: &EvidenceFile| {
+            if file.modified.is_empty() {
+                String::new()
+            } else if touched.contains(&final_component(&file.path)) {
+                format!(", modified by this session at {}", file.modified)
+            } else {
+                format!(", last modified {}", file.modified)
+            }
+        };
+        // Only a file that was ALREADY THERE and whose content moved: an
+        // instrument appearing or disappearing is not tampering with a
+        // verdict, and treating either as such would demote the very step
+        // that built the thing.
+        for now in &current {
+            let Some(old) = previous.iter().find(|old| old.path == now.path) else {
+                continue;
+            };
+            if old.hash == now.hash {
+                continue;
+            }
+            clauses.push(format!(
+                "`{}` content {} → {} ({} bytes now{})",
+                now.path,
+                old.short_hash(),
+                now.short_hash(),
+                now.len,
+                attribution(now)
+            ));
+        }
+        if clauses.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "EVIDENCE CHANGED SINCE THIS CHECK WAS LAST BASELINED: {}. This check renders \
+             its verdict THROUGH the file(s) named there, so a verdict reached over new \
+             content is UNKNOWN rather than a pass — it is not counted toward any budget, \
+             it completes nothing, and it earns no progress credit. The new content is now \
+             the baseline, so the very next run of this check decides. If you changed what \
+             the check runs in order to make it pass, change the artifact instead and \
+             re-run the check.",
+            clauses.join("; ")
+        ))
+    }
+}
+
+/// What the environment confirmed AT THIS INSTANT, beside the verdict text:
+/// each file the check reads, its size, and its modification time.
+///
+/// The failure this closes: a `file_exists` verdict stores "file exists:
+/// …/notes.md" and nothing else, so a later turn reading the completion back
+/// learns that *a* file was there and nothing about WHICH version — the exact
+/// gap a from-scratch rewrite walks through. Size and mtime are artifact
+/// identity, read from the filesystem rather than from anyone's memory.
+///
+/// Bound: the acceptance text names the set, and each entry is a path plus two
+/// numbers. Best effort — a file that has since vanished simply does not
+/// appear, which is itself the truth about that instant.
+fn verdict_artifacts(check: &AcceptanceCheck, workdir: &Path) -> Vec<serde_json::Value> {
+    fingerprint_paths(check.referenced_paths(), workdir)
+        .into_iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.path,
+                "bytes": file.len,
+                "modified": file.modified,
+            })
+        })
+        .collect()
+}
+
+/// The verdict line carried on a [`VerifiedOutcome`] — the clamped verdict
+/// plus the artifact identity, so the do-not-regress digest says WHICH file
+/// holds the verified work and not merely that something passed.
+fn verified_detail(verdict: &AcceptanceVerdict, artifacts: &[serde_json::Value]) -> String {
+    let mut detail = text_head(&verdict.detail, 240).to_string();
+    let named: Vec<String> = artifacts
+        .iter()
+        .filter_map(|a| {
+            let path = a.get("path").and_then(serde_json::Value::as_str)?;
+            let bytes = a.get("bytes").and_then(serde_json::Value::as_u64)?;
+            let modified = a
+                .get("modified")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            Some(if modified.is_empty() {
+                format!("{path} ({bytes} bytes)")
+            } else {
+                format!("{path} ({bytes} bytes, modified {modified})")
+            })
+        })
+        .collect();
+    if !named.is_empty() {
+        detail.push_str(" — on disk: ");
+        detail.push_str(&named.join(", "));
+    }
+    detail
+}
+
+/// Materialize the user's declared file prohibitions into the workspace
+/// registry the write tools consult.
+///
+/// Extraction is the store's ([`nanna_storage::extract_declared_invariants`])
+/// and is deliberately conservative — only an imperative sentence with an
+/// explicit path referent registers anything, because the tool side FAILS OPEN
+/// on a missing registry: a missed constraint costs today's behavior, an
+/// invented one blocks work the user asked for.
+///
+/// Invariants accumulate across turns (only the user lifts one, by saying so
+/// in chat), and a turn that declares nothing new never rewrites the file.
+/// Every failure path is silent by design: no workspace, an unwritable
+/// `.nanna/`, a corrupted registry — each degrades to "no invariants", which
+/// is exactly the behavior that shipped before this existed.
+async fn materialize_declared_invariants(goal: &str, workdir: &Path) {
+    let fresh = nanna_storage::extract_declared_invariants(goal, "session");
+    if fresh.is_empty() {
+        return;
+    }
+    // Canonical, workspace-relative spellings: one file has one identity on
+    // both sides of the contract (the write ratchet's ledger key rule).
+    let root = workdir.to_string_lossy().replace('\\', "/").to_lowercase();
+    let prefix = if root.ends_with('/') {
+        root
+    } else {
+        format!("{root}/")
+    };
+    let fresh: Vec<nanna_storage::DeclaredInvariant> = fresh
+        .into_iter()
+        .map(|mut invariant| {
+            if let Some(rest) = invariant.glob.strip_prefix(&prefix) {
+                invariant.glob = rest.to_string();
+            }
+            invariant
+        })
+        .collect();
+    let registry = workdir.join(nanna_storage::DECLARED_INVARIANTS_FILE);
+    let existing = tokio::fs::read_to_string(&registry).await.unwrap_or_default();
+    let Some(document) = nanna_storage::merge_declared_invariants(&existing, &fresh) else {
+        return;
+    };
+    if let Some(parent) = registry.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::write(&registry, document).await {
+        Ok(()) => tracing::info!(
+            invariants = fresh.len(),
+            registry = %registry.display(),
+            "registered user-declared file invariants — the write tools refuse mutations \
+             under them and quote the user's own sentence"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            registry = %registry.display(),
+            "could not write the declared-invariant registry — the write tools fail open, \
+             so this turn behaves exactly as before"
+        ),
+    }
+}
+
+/// The carried-forward finding for a verdict demoted by evidence drift — the
+/// evidence-drift sibling of [`hanging_check_finding`], and deliberately NOT
+/// that function: a hang is a diagnosis about the artifact, while this is a
+/// diagnosis about the verification setup, and telling a model its code hangs
+/// when a test file moved would send it fixing the wrong thing.
+fn evidence_changed_finding(check: &AcceptanceCheck, verdict: &AcceptanceVerdict) -> String {
+    let mut finding = format!(
+        "ACCEPTANCE VERDICT NOT COUNTED (its evidence moved — this does NOT mean the work \
+         failed): {}",
+        verdict.detail
+    );
+    if let Some(command) = check.self_check_command() {
+        finding.push_str(&format!(
+            "\nThe check is: `{command}` — run it again now that the changed files are the \
+             baseline, and the next verdict counts."
+        ));
+    }
+    finding
 }
 
 /// The timeout verdict's detail line. When the run was `capped`, the cut
@@ -423,7 +859,7 @@ async fn run_command_check(
             let tail: String = combined
                 .chars()
                 .rev()
-                .take(400)
+                .take(ACCEPTANCE_OUTPUT_EXCERPT_CHARS)
                 .collect::<String>()
                 .chars()
                 .rev()
@@ -434,9 +870,9 @@ async fn run_command_check(
                 tail.trim()
             );
             if passed {
-                AcceptanceVerdict::pass(detail)
+                AcceptanceVerdict::pass(detail).with_output_head(&combined)
             } else {
-                AcceptanceVerdict::fail(detail)
+                AcceptanceVerdict::fail(detail).with_output_head(&combined)
             }
         }
         Err(ShellRunError::Timeout { secs }) => {
@@ -906,8 +1342,12 @@ pub struct LongHorizonReport {
     /// first step completes it looks numerically identical to "hi".
     pub tool_calls: usize,
     /// The subset of `tool_calls` that CHANGED SOMETHING — the work-evidence
-    /// set the completion-claim rung accepts as proof (`is_work_evidence_tool`:
-    /// writes, edits, the shell). Reads and searches can run forever without
+    /// set the harness-continuation and liveness rungs read
+    /// (`is_work_evidence_tool`: writes, edits, the shell). The
+    /// completion-claim rung uses a STRICTER predicate of its own
+    /// (`claim_evidence_armed`), because a read-only shell success is proof a
+    /// run acted but not proof it produced anything to claim. Reads and
+    /// searches can run forever without
     /// touching anything outside the context window, so `tool_calls > 0`
     /// answers "did this run act?" while only this field answers "did this run
     /// change the world?".
@@ -993,6 +1433,50 @@ pub struct LongHorizonReport {
 // Prompt building (pure, byte-stable prefix)
 // ---------------------------------------------------------------------------
 
+/// The DO-NOT-REGRESS digest: what this run has already proven working,
+/// rendered for the model that EDITS rather than only the planner that plans.
+///
+/// Newest first — the freshest verdicts describe the current artifact best —
+/// and bounded by [`STEP_RESULT_TAIL_MAX_BYTES`], the one-screenful prompt
+/// bound the last-result block and the regression notice already obey, with
+/// the cut announced. The digest's SIZE is evidence-derived: one line per item
+/// this run closed on a passing check, each of which cost a real execution.
+///
+/// Voicing is the point. "Verified working" plus a stated cost for losing it
+/// is what turns the block from background trivia into a constraint: the
+/// observed failure was a full-file rewrite that silently dropped features
+/// whose checks had passed minutes earlier, with nothing in the step's context
+/// naming them.
+#[must_use]
+pub fn verified_digest(verified: &[VerifiedOutcome]) -> Option<String> {
+    if verified.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "These are VERIFIED WORKING right now — each one's done-condition was run by the \
+         harness and PASSED, and the verdict names the artifact state the environment \
+         confirmed. A rewrite that loses any of these is a regression, not progress: if \
+         your change must drop one, say which and why before you make it. Otherwise \
+         preserve them — read the file and extend it, do not reconstruct it.\n",
+    );
+    let mut omitted = 0usize;
+    for outcome in verified.iter().rev() {
+        let line = format!("- #{} {}: {}\n", outcome.id, outcome.title, outcome.detail);
+        if text.len() + line.len() > STEP_RESULT_TAIL_MAX_BYTES {
+            omitted += 1;
+            continue;
+        }
+        text.push_str(&line);
+    }
+    if omitted > 0 {
+        text.push_str(&format!(
+            "- …and {omitted} more verified item(s) not shown here — they are equally \
+             established; ask the task store for the full list before a wide rewrite.\n"
+        ));
+    }
+    Some(text)
+}
+
 /// Build the re-anchored step prompt.
 ///
 /// Layout is deliberate and load-bearing:
@@ -1000,13 +1484,15 @@ pub struct LongHorizonReport {
 ///   of a run — the shape KV-prefix caching rewards. The goal is pinned
 ///   verbatim and never summarized: everything else is compressible, intent
 ///   is not.
-/// - The **dynamic tail** (current task, verdict, budget) comes last, in
-///   recent attention where a small model actually looks.
+/// - The **dynamic tail** (current task, verdict, do-not-regress digest,
+///   budget) comes last, in recent attention where a small model actually
+///   looks.
 #[must_use]
 pub fn build_step_prompt(
     goal: &str,
     step: &TaskStep,
     last_result: Option<&str>,
+    verified_digest: Option<&str>,
     budget_line: &str,
 ) -> String {
     let mut prompt = stable_prefix(goal);
@@ -1055,6 +1541,15 @@ pub fn build_step_prompt(
     if let Some(last) = last_result {
         if !last.is_empty() {
             prompt.push_str(&format!("\n== LAST RESULT ==\n{last}\n"));
+        }
+    }
+    // Beside the last result, in the same recent-attention band: what must
+    // survive this step. The digest is deliberately NOT part of the stable
+    // prefix — it is state, it changes as work is verified, and it belongs
+    // where a small model actually looks.
+    if let Some(digest) = verified_digest {
+        if !digest.is_empty() {
+            prompt.push_str(&format!("\n== VERIFIED WORKING (do not regress) ==\n{digest}"));
         }
     }
     prompt.push_str(&format!("\n{budget_line}\n"));
@@ -1350,6 +1845,18 @@ impl LongHorizonRunner {
         // signature recurs across items, each affected item's step context
         // names the cluster so the model treats it as ONE bug.
         let mut failure_owners: HashMap<u64, std::collections::BTreeSet<i64>> = HashMap::new();
+        // A verdict is only as trustworthy as the files it reads. The guard
+        // fingerprints each check's evidence before every run of it and
+        // demotes a pass whose inputs moved (see [`EvidenceGuard`]).
+        let mut evidence_guard = EvidenceGuard::default();
+
+        // USER-DECLARED FILE INVARIANTS. Durable file prohibitions the user
+        // stated in the goal itself ("never create, edit or delete anything
+        // under tests/") are materialized to the workspace registry the write
+        // tools consult before mutating. Best effort at every step: a
+        // workspace that cannot be written simply keeps today's behavior,
+        // because the tool side fails open on a missing registry.
+        materialize_declared_invariants(goal, workdir).await;
 
         let stop = loop {
             if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
@@ -1405,12 +1912,25 @@ impl LongHorizonRunner {
                         let hang_cap = hung_checks
                             .contains(&check_identity(&check))
                             .then(|| longest_step.max(longest_decided_check));
-                        let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                        if verdict.timed_out {
+                        // Re-hash BEFORE the run: the fingerprint has to
+                        // describe the inputs this run is about to read.
+                        let drift = evidence_guard.observe(&check, workdir);
+                        let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                        if let Some(sentence) = &drift {
+                            verdict = verdict.with_evidence_drift(sentence);
+                        }
+                        if !verdict.timed_out {
+                            hung_checks.remove(&check_identity(&check));
+                            longest_decided_check =
+                                longest_decided_check.max(run_started.elapsed());
+                        }
+                        if verdict.is_unknown() {
                             // Unknown: not proof the goal is unmet, but it
-                            // still blocks "done" — carry the HANG as the
-                            // finding rather than a false failure verdict.
-                            hung_checks.insert(check_identity(&check));
+                            // still blocks "done" — carry the finding rather
+                            // than a false failure verdict.
+                            if verdict.timed_out {
+                                hung_checks.insert(check_identity(&check));
+                            }
                             acceptance_unknown += 1;
                             let detail = format!(
                                 "check produced no verdict — {}",
@@ -1419,9 +1939,6 @@ impl LongHorizonRunner {
                             abandoned_unmet.push(AbandonedUnmet { id, title, detail });
                             continue;
                         }
-                        hung_checks.remove(&check_identity(&check));
-                        longest_decided_check =
-                            longest_decided_check.max(run_started.elapsed());
                         note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                         if !verdict.passed {
                             // Evidence for the mission loop: this walked-away
@@ -1463,18 +1980,27 @@ impl LongHorizonRunner {
                         let hang_cap = hung_checks
                             .contains(&check_identity(&check))
                             .then(|| longest_step.max(longest_decided_check));
-                        let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
-                        if verdict.timed_out {
-                            // Unknown: a hung re-check is not evidence the
+                        let drift = evidence_guard.observe(&check, workdir);
+                        let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                        if let Some(sentence) = &drift {
+                            verdict = verdict.with_evidence_drift(sentence);
+                        }
+                        if !verdict.timed_out {
+                            hung_checks.remove(&check_identity(&check));
+                            longest_decided_check =
+                                longest_decided_check.max(run_started.elapsed());
+                        }
+                        if verdict.is_unknown() {
+                            // Unknown: a silent re-check is not evidence the
                             // verified work regressed — reopening on it would
-                            // charge the model for a wedged command.
-                            hung_checks.insert(check_identity(&check));
+                            // charge the model for a wedged command (or for a
+                            // test file someone edited).
+                            if verdict.timed_out {
+                                hung_checks.insert(check_identity(&check));
+                            }
                             acceptance_unknown += 1;
                             continue;
                         }
-                        hung_checks.remove(&check_identity(&check));
-                        longest_decided_check =
-                            longest_decided_check.max(run_started.elapsed());
                         note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                         if !verdict.passed
                             && source
@@ -1555,6 +2081,15 @@ impl LongHorizonRunner {
 
             let _ = source.start(step.id).await;
 
+            // Baseline this item's evidence BEFORE its step can touch it: the
+            // guard's whole value is that the fingerprint predates the work it
+            // judges. Idempotent — a check already baselined keeps the
+            // baseline the last verdict left, so re-selection never launders a
+            // modification made since.
+            if let Some(check) = &step.acceptance {
+                evidence_guard.ensure_baseline(check, workdir);
+            }
+
             // ACCEPTANCE PRE-CHECK. The environment is the judge of "done";
             // ask it before spending a step, not only after. When the
             // done-condition already passes with nothing run, the work is
@@ -1581,32 +2116,51 @@ impl LongHorizonRunner {
                 let hang_cap = hung_checks
                     .contains(&check_identity(check))
                     .then(|| longest_step.max(longest_decided_check));
-                let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                let drift = evidence_guard.observe(check, workdir);
+                let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                if let Some(sentence) = &drift {
+                    verdict = verdict.with_evidence_drift(sentence);
+                }
                 check_cost_paid += check_started.elapsed();
                 check_runs += 1;
-                if verdict.timed_out {
-                    hung_checks.insert(check_identity(check));
+                if verdict.is_unknown() {
                     // Unknown, not failure: the item runs its step normally,
-                    // but it starts KNOWING the check hangs — the finding is
-                    // the most useful thing the step could possibly hear.
+                    // but it starts KNOWING what silenced the check — the
+                    // finding is the most useful thing the step could hear.
+                    let hung = verdict.timed_out;
+                    if hung {
+                        hung_checks.insert(check_identity(check));
+                    } else {
+                        hung_checks.remove(&check_identity(check));
+                        longest_decided_check =
+                            longest_decided_check.max(check_started.elapsed());
+                    }
                     acceptance_unknown += 1;
                     let item = progress.entry(step.id).or_default();
-                    item.consecutive_check_timeouts += 1;
-                    let finding =
-                        hanging_check_finding(check, &verdict, item.consecutive_check_timeouts);
+                    let finding = if hung {
+                        item.consecutive_check_timeouts += 1;
+                        hanging_check_finding(check, &verdict, item.consecutive_check_timeouts)
+                    } else {
+                        evidence_changed_finding(check, &verdict)
+                    };
                     item.last_result = Some(finding.clone());
                     tracing::warn!(
                         item = step.id,
                         title = %step.title,
+                        hung,
                         detail = %text_head(&verdict.detail, 240),
-                        "acceptance pre-check timed out — no verdict; carrying the hang \
+                        "acceptance pre-check produced no usable verdict; carrying the \
                          finding into the step"
                     );
                     let _ = source.add_note(step.id, &finding).await;
                     let _ = source
                         .log(
                             step.id,
-                            "acceptance_timeout",
+                            if hung {
+                                "acceptance_timeout"
+                            } else {
+                                "acceptance_evidence_changed"
+                            },
                             serde_json::json!({
                                 "detail": verdict.detail,
                                 "check": check.describe(),
@@ -1635,9 +2189,14 @@ impl LongHorizonRunner {
                     }
                 }
                 if verdict.passed {
+                    // What the environment confirmed AT THIS INSTANT, not just
+                    // that it confirmed something (see `verdict_artifacts`).
+                    let artifacts = verdict_artifacts(check, workdir);
                     let detail = serde_json::json!({
                         "verified": true,
                         "verdict": verdict.detail,
+                        "output_head": verdict.output_head,
+                        "artifacts": artifacts,
                         "already_satisfied": true,
                         "steps_run": 0,
                         "tokens_spent": 0,
@@ -1665,7 +2224,7 @@ impl LongHorizonRunner {
                             verified_outcomes.push(VerifiedOutcome {
                                 id: step.id,
                                 title: step.title.clone(),
-                                detail: text_head(&verdict.detail, 240).to_string(),
+                                detail: verified_detail(&verdict, &artifacts),
                                 already_satisfied: true,
                             });
                             progress.remove(&step.id);
@@ -1738,8 +2297,17 @@ impl LongHorizonRunner {
                     (None, Some(notice)) => Some(notice),
                     (prev, None) => prev.map(str::to_string),
                 };
+                // The do-not-regress digest: verified state must reach the
+                // model that EDITS, not only the planner that plans.
+                let digest = verified_digest(&verified_outcomes);
                 (
-                    build_step_prompt(goal, &step, last_result.as_deref(), &line),
+                    build_step_prompt(
+                        goal,
+                        &step,
+                        last_result.as_deref(),
+                        digest.as_deref(),
+                        &line,
+                    ),
                     StepKind::Execute,
                 )
             };
@@ -1810,6 +2378,11 @@ impl LongHorizonRunner {
             steps_taken += 1;
             input_tokens += outcome.input_tokens;
             output_tokens += outcome.output_tokens;
+            // Attribution material for the evidence guard: which paths this
+            // run has written through a tool that RECORDS what it wrote. Only
+            // ever used to decide whether "modified by this session" is a
+            // claim the run can back up.
+            evidence_guard.note_touched(&outcome.touched_paths);
 
             let item = progress.entry(step.id).or_default();
             item.tokens_spent += outcome.input_tokens + outcome.output_tokens;
@@ -1902,7 +2475,14 @@ impl LongHorizonRunner {
                     let hang_cap = hung_checks
                         .contains(&check_identity(check))
                         .then(|| longest_step.max(longest_decided_check));
-                    let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                    // The step just ran; re-hash its check's evidence before
+                    // the verdict, so a step that edited what the check reads
+                    // cannot close the item in the same breath.
+                    let drift = evidence_guard.observe(check, workdir);
+                    let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                    if let Some(sentence) = &drift {
+                        verdict = verdict.with_evidence_drift(sentence);
+                    }
                     check_cost_paid += check_started.elapsed();
                     check_runs += 1;
                     if !verdict.timed_out {
@@ -1917,11 +2497,12 @@ impl LongHorizonRunner {
                             serde_json::json!({
                                 "passed": verdict.passed,
                                 "detail": verdict.detail,
-                                "unknown": verdict.timed_out,
+                                "unknown": verdict.is_unknown(),
+                                "evidence_changed": verdict.evidence_changed,
                             }),
                         )
                         .await;
-                    if verdict.timed_out {
+                    if verdict.is_unknown() {
                         // UNKNOWN, not failed. The check said nothing about
                         // the work, so nothing about the TIMEOUT may read as
                         // failure: no failure signature, no refuted claim,
@@ -1946,9 +2527,19 @@ impl LongHorizonRunner {
                         // check then hung — novel evidence, replenishes; and
                         // it burned 120 of 240 minutes re-staking 600s on
                         // the same silent check — the cap's job.)
-                        hung_checks.insert(check_identity(check));
+                        //
+                        // The evidence-drift demotion enters here for exactly
+                        // the same reason and with exactly the same
+                        // consequences (no budget charge, no completion, no
+                        // flip credit) — but it is NOT a hang: no hang finding
+                        // is minted and the re-stake cap stays disarmed, or a
+                        // model whose test file simply changed would be sent
+                        // hunting a non-existent infinite loop.
+                        let hung = verdict.timed_out;
+                        if hung {
+                            hung_checks.insert(check_identity(check));
+                        }
                         acceptance_unknown += 1;
-                        item.consecutive_check_timeouts += 1;
                         let fresh_success = novel_success_evidence(item, &outcome.tool_calls);
                         let degenerate =
                             outcome.degenerate_loop && outcome.tool_calls.is_empty();
@@ -1964,11 +2555,17 @@ impl LongHorizonRunner {
                                 item.steps_without_progress += 1;
                             }
                         }
-                        let mut finding = hanging_check_finding(
-                            check,
-                            &verdict,
-                            item.consecutive_check_timeouts,
-                        );
+                        let mut finding = if hung {
+                            item.consecutive_check_timeouts += 1;
+                            hanging_check_finding(
+                                check,
+                                &verdict,
+                                item.consecutive_check_timeouts,
+                            )
+                        } else {
+                            item.consecutive_check_timeouts = 0;
+                            evidence_changed_finding(check, &verdict)
+                        };
                         if degenerate {
                             finding.push_str("\n\n");
                             finding
@@ -1977,17 +2574,22 @@ impl LongHorizonRunner {
                         tracing::warn!(
                             item = step.id,
                             title = %step.title,
+                            hung,
                             consecutive = item.consecutive_check_timeouts,
                             step_charged = !fresh_success && !steered,
                             detail = %text_head(&verdict.detail, 240),
-                            "acceptance check timed out — unknown verdict; carrying the \
-                             hang finding forward and judging the step on its own evidence"
+                            "acceptance check produced no usable verdict — carrying the \
+                             finding forward and judging the step on its own evidence"
                         );
                         let _ = source.add_note(step.id, &finding).await;
                         let _ = source
                             .log(
                                 step.id,
-                                "acceptance_timeout",
+                                if hung {
+                                    "acceptance_timeout"
+                                } else {
+                                    "acceptance_evidence_changed"
+                                },
                                 serde_json::json!({
                                     "detail": verdict.detail,
                                     "consecutive": item.consecutive_check_timeouts,
@@ -2008,10 +2610,13 @@ impl LongHorizonRunner {
                                  replenishing every open item's fruitless budget"
                             );
                         }
+                        let artifacts = verdict_artifacts(check, workdir);
                         let item = progress.entry(step.id).or_default();
                         let detail = serde_json::json!({
                             "verified": true,
                             "verdict": verdict.detail,
+                            "output_head": verdict.output_head,
+                            "artifacts": artifacts,
                             "tokens_spent": item.tokens_spent,
                         });
                         match source.complete(step.id, detail).await {
@@ -2026,7 +2631,7 @@ impl LongHorizonRunner {
                                 verified_outcomes.push(VerifiedOutcome {
                                     id: step.id,
                                     title: step.title.clone(),
-                                    detail: text_head(&verdict.detail, 240).to_string(),
+                                    detail: verified_detail(&verdict, &artifacts),
                                     already_satisfied: false,
                                 });
                                 progress.remove(&step.id);
@@ -2275,15 +2880,24 @@ impl LongHorizonRunner {
                     let hang_cap = hung_checks
                         .contains(&check_identity(&check))
                         .then(|| longest_step.max(longest_decided_check));
-                    let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                    let drift = evidence_guard.observe(&check, workdir);
+                    let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                    if let Some(sentence) = &drift {
+                        verdict = verdict.with_evidence_drift(sentence);
+                    }
                     sweep_cost_paid += sweep_started.elapsed();
-                    if verdict.timed_out {
-                        hung_checks.insert(check_identity(&check));
+                    if !verdict.timed_out {
+                        hung_checks.remove(&check_identity(&check));
+                        longest_decided_check =
+                            longest_decided_check.max(sweep_started.elapsed());
+                    }
+                    if verdict.is_unknown() {
+                        if verdict.timed_out {
+                            hung_checks.insert(check_identity(&check));
+                        }
                         acceptance_unknown += 1;
                         continue;
                     }
-                    hung_checks.remove(&check_identity(&check));
-                    longest_decided_check = longest_decided_check.max(sweep_started.elapsed());
                     let flipped = note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                     if flipped {
                         // Verified environment change — replenish regardless
@@ -2342,17 +2956,26 @@ impl LongHorizonRunner {
                     let hang_cap = hung_checks
                         .contains(&check_identity(&check))
                         .then(|| longest_step.max(longest_decided_check));
-                    let verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                    let drift = evidence_guard.observe(&check, workdir);
+                    let mut verdict = check.run_with_timeout_cap(workdir, hang_cap).await;
+                    if let Some(sentence) = &drift {
+                        verdict = verdict.with_evidence_drift(sentence);
+                    }
                     sweep_cost_paid += sweep_started.elapsed();
-                    if verdict.timed_out {
-                        // Unknown — a hung re-check must not reopen verified
+                    if !verdict.timed_out {
+                        hung_checks.remove(&check_identity(&check));
+                        longest_decided_check =
+                            longest_decided_check.max(sweep_started.elapsed());
+                    }
+                    if verdict.is_unknown() {
+                        // Unknown — a silent re-check must not reopen verified
                         // work as "regressed".
-                        hung_checks.insert(check_identity(&check));
+                        if verdict.timed_out {
+                            hung_checks.insert(check_identity(&check));
+                        }
                         acceptance_unknown += 1;
                         continue;
                     }
-                    hung_checks.remove(&check_identity(&check));
-                    longest_decided_check = longest_decided_check.max(sweep_started.elapsed());
                     note_check_outcome(&mut check_outcomes, &check, verdict.passed);
                     if verdict.passed {
                         continue;
@@ -3300,11 +3923,12 @@ mod tests {
     #[test]
     fn step_prompt_prefix_is_byte_stable_across_steps() {
         let goal = "Refactor the parser crate without breaking the test suite";
-        let a = build_step_prompt(goal, &step(1, "first", None), None, "== BUDGET == x");
+        let a = build_step_prompt(goal, &step(1, "first", None), None, None, "== BUDGET == x");
         let b = build_step_prompt(
             goal,
             &step(2, "second", None),
             Some("previous result"),
+            Some("- #1 first: `sh t.sh` exited 0"),
             "== BUDGET == y",
         );
         let marker = "== CURRENT TASK ==";
@@ -3323,6 +3947,7 @@ mod tests {
             goal,
             &step(7, "do the thing", None),
             Some("last output"),
+            None,
             "== BUDGET == step 3",
         );
         assert!(prompt.contains(goal), "goal must appear verbatim");
@@ -3342,7 +3967,7 @@ mod tests {
             "kind": "command", "command": "sh tests/test_05.sh"
         }))
         .unwrap();
-        let prompt = build_step_prompt("g", &step(1, "t", Some(check)), None, "b");
+        let prompt = build_step_prompt("g", &step(1, "t", Some(check)), None, None, "b");
         assert!(prompt.contains("RUN THAT CHECK YOURSELF"));
         assert!(prompt.contains("exec `sh tests/test_05.sh`"));
     }
@@ -3356,7 +3981,7 @@ mod tests {
         }))
         .unwrap();
         assert!(check.self_check_command().is_none());
-        let prompt = build_step_prompt("g", &step(1, "t", Some(check)), None, "b");
+        let prompt = build_step_prompt("g", &step(1, "t", Some(check)), None, None, "b");
         assert!(!prompt.contains("RUN THAT CHECK YOURSELF"));
         assert!(prompt.contains("must exist"), "the condition is still stated");
     }
@@ -3367,10 +3992,10 @@ mod tests {
             command: "cargo test".to_string(),
             timeout_secs: None,
         };
-        let with = build_step_prompt("g", &step(1, "t", Some(check)), None, "b");
+        let with = build_step_prompt("g", &step(1, "t", Some(check)), None, None, "b");
         assert!(with.contains("cargo test"));
         assert!(with.contains("checked by the harness"));
-        let without = build_step_prompt("g", &step(1, "t", None), None, "b");
+        let without = build_step_prompt("g", &step(1, "t", None), None, None, "b");
         assert!(without.contains("TASK COMPLETE"));
     }
 
@@ -3436,6 +4061,8 @@ mod tests {
             passed: false,
             detail: "FAIL(test_04): exit code should be 1, got 0".to_string(),
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         };
         let result = failed_acceptance_result(&check, &verdict, false);
         assert!(
@@ -3467,6 +4094,8 @@ mod tests {
             passed: false,
             detail: "`sh run_tests.sh` exited 1 — 3 failures".to_string(),
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         };
         let result = failed_acceptance_result(&check, &verdict, true);
         assert!(
@@ -3489,6 +4118,8 @@ mod tests {
             passed: false,
             detail: "file does not exist: out.txt".to_string(),
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         };
         let result = failed_acceptance_result(&check, &verdict, false);
         assert!(result.starts_with("Done-condition NOT met:"), "{result}");
@@ -3512,6 +4143,8 @@ mod tests {
             passed: false,
             detail: format!("{}NEWEST-EVIDENCE", "x".repeat(STEP_RESULT_TAIL_MAX_BYTES * 10)),
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         };
         let result = failed_acceptance_result(&check, &verdict, true);
         assert!(
@@ -3541,6 +4174,8 @@ mod tests {
             passed: false,
             detail: "file does not exist: a.txt".to_string(),
             timed_out: false,
+            evidence_changed: false,
+            output_head: None,
         };
         let result = failed_acceptance_result(&check, &verdict, false);
         assert_eq!(result, "Done-condition NOT met: file does not exist: a.txt");
@@ -3582,6 +4217,371 @@ mod tests {
         );
         // First attempt has no verdict yet — the enrichment is failure-only.
         assert!(!requests[0].prompt.contains("Done-condition NOT met"));
+    }
+
+    // -----------------------------------------------------------------
+    // P23 — the do-not-regress digest
+    // -----------------------------------------------------------------
+
+    fn verified(id: i64, title: &str, detail: &str) -> VerifiedOutcome {
+        VerifiedOutcome {
+            id,
+            title: title.to_string(),
+            detail: detail.to_string(),
+            already_satisfied: false,
+        }
+    }
+
+    /// The digest is the thing the EDITING model sees, so it must name the
+    /// items, state the cost of losing them, and bound itself to the same
+    /// screenful every other prompt block obeys — with the cut announced.
+    #[test]
+    fn the_digest_names_verified_work_and_bounds_itself() {
+        assert!(verified_digest(&[]).is_none(), "nothing verified, nothing said");
+
+        let one = verified_digest(&[verified(3, "mset", "`sh t3.sh` exited 0")])
+            .expect("one verified item renders");
+        assert!(one.contains("#3 mset"), "{one}");
+        assert!(one.contains("`sh t3.sh` exited 0"), "{one}");
+        assert!(
+            one.contains("VERIFIED WORKING") || one.contains("VERIFIED"),
+            "the block must say what these facts ARE: {one}"
+        );
+        assert!(
+            one.contains("regression, not progress"),
+            "the cost of losing one must be stated: {one}"
+        );
+
+        // Newest first — the freshest verdicts describe the artifact best.
+        let two = verified_digest(&[
+            verified(1, "older", "old detail"),
+            verified(2, "newer", "new detail"),
+        ])
+        .unwrap();
+        assert!(
+            two.find("#2 newer").unwrap() < two.find("#1 older").unwrap(),
+            "{two}"
+        );
+
+        // Bounded like every other prompt block, and the cut announces itself.
+        let many: Vec<VerifiedOutcome> = (0..200)
+            .map(|i| verified(i, &format!("item {i}"), &"d".repeat(200)))
+            .collect();
+        let big = verified_digest(&many).unwrap();
+        assert!(
+            big.len() <= STEP_RESULT_TAIL_MAX_BYTES + 256,
+            "digest must stay one screenful: {} bytes",
+            big.len()
+        );
+        assert!(big.contains("not shown here"), "the cut must announce itself");
+    }
+
+    /// End-to-end: once an item is verified, every LATER step's prompt carries
+    /// it beside the last result. The failure this closes is a full-file
+    /// rewrite that dropped features whose checks had passed minutes earlier,
+    /// with nothing in the step's own context naming them.
+    #[tokio::test]
+    async fn a_verified_item_reaches_the_next_steps_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.txt"), b"here").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "make first.txt",
+                Some(AcceptanceCheck::FileExists {
+                    path: "first.txt".to_string(),
+                }),
+            ))
+            .await;
+        source
+            .push(step(
+                2,
+                "make second.txt",
+                Some(AcceptanceCheck::FileExists {
+                    path: "second.txt".to_string(),
+                }),
+            ))
+            .await;
+        let runner =
+            ScriptedRunner::new(vec![Ok(outcome("did one")), Ok(outcome("working on two"))]);
+        let _report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        let requests = runner.requests.lock().await;
+        assert!(requests.len() >= 2, "both items must get a step");
+        assert!(
+            !requests[0].prompt.contains("VERIFIED WORKING"),
+            "nothing is verified before the first verdict: {}",
+            requests[0].prompt
+        );
+        let second = &requests[1].prompt;
+        assert!(second.contains("== VERIFIED WORKING (do not regress) =="), "{second}");
+        assert!(second.contains("#1 make first.txt"), "{second}");
+        assert!(
+            second.contains("first.txt (4 bytes"),
+            "the verdict must carry artifact identity, not just 'a file exists': {second}"
+        );
+    }
+
+    /// The stored completion record must say what the environment confirmed at
+    /// that instant — the command's own output head and the subject file's
+    /// size and mtime — so a later turn reading it back knows WHICH version was
+    /// verified instead of merely that something passed.
+    #[tokio::test]
+    async fn a_completion_record_carries_the_artifact_it_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("report.txt"), b"PASS: all good").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "produce the report",
+                Some(AcceptanceCheck::Regex {
+                    pattern: "PASS".to_string(),
+                    path: Some("report.txt".to_string()),
+                    command: None,
+                    timeout_secs: None,
+                }),
+            ))
+            .await;
+        let runner = ScriptedRunner::new(vec![Ok(outcome("wrote it"))]);
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.items_completed, 1, "{report:?}");
+        let completions = source.completions.lock().await;
+        let (_, detail) = completions.first().expect("a completion was recorded");
+        let artifacts = detail
+            .get("artifacts")
+            .and_then(serde_json::Value::as_array)
+            .expect("the completion names the artifacts it verified");
+        assert_eq!(artifacts.len(), 1, "{detail}");
+        assert_eq!(
+            artifacts[0].get("path").and_then(serde_json::Value::as_str),
+            Some("report.txt")
+        );
+        assert_eq!(
+            artifacts[0].get("bytes").and_then(serde_json::Value::as_u64),
+            Some(14)
+        );
+        assert!(
+            artifacts[0]
+                .get("modified")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|m| !m.is_empty()),
+            "artifact identity needs the modification time: {detail}"
+        );
+        assert_eq!(
+            detail.get("output_head").and_then(serde_json::Value::as_str),
+            Some("PASS: all good"),
+            "the head of what the check actually read: {detail}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P23 — verdicts notice when their own evidence moved
+    // -----------------------------------------------------------------
+
+    /// Writes fixed content to one path every step and REPORTS it as touched —
+    /// the shape of a step that edits the very file its check reads.
+    struct EvidenceRewritingRunner {
+        path: PathBuf,
+        content: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StepRunner for EvidenceRewritingRunner {
+        async fn run_step(&self, _request: StepRequest) -> Result<StepOutcome, String> {
+            std::fs::write(&self.path, self.content.as_bytes()).map_err(|e| e.to_string())?;
+            let mut step_outcome = outcome("updated the report");
+            step_outcome.touched_paths = vec![self.path.display().to_string()];
+            Ok(step_outcome)
+        }
+    }
+
+    /// A pass produced in the same breath as a rewrite of the SCRIPT the check
+    /// runs is UNKNOWN, not a completion — and it costs exactly ONE named
+    /// re-verification, because the changed content immediately becomes the
+    /// baseline the next verdict is judged against.
+    #[tokio::test]
+    async fn a_pass_whose_evidence_the_step_rewrote_is_unknown_then_decided() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("check.sh");
+        std::fs::write(&script, b"exit 1\n").unwrap();
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "make the check pass",
+                Some(AcceptanceCheck::Command {
+                    command: "sh check.sh".to_string(),
+                    timeout_secs: Some(30),
+                }),
+            ))
+            .await;
+        // The step "fixes" the test instead of the artifact — the exact shape
+        // the guard exists to notice.
+        let runner = EvidenceRewritingRunner {
+            path: script.clone(),
+            content: "exit 0\n".to_string(),
+        };
+        let outcome_report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+
+        assert_eq!(
+            outcome_report.acceptance_unknown, 1,
+            "exactly one verdict is demoted — the one whose inputs moved: {outcome_report:?}"
+        );
+        assert_eq!(
+            outcome_report.steps_taken, 2,
+            "the demotion costs one re-verification step, not the item: {outcome_report:?}"
+        );
+        assert_eq!(
+            outcome_report.items_completed, 1,
+            "the SECOND verdict, judged against the new baseline, decides: \
+             {outcome_report:?}"
+        );
+
+        let notes = source.notes.lock().await;
+        let drift = notes
+            .iter()
+            .find(|(_, text)| text.contains("EVIDENCE CHANGED"))
+            .map(|(_, text)| text.clone())
+            .expect("the demotion must announce itself in the item's notes");
+        assert!(drift.contains("check.sh"), "{drift}");
+        assert!(
+            drift.contains("modified by this session at"),
+            "the step's own write ledger attributes it: {drift}"
+        );
+        assert!(
+            !drift.contains("HUNG"),
+            "an evidence change is not a hang — that would send the model hunting a \
+             non-existent infinite loop: {drift}"
+        );
+        drop(notes);
+
+        let log = source.log_entries.lock().await;
+        assert!(
+            log.iter().any(|(_, action)| action == "acceptance_evidence_changed"),
+            "the demotion is greppable and distinct from a timeout: {log:?}"
+        );
+    }
+
+    /// The mirror property, and the reason the guard is safe to run on every
+    /// verdict: a check whose instrument never moves is never demoted, and
+    /// PRODUCING the deliverable a check observes is never mistaken for
+    /// tampering with it (a `file_exists`/path-`regex` check has no instrument
+    /// at all — the file it names is the work).
+    #[tokio::test]
+    async fn producing_the_artifact_is_never_read_as_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("check.sh"), b"exit 0\n").unwrap();
+        let report_path = dir.path().join("report.txt");
+        let source = MemorySource::default();
+        source
+            .push(step(
+                1,
+                "run the check",
+                Some(AcceptanceCheck::Command {
+                    command: "sh check.sh".to_string(),
+                    timeout_secs: Some(30),
+                }),
+            ))
+            .await;
+        source
+            .push(step(
+                2,
+                "write the report",
+                Some(AcceptanceCheck::Regex {
+                    pattern: "PASS".to_string(),
+                    path: Some("report.txt".to_string()),
+                    command: None,
+                    timeout_secs: None,
+                }),
+            ))
+            .await;
+        // The second item's step writes the very file its check reads — the
+        // work, not tampering.
+        let runner = EvidenceRewritingRunner {
+            path: report_path,
+            content: "PASS".to_string(),
+        };
+        let report = LongHorizonRunner::new(fast_config())
+            .run("goal", &source, &runner, dir.path(), None)
+            .await;
+        assert_eq!(report.items_completed, 2, "{report:?}");
+        assert_eq!(
+            report.acceptance_unknown, 0,
+            "neither an untouched instrument nor a freshly-produced deliverable may \
+             demote a verdict: {report:?}"
+        );
+        assert_eq!(report.steps_taken, 2, "one step per item: {report:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // P23 — user-declared file invariants (the writer half)
+    // -----------------------------------------------------------------
+
+    /// The registry the write tools read is materialized from the user's own
+    /// words, in the shape the tool side parses, with the sentence quotable
+    /// verbatim.
+    #[tokio::test]
+    async fn a_declared_prohibition_reaches_the_workspace_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        materialize_declared_invariants(
+            "Fix the failing behaviour in ./minidb. Never create, edit or delete anything \
+             under tests/.",
+            dir.path(),
+        )
+        .await;
+        let raw = std::fs::read_to_string(
+            dir.path().join(nanna_storage::DECLARED_INVARIANTS_FILE),
+        )
+        .expect("the registry is written where the write tools look for it");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(doc.get("version").and_then(serde_json::Value::as_u64), Some(1));
+        let list = doc
+            .get("invariants")
+            .and_then(serde_json::Value::as_array)
+            .expect("invariants array");
+        assert!(
+            list.iter().any(|i| i.get("kind").and_then(serde_json::Value::as_str)
+                == Some("read_only")),
+            "{raw}"
+        );
+        assert!(
+            list.iter().all(|i| i.get("glob").and_then(serde_json::Value::as_str)
+                == Some("tests")),
+            "{raw}"
+        );
+        assert!(
+            list.iter().all(|i| i
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.contains("Never create, edit or delete"))),
+            "the refusal has to be able to quote the user: {raw}"
+        );
+    }
+
+    /// A goal that declares nothing must leave the workspace exactly as it
+    /// was: the tool side fails open on a missing registry, so an ordinary
+    /// chat turn writes no file and behaves exactly as before.
+    #[tokio::test]
+    async fn an_ordinary_goal_writes_no_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        materialize_declared_invariants(
+            "Add a --version flag to the CLI and update the README.",
+            dir.path(),
+        )
+        .await;
+        assert!(
+            !dir.path()
+                .join(nanna_storage::DECLARED_INVARIANTS_FILE)
+                .exists(),
+            "no declaration, no registry"
+        );
     }
 
     // -----------------------------------------------------------------

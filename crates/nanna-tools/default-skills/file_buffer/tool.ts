@@ -1,8 +1,8 @@
 export default {
   name: "file_buffer",
-  version: "0.1.6",
+  version: "0.1.7",
   output: "memory",
-  description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit. Commit carries write_file's safety net: a shrinking commit over a file that changed since you last read it returns the file's current content to merge, the previous version is parked at <file>.__prev__, and the cheapest structural check runs on the result with its verdict appended.",
+  description: "Write a LARGE file across MULTIPLE tool calls: append chunks of text one call at a time, then commit once to write the real file. Use this instead of write_file when a file is too long to write in one call. Sequence: file_buffer(action=\"append\", file_path, content) repeatedly in order from the top of the file, then file_buffer(action=\"commit\", file_path) to write it. action=\"show\" previews the pending buffer, action=\"clear\" discards it. The real file only changes on commit. Commit carries write_file's safety net: a shrinking commit over a file that changed since you last read it returns the file's current content to merge, a shrinking commit that deletes more top-level sections than it keeps is held ONCE with the removed names (commit the same buffer again to confirm), the previous version is parked at <file>.__prev__ and the richest earlier version at <file>.__best__, and the cheapest structural check runs on the result with its verdict appended.",
   parameters: {
     type: "object",
     properties: {
@@ -70,13 +70,19 @@ export default {
       var p = ".__prev__";
       return key.length >= p.length && key.lastIndexOf(p) === key.length - p.length;
     }
+    // The coverage high-water park — a recovery copy like .__prev__,
+    // rewritten wholesale, never judged by cross-call history.
+    function hiwaterIsBest(key) {
+      var b = ".__best__";
+      return key.length >= b.length && key.lastIndexOf(b) === key.length - b.length;
+    }
     function hiwaterIsState(key) {
       if (key === ".nanna/write_hiwater.json") return true;
       var tail = "/.nanna/write_hiwater.json";
       return key.length > tail.length && key.lastIndexOf(tail) === key.length - tail.length;
     }
     function hiwaterExempt(key) {
-      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsState(key);
+      return hiwaterIsBuffer(key) || hiwaterIsPrev(key) || hiwaterIsBest(key) || hiwaterIsState(key);
     }
     function hiwaterLoad() {
       try {
@@ -143,7 +149,26 @@ export default {
       }
       return a;
     }
-    function hiwaterRecord(path, newSize, prevSize, verdict) {
+    // Sign an acknowledged removal set onto the ratchet entry (P23 structural
+    // shrink hold, below) — the same field and semantics write_file uses: a
+    // follow-up commit whose removal set signs the same proceeds, and any
+    // successful commit rebuilds the entry, clearing the signature so the
+    // hold re-arms for the next removal event. Best-effort.
+    function heldGutPut(path, sig) {
+      try {
+        var map = hiwaterLoad();
+        var key = hiwaterKey(path);
+        var entry = hiwaterEntryFor(map, path);
+        if (!entry) entry = { hi: 0, last: 0, at: Date.now() };
+        entry.heldGut = sig;
+        entry.at = Date.now();
+        map[key] = entry;
+        hiwaterSave(map);
+      } catch (e) {
+        // Best-effort.
+      }
+    }
+    function hiwaterRecord(path, newSize, prevSize, verdict, goodSyms) {
       try {
         var key = hiwaterKey(path);
         if (hiwaterExempt(key)) return;
@@ -159,19 +184,40 @@ export default {
         if (prevSize >= 0 && entry && typeof entry.hi === "number" && isFinite(entry.hi) && entry.hi > hi) {
           hi = entry.hi;
         }
+        // Rebuilt from scratch, which is also how the structural shrink
+        // hold's `heldGut` signature clears itself: any successful commit
+        // drops it and the hold re-arms for the next removal event.
         var next = { hi: hi, last: newSize, at: Date.now() };
         if (prevSize >= 0 && entry) {
           if (hiwaterGood(entry) > 0) {
             next.good = entry.good;
             next.goodAt = entry.goodAt || 0;
+            if (Array.isArray(entry.goodSyms)) {
+              next.goodSyms = entry.goodSyms;
+            }
           }
           if (entry.chk === "ok" || entry.chk === "bad") next.chk = entry.chk;
+          // Coverage high-water record travels with the ratchet: a force
+          // commit resets it exactly as it resets `good`.
+          if (typeof entry.bestSyms === "number" && isFinite(entry.bestSyms)) {
+            next.bestSyms = entry.bestSyms;
+            next.bestAt = entry.bestAt || 0;
+          }
         }
         if (verdict) {
           next.chk = verdict.ok ? "ok" : "bad";
           if (verdict.ok) {
             next.good = newSize;
             next.goodAt = Date.now();
+            // The anchor's definition set rebases WITH its size (P23): a set
+            // left over from an older good version would name definitions
+            // this commit legitimately removed. Always replaced, never
+            // carried past a rebase.
+            if (Array.isArray(goodSyms)) {
+              next.goodSyms = goodSyms;
+            } else {
+              delete next.goodSyms;
+            }
           }
         }
         map[key] = next;
@@ -226,6 +272,163 @@ export default {
       } catch (e) {
         return true;
       }
+    }
+
+    // USER-DECLARED FILE INVARIANTS (P23), shared contract with write_file /
+    // edit_file (full design comment in write_file). Durable prohibitions the
+    // USER stated in chat are registered at plan time and consulted before
+    // any mutation — for this tool that means the append that starts building
+    // a file under a forbidden path as well as the commit that lands it. The
+    // refusal quotes the user's own sentence back; a missing, unreadable or
+    // malformed registry means NO invariants (fail open, silently); force
+    // does NOT bypass, because only the user lifts a constraint.
+    var INVARIANT_STATE = ".nanna/declared_invariants.json";
+    function invariantsLoad() {
+      try {
+        var raw = Nanna.readFile(INVARIANT_STATE);
+        if (!raw) return [];
+        var parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return [];
+        var list = parsed.invariants;
+        if (!Array.isArray(list)) return [];
+        return list;
+      } catch (e) {
+        return [];
+      }
+    }
+    // `**` crosses directory separators, `*`/`?` stop at one; a wildcard-free
+    // glob matches the path itself or anything under it. Matching runs over
+    // the same canonical spelling the ratchet ledger uses. Fails open.
+    function invariantMatches(glob, canonPath, normPath) {
+      try {
+        // Canonical on BOTH sides: an absolute glob under the workspace
+        // root collapses to the relative form exactly as the path does.
+        var g = hiwaterKey(String(glob));
+        while (g.length > 1 && g.charAt(g.length - 1) === "/") g = g.substring(0, g.length - 1);
+        if (g === "") return false;
+        if (g.indexOf("*") === -1 && g.indexOf("?") === -1) {
+          return canonPath === g || normPath === g ||
+            canonPath.indexOf(g + "/") === 0 || normPath.indexOf(g + "/") === 0;
+        }
+        var re = "";
+        for (var i = 0; i < g.length; i++) {
+          var c = g.charAt(i);
+          if (c === "*") {
+            if (g.charAt(i + 1) === "*") {
+              re += "[\\s\\S]*";
+              i++;
+              if (g.charAt(i + 1) === "/") i++;
+            } else {
+              re += "[^/]*";
+            }
+          } else if (c === "?") {
+            re += "[^/]";
+          } else if ("\\^$.|+()[]{}".indexOf(c) !== -1) {
+            re += "\\" + c;
+          } else {
+            re += c;
+          }
+        }
+        var rx = new RegExp("^" + re + "$");
+        return rx.test(canonPath) || rx.test(normPath);
+      } catch (e) {
+        return false;
+      }
+    }
+    // `path` is always the REAL target file, never the .__buffer__ sidecar:
+    // the constraint is about the artifact the user named, and the sidecar's
+    // existence is tooling detail.
+    function invariantRefusal(path, verb) {
+      try {
+        var list = invariantsLoad();
+        if (list.length === 0) return "";
+        var canon = hiwaterKey(path);
+        var norm = hiwaterNormKey(path);
+        for (var i = 0; i < list.length; i++) {
+          var inv = list[i];
+          if (!inv || typeof inv !== "object") continue;
+          var kind = typeof inv.kind === "string" ? inv.kind : "";
+          // `no_delete` is about deletion and is enforced where deletions
+          // happen (exec), not on a write path.
+          if (kind !== "read_only" && kind !== "no_create_under") continue;
+          if (typeof inv.glob !== "string") continue;
+          if (!invariantMatches(inv.glob, canon, norm)) continue;
+          if (kind === "no_create_under") {
+            // Only CREATION is forbidden: an existing file under the glob is
+            // not this constraint's business. One stat, only on a match.
+            var exists = false;
+            try { exists = !!Nanna.stat(path); } catch (eS) { exists = false; }
+            if (exists) continue;
+          }
+          var quoted = typeof inv.source === "string" && inv.source !== "" ? inv.source : "";
+          var scope = typeof inv.scope === "string" && inv.scope !== "" ? inv.scope : "session";
+          glog("file_buffer guard: " + verb + " REFUSED (declared invariant " + kind + " on '" + inv.glob + "') " + path);
+          return verb + " REFUSED — " + path + " is under a path you declared off-limits" +
+            (kind === "no_create_under" ? " for NEW files" : "") +
+            (quoted === "" ? " (" + kind + " on `" + inv.glob + "`)" : ": \"" + quoted + "\"") +
+            ". Nothing was written and the file on disk is unchanged. That is YOUR instruction (declared for " +
+            scope + "), not a tool limitation, and it stays in force until you lift it in chat. " +
+            "The fix belongs in the artifact you are producing — if something that READS " + path +
+            " is failing, change the code it exercises, not " + path + ". If you believe this constraint " +
+            "genuinely blocks the goal, ask_user about it instead of working around it.";
+        }
+        return "";
+      } catch (e) {
+        return "";
+      }
+    }
+
+    // WRITE-FAILURE HONESTY (P23), shared with write_file / edit_file (full
+    // design comment in write_file): classify BEFORE truncating, always keep
+    // the trailing cause, and only offer a retry for a plausibly transient
+    // fault. Parses both the current bridge format and one carrying the
+    // stable ErrorKind name, falling back to the locale-independent OS error
+    // number.
+    function writeErrorKind(msg) {
+      var m = /\(kind=([A-Za-z]+)\)/.exec(msg);
+      if (m) return m[1];
+      if (msg.indexOf("(os error 5)") !== -1 || msg.indexOf("(os error 13)") !== -1) return "PermissionDenied";
+      if (msg.indexOf("(os error 32)") !== -1 || msg.indexOf("(os error 33)") !== -1) return "SharingViolation";
+      if (msg.indexOf("(os error 4)") !== -1) return "Interrupted";
+      return "";
+    }
+    function writeErrorTransient(kind) {
+      return kind === "Interrupted" || kind === "TimedOut" || kind === "WouldBlock" ||
+        kind === "SharingViolation" || kind === "ResourceBusy";
+    }
+    // The same 120-char identification width as before, split so the trailing
+    // cause survives the cut.
+    function preserveCause(msg) {
+      if (msg.length <= 120) return msg;
+      return msg.substring(0, 80) + " … " + msg.substring(msg.length - 40);
+    }
+    function writeFailureNote(path, rawErr, retryAdvice) {
+      var kind = writeErrorKind(rawErr);
+      var shown = preserveCause(rawErr);
+      if (kind === "PermissionDenied") {
+        // FileStat carries no read-only bit, so the stat distinguishes what
+        // it CAN and the sentence claims only the denial the OS reported.
+        var what = " The filesystem refused the write, not this tool.";
+        try {
+          var st = Nanna.stat(path);
+          if (st && st.is_dir) {
+            what = " " + path + " is a DIRECTORY, not a file — writing to it can never work.";
+          } else if (st && st.is_file) {
+            what = " " + path + " exists and is write-protected on disk.";
+          }
+        } catch (eStat) {
+          what = " The path cannot even be stat'ed, so the protection is on the file or on the directory holding it.";
+        }
+        return "(" + shown + ")." + what +
+          " Retrying the identical call cannot succeed — nothing transient failed. " +
+          "Write protection is usually deliberate: it marks the file as INPUT. Unless the request is " +
+          "specifically to change THIS file, leave the protection in place and change the file you are producing instead.";
+      }
+      if (kind === "" || writeErrorTransient(kind)) {
+        return "(" + shown + "). " + retryAdvice;
+      }
+      return "(" + shown + "). That failure is not transient — retrying the identical call will fail the same way. " +
+        "Fix what the cause names (the path, the directory, the disk) and then write again.";
     }
 
     // Python syntax gate — same contract as write_file/edit_file: refuse
@@ -414,6 +617,16 @@ export default {
       }
       return map;
     }
+    // The sorted definition NAMES of a version, reusing an already-computed
+    // body map when the caller has one (the structural hold's pre-commit pass
+    // is over exactly this content) so no side is parsed twice.
+    function symbolNames(text, cachedBodies) {
+      var bodies = cachedBodies || symbolBodies(text);
+      var names = [];
+      for (var n in bodies) names.push(n);
+      names.sort();
+      return names;
+    }
     function nameList(arr) {
       var shown = arr.slice(0, 10);
       var more = arr.length - shown.length;
@@ -455,6 +668,17 @@ export default {
     }
     action = String(action).toLowerCase();
 
+    // The user's own declared prohibitions come FIRST, on every action that
+    // builds toward a mutation of the real file — before the syntax gate
+    // writes .__chk temp files beside the target and before the buffer
+    // sidecar is created. show/clear read or drop tooling state only.
+    var isCommitAction = action === "commit" || action === "flush" || action === "save";
+    var isAppendAction = action === "append" || action === "add" || action === "write";
+    if (isCommitAction || isAppendAction) {
+      var invBlock = invariantRefusal(filePath, isCommitAction ? "COMMIT" : "APPEND");
+      if (invBlock !== "") return fail(invBlock);
+    }
+
     var bufPath = filePath + ".__buffer__";
     var buffered = null;
     try {
@@ -478,9 +702,10 @@ export default {
       try {
         Nanna.writeFile(bufPath, joined);
       } catch (eW) {
-        var wErr = String(eW);
-        if (wErr.length > 120) wErr = wErr.substring(0, 120) + "...";
-        return fail("file_buffer failed writing the buffer (" + wErr + "). Retry the same append.");
+        // Classify BEFORE truncating (P23): the cause is the tail, and the
+        // advice that follows it must match the cause.
+        return fail("file_buffer failed writing the buffer for " + filePath + " " +
+          writeFailureNote(bufPath, String(eW), "Retry the same append."));
       }
       return {
         content: "Buffered: " + joined.length + " chars / " + lineCount(joined) + " lines pending for " + filePath + ". The buffer now ends with:\n" + lastLines(joined, 2) + "\nContinue with the NEXT lines via file_buffer(action=\"append\", ...), or finish with file_buffer(action=\"commit\", file_path=\"" + filePath + "\").",
@@ -497,6 +722,11 @@ export default {
       var fileExists = false;
       var hwKeyC = hiwaterKey(filePath);
       var pyGate = { ran: false, ok: false, detail: "" };
+      // The pre-commit definition pass. Computed once (when the structural
+      // hold below needs it) and reused by the rewrite-note after the commit,
+      // so each side is parsed exactly once per call.
+      var preOldBodies = null;
+      var preNewBodies = null;
       if (input.force !== true) {
         pyGate = pythonSyntaxCheck(filePath, buffered);
         if (pyGate.ran && !pyGate.ok) {
@@ -535,14 +765,14 @@ export default {
         // guard as write_file (design comment there). The buffer is KEPT;
         // the reply carries the file's current content and counts as the
         // read, so the next commit proceeds.
+        // Echo bound, same rule as write_file (design comment there) and
+        // shared by BOTH holds below: under 64 KiB the full content ships and
+        // counts as the read; over it, a loudly-truncated head ships, the
+        // mark is NOT recorded, and the next commit bounces into an explicit
+        // ranged read_file rather than a merge against a partial view.
+        var ECHO_MAX = 65536;
         if (fileExists && !hiwaterExempt(hwKeyC) && buffered.length < existingLen &&
             typeof existing === "string" && !seenSinceLastChange(filePath)) {
-          // Echo bound, same rule as write_file (design comment there):
-          // under 64 KiB the full content ships and counts as the read;
-          // over it, a loudly-truncated head ships, the mark is NOT
-          // recorded, and the next commit bounces into an explicit
-          // ranged read_file rather than a merge against a partial view.
-          var ECHO_MAX = 65536;
           if (existingLen <= ECHO_MAX) {
             readmarkPut(filePath);
             glog("file_buffer guard: stale-shrink echo for " + filePath + " (buffer " + buffered.length + " over " + existingLen + " bytes; file changed since last recorded read)");
@@ -592,6 +822,100 @@ export default {
           return fail("COMMIT REFUSED — the buffer holds only " + buffered.length + " chars but " + filePath + " " + sizeStory + ". The file is UNCHANGED and the buffer is KEPT — it looks incomplete. Keep appending the rest of the file, then commit again.");
         }
 
+        // STRUCTURAL SHRINK HOLD (P23), same guard write_file carries (full
+        // design comment there): bytes cannot see function removal, so a
+        // SHRINKING commit that removes more pre-existing definitions than it
+        // keeps — or drops definitions present in the last version that
+        // PASSED a structural check — is held ONCE, with the removed names
+        // and the current content as merge material, and the removal set
+        // signed onto the ratchet entry. Commit the same buffer again and it
+        // lands; any successful commit clears the signature. A guard that
+        // lives in only one tool does not protect the file, it just decides
+        // which tool gets used to damage it (the 2026-07-28 lesson). Fails
+        // OPEN in every direction; the buffer is always KEPT.
+        if (fileExists && !hiwaterExempt(hwKeyC) && buffered.length < existingLen &&
+            typeof existing === "string") {
+          var gutHold = null;
+          try {
+            preOldBodies = symbolBodies(existing);
+            preNewBodies = symbolBodies(buffered);
+            var gutRemoved = [];
+            var gutKept = 0;
+            var gutOldCount = 0;
+            for (var gOld in preOldBodies) {
+              gutOldCount++;
+              if (preNewBodies[gOld] === undefined) gutRemoved.push(gOld);
+              else gutKept++;
+            }
+            var gutNewCount = 0;
+            for (var gNew in preNewBodies) gutNewCount++;
+            if (gutOldCount > 0 && gutNewCount > 0) {
+              var gutEntry = hiwaterEntryFor(hiwaterLoad(), filePath);
+              // Measured against the buffered content, not against disk — the
+              // current disk copy may itself already have lost something the
+              // evidenced-good version had.
+              var goodNames = gutEntry && Array.isArray(gutEntry.goodSyms)
+                ? gutEntry.goodSyms : [];
+              var lostFromGood = [];
+              for (var gi = 0; gi < goodNames.length; gi++) {
+                var gn = goodNames[gi];
+                if (typeof gn !== "string") continue;
+                if (preNewBodies[gn] !== undefined) continue;
+                lostFromGood.push(gn);
+              }
+              if (gutRemoved.length > gutKept || lostFromGood.length > 0) {
+                // One removal SET, deduplicated: the two arms overlap
+                // whenever a definition is missing from both disk and the
+                // good anchor.
+                var gutSet = gutRemoved.slice(0);
+                for (var li = 0; li < lostFromGood.length; li++) {
+                  if (gutSet.indexOf(lostFromGood[li]) === -1) gutSet.push(lostFromGood[li]);
+                }
+                gutSet.sort();
+                var gutSig = String(hashStr(gutSet.join("\n")));
+                var gutAckd = gutEntry && typeof gutEntry.heldGut === "string" ? gutEntry.heldGut : "";
+                if (gutAckd !== gutSig) {
+                  gutHold = { names: gutSet, sig: gutSig, fromGood: lostFromGood, old: gutOldCount, kept: gutKept };
+                }
+              }
+            }
+          } catch (eGut) {
+            // No structural opinion — the commit proceeds exactly as before.
+            gutHold = null;
+          }
+          if (gutHold) {
+            heldGutPut(filePath, gutHold.sig);
+            var gutWhy = "This commit would replace " + filePath + " (" + existingLen + " → " + buffered.length +
+              " bytes) and REMOVE " + gutHold.names.length + " of the " + gutHold.old +
+              " top-level sections the file defines, keeping " + gutHold.kept + ": " + nameList(gutHold.names) + "." +
+              (gutHold.fromGood.length > 0
+                ? " " + nameList(gutHold.fromGood) + " were present in the last version of this file that PASSED a structural check."
+                : "") +
+              " Deleting more than you keep is usually a buffer built from a stale or partial copy rather than a deliberate removal, and byte counts cannot see it.";
+            var gutHow = "If those sections are genuinely obsolete, commit this SAME buffer again and it will be written — " +
+              "this hold fires once per removal set, not once per attempt. Otherwise fold the missing sections back in with " +
+              "edit_file(file_path=\"" + bufPath + "\", ...) and commit again.";
+            glog("file_buffer guard: structural shrink hold for " + filePath + " (" + existingLen + "->" + buffered.length +
+              " bytes) removed=[" + gutHold.names.join(",") + "] kept=" + gutHold.kept + " sig=" + gutHold.sig);
+            if (existingLen <= ECHO_MAX) {
+              readmarkPut(filePath);
+              return fail(
+                "COMMIT HELD — the real file is UNCHANGED and the buffer is KEPT. " + gutWhy +
+                "\n\nHere is the CURRENT content of " + filePath + ":\n\n" + existing +
+                "\n\n" + gutHow + " This reply counts as your read."
+              );
+            }
+            return fail(
+              "COMMIT HELD — the real file is UNCHANGED and the buffer is KEPT. " + gutWhy +
+              "\n\nThe file is too large (" + existingLen + " bytes) to echo here; its first lines are:\n\n" +
+              existing.substring(0, 4096) +
+              "\n\n[TRUNCATED — only the first 4096 of " + existingLen + " bytes shown; the file on disk is complete and unaffected.] " +
+              "This truncated preview does NOT count as reading the file — call read_file(\"" + filePath +
+              "\") (with offset/limit for ranges) to see what those sections contain. " + gutHow
+            );
+          }
+        }
+
         // P22: displaced content stays recoverable — park the outgoing
         // version at <file>.__prev__ before the overwrite, exactly as
         // write_file does. Best-effort, never blocks the commit.
@@ -602,9 +926,11 @@ export default {
       try {
         Nanna.writeFile(filePath, buffered);
       } catch (eC) {
-        var cErr = String(eC);
-        if (cErr.length > 120) cErr = cErr.substring(0, 120) + "...";
-        return fail("file_buffer failed writing " + filePath + " (" + cErr + "). The buffer is KEPT — retry the commit.");
+        // Classify BEFORE truncating (P23): the cause is the tail, and the
+        // advice that follows it must match the cause — a permission denial
+        // is not something a retry can fix.
+        return fail("file_buffer failed writing " + filePath + " — the buffer is KEPT. " +
+          writeFailureNote(filePath, String(eC), "Retry the commit."));
       }
       try {
         Nanna.exec("rm -f '" + bufPath + "' '" + filePath + ".__cleared__'", null, 15);
@@ -638,7 +964,20 @@ export default {
       // commit `existing` was never read: prevSize -1 re-arms from the
       // committed size and drops the stale good/chk evidence — exactly
       // force's reset semantics in write_file.
-      hiwaterRecord(filePath, buffered.length, input.force === true ? -1 : existingLen, verdict);
+      // A passing verdict also rebases the structural anchor the shrink hold
+      // measures against (P23) — computed only on the rebase, and reusing the
+      // hold's pass over this exact content when it already ran. No anchor is
+      // safer than a stale one, so a failed pass records none.
+      var commitGoodSyms = null;
+      if (verdict && verdict.ok) {
+        try {
+          if (!preNewBodies) preNewBodies = symbolBodies(buffered);
+          commitGoodSyms = symbolNames(buffered, preNewBodies);
+        } catch (eSyms) {
+          commitGoodSyms = null;
+        }
+      }
+      hiwaterRecord(filePath, buffered.length, input.force === true ? -1 : existingLen, verdict, commitGoodSyms);
       // The file now holds exactly the committed buffer — the session's
       // knowledge of the content is current, so the commit counts as a
       // read for the stale-shrink guard.
@@ -651,15 +990,51 @@ export default {
 
       // Rewrite-delta note, bidirectional (design comment in write_file).
       var lossNote = "";
+      var bestPath = filePath + ".__best__";
       if (fileExists && input.force !== true && typeof existing === "string" && existing !== buffered) {
         try {
-          var oldBodies = symbolBodies(existing);
-          var newBodies = symbolBodies(buffered);
+          var oldBodies = preOldBodies || symbolBodies(existing);
+          var newBodies = preNewBodies || symbolBodies(buffered);
           var dropped = [];
           var changed = [];
           for (var sName in oldBodies) {
             if (newBodies[sName] === undefined) dropped.push(sName);
             else if (newBodies[sName] !== oldBodies[sName]) changed.push(sName);
+          }
+          // COVERAGE HIGH-WATER PARK (P23), same rule as write_file (design
+          // comment there): .__prev__ holds one generation, so a two-commit
+          // spiral rotates the good version out. The outgoing version is
+          // parked at .__best__ whenever its top-level definition COUNT beats
+          // the recorded record (not a subset relation — spirals rename
+          // symbols); only commits that actually REMOVE sections qualify, the
+          // first parks unconditionally, and a force commit resets the record
+          // with the ratchet. Best-effort; never blocks.
+          var bestNote = "";
+          if (dropped.length > 0 && !hiwaterExempt(hwKeyC)) {
+            var outCount = 0;
+            for (var oName in oldBodies) outCount++;
+            try {
+              var bMap = hiwaterLoad();
+              var bEntry = hiwaterEntryFor(bMap, filePath);
+              var bHave = bEntry && typeof bEntry.bestSyms === "number" && isFinite(bEntry.bestSyms)
+                ? bEntry.bestSyms : 0;
+              if (outCount > bHave) {
+                Nanna.writeFile(bestPath, existing);
+                if (!bEntry) bEntry = { hi: existingLen, last: buffered.length, at: Date.now() };
+                bEntry.bestSyms = outCount;
+                bEntry.bestAt = Date.now();
+                bMap[hwKeyC] = bEntry;
+                hiwaterSave(bMap);
+                glog("file_buffer parked coverage high-water for " + filePath + " at " + bestPath +
+                  " (" + outCount + " sections, previous record " + bHave + ")");
+              } else if (bHave > 0) {
+                bestNote = " The fullest prior version (" + bHave + " sections, against " + outCount +
+                  " in the version this commit replaced) is parked at " + bestPath +
+                  " — read_file it before rewriting again.";
+              }
+            } catch (eBest) {
+              // Recovery copies are best-effort.
+            }
           }
           var grewPastDouble = existingLen > 500 && buffered.length > existingLen * 2;
           if (dropped.length > 0 || changed.length > 0 || grewPastDouble) {
@@ -672,7 +1047,7 @@ export default {
                 : " It also more than doubled the file — most of what is on disk now is new text.";
             }
             lossNote = " NOTE: this commit replaced " + filePath + " (" + existingLen + " → " + buffered.length + " bytes)." + parts +
-              " The commit SUCCEEDED — the file holds exactly the committed buffer. If any of those sections were verified working, re-verify them now; the previous version is preserved at " + filePath + ".__prev__ (read_file it to recover anything).";
+              " The commit SUCCEEDED — the file holds exactly the committed buffer. If any of those sections were verified working, re-verify them now; the previous version is preserved at " + filePath + ".__prev__ (read_file it to recover anything)." + bestNote;
             glog("file_buffer rewrite-note for " + filePath + " (" + existingLen + "->" + buffered.length + " bytes): removed=[" + dropped.join(",") + "] changed=[" + changed.join(",") + "]" + (grewPastDouble ? " grew>2x" : ""));
           }
         } catch (eLoss) {

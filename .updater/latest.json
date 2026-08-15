@@ -1,11 +1,11 @@
 {
-  "version": "0.3.7",
-  "notes": "Public Beta 12 - the P22 'Keep the peak' program, complete: steps end on progress exhaustion instead of a hard iteration cap (with a reserved wrap-up turn), compression triggers derive from measured headroom and verified outcomes are never compressed away, write-path honesty (content-echo shrink guard, structural verdicts, anchored ratchet), local-model admission gate, liveness beat + stream watchdog + fast send ack, structural narration salvage for dialect models, and background runs yield the model to live chat. Plus a dependency refresh and a rebuilt toolchain pin.",
-  "pub_date": "2026-08-14T20:50:29.000Z",
+  "version": "0.3.8",
+  "notes": "Public Beta 13 - P23 'Continuation without destruction': verified work now survives the turn boundary. A continuation turn carries a pinned ARTIFACT STATE block re-read from disk, a user claim that contradicts verified evidence gets reproduced before anything is rewritten, and shrinking rewrites that drop definitions are held once with the removals named. Endings are loud and honest: every turn ends with one stated reason, a round is never 'dry' while its own checks still fail, error rounds are charged only against a provider-health probe, and a transient outage parks and resumes instead of giving up. Tool results stopped lying: python registry saves say where they landed, a killed command reports what it did before the deadline, and directory tools teach instead of emitting OS jargon. Plus live (no longer boot-frozen) summarization-priority, GUI steering that no longer reads as failure, and two invalid installer-config keys that blocked builds outright.",
+  "pub_date": "2026-08-15T21:27:14.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXFCZXlFTlBCR1RaTzBMaWhXWWxqMmowM3lpVGZxT3JjNEhYYjdmVkdDRitBUG9scnJmRkN1bHd3WWs2bDh5bXExQ21XYm1MVUVmWXEvZXkxaEFFR2d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NzQwNTkxCWZpbGU6TmFubmFfMC4zLjdfeDY0LXNldHVwLmV4ZQpGcnJtbzhDSzExV0g2bzJiV2VGQWtkUlgrSDlvSE1tbWlXTkJZaWtjb0lYMTFyeUZwRkttd09OTitvODRJaXBDTmtJMDRTbFptc1hrWWQ1a2M4cWhBZz09Cg==",
-      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.7-beta.12/Nanna_0.3.7_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWVZwdytmMEYzaXUxQWh6SHprMG5tMXRjVWlQU05tRDUzUTdiN1JUSjZ4cmpBVmFmWnJIVmxsT0k1UW10ZXFac0hOWFNFc1phZWh3QUQwMzRReVB2TElSWW1LK2dldmcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODI5MjA3CWZpbGU6TmFubmFfMC4zLjhfeDY0LXNldHVwLmV4ZQpKMGUyM2FhdjMvUmcxanNBdVFNR2k3M2IrMm5vVmRNMDJXcUpLRHBWT1pQR1gzN0JwekUxWmxlR3l5bVZxQ0ozKzMrcGxCR3o3cEdsMy9WZ0ErUVRBUT09Cg==",
+      "url": "https://github.com/physics515/Nanna/releases/download/v0.3.8-beta.13/Nanna_0.3.8_x64-setup.exe"
     }
   }
 }

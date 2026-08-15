@@ -13,6 +13,7 @@ interface ModelStatus {
 const status = ref<ModelStatus | null>(null)
 const isLoading = ref(true)
 let unlisten: UnlistenFn | null = null
+let unlistenConfig: UnlistenFn | null = null
 
 // Ground glass for the pill
 const { meshBg, containerStyle, onEnter, onLeave } = useGroundGlass({
@@ -88,11 +89,19 @@ onMounted(async () => {
   unlisten = await listen<ModelStatus>('model-status', (event) => {
     status.value = event.payload
   })
+  // The model this pill names is config, and config is shared: another window,
+  // the settings page, or the agent itself can change it. Fetching once at
+  // mount left the pill naming a model that had stopped being the active one.
+  // Payload-free event → re-fetch, exactly like `workspaces-changed`.
+  unlistenConfig = await listen('config-changed', () => {
+    void loadStatus()
+  })
   setTimeout(() => { ready.value = true }, 200)
 })
 
 onUnmounted(() => {
   if (unlisten) unlisten()
+  if (unlistenConfig) unlistenConfig()
 })
 </script>
 

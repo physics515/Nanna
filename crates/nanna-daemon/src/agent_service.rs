@@ -123,6 +123,65 @@ impl Default for AgentServiceConfig {
     }
 }
 
+/// Copy every `[llm]`-derived field the running agent uses out of a config
+/// snapshot, in one place.
+///
+/// This is the *whole* answer to "which agent settings does a `[llm]` change
+/// reach?" — the bound is the field set the boot path already derives from
+/// `config.llm` (see `server.rs`, "Set agent configuration from loaded
+/// config"), so hot-reload and boot can never disagree about a field again.
+/// Fields boot does NOT take from `[llm]` (`max_tokens`, `temperature`, the
+/// iteration/nudge policy, thinking mode) are deliberately absent: copying
+/// them here would make a config write change behavior boot never would.
+///
+/// Split out of [`AgentService::apply_llm_config`] so the mapping is testable
+/// without a live service.
+pub fn apply_llm_settings(cfg: &mut AgentServiceConfig, llm: &nanna_config::LlmConfig) {
+    cfg.model_priority = llm.model_priority.clone();
+    // Same derivation boot uses: head of the priority list, else the single
+    // `llm.model`. A priority list that just became empty must not strand the
+    // agent on the model the old list's head named.
+    cfg.model = llm
+        .model_priority
+        .first()
+        .cloned()
+        .unwrap_or_else(|| llm.model.clone());
+    cfg.summarization_priority = llm.summarization_priority.clone();
+    cfg.summarization_ollama_url = llm.ollama_url.clone();
+    cfg.openrouter_api_key = llm.openrouter_api_key.clone();
+    cfg.openai_api_key = llm.openai_api_key.clone();
+    cfg.model_routing = llm.model_routing.clone();
+    cfg.routing_first_turn_primary = llm.routing_first_turn_primary;
+    cfg.sub_agent_model = llm.sub_agent_model.clone();
+    // Resolved (list > legacy single > main chat list), exactly as boot does,
+    // so consumers keep seeing one authoritative never-empty chain.
+    cfg.sub_agent_models = llm.effective_sub_agent_models();
+}
+
+/// Build the per-run/per-step [`AgentConfig`] from the service config.
+///
+/// Free function so the whole resolution chain — `[llm]` snapshot →
+/// [`AgentServiceConfig`] → the `AgentConfig` the agent loop actually
+/// summarizes with — is unit-testable without a live service.
+fn agent_config_from(config: &AgentServiceConfig) -> AgentConfig {
+    AgentConfig {
+        model: config.model.clone(),
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        max_iterations: config.max_iterations,
+        nudge_after_iterations: config.nudge_after_iterations,
+        nudge_interval_iterations: config.nudge_interval_iterations,
+        thinking_mode: config.thinking_mode,
+        summarization_priority: config.summarization_priority.clone(),
+        summarization_ollama_url: config.summarization_ollama_url.clone(),
+        openrouter_api_key: config.openrouter_api_key.clone(),
+        openai_api_key: config.openai_api_key.clone(),
+        model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
+        routing_first_turn_primary: config.routing_first_turn_primary,
+        ..Default::default()
+    }
+}
+
 /// Active chat request state
 struct ActiveChat {
     // Used for future session tracking features
@@ -494,20 +553,34 @@ impl AgentService {
         info
     }
 
-    /// Update model configuration at runtime (hot-reload from control plane)
-    pub async fn update_config(&self, model: Option<String>, model_priority: Option<Vec<String>>) {
-        let mut config = self.config.write().await;
-        if let Some(m) = model {
-            if config.model != m {
-                info!(old = %config.model, new = %m, "Switching model");
-                config.model = m;
+    /// Re-apply the running agent's `[llm]` settings from a config snapshot
+    /// (hot-reload from the control plane).
+    ///
+    /// This used to take only `model` + `model_priority`, so every other field
+    /// the agent derives from `[llm]` stayed frozen at whatever boot read from
+    /// disk — a config-frozen-at-boot bug of the same family as the router's.
+    /// The costly one was `summarization_priority`: a user who changed their
+    /// summarization model in settings (or pinned one over IPC) kept
+    /// summarizing on the boot-time model until the daemon restarted, and
+    /// nothing said so. Every compressed context in between was produced by a
+    /// model the user had already replaced.
+    ///
+    /// The field set is [`apply_llm_settings`] — deliberately the same set the
+    /// boot path derives from `config.llm`, not a hand-picked subset.
+    pub async fn apply_llm_config(&self, llm: &nanna_config::LlmConfig) {
+        {
+            let mut config = self.config.write().await;
+            let before_model = config.model.clone();
+            apply_llm_settings(&mut config, llm);
+            if before_model != config.model {
+                info!(old = %before_model, new = %config.model, "Switching model");
             }
+            info!(
+                model_priority = ?config.model_priority,
+                summarization_priority = ?config.summarization_priority,
+                "Applied [llm] settings to the running agent"
+            );
         }
-        if let Some(p) = model_priority {
-            info!(new_priority = ?p, "Updating model priority list");
-            config.model_priority = p;
-        }
-        drop(config);
 
         // Clear cached model info to force refresh on next request
         let mut cached = self.current_model_info.write().await;
@@ -518,22 +591,7 @@ impl AgentService {
     /// step runner builds fresh per-step agents from the same config)
     pub async fn agent_config(&self) -> AgentConfig {
         let config = self.config.read().await;
-        AgentConfig {
-            model: config.model.clone(),
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            max_iterations: config.max_iterations,
-            nudge_after_iterations: config.nudge_after_iterations,
-            nudge_interval_iterations: config.nudge_interval_iterations,
-            thinking_mode: config.thinking_mode,
-            summarization_priority: config.summarization_priority.clone(),
-            summarization_ollama_url: config.summarization_ollama_url.clone(),
-            openrouter_api_key: config.openrouter_api_key.clone(),
-            openai_api_key: config.openai_api_key.clone(),
-            model_routing: config.model_routing.iter().map(|s| ModelTier::parse(s)).collect(),
-            routing_first_turn_primary: config.routing_first_turn_primary,
-            ..Default::default()
-        }
+        agent_config_from(&config)
     }
     
     /// Get or create the per-session queue for serializing chat processing
@@ -1955,6 +2013,104 @@ mod tests {
             AgentService::parse_retry_after("İ error: retry after 42 seconds"),
             Some(42)
         );
+    }
+
+    /// The 2026-08-14 series bug: five benchmark legs each pinned
+    /// `llm.summarization_priority` to their own model over IPC, and all 171
+    /// context summarizations still ran on the model the daemon had booted
+    /// with — because the hot-reload path pushed only `model`/`model_priority`
+    /// onto the running service. The pin has to survive the whole chain, not
+    /// just the on-disk write.
+    #[test]
+    fn a_changed_summarization_priority_reaches_the_next_agent_config() {
+        let mut cfg = AgentServiceConfig {
+            // What the daemon booted with.
+            summarization_priority: vec!["ollama/lfm2.5".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_config_from(&cfg).summarization_priority,
+            vec!["ollama/lfm2.5".to_string()],
+            "boot value must be what the agent starts from"
+        );
+
+        // The user (or an operator over IPC) changes the summarization model.
+        let llm = nanna_config::LlmConfig {
+            summarization_priority: vec!["ollama/ornith:9b".to_string()],
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+
+        assert_eq!(cfg.summarization_priority, vec!["ollama/ornith:9b".to_string()]);
+        assert_eq!(
+            agent_config_from(&cfg).summarization_priority,
+            vec!["ollama/ornith:9b".to_string()],
+            "the next summarization request must use the new pin, not the boot model"
+        );
+
+        // Clearing the list must also propagate — empty means "truncate
+        // instead of summarize", and a stale non-empty list would keep
+        // spending a model the user just turned off.
+        apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
+        assert!(agent_config_from(&cfg).summarization_priority.is_empty());
+    }
+
+    #[test]
+    fn llm_settings_carry_the_rest_of_the_boot_derived_fields() {
+        let mut cfg = AgentServiceConfig::default();
+        let llm = nanna_config::LlmConfig {
+            model: "fallback-model".to_string(),
+            model_priority: vec!["primary".to_string(), "secondary".to_string()],
+            ollama_url: Some("http://127.0.0.1:11434".to_string()),
+            openrouter_api_key: Some("or-key".to_string()),
+            openai_api_key: Some("oa-key".to_string()),
+            model_routing: vec!["cheap:simple".to_string()],
+            routing_first_turn_primary: false,
+            sub_agent_models: vec!["sub".to_string()],
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+
+        // Head of the priority list wins, exactly as at boot.
+        assert_eq!(cfg.model, "primary");
+        assert_eq!(cfg.model_priority, vec!["primary".to_string(), "secondary".to_string()]);
+        assert_eq!(cfg.summarization_ollama_url.as_deref(), Some("http://127.0.0.1:11434"));
+        assert_eq!(cfg.openrouter_api_key.as_deref(), Some("or-key"));
+        assert_eq!(cfg.openai_api_key.as_deref(), Some("oa-key"));
+        assert_eq!(cfg.model_routing, vec!["cheap:simple".to_string()]);
+        assert!(!cfg.routing_first_turn_primary);
+        assert_eq!(cfg.sub_agent_models, vec!["sub".to_string()]);
+
+        // Empty priority list → the single `llm.model`, never the stale head.
+        let llm = nanna_config::LlmConfig {
+            model: "fallback-model".to_string(),
+            model_priority: vec![],
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &llm);
+        assert_eq!(cfg.model, "fallback-model");
+    }
+
+    #[test]
+    fn llm_settings_do_not_touch_fields_boot_leaves_alone() {
+        // The bound on `apply_llm_settings` is "the field set boot derives
+        // from `[llm]`". Anything boot leaves at the service default must stay
+        // untouched here, or a config write would change behavior a restart
+        // never would.
+        let mut cfg = AgentServiceConfig {
+            max_tokens: 4242,
+            temperature: 0.13,
+            nudge_after_iterations: 7,
+            nudge_interval_iterations: 3,
+            max_iterations: Some(9),
+            ..Default::default()
+        };
+        apply_llm_settings(&mut cfg, &nanna_config::LlmConfig::default());
+        assert_eq!(cfg.max_tokens, 4242);
+        assert!((cfg.temperature - 0.13).abs() < f32::EPSILON);
+        assert_eq!(cfg.nudge_after_iterations, 7);
+        assert_eq!(cfg.nudge_interval_iterations, 3);
+        assert_eq!(cfg.max_iterations, Some(9));
     }
 
     #[test]

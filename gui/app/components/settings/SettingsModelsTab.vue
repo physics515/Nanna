@@ -310,8 +310,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   Key, CheckCircle, XCircle, LogOut, Terminal, Download, RefreshCw,
   Brain, AlertTriangle, Layers, Link, ScanText, Bot
@@ -406,6 +407,23 @@ store.onSettingsLoaded(async () => {
   } catch {
     useEmbeddedOcr.value = true
   }
+})
+
+// The daemon owns the config this tab edits, and it is shared: another window,
+// a channel, or the agent itself can change a model priority while this tab is
+// open. Everything here was read once at mount, so those changes stayed
+// invisible until a reload. Payload-free event → re-read the whole slice, the
+// same shape `workspaces-changed` uses. Event-driven only: no poll, no TTL.
+let unlistenConfig: UnlistenFn | null = null
+
+onMounted(async () => {
+  unlistenConfig = await listen('config-changed', () => {
+    void loadSettings()
+  })
+})
+
+onUnmounted(() => {
+  if (unlistenConfig) unlistenConfig()
 })
 
 async function refreshAllModels() {

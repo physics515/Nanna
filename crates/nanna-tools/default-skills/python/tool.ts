@@ -1,7 +1,7 @@
 export default {
   name: "python",
   requires: ["python.exec"],
-  version: "0.1.0",
+  version: "0.1.1",
   output: "memory",
   description: "Execute Python code or manage saved scripts. Embedded interpreter — no system Python required. Supports standard library (os, json, re, pathlib, collections, math, etc). No pip/third-party packages. Use for file manipulation, data processing, batch edits, text transforms, and scripting.",
   parameters: {
@@ -13,7 +13,7 @@ export default {
       },
       action: {
         type: "string",
-        description: "Script management action: 'run' (default), 'save', 'load', 'list', 'delete'. 'run' executes code directly. 'save' stores code as a named script. 'load' runs a saved script. 'list' shows all saved scripts. 'delete' removes a saved script.",
+        description: "Script management action: 'run' (default), 'save', 'load', 'list', 'delete'. 'run' executes code directly. 'save' stores code in the session-scoped script registry, not as a workspace file — it creates no file of that name on disk; use write_file for that. 'load' runs a saved script. 'list' shows all saved scripts. 'delete' removes a saved script from that registry.",
         enum: ["run", "save", "load", "list", "delete"]
       },
       name: {
@@ -39,6 +39,9 @@ export default {
     var action = input.action || "run";
     var sessionId = Nanna.sessionId();
     var scriptFile = sessionId ? ".nanna-scripts-" + sessionId + ".json" : ".nanna-scripts.json";
+    // Set by the 'load' case so the run below can say WHERE the code came
+    // from. A saved script executes with no trace of its origin otherwise.
+    var loadedFrom = null;
 
     // Load saved scripts
     var scripts = {};
@@ -66,15 +69,31 @@ export default {
         };
         Nanna.writeFile(scriptFile, JSON.stringify(scripts, null, 2));
         var lineCount = input.code.split("\n").length;
-        return { content: "Saved script '" + input.name + "' (" + lineCount + " lines). Run with: python(action='load', name='" + input.name + "')", success: true };
+        // A side-effect ack must name WHERE the effect landed. "Saved script
+        // 'build.sh'" reads as a file write, and a model that believes it
+        // wrote build.sh never writes it — the effect landed in a session
+        // JSON index, under a key, not at that path. Say so in the ack, since
+        // nothing downstream can see the difference.
+        return {
+          content: "Saved script '" + input.name + "' (" + lineCount + " lines) to the session " +
+            "script registry (" + scriptFile + ") — this stores code for python(action='load', " +
+            "name='" + input.name + "'); it did NOT create or modify any workspace file named '" +
+            input.name + "'.",
+          success: true
+        };
       }
 
       case "list": {
         var names = Object.keys(scripts);
         if (names.length === 0) {
-          return { content: "No saved scripts in this session.", success: true };
+          return {
+            content: "No saved scripts in the session script registry (" + scriptFile +
+              "). This lists saved code, not workspace files — use list_dir for those.",
+            success: true
+          };
         }
-        var lines = ["Saved scripts (" + names.length + "):"];
+        var lines = ["Saved scripts (" + names.length + ") in the session script registry (" +
+          scriptFile + "):"];
         for (var i = 0; i < names.length; i++) {
           var s = scripts[names[i]];
           var lineCount = s.code.split("\n").length;
@@ -89,11 +108,19 @@ export default {
           return { content: "Error: 'name' is required for delete action", success: false };
         }
         if (!scripts[input.name]) {
-          return { content: "Error: script '" + input.name + "' not found", success: false };
+          return {
+            content: "Error: script '" + input.name + "' not found in the session script registry (" +
+              scriptFile + ")",
+            success: false
+          };
         }
         delete scripts[input.name];
         Nanna.writeFile(scriptFile, JSON.stringify(scripts, null, 2));
-        return { content: "Deleted script '" + input.name + "'.", success: true };
+        return {
+          content: "Deleted script '" + input.name + "' from the session script registry (" +
+            scriptFile + ") — no workspace file was deleted.",
+          success: true
+        };
       }
 
       case "load": {
@@ -103,10 +130,15 @@ export default {
         if (!scripts[input.name]) {
           var available = Object.keys(scripts);
           var hint = available.length > 0 ? " Available: " + available.join(", ") : " No scripts saved.";
-          return { content: "Error: script '" + input.name + "' not found." + hint, success: false };
+          return {
+            content: "Error: script '" + input.name + "' not found in the session script registry (" +
+              scriptFile + ")." + hint,
+            success: false
+          };
         }
         // Fall through to execution with the saved code
         input.code = scripts[input.name].code;
+        loadedFrom = input.name;
         // Fall through to run
       }
 
@@ -149,6 +181,13 @@ export default {
 
         if (result.duration_ms !== undefined) {
           output += "\n(" + result.duration_ms + "ms)";
+        }
+
+        // Same rule as the save ack: name where this code came from, so a
+        // loaded script's output is never mistaken for a workspace file's.
+        if (loadedFrom !== null) {
+          output = "(ran saved script '" + loadedFrom + "' from the session script registry " +
+            scriptFile + " — not a workspace file)\n" + output;
         }
 
         return { content: output, success: result.success };

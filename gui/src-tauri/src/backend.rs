@@ -291,6 +291,12 @@ impl Backend {
                         // this client's own active selection is untouched.
                         let _ = app.emit("workspaces-changed", ());
                     }
+                    DaemonEvent::ConfigChanged => {
+                        // Same shape as workspaces-changed: payload-free, each
+                        // view re-fetches the config slice it renders instead
+                        // of showing whatever it read at mount.
+                        let _ = app.emit("config-changed", ());
+                    }
                     DaemonEvent::ContextUsage { session_id, used, window } => {
                         let _ = app.emit("context-usage", serde_json::json!({
                             "session_id": session_id,
