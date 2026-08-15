@@ -56,17 +56,13 @@
         "silent": true
       },
       "nsis": {
-        "startMenuFolder": "Nanna",
-        "shortcutName": "Nanna",
-        "runAfterInstall": true
+        "startMenuFolder": "Nanna"
       }
     },
     "macOS": {
       "minimumSystemVersion": "10.15"
     },
-    "linux": {
-      "desktopTemplate": null
-    }
+    "linux": {}
   },
   "plugins": {
     "updater": {
