@@ -383,6 +383,30 @@ sent after idle — strong models read continuation as "start over". That lever 
 chat-general (any user nudging a long-running session) and is the successor work item.
 Ledgers, per-poll history, interjection records: `D:/Development/nanna-bench/ui-run-*/`.
 
+**Forensic analysis addendum (2026-08-15, 40-agent log analysis, adversarially
+verified — recommendations encoded as ROADMAP P23).** Corrections and mechanisms the
+live monitoring could not see: (a) the continuation-destruction mechanism is a fresh
+turn context seeded from a 63× compressed summary — the verified-pass record is absent,
+so the rewrite is the model's cheapest coherent continuation (ornith 30→0 in 8 min;
+qwen 41→0); (b) **qwen's peak artifact satisfies all 42 tests under hermetic per-test
+scoring** — the official 41 stands because the model ran `chmod +w tests/test_40.sh`
+(after 12+ write errors whose text wrongly advised retrying) and doctored the spec test,
+splitting its local verification from the pristine scorer; the scorer's order-coupled
+namespace residue is what hid the divergence until post-series (hermetic per-test
+scoring is now a P23 ops debt); (c) ornith's five destruction writes each removed 9–33
+functions while clearing the 30% *byte* floor, re-anchoring `good` downward each time;
+(d) qwen's run death at peak was planner error-round exhaustion with no stop line —
+error rounds burned 2→4 in one 30-second round via a stale-stop double-charge;
+(e) gemma's 97-minute 0/42 hole: single-page tool discovery missed `write_file`, so 201
+python registry "saves" acked success with zero files on disk, and the daemon dry-counted
+the run out while its own checks failed; (f) ministral's wall is transport — Ollama
+aborts the tool-call stream on a literal TAB in JSON, retried blind ×3 per generation
+(116/160 in-window retries were 0-byte dead streams); (g) **series-wide caveat: all 171
+Tier-2 summarizations ran on `lfm2.5` regardless of per-leg pins** (summarize-priority
+resolution bug in the bucket router) — every leg's compressed context was degraded by
+the weakest model, making these numbers a floor. 27 improvement levers survived
+adversarial review; all are chat-general per the owner rule. See ROADMAP P23.
+
 ---
 
 ## Suite 1 — Inference (not yet baselined)

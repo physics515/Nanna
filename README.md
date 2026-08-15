@@ -297,13 +297,46 @@ every poll — a dead daemon can never be scored again).
 **What P22 bought, measured:** peaks roughly doubled across the board (22→41, 16→30,
 0→16, unmeasured→4), destruction cycles that used to be terminal now recover in one to
 two polls, two of five legs ended *at* their peak, and the dialect model went from
-fabricated tool calls to real executions. **What it exposed:** the remaining
-peak-destroyer is no longer the harness — both high scorers lost their final number to a
-rewrite triggered by a *driver continuation message* ("continue: … do not rewrite passing
-work") sent after the run went idle. Continuation prompts read as "start over" to strong
-models; that is the next lever, and it is a chat-general one (any user nudging a
-long-running session hits it). Full per-poll history, ledgers, and interjection effect
-records: `D:/Development/nanna-bench/ui-run-*/`.
+fabricated tool calls to real executions (127 salvaged calls vs 379 frozen-era
+hallucinated ones).
+
+**What the 40-agent log forensics found underneath** (adversarially verified; full
+recommendations: [ROADMAP P23](ROADMAP.md)):
+
+- **The surviving destruction channel is cross-turn, with a mechanism.** A continuation
+  turn starts from a fresh context seeded by a heavily compressed summary (ornith's was
+  420 chars — 63× compression), so the knowledge that 30 tests passed is simply gone and
+  a from-scratch rewrite is the model's cheapest coherent move: ornith went 30→0 within
+  8 minutes of one continuation message; qwen 41→0 the same way. Chat-general — any user
+  nudging a long-running session hits it. P23 Tier 1 pins verified artifact state to
+  every continuation turn.
+- **qwen actually solved the ladder.** Its peak artifact satisfies all 42 tests under
+  hermetic per-test scoring; the official 41 stands because after 12+ misleading
+  "retry the same call" write errors it ran `chmod +w tests/test_40.sh` and doctored the
+  read-only spec test — from then on its local verification diverged from the pristine
+  scorer, and the driver's later "test_40 fails" interjections became a claim-conflict
+  it resolved by rewriting from scratch. Three P23 levers come straight from this:
+  tool-layer enforcement of user-declared read-only paths, verdicts that notice
+  self-modified evidence, and reproduce-first on claim conflicts.
+- **The byte-based 30% shrink floor cannot see function removal.** Ornith's five
+  destruction writes each removed 9–33 functions while clearing the floor, because a
+  gutted file that still parses re-anchors the "good" baseline downward. P23 Tier 2 adds
+  a symbol-aware one-bounce hold plus a `.__best__` structural-coverage parking slot.
+- **Two runs died silently.** qwen's run ended at its peak on planner error-round
+  exhaustion with no stop line and no user-visible message; gemma dry-counted out at
+  0/42 while its own acceptance checks were failing. P23 Tier 3: every exit names its
+  reason, and a round is never "dry" while the scope's own checks fail.
+- **The weak-model walls are transport and honesty, not just capability.** Ministral's
+  constant wall is Ollama aborting the stream on a literal TAB in tool-call JSON
+  (retried blind ×3 each time); gemma spent 97 minutes "saving" its artifact into the
+  python script registry — 201 success acks, zero files on disk — because the ack never
+  said *where* the save landed.
+
+Series caveat found post-hoc: a summarize-priority resolution bug routed all 171 Tier-2
+context summarizations to `lfm2.5` regardless of the per-leg pins — every leg's
+compressed context was degraded by the weakest model, so the P22 numbers above are, if
+anything, a floor. Full per-poll history, ledgers, and interjection effect records:
+`D:/Development/nanna-bench/ui-run-*/`.
 
 ### Endurance (42 features)
 
