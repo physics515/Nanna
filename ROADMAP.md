@@ -3211,7 +3211,7 @@ every bound derives from a real constraint. 27 candidates survived adversarial r
 the 40-agent series analysis (2026-08-15 session).
 
 **Tier 1 — verified work must survive the turn boundary** *(the headline fix)*
-- [ ] **Pinned artifact-state preamble on continuation turns**: on any turn into a scope
+- [x] **Pinned artifact-state preamble on continuation turns**: on any turn into a scope
       with prior verified work (done tasks OR non-empty hiwater ledger), build an ARTIFACT
       STATE block from ground truth re-read at turn start (per hiwater entry: canonical
       path, fresh stat, hi/good/chk; plus the scope's verified check verdicts persisted as
@@ -3223,7 +3223,7 @@ the 40-agent series analysis (2026-08-15 session).
       render the digest in `build_step_prompt` beside LAST RESULT. Idempotent per-turn
       snapshot; bounds = hiwater entries (each cost a real write) × distinct verdicts
       (each cost a real execution). No new caps.
-- [ ] **Reproduce-first on claim conflicts**: when an incoming message asserts failure of
+- [x] **Reproduce-first on claim conflicts**: when an incoming message asserts failure of
       a check identity whose latest verdict is a verified pass, render a CLAIM-CONFLICT
       block naming both sides, suspend the already-passed close for the contradicted item,
       and seed ONE reproduction task at the head of the plan (existing acceptance
@@ -3234,12 +3234,12 @@ the 40-agent series analysis (2026-08-15 session).
       mutating. While unresolved, the #224 stale-shrink content-echo applies
       unconditionally to shrinking rewrites of the disputed artifact. Evidence-only phase
       exit; no timers.
-- [ ] **Re-anchor note on transient-retry restarts**: the transient-error retry branch
+- [x] **Re-anchor note on transient-retry restarts**: the transient-error retry branch
       appends a bounded note (NO_PROGRESS_NUDGE pattern, same site tasks.rs:2318): the
       step was interrupted mid-flight, prior tool effects are on disk, continue — do not
       restart; re-read before whole-file writes. Name the last side-effecting call from
       the liveness step record when present. Same for the chat harness error-round retry.
-- [ ] **One fresh-context reseed before a dry-round death with failing checks —
+- [x] **One fresh-context reseed before a dry-round death with failing checks —
       internalize the interjection** *(what the human interjection supplied, gemma 0→16)*:
       when the dry exit would end a mission turn while `abandoned_unmet` is non-empty,
       re-enter turn-start semantics ONCE inside the same run handle (fresh
@@ -3250,7 +3250,7 @@ the 40-agent series analysis (2026-08-15 session).
       everything.
 
 **Tier 2 — the write path must see structure, not bytes**
-- [ ] **Symbol-aware shrink hold (one-bounce, echo-style)**: a shrinking whole-file write
+- [x] **Symbol-aware shrink hold (one-bounce, echo-style)**: a shrinking whole-file write
       that removes more top-level definitions than it keeps — or drops definitions
       present in the last structurally-good version — holds ONCE with the stale-shrink
       echo shape (current content as merge material, removed symbols named, echo counts
@@ -3258,12 +3258,12 @@ the 40-agent series analysis (2026-08-15 session).
       acknowledged signature proceeds. Reuses the rewrite-note's symbol pass (zero extra
       parse); fails open with no symbols; growth is never refused; `edit_file` exempt
       (explicit old_string intent). Catches 4 of ornith's 5 destruction writes.
-- [ ] **Park `<file>.__best__` — the structural-coverage high-water** — beside the
+- [x] **Park `<file>.__best__` — the structural-coverage high-water** — beside the
       one-slot `__prev__`: park the outgoing version when its top-level symbol count
       strictly exceeds the recorded best (rewrite spirals rename symbols, so subset
       relations rotate the peak out — count, not set). Rewrite-notes name it: "26
       sections removed; the fullest prior version (42) is parked at `<file>.__best__`."
-- [ ] **Verdicts notice self-modified evidence**: hash acceptance-referenced files at
+- [x] **Verdicts notice self-modified evidence**: hash acceptance-referenced files at
       canonicalization; re-hash at every verdict (pre-step, post-step, #218 sweep). On
       mismatch: structural sentence naming the transition (+ "modified by this session"
       only when the write ledger attributes it), demote a passing verdict to UNKNOWN
@@ -3272,27 +3272,27 @@ the 40-agent series analysis (2026-08-15 session).
       costs one named re-verification; tampering can't complete an item in the same
       breath as the mutation. *(qwen's doctored test_40 manufactured both its 41/42
       ceiling and the fatal claim-conflict.)*
-- [ ] **User-declared file invariants at the tool layer**: extract durable file
+- [x] **User-declared file invariants at the tool layer**: extract durable file
       prohibitions (read-only glob / do-not-delete / do-not-create-under, imperative +
       explicit path referent only) at the P14/P15 canonicalization pass into a
       per-scope registry (verbatim source sentence retained, inherited by subtasks);
       write tools consult it and refuse with a steer quoting the user's own sentence
       (`{content, success:false}`, never thrown); exec extends its ratchet-redirect
       refusal to registry paths. Lifted only by the user; `ask_user` is the escape hatch.
-- [ ] **Non-retryable write errors name the cause and disavow the bypass**: bridge write
+- [x] **Non-retryable write errors name the cause and disavow the bypass**: bridge write
       failures carry `io::ErrorKind`; on confirmed PermissionDenied the tool result says
       write-protected + non-retryable + "protection is usually deliberate — change the
       file you are producing instead" (retry advice survives only for transient kinds).
       exec appends an honesty echo (flag, never gate) when a protection-stripping command
       targets a file this session never wrote. *(12+ misleading "retry the same call"
       messages preceded qwen's chmod.)*
-- [ ] **Structural-verdict sentence for literal `\n` runs in sh comments** (write_file +
+- [x] **Structural-verdict sentence for literal `\n` runs in sh comments** (write_file +
       edit_file, sh-checked files only): ≥2 literal backslash-n on a comment-effective
       line → one verdict sentence warning flattened code may hide behind it. Sentence
       only, never a gate; fails open.
 
 **Tier 3 — endings must be loud, honest, and evidence-priced**
-- [ ] **End loudly; never end dry while your own checks still fail**: reify MissionEnd
+- [x] **End loudly; never end dry while your own checks still fail**: reify MissionEnd
       (initial-stop / dry / planner-fallback-exhausted / error-rounds-exhausted /
       rounds-max / cancelled / planner_starvation); exactly one cumulative
       `chat harness mission finished` line at continuation-loop exit (every turn, every
@@ -3302,29 +3302,29 @@ the 40-agent series analysis (2026-08-15 session).
       `abandoned_unmet` guard its sibling has: failing checks → NOT dry → reopen the top
       unmet item by id (#218 machinery) and charge the round. Dry keeps authority only
       when no canonicalized check most-recently-FAILED.
-- [ ] **Error rounds spent against provider-health evidence**: fix the stale-stop
+- [x] **Error rounds spent against provider-health evidence**: fix the stale-stop
       double-charge (observed 2→4 in one 30s round), and before consuming a round run one
       minimal single-token probe on the run's model (existing timeout + backoff ladder) —
       probe answers → charge (fault persists across a healthy provider); probe exhausts
       the ladder → transport-outage evidence: invoke the transient heal and charge, so
       three rounds require three full heal ladders instead of 60 seconds. Probe re-warms
       the model after keep_alive=0, closing the self-inflicted cold-load cascade.
-- [ ] **Park-and-resume on transient infrastructure**: at both terminal give-up sites,
+- [x] **Park-and-resume on transient infrastructure**: at both terminal give-up sites,
       when the stop classifies transient (`is_transient_llm_error`), end the turn PARKED
       (demote-to-pending + transcript notice naming provider and resume condition);
       resume on the daemon's next successful completion on that provider (recovery
       evidence, never a timer), carrying the SAME error_rounds counter through the
       ChatRunRegistry claim.
-- [ ] **Derive `is_mission` from session state, not run luck**: for error stops, grant
+- [x] **Derive `is_mission` from session state, not run luck**: for error stops, grant
       continuation rounds when run evidence OR open items in the session's scope show
       unfinished work (one query through the existing open-work path); a crashed run that
       seeded work it never touched still holds a mission.
-- [ ] **Classify 0-byte dead streams as a wedge**: one arm in `wedged_runner_error` on
+- [x] **Classify 0-byte dead streams as a wedge**: one arm in `wedged_runner_error` on
       the exact "No NDJSON line was ever parsed" literal (cannot match mid-generation
       aborts, which stay out — contention-cancel ambiguity); rides the existing
       Repeated-path reset. *(116/160 in-window ministral retries were this shape,
       healed blind.)*
-- [ ] **Heal the control-character transport wall**: classifier for Ollama's
+- [x] **Heal the control-character transport wall**: classifier for Ollama's
       character-naming abort bodies ("invalid character '\t' in string literal" family)
       → class-specific corrective retry note naming the offending character and the two
       legal routes (JSON escapes in tool-call strings; exec printf/heredoc for literal
@@ -3333,53 +3333,72 @@ the 40-agent series analysis (2026-08-15 session).
       constant wall; ornith's learned tab-avoidance.)*
 
 **Tier 4 — tool results must tell the truth about what happened**
-- [ ] **Side-effect acks name WHERE the effect landed**: python's registry save must say
+- [x] **Side-effect acks name WHERE the effect landed**: python's registry save must say
       "saved to the session script registry — did NOT create or modify any workspace
       file" (gemma "saved" 201 times with nothing on disk); then a one-pass audit of
       default-skills/*: any success message describing a side effect names its
       location/scope ("summaries must announce themselves" contract).
-- [ ] **Claim nudge grounded in evidence, both halves**: (a) arming — fire only when the
+- [x] **Claim nudge grounded in evidence, both halves**: (a) arming — fire only when the
       step holds a successful write/edit OR an exec fail→pass flip on the same command
       digest (read-only churn never arms; gemma's 40-firing window replays to zero);
       (b) content — when the newest work-evidence record FAILED, the nudge names that
       failure (bounded `preview_snippet`) and demands a re-verified fix before any
       TASK COMPLETE. *(Ornith's false "all 42 pass" claim was nudged into existence the
       same log-second as a 12-FAIL wall.)*
-- [ ] **Truthful deadline-exceeded exec (kill-and-tell)**: drain pipes incrementally;
+- [x] **Truthful deadline-exceeded exec (kill-and-tell)**: drain pipes incrementally;
       on timeout, kill the tree and RETURN `timed_out: true` + elapsed + partial output
       ("the command executed and may have left side effects; disk is truth") — "Nothing
       ran" is reserved for genuine spawn failures.
-- [ ] **Directory tools teach on file paths** (and converse in read_file): "'X' exists
+- [x] **Directory tools teach on file paths** (and converse in read_file): "'X' exists
       but is a FILE — use read_file" instead of os-error jargon, one extra stat only on
       already-failed calls; also closes read_file's latent uncaught-throw on
       directories.
 
 **Tier 5 — GUI truthfulness** *(from the leg-1 composer-driven observations)*
-- [ ] Breaker replays (`short_circuited === true`) render as inline steering, not the
+- [x] Breaker replays (`short_circuited === true`) render as inline steering, not the
       red "Tool Failed" toast.
-- [ ] Config-mutating verbs emit `Event::ConfigChanged` (WorkspacesChanged pattern);
+- [x] Config-mutating verbs emit `Event::ConfigChanged` (WorkspacesChanged pattern);
       Models tab, provider badge, and model chip re-fetch on it instead of caching at
       mount *(the stale-Offline badge, stale priority list, and stale chip were all this)*.
-- [ ] Composer content integrity: `autolink: false` in the editable editor + a
+- [x] Composer content integrity: `autolink: false` in the editable editor + a
       round-trip test — the leg-1 mission arrived as `test_[01.sh](http://01.sh)`.
-- [ ] Workspace create requires what the backend requires (one WORKSPACE_MARKER), not
+- [x] Workspace create requires what the backend requires (one WORKSPACE_MARKER), not
       one forced standard file; standard files become an unchecked offer.
 
 **Series ops debts** *(bugs and audits surfaced by the analysis, not levers)*
-- [ ] **Summarizer-pin resolution audit**: 171/171 Tier-2 summarizations ran on
+- [x] **Summarizer-pin resolution audit**: 171/171 Tier-2 summarizations ran on
       `ollama/lfm2.5` despite per-leg `llm.summarization_priority` pins — every
       compressed context in the series was degraded by the weakest model and VRAM was
       double-loaded. Audit the summarize-priority resolution in the bucket router.
-- [ ] **Zero-information breaker: normalized matching** — byte-identity was evaded by
+- [x] **Zero-information breaker: normalized matching** — byte-identity was evaded by
       ~20 trivially-varied spellings of the same sweep in five minutes (qwen
       05:09–05:13Z); normalize command text or match on result hashes.
-- [ ] **Bench-side (exempt from the owner rule, harness tooling): hermetic per-test
+- [x] **Bench-side (exempt from the owner rule, harness tooling): hermetic per-test
       scoring** in `bench/gui-leg/score.sh` + a per-test pass/fail map — order-coupled
       residue hid qwen's real test_40 divergence until after the series (its peak
       artifact scores 42/42 hermetically).
 - [ ] **Cross-leg importance-merge audit**: 19 global merges of near-identical
       "building minidb" memories across legs — no observed harm; audit the
       dreaming-adjacent vector.
+
+**Landed 2026-08-15 (v0.3.8-beta.13).** All 27 verified levers are in; 1046 tests
+green. Known remainders, deliberately scoped rather than silently dropped:
+
+- [ ] **Summarization priority is live per turn but still boot-frozen in three
+      long-lived consumers** (`server.rs`: the scheduled dream-cycle summarizer list,
+      the sub-agent `AgentConfig`, and script-services summarizer models each clone the
+      list once at boot). The per-turn chat/harness path — the one that degraded the
+      series — now re-reads it; these three need the same treatment.
+- [ ] **Steering marker on re-seeded timelines**: breaker replays render as steering
+      live, but a timeline rebuilt from the run journal after a remount does not carry
+      `short_circuited`, so history still shows them as failures.
+- [ ] **No lift path for a declared file invariant**: once registered, a prohibition
+      stands until the registry file is removed. "You can edit tests/ now" is exactly
+      the permissive phrasing a conservative extractor must not act on, so lifting
+      needs its own deliberate, `ask_user`-confirmed shape.
+- [ ] **Evidence hashing is anchored at run start, not at task-write time**: the
+      repository layer has no workspace root to resolve a relative acceptance path,
+      so the hash baseline is taken where the workdir is known instead.
 
 Full evidence: the 40-agent forensic analysis (per-leg + cross-cutting, adversarially
 verified) in the 2026-08-15 session; per-leg ledgers and per-poll history under
