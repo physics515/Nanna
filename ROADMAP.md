@@ -221,16 +221,16 @@ ceiling and a p95 latency target (reference: RTX 4070 Ti SUPER 16 GB). Methodolo
 ## Phases
 
 ### P0 - Public Preview Release
-- [ ] Create RELEASE_NOTES.md or MILESTONE that freezes scope.
-- [ ] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases.
-- [ ] Publish signed Windows .msi/.exe installer with bundled daemon sidecar.
-- [ ] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon).
-- [ ] Publish Linux AppImage and/or .deb/.rpm.
-- [ ] App launches without terminal; daemon starts automatically.
-- [x] Add Start Menu / tray / launch-at-login support.
-- [ ] WebView2 handling on Windows.
-- [ ] Document uninstall process.
-- [ ] Add "check for updates" or auto-update mechanism
+- [x] Create RELEASE_NOTES.md or MILESTONE that freezes scope. *(2026-08-15)*
+- [x] Set up GitHub Actions to build Tauri + daemon sidecar and attach artifacts to Releases. *(2026-08-15)*
+- [~] Publish signed Windows .msi/.exe installer with bundled daemon sidecar. *(signing deferred to P0.3)*
+- [~] Publish signed and notarized macOS .dmg (Universal or separate Intel/Apple Silicon). *(notarization deferred to P0.3)*
+- [x] Publish Linux AppImage and/or .deb/.rpm. *(2026-08-15)*
+- [x] App launches without terminal; daemon starts automatically. *(2026-08-15)*
+- [x] Add Start Menu / tray / launch-at-login support. *(2026-08-15 — launch-at-login deferred to P0.3)*
+- [x] WebView2 handling on Windows. *(2026-08-15 — downloadBootstrapper with silent install)*
+- [x] Document uninstall process. *(2026-08-15 — README.md Installation section)*
+- [x] Add "check for updates" or auto-update mechanism. *(2026-08-15 — tauri-plugin-updater)*
 
 #### P0.1 - First Run UX
 - [ ] Create public facing website / Github Pages
